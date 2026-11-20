@@ -243,7 +243,9 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// (`RGFX_QUEUE_UNSHARED`), so that no other process's work queues on the GPU ahead of its
     /// frames; and the host's own: a graphics display's window sink's and its mirror's, whose draws
     /// and syncs are on a present's path; the IOSurface device caches' transfer queue, whose fills
-    /// a present of a surface and a frame drawn from a cache wait for; and the decoder's release
+    /// a present of a surface and a frame drawn from a cache wait for; those caches' rounds' queue,
+    /// on which the later rounds of a copy out longer than the two pieces it circulates go, each
+    /// once the host has moved the round before it out of its piece; and the decoder's release
     /// queue, which signals a closed context's plain events, so that no command buffer of the
     /// guest's, nor one waiting on another GPU queue, holds it up. A platform that shares no GPU
     /// queue between command queues answers `new_command_queue`'s queue. Never nil-checked; a raise

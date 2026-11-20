@@ -307,7 +307,18 @@
 //!   one. The first copies that find none idle make them, whole, each on its own thread, until
 //!   two are kept; nothing makes one after, and none is let go of. A copy that finds none idle
 //!   once both are kept makes a scratch piece of the length it needs on its own thread, let go
-//!   of once its copy is done. A use's fill, at once or deferred, a present's fill, a download's
+//!   of once its copy is done. A copy out whose bytes take more pieces than the two kept ones
+//!   circulates two ([`Rounds`]): it moves its bytes a piece's length at a time, each round
+//!   into one of its two pieces on a command buffer of its own, the first two on the transfer
+//!   queue with the copy and each later one on a queue of the rounds' own, committed by the host
+//!   once its CPU has moved the round before it in that piece into the pages. The GPU copies one
+//!   round while the CPU moves the one before it, the transfer queue's other copies go on
+//!   between the rounds, and the copy takes two pieces, whatever its length: the kept ones where
+//!   idle, else made, let go of with the copy. Such a copy signals no value of the transfer
+//!   event: an event of its own stands for it, which the host sets once the last round's bytes
+//!   are in the pages, and which a use of the cache after it waits for, a fill or a copy out of
+//!   it on the transfer queue among them ([`OutCopy`]). A use's
+//!   fill, at once or deferred, a present's fill, a download's
 //!   copy out and a release's find their pieces made ahead: where the idle kept pieces and the
 //!   pieces reserved for the block lack some a copy of all of the bytes it may move would take
 //!   ([`SurfaceCaches::lacking`]), the kept pieces that serve it are taken into the block's
@@ -610,7 +621,7 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// The cache's last copy into its pages on the transfer queue ([`SurfaceCaches::write_back`]),
     /// until it lands: a download or a release that copies nothing waits for it, as for an
     /// early copy, and so does a use that writes the cache, on the GPU.
-    out: Option<OutCopy>,
+    out: Option<OutCopy<P>>,
     /// The cache's life, where its memory was made for the host's video (exportable, or a
     /// dma-buf: [`CacheMaker::make`]), as the host's video keeps what it makes of the
     /// cache's memory (an import of it, [`SurfaceCaches::identity`]): it ends as the cache goes.
@@ -792,10 +803,24 @@ impl<P: Platform> SurfaceCache<P> {
 }
 
 /// A copy of a cache into its pages on the transfer queue ([`SurfaceCaches::write_back`]): the
-/// transfer event's value it signals as it ends, and its landing.
-struct OutCopy {
+/// transfer event's value it signals as it ends, and its landing; for a copy that circulates its
+/// pieces ([`Rounds`]), its own event, which stands for the transfer event's value, and
+/// [`ROUNDS_DRAINED`], set once its last round's bytes are in the pages.
+struct OutCopy<P: Platform> {
     value: u64,
     landing: Arc<Landing>,
+    own: Option<P::SharedEvent>,
+}
+
+impl<P: Platform> OutCopy<P> {
+    /// Has `cb` wait on the GPU for the copy: on `transfer`, the transfer event, at its value, or
+    /// on its own event where it has one.
+    fn wait(&self, cb: &P::CommandBuffer, transfer: &P::Event) -> RaiseResult<()> {
+        match &self.own {
+            Some(own) => cb.encode_wait(Some(EventRef::Shared(own)), self.value),
+            None => cb.encode_wait(Some(EventRef::Event(transfer)), self.value),
+        }
+    }
 }
 
 /// A copy of a cache into pages asked and not yet landed, by the pages' host addresses in the
@@ -1568,6 +1593,10 @@ struct Transfer<P: Platform> {
     /// where the platform makes no queue: those writers take no early copy.
     read_back: Option<P::CommandQueue>,
     event: P::Event,
+    /// The later rounds of the copies out that circulate their pieces ([`Rounds`]), unshared,
+    /// so no other queue's work holds them back; `None` where the platform makes none: such
+    /// copies take a piece for each piece's length.
+    rounds: Option<P::CommandQueue>,
     /// The last value a copy signals.
     signalled: u64,
     /// How far its fills have finished.
@@ -1588,6 +1617,7 @@ impl<P: Platform> Transfer<P> {
             queue,
             read_back: device.new_command_queue(),
             event,
+            rounds: device.new_command_queue_unshared(),
             signalled: 0,
             fills: Arc::new(Fills {
                 done: AtomicU64::new(0),
@@ -3886,7 +3916,7 @@ impl<P: Platform> SurfaceCaches<P> {
                     && !out.landing.landed()
                     && let Some(t) = &self.transfer
                 {
-                    cb.encode_wait(Some(EventRef::Event(&t.event)), out.value)?;
+                    out.wait(cb, &t.event)?;
                 }
             }
         }
@@ -4262,7 +4292,7 @@ impl<P: Platform> SurfaceCaches<P> {
             if let Some(out) = (self.by_block.get(&block)).and_then(|c| c.out.as_ref())
                 && !out.landing.landed()
             {
-                cb.encode_wait(Some(EventRef::Event(&transfer.event)), out.value)?;
+                out.wait(&cb, &transfer.event)?;
             }
             cb.encode_signal(Some(EventRef::Shared(event)), number)?;
             Ok(Some(cb))
@@ -4569,6 +4599,7 @@ impl<P: Platform> SurfaceCaches<P> {
             (Way::In, block),
             &mut self.counts,
             (timed, &self.spares, &mut reserve),
+            None,
         );
         if !reserve.is_empty() {
             self.left_over.insert(block, reserve);
@@ -4960,6 +4991,15 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             _ => return None,
         };
+        // A copy out longer than the pieces it circulates takes those alone, where the platform
+        // made the rounds' queue ([`Rounds`]).
+        let rounds = (self.transfer.as_ref()).is_some_and(|t| t.rounds.is_some());
+        let lens = match (&cache.pages, way) {
+            (Some(CachePages::Copied(_)), Way::Out) if rounds && lens.len() > ROUND_PIECES => {
+                circulated(&lens)
+            }
+            _ => lens,
+        };
         Some((lens, !cache.staged))
     }
 
@@ -5201,12 +5241,26 @@ impl<P: Platform> SurfaceCaches<P> {
             (Way::Out, block),
             &mut self.counts,
             (timed, &self.spares, &mut reserve),
+            (transfer.rounds.as_ref()).map(|rounds| (&transfer.queue, rounds)),
         );
         if !reserve.is_empty() {
             self.left_over.insert(block, reserve);
         }
-        let staged = staged?;
-        signal_after::<P>(&cb, signal.as_ref())?;
+        let mut staged = staged?;
+        // A copy that circulates its pieces commits its second round after `cb`, and each later
+        // one as the host has moved the round before it in its piece out ([`Rounds`]); the last
+        // signals the deferred copy's number, and the copy's own event stands for a value of
+        // the transfer event.
+        let (mut second, mut own) = (None, None);
+        match staged.as_mut().and_then(|staged| staged.rounds.as_mut()) {
+            Some(rounds) => {
+                second = rounds.second.take();
+                own = Some(rounds.own.clone_ref());
+                rounds.signal =
+                    (signal.as_ref()).map(|(event, number)| (event.clone_ref(), *number));
+            }
+            None => signal_after::<P>(&cb, signal.as_ref())?,
+        }
         // The buffers live until the copy is done, past the cache's own end at a release.
         let view = match &cache.pages {
             Some(CachePages::View(pages)) => Some(pages.clone_ref()),
@@ -5214,17 +5268,44 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         let held = (cache.device.clone_ref(), view);
         let now = trace.and_then(|trace| trace.now.clone());
-        transfer.signalled += 1;
-        let value = transfer.signalled;
-        cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
+        let value = match &own {
+            Some(_) => ROUNDS_DRAINED,
+            None => {
+                transfer.signalled += 1;
+                let value = transfer.signalled;
+                cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
+                value
+            }
+        };
         let landing = Landing::new();
         let lands = Arc::clone(&landing);
         let gpu = Arc::clone(&self.copy_gpu);
-        match staged {
+        match (staged, &second) {
+            // Each round's bytes move into the pages as its command buffer completes, on the
+            // caches' own threads, in order, the block's turn, and the round after it in its
+            // piece is committed then; the last round's lands the copy, its GPU times and the
+            // CPU's time those of the last round ([`Circulation`]).
+            (Some(staged), Some(second)) => {
+                let end: CopyEnd = Box::new(move |gpu_times, took| {
+                    drop(held);
+                    lands.land_timed(gpu_times, took);
+                    done();
+                });
+                let circulation = Arc::new(Circulation {
+                    block,
+                    staged: Mutex::new(Some(staged)),
+                    end: Mutex::new(Some(end)),
+                    now,
+                    gpu,
+                    lands_out: Arc::clone(&self.lands_out),
+                });
+                cb.add_completed_handler(ON, round_ended(Arc::clone(&circulation), 0))?;
+                second.add_completed_handler(ON, round_ended(circulation, 1))?;
+            }
             // A copied cache's pages take the staging pieces' bytes on the host's CPU, before
             // `done`: on the caches' own threads, as the copy would hold the platform's thread
             // that sees every queue's completions (the module doc, "Staged copies").
-            Some(staged) => {
+            (Some(staged), None) => {
                 let lands_out = Arc::clone(&self.lands_out);
                 cb.add_completed_handler(
                     ON,
@@ -5248,7 +5329,7 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             // Else answered as the platform sees the copy done, with no handler thread woken
             // between, as an early copy's landing is; the buffers go in the completed handler.
-            None => {
+            (None, _) => {
                 cb.add_completion_seen_handler(
                     ON,
                     Box::new(move |info: CompletedInfo| {
@@ -5261,6 +5342,7 @@ impl<P: Platform> SurfaceCaches<P> {
             }
         }
         self.owed_commits.push(cb);
+        self.owed_commits.extend(second);
         if let Some(trace) = trace {
             trace.made(users, &landing);
         }
@@ -5282,6 +5364,7 @@ impl<P: Platform> SurfaceCaches<P> {
             cache.out = Some(OutCopy {
                 value,
                 landing: Arc::clone(&landing),
+                own,
             });
         }
         let runs = (self.watched.0.lock().get(&block)).map_or_else(Vec::new, |p| p.runs.clone());
@@ -7694,7 +7777,9 @@ fn download_op<P: Platform>(
 }
 
 /// Makes `cb` wait for the latest command buffer of each queue that used `cache`; how many it
-/// waits for.
+/// waits for. A copy on the transfer queue also waits for the cache's copy out that circulates
+/// its pieces, until it lands, as its later rounds go on a queue of their own ([`Rounds`]):
+/// not counted.
 fn wait_for_users<P: Platform>(
     cb: &P::CommandBuffer,
     ends: &HashMap<u64, (P::Event, u64)>,
@@ -7706,6 +7791,12 @@ fn wait_for_users<P: Platform>(
             cb.encode_wait(Some(EventRef::Event(event)), value)?;
             waits += 1;
         }
+    }
+    if let Some(out) = &cache.out
+        && let Some(own) = &out.own
+        && !out.landing.landed()
+    {
+        cb.encode_wait(Some(EventRef::Shared(own)), out.value)?;
     }
     Ok(waits)
 }
@@ -8285,6 +8376,8 @@ struct Staging<P: Platform> {
     /// Where the caches' copies are staged, the clock that times the copy into the pages
     /// ([`DOWNLOADS`]).
     timed: Option<Now>,
+    /// Where a copy out circulates its pieces, its rounds.
+    rounds: Option<Rounds<P>>,
 }
 
 impl<P: Platform> Staging<P> {
@@ -8304,6 +8397,261 @@ impl<P: Platform> Staging<P> {
             }
         }
         give_back(self.pieces);
+    }
+
+    /// Round `round` of a copy out that circulates its pieces ([`Rounds`]) has completed on the
+    /// GPU: the bytes it wrote into its piece move into the pages, the spans alone.
+    fn drain(&self, round: usize) {
+        if let Some((pages, spans)) = &self.into
+            && let Some(piece) = self.pieces.get(round % ROUND_PIECES)
+        {
+            let at = self.timed.as_ref().map(|now| now());
+            let base = piece.contents().as_ptr::<u8>();
+            let spans: Vec<(Range<u64>, *mut u8)> = (spans.iter())
+                .filter(|span| span.piece == round)
+                .map(|span| (span.bytes.clone(), base.wrapping_add(span.at.to_usize())))
+                .collect();
+            // SAFETY: each span's bytes of its round's piece's Shared bytes, which hold them and
+            // which the round's copy into them, now done, was the last GPU work to use: the
+            // round that takes the piece next is committed only after this; the pages are named,
+            // so wired.
+            unsafe { pages.copy(&spans, true) };
+            if let (Some(now), Some(at)) = (&self.timed, at) {
+                DOWNLOADS.took(now, at);
+            }
+        }
+    }
+}
+
+/// How many pieces a staged copy out longer than they hold circulates ([`Rounds`]): as many as
+/// the caches keep ([`SPARE_BYTES`], two whole ones).
+const ROUND_PIECES: usize = 2;
+
+/// The value of a circulating copy's own event once its first [`ROUND_PIECES`] rounds are done
+/// on the GPU, which each later round waits for ([`Rounds`]).
+const ROUNDS_BEGUN: u64 = 1;
+
+/// The value the host sets a circulating copy's own event to once its last round's bytes are in
+/// the pages, which a later use of the cache waits for ([`OutCopy`]).
+const ROUNDS_DRAINED: u64 = 2;
+
+/// A staged copy out whose bytes take more pieces than [`ROUND_PIECES`] (the module doc, "Staged
+/// copies"): it takes that many pieces and moves its bytes in rounds, round `k` the bytes
+/// [`pack`] laid in its piece `k`, into piece `k % ROUND_PIECES`. Its first two rounds are
+/// committed with the copy on the transfer queue, the second signalling `own` at
+/// [`ROUNDS_BEGUN`] as it ends. Each later round goes on `queue`, the rounds' own
+/// ([`Transfer::rounds`]), committed by the host once the round before it in its piece has
+/// completed and its bytes are in the pages ([`Circulation`]), and waits on the GPU for `own` at
+/// [`ROUNDS_BEGUN`], so it reads the cache after what the first round waited for. The GPU copies
+/// one round while the CPU moves the one before it, the transfer queue's other copies go on
+/// between the rounds, and the copy makes no piece past the ones it circulates. Once the last
+/// round's bytes are in the pages the host sets `own` to [`ROUNDS_DRAINED`], which a later use
+/// of the cache waits for ([`OutCopy`]).
+struct Rounds<P: Platform> {
+    /// The second round's command buffer, its encoder ended, until the caller takes it to commit
+    /// after the first's ([`SurfaceCaches::write_back`]).
+    second: Option<P::CommandBuffer>,
+    /// Each later round's parts, from the third on, as [`between`] copies them.
+    later: Vec<Vec<(u64, u64, u64)>>,
+    queue: P::CommandQueue,
+    own: P::SharedEvent,
+    /// The cache's buffer, which the later rounds copy out of.
+    cache: P::Buffer,
+    /// The deferred copy's event and number the last round signals ([`signal_after`]).
+    signal: Option<(P::SharedEvent, u64)>,
+    /// How many rounds the copy makes: fewer than its pieces' where the platform made a later
+    /// round not ([`Circulation::round_done`]).
+    count: usize,
+}
+
+/// The lengths of the pieces a copy circulates for pieces of `lens` ([`Rounds`]): each the
+/// longest of the lengths whose rounds it takes.
+fn circulated(lens: &[u64]) -> Vec<u64> {
+    (0..ROUND_PIECES.min(lens.len()))
+        .map(|piece| {
+            (lens.iter().skip(piece).step_by(ROUND_PIECES))
+                .copied()
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// A circulating copy as it begins ([`rounds`]): its own event, the rounds' queue, and the
+/// second round's command buffer with its blit encoder open.
+type Begun<P> = (
+    <P as Platform>::SharedEvent,
+    <P as Platform>::CommandQueue,
+    <P as Platform>::CommandBuffer,
+    <P as Platform>::BlitEncoder,
+);
+
+/// The own event of a copy that circulates its pieces ([`Rounds`]), made on `device`, the
+/// rounds' queue of `queues`, and its second round's command buffer, made on the transfer queue
+/// of `queues`, with its blit encoder open; `None` where the platform makes any of them not.
+fn rounds<P: Platform>(
+    device: &P::Device,
+    (transfer, queue): (&P::CommandQueue, &P::CommandQueue),
+) -> RaiseResult<Option<Begun<P>>> {
+    let Some(own) = device.new_shared_event() else {
+        return Ok(None);
+    };
+    let Some(cb) = transfer.command_buffer(ON)? else {
+        return Ok(None);
+    };
+    let Some(blit) = cb.blit_encoder(ON)? else {
+        return Ok(None);
+    };
+    Ok(Some((own, queue.clone_ref(), cb, blit)))
+}
+
+/// Ends the encoder of a circulating copy begun and not used ([`rounds`]); its command buffer
+/// goes uncommitted.
+fn end_rounds<P: Platform>(begun: Option<Begun<P>>) -> RaiseResult<()> {
+    if let Some((_, _, _, encoder)) = begun {
+        encoder.encode(ON, BlitCmd::EndEncoding)?;
+    }
+    Ok(())
+}
+
+/// Lands a copy out ([`Circulation`]), given its last command buffer's GPU times and the CPU's
+/// time of its last move into the pages.
+type CopyEnd = Box<dyn FnOnce(Option<(u64, u64)>, std::time::Duration) + Send>;
+
+/// A copy out that circulates its pieces ([`Rounds`]), as its rounds' completed handlers share
+/// it.
+struct Circulation<P: Platform> {
+    block: u64,
+    /// The copy's pieces, its pages and its rounds, until its last round lands.
+    staged: Mutex<Option<Staging<P>>>,
+    end: Mutex<Option<CopyEnd>>,
+    /// The clock that times the last round's move into the pages, where the copy is traced.
+    now: Option<Now>,
+    gpu: Arc<CopyGpu>,
+    lands_out: Arc<Worker>,
+}
+
+/// The completed handler of round `round` of `circulation`'s copy: its GPU time counted, its
+/// bytes moved into the pages on the caches' own threads, the block's turn
+/// ([`Circulation::round_done`]).
+fn round_ended<P: Platform>(
+    circulation: Arc<Circulation<P>>,
+    round: usize,
+) -> reims_vgpu_vulkan::core::platform::command::CompletedHandler {
+    Box::new(move |info: CompletedInfo| {
+        let gpu_times = info.gpu_times_ns;
+        CopyGpu::add(&circulation.gpu.out, gpu_times);
+        let (lands_out, block) = (Arc::clone(&circulation.lands_out), circulation.block);
+        let job = move || circulation.round_done(round, gpu_times);
+        lands_out.submit_waitless(block, Box::new(job));
+    })
+}
+
+impl<P: Platform> Circulation<P> {
+    /// Round `round` has completed on the GPU, with `gpu_times`: its bytes move into the pages
+    /// ([`Staging::drain`]), then the round after it in its piece, where there is one, is
+    /// committed. After the last round the host sets the copy's own event to
+    /// [`ROUNDS_DRAINED`], gives the pieces back and lands the copy. Where the platform makes a
+    /// round not, logged, the copy ends with the round before it, and the deferred copy's
+    /// number that round would have signalled is set on the CPU.
+    fn round_done(self: &Arc<Self>, round: usize, gpu_times: Option<(u64, u64)>) {
+        let at = self.now.as_ref().map(|now| now());
+        let mut staged = self.staged.lock();
+        let Some(staging) = staged.as_mut() else {
+            return;
+        };
+        staging.drain(round);
+        let Some(rounds) = staging.rounds.as_ref() else {
+            return;
+        };
+        let next = round + ROUND_PIECES;
+        let mut cut = false;
+        if next < rounds.count {
+            let made = refusing(|| self.commit_round(&staging.pieces, rounds, next));
+            if !matches!(made, Ok(true)) {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "the IOSurface block at {:#x}: the platform made round {next} of its staged \
+                     copy out not ({made:?}); the copy ends with the rounds before it",
+                    self.block
+                );
+                cut = true;
+            }
+        }
+        if let Some(rounds) = staging.rounds.as_mut()
+            && cut
+        {
+            rounds.count = next;
+        }
+        if staging
+            .rounds
+            .as_ref()
+            .is_some_and(|rounds| round + 1 < rounds.count)
+        {
+            return;
+        }
+        let Some(staging) = staged.take() else {
+            return;
+        };
+        drop(staged);
+        if let Some(rounds) = &staging.rounds {
+            let mut sets = vec![(&rounds.own, ROUNDS_DRAINED)];
+            if rounds.count < rounds.later.len() + ROUND_PIECES
+                && let Some((event, number)) = &rounds.signal
+            {
+                sets.push((event, *number));
+            }
+            for (event, value) in sets {
+                if let Err(raise) = event.set_signaled_value(value) {
+                    log::warn!(
+                        target: "reims_vgpu::graphics", kind:% = raise;
+                        "the IOSurface block at {:#x}: the platform raised at the set of its \
+                         staged copy out's event to {value} ({raise:?})",
+                        self.block
+                    );
+                }
+            }
+        }
+        give_back(staging.pieces);
+        let took = (self.now.as_ref().zip(at)).map_or(std::time::Duration::ZERO, |(now, at)| {
+            now().saturating_duration_since(at)
+        });
+        if let Some(end) = self.end.lock().take() {
+            end(gpu_times, took);
+        }
+    }
+
+    /// Commits round `round` on the rounds' queue: a copy of its parts out of the cache into its
+    /// piece of `pieces`, after the copy's first rounds, its completion handled as each round's
+    /// ([`round_ended`]); the last round signals the deferred copy's number. False where the
+    /// platform made its command buffer or its encoder not.
+    fn commit_round(
+        self: &Arc<Self>,
+        pieces: &[Piece<P>],
+        rounds: &Rounds<P>,
+        round: usize,
+    ) -> RaiseResult<bool> {
+        let (Some(parts), Some(piece)) = (
+            rounds.later.get(round - ROUND_PIECES),
+            pieces.get(round % ROUND_PIECES),
+        ) else {
+            return Ok(false);
+        };
+        let Some(cb) = rounds.queue.command_buffer(ON)? else {
+            return Ok(false);
+        };
+        cb.encode_wait(Some(EventRef::Shared(&rounds.own)), ROUNDS_BEGUN)?;
+        let Some(blit) = cb.blit_encoder(ON)? else {
+            return Ok(false);
+        };
+        between::<P>(&blit, (&rounds.cache, &**piece), parts, Way::Out)?;
+        blit.encode(ON, BlitCmd::EndEncoding)?;
+        if round + 1 == rounds.count {
+            signal_after::<P>(&cb, rounds.signal.as_ref())?;
+        }
+        cb.add_completed_handler(ON, round_ended(Arc::clone(self), round))?;
+        cb.commit(ON)?;
+        Ok(true)
     }
 }
 
@@ -8754,6 +9102,13 @@ impl StagedCodes {
 /// taken, where it holds none. A copy encoded between the cache and its named pages leaves the
 /// record empty: the two then hold the same bytes. A fill of them that copies nothing leaves it
 /// whole, the cache's bytes unknown against the pages'.
+///
+/// A staged copy out whose bytes take more pieces than [`ROUND_PIECES`] circulates that many
+/// where `rounds_on`, the transfer queue and the rounds' own, are given ([`Rounds`]): `cb` holds
+/// its first round, a command buffer of its own on the transfer queue its second, which the
+/// caller commits after `cb`, and the copy keeps each later round's parts for the host to
+/// commit on the rounds' queue. Where the platform makes no event, command buffer or encoder
+/// for the second round, it takes a piece for each piece's length as any other copy does.
 fn copy<P: Platform>(
     device: &P::Device,
     cb: &P::CommandBuffer,
@@ -8761,6 +9116,7 @@ fn copy<P: Platform>(
     (way, block): (Way, u64),
     counts: &mut CacheCounts,
     (timed, spares, reserve): (Option<&Now>, &Arc<Spares<P>>, &mut Vec<Piece<P>>),
+    rounds_on: Option<(&P::CommandQueue, &P::CommandQueue)>,
 ) -> RaiseResult<Option<Staging<P>>> {
     if way == Way::In && cache.pages.is_some() {
         cache.changed = Changed::All;
@@ -8840,12 +9196,28 @@ fn copy<P: Platform>(
             )),
             _ => None,
         };
+        // A copy out longer than the pieces it circulates takes those alone ([`Rounds`]).
+        let mut rounds = match (rounds_on, &packed, &cache.pages, way) {
+            (Some(queues), Some(packed), Some(CachePages::Copied(_)), Way::Out)
+                if packed.lens.len() > ROUND_PIECES =>
+            {
+                rounds::<P>(device, queues)?
+            }
+            _ => None,
+        };
         let mut pieces = match &packed {
             Some(packed) => {
-                spares.pieces_from(device, reserve, &packed.lens, (first, true), timed)?
+                let lens = match &rounds {
+                    Some(_) => circulated(&packed.lens),
+                    None => packed.lens.clone(),
+                };
+                spares.pieces_from(device, reserve, &lens, (first, true), timed)?
             }
             None => None,
         };
+        if pieces.is_none() {
+            end_rounds::<P>(rounds.take())?;
+        }
         if let Some(CachePages::Copied(copied)) = &cache.pages
             && let Some(packed) = &packed
             && let Some(pieces) = pieces.take()
@@ -8858,11 +9230,46 @@ fn copy<P: Platform>(
             }
             // The GPU's copy moves each place's bytes the cache holds between its piece and the
             // cache, the CPU's the surface's between it and the pages; a copy out's CPU copy
-            // takes the texels of those bytes.
+            // takes the texels of those bytes. A circulating copy's round `k` goes into piece
+            // `k % ROUND_PIECES`: its second on the second round's command buffer, each later
+            // one kept for its own.
+            let mut later = vec![Vec::new(); packed.lens.len().saturating_sub(ROUND_PIECES)];
             for place in &packed.places {
                 let parts = cache.moves([(place.bytes.clone(), place.at)]);
-                between::<P>(&blit, (&cache.device, &*pieces[place.piece]), &parts, way)?;
+                match (&rounds, place.piece) {
+                    (Some(_), round) if round >= ROUND_PIECES => {
+                        later[round - ROUND_PIECES].extend(parts);
+                    }
+                    (Some((_, _, _, second)), 1) => {
+                        between::<P>(second, (&cache.device, &*pieces[1]), &parts, way)?;
+                    }
+                    _ => {
+                        let piece = &*pieces[place.piece];
+                        between::<P>(&blit, (&cache.device, piece), &parts, way)?;
+                    }
+                }
             }
+            // The rounds past the last whose piece holds bytes it moves make no command buffer: a
+            // copy that moves fewer bytes than its pieces were laid for ends with that round.
+            while later.last().is_some_and(Vec::is_empty) {
+                later.pop();
+            }
+            let rounds = match rounds.take() {
+                Some((own, queue, second, encoder)) => {
+                    encoder.encode(ON, BlitCmd::EndEncoding)?;
+                    second.encode_signal(Some(EventRef::Shared(&own)), ROUNDS_BEGUN)?;
+                    Some(Rounds {
+                        second: Some(second),
+                        count: later.len() + ROUND_PIECES,
+                        later,
+                        queue,
+                        own,
+                        cache: cache.device.clone_ref(),
+                        signal: None,
+                    })
+                }
+                None => None,
+            };
             let into = out.map(|(cpu, _)| (Arc::clone(copied), placed(&cpu, &packed.places)));
             moved = true;
             cache.staged = true;
@@ -8884,6 +9291,7 @@ fn copy<P: Platform>(
                 pieces,
                 into,
                 timed,
+                rounds,
             });
         }
         // Pieces as a staged copy's, unzeroed: the CPU copy writes each of their bytes, the
@@ -8928,8 +9336,10 @@ fn copy<P: Platform>(
                 pieces,
                 into: None,
                 timed: None,
+                rounds: None,
             });
         }
+        end_rounds::<P>(rounds)?;
     }
     blit.encode(ON, BlitCmd::EndEncoding)?;
     if moved && cache.pages.is_some() {
@@ -10960,8 +11370,8 @@ pub(super) mod tests {
     }
 
     /// The transfer queue is made with the first command queue, once, and unshared: a present of
-    /// a surface waits for its fill. The read-back queue is made with it, plain. The fills make no
-    /// queue
+    /// a surface waits for its fill. The read-back queue is made with it, plain, and the queue of
+    /// the long copies' later rounds, unshared. The fills make no queue
     #[test]
     fn the_transfer_queue_is_made_unshared_with_the_first_queue() {
         use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
@@ -10972,8 +11382,8 @@ pub(super) mod tests {
         );
         assert_eq!(
             (unshared, plain),
-            (1, 3),
-            "made with queue 1, beside queues 1 and 2 and the read-back queue"
+            (2, 3),
+            "made with queue 1, beside queues 1 and 2 and the read-back queue, with the rounds' queue"
         );
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
@@ -14627,11 +15037,85 @@ pub(super) mod tests {
     }
 
     /// Completes every command buffer in flight, then waits until the staged copies out of the
-    /// caches they completed have landed in their pages ([`INTO_PAGES_THREADS`]).
+    /// caches they completed have landed in their pages ([`INTO_PAGES_THREADS`]); again while
+    /// those landings commit more, the later rounds of a copy that circulates its pieces
+    /// ([`Rounds`]).
     pub(crate) fn complete_staged(r: &Rig) {
-        r.p.world().complete_all(CompleteOn::Caller);
         let lands_out = r.dec.caches().lands_out();
-        lands_out.flush();
+        for _ in 0..1000 {
+            r.p.world().complete_all(CompleteOn::Caller);
+            lands_out.flush();
+            if r.p.world().committed().is_empty() {
+                return;
+            }
+        }
+        panic!("the staged copies' landings go on committing");
+    }
+
+    /// Completes the command buffer `id`, as the GPU ends it, with no wait for what its handlers
+    /// hand the caches' own threads.
+    fn complete_one(r: &Rig, id: reims_vgpu_vulkan::core::platform::ObjId) {
+        use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+        let status = CommandBufferStatus::COMPLETED;
+        assert!(
+            (r.p.world()).complete(id, status, None, CompleteOn::Caller),
+            "{id:?} in flight"
+        );
+    }
+
+    /// Completes the command buffer `id`, one round of a staged copy out that circulates its
+    /// pieces ([`Rounds`]), then waits until the bytes it moved have landed in their pages
+    /// ([`INTO_PAGES_THREADS`]) and the round its landing commits, if any, is committed.
+    pub(crate) fn complete_round(r: &Rig, id: reims_vgpu_vulkan::core::platform::ObjId) {
+        complete_one(r, id);
+        r.dec.caches().lands_out().flush();
+    }
+
+    /// The value the fake's event of id `id` holds, a plain or a shared one.
+    fn event_now(r: &Rig, id: reims_vgpu_vulkan::core::platform::ObjId) -> u64 {
+        use reims_vgpu_vulkan::core::testkit::objects::event_value;
+        let event = r.p.world().find(id).expect("a live event");
+        event_value(event.obj())
+    }
+
+    /// The (event, value) waits that command buffer `cb` encodes, of `calls`.
+    fn waits_of(
+        calls: &[Call],
+        cb: reims_vgpu_vulkan::core::platform::ObjId,
+    ) -> Vec<(reims_vgpu_vulkan::core::platform::ObjId, u64)> {
+        (calls.iter())
+            .filter(|c| c.obj == cb && c.sel == WAIT)
+            .map(|c| {
+                (
+                    c.args[0].as_obj().expect("an event"),
+                    c.args[1].as_u64().expect("a value"),
+                )
+            })
+            .collect()
+    }
+
+    /// The (event, value) signals that command buffer `cb` encodes, of `calls`.
+    fn signals_of(
+        calls: &[Call],
+        cb: reims_vgpu_vulkan::core::platform::ObjId,
+    ) -> Vec<(reims_vgpu_vulkan::core::platform::ObjId, u64)> {
+        (calls.iter())
+            .filter(|c| c.obj == cb && c.sel == SIGNAL)
+            .map(|c| {
+                (
+                    c.args[0].as_obj().expect("an event"),
+                    c.args[1].as_u64().expect("a value"),
+                )
+            })
+            .collect()
+    }
+
+    /// The values the host set the fake's event of id `event` to, of `calls`.
+    fn sets_of(calls: &[Call], event: reims_vgpu_vulkan::core::platform::ObjId) -> Vec<u64> {
+        (calls.iter())
+            .filter(|c| c.obj == event && c.sel == "setSignaledValue:")
+            .map(|c| c.args[0].as_u64().expect("a value"))
+            .collect()
     }
 
     /// `BLOCK_RELEASE` of the block at `block`, and whether it was answered.
@@ -16392,8 +16876,10 @@ pub(super) mod tests {
     /// of a piece's length at most ([`pack`]), none of the surface's: a fill's CPU copy writes
     /// each piece's share of the pages, and its GPU copy moves each piece into its own bytes of
     /// the cache; a download moves each piece's share back into its own bytes of the pages. The
-    /// spares keep two pieces of the fill's three for the download, which makes the third; each
-    /// piece is counted, and each make, the fill's as the cache's first staged copy's
+    /// spares keep two pieces of the fill's three, which the download, longer than they hold,
+    /// circulates, its third share in the first's piece once the first's bytes are in the pages
+    /// ([`Rounds`]), making none; each piece is counted, and each make, the fill's as the cache's
+    /// first staged copy's
     #[test]
     fn a_staged_copy_longer_than_a_piece_lays_its_bytes_in_pieces() {
         let mut r = rig(8);
@@ -16462,22 +16948,26 @@ pub(super) mod tests {
             (out.iter())
                 .map(|&(from, at, _, into, size)| (from, at, into, size))
                 .collect::<Vec<_>>(),
-            [
-                (cache, 0, 0, piece),
-                (cache, piece, 0, piece),
-                (cache, 2 * piece, 0, page)
-            ],
-            "each of the cache's shares into its own piece"
+            [(cache, 0, 0, piece), (cache, piece, 0, piece)],
+            "the first two rounds' shares of the cache, each into its piece"
         );
         assert_eq!(
             (calls.iter()).filter(|c| c.sel == SCRATCH_BUFFER).count(),
-            1,
-            "two spares of the fill's, and one made"
+            0,
+            "the two spares of the fill's, circulated: none made"
         );
-        for (k, &(_, _, id, ..)) in out.iter().enumerate() {
-            buffer_bytes(&r, id, Some(0xa0 + k as u8));
+        // The third round is committed once the first's bytes are in the pages, into its piece.
+        let mut k = 0;
+        while let Some(&round) = r.p.world().committed().first() {
+            let out = copies_at(&r.p.call_log().since(mark));
+            let (_, _, id, at, size) = out[k];
+            fill_buffer(&r, id, at..at + size, 0xa0 + k as u8);
+            complete_round(&r, round);
+            k += 1;
         }
-        complete_staged(&r);
+        assert_eq!(k, 3, "a command buffer a round");
+        let out = copies_at(&r.p.call_log().since(mark));
+        assert_eq!(out[2].2, out[0].2, "the third share in the first's piece");
         assert!(done.load(Ordering::SeqCst));
         let pages = ram_bytes(&r, 1, length, None);
         for (at, &b) in pages.iter().enumerate() {
@@ -16487,15 +16977,428 @@ pub(super) mod tests {
         let after = codes.map(counted);
         assert_eq!(
             [0, 1, 2, 3].map(|i| after[i] - before[i]),
-            [6, 2, 3, 1],
-            "six pieces taken, two of them spares; three made for the first copy, one after"
+            [5, 2, 3, 0],
+            "five pieces taken, two of them spares; three made for the first copy, none after"
         );
+    }
+
+    /// Where the caches' copies are staged, a download whose bytes take more pieces than the
+    /// caches keep circulates the two kept ones ([`Rounds`]) and makes no piece: round `k`, a
+    /// piece's length of the cache's bytes, goes into piece `k % 2`. The first two rounds are
+    /// committed with the download, the second signalling the copy's own event at
+    /// [`ROUNDS_BEGUN`], and neither the transfer event; each later round is committed only once
+    /// the round before it in its piece has completed and its bytes are in the pages, and waits
+    /// on the GPU for the first two. The pages then hold the cache's bytes, each in its own
+    /// place, the host sets the copy's event to [`ROUNDS_DRAINED`] once, after the last round's
+    /// bytes are in them, the download is answered then, and both kept pieces are idle again
+    #[test]
+    fn a_download_longer_than_the_kept_pieces_circulates_them_and_makes_none() {
+        let mut r = rig(16);
+        r.dec.set_staged_surface_copies();
+        let page = r.page;
+        let piece = 2 * page;
+        r.dec.surface_caches.set_staging_piece(piece);
+        queues(&mut r);
+        // Nine pages: four whole pieces and a page, five rounds.
+        let length = 9 * page;
+        ram_pattern(&r, 1, length);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 9)], length, true),
+            RGFX_STATUS_OK
+        );
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            r.dec.caches().spares.held(),
+            (vec![piece, piece], 2),
+            "the fill's first two pieces kept, idle"
+        );
+        let cache = cache_id(&r);
+        let codes = [
+            PIECES_TAKEN,
+            PIECES_SPARED,
+            PIECE_MAKES[0].0,
+            PIECE_MAKES[1].0,
+        ];
+        let before = codes.map(counted);
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(scratch_made(&calls), Vec::<u64>::new(), "no piece made");
+        let first = r.p.world().committed();
+        assert_eq!(
+            first.len(),
+            2,
+            "the first two rounds, committed with the download"
+        );
+        assert_eq!(signals_of(&calls, first[0]), [], "round 0 signals nothing");
+        let own = match signals_of(&calls, first[1])[..] {
+            [(own, ROUNDS_BEGUN)] => own,
+            ref other => panic!("round 1 signals the copy's own event alone: {other:?}"),
+        };
+
+        // Each round's GPU copy, then its completion: its bytes move into the pages, and only
+        // then is the round after it in its piece committed.
+        let cached: Vec<u8> = (0..length).map(|at| (at * 7 % 253) as u8 ^ 0x5a).collect();
+        let share = |k: u64| (k * piece, piece.min(length - k * piece));
+        let lands_out = r.dec.caches().lands_out();
+        let mut into = Vec::new();
+        for k in 0..5u64 {
+            let calls = r.p.call_log().since(mark);
+            let out = copies_at(&calls);
+            assert_eq!(
+                out.len().to_u64(),
+                (k + 2).min(5),
+                "round {k}: two rounds ahead"
+            );
+            let (from, id, at, size) = (
+                out[k.to_usize()].1,
+                out[k.to_usize()].2,
+                out[k.to_usize()].3,
+                out[k.to_usize()].4,
+            );
+            assert_eq!(
+                (out[k.to_usize()].0, from, at, size),
+                (cache, share(k).0, 0, share(k).1),
+                "round {k}: its share of the cache into its piece"
+            );
+            into.push(id);
+            write_buffer(
+                &r,
+                id,
+                at,
+                &cached[from.to_usize()..(from + size).to_usize()],
+            );
+            let flight = r.p.world().committed();
+            let round = flight[0];
+            if k >= 2 {
+                assert_eq!(
+                    waits_of(&calls, round),
+                    [(own, ROUNDS_BEGUN)],
+                    "round {k}: after the first two"
+                );
+                assert_eq!(signals_of(&calls, round), [], "round {k} signals nothing");
+            }
+            assert!(!done.load(Ordering::SeqCst), "round {k}: not answered yet");
+            let moved = |r: &Rig| {
+                ram_bytes(r, 1, length, None)[from.to_usize()..(from + size).to_usize()]
+                    == cached[from.to_usize()..(from + size).to_usize()]
+            };
+            lands_out.hold();
+            let at_end = r.p.call_log().mark();
+            complete_one(&r, round);
+            assert_eq!(
+                r.p.world().committed(),
+                flight[1..],
+                "round {k}: nothing committed before its bytes are in the pages"
+            );
+            assert!(!moved(&r), "round {k}: its bytes not moved yet");
+            lands_out.release();
+            lands_out.flush();
+            assert!(moved(&r), "round {k}: its bytes in the pages");
+            let wants = flight.len() - 1 + usize::from(k + 2 < 5);
+            assert_eq!(
+                r.p.world().committed().len(),
+                wants,
+                "round {k}: the round after it in its piece committed once it moved out"
+            );
+            let sets = sets_of(&r.p.call_log().since(at_end), own);
+            let drained: &[u64] = if k == 4 { &[ROUNDS_DRAINED] } else { &[] };
+            assert_eq!(
+                sets, drained,
+                "round {k}: the copy's event set after the last alone"
+            );
+        }
+        assert_ne!(into[0], into[1], "two pieces");
+        for (k, &id) in into.iter().enumerate() {
+            assert_eq!(id, into[k % 2], "round {k} in piece {}", k % 2);
+        }
+        assert!(
+            done.load(Ordering::SeqCst),
+            "answered once the last round landed"
+        );
+        assert!(
+            ram_bytes(&r, 1, length, None) == cached,
+            "the pages hold the cache's bytes, each in its place"
+        );
+        assert_eq!(event_now(&r, own), ROUNDS_DRAINED);
+        assert_eq!(
+            r.dec.caches().spares.held(),
+            (vec![piece, piece], 2),
+            "both kept pieces idle again"
+        );
+        let after = codes.map(counted);
+        assert_eq!(
+            [0, 1, 2, 3].map(|i| after[i] - before[i]),
+            [2, 2, 0, 0],
+            "two pieces taken, both kept ones; none made"
+        );
+    }
+
+    /// A rig as [`a_download_longer_than_the_kept_pieces_circulates_them_and_makes_none`]'s: the
+    /// caches' copies staged in pieces of two pages, its block at [`BLOCK`] nine pages of a
+    /// surface from page 1, filled and written by a command buffer of queue 1, all completed, the
+    /// fill's first two pieces kept; and a block of one page at page 12, `BLOCK + 0x10000`, its
+    /// cache filled alike.
+    fn circulating() -> Rig {
+        let mut r = rig(16);
+        r.dec.set_staged_surface_copies();
+        let page = r.page;
+        r.dec.surface_caches.set_staging_piece(2 * page);
+        queues(&mut r);
+        ram_pattern(&r, 1, 9 * page);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 9)], 9 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_cached(BLOCK + 0x10000, &[(12, 1)], page, true),
+            RGFX_STATUS_OK
+        );
+        use_surfaces(
+            &mut r,
+            1,
+            0x100,
+            &[(BLOCK, 0, true), (BLOCK + 0x10000, 0, false)],
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        r
+    }
+
+    /// The command buffers committed since `before`, the ones in flight then.
+    fn new_since(
+        r: &Rig,
+        before: &[reims_vgpu_vulkan::core::platform::ObjId],
+    ) -> Vec<reims_vgpu_vulkan::core::platform::ObjId> {
+        (r.p.world().committed().into_iter())
+            .filter(|cb| !before.contains(cb))
+            .collect()
+    }
+
+    /// Where a download circulates its pieces ([`Rounds`]), the uses of its cache asked while it
+    /// is in flight come after it on the GPU, its later rounds being on a queue of their own: a
+    /// fill of the cache on the transfer queue, a command buffer that writes it, and a download
+    /// of that write each wait for the copy's own event at [`ROUNDS_DRAINED`], which the host
+    /// sets only once the last round's bytes are in the pages, so a writer sees the whole
+    /// download; the second download's bytes then land over the first's. A fill of another
+    /// surface asked meanwhile waits for nothing of the download's, and is committed between its
+    /// rounds
+    #[test]
+    fn the_uses_of_a_circulating_downloads_cache_come_after_it_and_others_go_between() {
+        let mut r = circulating();
+        let page = r.page;
+        let length = 9 * page;
+        let other = BLOCK + 0x10000;
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let rounds = r.p.world().committed();
+        assert_eq!(rounds.len(), 2);
+        let own = signals_of(&r.p.call_log().since(mark), rounds[1])[0].0;
+        // Held, as the second download's copy takes the cache's place for its own.
+        let held = r.p.world().find(own).expect("the copy's event");
+        let own_now = || reims_vgpu_vulkan::core::testkit::objects::event_value(held.obj());
+
+        // A fill of the other surface: committed now, waiting for nothing of the download's.
+        let flight = r.p.world().committed();
+        use_surfaces(&mut r, 1, 0x101, &[(other, 1, false)]);
+        let other_fill = new_since(&r, &flight);
+        let calls = r.p.call_log().since(mark);
+        assert!(
+            !other_fill.is_empty(),
+            "the other surface's fill committed during the download"
+        );
+        for &cb in &other_fill {
+            assert!(
+                waits_of(&calls, cb).iter().all(|&(event, _)| event != own),
+                "the other surface's fill waits for nothing of the download's"
+            );
+        }
+        // A fill of the download's cache, a writer of it, and a download of that write.
+        let flight = r.p.world().committed();
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 1, false)]);
+        let fill = new_since(&r, &flight);
+        let flight = r.p.world().committed();
+        use_surfaces(&mut r, 2, 0x103, &[(BLOCK, 1, true)]);
+        let writer = new_since(&r, &flight);
+        let flight = r.p.world().committed();
+        let again = download(&r, BLOCK);
+        let second = new_since(&r, &flight);
+        let calls = r.p.call_log().since(mark);
+        for (what, cbs) in [
+            ("the fill", &fill),
+            ("the writer", &writer),
+            ("the download", &second),
+        ] {
+            assert!(
+                cbs.iter()
+                    .any(|&cb| waits_of(&calls, cb).contains(&(own, ROUNDS_DRAINED))),
+                "{what} waits for the first download's last round's bytes"
+            );
+        }
+
+        // The first download's rounds, as the GPU ends them, into the kept pair: the other
+        // surface's fill goes between them; the copy's event reaches ROUNDS_DRAINED once the
+        // pages hold them all.
+        let cache = cache_id(&r);
+        let outs = |r: &Rig| -> Vec<(u64, u64, u64, u64, u64)> {
+            (copies_at(&r.p.call_log().since(mark)).into_iter())
+                .filter(|&(source, ..)| source == cache)
+                .collect()
+        };
+        let pair = [outs(&r)[0].2, outs(&r)[1].2];
+        let cached: Vec<u8> = (0..length).map(|at| (at * 7 % 253) as u8 ^ 0x5a).collect();
+        let mut ours = rounds.clone();
+        let mut k = 0usize;
+        while let Some(&round) = ours.first() {
+            let mine: Vec<_> = (outs(&r).into_iter())
+                .filter(|&(_, _, id, ..)| pair.contains(&id))
+                .collect();
+            let (_, from, id, at, size) = mine[k];
+            write_buffer(
+                &r,
+                id,
+                at,
+                &cached[from.to_usize()..(from + size).to_usize()],
+            );
+            assert!(
+                own_now() < ROUNDS_DRAINED,
+                "round {k}: the uses after it still wait"
+            );
+            let flight = r.p.world().committed();
+            complete_round(&r, round);
+            ours.remove(0);
+            ours.extend(new_since(&r, &flight));
+            if k == 0 {
+                let committed = r.p.world().committed();
+                let at = |cb| committed.iter().position(|&c| c == cb);
+                assert!(
+                    other_fill.iter().all(|&cb| at(cb) < at(ours[1])),
+                    "the other surface's fill committed before the third round"
+                );
+            }
+            k += 1;
+        }
+        assert_eq!(k, 5);
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(own_now(), ROUNDS_DRAINED, "the uses after it go on");
+        assert!(
+            ram_bytes(&r, 1, length, None) == cached,
+            "a writer after it sees the whole download"
+        );
+        // The rest in commit order, the second download's rounds in pieces of its own.
+        let from_second: Vec<u8> = (0..length).map(|at| (at * 3 % 241) as u8 ^ 0xa5).collect();
+        let mut written = 0;
+        for _ in 0..1000 {
+            let Some(&cb) = r.p.world().committed().first() else {
+                break;
+            };
+            let theirs: Vec<_> = (outs(&r).into_iter())
+                .filter(|&(_, _, id, ..)| !pair.contains(&id))
+                .collect();
+            for &(_, from, id, at, size) in &theirs[written..] {
+                write_buffer(
+                    &r,
+                    id,
+                    at,
+                    &from_second[from.to_usize()..(from + size).to_usize()],
+                );
+            }
+            written = theirs.len();
+            complete_round(&r, cb);
+        }
+        assert!(again.load(Ordering::SeqCst), "the second download answered");
+        assert!(
+            ram_bytes(&r, 1, length, None) == from_second,
+            "the second download's bytes over the first's"
+        );
+    }
+
+    /// Where the platform makes no event, no command buffer or no encoder for a download's
+    /// second round, the download circulates no piece: it takes a piece for each piece's length,
+    /// the two kept ones and three made, on one command buffer that signals the transfer event,
+    /// and its pages then hold the cache's bytes, each in its own place
+    #[test]
+    fn a_download_whose_rounds_the_platform_makes_not_takes_a_piece_for_each() {
+        use reims_vgpu_vulkan::core::testkit::script::Step;
+        for (sel, skip) in [
+            ("newSharedEvent", 0),
+            ("commandBuffer", 1),
+            ("blitCommandEncoder", 1),
+        ] {
+            let r = circulating();
+            let page = r.page;
+            let length = 9 * page;
+            let cache = cache_id(&r);
+            r.p.script().after(sel, skip, Step::Nil);
+            let mark = r.p.call_log().mark();
+            let done = download(&r, BLOCK);
+            let calls = r.p.call_log().since(mark);
+            assert_eq!(
+                scratch_made(&calls),
+                [
+                    2 * page,
+                    2 * page,
+                    page.next_multiple_of(PIECE_GRANULE).min(2 * page)
+                ],
+                "{sel}: the three pieces the kept two lack"
+            );
+            let flight = r.p.world().committed();
+            assert_eq!(flight.len(), 1, "{sel}: one command buffer");
+            let signals = signals_of(&calls, flight[0]);
+            assert_eq!(
+                signals.len(),
+                1,
+                "{sel}: it signals the transfer event: {signals:?}"
+            );
+            let cached: Vec<u8> = (0..length).map(|at| (at * 5 % 239) as u8 ^ 0x3c).collect();
+            let out = copies_at(&calls);
+            assert_eq!(out.len(), 5, "{sel}: a copy a piece");
+            for &(source, from, id, at, size) in &out {
+                assert_eq!(source, cache);
+                write_buffer(
+                    &r,
+                    id,
+                    at,
+                    &cached[from.to_usize()..(from + size).to_usize()],
+                );
+            }
+            complete_staged(&r);
+            assert!(done.load(Ordering::SeqCst), "{sel}: answered");
+            assert!(
+                ram_bytes(&r, 1, length, None) == cached,
+                "{sel}: the pages hold the cache's bytes, each in its place"
+            );
+            assert_eq!(
+                r.dec.caches().spares.held(),
+                (vec![2 * page, 2 * page], 2),
+                "{sel}: both kept pieces idle again"
+            );
+        }
+    }
+
+    /// Writes `bytes` over the Shared buffer of id `id` from its byte `at`, as a GPU copy into it
+    /// would.
+    fn write_buffer(r: &Rig, id: u64, at: u64, bytes: &[u8]) {
+        use reims_vgpu_vulkan::core::platform::ObjId;
+        use reims_vgpu_vulkan::core::testkit::objects::kind;
+        let buffer = (r.p.world().find(ObjId(id)))
+            .and_then(|o| o.cast::<kind::Buffer>())
+            .expect("a live buffer");
+        assert!(at + bytes.len().to_u64() <= buffer.length() && !buffer.contents().is_null());
+        // SAFETY: a live Shared buffer's bytes from `at`, inside its length, which no work of the
+        // test's uses now.
+        unsafe {
+            let into = buffer.contents().as_ptr::<u8>().add(at.to_usize());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), into, bytes.len());
+        }
     }
 
     /// Where the caches' copies are staged, a download whose copy the spares serve in part takes
     /// the spares that serve it into its block's reserve before it lets go of the caches' lock to
     /// make the piece they lack: the make takes no spare counted for the copy, which then finds
-    /// each of its pieces reserved, and makes none under the lock ([`PIECE_MAKES_LOCKED`])
+    /// each of its pieces reserved, and makes none under the lock ([`PIECE_MAKES_LOCKED`]). A
+    /// copy longer than the kept pieces reserves the two it circulates ([`Rounds`])
     #[test]
     fn a_reservation_holds_the_spares_it_counts_while_it_makes_the_rest() {
         let mut r = rig(8);
@@ -16511,23 +17414,28 @@ pub(super) mod tests {
         );
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
         r.p.world().complete_all(CompleteOn::Caller);
-        // The fill's first two pieces are the kept ones; the download's copy takes three.
+        // The fill's first two pieces are the kept ones; one is held aside, as a copy in flight
+        // holds it, and the download's copy, of three pieces' bytes, circulates two.
         assert_eq!(
             r.dec.caches().spares.held(),
             (vec![piece, piece], 2),
             "the fill's pieces kept"
         );
+        let aside = (r.dec.caches().spares.take(piece)).expect("an idle kept piece");
         let locked = counted(PIECE_MAKES_LOCKED);
         let mark = r.p.call_log().mark();
         let done = download(&r, BLOCK);
         let calls = r.p.call_log().since(mark);
-        let last = page.next_multiple_of(PIECE_GRANULE).min(piece);
         assert_eq!(
             scratch_made(&calls),
-            vec![last],
-            "the one piece the kept ones lack"
+            vec![piece],
+            "the one piece the idle kept one lacks"
         );
-        assert_eq!(copies_at(&calls).len(), 3, "the download's copy, at once");
+        assert_eq!(
+            copies_at(&calls).len(),
+            2,
+            "the download's first two rounds, at once"
+        );
         assert_eq!(
             counted(PIECE_MAKES_LOCKED),
             locked,
@@ -16535,6 +17443,7 @@ pub(super) mod tests {
         );
         complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
+        give_back(vec![aside]);
     }
 
     /// Where the caches' copies are staged, a download of a cache laid out at the GPU's pitch
@@ -16570,6 +17479,32 @@ pub(super) mod tests {
 
         let mark = r.p.call_log().mark();
         let done = download(&r, BLOCK);
+        // Each round's GPU copy, then its completion, which commits the round after it in its
+        // piece: each copy's round the piece of the packed bytes that holds it.
+        let round = [0, 0, 1, 1, 2];
+        let mut k = 0;
+        while let Some(&cb) = r.p.world().committed().first() {
+            let out = copies_at(&r.p.call_log().since(mark));
+            if k == 0 {
+                assert_eq!(
+                    out.len(),
+                    4,
+                    "the first two rounds' copies, at once: {out:?}"
+                );
+                for &(_, _, id, ..) in &out {
+                    buffer_bytes(&r, id, Some(0xee));
+                }
+            }
+            for (&(_, _, into, at, size), _) in out.iter().zip(round).filter(|&(_, of)| of == k) {
+                fill_buffer(&r, into, at..at + size, 0xc0 + k as u8);
+            }
+            complete_round(&r, cb);
+            k += 1;
+        }
+        assert_eq!(
+            k, 3,
+            "a command buffer a round, none past the last that moves bytes"
+        );
         let out = copies_at(&r.p.call_log().since(mark));
         let mut pieces: Vec<u64> = Vec::new();
         for &(_, _, id, ..) in &out {
@@ -16579,30 +17514,23 @@ pub(super) mod tests {
         }
         assert_eq!(
             pieces.len(),
-            3,
-            "the rows lie in the first three pieces: {out:?}"
+            2,
+            "the rows lie in the first three rounds, which circulate two pieces: {out:?}"
         );
         let piece = |id| pieces.iter().position(|&p| p == id).unwrap();
         assert_eq!(
-            (out.iter())
-                .map(|&(_, from, id, at, size)| (piece(id), from, at, size))
+            (out.iter().zip(round))
+                .map(|(&(_, from, id, at, size), round)| (round, piece(id), from, at, size))
                 .collect::<Vec<_>>(),
             [
-                (0, 0, 0, 704),
-                (0, 768, 800, 224),
-                (1, 992, 0, 480),
-                (1, 1536, 576, 448),
-                (2, 1984, 0, 256),
+                (0, 0, 0, 0, 704),
+                (0, 0, 768, 800, 224),
+                (1, 1, 992, 0, 480),
+                (1, 1, 1536, 576, 448),
+                (2, 0, 1984, 0, 256),
             ],
-            "each row from the GPU's pitch to its bytes of the piece that holds them"
+            "each row from the GPU's pitch to its bytes of its round's piece"
         );
-        for &id in &pieces {
-            buffer_bytes(&r, id, Some(0xee));
-        }
-        for &(_, _, id, at, size) in &out {
-            fill_buffer(&r, id, at..at + size, 0xc0 + piece(id) as u8);
-        }
-        complete_staged(&r);
         assert!(done.load(Ordering::SeqCst));
         let after = ram_bytes(&r, 1, page, None);
         for (at, (&now, &was)) in after.iter().zip(&before).enumerate() {

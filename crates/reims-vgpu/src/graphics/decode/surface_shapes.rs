@@ -367,9 +367,9 @@ mod tests {
     use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::super::surface_cache::tests::{
-        NO_REACH, blit_with, blits_with, buffer_bytes, cache_id, cached, complete_staged, copies,
-        download, encoder_with, queues, ram_bytes, reading, release, surface_texture,
-        surface_texture_as, surface_textures, use_surfaces,
+        NO_REACH, blit_with, blits_with, buffer_bytes, cache_id, cached, complete_round,
+        complete_staged, copies, download, encoder_with, queues, ram_bytes, reading, release,
+        surface_texture, surface_texture_as, surface_textures, use_surfaces,
     };
     use super::super::surface_pages::tests::{BLOCK, Rig, one_plane, rig};
     use super::*;
@@ -1266,6 +1266,74 @@ mod tests {
         assert_eq!(copies(&calls).len(), 1, "the buffer into the pages");
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(downloaded.load(Ordering::SeqCst));
+    }
+
+    /// Where the caches' copies are staged, a fill of a shape asked while a download of its
+    /// cache circulates its pieces (`surface_cache`'s `Rounds`) waits on the GPU for the copy's
+    /// own event at its last round's drain, which the host sets only once the pages hold every
+    /// round, so the shapes' writes the fill takes back into the cache first reach none of the
+    /// download's rounds; the download is answered as its last round lands
+    #[test]
+    fn a_shapes_fill_asked_while_a_download_circulates_waits_for_its_last_round() {
+        const WAIT: &str = "encodeWaitForEvent:value:";
+        const SIGNAL: &str = "encodeSignalEvent:value:";
+        // The value of the copy's own event once its last round's bytes are in the pages.
+        const DRAINED: u64 = 2;
+        // As `shaped_staged`, in pieces of half a page; a blit over the cache's buffer makes the
+        // download whole, four pieces' length.
+        let mut r = rig(8);
+        r.dec.set_staged_surface_copies();
+        let page = r.page;
+        r.dec.surface_caches.set_staging_piece(page / 2);
+        take_shapes(&r);
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        let cache = cache_id(&r);
+        writable_at(&mut r, 25, 0);
+        write(&mut r, 0x100, 25, (32, 8));
+        complete_staged(&r);
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let rounds = r.p.world().committed();
+        assert_eq!(rounds.len(), 2, "the download's first two rounds");
+        // A shape of its own, not texture 25's, which owes its fill.
+        let image = texture_image(&mut r, 21, 80, (16, 4));
+        let own = (r.p.call_log().since(mark).iter())
+            .find(|c| c.obj == rounds[1] && c.sel == SIGNAL)
+            .and_then(|c| c.args[0].as_obj())
+            .expect("the copy's own event");
+        let held = r.p.world().find(own).expect("the copy's event");
+        let own_now = || reims_vgpu_vulkan::core::testkit::objects::event_value(held.obj());
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 2, 0x101, &[(BLOCK, 0, false)]);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(fills(&calls), [(cache, 0, image)], "the shape's fill");
+        assert!(
+            (calls.iter()).any(|c| c.sel == WAIT
+                && c.args[0].as_obj() == Some(own)
+                && c.args[1].as_u64() == Some(DRAINED)),
+            "the fill waits for the download's last round"
+        );
+        let mut ended = 0;
+        while let Some(&cb) = r.p.world().committed().first() {
+            assert!(own_now() < DRAINED, "the fill still waits");
+            complete_round(&r, cb);
+            ended += 1;
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        assert!(ended > 2, "the download's rounds");
+        assert_eq!(own_now(), DRAINED, "set once the last round landed");
+        complete_staged(&r);
+        assert!(done.load(Ordering::SeqCst));
     }
 
     /// A new shape's fill asked while a command buffer that uses the cache is begun and not

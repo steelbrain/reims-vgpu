@@ -7985,9 +7985,10 @@ mod tests {
     /// A queue create whose tail holds `RGFX_QUEUE_UNSHARED` makes the platform's unshared queue,
     /// and one without it (no tail, a tail of none, or of other flags) the plain `newCommandQueue`,
     /// each stored under its id, and then its surface timeline and its device caches' end event,
-    /// the first queue's followed by the caches' transfer queue, unshared, and its event, and their
-    /// read-back queue, plain, and its end event. A queue the platform makes nothing of, either
-    /// way, is refused, and stores and makes nothing more.
+    /// the first queue's followed by the caches' transfer queue, unshared, and its event, their
+    /// read-back queue, plain, the queue of their long copies' later rounds, unshared, and the
+    /// read-back's end event. A queue the platform makes nothing of, either way, is refused, and
+    /// stores and makes nothing more.
     #[test]
     fn an_unshared_queue_create_makes_the_platforms_unshared_queue() {
         use reims_vgpu_graphics::wire::{
@@ -8040,7 +8041,13 @@ mod tests {
 
         let unshared = Some(RGFX_QUEUE_UNSHARED);
         let mut first = made(UNSHARED_QUEUE);
-        first.extend([UNSHARED_QUEUE, "newEvent", "newCommandQueue", "newEvent"]);
+        first.extend([
+            UNSHARED_QUEUE,
+            "newEvent",
+            "newCommandQueue",
+            UNSHARED_QUEUE,
+            "newEvent",
+        ]);
         assert_eq!(decode(&mut dec, &create(1, unshared)), (Ok(()), first));
         let both = Some(RGFX_QUEUE_UNSHARED | RGFX_QUEUE_QUIET_SCHEDULED);
         assert_eq!(
