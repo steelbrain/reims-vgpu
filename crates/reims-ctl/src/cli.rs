@@ -1108,7 +1108,7 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             match (&c.gpu.name, &c.gpu.driver_file) {
                 (Some(n), _) => n.clone(),
                 (None, Some(f)) => paths::tilde(f),
-                _ => "automatic: the only GPU, or the fastest of several".into(),
+                _ => "automatic: the only GPU, or a discrete one before an integrated one".into(),
             },
         );
     }
@@ -1368,7 +1368,7 @@ fn gpus(host: Host) {
         None => return println!("{}", crate::host::UNSUPPORTED),
         Some(p) if !p.gpu_choice(host) => {
             return println!(
-                "A VM runs on this Mac's GPU, through MoltenVK: there is none to choose"
+                "A VM runs on this Mac's GPU, through Mesa's KosmicKrisp: there is none to choose"
             );
         }
         Some(_) => {}
@@ -1381,8 +1381,8 @@ fn gpus(host: Host) {
         return;
     }
     println!(
-        "By default the library takes the only GPU, or the one of several that runs a short workload \
-         fastest, timed once for each set of GPUs and drivers."
+        "By default a VM gets the only GPU, or, of several, a discrete GPU before an integrated \
+         one."
     );
     for (i, g) in list.iter().enumerate() {
         println!(

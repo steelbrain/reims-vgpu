@@ -1,18 +1,19 @@
 //! The host's GPUs a VM can be given.
 //!
-//! On Linux and Windows the library runs on Vulkan. Of the host's GPUs it opens the only one, or,
-//! of several, the one that ran a short workload fastest, timed once for each set of GPUs and
-//! drivers (reims-vgpu-vulkan's `device_choice`), unless the host's user picked one. The list
-//! comes from asking each driver's manifest (an ICD JSON file) in a child process (`reims-ctl
-//! __vulkan-probe`), so a driver that hangs or crashes costs only that one. The manifests are
-//! the loader's: on Linux in its search paths, on Windows in the registry ([`icd_files`]).
+//! On Linux and Windows the library runs on Vulkan. Of the host's GPUs it opens the one the host's
+//! user picked, else the only one, else the first in the runtime's order of kinds, discrete
+//! before integrated; it times none (reims-vgpu-vulkan's `device_choice`, `chosen_untimed`). The
+//! list comes from asking each driver's manifest (an ICD JSON file) in a child process
+//! (`reims-ctl __vulkan-probe`), so a driver that hangs or crashes costs only that one. The
+//! manifests are the loader's: on Linux in its search paths, on Windows in the registry
+//! ([`icd_files`]).
 //!
 //! **A VM's GPU.** A GPU picked from the list is named by its vendor and device IDs, in
 //! `MESA_VK_DEVICE_SELECT` and `VK_LOADER_DEVICE_SELECT` ([`crate::vm::Gpu::select`]): both list
-//! that GPU first without hiding the others, and the library opens the first. Every driver still
-//! loads, so the library also sees the GPU the desktop composites the window on, and where that
-//! is another GPU it presents the window from a device of its own there, instead of sending every
-//! frame across from the pick. Mesa's device-select layer reads the first; it sorts the GPUs after
+//! that GPU first without hiding the others, and the library opens the one they name. Its window
+//! presents from that GPU, the process's one device, wherever the desktop composites it: where
+//! that is another GPU, each frame crosses to it through the window system (reims-vgpu's
+//! `graphics/rt_window.rs`). Mesa's device-select layer reads the first; it sorts the GPUs after
 //! the loader does and puts its own default first, so the loader's variable alone leaves that
 //! default first. The loader reads the second, on a host without the layer. **Measured** on a host
 //! with an RTX 3090 and a Radeon 780M (loader 1.4.363, Mesa 26.2.6's layer, 2026-11-14): the

@@ -208,7 +208,7 @@ impl Profile {
     }
 
     /// Whether a Vulkan GPU can be chosen: the library runs on the host's Vulkan GPUs on Linux
-    /// and Windows, and on a Mac on MoltenVK, over the Mac's one GPU.
+    /// and Windows, and on a Mac on Mesa's KosmicKrisp, over the Mac's one GPU.
     pub fn gpu_choice(self, host: Host) -> bool {
         matches!(host.os, Os::Linux | Os::Windows)
     }
