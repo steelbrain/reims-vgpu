@@ -415,26 +415,24 @@ fn on_vulkan_a_cold_device_takes_no_guest_texture_id() {
     );
 }
 
-/// The variable naming the guest architecture of [`the_guest_s_class_decides_the_answers`]'s
-/// child, `x86_64` or `arm64`.
+/// The variable naming the guest architecture of [`a_new_private_texture_reads_zero`]'s child,
+/// `x86_64` or `arm64`.
 const GUEST_CLASS_CHILD: &str = "RVG_GUEST_CLASS_CHILD";
 
-/// The guest's class decides the answers whatever the host GPU: a new `Private` 64 by 64
-/// `RGBA8Unorm` render target, blitted into a buffer before anything writes it, reads Metal's
-/// fixed pattern for the arm64 guest, opaque magenta in every texel, as an Apple M3 Max reads it;
-/// for the x86-64 guest it reads zero on every host GPU, as the Intel UHD 630 and the AMD Radeon
-/// Pro 5300M read zero, so it never shows the earlier bytes of its memory. Each architecture runs
-/// in a child process of its own, in which the graphics device is the process's first
+/// A new `Private` 64 by 64 `RGBA8Unorm` render target, blitted into a buffer before anything
+/// writes it, reads zero for every guest on every host GPU, so it never shows the earlier bytes of
+/// its memory: rt takes no guest architecture, and what such a texture reads before its first
+/// write is undocumented Metal. (The Intel UHD 630 and the AMD Radeon Pro 5300M read zero; an
+/// Apple M3 Max reads opaque magenta in every texel.) Each architecture runs in a child process of
+/// its own, in which the graphics device is the process's first
 #[test]
-#[ignore = "rt is told no guest class: every guest's new Private texture reads the same, so one \
-            of the two answers differs"]
-fn on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu() {
-    the_guest_s_class_decides_the_answers();
+fn on_vulkan_a_new_private_texture_reads_zero_for_every_guest() {
+    a_new_private_texture_reads_zero();
 }
 
-/// [`on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu`]: in the child, the
-/// device and the texture of [`GUEST_CLASS_CHILD`]'s architecture; else a child for each.
-fn the_guest_s_class_decides_the_answers() {
+/// [`on_vulkan_a_new_private_texture_reads_zero_for_every_guest`]: in the child, the device and
+/// the texture of [`GUEST_CLASS_CHILD`]'s architecture; else a child for each.
+fn a_new_private_texture_reads_zero() {
     use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
@@ -447,7 +445,7 @@ fn the_guest_s_class_decides_the_answers() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "graphics::tests::on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu",
+                    "graphics::tests::on_vulkan_a_new_private_texture_reads_zero_for_every_guest",
                     "--nocapture",
                     "--test-threads=1",
                 ])
@@ -523,23 +521,13 @@ fn the_guest_s_class_decides_the_answers() {
     let read = unsafe {
         std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length as usize).to_vec()
     };
-    match guest {
-        GuestArch::Arm64 => {
-            assert!(
-                read.chunks(4).all(|t| t == [0xff, 0x00, 0xff, 0xff]),
-                "{guest:?} on {name}: a new texture reads Metal's pattern: {:02x?}",
-                &read[..16]
-            );
-        }
-        // Whatever the host GPU: a new Private texture never shows its memory's earlier bytes.
-        GuestArch::X86_64 => {
-            assert!(
-                read.iter().all(|&b| b == 0),
-                "{guest:?} on {name}: a new texture reads zero: {:02x?}",
-                &read[..16]
-            );
-        }
-    }
+    // Whatever the guest and the host GPU: a new Private texture never shows its memory's
+    // earlier bytes.
+    assert!(
+        read.iter().all(|&b| b == 0),
+        "{guest:?} on {name}: a new texture reads zero: {:02x?}",
+        &read[..16]
+    );
     println!("GUEST-CLASS {arch}: {guest:?} on {name}");
 }
 
