@@ -2659,7 +2659,15 @@ mod tests {
         let over = || {
             let id = NEXT.fetch_add(1, Relaxed);
             let image = 0x4000 | (1 << 63);
-            Made::of(id, image, Call::OverBuffer, false, &shape, (0, 0), (None, None))
+            Made::of(
+                id,
+                image,
+                Call::OverBuffer,
+                false,
+                &shape,
+                (0, 0),
+                (None, None),
+            )
         };
         assert_eq!(over().shared_with(&over()), "one buffer");
         let (s, t) = (Made::new(Call::View, &shape), Made::new(Call::View, &shape));
@@ -2709,7 +2717,9 @@ mod tests {
     /// not.
     #[test]
     fn refusals_count_by_kind() {
-        use metal2vulkan::error::{DiagName, Error as Translator, Feature, LowerFamily, Unsupported};
+        use metal2vulkan::error::{
+            DiagName, Error as Translator, Feature, LowerFamily, Unsupported,
+        };
         refusal(&rt::Error::Unsupported(rt::Gap::Draw {
             kind: rt::DrawKind::AttachmentRead,
         }));
@@ -2725,7 +2735,9 @@ mod tests {
         let translator = |u: Unsupported| rt::Error::Translation(Translator::Unsupported(u));
         let lowering = Unsupported::not_implemented(Feature::Lowering(LowerFamily::Texture));
         refusal(&translator(lowering.naming(DiagName::new("a_function"))));
-        refusal(&translator(Unsupported::not_implemented(Feature::Imageblocks)));
+        refusal(&translator(Unsupported::not_implemented(
+            Feature::Imageblocks,
+        )));
         refusal(&rt::Error::Translation(Translator::Cancelled));
         refusal(&rt::Error::Quiesced);
         let gaps = GAPS.lock();
