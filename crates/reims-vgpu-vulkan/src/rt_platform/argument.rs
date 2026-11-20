@@ -290,8 +290,9 @@ mod tests {
 
     /// A function's argument buffer answers the layout its translation reads, the one Metal's
     /// compiler gave it: `sum_args`' two pointers at 0 and 8, 16 bytes aligned to 8 (as Metal's
-    /// encoder answers it); `mixed_args`' array of pointers, constant, texture and pointer to a
-    /// nested argument buffer, which carries its own layout. Its plain buffer at index 1 has none,
+    /// encoder answers it); `mixed_args`' `metal::array` of two pointers, which the compiler
+    /// gives as a struct taking two indices, its constant, its texture and its pointer to a nested
+    /// argument buffer, each nested layout with its holder. Its plain buffer at index 1 has none,
     /// which Metal refuses
     #[test]
     fn a_function_s_argument_buffer_answers_the_layout_its_translation_reads() {
@@ -322,13 +323,20 @@ mod tests {
         };
         let mut nested = member(4, 1, 32, 8, K::Buffer);
         nested.layout = Some(Box::new(inner));
+        let mut array = member(0, 1, 0, 16, K::Struct);
+        array.ids_per_element = 2;
+        array.layout = Some(Box::new(ArgumentLayout {
+            encoded_length: 16,
+            alignment: 1,
+            members: vec![member(0, 2, 0, 8, K::Buffer)],
+        }));
         assert_eq!(
             function_layout(&function("mixed_args"), 0),
             Some(ArgumentLayout {
                 encoded_length: 40,
                 alignment: 8,
                 members: vec![
-                    member(0, 2, 0, 8, K::Buffer),
+                    array,
                     member(2, 1, 16, 4, K::Constant),
                     member(3, 1, 24, 8, K::Texture),
                     nested,

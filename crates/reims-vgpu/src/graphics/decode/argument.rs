@@ -774,9 +774,10 @@ mod tests {
     }
 
     /// On the Vulkan platform, every kind a kernel reads through an argument buffer lands where
-    /// the guest writes it: `mixed_args`' layout answers an array of two pointers at 0, a constant
-    /// at 16, a texture at 24 and a pointer at 32 to a nested argument buffer (layout 1: a pointer
-    /// at 0, a constant at 8), and the kernel reads each word the guest writes there: the buffers'
+    /// the guest writes it: `mixed_args`' layout answers its `metal::array` of two pointers at 0
+    /// as a struct taking two indices (layout 1: the two pointers, 8 bytes apart), a constant at
+    /// 16, a texture at 24 and a pointer at 32 to a nested argument buffer (layout 2: a pointer at
+    /// 0, a constant at 8), and the kernel reads each word the guest writes there: the buffers'
     /// addresses, the constant, the texture's resource ID, and the nested buffer's address and
     /// words
     #[test]
@@ -801,21 +802,27 @@ mod tests {
             (Some(9), RGFX_STATUS_OK)
         );
         let (head, layouts, members) = answer(&region, reply);
-        assert_eq!((head.layout_count, head.member_count), (2, 6));
+        assert_eq!((head.layout_count, head.member_count), (3, 7));
         assert_eq!((layouts[0].encoded_length, layouts[0].alignment), (40, 8));
-        assert_eq!((layouts[1].encoded_length, layouts[1].alignment), (16, 8));
+        assert_eq!((layouts[1].encoded_length, layouts[1].alignment), (16, 1));
+        assert_eq!((layouts[2].encoded_length, layouts[2].alignment), (16, 8));
         let none = RGFX_ARGUMENT_NO_LAYOUT;
         assert_eq!(
             members_of(&layouts, &members, 0),
             [
-                (0, 2, 0, 8, 8, RGFX_ARGUMENT_BUFFER, none),
+                (0, 1, 0, 16, 16, RGFX_ARGUMENT_STRUCT, 1),
                 (2, 1, 16, 4, 4, RGFX_ARGUMENT_CONSTANT, none),
                 (3, 1, 24, 8, 8, RGFX_ARGUMENT_TEXTURE, none),
-                (4, 1, 32, 8, 8, RGFX_ARGUMENT_BUFFER, 1),
+                (4, 1, 32, 8, 8, RGFX_ARGUMENT_BUFFER, 2),
             ]
         );
+        assert_eq!(members[0].ids_per_element, 2);
         assert_eq!(
             members_of(&layouts, &members, 1),
+            [(0, 2, 0, 8, 8, RGFX_ARGUMENT_BUFFER, none)]
+        );
+        assert_eq!(
+            members_of(&layouts, &members, 2),
             [
                 (0, 1, 0, 8, 8, RGFX_ARGUMENT_BUFFER, none),
                 (1, 1, 8, 4, 4, RGFX_ARGUMENT_CONSTANT, none),
@@ -846,16 +853,18 @@ mod tests {
                 0,
             )
             .unwrap();
-        let inner = words(&device, layouts[1].encoded_length as usize / 4, |_| 0);
-        let nested = members_of(&layouts, &members, 1);
+        let inner = words(&device, layouts[2].encoded_length as usize / 4, |_| 0);
+        let nested = members_of(&layouts, &members, 2);
         put(&inner, nested[0].2, c.gpu_address().as_bytes());
         put(&inner, nested[1].2, 5u32.as_bytes());
         let args = words(&device, layouts[0].encoded_length as usize / 4, |_| 0);
         let outer = members_of(&layouts, &members, 0);
-        put(&args, outer[0].2, a.gpu_address().as_bytes());
+        // The array's two pointers: the struct's one element, its member's elements 0 and 1.
+        let ptrs = members_of(&layouts, &members, 1)[0];
+        put(&args, outer[0].2 + ptrs.2, a.gpu_address().as_bytes());
         put(
             &args,
-            outer[0].2 + outer[0].3,
+            outer[0].2 + ptrs.2 + ptrs.3,
             (b.gpu_address() + 256).as_bytes(),
         );
         put(&args, outer[1].2, 3u32.as_bytes());
