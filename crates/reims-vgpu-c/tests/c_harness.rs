@@ -85,36 +85,58 @@ fn harness(name: &str) -> Harness {
     }
 }
 
-/// The Vulkan files the rt platform loads on macOS, under Homebrew's prefix: the loader, and
-/// Mesa's KosmicKrisp, each through its formula's `opt` directory, the files `make vulkan-links`
-/// links for QEMU.
+/// The Vulkan files the rt platform loads on macOS: the loader, and Mesa's KosmicKrisp, each as
+/// its file's name and the path under Homebrew's prefix of its formula's `opt` directory, the
+/// files `make vulkan-links` links for QEMU.
 #[cfg(target_os = "macos")]
-const VULKAN_FILES: [&str; 2] = [
-    "opt/vulkan-loader/lib/libvulkan.1.dylib",
-    "opt/mesa/lib/libvulkan_kosmickrisp.dylib",
+const VULKAN_FILES: [(&str, &str); 2] = [
+    (
+        "libvulkan.1.dylib",
+        "opt/vulkan-loader/lib/libvulkan.1.dylib",
+    ),
+    (
+        "libvulkan_kosmickrisp.dylib",
+        "opt/mesa/lib/libvulkan_kosmickrisp.dylib",
+    ),
 ];
 
 /// Links [`VULKAN_FILES`] into `dir`, beside the harness: the rt platform loads each only from
 /// beside the process's executable or from `../lib` from it (reims-vgpu-vulkan's
-/// `os/macos/rt_driver.rs`), as a QEMU install has them in its `lib`. Returns each file Homebrew
-/// lacks, or Homebrew itself where `brew --prefix` answers none.
+/// `os/macos/rt_driver.rs`), as a QEMU install has them in its `lib`. Each comes from where the
+/// same lookup finds it for this test's own executable, so the harness runs on the files the
+/// library's other tests run on, else from Homebrew. Returns each file found in neither place.
 #[cfg(target_os = "macos")]
 fn link_vulkan(dir: &Path) -> Vec<String> {
-    let prefix = match Command::new("brew").arg("--prefix").output() {
-        Ok(out) if out.status.success() => {
-            PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-        }
-        _ => return vec!["Homebrew (`brew --prefix` answered none)".to_owned()],
-    };
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let prefix = Command::new("brew")
+        .arg("--prefix")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
     let mut missing = Vec::new();
-    for file in VULKAN_FILES {
-        let from = prefix.join(file);
-        if from.is_file() {
-            let at = dir.join(from.file_name().unwrap());
-            std::os::unix::fs::symlink(&from, &at)
-                .unwrap_or_else(|e| panic!("{}: {e}", at.display()));
-        } else {
-            missing.push(from.display().to_string());
+    for (name, under_brew) in VULKAN_FILES {
+        let beside = exe_dir
+            .iter()
+            .flat_map(|d| [d.join(name), d.join("../lib").join(name)]);
+        let brew = prefix.iter().map(|p| p.join(under_brew));
+        let candidates: Vec<PathBuf> = beside.chain(brew).collect();
+        match candidates.iter().find(|from| from.is_file()) {
+            Some(from) => {
+                let at = dir.join(name);
+                std::os::unix::fs::symlink(from, &at)
+                    .unwrap_or_else(|e| panic!("{}: {e}", at.display()));
+            }
+            None => missing.push(format!(
+                "{name} (looked in {})",
+                candidates
+                    .iter()
+                    .map(|c| c.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
         }
     }
     missing
