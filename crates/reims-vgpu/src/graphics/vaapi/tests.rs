@@ -551,7 +551,7 @@ fn a_copy_after_the_devices_recovery_is_the_cpus_copy_byte_for_byte() {
 /// dma-bufs passed for it ([`exported_dma_buf_reads`]), and is a shadow elsewhere (on an RX 550's
 /// RADV, whose check made no such image), reading as the CPU's copy either way. The planes lie as
 /// CoreVideo lays a frame's in the guest's caches, 32 bytes into their pages, the first on 256
-/// bytes of the cache's memory, so the chroma plane lies past a gap (`docs/video/bugs.md`, U28).
+/// bytes of the cache's memory, so the chroma plane lies past a gap (`docs/video/bugs.md`, U29).
 /// A stream the decoder refuses is left at its refusal. Where the driver's check refuses H.264
 /// into NV12 targets the arm decodes into no cache, and the test says so and ends.
 #[test]

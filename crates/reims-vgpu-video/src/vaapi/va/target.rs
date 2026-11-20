@@ -23,7 +23,7 @@
 //!   Imported as tall as [`declared_rows`] says, the luma plane declared over the gap and over
 //!   the chroma plane's first rows, every sample was written and no byte outside the planes'
 //!   rows changed; an import whose declared planes run past the dma-buf is refused. Its video
-//!   processing writes the same surfaces at their offsets (docs/video/bugs.md, U28).
+//!   processing writes the same surfaces at their offsets (docs/video/bugs.md, U29).
 //! - **The references.** VA names a picture's references by their render targets. A driver that
 //!   reads a reference from its target's memory would read whatever the caller wrote there since,
 //!   so a caller hands targets only to a driver its check found keeping its references apart
