@@ -27,7 +27,7 @@ use metal2vulkan_runtime as rt;
 pub use clock::LinuxClock;
 pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 #[cfg(feature = "rt")]
-pub(crate) use device_lend::{MappingsHeld, hold_mappings, through_dma_bufs};
+pub(crate) use device_lend::{MappingsHeld, dma_bufs_of_host, hold_mappings, through_dma_bufs};
 pub use lease::{GuestMemoryLease, lease_guest_memory};
 pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFill, PlaneFormat};
 pub use threads::LinuxThreads;

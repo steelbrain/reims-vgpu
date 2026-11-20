@@ -82,11 +82,12 @@ pub use host_os::{
 #[cfg(target_os = "linux")]
 pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 /// Whether some of a range's pages lie in a view mapped through a dma-buf, which no kernel pin
-/// takes, as the rt platform asks before it hands rt their pointer, and the hold that keeps a
-/// range's pages as they are mapped while rt may take them by it, on Linux
+/// takes, as the rt platform asks before it hands rt their pointer, the hold that keeps a range's
+/// pages as they are mapped while rt may take them by it, and dma-bufs of a range's pages cut for
+/// rt to bind behind one buffer where one dma-buf does not hold them, on Linux
 /// (`os/linux/device_lend.rs`).
 #[cfg(all(target_os = "linux", feature = "rt"))]
-pub(crate) use host_os::{MappingsHeld, hold_mappings, through_dma_bufs};
+pub(crate) use host_os::{MappingsHeld, dma_bufs_of_host, hold_mappings, through_dma_bufs};
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
 /// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, of a

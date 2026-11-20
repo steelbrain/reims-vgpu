@@ -70,21 +70,55 @@ pub fn dma_buf_of_host(
     let size = pages.iter().map(|&(_, length)| length).sum();
     match dma_buf::of_ranges(&pages) {
         Ok(fd) => Ok(LentDmaBuf { fd, size, offsets }),
-        Err(
-            refusal @ Refusal::Limit {
-                pieces,
-                bytes,
-                limits,
-                ..
-            },
-        ) => Err(LendRefusal::TooLarge {
+        Err(refusal) => Err(lend_refusal(refusal)),
+    }
+}
+
+/// Dma-bufs of the whole pages of the `length` bytes from `first`, memory the library mapped from
+/// files or the host registered, in their order, for a device that binds several dma-bufs behind
+/// one buffer, as rt's `import_dma_bufs` does, where one dma-buf does not hold them
+/// ([`dma_buf_of_host`]'s [`LendRefusal::TooLarge`]): each dma-buf with its length, the pages cut
+/// where one dma-buf's runs or bytes end, at multiples of `granule` from the first, and the last
+/// padded to a multiple of `granule` with zeroed memory of its own, which no other mapping shows
+/// ([`super::dma_buf::of_pages`]). One dma-buf of the pages' own length where one holds them now.
+/// Refused as [`dma_buf_of_host`] is: too large only where a granule of the pages is more runs or
+/// bytes than one dma-buf holds.
+///
+/// The caller keeps the `length` bytes from `first` mapped for the call.
+#[cfg(any(test, feature = "rt"))]
+pub(crate) fn dma_bufs_of_host(
+    first: NonNull<u8>,
+    length: u64,
+    granule: u64,
+) -> Result<Vec<(OwnedFd, u64)>, LendRefusal> {
+    let (start, end) = whole_pages(first, length);
+    let chunks = dma_buf::of_pages(start, end - start, granule).map_err(lend_refusal)?;
+    let fds = chunks.into_iter().map(|chunk| {
+        // Each chunk's file is its own, made for it: no other handle of it is held.
+        let fd = std::sync::Arc::try_unwrap(chunk.file).or_else(|file| file.try_clone());
+        let fd = fd.map_err(|e| LendRefusal::Refused(format!("a dma-buf not taken: {e}")))?;
+        Ok((fd, chunk.length))
+    });
+    fds.collect()
+}
+
+/// udmabuf's `refusal` of a dma-buf of host memory, as a device outside the runtime is given it:
+/// too large where its limits refused it, with them named.
+fn lend_refusal(refusal: Refusal) -> LendRefusal {
+    match refusal {
+        refusal @ Refusal::Limit {
+            pieces,
+            bytes,
+            limits,
+            ..
+        } => LendRefusal::TooLarge {
             pieces,
             bytes,
             most_pieces: limits.pieces,
             most_bytes: limits.bytes,
             why: refusal.to_string(),
-        }),
-        Err(refusal) => Err(LendRefusal::Refused(refusal.to_string())),
+        },
+        refusal => LendRefusal::Refused(refusal.to_string()),
     }
 }
 

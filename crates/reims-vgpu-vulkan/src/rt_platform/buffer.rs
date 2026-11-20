@@ -75,8 +75,13 @@
 //! the bytes are the same pages the CPU's mapping reaches. One holds as many runs of file pages as
 //! udmabuf's `list_limit` takes, and as many bytes as its `size_limit_mb`: at the stock limit of
 //! 1,024 runs about 4 MiB of a guest buffer, whose pages are nearly each a run of their own
-//! (`crate::os::linux::device_lend`'s measured note). Pages past either are imported as a copy
-//! ("A copy at the refusal point"), counted as too large with their runs and bytes
+//! (`crate::os::linux::device_lend`'s measured note). Pages past either go as several dma-bufs,
+//! cut where one's limits end at multiples of rt's granule and the last padded with zeroed memory
+//! of its own (`crate::os`'s `dma_bufs_of_host`), which rt binds behind one buffer, its addresses
+//! running across them as over one range (rt's `import_dma_bufs`), counted
+//! ([`IMPORTS_DMA_BUFS`]). Where rt binds none so on the device (no granule: Mesa's Intel driver), the host makes none, or
+//! rt refuses them, counted ([`IMPORTS_DMA_BUFS_REFUSED`]), the pages are imported as a copy ("A
+//! copy at the refusal point"), counted as too large with their runs and bytes
 //! ([`IMPORTS_TOO_LARGE`], `super::diag::import_path`); so are pages with no file behind them. rt
 //! answers no `contents` for a dma-buf's block: until it takes the mapping, the device keeps the
 //! host address of the pages the dma-buf holds for it ([`KnownBlocks`]), which a buffer in the
@@ -96,23 +101,23 @@
 //! (the Vulkan platform's runtime records the same of the 615 driver, its
 //! `UnpinnablePagesBreakHostMemory`). Pages a byte of which lies in such a mapping
 //! (`crate::os`'s `through_dma_bufs`) are imported as a dma-buf of the files behind them first,
-//! as above; where the host makes none (past udmabuf's limits) or rt refuses it, they are mapped
-//! from their files (`crate::os`'s `map_for_pointer`) and imported by their pointer, counted
-//! ([`IMPORTS_FROM_FILES`]), and each as why no dma-buf was imported too: too large for one, with
-//! their runs ([`IMPORTS_FROM_FILES_TOO_LARGE`], `super::diag`'s import paths), refused by rt
-//! ([`IMPORTS_FROM_FILES_DMA_BUF_REFUSED`]), or none made by the host
+//! or as several past one's limits, as above; where the host makes none or rt refuses them, they
+//! are mapped from their files (`crate::os`'s `map_for_pointer`) and imported by their pointer,
+//! counted ([`IMPORTS_FROM_FILES`]), and each as why no dma-buf was imported too: too large for
+//! one, with their runs ([`IMPORTS_FROM_FILES_TOO_LARGE`], `super::diag`'s import paths), refused
+//! by rt ([`IMPORTS_FROM_FILES_DMA_BUF_REFUSED`]), or none made by the host
 //! ([`IMPORTS_FROM_FILES_NO_DMA_BUF`]), the process's first of each with a line saying why, rt's
 //! refusal named; where they cannot all be mapped so (near the views' budget), or rt refuses that
 //! pointer, they are imported as a copy, with no pointer of theirs asked of rt while a page of
-//! them lies in a dma-buf's mapping. Pages
-//! in no dma-buf's mapping go by their pointer first. From before an import asks where its pages
+//! them lies in a dma-buf's mapping. Pages in no dma-buf's mapping go by their pointer first. From before an import asks where its pages
 //! lie until rt frees an import of their pointer, the platform holds their mappings as they are
 //! (`crate::os`'s `MappingsHeld`), so no fold of the views maps them through dma-bufs under it
 //! (`vm`'s docs, "Folding back").
 //!
-//! **A copy at the refusal point.** Pages that rt imports neither by their pointer nor as a
-//! dma-buf of their files (on Linux past one dma-buf's limits, with no file behind them, near the
-//! views' budget, or refused by the driver; elsewhere wherever rt refuses their pointer) are
+//! **A copy at the refusal point.** Pages that rt imports neither by their pointer nor as
+//! dma-bufs of their files (on Linux past one dma-buf's limits where no several are imported, with
+//! no file behind them, near the views' budget, or refused by the driver; elsewhere wherever rt
+//! refuses their pointer) are
 //! imported as a copy (`super::copied`), as rt refused nothing: memory of the platform's own that
 //! holds their bytes, which rt imports by its pointer. A buffer in the copy's block answers the
 //! pages as its `contents`, and a pinned buffer over the pages is a range of the block, as over a
@@ -216,6 +221,20 @@ pub const IMPORTS_POINTER: &str = "rt-imports-pointer";
 /// GPU taking no pointer to them (the module's docs, "Dma-bufs of the pages"), counted per import.
 pub const IMPORTS_DMA_BUF: &str = "rt-imports-dma-buf";
 
+/// The code of an import of the host's memory made as several dma-bufs of the files behind its
+/// pages bound behind one buffer (rt's `import_dma_bufs`), its pages more runs of file pages, or
+/// more bytes, than one dma-buf holds (the module's docs, "Dma-bufs of the pages"), counted per
+/// import, each counted as [`IMPORTS_DMA_BUF`] too.
+pub const IMPORTS_DMA_BUFS: &str = "rt-imports-dma-bufs";
+
+/// The code of an import of the host's memory whose pages are more runs of file pages, or more
+/// bytes, than one dma-buf holds, and of which no several dma-bufs were imported: rt binds none
+/// behind one buffer on the device (no granule), the host made none, or rt refused them (the
+/// module's docs, "Dma-bufs of the pages"), counted per import asked, the process's first of each
+/// with a line naming why. Each goes on as one dma-buf's too large ([`IMPORTS_TOO_LARGE`],
+/// [`IMPORTS_FROM_FILES_TOO_LARGE`]).
+pub const IMPORTS_DMA_BUFS_REFUSED: &str = "rt-imports-dma-bufs-refused";
+
 /// The code of an import of the host's memory made by its pointer once the pages of a view mapped
 /// through dma-bufs, of which no dma-buf was imported, were mapped from their files (the module's
 /// docs, "Pages no pin takes"), counted per import, each counted as [`IMPORTS_POINTER`] too.
@@ -240,7 +259,8 @@ pub const IMPORTS_FROM_FILES_DMA_BUF_REFUSED: &str = "rt-imports-from-files-dma-
 pub const IMPORTS_FROM_FILES_NO_DMA_BUF: &str = "rt-imports-from-files-no-dma-buf";
 
 /// The code of an import of the host's memory whose pages are more runs of file pages, or more
-/// bytes, than one dma-buf holds, the GPU taking no pointer to them (the module's docs, "Dma-bufs
+/// bytes, than one dma-buf holds, of which no several dma-bufs were imported
+/// ([`IMPORTS_DMA_BUFS_REFUSED`]), the GPU taking no pointer to them (the module's docs, "Dma-bufs
 /// of the pages"), made as a copy where one is ([`IMPORTS_COPIED`]), counted per import asked.
 pub const IMPORTS_TOO_LARGE: &str = "rt-imports-too-large";
 
@@ -1204,7 +1224,7 @@ fn unpinnable(
     held: Held,
 ) -> Option<(rt::Block, u64)> {
     let kind = codes.made;
-    let no = match dma_buf(device, (at, len), released_into(codes, then)) {
+    let no = match dma_buf(device, sel, (at, len), released_into(codes, then)) {
         Ok(made) => {
             dma_buf_made(sel, kind, len, &UNPINNABLE);
             return Some(made);
@@ -1320,8 +1340,9 @@ fn released_into(codes: crate::answer::MadeCodes, then: &Then) -> Released {
 /// dma-buf of the files behind them, where rt refused their pointer with `error` (the module's
 /// docs, "Dma-bufs of the pages"), for a make of `codes`, rt's release of it running `then`: the
 /// block, and the offset of the pages' first byte in it, whose host address the device keeps for
-/// the block ([`HostMappings`]) until rt frees it. Past what one dma-buf holds, with no file behind
-/// them, or where rt refuses the dma-buf, as a copy ([`refused`]). `None` where the pages are
+/// the block ([`HostMappings`]) until rt frees it; past what one dma-buf holds, as several
+/// ([`dma_bufs`]). Where none of those is imported, with no file behind them, or where rt refuses
+/// the dma-buf, as a copy ([`refused`]). `None` where the pages are
 /// refused, counted: as rt's last refusal of them.
 #[cfg(target_os = "linux")]
 fn by_dma_buf(
@@ -1336,7 +1357,7 @@ fn by_dma_buf(
     if matches!(error, rt::Error::Quiesced) {
         return import_refused(sel, kind, len, error);
     }
-    match dma_buf(device, (at, len), released_into(codes, then)) {
+    match dma_buf(device, sel, (at, len), released_into(codes, then)) {
         Ok(made) => {
             dma_buf_made(sel, kind, len, error);
             Some(made)
@@ -1407,12 +1428,15 @@ impl DmaBufNo {
 }
 
 /// rt's import of a dma-buf of the files behind `pages`, the `len` bytes of whole pages at their
-/// address, rt's release of it from `release`, uncounted: the block, and the offset of the pages'
-/// first byte in it, whose host address the device keeps for the block ([`HostMappings`]) until
-/// rt frees it; else why none was imported, `release` dropped unrun.
+/// address, for `sel`, rt's release of it from `release`, uncounted: the block, and the offset of
+/// the pages' first byte in it, whose host address the device keeps for the block
+/// ([`HostMappings`]) until rt frees it; else why none was imported, `release` dropped unrun.
+/// Pages more than one dma-buf holds go as several bound behind one buffer ([`dma_bufs`]),
+/// counted there.
 #[cfg(target_os = "linux")]
 fn dma_buf(
     device: &RtObj<RtDevice>,
+    sel: &'static str,
     (at, len): (NonNull<u8>, u64),
     release: Released,
 ) -> Result<(rt::Block, u64), DmaBufNo> {
@@ -1435,7 +1459,8 @@ fn dma_buf(
                 most_pieces,
                 most_bytes,
             };
-            return Err(DmaBufNo::TooLarge { path, bytes });
+            let too_large = DmaBufNo::TooLarge { path, bytes };
+            return dma_bufs(device, sel, (at, len), release, too_large);
         }
         Err(LendRefusal::Refused(_)) => return Err(DmaBufNo::Refused),
     };
@@ -1465,6 +1490,101 @@ fn dma_buf(
         Err(refusal) => Err(DmaBufNo::Rt(refusal)),
     }
 }
+
+/// [`dma_buf`]'s import of `pages`, the `len` bytes of whole pages at their address, for `sel`,
+/// where one dma-buf does not hold them, as `too_large` says: rt's import of several dma-bufs of
+/// the files behind them, cut at rt's granule and the last padded, bound behind one buffer (rt's
+/// `import_dma_bufs`; the module's docs, "Dma-bufs of the pages"), counted ([`IMPORTS_DMA_BUFS`]),
+/// the process's first with a line; the block, whose host address the device keeps for it from
+/// its first byte ([`HostMappings`]) until rt frees it, and 0. Where rt binds no dma-bufs behind
+/// one buffer on the device, the host makes none, or rt refuses them, counted
+/// ([`IMPORTS_DMA_BUFS_REFUSED`]), and `too_large`; rt's quiescing is rt's refusal. `release`
+/// dropped unrun where none was imported.
+#[cfg(target_os = "linux")]
+fn dma_bufs(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    (at, len): (NonNull<u8>, u64),
+    release: Released,
+    too_large: DmaBufNo,
+) -> Result<(rt::Block, u64), DmaBufNo> {
+    let Some(granule) = device.rt().dma_buf_granule() else {
+        let why = "metal2vulkan-rt binds no dma-bufs behind one buffer here";
+        dma_bufs_refused(sel, 0, &why);
+        return Err(too_large);
+    };
+    let chunks = match crate::os::dma_bufs_of_host(at, len, granule) {
+        Ok(chunks) => chunks,
+        Err(refusal) => {
+            let why = match refusal {
+                crate::os::LendRefusal::TooLarge { why, .. } => why,
+                crate::os::LendRefusal::Refused(why) => why,
+            };
+            dma_bufs_refused(sel, 1, &format_args!("the host made none: {why}"));
+            return Err(too_large);
+        }
+    };
+    let (count, bytes) = (chunks.len(), chunks.iter().map(|&(_, l)| l).sum::<u64>());
+    let mapped = device.known_blocks().mapped.clone();
+    let id = Arc::new(OnceLock::new());
+    let release = release(mapped.clone(), Arc::clone(&id));
+    // Pages one dma-buf holds by now (udmabuf's limits raised since) are that one dma-buf, of their
+    // own length, which rt binds as a plain buffer.
+    let imported = match <[_; 1]>::try_from(chunks) {
+        Ok([(fd, size)]) => device.rt().import_dma_buf(fd, size, Some(release)),
+        Err(chunks) => device.rt().import_dma_bufs(chunks, Some(release)),
+    };
+    match imported {
+        Ok((block, _)) => {
+            let _ = id.set(block.id);
+            let first = at.as_ptr().addr().to_u64();
+            mapped.0.lock().insert(block.id, first);
+            crate::answer::count_kind(IMPORTS_DMA_BUFS);
+            if !DMA_BUFS_SAID.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    target: TARGET,
+                    "{sel}: the pages of a no-copy buffer or heap, more than one dma-buf holds, \
+                     were imported as {count} dma-bufs of {bytes} bytes bound behind one buffer \
+                     ({granule}-byte granule); each such import is counted from here \
+                     ({IMPORTS_DMA_BUFS})"
+                );
+            }
+            Ok((block, 0))
+        }
+        Err(error @ rt::Error::Quiesced) => Err(DmaBufNo::Rt(error)),
+        Err(error) => {
+            let why = format!("metal2vulkan-rt refused {count} of {bytes} bytes: {error}");
+            dma_bufs_refused(sel, 2, &why);
+            Err(too_large)
+        }
+    }
+}
+
+/// Counts an import for `sel` whose pages one dma-buf does not hold, of which no several dma-bufs
+/// were imported ([`IMPORTS_DMA_BUFS_REFUSED`]), for the reason numbered `said` (rt binds none
+/// here, the host made none, rt refused them); the process's first of each logged, `why` in
+/// words.
+#[cfg(target_os = "linux")]
+fn dma_bufs_refused(sel: &'static str, said: usize, why: &dyn std::fmt::Display) {
+    crate::answer::count_kind(IMPORTS_DMA_BUFS_REFUSED);
+    if !DMA_BUFS_REFUSED_SAID[said].swap(true, Ordering::Relaxed) {
+        log::info!(
+            target: TARGET,
+            "{sel}: the pages of a no-copy buffer or heap, more than one dma-buf holds, were not \
+             imported as several dma-bufs ({why}); each such import is counted from here \
+             ({IMPORTS_DMA_BUFS_REFUSED}) and goes on as too large for one"
+        );
+    }
+}
+
+/// Whether the process logged its first import made as several dma-bufs ([`dma_bufs`]).
+#[cfg(target_os = "linux")]
+static DMA_BUFS_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Whether the process logged its first import not made as several dma-bufs ([`dma_bufs`]), for
+/// each reason: rt binds none here, the host made none, rt refused them.
+#[cfg(target_os = "linux")]
+static DMA_BUFS_REFUSED_SAID: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
 
 /// Counts an import of `len` bytes for `sel` made as a dma-buf ([`dma_buf`]), for a make whose
 /// imports are counted as `kind`; the process's first logged, with `why` the pages went so.
@@ -2721,9 +2841,12 @@ mod tests {
 
     /// On Linux, on the GPU the test holds, where the GPU takes no pointer to a no-copy buffer's
     /// pages (`POINTER_REFUSED`, as RADV refuses a memfd's): over pages with no file behind them,
-    /// and over pages in more runs of file pages than one dma-buf takes, the buffer is made over a
-    /// copy of them, counted as refused or too large and as copied, its `contents` the pages, a
-    /// deallocator run once rt freed the copy. Over pages with a file behind them, the buffer is a
+    /// the buffer is made over a copy of them, counted as refused and as copied, its `contents`
+    /// the pages, a deallocator run once rt freed the copy. Over pages in more runs of file pages
+    /// than one dma-buf takes, it is a range of rt's import of several dma-bufs of them, counted,
+    /// where rt binds dma-bufs behind one buffer and imports one of a page; else it is made over a
+    /// copy, counted as too large, as copied and as no several dma-bufs imported. Over pages with
+    /// a file behind them, the buffer is a
     /// range of rt's import of a dma-buf of them, counted, its `contents` its bytes, which the
     /// CPU's writes and a blit's reach both ways; a known import's block holds a no-copy buffer
     /// pinned over its bytes, with no import of its own, and a Managed one over them too, counted,
@@ -2752,9 +2875,11 @@ mod tests {
             IMPORTS_REFUSED,
             IMPORTS_TOO_LARGE,
             IMPORTS_COPIED,
+            IMPORTS_DMA_BUFS,
+            IMPORTS_DMA_BUFS_REFUSED,
         ];
         let counts = || codes.map(counted);
-        let plus = |before: [u64; 5], counted: &[usize]| {
+        let plus = |before: [u64; 7], counted: &[usize]| {
             let mut after = before;
             counted.iter().for_each(|&i| after[i] += 1);
             after
@@ -2787,6 +2912,12 @@ mod tests {
         unsafe { at.as_ptr::<u8>().write_bytes(0x11, 128) };
         let first = NonNull::new(pages.as_ptr::<u8>()).expect("mapped pages");
         let lent = crate::os::dma_buf_of_host(first, page, &[(0, page)]).is_ok();
+        // Whether rt binds dma-bufs behind one buffer here, and imports one of a page.
+        let one = crate::os::dma_buf_of_host(first, page, &[(0, page)]);
+        let imports =
+            |one: crate::os::LentDmaBuf| device.rt().import_dma_buf(one.fd, one.size, None);
+        let takes =
+            device.rt().dma_buf_granule().is_some() && one.is_ok_and(|one| imports(one).is_ok());
 
         // Pages in more runs than one dma-buf takes (udmabuf's `list_limit` as the host has it):
         // a view of every other page of a file. Where it takes more runs than the test makes, or
@@ -2809,9 +2940,15 @@ mod tests {
                 // SAFETY: the view and its pages are the test's own, never freed.
                 let bytes = unsafe { HostRange::new(view, n * page) };
                 let made = device.new_buffer_over_host_memory(on, bytes, 0, None);
-                let copy = made.expect("never a raise").expect("a buffer over a copy");
-                assert_eq!(counts(), plus(before, &[3, 4]));
-                assert_eq!(copy.contents(), view);
+                let buffer = made
+                    .expect("never a raise")
+                    .expect("a buffer over the view");
+                let several = device.known_blocks().is_dma_buf(buffer.rt().block());
+                assert_eq!(several, takes, "several dma-bufs where rt takes them");
+                let made = if takes { &[1, 5][..] } else { &[3, 4, 6] };
+                assert_eq!(counts(), plus(before, made));
+                assert_eq!(buffer.contents(), view);
+                eprintln!("a view of {n} runs: imported as several dma-bufs {several}");
             }
             None => eprintln!("udmabuf takes {limit:?} runs, dma-bufs {lent}: unchecked past it"),
         }
@@ -3034,9 +3171,12 @@ mod tests {
 
     /// On Linux, on the GPU the test holds, a no-copy buffer over a view of more runs of a file's
     /// pages than one dma-buf takes (udmabuf's `list_limit` as the host has it), every other page
-    /// of the file ("Pages no pin takes"): made by the view's pointer, once the view is mapped
-    /// from its files where it lay in dma-bufs' mappings, counted as from its files and too large
-    /// for one dma-buf; else made over a copy, counted as too large and copied. Its `contents` are
+    /// of the file ("Pages no pin takes"): made by the view's pointer where the GPU takes it; else
+    /// as several dma-bufs of the pages where rt takes them, counted, its bytes the pages, which a
+    /// blit reads across every cut and writes across the first; else by the view's pointer once
+    /// the view is mapped from its files where it lay in dma-bufs' mappings, counted as from its
+    /// files, too large for one dma-buf and as no several dma-bufs imported; else made over a
+    /// copy, counted as too large, copied and as no several dma-bufs imported. Its `contents` are
     /// the view, whose last page is the file's last run. Where the host makes no dma-buf, or
     /// udmabuf takes more runs than the test makes, unchecked.
     #[cfg(target_os = "linux")]
@@ -3058,6 +3198,9 @@ mod tests {
             IMPORTS_COPIED,
             IMPORTS_FROM_FILES_DMA_BUF_REFUSED,
             IMPORTS_FROM_FILES_NO_DMA_BUF,
+            IMPORTS_DMA_BUF,
+            IMPORTS_DMA_BUFS,
+            IMPORTS_DMA_BUFS_REFUSED,
         ];
         let counts = || codes.map(counted);
         let one = crate::os::allocate_aliasable(page).expect("a page of a file");
@@ -3072,9 +3215,16 @@ mod tests {
             return;
         };
 
-        // A view of every other page of a file, the last of them 0x44s.
+        // A view of every other page of a file, the last of them 0x44s and each before it the
+        // byte its place in the view gives ([`run_byte`]).
         let ram = crate::os::allocate_aliasable(2 * n * page).expect("pages of a file");
         let last = ram.wrapping_add(2 * (n - 1) * page);
+        let run_byte = |i: u64| (i % 199 + 1).to_le_bytes()[0];
+        for i in 0..n - 1 {
+            let run = ram.wrapping_add(2 * i * page).as_ptr::<u8>();
+            // SAFETY: a fresh page of the test's own, which nothing uses yet.
+            unsafe { run.write_bytes(run_byte(i), page.to_usize()) };
+        }
         // SAFETY: a fresh page of the test's own, which nothing uses yet.
         unsafe { last.as_ptr::<u8>().write_bytes(0x44, page.to_usize()) };
         let runs: Vec<_> = (0..n)
@@ -3094,24 +3244,79 @@ mod tests {
             .expect("never a raise")
             .expect("a buffer over the view");
         let after = counts();
-        let delta: [u64; 8] = std::array::from_fn(|i| after[i] - before[i]);
-        let from_files = delta == [1, 1, 1, 0, 0, 0, 0, 0];
-        let by_pointer = delta == [1, 0, 0, 0, 0, 0, 0, 0];
-        let copied = delta == [0, 0, 0, 1, 0, 1, 0, 0];
+        let delta: [u64; 11] = std::array::from_fn(|i| after[i] - before[i]);
+        let several = delta == [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0];
+        let from_files = delta == [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        let by_pointer = delta == [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let copied = delta == [0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1];
         assert!(
-            (through && from_files) || (!through && by_pointer) || copied,
+            several || (through && from_files) || (!through && by_pointer) || copied,
             "imports {delta:?}, the view through dma-bufs {through}"
         );
+        let block = buffer.rt().block();
+        assert_eq!(device.known_blocks().is_dma_buf(block), several);
         eprintln!(
             "a view of {n} runs, through dma-bufs {through}: imported as {}",
-            match (from_files, by_pointer) {
-                (true, _) => "its pointer, mapped from its files",
-                (_, true) => "its pointer",
+            match (several, from_files, by_pointer) {
+                (true, ..) => "several dma-bufs",
+                (_, true, _) => "its pointer, mapped from its files",
+                (.., true) => "its pointer",
                 _ => "a copy",
             }
         );
         assert_eq!((buffer.contents(), buffer.length()), (view, n * page));
         assert_eq!(read(view.wrapping_add((n - 1) * page), 16), [0x44; 16]);
+        let Some(granule) = device.rt().dma_buf_granule().filter(|_| several) else {
+            return;
+        };
+
+        // A blit reads every page through the dma-bufs, and writes two pages across the first
+        // cut, where the first dma-buf's runs end, which the view then shows.
+        let of = |length| device.new_buffer_of_length(on, length, 0);
+        let of = |length| of(length).expect("never a raise").expect("a buffer");
+        let (out, source) = (of(n * page), of(2 * page));
+        // SAFETY: the Shared buffer's bytes, mapped while it lives.
+        unsafe { (source.contents().as_ptr::<u8>()).write_bytes(0x99, (2 * page).to_usize()) };
+        let cut = (n - 1) * page / granule * granule;
+        assert!(cut >= 2 * page, "a cut inside the view");
+        let queue = device.new_command_queue().expect("a command queue");
+        // The read, then the write, each its own command buffer, waited for.
+        let copies = [
+            (&buffer, 0, &out, 0, n * page),
+            (&source, 0, &buffer, cut - page, 2 * page),
+        ];
+        for (from, source_offset, to, destination_offset, size) in copies {
+            let commands = queue.command_buffer(on).expect("never a raise");
+            let commands = commands.expect("a command buffer");
+            let encoder = commands.blit_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a blit encoder");
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(from),
+                source_offset,
+                destination_buffer: Some(to),
+                destination_offset,
+                size,
+            };
+            assert_eq!(encoder.encode(on, copy), Ok(()));
+            assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+            assert_eq!(commands.commit(on), Ok(()));
+            assert_eq!(commands.wait_until_completed(on), Ok(()));
+        }
+        for i in 0..n {
+            let byte = if i == n - 1 { 0x44 } else { run_byte(i) };
+            let at = out.contents().wrapping_add(i * page);
+            assert_eq!(
+                read(at, page.to_usize()),
+                vec![byte; page.to_usize()],
+                "page {i}"
+            );
+        }
+        let written = read(view.wrapping_add(cut - page), (2 * page).to_usize());
+        assert_eq!(written, vec![0x99; (2 * page).to_usize()]);
+        let run = ram.wrapping_add(2 * (cut / page) * page);
+        assert_eq!(read(run, 16), [0x99; 16], "the run after the cut");
+        let before_cut = read(view.wrapping_add(cut - page - 16), 16);
+        assert_eq!(before_cut, vec![run_byte(cut / page - 2); 16]);
     }
 
     /// On Linux, on the GPU the test holds, a no-copy buffer over a view of two runs of a file's
