@@ -47,7 +47,10 @@
 //!   buffer, and where it used one its first completed handler merges the GPU's writes back into
 //!   their pages, before core's completion-seen handlers.
 //! - **What it keeps**: the pipeline states its encoders set ([`Kept`]), from their set until it
-//!   completes, released after its completed handlers ran.
+//!   completes, released after its completed handlers ran. It keeps no texture or sampler state:
+//!   it notes those its work reads through one of the platform's own indices (`super::texture`'s
+//!   `Reads`), each until it completes, finished first of its completed handlers, or until it
+//!   goes uncommitted, for the boot diagnostics' count of such an index taken again meanwhile.
 //! - **Tiled textures** (`super::tiled`): its encoders note each tiled texture they use whose
 //!   bytes are to take, and its commit takes them first, in a command buffer committed ahead of it.
 //! - **A signal as it is scheduled** (`encodeSignalEventScheduled:value:`) sets the shared
@@ -100,7 +103,7 @@ use super::compute::RtComputeEncoder;
 use super::device::RtDevice;
 use super::diag::{Use, Uses};
 use super::render::RtRenderEncoder;
-use super::texture::{RtTexture, refused_metal};
+use super::texture::{Reads, RtTexture, refused_metal};
 use super::tiled::Takes;
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused, rt_refused_create};
 use super::{RtObj, RtPlatform};
@@ -477,8 +480,9 @@ impl RtCommandBuffer {
 /// It holds too its uses of textures over an imported block, for the boot diagnostics
 /// (`super::diag`), which its commit counts, the tiled textures it used whose bytes its commit
 /// takes (`super::tiled`), whether its caller failed it for a deferred buffer's memory
-/// ([`Failed`]), and the copies of host pages it used, which its commit and completion sync
-/// (`super::copied`).
+/// ([`Failed`]), the copies of host pages it used, which its commit and completion sync
+/// (`super::copied`), and its reads through the platform's own indices, finished as it completes
+/// (`super::texture`'s `Reads`).
 #[derive(Clone, Default)]
 pub struct Kept(
     Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>,
@@ -486,6 +490,7 @@ pub struct Kept(
     Takes,
     Failed,
     super::copied::Used,
+    Reads,
 );
 
 /// Whether a command buffer's caller failed it for a deferred buffer's memory rt refused
@@ -516,13 +521,24 @@ impl Kept {
         &self.4
     }
 
+    /// Its reads through the platform's own indices (`super::texture`'s `Reads`), which its
+    /// encoders note where they bind a sampler state, declare a texture with `useResource:` or
+    /// render a colour attachment.
+    pub fn reads(&self) -> &Reads {
+        &self.5
+    }
+
     /// An encoder of it used `texture` as `how` says: a use for the boot diagnostics
     /// ([`Uses::add`]), of a tiled texture whose bytes are to take, a take at its commit
-    /// ([`Takes::used`]), and of a texture over a copy, the copy's use (`super::copied::Used`).
+    /// ([`Takes::used`]), of a texture over a copy, the copy's use (`super::copied::Used`), and of
+    /// one bound to a shader's slot, a read through its index ([`Reads::note`]).
     pub fn used(&self, texture: &RtObj<RtTexture>, how: Use) {
         self.1.add(texture, how);
         self.2.used(texture);
         self.4.add(texture.copied());
+        if how == Use::Sampled {
+            self.5.note(texture.index_use());
+        }
     }
 
     /// Keeps `object`, whose identity is `id`, unless an object of that identity is kept.
@@ -798,6 +814,12 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             if !kept.is_empty() {
                 seen.push(Box::new(move |_made: &rt::CommandBuffer| drop(kept)));
             }
+            // Its reads through own indices finish first of its completed handlers, as its work
+            // has: a handler of core's may let go of an object they read.
+            let reads = self.kept.reads().take();
+            if !reads.is_empty() {
+                seen.insert(0, Box::new(move |_made: &rt::CommandBuffer| drop(reads)));
+            }
             let run = |handlers: Vec<Handler>| {
                 move |made: &rt::CommandBuffer| {
                     handlers.into_iter().for_each(|handler| handler(made))
@@ -955,6 +977,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                         let blocks = targets.iter().filter_map(|t| t.made.block());
                         super::copied::store_outs(sel, blocks);
                         render_pass_descriptor.note_copies(kept.copies());
+                        render_pass_descriptor.note_reads(kept.reads());
                         for tiled in render_pass_descriptor.tiled() {
                             kept.takes().used_tiled(&tiled);
                         }

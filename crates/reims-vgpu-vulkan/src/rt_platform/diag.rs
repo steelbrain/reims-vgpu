@@ -95,6 +95,16 @@
 //!   `take_lock_waits`, `take_makes`, `take_maps`, `maker_makes`, `zero_writes`,
 //!   `long_take_zero_writes`): for each, its calls, those over 5 ms, and its longest call with
 //!   that call's bytes and whether it made an allocation of its own.
+//! - **Own indices taken while their last owner's reads are unfinished.** Each of the platform's
+//!   own texture and sampler indices (`super::texture::OwnIndices`) taken again while a command
+//!   buffer that read its last owner through it was unfinished (made and not completed: encoding,
+//!   committed and held, or in flight; `super::texture::IndexUse`), which rt's array element of
+//!   the index then holds the new owner for: by the last owner's site and the take's, each what it
+//!   is, the selector that made it, the decoder's message carried out on the thread and the
+//!   thread's name without its number ([`own_index_reused`]). Its line is written on the rt
+//!   platform whether or not one was counted, with the textures' and sampler states' totals; the
+//!   first of each pair of sites, ten at most, writes its line as it is counted, with the last
+//!   owner's context, format, size and usage. A diagnostic: nothing waits for the reads.
 //!
 //! Totals, numbers, formats, sizes and usages only: no name, label or byte of the guest's leaves
 //! the process, but through the switch below. A diagnostic, which the contract leaves free:
@@ -1231,6 +1241,133 @@ fn timed_parts_line(m: &rt::Metrics) -> String {
     format!("reims-vgpu: rt-diag timed take parts: {}", all.join(", "))
 }
 
+// ----- Own indices taken while their last owner's reads are unfinished.
+
+/// Where an object at one of the platform's own indices was made, or such an index taken
+/// (`super::texture::OwnIndices`): what it is (a texture's [`Call`], a sampler state), the selector
+/// that made it, the decoder's message carried out on the thread (0: none), and the thread's name
+/// without its number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OwnSite {
+    what: &'static str,
+    sel: &'static str,
+    message: u32,
+    thread: &'static str,
+}
+
+impl OwnSite {
+    /// The site of `what`, made by `sel` on this thread now.
+    fn now(what: &'static str, sel: &'static str) -> OwnSite {
+        OwnSite {
+            what,
+            sel,
+            message: MESSAGE.get(),
+            thread: thread_class(),
+        }
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "{} {} message {:#x} thread {}",
+            self.what, self.sel, self.message, self.thread
+        )
+    }
+}
+
+/// An object at one of the platform's own indices as it was made (`super::texture::IndexUse`):
+/// its site, the context whose command buffer its thread walked, and a texture's format, width,
+/// height and usage.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnMade {
+    site: OwnSite,
+    context: Option<u32>,
+    shape: Option<(u32, u32, u32, u64)>,
+}
+
+impl OwnMade {
+    /// The texture `made`, made by `sel` on this thread now.
+    pub fn texture(sel: &'static str, made: &Made) -> OwnMade {
+        OwnMade {
+            site: OwnSite::now(made.call_name(), sel),
+            context: context_now(),
+            shape: Some((made.format, made.width, made.height, made.usage)),
+        }
+    }
+
+    /// A sampler state made by `sel` on this thread now.
+    pub fn sampler(sel: &'static str) -> OwnMade {
+        OwnMade {
+            site: OwnSite::now("sampler", sel),
+            context: context_now(),
+            shape: None,
+        }
+    }
+
+    fn name(&self) -> String {
+        let context = self.context.map_or("unknown".to_owned(), |c| c.to_string());
+        let shape = self
+            .shape
+            .map_or(String::new(), |(format, width, height, usage)| {
+                format!(", format {format} {width}x{height} usage {usage:#x}")
+            });
+        format!("{} (context {context}{shape})", self.site.name())
+    }
+}
+
+/// The platform's own indices taken while a command buffer that read their last owner through
+/// them was unfinished, by the last owner's site and the take's.
+static OWN_REUSED: Mutex<BTreeMap<(OwnSite, OwnSite), u64>> = Mutex::new(BTreeMap::new());
+
+/// Each of the platform's own indices of objects `what` names taken by `sel` while a command
+/// buffer that read its last owner, `last`, through it was unfinished
+/// (`super::texture::OwnIndices::take`): counted by the two sites, and the first of each pair,
+/// [`FIRST_LINES`] pairs at most, writes its line.
+pub fn own_index_reused(what: &'static str, last: &OwnMade, sel: &'static str) {
+    let taker = OwnSite::now(what, sel);
+    let first = {
+        let mut reused = OWN_REUSED.lock();
+        let n = reused.entry((last.site, taker)).or_insert(0);
+        *n += 1;
+        *n == 1 && reused.len() <= FIRST_LINES
+    };
+    if first {
+        let context = context_now().map_or("unknown".to_owned(), |c| c.to_string());
+        say(&format!(
+            "reims-vgpu: rt-diag own-index-reuse first of a site: last owner {}, taken by {} \
+             (context {context})\n",
+            last.name(),
+            taker.name()
+        ));
+    }
+}
+
+/// The own-index-reuse line (the module's docs, "Own indices taken while their last owner's
+/// reads are unfinished"): the textures' and sampler states' totals, then each pair of sites.
+fn own_reused_line() -> String {
+    let reused = OWN_REUSED.lock();
+    let of = |sampler: bool| -> u64 {
+        (reused.iter())
+            .filter(|((last, _), _)| (last.what == "sampler") == sampler)
+            .map(|(_, n)| n)
+            .sum()
+    };
+    let (textures, samplers) = (of(false), of(true));
+    let sites: Vec<String> = (reused.iter())
+        .map(|((last, taker), n)| format!("{} -> {}: {n}", last.name(), taker.name()))
+        .collect();
+    let by = match sites.is_empty() {
+        true => String::new(),
+        false => format!(
+            "; by the last owner's site and the take's: {}",
+            sites.join(", ")
+        ),
+    };
+    format!(
+        "reims-vgpu: rt-diag own-index-reuse: textures {textures}, samplers {samplers} taken \
+         while a command buffer that read their last owner was unfinished{by}"
+    )
+}
+
 // ----- Refused pipelines' AIR.
 
 /// The variable that names the directory refused pipelines' AIR is written into (the module's
@@ -2056,6 +2193,7 @@ pub fn write() {
             idle >> 20,
             blocks
         );
+        let _ = writeln!(out, "{}", own_reused_line());
     }
     let _ = writeln!(out, "{}", export_makes_line(&EXPORT_MAKES.lock()));
     for (kind, t) in OVERS.lock().iter() {

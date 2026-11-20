@@ -497,6 +497,15 @@ impl PassFields {
         (attachments.filter_map(|a| a.texture.as_ref()?.tiled().cloned())).collect()
     }
 
+    /// Notes in `reads` the pass's colour attachments' textures, which a fragment function may read
+    /// through their indices (`super::texture`'s `Reads`).
+    pub fn note_reads(&self, reads: &super::texture::Reads) {
+        let pass = self.lock();
+        for a in &pass.colors {
+            reads.note(a.texture.as_ref().and_then(|t| t.index_use()));
+        }
+    }
+
     /// Notes in `used` the copies the pass's attachments, their resolves and its visibility
     /// result buffer lie over ([`super::copied::Used`]).
     pub fn note_copies(&self, used: &super::copied::Used) {

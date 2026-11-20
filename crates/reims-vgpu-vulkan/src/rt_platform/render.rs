@@ -14,7 +14,8 @@
 //!   made.
 //! - **Nothing to record**: `useResources:` and `useHeaps:` in each form (rt's pass orders every
 //!   earlier command before it and itself before every later one, and every resource is
-//!   resident), but that a tiled texture `useResources:` names is a use of it (`super::tiled`); the
+//!   resident), but that a tiled texture `useResources:` names is a use of it (`super::tiled`), and
+//!   a texture it names at one of the platform's own indices a read through it (`Kept::reads`); the
 //!   store action options (rt renders one sample, and the one option is custom
 //!   sample positions); the object, mesh and tile functions' buffers, textures, samplers and
 //!   threadgroup memory, and the tile threadgroup memory length (rt makes no state with such
@@ -302,6 +303,7 @@ impl RtRenderEncoder {
                 for resource in resources.iter().flatten() {
                     if let ResourceRef::Texture(texture) = resource {
                         self.kept.takes().used(texture);
+                        self.kept.reads().note(texture.index_use());
                     }
                 }
             }
@@ -496,12 +498,14 @@ impl RtRenderEncoder {
                 let at = slots(range, &[samplers.len()])?;
                 for (sampler, index) in samplers.iter().zip(at) {
                     e.set_vertex_sampler_state(sampler.map(|s| s.rt()), index)?;
+                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                 }
             }
             RenderCmd::SetFragmentSamplerStates { samplers, range } => {
                 let at = slots(range, &[samplers.len()])?;
                 for (sampler, index) in samplers.iter().zip(at) {
                     e.set_fragment_sampler_state(sampler.map(|s| s.rt()), index)?;
+                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                 }
             }
             RenderCmd::SetVertexSamplerStatesLodClamps {
@@ -514,6 +518,7 @@ impl RtRenderEncoder {
                 let at = slots(range, &lengths)?;
                 let clamps = lod_min_clamps.iter().zip(lod_max_clamps);
                 for ((sampler, (&min, &max)), index) in samplers.iter().zip(clamps).zip(at) {
+                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                     let sampler = sampler.map(|s| s.rt());
                     e.set_vertex_sampler_state_with_lod_clamps(sampler, min, max, index)?;
                 }
@@ -528,6 +533,7 @@ impl RtRenderEncoder {
                 let at = slots(range, &lengths)?;
                 let clamps = lod_min_clamps.iter().zip(lod_max_clamps);
                 for ((sampler, (&min, &max)), index) in samplers.iter().zip(clamps).zip(at) {
+                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                     let sampler = sampler.map(|s| s.rt());
                     e.set_fragment_sampler_state_with_lod_clamps(sampler, min, max, index)?;
                 }

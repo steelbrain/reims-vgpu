@@ -40,11 +40,17 @@
 //! and no texture of the platform's took yet, granted as it is taken, and once those are gone the
 //! one given back longest ago. So an index a released texture held is taken again as late as can
 //! be: rt leaves to the program that no work in flight reads a released texture through its index,
-//! and Metal frees a texture's ID only once its command buffers completed. A texture no shader
-//! reaches has no index. Its `gpuResourceID` is rt's, the index and the translator's word of its
-//! format and swizzle, and its `resourceIndex` and `uniqueIdentifier` the index: 0 for one with no
-//! index, where Metal numbers every texture from its lowest free ID. Nothing of core or the decoder
-//! reads them but the check of the guest's reservation.
+//! and Metal frees a texture's ID only once its command buffers completed. Nothing waits for that
+//! here, and a take of an index while a command buffer that read its last owner through it is
+//! unfinished is counted, for the boot diagnostics ([`IndexUse`]): a command buffer's work reads a
+//! texture through its index where its encoders bind it to a shader's slot, declare it with
+//! `useResource:`, which an argument buffer's reads through its ID need, or render it as a colour
+//! attachment, which a fragment function may read through the index; not where a blit copies it,
+//! which reads the image. A texture no shader reaches has no index. Its `gpuResourceID` is rt's,
+//! the index and the translator's word of its format and swizzle, and its `resourceIndex` and
+//! `uniqueIdentifier` the index: 0 for one with no index, where Metal numbers every texture from
+//! its lowest free ID. Nothing of core or the decoder reads them but the check of the guest's
+//! reservation.
 //!
 //! **Answers.** A texture's descriptor values are rt's descriptor of it. Its usage is Metal's
 //! answer (measured on the M3 Max, `crate::gpu::desc`'s docs): the usage set without 0x8, which
@@ -70,7 +76,7 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_rt as rt;
@@ -170,6 +176,9 @@ pub struct RtTexture {
     /// Its index where it is one of the platform's own ([`OwnIndices`]), which its drop gives
     /// back.
     own: Option<u32>,
+    /// What reads it through that index ([`IndexUse`]), which goes back with it; `None` where it
+    /// has none of the platform's own.
+    read: Option<Arc<IndexUse>>,
     /// Its purgeable state, as Metal keeps it ([`GpuResource::set_purgeable_state`]).
     purgeable: AtomicU64,
     /// What it is, for the boot diagnostics (`super::diag`).
@@ -185,7 +194,7 @@ pub struct RtTexture {
 impl Drop for RtTexture {
     fn drop(&mut self) {
         if let Some(index) = self.own {
-            self.device.indices().give_back(index);
+            self.device.indices().give_back(index, self.read.take());
         }
     }
 }
@@ -194,6 +203,12 @@ impl RtTexture {
     /// rt's texture.
     pub fn rt(&self) -> &rt::Texture {
         &self.rt
+    }
+
+    /// What reads it through its index, where that is one of the platform's own ([`IndexUse`]),
+    /// which a command buffer whose work reads it so notes ([`Reads::note`]).
+    pub(super) fn index_use(&self) -> Option<&Arc<IndexUse>> {
+        self.read.as_ref()
     }
 
     /// What it is, for the boot diagnostics (`super::diag`).
@@ -313,6 +328,7 @@ impl RtTexture {
             usage,
             protection_options: self.protection_options,
             own,
+            read: None,
             purgeable: purgeable_state(),
             made: Made::view(&self.made, format_raw, first),
             tiled: self.tiled.clone(),
@@ -409,6 +425,7 @@ fn answered(
         usage,
         protection_options: desc.protection_options.unwrap_or(0),
         own,
+        read: None,
         purgeable: purgeable_state(),
         made: diag(&shape),
         tiled: OnceLock::new(),
@@ -423,10 +440,11 @@ const STORAGE_PRIVATE: u64 = 0x20;
 const USAGE_RENDER_TARGET: u64 = 0x4;
 
 /// The texture over a window swapchain's image (`super::swapchain`): rt's drawable `texture`, made
-/// of [`drawable_descriptor`]'s descriptor at `own`, one of the platform's own indices, which its
-/// drop gives back.
+/// by `sel` of [`drawable_descriptor`]'s descriptor at `own`, one of the platform's own indices,
+/// which its drop gives back.
 pub(super) fn drawable(
     device: &RtObj<RtDevice>,
+    sel: &'static str,
     texture: rt::Texture,
     own: Option<u32>,
 ) -> RtObj<RtTexture> {
@@ -438,6 +456,7 @@ pub(super) fn drawable(
         storage: STORAGE_PRIVATE >> 4,
         usage: USAGE_RENDER_TARGET,
     };
+    let made = Made::new(Call::Drawable, &shape);
     RtObj::new(RtTexture {
         rt: texture,
         device: device.clone_ref(),
@@ -445,8 +464,9 @@ pub(super) fn drawable(
         usage: USAGE_RENDER_TARGET,
         protection_options: 0,
         own,
+        read: own.map(|_| IndexUse::new(super::diag::OwnMade::texture(sel, &made))),
         purgeable: purgeable_state(),
-        made: Made::new(Call::Drawable, &shape),
+        made,
         tiled: OnceLock::new(),
         copied: OnceLock::new(),
     })
@@ -641,7 +661,7 @@ impl RtObj<RtDevice> {
             };
             return Some((Some(index), None));
         }
-        match self.indices().take(self.rt()) {
+        match self.indices().take(self.rt(), sel) {
             Ok(Some(index)) => Some((Some(index), Some(index))),
             Ok(None) => {
                 crate::core::platform::device::note_relayed_gap();
@@ -657,7 +677,8 @@ impl RtObj<RtDevice> {
     }
 
     /// The texture `sel` made, of rt's answer `made`, or nil where rt refused it, counted, its
-    /// own index given back.
+    /// own index given back. One at an index of the platform's own notes where it was made
+    /// ([`IndexUse`]).
     fn made(
         &self,
         sel: &'static str,
@@ -666,10 +687,17 @@ impl RtObj<RtDevice> {
         texture: impl FnOnce(rt::Texture) -> RtTexture,
     ) -> Option<RtObj<RtTexture>> {
         match made {
-            Ok(made) => Some(RtObj::new(texture(made))),
+            Ok(made) => {
+                let mut texture = texture(made);
+                if own.is_some() {
+                    let site = super::diag::OwnMade::texture(sel, &texture.made);
+                    texture.read = Some(IndexUse::new(site));
+                }
+                Some(RtObj::new(texture))
+            }
             Err(error) => {
                 if let Some(index) = own {
-                    self.indices().give_back(index);
+                    self.indices().give_back(index, None);
                 }
                 rt_refused_texture_create(sel, &error);
                 None
@@ -726,6 +754,103 @@ pub(super) fn refused_metal<T>(sel: &'static str, why: &dyn std::fmt::Display) -
     None
 }
 
+/// What reads an object at one of the platform's own indices through its index: the command
+/// buffers not finished (made and not completed) whose work reads it so, which [`Reads`] notes, and
+/// where it was made. Its index goes back with it ([`OwnIndices::give_back`]), and a take of the
+/// index while one of those command buffers is unfinished is counted (`super::diag`'s
+/// `own_index_reused`): rt writes the new owner into the index's array element at once, which
+/// such work then reads. A diagnostic: nothing waits for the reads.
+pub struct IndexUse {
+    /// The notes of it ([`Reads::note`]) whose command buffers are unfinished: one a command
+    /// buffer, but one that notes it again after another's note.
+    unfinished: AtomicUsize,
+    /// The number of the command buffer that noted it last ([`Reads`]); 0 for none.
+    last: AtomicU64,
+    /// Where it was made.
+    made: super::diag::OwnMade,
+}
+
+impl IndexUse {
+    /// An object made as `made` says, which no command buffer read yet.
+    pub(super) fn new(made: super::diag::OwnMade) -> Arc<IndexUse> {
+        Arc::new(IndexUse {
+            unfinished: AtomicUsize::new(0),
+            last: AtomicU64::new(0),
+            made,
+        })
+    }
+
+    /// Whether a command buffer that read it is unfinished.
+    fn unfinished(&self) -> bool {
+        self.unfinished.load(Ordering::Acquire) != 0
+    }
+}
+
+/// A command buffer's reads through the platform's own indices ([`IndexUse`]): each object it read
+/// so, noted at its first read, until the command buffer finishes, as it completes or goes
+/// uncommitted. Its encoders share it.
+#[derive(Clone)]
+pub struct Reads {
+    /// The command buffer's number, from 1.
+    number: u64,
+    /// The objects noted, until the commit takes them.
+    noted: Arc<Mutex<Noted>>,
+}
+
+/// The next command buffer's number ([`Reads`]).
+static NEXT_READS: AtomicU64 = AtomicU64::new(1);
+
+impl Default for Reads {
+    fn default() -> Reads {
+        Reads {
+            number: NEXT_READS.fetch_add(1, Ordering::Relaxed),
+            noted: Arc::default(),
+        }
+    }
+}
+
+impl Reads {
+    /// The command buffer's work reads the object `read` notes through its index, where it is one
+    /// of the platform's own: noted unless this command buffer noted it last. The cost of a read of
+    /// an object noted so is a load.
+    pub fn note(&self, read: Option<&Arc<IndexUse>>) {
+        let Some(read) = read else {
+            return;
+        };
+        if read.last.load(Ordering::Relaxed) == self.number {
+            return;
+        }
+        read.last.store(self.number, Ordering::Relaxed);
+        read.unfinished.fetch_add(1, Ordering::AcqRel);
+        self.noted.lock().0.push(Arc::clone(read));
+    }
+
+    /// What was noted, taken, to drop as the command buffer completes.
+    pub fn take(&self) -> Noted {
+        std::mem::take(&mut *self.noted.lock())
+    }
+}
+
+/// The objects a command buffer read through the platform's own indices ([`Reads`]): its reads of
+/// each are finished as this drops.
+#[derive(Default)]
+pub struct Noted(Vec<Arc<IndexUse>>);
+
+impl Noted {
+    /// Whether nothing was noted.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        for read in &self.0 {
+            read.unfinished.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// The platform's own indices of a class, textures' (the module's docs) or sampler states'
 /// (`super::state`): those the guest's reservations hold are never taken.
 pub struct OwnIndices {
@@ -733,6 +858,9 @@ pub struct OwnIndices {
     class: rt::IndexClass,
     /// What was taken and reserved.
     own: Mutex<Own>,
+    /// How many were taken while a command buffer that read their last owner was unfinished
+    /// ([`IndexUse`]).
+    reused: AtomicU64,
 }
 
 /// [`OwnIndices`]' state.
@@ -743,8 +871,8 @@ struct Own {
     first: u32,
     /// The next index not taken yet, counting down; none once every one was taken.
     fresh: Option<u32>,
-    /// The indices given back, the longest ago first.
-    free: VecDeque<u32>,
+    /// The indices given back, the longest ago first, each with what read its last owner.
+    free: VecDeque<(u32, Option<Arc<IndexUse>>)>,
 }
 
 impl OwnIndices {
@@ -753,7 +881,14 @@ impl OwnIndices {
         OwnIndices {
             class,
             own: Mutex::new(Own::new(class.range())),
+            reused: AtomicU64::new(0),
         }
+    }
+
+    /// How many were taken while a command buffer that read their last owner was unfinished
+    /// ([`IndexUse`]).
+    pub fn reused(&self) -> u64 {
+        self.reused.load(Ordering::Relaxed)
     }
 
     /// Notes `indices` as the guest's, never to be taken: those past the class's range are none of
@@ -767,11 +902,12 @@ impl OwnIndices {
         }
     }
 
-    /// An index for an object of the platform's own, granted on `device` where it is new; `None`
-    /// where every index is reserved or held.
-    pub fn take(&self, device: &rt::Device) -> Result<Option<u32>, rt::Error> {
+    /// An index for an object of the platform's own, which `sel` makes, granted on `device` where
+    /// it is new; `None` where every index is reserved or held. One taken while a command buffer
+    /// that read its last owner is unfinished is counted ([`IndexUse`]).
+    pub fn take(&self, device: &rt::Device, sel: &'static str) -> Result<Option<u32>, rt::Error> {
         let mut own = self.own.lock();
-        let Some((index, fresh)) = own.next() else {
+        let Some((index, fresh, last)) = own.next() else {
             return Ok(None);
         };
         if fresh {
@@ -784,12 +920,28 @@ impl OwnIndices {
                 }
             }
         }
+        drop(own);
+        if let Some(last) = last.filter(|last| last.unfinished()) {
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            let what = match self.class {
+                rt::IndexClass::Sampler => "sampler",
+                _ => "texture",
+            };
+            super::diag::own_index_reused(what, &last.made, sel);
+        }
         Ok(Some(index))
     }
 
-    /// Gives `index` back, to be taken again once those given back before it are.
-    pub fn give_back(&self, index: u32) {
-        self.own.lock().give_back(index);
+    /// Gives `index` back, to be taken again once those given back before it are, with what read
+    /// its last owner (`read`; `None` for none, or an owner never made).
+    pub fn give_back(&self, index: u32, read: Option<Arc<IndexUse>>) {
+        self.own.lock().give_back(index, read);
+    }
+
+    /// Takes no index not taken before from here: each take is of one given back.
+    #[cfg(test)]
+    fn take_none_fresh(&self) {
+        self.own.lock().fresh = None;
     }
 }
 
@@ -817,27 +969,28 @@ impl Own {
         word.is_some_and(|word| word & (1 << (index % 64)) != 0)
     }
 
-    /// The next index to take, and whether it is new (not given back before): the highest not
-    /// taken yet and not reserved, else the one given back longest ago that is not reserved since.
-    fn next(&mut self) -> Option<(u32, bool)> {
+    /// The next index to take, whether it is new (not given back before), and what read its last
+    /// owner where it was given back: the highest not taken yet and not reserved, else the one
+    /// given back longest ago that is not reserved since.
+    fn next(&mut self) -> Option<(u32, bool, Option<Arc<IndexUse>>)> {
         while let Some(index) = self.fresh {
             self.fresh = (index.checked_sub(1)).filter(|&next| next >= self.first);
             if !self.is_reserved(index) {
-                return Some((index, true));
+                return Some((index, true, None));
             }
         }
-        while let Some(index) = self.free.pop_front() {
+        while let Some((index, read)) = self.free.pop_front() {
             if !self.is_reserved(index) {
-                return Some((index, false));
+                return Some((index, false, read));
             }
         }
         None
     }
 
-    /// Gives `index` back, but one reserved since it was taken.
-    fn give_back(&mut self, index: u32) {
+    /// Gives `index` back, with what read its last owner, but one reserved since it was taken.
+    fn give_back(&mut self, index: u32, read: Option<Arc<IndexUse>>) {
         if !self.is_reserved(index) {
-            self.free.push_back(index);
+            self.free.push_back((index, read));
         }
     }
 }
@@ -1227,24 +1380,132 @@ mod tests {
     /// those given back in the order they were, never one reserved since.
     #[test]
     fn own_indices_go_down_and_come_back_in_order() {
+        fn next(own: &mut Own) -> Option<(u32, bool)> {
+            own.next().map(|(index, fresh, _)| (index, fresh))
+        }
         let mut own = Own::new(1..8);
         own.reserve(7);
         own.reserve(5);
         own.reserve(64);
-        assert_eq!(own.next(), Some((6, true)));
-        assert_eq!(own.next(), Some((4, true)));
-        own.give_back(6);
-        own.give_back(4);
-        own.give_back(5);
+        assert_eq!(next(&mut own), Some((6, true)));
+        assert_eq!(next(&mut own), Some((4, true)));
+        own.give_back(6, None);
+        own.give_back(4, None);
+        own.give_back(5, None);
         assert_eq!(
-            [own.next(), own.next(), own.next()],
+            [next(&mut own), next(&mut own), next(&mut own)],
             [Some((3, true)), Some((2, true)), Some((1, true))]
         );
         own.reserve(6);
-        assert_eq!(own.next(), Some((4, false)));
-        assert_eq!(own.next(), None);
-        own.give_back(2);
-        assert_eq!(own.next(), Some((2, false)));
+        assert_eq!(next(&mut own), Some((4, false)));
+        assert_eq!(next(&mut own), None);
+        own.give_back(2, None);
+        assert_eq!(next(&mut own), Some((2, false)));
+    }
+
+    /// On the GPU the test holds: an own index taken again while a command buffer whose compute
+    /// encoder bound its last owner, a texture or a sampler state, is uncommitted, or committed
+    /// and in flight, held by a wait for a shared event, is counted, once a take; one taken after
+    /// the command buffer completed, its completed handlers run, is not.
+    #[test]
+    fn own_indices_taken_while_their_last_owner_s_reads_are_unfinished_count_on_vulkan() {
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::resource::SamplerState as _;
+        use crate::core::platform::values::SamplerDesc;
+        use crate::core::raise::OnFault;
+        let on = OnFault::Return;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let small = TextureDesc {
+            width: 4,
+            height: 4,
+            ..TextureDesc::default()
+        };
+        let texture = || {
+            let made = device.new_texture(on, &platform.texture_descriptor(&small));
+            made.expect("never a raise").expect("a texture")
+        };
+        let sampler = || {
+            let made = device.new_sampler_state(&SamplerDesc::default());
+            made.expect("never a raise").expect("a sampler state")
+        };
+        let [t0, t1, t2] = [texture(), texture(), texture()];
+        let [s0, s1, s2] = [sampler(), sampler(), sampler()];
+        let textures = [&t0, &t1, &t2].map(|t| t.resource_index());
+        let samplers = [&s0, &s1, &s2].map(|s| s.resource_index());
+        device.indices().take_none_fresh();
+        device.sampler_indices().take_none_fresh();
+        let reused = || (device.indices().reused(), device.sampler_indices().reused());
+
+        // A command buffer held by a wait for the event binds the three of each.
+        let shared = device.new_shared_event().expect("a shared event");
+        let queue = device.new_command_queue().expect("a command queue");
+        let commands = queue.command_buffer(on).expect("never a raise");
+        let commands = commands.expect("a command buffer");
+        let wait = commands.encode_wait(Some(EventRef::Shared(&shared)), 1);
+        assert_eq!(wait, Ok(()));
+        {
+            let encoder = commands.compute_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a compute encoder");
+            let binds = [
+                ComputeCmd::SetTextures {
+                    textures: &[Some(&t0), Some(&t1), Some(&t2)],
+                    range: NsRange::new(0, 3),
+                },
+                ComputeCmd::SetSamplerStates {
+                    samplers: &[Some(&s0), Some(&s1), Some(&s2)],
+                    range: NsRange::new(0, 3),
+                },
+                ComputeCmd::EndEncoding,
+            ];
+            for bind in binds {
+                assert_eq!(encoder.encode(on, bind), Ok(()));
+            }
+        }
+        assert_eq!(reused(), (0, 0));
+
+        // Uncommitted: the first of each, taken again, counts.
+        drop((t0, s0));
+        let (u0, v0) = (texture(), sampler());
+        assert_eq!(
+            (u0.resource_index(), v0.resource_index()),
+            (textures[0], samplers[0])
+        );
+        assert_eq!(reused(), (1, 1));
+
+        // Committed and in flight, held by the wait: the second of each counts.
+        assert_eq!(commands.commit(on), Ok(()));
+        drop((t1, s1));
+        let (u1, v1) = (texture(), sampler());
+        assert_eq!(
+            (u1.resource_index(), v1.resource_index()),
+            (textures[1], samplers[1])
+        );
+        assert_eq!(reused(), (2, 2));
+
+        // Completed, its completed handlers run: the third of each counts no more.
+        assert_eq!(shared.set_signaled_value(1), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+        let reads = [t2.index_use(), s2.index_use()];
+        let reads = reads.map(|read| Arc::clone(read.expect("what reads an own index")));
+        for _ in 0..1000 {
+            if reads.iter().all(|read| !read.unfinished()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(reads.iter().all(|read| !read.unfinished()));
+        drop((t2, s2));
+        let (u2, v2) = (texture(), sampler());
+        assert_eq!(
+            (u2.resource_index(), v2.resource_index()),
+            (textures[2], samplers[2])
+        );
+        assert_eq!(reused(), (2, 2));
+        drop((u0, u1, u2, v0, v1, v2));
     }
 
     /// The texture class's own indices start at its last, 65,535.
@@ -1252,7 +1513,61 @@ mod tests {
     fn own_indices_start_at_the_class_s_last() {
         let own = OwnIndices::new(rt::IndexClass::Texture);
         own.reserve(&[65535, 1 << 40]);
-        assert_eq!(own.own.lock().next(), Some((65534, true)));
+        let next = own
+            .own
+            .lock()
+            .next()
+            .map(|(index, fresh, _)| (index, fresh));
+        assert_eq!(next, Some((65534, true)));
+    }
+
+    /// What reads an object at an own index ([`IndexUse`]): unfinished from a command buffer's
+    /// first note of it until what it noted drops, as the command buffer completes or goes
+    /// uncommitted; a command buffer that noted it last notes it no more, and one that notes it
+    /// again after another's note finishes both notes; an index given back carries what read its
+    /// last owner to its take, and one reserved since drops it.
+    #[test]
+    fn reads_through_own_indices_are_unfinished_until_their_command_buffers_finish() {
+        let made = super::super::diag::OwnMade::sampler("a test's make");
+        let (read, other) = (IndexUse::new(made), IndexUse::new(made));
+        let (first, second) = (Reads::default(), Reads::default());
+        assert!(!read.unfinished());
+        first.note(Some(&read));
+        first.clone().note(Some(&read));
+        first.note(None);
+        assert_eq!(read.unfinished.load(Ordering::Acquire), 1);
+        second.note(Some(&read));
+        first.note(Some(&read));
+        assert_eq!(read.unfinished.load(Ordering::Acquire), 3);
+        let noted = first.take();
+        assert_eq!(noted.0.len(), 2);
+        assert!(first.take().is_empty());
+        drop(noted);
+        assert!(read.unfinished());
+        drop(second);
+        assert!(
+            !read.unfinished(),
+            "an uncommitted command buffer's reads end as it goes"
+        );
+
+        let mut own = Own::new(1..3);
+        let taken = [own.next(), own.next()].map(|n| n.map(|(index, fresh, _)| (index, fresh)));
+        assert_eq!(taken, [Some((2, true)), Some((1, true))]);
+        let reads = Reads::default();
+        reads.note(Some(&other));
+        own.give_back(2, Some(Arc::clone(&other)));
+        own.give_back(1, Some(Arc::clone(&read)));
+        let (index, fresh, last) = own.next().expect("one given back");
+        assert_eq!((index, fresh), (2, false));
+        assert!(last.is_some_and(|last| Arc::ptr_eq(&last, &other) && last.unfinished()));
+        own.reserve(1);
+        assert!(own.next().is_none());
+        drop(reads);
+        assert!(!other.unfinished());
+        assert_eq!(
+            (Arc::strong_count(&read), Arc::strong_count(&other)),
+            (1, 1)
+        );
     }
 
     /// A texture reaches shaders by shader-read or shader-write usage, `Unknown`, or render-target

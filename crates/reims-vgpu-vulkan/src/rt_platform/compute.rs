@@ -200,6 +200,7 @@ impl RtComputeEncoder {
                 let at = slots(range, &lengths)?;
                 let clamps = lod_min_clamps.iter().zip(lod_max_clamps);
                 for ((sampler, (&min, &max)), index) in samplers.iter().zip(clamps).zip(at) {
+                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                     let sampler = sampler.map(|s| s.rt());
                     e.set_sampler_state_with_lod_clamps(sampler, min, max, index)?;
                 }
@@ -208,6 +209,7 @@ impl RtComputeEncoder {
                 let at = slots(range, &[samplers.len()])?;
                 for (sampler, index) in samplers.iter().zip(at) {
                     e.set_sampler_state(sampler.map(|s| s.rt()), index)?;
+                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                 }
             }
             ComputeCmd::SetStageInRegion { region } => {
@@ -266,6 +268,7 @@ impl RtComputeEncoder {
                         ResourceRef::Buffer(b) => rt::Resource::Buffer(b.rt()),
                         ResourceRef::Texture(t) => {
                             self.kept.takes().used(t);
+                            self.kept.reads().note(t.index_use());
                             rt::Resource::Texture(t.rt())
                         }
                         ResourceRef::Icb(icb) => icb.unreachable(),
