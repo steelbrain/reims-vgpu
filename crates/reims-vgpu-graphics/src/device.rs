@@ -915,9 +915,25 @@ pub trait Host: Send + Sync + 'static {
     ///   `bound` only where the guest holds the offset of its clock from the host's, and `held`,
     ///   from its take to the event.
     ///
+    /// And, on a thread where the host times the device's posts ([`Self::times_posts_here`]):
+    /// - `qraise queue ns`: queue `queue`'s vector raised, the nanoseconds of the raise, the
+    ///   host's own call among them;
+    /// - `qhanded queue posted ns`: the records handed over on queue `queue`'s ring posted on
+    ///   that thread ([`Shared::post_handed`]), how many (0 where another thread posts them, or
+    ///   the first found no room), and their nanoseconds, their raises (each a `qraise` before
+    ///   it) and what follows each record among them.
+    ///
     /// The default writes nothing.
     fn trace(&self, kind: &'static str, values: &[u64]) {
         let _ = (kind, values);
+    }
+
+    /// Whether the host's trace times the device's posts onto a queue's completion ring on this
+    /// thread (`qraise` and `qhanded`, [`Self::trace`]): asked at each raise and each post of
+    /// records handed over, so a host whose trace is off pays the call alone. The default
+    /// answers false.
+    fn times_posts_here(&self) -> bool {
+        false
     }
 
     /// The device met `kind` on a completion ring ([`RingDegradation`]): the host counts it with
@@ -4562,9 +4578,21 @@ impl Shared {
             }
         };
         if raise {
-            self.host.raise_interrupt(queue.vector);
+            self.raise_queue(queue);
         }
         Post::Done
+    }
+
+    /// Raises `queue`'s vector, timed for the host's trace where it times posts on this thread
+    /// (`qraise`, [`Host::trace`]).
+    fn raise_queue(&self, queue: &QueueShared) {
+        if !self.host.times_posts_here() {
+            return self.host.raise_interrupt(queue.vector);
+        }
+        let began = now_ns();
+        self.host.raise_interrupt(queue.vector);
+        let ns = now_ns().saturating_sub(began);
+        self.host.trace("qraise", &[queue.obj_id, ns]);
     }
 
     /// Display `display`'s refresh thread (the module doc): a refresh at each tick of its grid
@@ -4950,16 +4978,31 @@ impl Shared {
     /// post drops it. True where none is left; false where one found no room (it is kept, first,
     /// for a later look) or another thread is posting them (which posts any handed over meanwhile
     /// in its turn). A record that found no room, and its spell of the ring, are noted for the
-    /// service thread to tell ([`Self::tell_queue_ring`]).
+    /// service thread to tell ([`Self::tell_queue_ring`]). Timed for the host's trace where it
+    /// times posts on this thread (`qhanded`, [`Host::trace`]).
     fn post_handed(&self, queue: &QueueShared) -> bool {
+        if !self.host.times_posts_here() {
+            return self.post_handed_counted(queue).0;
+        }
+        let began = now_ns();
+        let (none_left, posted) = self.post_handed_counted(queue);
+        let ns = now_ns().saturating_sub(began);
+        self.host.trace("qhanded", &[queue.obj_id, posted, ns]);
+        none_left
+    }
+
+    /// [`Self::post_handed`], and how many records it took off the hand-over and posted (or
+    /// dropped as a post drops it).
+    fn post_handed_counted(&self, queue: &QueueShared) -> (bool, u64) {
+        let mut posted = 0;
         {
             let mut handed = queue.handed.lock();
             if handed.posting {
-                return false;
+                return (false, posted);
             }
             if handed.records.is_empty() {
                 queue.handing.store(false, Ordering::Release);
-                return true;
+                return (true, posted);
             }
             handed.posting = true;
         }
@@ -4971,7 +5014,7 @@ impl Shared {
                     None => {
                         handed.posting = false;
                         queue.handing.store(false, Ordering::Release);
-                        return true;
+                        return (true, posted);
                     }
                 }
             };
@@ -4983,8 +5026,9 @@ impl Shared {
                 let mut handed = queue.handed.lock();
                 handed.records.push_front(record);
                 handed.posting = false;
-                return false;
+                return (false, posted);
             }
+            posted += 1;
             if record.at != 0 {
                 let waited = now_ns().saturating_sub(record.at);
                 self.handed_wait_ns.fetch_max(waited, Ordering::Relaxed);

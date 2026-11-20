@@ -81,8 +81,12 @@
 //! - **The trace** (`core::trace`), where it is on: each command buffer's completion writes the
 //!   Vulkan platform's `cbdone`, with its commit's time and rt's submission and GPU times
 //!   ([`trace_commit`]), so a traced walk splits a command buffer's wait at its submission's end
-//!   and its GPU's start and end; and commits and completions write rt's metrics, first-use
-//!   waits and lowerings among them, at most every 50 ms ([`trace_metrics`]).
+//!   and its GPU's start and end; each signal and wait of an event it encodes, as rt takes it,
+//!   writes `evsignal` or `evwait`, and a shared event's signal at its scheduling `evsched`, with
+//!   the command buffer, as its `cbdone` names it, the event and the value
+//!   ([`trace_event_op`]), so a traced walk finds the command buffer that signals the value
+//!   another waits for; and commits and completions write rt's metrics, first-use waits and
+//!   lowerings among them, at most every 50 ms ([`trace_metrics`]).
 //!
 //! Every call rt refuses answers as Metal's answers where it fails (nothing encoded, nil, no
 //! wait), counted under the refusal's kind ([`rt_refused`]); never a death.
@@ -235,6 +239,14 @@ fn trace_metrics(now: u64) {
             m.maker_yields,
         ],
     );
+}
+
+/// Writes to the trace, where it is on, an event op that `cb` encoded and rt took: `kind`, then
+/// the command buffer, named as its `cbdone` names it, the event, by its object's address (one
+/// shared event's signals and waits name the same), and the value.
+fn trace_event_op(kind: &str, cb: &rt::CommandBuffer, event: &rt::Event, value: u64) {
+    // evsignal, evwait: command buffer, event, value
+    trace::event(kind, &[address(cb), address(event), value]);
 }
 
 /// `of`'s address, which names it in the trace.
@@ -1020,10 +1032,11 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             crate::recorder::rec_call!("encodeSignalEvent:value:", self, event, value);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let sel = "encodeSignalEvent:value:";
-            if let Some(event) = rt_event(sel, event)
-                && let Err(error) = self.rt.encode_signal_event(event, value)
-            {
-                rt_refused(sel, &error);
+            if let Some(event) = rt_event(sel, event) {
+                match self.rt.encode_signal_event(event, value) {
+                    Ok(()) => trace_event_op("evsignal", &self.rt, event, value),
+                    Err(error) => rt_refused(sel, &error),
+                }
             }
             Ok(())
         });
@@ -1050,10 +1063,13 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 refused_as(sel, RtRefusal::Refused, &"a nil event");
                 return Ok(());
             };
+            let traced = address(event.as_event());
             let event = rt::SharedEvent::clone(event);
             let signal = move |_made: &rt::CommandBuffer| event.set_signaled_value(value);
             if self.hold(sel, |h| &mut h.scheduled, Box::new(signal)) {
                 self.held.lock().scheduled_signal = true;
+                // evsched: command buffer, event, value (as evsignal's, [`trace_event_op`])
+                trace::event("evsched", &[address(&self.rt), traced, value]);
             }
             Ok(())
         });
@@ -1067,10 +1083,11 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             crate::recorder::rec_call!("encodeWaitForEvent:value:", self, event, value);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
             let sel = "encodeWaitForEvent:value:";
-            if let Some(event) = rt_event(sel, event)
-                && let Err(error) = self.rt.encode_wait_for_event(event, value)
-            {
-                rt_refused(sel, &error);
+            if let Some(event) = rt_event(sel, event) {
+                match self.rt.encode_wait_for_event(event, value) {
+                    Ok(()) => trace_event_op("evwait", &self.rt, event, value),
+                    Err(error) => rt_refused(sel, &error),
+                }
             }
             Ok(())
         });

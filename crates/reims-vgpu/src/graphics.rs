@@ -3691,6 +3691,15 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         reims_vgpu_vulkan::core::trace::event(kind, values);
     }
 
+    /// Where the trace is on, on rt's threads that run a command buffer's handlers
+    /// ([`RT_HANDLER_THREADS`]).
+    fn times_posts_here(&self) -> bool {
+        reims_vgpu_vulkan::core::trace::on()
+            && std::thread::current()
+                .name()
+                .is_some_and(|name| RT_HANDLER_THREADS.contains(&name))
+    }
+
     fn ring_degraded(&self, kind: RingDegradation) {
         reims_vgpu_vulkan::answer::count_kind(kind.code());
     }
@@ -4115,6 +4124,14 @@ fn foreign_committer() -> bool {
             .name()
             .is_some_and(|name| RAISE_THREADS.iter().any(|named| name.starts_with(named)))
 }
+
+/// rt's threads that run a command buffer's handlers, and so post onto its queue's ring and raise
+/// its vector inline: its submit thread, which runs its submission and scheduled handlers, and its
+/// completion thread, which runs its completed handlers but those handed on
+/// (`reims-vgpu.rt-handed-on`) and the scheduled handlers of one held for a shared event's value
+/// (`reims_vgpu_vulkan::rt_platform::command`'s module doc). The host's trace times the device's
+/// posts on them (`qraise`, `qhanded`, `reims_vgpu_graphics::Host::trace`).
+const RT_HANDLER_THREADS: [&str; 2] = ["m2v-submit", "m2v-complete"];
 
 /// The names, or their prefixes, of the library's threads `RvgGraphicsRaiseFn` names: the
 /// control thread, a context's, the presents' and a block's lanes, the refresh thread, a queue's

@@ -20,12 +20,15 @@ use crate::wire::*;
 const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
 
 /// A host that keeps each queue's completion poster as the device tells it of the queue, and
-/// records what the device told it of its completion rings and the threads it raised on.
+/// records what the device told it of its completion rings, the threads it raised on, and the
+/// posts it timed for the trace, which it times on the tests' platform handler thread
+/// ([`returns_at_once`]) alone.
 #[derive(Clone, Default)]
 struct PostingHost {
     posters: Arc<Mutex<Vec<CompletionPoster>>>,
     degraded: Arc<Mutex<Vec<RingDegradation>>>,
     raised_on: Arc<Mutex<Vec<Option<String>>>>,
+    timed: Arc<Mutex<Vec<(&'static str, Vec<u64>)>>>,
 }
 
 impl Host for PostingHost {
@@ -39,6 +42,14 @@ impl Host for PostingHost {
     fn ring_degraded(&self, kind: RingDegradation) {
         self.degraded.lock().push(kind);
     }
+    fn trace(&self, kind: &'static str, values: &[u64]) {
+        if matches!(kind, "qraise" | "qhanded") {
+            self.timed.lock().push((kind, values.to_vec()));
+        }
+    }
+    fn times_posts_here(&self) -> bool {
+        std::thread::current().name() == Some("platform-handler")
+    }
 }
 
 impl PostingHost {
@@ -49,6 +60,11 @@ impl PostingHost {
 
     fn degraded(&self) -> Vec<RingDegradation> {
         self.degraded.lock().clone()
+    }
+
+    /// The timed posts' kinds and values ([`Host::trace`]).
+    fn timed(&self) -> Vec<(&'static str, Vec<u64>)> {
+        self.timed.lock().clone()
     }
 }
 
@@ -319,6 +335,64 @@ fn a_post_unwaiting_goes_behind_records_handed_over_though_the_ring_has_room() {
     let (taken, _) = take_all(&rig, consumed);
     assert_eq!(taken, [HOLDS, HOLDS + 1]);
     assert_eq!(rig.device.handed_over(), 2);
+}
+
+/// On a thread where the host times posts, a raise of a queue's vector is traced as `qraise`, with
+/// the queue, and a post of the records handed over on its ring as `qhanded`, with the queue and
+/// how many it posted, after the raises among them; on another thread neither is
+#[test]
+fn a_host_that_times_posts_on_a_thread_is_told_of_the_raises_and_handed_posts_there() {
+    let host = PostingHost::default();
+    let rig = queue_rig(&host);
+    rig.device
+        .shared
+        .room_poll_ns
+        .store(60_000_000_000, Ordering::Relaxed);
+    let arm = || {
+        rig.region()
+            .atomic_u32(QUEUE_COMPLETE + 0xc0)
+            .store(1, Ordering::SeqCst);
+    };
+    let poster = host.poster();
+    let raised = host.raised_on.lock().len();
+    arm();
+    let posted = {
+        let poster = poster.clone();
+        returns_at_once(move || poster.post_unwaiting(&record(0), None))
+    };
+    assert!(posted);
+    arm();
+    poster.post(&record(1));
+    assert_eq!(host.raised_on.lock().len(), raised + 2);
+    let timed = host.timed();
+    assert_eq!(timed.len(), 1, "{timed:?}");
+    assert_eq!((timed[0].0, timed[0].1[0]), ("qraise", QUEUE));
+
+    // A record handed over behind a full ring: the service thread finds no room and looks again
+    // only after its poll, and the guest makes room, ringing nothing.
+    for cb in 2..HOLDS {
+        poster.post(&record(cb));
+    }
+    poster.post_unwaiting(&record(HOLDS), None);
+    std::thread::sleep(Duration::from_millis(50));
+    let (taken, consumed) = take_all(&rig, 0);
+    assert_eq!(taken.len() as u64, HOLDS);
+    arm();
+    let queue = rig.device.shared.queues.lock().by_obj[&QUEUE].clone();
+    let shared = Arc::clone(&rig.device.shared);
+    assert!(returns_at_once(move || assert!(shared.post_handed(&queue))));
+    assert_eq!(produced(&rig), consumed + 16 + 48);
+    let timed = host.timed();
+    let kinds: Vec<_> = timed
+        .iter()
+        .map(|(kind, values)| (*kind, values[0]))
+        .collect();
+    assert_eq!(
+        kinds,
+        [("qraise", QUEUE), ("qraise", QUEUE), ("qhanded", QUEUE)]
+    );
+    assert_eq!(timed[2].1[1], 1, "the records it posted");
+    assert!(timed[2].1[2] >= timed[1].1[1], "its time holds its raise's");
 }
 
 /// The records handed over to a queue's service thread when the device is reset are dropped,
