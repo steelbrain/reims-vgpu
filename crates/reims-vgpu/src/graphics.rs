@@ -1050,7 +1050,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     }
 
     /// Asks for at least `length` more bytes of the guest's Shared pool now, as the guest's own
-    /// ask does: the pool's thread takes a block and asks the host to map it
+    /// ask does: the pool's taker takes a block, and the pool's thread asks the host to map it
     /// ([`GraphicsCallbacks::pool_add`]). Waits for nothing and calls back never.
     /// [`Error::InvalidArgument`] without a pool, or for a `length` of 0.
     pub fn pool_grow(&self, length: u64) -> Result<(), Error> {

@@ -10,10 +10,13 @@
 //! that fits, first fit), on the thread that carries the take out, with the pool's lock held and
 //! nothing else done: it never allocates and never zeroes. The take then goes to its context's
 //! worker (`reims-vgpu.graphics-pool-take`), which zeroes the block through the piece's host
-//! mapping and answers. Where nothing fits, the worker asks for a piece of the take's length, waits
-//! for the pool's thread to place it and the host to map it, and carves again. A context's takes
-//! are answered in its own order, one worker a context with a take in flight, so a take waits only
-//! behind its own context's earlier ones, never behind another's growth or zeroing. A worker goes
+//! mapping and answers. Where nothing fits, the worker takes a block of the take's length from the
+//! source with the pool's lock let go of, so only this take waits for its allocation, and hands it
+//! to the pool's thread, which places it ahead of the headroom's blocks; once the host mapped the
+//! piece, the worker carves again. A context's takes are answered in its own order, one worker a
+//! context with a take in flight, so a take waits only behind its own context's earlier ones,
+//! never behind another's growth or zeroing, nor behind the headroom's blocks or the pieces going
+//! back. A worker goes
 //! after [`WORKER_IDLE`] with no take. Every block reads zero at its answer: its worker zeroes
 //! it at its take, off the thread that carried the take out, its bytes counted
 //! ([`super::TAKE_ZEROED_BYTES_CODE`]), but for those the pool's zeroer zeroed ahead of it
@@ -103,11 +106,12 @@ use parking_lot::MutexGuard;
 use reims_vgpu_vulkan::answer::count_kind_by;
 
 use super::{
-    Ask, Error, Live, Mapped, MonoTime, Piece, Shared, State, TAKE_CLAIM_WAIT_MAX_NS_CODE,
-    TAKE_CLAIM_WAIT_NS_CODE, TAKE_CLAIM_WAITS_CODE, TAKE_WAIT_CODES, TAKE_WAITS_CODE,
-    TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE, ZERO_HOLD_LONG, ZERO_HOLD_MAX_NS_CODE,
-    ZERO_HOLD_PART_MAX_NS_CODES, ZERO_HOLDS_LONG_CODE, ZERO_LONG_HOLD_PART_NS_CODES,
-    ZERO_WRITE_MAX_NS_CODE, ZERO_WRITE_NS_CODE, ZEROED_AHEAD_BYTES_CODE,
+    Error, Live, Mapped, MemoryClass, MonoTime, Own, Piece, Shared, State,
+    TAKE_CLAIM_WAIT_MAX_NS_CODE, TAKE_CLAIM_WAIT_NS_CODE, TAKE_CLAIM_WAITS_CODE, TAKE_WAIT_CODES,
+    TAKE_WAITS_CODE, TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE, ZERO_HOLD_LONG,
+    ZERO_HOLD_MAX_NS_CODE, ZERO_HOLD_PART_MAX_NS_CODES, ZERO_HOLDS_LONG_CODE,
+    ZERO_LONG_HOLD_PART_NS_CODES, ZERO_WRITE_MAX_NS_CODE, ZERO_WRITE_NS_CODE,
+    ZEROED_AHEAD_BYTES_CODE,
 };
 
 /// A block's alignment and its length's granule: 64 KiB, the wire's `RGFX_POOL_BLOCK_ALIGN`.
@@ -1038,10 +1042,11 @@ impl Shared {
     }
 
     /// A carve of `len` bytes for the take of `context` numbered `life`, which none fitted at its
-    /// take: asks the pool for a piece of `len`, waits for its thread to place it and the host to
-    /// map it, and carves again, until a carve fits, no piece comes, or the take is stale. Where
-    /// the zeroer's claimed chunk alone keeps it out, it waits for the chunk's write instead of
-    /// asking, counted (the module doc's "Zeros ahead").
+    /// take: takes a block of `len` from the source with the pool's lock let go of, so only this
+    /// take waits for its allocation, hands it to the pool's thread to place, waits for its place
+    /// and the host's map, and carves again, until a carve fits, no piece comes, or the take is
+    /// stale. Where the zeroer's claimed chunk alone keeps it out, it waits for the chunk's write
+    /// instead, counted (the module doc's "Zeros ahead").
     fn carve_grown(
         &self,
         st: &mut MutexGuard<'_, State>,
@@ -1073,12 +1078,29 @@ impl Shared {
                 continue;
             }
             asked = asked.or_else(|| Some((self.now)()));
+            let Some(source) = st.source.clone() else {
+                return Grown::Stale;
+            };
+            let block = MutexGuard::unlocked(st, || source.take_block(MemoryClass::Shared, len));
+            let block = match block {
+                Ok(block) => block,
+                Err(e) => {
+                    MutexGuard::unlocked(st, || {
+                        log::warn!(kind:? = e; "pool: no block of {len} bytes: {e:?}");
+                    });
+                    return Grown::NoRoom;
+                }
+            };
+            if !st.stands(context, life) {
+                // Its take ended, or the device was released, meanwhile: it goes back unplaced.
+                MutexGuard::unlocked(st, || {
+                    let _ = source.release_block(block.id);
+                });
+                return Grown::Stale;
+            }
             let wait = st.next_serial();
             st.waits.insert(wait, None);
-            st.asks.push_back(Ask {
-                length: len,
-                wait: Some(wait),
-            });
+            st.own.push_back(Own { block, wait });
             self.changed.notify_all();
             let placed = loop {
                 if !st.stands(context, life) {

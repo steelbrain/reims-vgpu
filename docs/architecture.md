@@ -498,8 +498,9 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   ahead on Windows (`reims-vgpu.graphics-drawn-spares-<i>`), video
   (`reims-vgpu.graphics-video-<i>`) and event waits (`reims-vgpu.graphics-event-waits`). How
   long a pool keeps an idle thread is `reims-vgpu-graphics`'s `keep`. The guest's Shared pool
-  has a thread of its own (`reims-vgpu.graphics-pool`, 15.1), which takes blocks and gives them
-  back.
+  has two threads of its own (15.1): its taker (`reims-vgpu.graphics-pool-ahead`), which takes
+  the blocks of its own asks for more pool, and its thread (`reims-vgpu.graphics-pool`), which
+  places the blocks, has the host map them and gives them back.
 - A worker per serial queue while it has work (it ends after 5 s idle), the process's display
   thread among them.
 - Metal's completion threads, and the host's own threads inside a call that may call back (both
@@ -945,23 +946,26 @@ The guest's Shared pool (`pool.rs`, api.md "The guest's Shared pool") is a range
 addresses with no RAM under it. The host names the addresses it can give in the config, and the
 device takes as many as its GPU device's memory heaps hold, every heap summed (`pool_range` in
 `graphics.rs`, `PoolConfig::sized`, the sum from `GpuDevice::memory_heaps_total`), which the host
-then reserves (`rvg_graphics_device_pool_range`). The pool's thread takes Shared blocks from its
-block source, places each at the range's lowest free 2 MiB-aligned address, and has the host map it
-there (`pool_add`); a piece is found only once the host says it is in (`pool_added`). The source is
-rt's blocks (`pool::RtBlocks`, the platform's `ApiPlatform::block_source`), each known to its device
-while handed out; where a platform gives none (the testkit's), it is `HostBlocks`, the process's own
-memory, in the same shape (`take_block`, `release_block`). A piece the pool asks for itself is one
-of metal2vulkan-rt's units, 16 MiB (`BLOCK_LEN`, read from rt), and a take longer than a unit has a
-piece of its own length. The pool keeps 64 MiB of empty pieces as headroom (`HEADROOM`), from the
-guest driver's take of `POOL` on (`Host::pool_taken`), so the guest's first takes find them, and
-gives a piece above them that stays empty past `RELEASE_DELAY` back to the source, which keeps it
-ready or frees it. Before a block goes back the pool takes its piece out of the lookups, waits for
-the device's holds on it, asks the host to remove it (`pool_remove`), and gives the block back once
-the host says it is out (`pool_removed`), so the source may free any block it gets back at once: no
-guest access and no thread touches it. A block taken again is placed and mapped anew. The device's
-drop closes the pool after its windows: the pool's thread ends, the pool waits for every hold, gives
-every block back and lets go of the source, which frees them; the host has removed every piece
-before the release (QEMU at its teardown), so the pool asks it nothing then.
+then reserves (`rvg_graphics_device_pool_range`). The pool's taker takes Shared blocks from its
+block source for the pool's own asks, and a take that fits no piece takes a block of its own length
+on its context's take worker, so only that take waits for the source's allocation. The pool's thread
+places each block, the takes' first, at the range's lowest free 2 MiB-aligned address, and has the
+host map it there (`pool_add`); a piece is found only once the host says it is in (`pool_added`).
+The source is rt's blocks (`pool::RtBlocks`, the platform's `ApiPlatform::block_source`), each known
+to its device while handed out; where a platform gives none (the testkit's), it is `HostBlocks`, the
+process's own memory, in the same shape (`take_block`, `release_block`). A piece the pool asks for
+itself is one of metal2vulkan-rt's units, 16 MiB (`BLOCK_LEN`, read from rt), and a take longer than
+a unit has a piece of its own length. The pool keeps 64 MiB of empty pieces as headroom
+(`HEADROOM`), from the guest driver's take of `POOL` on (`Host::pool_taken`), so the guest's first
+takes find them, and gives a piece above them that stays empty past `RELEASE_DELAY` back to the
+source, which keeps it ready or frees it. Before a block goes back the pool takes its piece out of
+the lookups, asks the host to remove it (`pool_remove`) once the device's holds on it are gone, and
+gives the block back once the host says it is out (`pool_removed`), its thread waiting for neither
+meanwhile, so the source may free any block it gets back at once: no guest access and no thread
+touches it. A block taken again is placed and mapped anew. The device's drop closes the pool after
+its windows: the pool's threads end, the pool waits for every hold, gives every block back and lets
+go of the source, which frees them; the host has removed every piece before the release (QEMU at its
+teardown), so the pool asks it nothing then.
 
 ### 15.3 Drop order is explicit
 

@@ -1280,6 +1280,157 @@ impl BlockSource for Gated {
     }
 }
 
+/// A source whose takes of the lengths `gated` names wait until the test opens its gate, counted
+/// as they wait; the rest are [`HostBlocks`]'.
+struct Held {
+    blocks: HostBlocks,
+    gated: fn(u64) -> bool,
+    open: Mutex<bool>,
+    waiting: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl Held {
+    fn new(gated: fn(u64) -> bool) -> Arc<Held> {
+        Arc::new(Held {
+            blocks: HostBlocks::new(),
+            gated,
+            open: Mutex::new(false),
+            waiting: Mutex::new(0),
+            changed: Condvar::new(),
+        })
+    }
+
+    /// The pool over `range(64)` on `host` and `clock`, its blocks from `self`.
+    fn pool(self: &Arc<Self>, host: &Arc<Host>, delay: Duration, clock: PoolNow) -> Pool {
+        let source: Arc<dyn BlockSource> = Arc::clone(self) as _;
+        Pool::with_delay(range(64), host.pool_host(), delay, clock, source).unwrap()
+    }
+
+    /// Waits until `n` takes wait at the gate, or the test fails after 10 s.
+    fn wait_waiting(&self, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut waiting = self.waiting.lock();
+        while *waiting < n {
+            assert!(
+                !self.changed.wait_until(&mut waiting, deadline).timed_out(),
+                "{} takes wait at the gate, not {n}",
+                *waiting
+            );
+        }
+    }
+
+    /// Opens the gate.
+    fn open(&self) {
+        *self.open.lock() = true;
+        self.changed.notify_all();
+    }
+
+    /// A guard that opens the gate at its drop: made after the pool, it drops first, so a test
+    /// that fails with a take at the gate still closes its pool.
+    fn opener(self: &Arc<Self>) -> Opener {
+        Opener(Arc::clone(self))
+    }
+}
+
+/// [`Held::opener`].
+struct Opener(Arc<Held>);
+
+impl Drop for Opener {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+impl BlockSource for Held {
+    fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
+        if (self.gated)(len) {
+            *self.waiting.lock() += 1;
+            self.changed.notify_all();
+            let mut open = self.open.lock();
+            while !*open {
+                self.changed.wait(&mut open);
+            }
+        }
+        self.blocks.take_block(class, len)
+    }
+
+    fn release_block(&self, block: BlockId) -> Result<(), BlockError> {
+        self.blocks.release_block(block)
+    }
+}
+
+/// A take that fits no piece takes a block of its own length on its context's worker, and the
+/// pool's thread places and maps it ahead of the headroom's: it waits behind none of the blocks
+/// the pool's taker takes, which here wait at the source
+#[test]
+fn a_take_of_a_piece_of_its_own_waits_behind_no_headroom_block() {
+    let host = Arc::new(Host::default());
+    let source = Held::new(|len| len <= BLOCK_LEN);
+    let pool = source.pool(&host, LONG, now());
+    let _open = source.opener();
+    let ledger = pool.ledger();
+    assert!(ledger.keep_headroom());
+    source.wait_waiting(1);
+    let long = BLOCK_LEN + TAKE_ALIGN;
+    let rx = take(&ledger, 1, long);
+    // [`HostBlocks`] rounds a block longer than a unit up to 2 MiB.
+    let own = BLOCK_LEN + 2 * MIB;
+    assert_eq!(host.wait_for(1), [Call::Add(BASE, own)]);
+    pool.added(BASE).unwrap();
+    assert_eq!(answer(&rx), Some((0, long)));
+    // The headroom's blocks come once the source gives them, placed past the take's.
+    source.open();
+    let adds: Vec<_> = (0..KEPT)
+        .map(|i| Call::Add(BASE + own + i * BLOCK_LEN, BLOCK_LEN))
+        .collect();
+    assert_eq!(host.wait_for(1 + KEPT_CALLS)[1..], adds[..]);
+}
+
+/// While a take's own block is being made (here: it waits at the source), the rest of the pool
+/// goes on: a piece empty past its delay is asked out of the guest, its remove left unanswered by
+/// the host; another context's take is carved and answered; and the next headroom piece its take
+/// asked is taken, placed past the piece going back, and mapped. The take's block, once it comes,
+/// is placed past them and answered, and the piece going back goes once the host removed it
+#[test]
+fn a_takes_own_block_holds_up_no_other_take_headroom_or_give_back() {
+    let delay = Duration::from_millis(50);
+    let (host, hand) = (Arc::new(Host::default()), Hand::default());
+    let source = Held::new(|len| len > BLOCK_LEN);
+    let pool = source.pool(&host, delay, hand.clock());
+    let _open = source.opener();
+    for _ in 0..=KEPT {
+        pool.grow(BLOCK_LEN);
+    }
+    let n = KEPT_CALLS + 1;
+    host.wait_for(n);
+    for i in 0..=KEPT {
+        pool.added(BASE + i * BLOCK_LEN).unwrap();
+    }
+    let ledger = pool.ledger();
+    let long = BLOCK_LEN + TAKE_ALIGN;
+    let rx = take(&ledger, 1, long);
+    source.wait_waiting(1);
+    hand.on(delay);
+    assert_eq!(host.wait_for(n + 1)[n], Call::Remove(PAST, BLOCK_LEN));
+    assert_eq!(answer(&take(&ledger, 2, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+    let next = PAST + BLOCK_LEN;
+    assert_eq!(host.wait_for(n + 2)[n + 1], Call::Add(next, BLOCK_LEN));
+    pool.added(next).unwrap();
+    assert!(rx.try_recv().is_err(), "answered before its block came");
+    source.open();
+    let at = next + BLOCK_LEN;
+    assert_eq!(
+        host.wait_for(n + 3)[n + 2],
+        Call::Add(at, BLOCK_LEN + 2 * MIB)
+    );
+    pool.added(at).unwrap();
+    assert_eq!(answer(&rx), Some((at - BASE, long)));
+    pool.removed(PAST).unwrap();
+    wait_counts(&source.blocks, n + 1, 1);
+    assert_eq!(host.calls().len(), n + 3);
+}
+
 /// A block the source hands out once the device's release began goes back to it, and the host
 /// is asked to map nothing: it removed its pieces before the release
 #[test]
