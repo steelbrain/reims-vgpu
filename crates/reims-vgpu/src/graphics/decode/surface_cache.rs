@@ -1073,7 +1073,9 @@ impl<P: Platform> Reserve<P> {
     /// Makes the pieces on `device` and reserves them for the block at `block` in `caches`; none
     /// where the platform makes one not, or raises, as the copy then makes its own.
     fn make(self, caches: &Caches<P>, device: &P::Device, block: u64) {
-        let made = self.spares.pieces(device, &self.lens, self.first, self.timed.as_ref());
+        let made = self
+            .spares
+            .pieces(device, &self.lens, self.first, self.timed.as_ref());
         if let Ok(Some(pieces)) = made {
             let mut state = caches.state.lock();
             state.reserved.entry(block).or_default().extend(pieces);
@@ -6524,13 +6526,11 @@ impl<P: Platform> Caches<P> {
             let mut state = self.state.lock();
             let may_copy = state.release_may_copy(block, unheld);
             let lacking = may_copy.then(|| state.lacking(block, Way::Out)).flatten();
-            let reserve = lacking.map(|(lens, first)| {
-                Reserve {
-                    spares: Arc::clone(&state.spares),
-                    lens,
-                    first,
-                    timed: state.staged.clone(),
-                }
+            let reserve = lacking.map(|(lens, first)| Reserve {
+                spares: Arc::clone(&state.spares),
+                lens,
+                first,
+                timed: state.staged.clone(),
             });
             let runs = (state.by_block.contains_key(&block))
                 .then(|| (state.watched.0.lock().get(&block)).map(|p| p.runs.clone()))
@@ -6576,7 +6576,10 @@ impl<P: Platform> Caches<P> {
             return;
         }
         // A copy that lacks pieces has them made on the pace's thread first.
-        let turn = reserve.is_none().then(|| self.pace.turn_now(&now)).flatten();
+        let turn = reserve
+            .is_none()
+            .then(|| self.pace.turn_now(&now))
+            .flatten();
         match turn {
             Some(turn) => {
                 self.after_writers(device, block, Box::new(move |state| op(state, Some(turn))));
@@ -8194,7 +8197,9 @@ fn copy<P: Platform>(
             _ => None,
         };
         let mut pieces = match &packed {
-            Some(packed) => spares.pieces_from(device, reserve, &packed.lens, (first, true), timed)?,
+            Some(packed) => {
+                spares.pieces_from(device, reserve, &packed.lens, (first, true), timed)?
+            }
             None => None,
         };
         if let Some(CachePages::Copied(copied)) = &cache.pages
@@ -15089,7 +15094,11 @@ pub(super) mod tests {
             .map(|c| c.args[0].as_u64())
             .collect();
         let lens = pack(std::iter::once(0..length), PIECE).lens;
-        assert_eq!(made, lens.into_iter().map(Some).collect::<Vec<_>>(), "its piece made");
+        assert_eq!(
+            made,
+            lens.into_iter().map(Some).collect::<Vec<_>>(),
+            "its piece made"
+        );
         let filled = copies(&calls);
         assert_eq!(filled.len(), 1);
         assert_eq!(
@@ -15097,7 +15106,11 @@ pub(super) mod tests {
             written,
             "the CPU's bytes, in the piece reserved for the fill"
         );
-        assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
+        assert_eq!(
+            counted(PIECE_MAKES_LOCKED),
+            locked,
+            "none made under the lock"
+        );
     }
 
     /// Where the caches' copies are staged, a present's fill that lacks pieces the spares do not
@@ -15127,7 +15140,11 @@ pub(super) mod tests {
             .map(|c| c.args[0].as_u64())
             .collect();
         let lens = pack(std::iter::once(0..length), PIECE).lens;
-        assert_eq!(made, lens.into_iter().map(Some).collect::<Vec<_>>(), "its piece made");
+        assert_eq!(
+            made,
+            lens.into_iter().map(Some).collect::<Vec<_>>(),
+            "its piece made"
+        );
         let filled = copies(&calls);
         assert_eq!(filled.len(), 1);
         assert_eq!(
@@ -15135,7 +15152,11 @@ pub(super) mod tests {
             written,
             "the CPU's bytes, in the piece reserved for the fill"
         );
-        assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
+        assert_eq!(
+            counted(PIECE_MAKES_LOCKED),
+            locked,
+            "none made under the lock"
+        );
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(wait.done());
     }
@@ -15191,7 +15212,11 @@ pub(super) mod tests {
             ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0x5a),
             "the pages hold what the GPU copied out of the cache"
         );
-        assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
+        assert_eq!(
+            counted(PIECE_MAKES_LOCKED),
+            locked,
+            "none made under the lock"
+        );
     }
 
     /// Where the caches' copies are staged, a release whose copy lacks pieces the spares do not
@@ -15253,7 +15278,11 @@ pub(super) mod tests {
             ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0xc3),
             "the pages hold what the GPU copied out of the cache"
         );
-        assert_eq!(counted(PIECE_MAKES_LOCKED), locked, "none made under the lock");
+        assert_eq!(
+            counted(PIECE_MAKES_LOCKED),
+            locked,
+            "none made under the lock"
+        );
     }
 
     /// A copy whose takes leave no whole piece among the staged copies' spares hands a top-up to
