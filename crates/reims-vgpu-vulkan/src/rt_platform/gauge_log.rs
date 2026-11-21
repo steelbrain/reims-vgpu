@@ -17,10 +17,13 @@
 //!   their idle allocations and reserve, the blocks taken from them, the live buffers in them and
 //!   the long allocations held again, the textures' places in texture blocks, which are Private
 //!   blocks, and outside the pools, the textures' allocations of their own, the spills, the
-//!   imports and the surface imports; then the live `VkDeviceMemory` allocations, the imports,
-//!   surface imports and exports among them, the live buffers and textures, and the releases
-//!   that wait for the command buffers committed before them. A look at which none changed writes
-//!   no line ([`Lines`]).
+//!   imports, the surface imports, and the preprocess regions, each a buffer on an allocation of
+//!   its own, that executions of indirect command buffers hold (each taken at an execution's
+//!   record and given back when its command buffer completes) and that no execution holds, kept
+//!   for the next ones; then the live `VkDeviceMemory` allocations, the imports, surface imports
+//!   and exports among them, the live buffers and textures, and the releases that wait for the
+//!   command buffers committed before them. A look at which none changed writes no line
+//!   ([`Lines`]).
 
 use std::sync::Once;
 use std::time::Duration;
@@ -61,6 +64,8 @@ pub(crate) fn line(gauges: &rt::Gauges) -> String {
         managed_spilled_bytes,
         import_bytes,
         surface_import_bytes,
+        preprocess_used_bytes,
+        preprocess_idle_bytes,
         blocks,
         imports,
         surface_imports,
@@ -144,6 +149,8 @@ mod tests {
         gauges.shared_buffer_bytes = 65_536;
         gauges.texture_own_bytes = 2_097_152;
         gauges.import_bytes = 3_145_728;
+        gauges.preprocess_used_bytes = 1_179_648;
+        gauges.preprocess_idle_bytes = 524_288;
         gauges.blocks = 6;
         gauges.imports = 3;
         gauges.buffers = 4;
@@ -156,8 +163,9 @@ mod tests {
                         shared_idle_bytes 0, shared_reserve_bytes 0, shared_placed_bytes 65536, \
                         shared_buffer_bytes 65536, shared_long_reused_bytes 0, \
                         texture_own_bytes 2097152, spilled_bytes 0, managed_spilled_bytes 0, \
-                        import_bytes 3145728, surface_import_bytes 0, blocks 6, imports 3, \
-                        surface_imports 0, exports 0, buffers 4, textures 5, \
+                        import_bytes 3145728, surface_import_bytes 0, \
+                        preprocess_used_bytes 1179648, preprocess_idle_bytes 524288, blocks 6, \
+                        imports 3, surface_imports 0, exports 0, buffers 4, textures 5, \
                         releases_waiting 2";
         assert_eq!(line(&gauges), expected);
 
