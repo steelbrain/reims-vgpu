@@ -332,8 +332,9 @@ RgfxSurfaceTable surfaceTable = {nullptr, 0};
 // from before its pages are wired to its block's place in the table, or its failure
 // (pagesBlockOver). A sole holder's block is refused while any is (soleHolderAlone).
 UInt32 writableMakes = 0;
-// The bytes of surface pages the dormant blocks hold at most (RgfxSurfaceBlocks.hpp): an eighth
-// of the guest's memory, read at the first context's open.
+// The bytes of surface pages the dormant blocks hold at most, and of the dormant deferred blocks'
+// caches where half deferredBudget is more (RgfxSurfaceBlocks.hpp): an eighth of the guest's
+// memory, read at the first context's open.
 UInt64 dormantMaxBytes = 0;
 // What the dormant blocks did, under contextLock, logged once something changed and
 // kDormantLogMs passed since the last line (noteDormant).
@@ -2128,8 +2129,10 @@ bool trimDormant()
 	RgfxDormantCause why = kRgfxDormantCauses;
 	for (int32_t i; (i = rgfxSurfaceOverCaps(surfaceTable, dormantMaxBytes, &why)) >= 0;)
 		release |= letGoDormant(static_cast<UInt32>(i), why);
-	// The deferred ones past half the device's budget for them.
-	for (int32_t i; (i = rgfxSurfaceOverDeferredCap(surfaceTable, deferredBudget / 2, &why)) >= 0;)
+	// The deferred ones past the smaller of half the device's budget for them and the dormant
+	// bytes' cap.
+	const uint64_t deferredCap = rgfxSurfaceDormantDeferredCap(deferredBudget, dormantMaxBytes);
+	for (int32_t i; (i = rgfxSurfaceOverDeferredCap(surfaceTable, deferredCap, &why)) >= 0;)
 		release |= letGoDormant(static_cast<UInt32>(i), why);
 	return release;
 }

@@ -36,7 +36,8 @@
 // ask looks up by the IOSurfaceID it gives in its own task, and its holders hold no wired pages.
 // It stays keyed so for its life, its pages named or not. Its bytes count against the device's
 // budget for such caches (rgfxSurfaceDeferFits), held and dormant, until it goes, and a dormant
-// one's against half of it (rgfxSurfaceOverDeferredCap) rather than the cap of wired pages.
+// one's against the dormant deferred cap (rgfxSurfaceDormantDeferredCap,
+// rgfxSurfaceOverDeferredCap) rather than the cap of wired pages.
 // The caller holds the accelerator's lock around every call. Header-only and free of the
 // kernel's headers, so its native test (tests/surface_blocks_test.cpp) builds it as the kext
 // does.
@@ -235,7 +236,7 @@ enum RgfxDormantCause : uint32_t {
 	kRgfxDormantNoSpace,
 	// An ask of its pages it does not answer: by another device cache, or in the other mode.
 	kRgfxDormantStale,
-	// A deferred one, past half the device's budget for deferred blocks' caches, the oldest.
+	// A deferred one, past the dormant deferred cap (rgfxSurfaceDormantDeferredCap), the oldest.
 	kRgfxDormantDeferredBytes,
 	kRgfxDormantCauses,
 };
@@ -665,8 +666,21 @@ inline int32_t rgfxSurfaceOverCaps(const RgfxSurfaceTable &t, uint64_t maxBytes,
 	return rgfxSurfaceOldestDormant(t, kRgfxDormantWiredOnly);
 }
 
-// The dormant deferred entry to let go while their bytes pass `maxBytes`, half the device's
-// budget for deferred blocks' caches: the first of them to go; -1 within it.
+// The dormant deferred blocks' cap: the smaller of half the device's budget for deferred blocks'
+// caches, `deferredBudget`, and `dormantMaxBytes`, the dormant blocks' cap of wired pages (an
+// eighth of the guest's memory). A dormant deferred block's bytes live only in the host's device
+// cache, which stays while the block does, so the guest's cap bounds what the host keeps for
+// blocks no process holds, as it bounds the wired pages of the others. Half the budget alone is
+// sized by the host GPU's memory, not the guest's, and left only kRgfxDormantMaxBlocks to bound
+// them (docs/graphics-kext/design.md).
+inline uint64_t rgfxSurfaceDormantDeferredCap(uint64_t deferredBudget, uint64_t dormantMaxBytes)
+{
+	const uint64_t half = deferredBudget / 2;
+	return half < dormantMaxBytes ? half : dormantMaxBytes;
+}
+
+// The dormant deferred entry to let go while their bytes pass `maxBytes`, the dormant deferred
+// cap (rgfxSurfaceDormantDeferredCap): the first of them to go; -1 within it.
 inline int32_t rgfxSurfaceOverDeferredCap(const RgfxSurfaceTable &t, uint64_t maxBytes,
                                           RgfxDormantCause *why)
 {

@@ -3,8 +3,9 @@
 // let-go, the block with its last holder's, and only a holder's span is named. A dormant block is
 // held again only by its own device cache, live, and the dormant blocks past their caps go
 // oldest first. A deferred block is found by its surface alone, never by pages, counts against
-// the device's budget while it lives and against half of it while dormant, and keeps room for
-// one run a page of its whole allocation, every plane's. A cached block in place is found by its
+// the device's budget while it lives and while dormant against the smaller of half of it and the
+// dormant bytes' cap, an eighth of the guest's memory, and keeps room for one run a page of its
+// whole allocation, every plane's. A cached block in place is found by its
 // surface too, laid out as the ask, by an ask that maps the surface where it asks, and by no
 // other; a surface's memory is its block's runs only page for page. Pages a SURFACE_PAGES named
 // and the host never answered for stay wired. A client's new hold makes its other asks wait until
@@ -264,6 +265,47 @@ void deferred()
 	      "found by its pages, not its surface");
 	rgfxSurfaceClear(t, u);
 	check(t.deferredBytes == kBgra4k, "and its let-go counts nothing twice");
+}
+
+// The dormant deferred blocks' cap is the smaller of half the device's budget for deferred
+// blocks' caches and the dormant bytes' cap, an eighth of the guest's memory, and past it the
+// oldest dormant deferred block goes, though half the budget holds them all.
+void dormantDeferredCap()
+{
+	// A host GPU's budget of 10 GiB, half of it 5 GiB, and an 8 GiB guest's cap of 1 GiB.
+	constexpr uint64_t kBudget = 10ull << 30, kGuestCap = (8ull << 30) / 8;
+	check(rgfxSurfaceDormantDeferredCap(kBudget, kGuestCap) == kGuestCap,
+	      "the guest's cap, where it is the smaller");
+	check(rgfxSurfaceDormantDeferredCap(kBudget, kBudget) == kBudget / 2,
+	      "half the budget, where it is the smaller");
+	check(rgfxSurfaceDormantDeferredCap(0, kGuestCap) == 0, "a budget of 0 keeps none");
+
+	// Three dormant deferred blocks of 400 MiB, 1200 MiB in all: within half the budget, past
+	// the guest's cap.
+	RgfxSurfaceEntry entries[3] = {};
+	RgfxSurfaceTable t = {entries, 3};
+	char surfaces[3] = {};
+	constexpr uint64_t kLength = 400ull << 20;
+	for (uint32_t i = 0; i < 3; i++) {
+		RgfxSurfaceEntry &e = entries[i];
+		e.used = e.inPlace = e.cached = true;
+		e.offset = 0x200000 * (i + 1);
+		e.size = 0x1000;
+		e.length = kLength;
+		e.surface = &surfaces[i];
+		rgfxSurfaceDefer(t, e);
+		rgfxSurfaceSleep(t, e);
+	}
+	check(t.dormantDeferredBytes == 3 * kLength && t.dormantBytes == 0,
+	      "three dormant deferred blocks");
+	RgfxDormantCause why = kRgfxDormantCauses;
+	check(rgfxSurfaceOverDeferredCap(t, kBudget / 2, &why) == -1, "within half the budget");
+	const uint64_t cap = rgfxSurfaceDormantDeferredCap(kBudget, kGuestCap);
+	check(rgfxSurfaceOverDeferredCap(t, cap, &why) == 0 && why == kRgfxDormantDeferredBytes,
+	      "past the guest's cap, the oldest goes");
+	rgfxSurfaceClear(t, entries[0]);
+	check(rgfxSurfaceOverDeferredCap(t, cap, &why) == -1 && t.dormantDeferredBytes == 2 * kLength,
+	      "then the cap holds the other two");
 }
 
 // A SURFACE_PAGES naming a block's pages: named, refused, or never answered, where the host may
@@ -577,6 +619,7 @@ int main()
 {
 	naming();
 	deferred();
+	dormantDeferredCap();
 	cachedBySurface();
 	askNotMapping();
 	runsWalk();

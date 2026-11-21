@@ -878,8 +878,16 @@ Stages:
         table's, the device cache's, and the release thread's), so the
         release copies the cache into them; else nothing reads them. Deferred
         blocks fit the host's budget (`DEFERRED_BUDGET_LO` and `_HI`), held
-        and dormant, and dormant ones are let go past half of it, the oldest
-        first (`guest/kext/src/RgfxSurfaceBlocks.hpp`).
+        and dormant, and dormant ones are let go past the smaller of half of
+        it and an eighth of the guest's memory, the cap of the other dormant
+        blocks' wired bytes, the oldest first
+        (`guest/kext/src/RgfxSurfaceBlocks.hpp`). Only the host's cache
+        holds a dormant deferred block's bytes, so the guest's cap bounds
+        what the host keeps for surfaces no process holds. Half the budget
+        alone is sized by the host GPU's memory and left the count of 1024
+        to bind: after the browser closed, the dormant blocks' caches held
+        3,862 MiB of images on the host, on an 8 GiB arm64 guest
+        (**measured**, macOS 27.0.1 on an M3 Max, walk m3-max-63600).
     - **Device caches on a GPU that shares the CPU's memory:** such a host
       offers `SURFACE_CACHE`, `SURFACE_DEFERRED` and `SURFACE_DEFERRED_CARRY`,
       as a GPU of its own memory does, so the kext caches every surface it
