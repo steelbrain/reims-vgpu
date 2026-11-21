@@ -19,11 +19,18 @@
 # Cargo.toml pins, from a checkout beside the main checkout (M2V_DIR names another), which the job
 # fetches into cargo's git database.
 #
+# The build starts from the machine's base workspace, a build of development the harness keeps
+# there: its new workspace first copies the base's target/ (scripts/internal/mini-base.sh seed,
+# which says what it copied and dropped), and cargo then builds only what this commit changed
+# since the base's. Without a base, or with MINIBASE=0, it builds from nothing. A seeded build or
+# test job that fails says so in its last lines, naming the base, for a run again with MINIBASE=0
+# to tell a seed's fault from a compile error.
+#
 # Environment: PRIORITY (the jobs' potluck priority, default 4), LANE (their `lane` label, default
 # windows-tests), BUILD_RAM and TEST_RAM (GiB each job reserves, its commit charge's limit on
-# Windows: default 12 and 26), OUT (where the jobs' logs go, default target/windows-tests). The
-# workspace stays held for an hour after the tests, for a run again with `potluck dispatch
-# --workspace`; the script prints it.
+# Windows: default 12 and 26), OUT (where the jobs' logs go, default target/windows-tests),
+# MINIBASE (0: the build does not start from the base). The workspace stays held for an hour after
+# the tests, for a run again with `potluck dispatch --workspace`; the script prints it.
 #
 # TEST_RAM's default is 1.25 times the largest commit charge the tests' job was measured at: runs
 # peaked at 14.7 to 18.1 GiB, then one at 20.7 GiB (potluck job m3-max-56017), and a job that
@@ -80,6 +87,7 @@ if [ -n "$job" ]; then
   start=$(date +%s)
   case $job in
     build)
+      bash scripts/internal/mini-base.sh seed
       rm -f "$built"
       cargo nextest run --target "$target" "${args[@]}" --no-run && git rev-parse HEAD > "$built"
       ;;
@@ -93,6 +101,7 @@ if [ -n "$job" ]; then
   esac
   rc=$?
   git checkout -- Cargo.lock
+  [ $rc = 0 ] || bash scripts/internal/mini-base.sh failed
   echo "== windows-tests $job exit $rc in $(( $(date +%s) - start )) s"
   exit $rc
 fi
@@ -114,6 +123,7 @@ main=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
 m2v=${M2V_DIR:-$(dirname "$main")/metal2vulkan}
 common=(--on windows --on "node=$node" --cpu 12 --priority "${PRIORITY:-4}" --kill-on-stall
   --without-submodule vendor/qemu --label "lane=${LANE:-windows-tests}")
+[ -n "${MINIBASE:-}" ] && common+=(--env "MINIBASE=$MINIBASE")
 if [ -n "$rev" ] && [ -d "$m2v" ]; then
   common+=(--carry "$m2v@$rev")
 else
@@ -185,7 +195,7 @@ if ! wait_job "$build" "$out/$head-build.log"; then
 fi
 wait_job "$test" "$out/$head-test.log"
 rc=$?
-grep -aE '^ +(FAIL|SIGSEGV|SIGABRT|TIMEOUT) \[|^ +Summary|^== windows-tests' "$out/$head-test.log" | tail -40
+grep -aE '^ +(FAIL|SIGSEGV|SIGABRT|TIMEOUT) \[|^ +Summary|^mini-base: this|^== windows-tests' "$out/$head-test.log" | tail -40
 potluck why "$test" 2>&1 | grep -E 'peak memory'
 echo "windows-tests: exit $rc; workspace $workspace held for an hour (potluck release $workspace ends it)"
 exit "$rc"
