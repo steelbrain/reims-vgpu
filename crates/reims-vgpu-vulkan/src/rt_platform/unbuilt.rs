@@ -263,8 +263,8 @@ pub enum RtRefusal {
     /// The translator's refusal (`Error::Translation`).
     Translation,
     /// A Metal feature rt does not build yet, a known gap of its own (`Error::Unsupported`), or a
-    /// kernel past rt's stage bound that no helper has compiled (`Error::StageUnfilled`): the
-    /// platform runs no helper, so rt makes no such kernel's pipeline.
+    /// kernel past rt's stage bound that no helper has compiled (`Error::StageUnfilled`), whose
+    /// fill the platform starts in its helper process (`super::stage`).
     Gap,
     /// A call after the device was quiesced (`Error::Quiesced`).
     Quiesced,
