@@ -993,7 +993,7 @@ struct PublishingKext {
 	bool publishNothing = false;
 	// Run once, at the next batch call with a publish, before it posts: the bundle's held messages
 	// are locked for the call then.
-	std::function<void()> once;
+	std::function<void()> once = nullptr;
 
 	static bool submitOne(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
 	                      uint32_t *out_status)
