@@ -63,9 +63,9 @@
 //!      run declines.
 //!   2. **By the device's GPU** ([`GpuCopies`]): each plane copied into the plane's buffer, the
 //!      guest's pages or the surface's device cache, at its own rows and offset, the crop alone as
-//!      the CPU's copy writes it, where the open made a copier. On Linux the open
-//!      makes none; on Windows the rt platform's copier declines each picture, counted, so that
-//!      each lands by the CPU (`rt_windows`).
+//!      the CPU's copy writes it, where the open made a copier. On Linux the rt platform's
+//!      copies make none, only encode sessions' fillers (`fill`); on Windows the rt platform's
+//!      copier declines each picture, counted, so that each lands by the CPU (`rt_windows`).
 //!   3. **By the CPU**: the frame read back (staged, or `vaGetImage`, the VA crate's way back),
 //!      and copied into the planes' host bytes, or into the session's staging for a plane in a
 //!      device cache.
@@ -77,10 +77,10 @@
 //!   (`Frame::write_to_guest`, the first way above) where the import check takes the surface's
 //!   layout and memory, else read back and copied by the CPU into the surface's pages.
 //! - **VideoToolbox's paravirtual encoders** (`encode::VaGuestEncoder`, `super::vt`): an arm64
-//!   guest's encoder reads each source frame from the IOSurface its kext lent: copied by the
-//!   runtime device's GPU from a buffer over its pages into an input surface of the encoder's,
-//!   as an x86 guest's frames are (`encode`'s module doc), else through the host's view of its
-//!   pages, which the VA crate's encoder uploads.
+//!   guest's encoder reads each source frame from the IOSurface its kext lent: written by the
+//!   runtime device's GPU from a buffer over its pages into an input of the encoder's, as an x86
+//!   guest's frames are (`encode`'s module doc), else through the host's view of its pages, which
+//!   the VA crate's encoder uploads.
 //! - **The layout** ([`layout`]) is granularity [2, 2], so that each plane holds the crop's
 //!   even rows and columns, and the alignment the import check found for the codec's formats;
 //!   all zero where it found none.
@@ -110,11 +110,11 @@ use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
-    H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, InputSurface, PlaneRows, Profile,
-    TargetCodec, TargetFor, encoder_support,
+    H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, Target,
+    TargetCodec, TargetFor, VideoEncoder, encoder_support,
 };
 #[cfg(unix)]
-use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, Target, TargetChecks, TargetPlane, TargetShape};
+use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, TargetChecks, TargetPlane, TargetShape};
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::num::ToUsize as _;
@@ -139,6 +139,8 @@ use super::video_host::{
 };
 
 mod encode;
+#[cfg(unix)]
+mod fill;
 #[cfg(windows)]
 mod rt_windows;
 
@@ -224,9 +226,10 @@ impl std::fmt::Display for DisplayAt<'_> {
 
 /// The VA-API video of the rt platform's `device`, on its GPU's render node
 /// (`host_gpus::render_node_at`), as [`open`] opens it; `None`, logged, where its GPU has none.
-/// Its pictures land by the driver's video processing or the CPU's copy, as no GPU copier is
-/// given; a reference picture is not decoded into its cache ([`CachedReferences::Apart`]), and no
-/// encoder is answered: the platform does not yet release an encoder's sources to the driver.
+/// Its pictures land by the driver's video processing or the CPU's copy, as its GPU copies
+/// ([`fill::DeviceFills`]) make no copier; a reference picture is not decoded into its cache
+/// ([`CachedReferences::Apart`]); and no encoder is answered yet, though the GPU copies give an
+/// encode session a filler (`fill`).
 #[cfg(unix)]
 pub(crate) fn open_on_rt(
     device: &RtDevice,
@@ -243,12 +246,14 @@ pub(crate) fn open_on_rt(
         references: CachedReferences::Apart,
         encodes: false,
     };
+    let copies: Arc<dyn GpuCopies<reims_vgpu_vulkan::RtPlatform>> =
+        Arc::new(fill::DeviceFills::new(device, &runtime));
     open::<reims_vgpu_vulkan::RtPlatform>(
         device,
         device.facts().registry_id,
         DisplayAt::Node(&node),
         runtime,
-        None,
+        Some(copies),
         checks,
         rules,
     )
@@ -258,7 +263,8 @@ pub(crate) fn open_on_rt(
 /// the LUID Vulkan answers for it (`rt_platform::HostGpu`), over Mesa's VA-on-D3D12 driver, as
 /// [`open`] opens it; `None`, logged, where its GPU names none. Its pictures land by the CPU's
 /// copy, at the GPU's copy's refusal of each, counted (`rt_windows`); a reference picture is not
-/// decoded into its cache ([`CachedReferences::Apart`]), and no encoder is answered, as on Linux.
+/// decoded into its cache ([`CachedReferences::Apart`]), and no encoder is answered: rt imports
+/// no shared Direct3D 12 texture, which an encoder's input would be written through.
 #[cfg(windows)]
 pub(crate) fn open_on_rt(
     device: &RtDevice,
@@ -1561,21 +1567,29 @@ pub(crate) trait GpuCopies<P: Platform>: Send + Sync {
     }
 }
 
-/// One encode session's GPU copies of its frames into its encoder's input surfaces.
+/// One encode session's GPU writes of its frames into its encoder's inputs.
 pub(crate) trait GpuFiller<P: Platform>: Send {
-    /// Writes the frame of `size`, of samples of `sample` bytes, in `luma` and `chroma` where they
-    /// lie, into `surface`, an input surface of the encoder's of its coded size, the margin past
-    /// the frame filled as the VA crate's upload fills it, and returns once the GPU wrote it;
-    /// [`DeviceWrite::Declined`] with why, nothing written, where it cannot. `Err` where the copy
-    /// failed once on the GPU, which may write the surface still.
+    /// Writes the frame `encoder` codes, of its settings' size and its input's samples, from
+    /// `luma` and `chroma` where they lie, into an input of `encoder`'s shape, the margin past the
+    /// frame filled as the VA crate's upload fills it, and returns once the GPU wrote it;
+    /// [`Filled::Declined`] with why, nothing written, where it cannot. `Err` where the write
+    /// failed once on the GPU, which may write the input still.
     fn fill(
         &mut self,
-        surface: &InputSurface,
+        encoder: &VideoEncoder,
         luma: &OutputPlane<P>,
         chroma: &OutputPlane<P>,
-        size: (u32, u32),
-        sample: u32,
-    ) -> Result<DeviceWrite, BackendError>;
+    ) -> Result<Filled, BackendError>;
+}
+
+/// What came of an encode session's fill of a frame ([`GpuFiller::fill`]). On Windows no filler
+/// makes one: rt imports no shared Direct3D 12 texture there (`rt_windows`).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) enum Filled {
+    /// The frame lies in this input of the encoder's, written and waited for.
+    Written(Target),
+    /// Nothing was written, for the reason given: the frame is uploaded.
+    Declined(String),
 }
 
 /// One session's GPU copies of its pictures into their outputs.

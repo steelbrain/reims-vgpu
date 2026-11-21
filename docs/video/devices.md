@@ -216,8 +216,11 @@ buffer of an encode session's process (reims-vgpu's `graphics/video_host/encode.
 - **The frame is encoded** on the session's encode thread (`reims-vgpu.graphics-video-encode`),
   in the order the encodes were taken, once the command buffer's waits are done. The runtime
   device's GPU copies its two planes, where they lie, in the surface's pages or its device
-  caches, into the encoder's own input: a VA-API input surface exported as dma-bufs, or an
-  exportable buffer CUDA imported, which NVENC registers and maps for the frame. Where the arm
+  caches, into the encoder's own input: on VA-API a buffer of the runtime device's, a dma-buf
+  the encoder's display imports as an input surface (on Linux; on Windows the arm answers no
+  encoder, as the runtime imports no shared Direct3D 12 texture), or on NVENC an exportable
+  buffer CUDA imported, which NVENC registers and maps for the frame. The margin past the
+  picture to the coded size is written as the upload writes it. Where the arm
   declines that copy (said once a session), the planes are read as host bytes, in the surface's
   pages, or, for a plane in a device cache, in a staging buffer the GPU copies it into first, and
   the encoder's upload copies them. The encoder codes the same bytes either way.

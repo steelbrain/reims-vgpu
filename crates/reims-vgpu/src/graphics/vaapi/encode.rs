@@ -15,23 +15,25 @@
 //!   to the encoder from the next frame. `min_qp`, `max_qp` and a change of `quality` alone are
 //!   not taken: the VA crate's encoder has no such setting.
 //! - **A frame** ([`VaFrame`]) reaches the encoder on the session's encode thread one of two
-//!   ways. By the device's GPU, where the session's copier gives a filler (`super::GpuCopies`;
-//!   the rt platform's gives none, so a frame reaches the encoder the other way): a
-//!   copy of the source's planes, where they lie, in the surface's pages or its device caches,
-//!   into an input surface of the encoder's, exported as dma-bufs (the VA crate's
-//!   `VideoEncoder::input_surface`), its margin to the coded size filled as an upload fills it, so
-//!   the encoder codes the same bytes either way. Else, and where the copy is declined (said once
-//!   a session, with why, at info), from the source's host bytes, which the VA crate's encoder
-//!   uploads. Its sample, NAL units behind four-byte lengths, is written as Annex B: a keyframe's
-//!   parameter sets first, from the encoder's configuration record (`avcC`, `hvcC`). One that
-//!   does not fit the capacity is not written, and the next frame is made a keyframe.
+//!   ways. By the device's GPU, where the session's copies give a filler (`super::GpuCopies`; on
+//!   Linux the rt platform's, `super::fill`, and on Windows none, as rt imports no shared
+//!   Direct3D 12 texture): the source's planes, read where they lie, in the surface's pages or its
+//!   device caches, written into an input of the encoder's, a buffer of the device's that the
+//!   encoder's display imports (the VA crate's `VideoEncoder::import_input`), its margin to the
+//!   coded size filled as an upload fills it, so the encoder codes the same bytes either way
+//!   (`VideoEncoder::encode_target`). Else, and where the write is declined (said once a
+//!   session, with why, at info), from the source's host bytes, which the VA crate's encoder
+//!   uploads. The session logs at its end how many frames went each way. Its sample, NAL units
+//!   behind four-byte lengths, is written as Annex B: a keyframe's parameter sets first, from the
+//!   encoder's configuration record (`avcC`, `hvcC`). One that does not fit the capacity is not
+//!   written, and the next frame is made a keyframe.
 //! - **VideoToolbox's paravirtual encoders** (`VaGuestEncoder`, `super::super::vt`): an arm64
 //!   guest's encoders, one for each codec the driver encodes a profile of ([`guest_encoders`]),
 //!   whose settings the guest's session properties make, `Quality` onto the quality levels as
-//!   `quality` maps. Each source frame reaches the encoder as an x86 guest's frame does: copied by
-//!   the runtime device's GPU from a Shared buffer over the IOSurface's pages, which the guest
-//!   lent, into an input surface of the encoder's; else, and where the copy is declined (said
-//!   once a session), from the host's view of the pages, which the VA crate's encoder uploads.
+//!   `quality` maps. Each source frame reaches the encoder as an x86 guest's frame does: written
+//!   by the runtime device's GPU from a Shared buffer over the IOSurface's pages, which the guest
+//!   lent, into an input of the encoder's; else, and where the write is declined (said once a
+//!   session), from the host's view of the pages, which the VA crate's encoder uploads.
 //!   A change of the bitrate, frame rate or key-frame interval goes to the encoder from the next
 //!   frame; one that makes a new sequence, or changes the rate control's mode, makes a new
 //!   encoder before the first frame, and after it is answered as taken and left out, the running
@@ -56,22 +58,21 @@ use reims_vgpu_video::codec::encode::{
     InputFrame, Plane, Profile as EncodeProfile, RateControl,
 };
 use reims_vgpu_video::core::backend::BackendError as VideoError;
-use reims_vgpu_video::core::backend::DeviceWrite;
 use reims_vgpu_video::core::surfaces::PlaneLayout;
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, SourceFrame};
-use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, InputSurface, VideoEncoder};
+use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, Target, VideoEncoder};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::super::decode::{GuestEncoder, GuestSource, rate_past_first_frame, same_rate_mode};
 use super::super::video_host::{
     BackendError, EncodeFrame, EncodeSource, Encoded, FrameSource, HostEncodedFrame, HostEncoder,
-    SourcePlane,
+    OutputPlane, SourcePlane,
 };
 use super::super::vt_encode::{
     buffer_planes, encoders_of, host_planes, quality_percent, source_planes,
 };
-use super::{GpuFiller, H264_TOP_LEVEL, HEVC_TOP_LEVEL, MIN_SIZE, NAME};
+use super::{Filled, GpuFiller, H264_TOP_LEVEL, HEVC_TOP_LEVEL, MIN_SIZE, NAME};
 
 /// `VA_RC_CBR`, `VA_RC_VBR` and `VA_RC_CQP` (va.h): rate control bits of
 /// `VAConfigAttribRateControl`.
@@ -349,17 +350,31 @@ impl State {
     }
 }
 
-/// A session's GPU filler, its frames' to share, or why it has none; and the reasons a frame was
-/// uploaded instead, each said once.
+/// A session's GPU filler, its frames' to share, or why it has none; the reasons a frame was
+/// uploaded instead, each said once; and how many frames went each way, which the session logs
+/// at its end.
 struct Fills<P: Platform> {
     filler: Result<Box<dyn GpuFiller<P>>, String>,
     said: Vec<String>,
-    /// The input surfaces of fills that failed on the GPU, which may write them still: kept out
-    /// of the encoder's pool while the session lives.
-    failed: Vec<InputSurface>,
+    /// Fillers whose write failed on the GPU, which may write their inputs still: kept, and their
+    /// inputs with them, while the session lives.
+    failed: Vec<Box<dyn GpuFiller<P>>>,
+    filled: u64,
+    uploaded: u64,
 }
 
 impl<P: Platform> Fills<P> {
+    /// A session's fills by `filler` where it is given (or why not).
+    fn new(filler: Result<Box<dyn GpuFiller<P>>, String>) -> Self {
+        Self {
+            filler,
+            said: Vec::new(),
+            failed: Vec::new(),
+            filled: 0,
+            uploaded: 0,
+        }
+    }
+
     /// Says, once a session, and at info once per process (`kind`), why a frame was uploaded by
     /// the CPU.
     fn uploaded_because(&mut self, why: String) {
@@ -368,12 +383,62 @@ impl<P: Platform> Fills<P> {
             self.said.push(why);
         }
     }
+
+    /// The input of `encoder`'s that the session's filler wrote the frame into from `luma` and
+    /// `chroma` where they lie (module doc); `None` where the write was declined, nothing
+    /// written, which is said once a session. `Err` where it failed once on the GPU: the
+    /// filler is kept, and the session's frames are uploaded from here on.
+    fn fill(
+        &mut self,
+        encoder: &VideoEncoder,
+        luma: &OutputPlane<P>,
+        chroma: &OutputPlane<P>,
+    ) -> Result<Option<Target>, BackendError> {
+        let filled = match &mut self.filler {
+            Ok(filler) => filler.fill(encoder, luma, chroma),
+            Err(why) => {
+                let why = why.clone();
+                self.uploaded_because(why);
+                return Ok(None);
+            }
+        };
+        match filled {
+            Ok(Filled::Written(target)) => {
+                self.filled += 1;
+                Ok(Some(target))
+            }
+            Ok(Filled::Declined(why)) => {
+                self.uploaded_because(format!("the GPU's copy: {why}"));
+                Ok(None)
+            }
+            Err(error) => {
+                let why = format!("the GPU's copy failed: {error}");
+                if let Ok(filler) = std::mem::replace(&mut self.filler, Err(why)) {
+                    self.failed.push(filler);
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<P: Platform> Drop for Fills<P> {
+    fn drop(&mut self) {
+        if self.filled + self.uploaded > 0 {
+            log::info!(
+                "hardware video: {NAME}: an encode session's frames: {} written by the GPU, {} \
+                 uploaded by the CPU",
+                self.filled,
+                self.uploaded
+            );
+        }
+    }
 }
 
 /// A session's encoder on VA-API ([`HostEncoder`]).
 pub(super) struct VaEncoder<P: Platform> {
     state: Arc<Mutex<State>>,
-    /// What writes its frames into the encoder's input surfaces on the GPU (module doc).
+    /// What writes its frames into the encoder's inputs on the GPU (module doc).
     fills: Arc<Mutex<Fills<P>>>,
     /// The profiles the driver encodes, which [`HostEncoder::check`] holds settings to.
     supports: Arc<[EncoderSupport]>,
@@ -386,7 +451,7 @@ pub(super) struct VaEncoder<P: Platform> {
 
 impl<P: Platform> VaEncoder<P> {
     /// An encoder of `codec` on `display`, which encodes `supports`, as its entry `entry` and
-    /// `encode` list them, its frames written into its input surfaces by `filler` where it is
+    /// `encode` list them, its frames written into its inputs by `filler` where it is
     /// given (or why not).
     pub(super) fn new(
         display: &Display,
@@ -410,11 +475,7 @@ impl<P: Platform> VaEncoder<P> {
                 settings: None,
                 key_next: false,
             })),
-            fills: Arc::new(Mutex::new(Fills {
-                filler,
-                said: Vec::new(),
-                failed: Vec::new(),
-            })),
+            fills: Arc::new(Mutex::new(Fills::new(filler))),
             supports,
             min_size: entry.min_size,
             max_size: entry.max_size,
@@ -494,15 +555,16 @@ impl<P: Platform> HostEncodedFrame<P> for VaFrame<P> {
         if let Some(encoded) = self.filled(&mut state, &input, source, out)? {
             return Ok(encoded);
         }
+        self.fills.lock().uploaded += 1;
         let host = source.host()?;
         encode_host(&mut state, &input, &host, out)
     }
 }
 
 impl<P: Platform> VaFrame<P> {
-    /// The frame encoded from `source`'s planes where they lie, copied by the GPU into an input
-    /// surface of the encoder's (module doc), into `out`; `None` where the copy was declined,
-    /// nothing written, which is said once a session. `Err` where the encode failed, or the copy
+    /// The frame encoded from `source`'s planes where they lie, written by the GPU into an input
+    /// of the encoder's (module doc), into `out`; `None` where the write was declined, nothing
+    /// written, which is said once a session. `Err` where the encode failed, or the write
     /// failed once on the GPU.
     fn filled(
         &self,
@@ -511,44 +573,13 @@ impl<P: Platform> VaFrame<P> {
         source: &FrameSource<'_, P>,
         out: &mut [u8],
     ) -> Result<Option<Encoded>, BackendError> {
-        let mut fills = self.fills.lock();
-        let declined = match &mut fills.filler {
-            Ok(filler) => {
-                let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
-                match encoder.input_surface() {
-                    Ok(surface) => {
-                        let [luma, chroma] = source.planes();
-                        let sample = encoder.settings().input_format().bytes_per_sample();
-                        let sample = u32::try_from(sample).unwrap_or(0);
-                        match filler.fill(&surface, luma, chroma, source.size(), sample) {
-                            Ok(DeviceWrite::Written) => {
-                                drop(fills);
-                                let coded = encoder.encode_surface(surface, input)?;
-                                return finish_coded(state, coded, out).map(Some);
-                            }
-                            Ok(DeviceWrite::Declined(why)) => format!("the GPU's copy: {why}"),
-                            // The GPU may write the surface still: it stays out of the pool, and
-                            // the session's frames are uploaded from here on.
-                            Err(error) => {
-                                fills.failed.push(surface);
-                                fills.filler = Err(format!("the GPU's copy failed: {error}"));
-                                return Err(error);
-                            }
-                        }
-                    }
-                    // The driver's surfaces export so for none of its frames: the session's
-                    // frames are uploaded from here on.
-                    Err(why) => {
-                        let why = format!("no input surface for the GPU's copy: {why}");
-                        fills.filler = Err(why.clone());
-                        why
-                    }
-                }
-            }
-            Err(why) => why.clone(),
+        let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
+        let [luma, chroma] = source.planes();
+        let Some(target) = self.fills.lock().fill(encoder, luma, chroma)? else {
+            return Ok(None);
         };
-        fills.uploaded_because(declined);
-        Ok(None)
+        let coded = encoder.encode_target(&target, input)?;
+        finish_coded(state, coded, out).map(Some)
     }
 
     /// [`HostEncodedFrame::finish`] from `source`'s host bytes, which the encoder uploads.
@@ -727,13 +758,13 @@ pub(super) struct VaGuestEncoder<P: Platform> {
     /// Whether a frame was encoded: until then, settings that make a new sequence make a new
     /// encoder.
     encoded: bool,
-    /// What writes its source frames into the encoder's input surfaces on the GPU (module doc).
+    /// What writes its source frames into the encoder's inputs on the GPU (module doc).
     fills: Fills<P>,
 }
 
 impl<P: Platform> VaGuestEncoder<P> {
     /// An encoder of `config` on `display`, whose driver encodes `supports`, its frames written
-    /// into its input surfaces by `filler` where it is given (or why not).
+    /// into its inputs by `filler` where it is given (or why not).
     pub(super) fn new(
         display: &Display,
         supports: &[EncoderSupport],
@@ -755,59 +786,31 @@ impl<P: Platform> VaGuestEncoder<P> {
             encoder,
             settings,
             encoded: false,
-            fills: Fills {
-                filler,
-                said: Vec::new(),
-                failed: Vec::new(),
-            },
+            fills: Fills::new(filler),
         })
     }
 
     /// The frame of `times` encoded from `planes`, the source surface's luma and chroma in
-    /// `buffer`, over its pages, copied by the GPU into an input surface of the encoder's
-    /// (module doc); `None` where the copy was declined, nothing written, which is said once a
-    /// session. `Err` where the encode failed, or the copy failed once on the GPU.
+    /// `buffer`, over its pages, written by the GPU into an input of the encoder's (module doc);
+    /// `None` where the write was declined, nothing written, which is said once a session. `Err`
+    /// where the encode failed, or the write failed once on the GPU.
     fn filled(
         &mut self,
         buffer: &P::Buffer,
         planes: &[PlaneLayout; 2],
         times: &InputFrame<'_>,
     ) -> Result<Option<Vec<Coded<reims_vgpu_video::vaapi::Error>>>, VideoError> {
-        let declined = match &mut self.fills.filler {
-            Ok(filler) => match self.encoder.input_surface() {
-                Ok(surface) => {
-                    let (width, height) = (self.settings.width, self.settings.height);
-                    let sample = self.settings.input_format().bytes_per_sample();
-                    let sample = u32::try_from(sample).unwrap_or(0);
-                    let [luma, chroma] = buffer_planes(buffer, planes, (width, height), sample);
-                    match filler.fill(&surface, &luma, &chroma, (width, height), sample) {
-                        Ok(DeviceWrite::Written) => {
-                            let coded = (self.encoder.encode_surface(surface, times))
-                                .map_err(super::video_error)?;
-                            return Ok(Some(coded));
-                        }
-                        Ok(DeviceWrite::Declined(why)) => format!("the GPU's copy: {why}"),
-                        // The GPU may write the surface still: it stays out of the pool, and the
-                        // session's frames are uploaded from here on.
-                        Err(error) => {
-                            self.fills.failed.push(surface);
-                            self.fills.filler = Err(format!("the GPU's copy failed: {error}"));
-                            return Err(VideoError::Malfunction(error.to_string()));
-                        }
-                    }
-                }
-                // The driver's surfaces export so for none of its frames: the session's frames
-                // are uploaded from here on.
-                Err(why) => {
-                    let why = format!("no input surface for the GPU's copy: {why}");
-                    self.fills.filler = Err(why.clone());
-                    why
-                }
-            },
-            Err(why) => why.clone(),
+        let (width, height) = (self.settings.width, self.settings.height);
+        let sample = self.settings.input_format().bytes_per_sample();
+        let sample = u32::try_from(sample).unwrap_or(0);
+        let [luma, chroma] = buffer_planes(buffer, planes, (width, height), sample);
+        let filled = self.fills.fill(&self.encoder, &luma, &chroma);
+        let Some(target) = filled.map_err(|error| VideoError::Malfunction(error.to_string()))?
+        else {
+            return Ok(None);
         };
-        self.fills.uploaded_because(declined);
-        Ok(None)
+        let coded = (self.encoder.encode_target(&target, times)).map_err(super::video_error)?;
+        Ok(Some(coded))
     }
 }
 
@@ -875,6 +878,7 @@ impl<P: Platform> GuestEncoder<P> for VaGuestEncoder<P> {
             self.encoded = true;
             return Ok(guest_coded(coded));
         }
+        self.fills.uploaded += 1;
         let view = (source.memory.host_view())
             .map_err(|error| VideoError::Malfunction(error.to_string()))?;
         let [y, uv] = host_planes(&view, &[luma, chroma])?;
