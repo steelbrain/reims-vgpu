@@ -83,10 +83,11 @@ pub enum Step {
     /// The call is held, with nothing of the fake's locked, until the test lets it go; then the
     /// model answers.
     Hold(HeldCall),
-    /// A dispatch the platform refuses for this stage, whose compile is not in its store: the
-    /// dispatch waits for the stage's fill ([`FakeStages`](super::stages::FakeStages)), then is
-    /// made, where the fill filled the store, else answered as refused. Another call takes it as
-    /// `Default`.
+    /// A call the platform refuses for this stage, whose compile is not in its store. A dispatch
+    /// waits for the stage's fill ([`FakeStages`](super::stages::FakeStages)), then is made, where
+    /// the fill filled the store, else answered as refused; a compute state's make asks for the
+    /// fill, notes it for its caller and answers its refusal at once (`impls::device`'s
+    /// `stage_refusal`). Another call takes it as `Default`.
     Stage(u64),
 }
 

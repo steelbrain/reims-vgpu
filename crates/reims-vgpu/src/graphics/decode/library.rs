@@ -379,6 +379,14 @@ pub(crate) enum LibraryRef<P: Platform> {
 }
 
 impl<P: Platform> LibraryRef<P> {
+    /// Another reference to the same library, or to the same make of it.
+    pub(crate) fn clone_ref(&self) -> Self {
+        match self {
+            LibraryRef::Ready(library) => LibraryRef::Ready(library.clone_ref()),
+            LibraryRef::Making(slot) => LibraryRef::Making(Arc::clone(slot)),
+        }
+    }
+
     /// The library, waiting for its make where it is being made; `None` where that was refused.
     pub(crate) fn resolve(self) -> Option<P::Library> {
         match self {

@@ -840,6 +840,27 @@ impl<P: Platform> Context<P> {
         Some((at, replaced))
     }
 
+    /// The table's clock now: a view taken now is taken at it ([`View::take`]).
+    pub(crate) fn clock(&self) -> u64 {
+        self.tables.read().clock
+    }
+
+    /// The entry of `id` that a view taken at `at` names though it may have been stored after
+    /// the view's taking, since the message that made it began before ([`Self::insert_after`]'s
+    /// `seen_from`, the entry's `seen`, at or before `at`): the live one, else one removed since
+    /// `at` and kept for such a view. A view names it then as it names its message's own make
+    /// ([`View::made`]).
+    pub(crate) fn stored_for(&self, id: u64, at: u64) -> Option<NonNull<Entry<P>>> {
+        let t = self.tables.read();
+        if let Some(owned) = t.live.get(&id).filter(|o| o.entry().seen <= at) {
+            return Some(owned.0);
+        }
+        t.gone.iter().rev().find_map(|g| {
+            let r = &g.removed;
+            (r.id == id && r.owned.entry().seen <= at && at < g.at).then_some(r.owned.0)
+        })
+    }
+
     /// [`Self::remove_after`] with no command buffer to wait for.
     #[cfg(test)]
     pub(crate) fn remove(&self, id: u64) -> Option<(bool, Option<Removed<P>>)> {
@@ -1058,7 +1079,8 @@ impl<P: Platform> View<P> {
         };
         // SAFETY: the entry was in the table, made by the view's taking, or removed after it; or
         // it is the message's own make, whose `seen` is this view's clock or earlier (the
-        // decoder's `view_at`), removed (if at all) after this view's taking. Either way this view
+        // decoder's `view_at`), or one stored for the view since ([`Context::stored_for`]), whose
+        // `seen` is too, either removed (if at all) after this view's taking. Either way this view
         // names it, so it is freed only once no such view is open, and this one is until it
         // drops: it outlives `&self`.
         found.map(|p| unsafe { p.as_ref() })

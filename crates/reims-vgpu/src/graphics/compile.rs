@@ -30,12 +30,27 @@
 //!
 //! **Order.** From its dispatch until it is stored, the pipeline is pending. A command buffer
 //! that names a pending pipeline (`SET_RENDER_PIPELINE_STATE`, `SET_COMPUTE_PIPELINE_STATE`: the
-//! only ops that name one) waits for it before it is decoded; one that names none is not held.
-//! An `OBJECT_DESTROY` of a pending pipeline, or its context's close, cancels it: the compile's
+//! only ops that name one) is begun on its queue's service thread, which goes on to the queue's
+//! next buffers, and waits for it on its queue's lane before its walk ([`Pending::wait_on_lane`]),
+//! the lane walking its next buffers meanwhile; its view of the table then names the pipeline
+//! stored since, as one taken after the store would. One that names none is not held. An
+//! `OBJECT_DESTROY` of a pending pipeline, or its context's close, cancels it: the compile's
 //! pipeline is then not stored, so the destroy keeps its place in ring order: the compile's store
 //! asks the pending set under the lock of the table the pipeline goes in, and the destroy cancels
-//! it before it removes from that table. A table's lock is taken before the pending set's wherever
-//! both are held, and a waiter holds only the pending set's.
+//! it before it removes from that table; a buffer waits for no cancelled pipeline. A table's lock
+//! is taken before the pending set's wherever both are held, and a waiter holds only the pending
+//! set's. The device's reset ends every such wait as it begins ([`Pending::resetting`]).
+//!
+//! **A make held for its stage.** A compute pipeline whose make the platform refused for a stage
+//! whose compile runs outside the process
+//! ([`reims_vgpu_vulkan::core::platform::stage::making`]) stays pending, its compile's thread
+//! let go, until the stage's fill ends: where the fill filled the store, the make is made again
+//! on the pool, once, and its answer stands; after a breach or a failed fill, or the pipeline's
+//! destroy or its context's close meanwhile, the first refusal stands, made no more; and after a
+//! cancelled fill (the device's reset, the process's exit) the pipeline is let go of unstored, on
+//! the thread that cancelled it, and its reply posted where the ring has room, waiting for
+//! nothing. A command buffer that names it waits for it on its lane meanwhile, minutes where its
+//! stage's compile takes them.
 //!
 //! **At the exit.** Each compile a thread runs is a making of the exit gate's
 //! ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for those in progress, and a
@@ -44,7 +59,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use reims_vgpu_graphics::icb::{
@@ -518,7 +533,9 @@ pub(crate) struct Pending {
     ids: Mutex<HashMap<u64, (bool, u64)>>,
     /// The device's resets so far ([`Self::reset`]).
     resets: AtomicU64,
-    /// Notified as each pending pipeline is done, and at a reset.
+    /// A reset begun ([`Self::resetting`]) and not yet carried out ([`Self::reset`]).
+    resetting: AtomicBool,
+    /// Notified as each pending pipeline is done or cancelled, and at a reset.
     done: Condvar,
 }
 
@@ -532,20 +549,34 @@ impl Pending {
         began
     }
 
-    /// An `OBJECT_DESTROY` of `obj_id`: a pending pipeline is not stored when its compile ends.
+    /// An `OBJECT_DESTROY` of `obj_id`: a pending pipeline is not stored when its compile ends,
+    /// and no command buffer waits for it.
     pub(crate) fn cancel(&self, obj_id: u64) {
         if let Some((cancelled, _)) = self.ids.lock().get_mut(&obj_id) {
             *cancelled = true;
         }
+        self.done.notify_all();
     }
 
-    /// Context `context`'s close: none of its pending pipelines is stored.
+    /// Context `context`'s close: none of its pending pipelines is stored, and no command buffer
+    /// waits for one.
     pub(crate) fn cancel_context(&self, context: u32) {
         for (id, (cancelled, _)) in self.ids.lock().iter_mut() {
             if id >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context) {
                 *cancelled = true;
             }
         }
+        self.done.notify_all();
+    }
+
+    /// The device's reset begins: every command buffer's wait on its lane ([`Self::wait_on_lane`])
+    /// ends, and one that begins before the reset is carried out ([`Self::reset`]) ends at once,
+    /// so the lanes' jobs let go of the reset's gate with no compile waited for.
+    pub(crate) fn resetting(&self) {
+        let ids = self.ids.lock();
+        self.resetting.store(true, Ordering::Release);
+        drop(ids);
+        self.done.notify_all();
     }
 
     /// The device's reset: no pipeline pending is stored, a command buffer waiting on one goes on,
@@ -555,6 +586,7 @@ impl Pending {
         let mut ids = self.ids.lock();
         self.resets.fetch_add(1, Ordering::AcqRel);
         ids.clear();
+        self.resetting.store(false, Ordering::Release);
         drop(ids);
         self.done.notify_all();
     }
@@ -585,17 +617,37 @@ impl Pending {
         ids.is_empty() || !pipelines_named(message).any(|id| ids.contains_key(&id))
     }
 
-    /// Waits until no pipeline the command buffer `message` names is pending.
-    pub(crate) fn wait_for_command_buffer(&self, message: &[u8]) {
-        let mut ids = self.ids.lock();
+    /// The pipelines the command buffer `message` names that are pending and not cancelled, each
+    /// once: those its walk waits for ([`Self::wait_on_lane`]). Empty, allocating nothing, where
+    /// none is pending.
+    pub(crate) fn named_by(&self, message: &[u8]) -> Vec<u64> {
+        let ids = self.ids.lock();
         if ids.is_empty() {
-            return;
+            return Vec::new();
         }
-        let named = named_pipelines(message);
-        while named.iter().any(|id| ids.contains_key(id)) {
+        let mut named: Vec<u64> = pipelines_named(message)
+            .filter(|&id| uncancelled(&ids, id))
+            .collect();
+        named.sort_unstable();
+        named.dedup();
+        named
+    }
+
+    /// Waits, on a command buffer's lane, until none of the pipelines `named` is pending and not
+    /// cancelled, or the device's reset begins ([`Self::resetting`]).
+    pub(crate) fn wait_on_lane(&self, named: &[u64]) {
+        let mut ids = self.ids.lock();
+        while !self.resetting.load(Ordering::Acquire)
+            && named.iter().any(|&id| uncancelled(&ids, id))
+        {
             self.done.wait(&mut ids);
         }
     }
+}
+
+/// Whether `id` is pending in `ids`, a [`Pending`]'s, and not cancelled.
+fn uncancelled(ids: &HashMap<u64, (bool, u64)>, id: u64) -> bool {
+    ids.get(&id).is_some_and(|&(cancelled, _)| !cancelled)
 }
 
 impl Pending {
@@ -727,14 +779,9 @@ pub(crate) fn icb_write_pipelines(message: &[u8]) -> Vec<u64> {
     named
 }
 
-/// The pipelines a `COMMAND_BUFFER` message's ops name: each `SET_RENDER_PIPELINE_STATE` and
-/// `SET_COMPUTE_PIPELINE_STATE`'s, nil left out. The walk stops at an op it cannot step past; the
-/// decoder refuses such a stream itself.
-pub(crate) fn named_pipelines(message: &[u8]) -> Vec<u64> {
-    pipelines_named(message).collect()
-}
-
-/// [`named_pipelines`], read in place, allocating nothing.
+/// The pipelines a `COMMAND_BUFFER` message's ops name, read in place, allocating nothing: each
+/// `SET_RENDER_PIPELINE_STATE` and `SET_COMPUTE_PIPELINE_STATE`'s, nil left out. The walk stops at
+/// an op it cannot step past; the decoder refuses such a stream itself.
 fn pipelines_named(message: &[u8]) -> impl Iterator<Item = u64> + '_ {
     let end = RgfxCommandBuffer::read_from_prefix(message)
         .ok()

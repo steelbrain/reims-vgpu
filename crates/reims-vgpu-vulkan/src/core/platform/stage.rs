@@ -17,6 +17,10 @@
 //! - **Nothing waits but a hold.** [`StageFills::fill`] returns at once. A walk's dispatch waits
 //!   for its fill ([`Fill::wait`]); a make is made again at its fill's end ([`Fill::on_end`]); a
 //!   make ahead waits for nothing.
+//! - **A make's refusal hands its fill out.** A make refused for a stage not in the store notes
+//!   the fill it asked for ([`refused_for`]) for the [`making`] it runs in, and answers its
+//!   refusal as before: the make's caller, which [`making`] answers the fill, makes it again at
+//!   that fill's end.
 //! - **A refusal says its fill's end.** A dispatch [`held`] did not make answers its refusal with
 //!   how its stage's fill ended ([`Refused`]), which its platform answers by: on the rt platform,
 //!   a dispatch whose fill failed or breached is skipped, and its command buffer fails.
@@ -59,7 +63,8 @@ pub enum FillEnd {
 /// names ([`Start`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Site {
-    /// A pipeline state's make: it fails, and a later make of the state finds the stage filled.
+    /// A pipeline state's make: it fails, and its caller makes it again at the fill's end
+    /// ([`making`]).
     Make,
     /// A dispatch's make ahead, in its command buffer's pre-pass: it waits for nothing.
     MakeAhead,
@@ -481,6 +486,41 @@ impl Drop for Holding {
     }
 }
 
+thread_local! {
+    /// While a [`making`] runs on the thread: the fill its make's first refusal for a stage noted
+    /// ([`refused_for`]), if one has.
+    static MAKING: RefCell<Option<Option<Arc<Fill>>>> = const { RefCell::new(None) };
+}
+
+/// Runs `make`, a make of a pipeline state, and answers its answer with the fill that the make's
+/// first refusal for a stage not in the store asked for ([`refused_for`]), if one did. A making
+/// inside `make` answers its own make's fill, which the outer one does not see.
+pub fn making<T>(make: impl FnOnce() -> T) -> (T, Option<Arc<Fill>>) {
+    /// The outer making's slot, put back where the make returns or unwinds.
+    struct Outer(Option<Option<Arc<Fill>>>);
+    impl Drop for Outer {
+        fn drop(&mut self) {
+            let outer = self.0.take();
+            MAKING.with(|slot| *slot.borrow_mut() = outer);
+        }
+    }
+    let outer = Outer(MAKING.with(|slot| slot.replace(Some(None))));
+    let answer = make();
+    let fill = MAKING.with(|slot| slot.borrow_mut().take()).flatten();
+    drop(outer);
+    (answer, fill)
+}
+
+/// Notes `fill`, the fill a make's refusal asked for, for the [`making`] the make runs in, where
+/// none was noted before in it. Outside a making it notes nothing.
+pub fn refused_for(fill: &Arc<Fill>) {
+    MAKING.with(|slot| {
+        if let Some(noted @ None) = &mut *slot.borrow_mut() {
+            *noted = Some(Arc::clone(fill));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -842,5 +882,40 @@ mod tests {
         fake.end(FillEnd::Breached);
         assert_eq!(got.recv().unwrap(), FillEnd::Breached);
         waiter.join().unwrap().unwrap();
+    }
+
+    /// A making answers the fill its make's first refusal noted, and only that one.
+    #[test]
+    fn a_making_answers_the_first_fill_its_make_noted() {
+        let first = Fill::ended_with(FillEnd::Filled);
+        let second = Fill::ended_with(FillEnd::Breached);
+        let (answer, noted) = making(|| {
+            refused_for(&first);
+            refused_for(&second);
+            7
+        });
+        assert_eq!(answer, 7);
+        assert!(Arc::ptr_eq(&noted.unwrap(), &first));
+        let ((), none) = making(|| ());
+        assert!(none.is_none());
+    }
+
+    /// A fill noted outside a making is noted nowhere, and a making inside a make keeps its fill
+    /// from the outer one.
+    #[test]
+    fn a_fill_is_noted_for_its_own_making_alone() {
+        let stray = Fill::ended_with(FillEnd::Failed);
+        refused_for(&stray);
+        let inner = Fill::ended_with(FillEnd::Filled);
+        let outer = Fill::ended_with(FillEnd::Breached);
+        let (inner_noted, outer_noted) = making(|| {
+            let ((), noted) = making(|| refused_for(&inner));
+            refused_for(&outer);
+            noted
+        });
+        assert!(Arc::ptr_eq(&inner_noted.unwrap(), &inner));
+        assert!(Arc::ptr_eq(&outer_noted.unwrap(), &outer));
+        let ((), none) = making(|| ());
+        assert!(none.is_none());
     }
 }

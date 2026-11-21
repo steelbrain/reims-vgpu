@@ -4,7 +4,7 @@
 //! (`fake::script`) before its model; a value's creator logs the value. The device's
 //! capabilities come from its [`DeviceModel`], neither logged nor scripted.
 
-use crate::core::testkit::script::Policy;
+use crate::core::testkit::script::{Policy, Step};
 use std::sync::Arc;
 
 use super::super::calllog::Arg;
@@ -21,6 +21,7 @@ use crate::core::platform::caps::{
     self, DeviceCaps, FormatAnswers, IdentityCaps, IdentityFlags, IdentitySizes,
 };
 use crate::core::platform::device::*;
+use crate::core::platform::stage::{self, Site};
 use crate::core::platform::types::{
     ArgumentKind, ArgumentLayout, ArgumentMember, MtlSize, NsErrorText, PixelFormatInfo,
     SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
@@ -956,23 +957,37 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         ))
     }
 
-    /// The whole value is the call's first argument, then the options (0).
+    /// The whole value is the call's first argument, then the options (0). One refused for a
+    /// stage ([`Step::Stage`]) asks for the stage's fill at the make and notes it for the make's
+    /// caller ([`stage::refused_for`]), as the rt platform's make does, and answers
+    /// [`stage_refusal`], a gap of the platform's own.
     fn new_compute_pipeline_state_full(
         &self,
         desc: &FullComputePipelineDesc<'_, FakePlatform>,
     ) -> Result<Option<<FakePlatform as Platform>::ComputePipeline>, NsErrorText> {
-        fatal(self.make_or_error(
-            Policy::Fatal,
-            "newComputePipelineStateWithDescriptor:options:reflection:error:",
-            vec![Arg::val(desc), Arg::U64(0)],
-            |w| {
-                Some(new_pipeline::<kind::ComputePipeline>(
-                    w,
-                    Space::COMPUTE_PIPELINE,
-                    None,
-                ))
-            },
-        ))
+        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+        let step = self.call(sel, vec![Arg::val(desc), Arg::U64(0)]);
+        if let Step::Stage(refused) = step {
+            let fills = self.world().stages().fills();
+            stage::refused_for(&fills.fill(refused, Site::Make));
+            note_relayed_gap();
+            return Err(stage_refusal(refused));
+        }
+        let w = self.world().clone();
+        fatal(step.create_or_error(Policy::Fatal, sel, || {
+            let made = new_pipeline::<kind::ComputePipeline>(&w, Space::COMPUTE_PIPELINE, None);
+            Some(self.adopt(made))
+        }))
+    }
+}
+
+/// The `NSError` of a compute state's make refused for `stage`, whose compile is not in the
+/// store ([`Step::Stage`]).
+pub fn stage_refusal(stage: u64) -> NsErrorText {
+    NsErrorText {
+        domain: "FakeStageDomain".to_owned(),
+        code: 0,
+        description: format!("the fake refused it: stage {stage}'s compile is not in its store"),
     }
 }
 

@@ -116,6 +116,7 @@ use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
 use reims_vgpu_vulkan::core::platform::resource::Texture;
+use reims_vgpu_vulkan::core::platform::stage::{self, FillEnd};
 use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 use reims_vgpu_vulkan::core::platform::{Handle, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
@@ -139,8 +140,9 @@ use crate::graphics::decode::prepass::{Ahead, Prepass, WalkEnd};
 use crate::graphics::decode::shares::ListenSink;
 use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
-    AheadSinks, Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, FinishedSink,
-    GraphicsDecoder, Joined, LibraryJob, LibraryStart, MadeLibrary, PipelineJob, PipelineReply,
+    AheadSinks, Begun, CompiledPipeline, CompletionSink, DecodeError, Decoders, DrainAnswer,
+    FinishedSink, GraphicsDecoder, Joined, LibraryJob, LibraryStart, MadeLibrary, PipelineJob,
+    PipelineKey, PipelineReply,
     ReflectionSink, ScheduledSink, SignalSink, Sinks, SubmittedSink, SurfacePresent, Then,
     compile_refusing, complete, make_library, refused_reply, refusing,
 };
@@ -1452,8 +1454,8 @@ type BegunBuffer<P> = (
 );
 
 /// Where a `COMMAND_BUFFER` message's queue's service thread meant its walk to go as it began
-/// it ([`GraphicsControl::begin_command_buffer`]), for [`GraphicsControl::carry_out`].
-#[derive(Clone, Copy)]
+/// it ([`GraphicsControl::begin_command_buffer`]), and what the walk waits for first, for
+/// [`GraphicsControl::carry_out`].
 struct Walk {
     /// The lane's idle thread was woken for it as its turn was taken
     /// ([`GraphicsControl::goes_to_lane`]), the buffer not alone.
@@ -1465,6 +1467,38 @@ struct Walk {
     /// (`decode::prepass`, "Whether every dispatch is made"): its walk waits for no make, nor
     /// for a stage's fill.
     made: bool,
+    /// The pipelines it names that were pending as it was begun ([`Pending::named_by`]), which its
+    /// walk waits for on its lane ([`Pending::wait_on_lane`]); empty for most.
+    awaited: Vec<u64>,
+}
+
+/// A pipeline create compiled off its ring ([`GraphicsControl::compile`]): what its settling
+/// needs of it once its make has run ([`GraphicsControl::settle`]).
+#[derive(Clone, Copy)]
+struct Creating {
+    /// The pipeline's id.
+    obj_id: u64,
+    /// The create's seqno.
+    seqno: u64,
+    /// The create's key, under which its answer is kept for the next runs.
+    key: Option<PipelineKey>,
+    /// The clock of its table as the create was prepared ([`PipelineJob::seen_from`]).
+    seen_from: u64,
+    /// The reset count its compile began at ([`Pending::begin`]).
+    began: u64,
+}
+
+impl Creating {
+    /// The create `job` is of, its compile begun at reset count `began`.
+    fn of<P: Platform>(job: &PipelineJob<P>, began: u64) -> Creating {
+        Creating {
+            obj_id: job.obj_id,
+            seqno: job.seqno,
+            key: job.key(),
+            seen_from: job.seen_from,
+            began,
+        }
+    }
 }
 
 /// The display's hold of the region block a surface's texture lies over, as a compositor holds
@@ -2000,6 +2034,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // compile outside the process (`GpuDevice::reset_begins`).
                 self.decoders.resetting();
                 self.device.reset_begins();
+                // And command buffers' waits on their lanes for pipelines still compiling, which
+                // hold the gate.
+                self.pending.resetting();
                 let _alone = self.reset_gate.write();
                 self.pending.reset();
                 let decoder = self.decoder();
@@ -2372,8 +2409,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ///
     /// A pipeline or library create is made on the compile pool instead
     /// ([`Self::start_pipeline`], [`Self::start_library`]), and a command buffer that names a
-    /// pipeline still compiling waits for it first (`compile`), and is then begun here and walked
-    /// and committed on its queue's lane ([`Self::begin_command_buffer`]). An indirect command
+    /// pipeline still compiling is begun here all the same, and waits for it on its queue's lane,
+    /// where it is then walked and committed ([`Self::begin_command_buffer`]). An indirect command
     /// buffer's create is made on the ICB worker ([`Self::start_icb`]), and the destroy of one
     /// still being made waits for it. A library lookup is answered here
     /// ([`Self::lookup_library`]).
@@ -2463,7 +2500,6 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 return;
             }
             RGFX_CMD_COMMAND_BUFFER => {
-                self.pending.wait_for_command_buffer(message);
                 if !foreign_queue(poster, message) {
                     self.begin_command_buffer(poster, bytes.into_owned(), claim);
                     return;
@@ -2700,7 +2736,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// (`decode::lane`, "Woken as the buffer is begun"), unless it is alone on its queue's ring:
     /// [`INLINE_WALK_ALONE_MAX`] bytes at most, with nothing published behind it as it is taken
     /// ([`QueueClaim::nothing_published`]), so that it is walked here where its commit would wait
-    /// for nothing.
+    /// for nothing. One that names a pipeline still compiling is begun all the same, and waits for
+    /// it on its lane before its walk ([`Self::carry_out`]).
     fn begin_command_buffer(
         self: &Arc<Self>,
         poster: &CompletionPoster,
@@ -2724,6 +2761,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     .is_some_and(|claim| claim.nothing_published());
             let to_lane = self.goes_to_lane(&message) && !alone;
             let queue = poster.queue_obj_id();
+            // Before the begin takes the message's views of the tables: a pipeline stored between
+            // the two is in both, and none is in neither.
+            let awaited = self.pending.named_by(&message);
             let begun = refusing(|| decoder.begin_taken(&self.device, &message, queue, to_lane));
             let (prepass, made) = match &begun {
                 Ok(Ok(b)) if b.computes() => self.hand_prepass(&decoder, &message),
@@ -2733,6 +2773,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 to_lane,
                 alone,
                 made,
+                awaited,
             };
             let begun = (begun, prepass, walk);
             self.carry_out(decoder, begun, carried, poster.clone(), message, claim);
@@ -2796,7 +2837,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// find made ([`Walk::made`]): that walk may wait for the pipeline's make, or for its stage's
     /// fill, a minute or two (`reims_vgpu_vulkan::core::platform::stage`), and here the queue's
     /// next messages would wait behind it. It goes to the lane, whose thread waits out of the
-    /// lane's walks (`decode::lane`), the queue's next buffers taken and walked meanwhile.
+    /// lane's walks (`decode::lane`), the queue's next buffers taken and walked meanwhile. So does
+    /// one that names a pipeline still compiling as it was begun ([`Walk::awaited`]), whose
+    /// compile may wait for its stage's fill as long: its walk first waits there for the
+    /// compile's store, or its cancel, or the device's reset ([`Pending::wait_on_lane`]), and its
+    /// views of the tables then name the pipelines stored since
+    /// ([`GraphicsDecoder::see_stored`]), as views taken after the stores would.
     ///
     /// A buffer carried out here lets its queue's `claim` go first, once begun
     /// ([`QueueClaim::let_go`]): a buffer the guest published behind it and asked `CB_SUBMITTED`
@@ -2820,7 +2866,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let expected = walk.to_lane;
         let begun_whole = matches!(&begun, Ok(Ok(_)));
         let here = match &begun {
-            Ok(Ok(_)) if !walk.made => false,
+            Ok(Ok(_)) if !walk.made || !walk.awaited.is_empty() => false,
             Ok(Ok(b)) if b.ordered() => decoder.turn_is_next(),
             Ok(Ok(_)) => {
                 (message.len() <= self.inline_walk_max.load(Ordering::Relaxed) || walk.alone)
@@ -2829,9 +2875,27 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             _ => false,
         };
         let control = Arc::clone(self);
+        let awaited = walk.awaited;
         let job = move || {
             entry::run(|_| {
                 let mut decoder = decoder;
+                // The pipelines it names that were still compiling as it was begun, waited for out
+                // of the lane's walks; its views then name those stored since.
+                if matches!(&begun, Ok(Ok(_))) && !awaited.is_empty() {
+                    decoder.waiting(|| control.pending.wait_on_lane(&awaited));
+                    // Of a queue the device's reset ended as it waited: nothing of it is carried
+                    // out, and nothing is owed.
+                    if poster.stale() {
+                        if let Some(prepass) = prepass {
+                            prepass.close(WalkEnd::Unwalked, || control.pool.now());
+                        }
+                        drop(begun);
+                        drop(decoder);
+                        drop(carried);
+                        return;
+                    }
+                    decoder.see_stored(&awaited);
+                }
                 let outcome = match begun {
                     Ok(Ok(begun)) => {
                         refusing(|| decoder.finish_command_buffer(&control.device, &message, begun))
@@ -2984,43 +3048,135 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let poster = poster.clone();
         if let Err(compile) = self
             .pool
-            .submit(of, Box::new(move || me.compile(job, began, &poster)))
+            .submit(of, Box::new(move || me.compile(job, began, poster, false)))
         {
             compile();
         }
     }
 
     /// Compiles a prepared pipeline create, pending since reset count `began`, under a library
-    /// entry, with no lock held; stores the pipeline where no destroy, close or reset cancelled it
-    /// meanwhile, lets the command buffers that wait for it go on, and posts its reply (its
-    /// reflection, or a refusal) through `poster`.
-    fn compile(&self, job: PipelineJob<P>, began: u64, poster: &CompletionPoster) {
+    /// entry, with no lock held, and settles it ([`Self::settle`]).
+    ///
+    /// A compute create whose make the platform refused for a stage whose compile runs outside
+    /// the process, naming the stage's fill ([`stage::making`]), is held instead: it stays
+    /// pending, the pool's thread let go, until that fill ends ([`Self::held_end`]), and is then
+    /// made again, `remade`, once. A remade create settles whatever its make answers.
+    fn compile(
+        self: &Arc<Self>,
+        job: PipelineJob<P>,
+        began: u64,
+        poster: CompletionPoster,
+        remade: bool,
+    ) {
         entry::run(|_| {
-            let (obj_id, seqno, key) = (job.obj_id, job.seqno, job.key());
-            let compiled = compile_refusing::<P>(&self.device, job);
-            if let Some(reason) = compiled.refusal() {
-                log::warn!(
-                    target: "reims_vgpu::graphics", kind:% = reason;
-                    "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
-                );
+            let creating = Creating::of(&job, began);
+            let again = if remade { None } else { job.again() };
+            let (compiled, fill) = stage::making(|| compile_refusing::<P>(&self.device, job));
+            match (fill, again) {
+                (Some(fill), Some(again)) if compiled.is_refused() => {
+                    log::info!(
+                        target: "reims_vgpu::graphics",
+                        "a pipeline create (seqno {}, object {:#x}) waits for its stage's fill",
+                        creating.seqno,
+                        creating.obj_id
+                    );
+                    let me = Arc::clone(self);
+                    fill.on_end(move |end| me.held_end(end, again, creating, poster, compiled));
+                }
+                _ => self.settle(compiled, creating, &poster),
             }
-            let reply = compiled.reply();
-            // A keyed create's answer is kept for the next runs, or drops the kept one where it
-            // was refused or answered otherwise, before the guest has it.
-            if let Some(key) = key {
-                let made = (!compiled.is_refused()).then_some(&reply.reflection);
-                self.answers.observe(&key, made);
-            }
-            // Stored where no destroy, close or reset cancelled it, under the lock of its table,
-            // which its destroy removes from after cancelling it; a reset waits for the store.
-            {
-                let _carried = self.reset_gate.read();
-                self.decoder()
-                    .finish_pipeline_if(compiled, || self.pending.live(obj_id, began));
-                self.pending.finish(obj_id, began);
-            }
-            poster.post(&reply.bytes());
         });
+    }
+
+    /// The end of the fill a held compute create waits for ([`Self::compile`]), on the thread
+    /// that ends it, or at once where it had ended. Where it filled the store and no destroy,
+    /// close or reset cancelled the create, its make, `again`, is made again on the pool; after a
+    /// breach or a failed fill, or the create's cancel, the make's first refusal, `first`,
+    /// settles it there ([`Self::settle`]); and after a cancelled fill (the device's reset, the
+    /// process's exit) the create is let go of here, unstored and its answer not kept, its
+    /// reply posted where the ring has room, waiting for nothing.
+    fn held_end(
+        self: &Arc<Self>,
+        end: FillEnd,
+        again: PipelineJob<P>,
+        creating: Creating,
+        poster: CompletionPoster,
+        first: CompiledPipeline<P>,
+    ) {
+        if end == FillEnd::Cancelled {
+            entry::run(|_| {
+                self.pending.finish(creating.obj_id, creating.began);
+                if !poster.try_post(&first.reply().bytes()) {
+                    log::debug!(
+                        target: "reims_vgpu::graphics",
+                        "a pipeline create (seqno {}, object {:#x}) let go of at its fill's \
+                         cancel: its reply found no room",
+                        creating.seqno,
+                        creating.obj_id
+                    );
+                }
+                drop(again);
+                drop(first);
+            });
+            return;
+        }
+        let me = Arc::clone(self);
+        let settle = move || {
+            if end == FillEnd::Filled && me.pending.live(creating.obj_id, creating.began) {
+                drop(first);
+                me.compile(again, creating.began, poster, true);
+            } else {
+                entry::run(|_| {
+                    drop(again);
+                    me.settle(first, creating, &poster);
+                });
+            }
+        };
+        let of = CompileOf::new(CompileKind::Pipeline, creating.obj_id);
+        if let Err(settle) = self.pool.submit(of, Box::new(settle)) {
+            settle();
+        }
+    }
+
+    /// Settles a pipeline create's compile, `compiled`, of the create `creating`: logs its
+    /// refusal, keeps a keyed create's answer for the next runs, stores the pipeline where no
+    /// destroy, close or reset cancelled it meanwhile, lets the command buffers that wait for it
+    /// go on, and posts its reply (its reflection, or a refusal) through `poster`.
+    fn settle(
+        &self,
+        compiled: CompiledPipeline<P>,
+        creating: Creating,
+        poster: &CompletionPoster,
+    ) {
+        let Creating {
+            obj_id,
+            seqno,
+            key,
+            seen_from,
+            began,
+        } = creating;
+        if let Some(reason) = compiled.refusal() {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = reason;
+                "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
+            );
+        }
+        let reply = compiled.reply();
+        // A keyed create's answer is kept for the next runs, or drops the kept one where it was
+        // refused or answered otherwise, before the guest has it.
+        if let Some(key) = key {
+            let made = (!compiled.is_refused()).then_some(&reply.reflection);
+            self.answers.observe(&key, made);
+        }
+        // Stored where no destroy, close or reset cancelled it, under the lock of its table, which
+        // its destroy removes from after cancelling it; a reset waits for the store.
+        {
+            let _carried = self.reset_gate.read();
+            let live = || self.pending.live(obj_id, began);
+            (self.decoder()).finish_pipeline_if(compiled, Some(seen_from), live);
+            self.pending.finish(obj_id, began);
+        }
+        poster.post(&reply.bytes());
     }
 
     /// A library lookup from ring 0, answered at once: a hit binds the library's new id to the

@@ -253,7 +253,7 @@ pub(crate) use library::whole_key as test_whole_key;
 use library::{Libraries, LibraryRef};
 pub(crate) use library::{LibraryJob, LibraryStart, MadeLibrary, complete, make_library};
 use managed::{STORAGE_MODE_MANAGED, storage_mode};
-use pipeline_key::PipelineKey;
+pub(crate) use pipeline_key::PipelineKey;
 use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
@@ -5085,15 +5085,25 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// [`Self::store`], where `live` answers, under the states' lock where the context has no
     /// state ([`Self::context_made_if`]) and under the table's lock, that the object is still to
-    /// be stored: one `live` refuses is let go of, and makes its context no state.
-    fn store_if(&self, obj_id: u64, entry: Entry<P>, live: impl Fn() -> bool) {
+    /// be stored: one `live` refuses is let go of, and makes its context no state. `seen_from`,
+    /// where given, is a clock of the table before the store that views taken from then on name
+    /// the entry at ([`Context::stored_for`]).
+    fn store_if(
+        &self,
+        obj_id: u64,
+        entry: Entry<P>,
+        seen_from: Option<u64>,
+        live: impl Fn() -> bool,
+    ) {
         let Some(context) = self.context_made_if(context_of(obj_id), &live) else {
             return;
         };
         let pending = self.uncommitted_over(&context, obj_id);
-        if let Some((at, replaced)) =
-            context.insert_if(obj_id, entry, self.view_at(&context), pending, &live)
-        {
+        let seen_from = [seen_from, self.view_at(&context)]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some((at, replaced)) = context.insert_if(obj_id, entry, seen_from, pending, &live) {
             self.saw(&context, obj_id, Some(at));
             drop(replaced.map(tables::Removed::into_entry));
         }
@@ -5124,6 +5134,31 @@ impl<P: Platform> GraphicsDecoder<P> {
             .iter()
             .find(|v| Arc::ptr_eq(v.context(), context))
             .map(View::at)
+    }
+
+    /// The pipelines `ids`, pending as the command buffer the message carries was begun, which its
+    /// walk then waited for on its lane (`GraphicsControl::carry_out`): the message's view of
+    /// each one's table names it where it was stored since, for a view taken as early as the
+    /// message's ([`Context::stored_for`]), as the view would had it been taken after the store.
+    /// One not stored (cancelled, or the device reset) stays unnamed.
+    pub(crate) fn see_stored(&self, ids: &[u64]) {
+        self.recent.clear();
+        let views = self.views.borrow();
+        for &id in ids {
+            let context = context_of(id);
+            if let Some(view) = views.iter().find(|v| v.context().id == context)
+                && let Some(at) = view.context().stored_for(id, view.at())
+            {
+                view.made(id, at);
+            }
+        }
+    }
+
+    /// The clock of `obj_id`'s context's table now, 0 where the context has no table
+    /// ([`PipelineJob::seen_from`]).
+    fn table_clock(&self, obj_id: u64) -> u64 {
+        self.context_state(context_of(obj_id))
+            .map_or(0, |context| context.clock())
     }
 
     /// The message's own change of `obj_id` in `context`'s table: made at `at`, or removed.
@@ -5433,6 +5468,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             return Ok(PipelineJob {
                 obj_id: m.obj_id,
                 seqno: m.header.seqno,
+                seen_from: self.table_clock(m.obj_id),
                 key: self.pipeline_key(message),
                 shape: PipelineShape::Compute {
                     library,
@@ -5500,6 +5536,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
+            seen_from: self.table_clock(m.obj_id),
             key: self.pipeline_key(message),
             shape: PipelineShape::Render {
                 vertex_library,
@@ -5574,6 +5611,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
+            seen_from: self.table_clock(m.obj_id),
             key: None,
             shape: PipelineShape::Mesh(Box::new(MeshShape {
                 object,
@@ -5688,17 +5726,19 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// accepted one unanswered ("Known pipeline creates"), and its draws are then dropped, not
     /// its command buffers.
     pub(crate) fn finish_pipeline(&self, compiled: CompiledPipeline<P>) {
-        self.finish_pipeline_if(compiled, || true);
+        self.finish_pipeline_if(compiled, None, || true);
     }
 
     /// [`Self::finish_pipeline`], where `live` answers, under the lock of the table the pipeline
     /// goes in, that no destroy or close cancelled it: a destroy cancels the compile before it
     /// removes what the id names, so the pipeline is never stored after its destroy, and a close
     /// before it takes the context's state out, so a compile ending after its context's close
-    /// makes the closed context no state again ([`Self::store_if`]).
+    /// makes the closed context no state again ([`Self::store_if`]). `seen_from` is the clock its
+    /// create was prepared at ([`PipelineJob::seen_from`]), where it was compiled off its ring.
     pub(crate) fn finish_pipeline_if(
         &self,
         compiled: CompiledPipeline<P>,
+        seen_from: Option<u64>,
         live: impl Fn() -> bool,
     ) {
         let handle = compiled.handle.unwrap_or_else(|| {
@@ -5708,7 +5748,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 _ => RGFX_CMD_RENDER_PIPELINE_CREATE,
             }))
         });
-        self.store_if(compiled.obj_id, Entry::of(handle), live);
+        self.store_if(compiled.obj_id, Entry::of(handle), seen_from, live);
     }
 }
 
@@ -5719,6 +5759,11 @@ pub(crate) struct PipelineJob<P: Platform> {
     pub(crate) obj_id: u64,
     /// The create's seqno, which its reply carries.
     pub(crate) seqno: u64,
+    /// The clock of the pipeline's context's table as the create was prepared, 0 where the
+    /// context had no table: its entry's first clock of a view that names it, so a command buffer
+    /// begun after the create and before the store names it once its walk has waited for it
+    /// ([`GraphicsDecoder::see_stored`]).
+    pub(crate) seen_from: u64,
     /// The create's key, which a made pipeline's reply carries ([`pipeline_key::pipeline_key`]).
     key: Option<PipelineKey>,
     /// The pipeline's functions and descriptor.
@@ -5729,6 +5774,42 @@ impl<P: Platform> PipelineJob<P> {
     /// The create's key, where it asked for one and could be keyed.
     pub(crate) fn key(&self) -> Option<PipelineKey> {
         self.key
+    }
+
+    /// Another job of the same compute pipeline create, its handles taken again, to make it once
+    /// more after its stage's fill (`GraphicsControl::compile`); `None` for a render or mesh
+    /// create, whose make no stage's fill holds.
+    pub(crate) fn again(&self) -> Option<PipelineJob<P>> {
+        let PipelineShape::Compute {
+            library,
+            name,
+            constants,
+            linked,
+            libraries,
+            fields,
+        } = &self.shape
+        else {
+            return None;
+        };
+        Some(PipelineJob {
+            obj_id: self.obj_id,
+            seqno: self.seqno,
+            seen_from: self.seen_from,
+            key: self.key,
+            shape: PipelineShape::Compute {
+                library: library.clone_ref(),
+                name: name.clone(),
+                constants: constants.clone(),
+                linked: linked.iter().map(LinkedRef::clone_ref).collect(),
+                libraries: DynamicLibrariesDesc {
+                    preloaded: libraries.preloaded.iter().map(Handle::clone_ref).collect(),
+                    loaded: (libraries.loaded.iter())
+                        .map(|(name, library)| (name.clone(), library.clone_ref()))
+                        .collect(),
+                },
+                fields: fields.clone(),
+            },
+        })
     }
 
     /// [`RGFX_PIPELINE_KIND_RENDER`], [`RGFX_PIPELINE_KIND_MESH`] or
@@ -5795,6 +5876,20 @@ struct LinkedRef<P: Platform> {
     /// The descriptor's `specializedName`, where the guest gave one.
     specialized_name: Option<String>,
     list: LinkedList,
+}
+
+impl<P: Platform> LinkedRef<P> {
+    /// Another of the same linked function, its library taken again.
+    fn clone_ref(&self) -> Self {
+        LinkedRef {
+            library: self.library.clone_ref(),
+            name: self.name.clone(),
+            constants: self.constants.clone(),
+            options: self.options,
+            specialized_name: self.specialized_name.clone(),
+            list: self.list.clone(),
+        }
+    }
 }
 
 /// The list of `MTLLinkedFunctions` a linked function is in.

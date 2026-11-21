@@ -1807,7 +1807,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Runs `wait`, a wait of the command buffer's for what is committed before it, where it has a
     /// turn in its queue's lane as a wait of the lane's job ([`Lane::waiting`]): the lane starts
     /// its next buffer's walk meanwhile.
-    fn waiting<R>(&self, wait: impl FnOnce() -> R) -> R {
+    pub(crate) fn waiting<R>(&self, wait: impl FnOnce() -> R) -> R {
         match self.lane() {
             Some(lane) => lane.waiting(wait),
             None => wait(),
