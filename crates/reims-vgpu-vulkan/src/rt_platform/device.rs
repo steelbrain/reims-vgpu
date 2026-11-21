@@ -56,6 +56,7 @@ use metal2vulkan_runtime as rt;
 use crate::core::platform::caps::{DeviceCaps, IdentityCaps, SAMPLE_COUNTS};
 use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
 use crate::core::platform::host_range::HostRange;
+use crate::core::platform::stage::StageFills;
 use crate::core::platform::types::{
     ArgumentLayout, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
@@ -79,6 +80,7 @@ use super::library::{self, RtLibrary};
 use super::pipeline::{self, Numbering};
 use super::queue::RtQueue;
 use super::render_pipeline;
+use super::stage::StageKey;
 use super::texture::OwnIndices;
 use super::unbuilt::{
     RtRefusal, Unbuilt, refuse, refuse_create, refused_as, refused_error, rt_refused,
@@ -241,6 +243,9 @@ pub struct RtDevice {
     /// Its loss as its command buffers see it (`super::command`'s docs, "What a completed handler
     /// learns" and "A lost device's line").
     loss: Arc<DeviceLoss>,
+    /// The fills of the stages rt refuses for a compile not in its store (`super::stage`), which
+    /// its encoders' dispatches wait for.
+    stage_fills: Arc<StageFills<StageKey>>,
 }
 
 /// Where a device's GPU lies on the host, as Vulkan answers it, which the host's video opens its
@@ -289,6 +294,11 @@ impl RtDevice {
     /// learns" and "A lost device's line"), which each of them keeps.
     pub fn loss(&self) -> &Arc<DeviceLoss> {
         &self.loss
+    }
+
+    /// The fills of the stages rt refuses for a compile not in its store (`super::stage`).
+    pub fn stage_fills(&self) -> &Arc<StageFills<StageKey>> {
+        &self.stage_fills
     }
 
     /// Its history of released ranges (`super::fault`), which the tables' objects record their
@@ -524,6 +534,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         present_fences,
         host_gpu,
         loss,
+        stage_fills: Arc::new(super::stage::fills()),
     }))
 }
 

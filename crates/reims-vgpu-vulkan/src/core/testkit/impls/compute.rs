@@ -9,8 +9,33 @@ use super::super::platform::FakePlatform;
 use super::res_ids;
 use crate::core::platform::Platform;
 use crate::core::platform::compute::*;
+use crate::core::platform::stage::held;
 use crate::core::raise::{OnFault, RaiseResult};
-use crate::core::testkit::script::Policy;
+use crate::core::testkit::script::{Policy, Step};
+
+impl Fk<kind::ComputeEncoder> {
+    /// A dispatch, logged: the script's outcome. One refused for a stage ([`Step::Stage`]) waits
+    /// for the stage's fill and is made once more after the fill filled the store, as the rt
+    /// platform's dispatch ([`held`]); otherwise it is answered as refused, encoding nothing
+    /// ([`FakeStages::refused`](crate::core::testkit::stages::FakeStages::refused)).
+    fn dispatch(&self, sel: &'static str, args: Vec<Arg>) -> RaiseResult<()> {
+        let stage = match self.call(sel, args) {
+            Step::Stage(stage) => stage,
+            step => return step.throws(Policy::Caught, sel),
+        };
+        let stages = self.world().stages();
+        let mut refusal = Some(stage);
+        let made = held(
+            stages.fills(),
+            || refusal.take().map_or(Ok(()), Err),
+            |&stage| Some(stage),
+        );
+        if let Err(stage) = made {
+            stages.note_refused(sel, stage);
+        }
+        Ok(())
+    }
+}
 
 impl ComputeEncoder<FakePlatform> for Fk<kind::ComputeEncoder> {
     fn encode(&self, on: OnFault, cmd: ComputeCmd<'_, FakePlatform>) -> RaiseResult<()> {
@@ -19,8 +44,7 @@ impl ComputeEncoder<FakePlatform> for Fk<kind::ComputeEncoder> {
             ComputeCmd::DispatchThreadgroups {
                 threadgroups_per_grid,
                 threads_per_threadgroup,
-            } => self.act(
-                Policy::Caught,
+            } => self.dispatch(
                 sel,
                 vec![
                     Arg::val(&threadgroups_per_grid),
@@ -31,8 +55,7 @@ impl ComputeEncoder<FakePlatform> for Fk<kind::ComputeEncoder> {
                 indirect_buffer,
                 indirect_buffer_offset,
                 threads_per_threadgroup,
-            } => self.act(
-                Policy::Caught,
+            } => self.dispatch(
                 sel,
                 vec![
                     Arg::opt(indirect_buffer),
@@ -43,8 +66,7 @@ impl ComputeEncoder<FakePlatform> for Fk<kind::ComputeEncoder> {
             ComputeCmd::DispatchThreads {
                 threads_per_grid,
                 threads_per_threadgroup,
-            } => self.act(
-                Policy::Caught,
+            } => self.dispatch(
                 sel,
                 vec![
                     Arg::val(&threads_per_grid),

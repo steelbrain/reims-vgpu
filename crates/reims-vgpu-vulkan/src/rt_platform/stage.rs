@@ -1,33 +1,58 @@
 //! A stage's fill on the rt platform: a helper process that compiles it ([`helper_start`]).
 //!
 //! rt refuses, in the VM's process, a stage whose compile is not in its store and weighs past its
-//! bound, and the device's fills ([`StageFills`](crate::core::platform::stage::StageFills)) start
-//! one fill a stage. Each fill here is a helper process (`os::compile_helper`): the caller's
-//! `talk` is the fill, which rt carries out over the helper's stdin and stdout, and the caller's
-//! `on_end` maps how the helper ended to the fill's end, recording a breach with rt where the
-//! helper was killed at a cap. A cancel of the fill kills the helper.
+//! bound, and the device's fills ([`StageFills`]) start one fill a stage. Each fill here is a
+//! helper process (`os::compile_helper`): the caller's `talk` is the fill, which rt carries out
+//! over the helper's stdin and stdout, and the caller's `on_end` maps how the helper ended to the
+//! fill's end, recording a breach with rt where the helper was killed at a cap. A cancel of the
+//! fill kills the helper.
 //!
 //! Where there is no helper to run, no fill starts, and the stage's fill ends
 //! [`FillEnd::Failed`] at once: nothing is recorded, and a make of the stage refuses as before.
+//!
+//! A device's fills ([`fills`]) are keyed by [`StageKey`], what rt's stage refusal names
+//! ([`stage_of`]). Until rt's refusal carries its request, the key has no values: no refusal names
+//! a stage, and no fill starts.
 
-#![cfg_attr(
+use std::fmt;
+use std::process::{ChildStdin, ChildStdout};
+use std::sync::Arc;
+
+use metal2vulkan_runtime as rt;
+
+use crate::core::platform::stage::{Cancel, FillDone, FillEnd, StageFills, Start};
+use crate::os::compile_helper::{Helper, HelperEnd, HelperRun};
+
+/// A stage that no refusal names yet: rt's refusal does not carry its request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NoStage {}
+
+/// What a stage's refusal names, and a device's fills are keyed by.
+pub type StageKey = NoStage;
+
+/// The stage whose compile rt's refusal `error` waits for, where it is such a refusal: none yet.
+pub(crate) fn stage_of(error: &rt::Error) -> Option<StageKey> {
+    let _ = error;
+    None
+}
+
+/// A device's fills: none starts while no refusal names a stage.
+pub(crate) fn fills() -> StageFills<StageKey> {
+    StageFills::new(Box::new(|stage: &StageKey, _: FillDone| -> Cancel {
+        match *stage {}
+    }))
+}
+
+/// A start of fills ([`Start`]) that runs each in a helper process: what `run` names, or no fill
+/// where it fails, as it says. The helper's talk is `talk`, and the fill's end is what `on_end`
+/// makes of the helper's end and the talk's result.
+#[cfg_attr(
     not(test),
     expect(
         dead_code,
         reason = "its caller, the handler of rt's stage refusal, lands with the helper's binary"
     )
 )]
-
-use std::fmt;
-use std::process::{ChildStdin, ChildStdout};
-use std::sync::Arc;
-
-use crate::core::platform::stage::{Cancel, FillDone, FillEnd, Start};
-use crate::os::compile_helper::{Helper, HelperEnd, HelperRun};
-
-/// A start of fills ([`Start`]) that runs each in a helper process: what `run` names, or no fill
-/// where it fails, as it says. The helper's talk is `talk`, and the fill's end is what `on_end`
-/// makes of the helper's end and the talk's result.
 pub(crate) fn helper_start<K, T>(
     run: impl Fn() -> Result<HelperRun, String> + Send + Sync + 'static,
     talk: impl Fn(&K, ChildStdin, ChildStdout) -> T + Send + Sync + 'static,

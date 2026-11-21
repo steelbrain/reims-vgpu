@@ -25,14 +25,14 @@ const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
 const RING_DATA: u32 = 0x1_0000;
 
 /// The context the guest's objects are of.
-const CONTEXT: u32 = 3;
+pub(super) const CONTEXT: u32 = 3;
 
 /// The fake's class of a compute state.
 const CLASS: &str = "MTLComputePipelineState";
 
 /// A device whose context [`CONTEXT`] has queue 1, library 10 and the compute states `states`
 /// made: the device, its platform, the guest and the queue's rings.
-fn with_states(
+pub(super) fn with_states(
     states: &[u64],
 ) -> (
     GraphicsDevice<FakePlatform>,
@@ -75,7 +75,7 @@ fn op(tag: u16, body: &[u8]) -> Vec<u8> {
 }
 
 /// A `COMMAND_BUFFER` `cb_obj_id` on queue 1 of [`CONTEXT`] of the ops `ops`.
-fn command_buffer_of(cb_obj_id: u64, ops: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn command_buffer_of(cb_obj_id: u64, ops: &[Vec<u8>]) -> Vec<u8> {
     let ops = ops.concat();
     let mut bytes = RgfxCommandBuffer {
         header: RgfxMsgHeader {
@@ -94,7 +94,7 @@ fn command_buffer_of(cb_obj_id: u64, ops: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// A compute encoder's begin.
-fn begin() -> Vec<u8> {
+pub(super) fn begin() -> Vec<u8> {
     op(
         RGFX_OP_ENCODER_BEGIN_COMPUTE,
         RgfxComputePassDesc::default().as_bytes(),
@@ -102,12 +102,12 @@ fn begin() -> Vec<u8> {
 }
 
 /// An encoder's end.
-fn end() -> Vec<u8> {
+pub(super) fn end() -> Vec<u8> {
     op(RGFX_OP_ENCODER_END, &[])
 }
 
 /// `setComputePipelineState:` of [`CONTEXT`]'s object `n`.
-fn set_state(n: u64) -> Vec<u8> {
+pub(super) fn set_state(n: u64) -> Vec<u8> {
     let body = RgfxComputeOpSetComputePipelineState {
         pipeline_obj_id: obj(CONTEXT, n),
     };
@@ -124,7 +124,7 @@ fn length(length: u64, index: u64) -> Vec<u8> {
 }
 
 /// `dispatchThreads:threadsPerThreadgroup:`.
-fn threads([w, h, d]: [u64; 3], [tw, th, td]: [u64; 3]) -> Vec<u8> {
+pub(super) fn threads([w, h, d]: [u64; 3], [tw, th, td]: [u64; 3]) -> Vec<u8> {
     let body = RgfxComputeOpDispatchThreads {
         grid_width: w,
         grid_height: h,
@@ -167,7 +167,7 @@ fn indirect(n: u64, [tw, th, td]: [u64; 3]) -> Vec<u8> {
 
 /// The next event of `ring`, completing the platform's committed buffers meanwhile, which must be
 /// `cb_obj_id`'s `CB_COMPLETE`: its status.
-fn completed(platform: &FakePlatform, ring: &mut QueueRing, cb_obj_id: u64) -> u32 {
+pub(super) fn completed(platform: &FakePlatform, ring: &mut QueueRing, cb_obj_id: u64) -> u32 {
     assert!(
         complete_until_event(platform, ring),
         "buffer {cb_obj_id} never completed"

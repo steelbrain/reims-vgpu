@@ -328,6 +328,32 @@ impl<K> Drop for StageFills<K> {
     }
 }
 
+/// A platform call that a stage's fill holds, a dispatch: `attempt`; where it refuses for a stage
+/// whose compile is not in the store (`stage_of` names the stage), the wait for that stage's fill
+/// ([`StageFills::fill`]), then, where the fill filled the store, `attempt` once more, whose
+/// answer stands. Otherwise the first refusal stands: after a breach, a failed or a cancelled
+/// fill, and at once for a stage whose fill ended before.
+pub fn held<K, T, E>(
+    fills: &StageFills<K>,
+    mut attempt: impl FnMut() -> Result<T, E>,
+    stage_of: impl FnOnce(&E) -> Option<K>,
+) -> Result<T, E>
+where
+    K: Eq + Hash + Clone + Send + 'static,
+{
+    let refused = match attempt() {
+        Ok(answer) => return Ok(answer),
+        Err(refused) => refused,
+    };
+    let Some(stage) = stage_of(&refused) else {
+        return Err(refused);
+    };
+    match fills.fill(stage).wait() {
+        FillEnd::Filled => attempt(),
+        FillEnd::Breached | FillEnd::Failed | FillEnd::Cancelled => Err(refused),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -531,6 +557,54 @@ mod tests {
             theirs.fetch_add(1, Ordering::SeqCst);
         }));
         assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    }
+
+    /// A call refused for a stage waits for the stage's fill, and is made once more after the
+    /// fill filled the store, whose answer stands: a second refusal is not waited for again.
+    #[test]
+    fn a_held_call_is_made_again_once_after_its_fill() {
+        let fake = Fake::default();
+        let fills = Arc::new(fake.fills());
+        let answers = Arc::new(Mutex::new(vec![Err::<(), _>(Some(7_u32)), Err(Some(7))]));
+        let (theirs, asked) = (Arc::clone(&fills), Arc::clone(&answers));
+        let call = std::thread::Builder::new()
+            .spawn(move || held(&theirs, || asked.lock().remove(0), |&stage| stage))
+            .unwrap();
+        while fake.starts() == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!call.is_finished());
+        fake.end(FillEnd::Filled);
+        assert_eq!(call.join().unwrap(), Err(Some(7)));
+        assert!(answers.lock().is_empty());
+        assert_eq!(fake.starts(), 1);
+    }
+
+    /// A call refused for a stage whose fill ended otherwise than filled answers its refusal,
+    /// made once; a refusal that names no stage starts no fill.
+    #[test]
+    fn a_held_call_answers_its_refusal_after_a_breach() {
+        let fake = Fake::default();
+        let fills = fake.fills();
+        let _ = fills.fill(3);
+        fake.end(FillEnd::Breached);
+        let mut made = 0;
+        let answer: Result<(), Option<u32>> = held(
+            &fills,
+            || {
+                made += 1;
+                Err(Some(3))
+            },
+            |&stage| stage,
+        );
+        assert_eq!((answer, made), (Err(Some(3)), 1));
+        let answer: Result<(), Option<u32>> = held(&fills, || Err(None), |&stage| stage);
+        assert_eq!(answer, Err(None));
+        assert_eq!(
+            held(&fills, || Ok::<_, Option<u32>>(5), |&stage| stage),
+            Ok(5)
+        );
+        assert_eq!(fake.starts(), 1);
     }
 
     /// A wait on a fill that does not end goes on waiting: nothing ends a fill but its end or a

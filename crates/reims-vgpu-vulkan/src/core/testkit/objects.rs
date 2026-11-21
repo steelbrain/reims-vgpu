@@ -45,6 +45,7 @@ use super::impls::icb::{IcbCommandModel, IcbModel};
 use super::impls::rate_map::{RateMapDescriptorModel, RateMapModel};
 use super::impls::resource::PipelineModel;
 use super::script::{HeldCall, Script, Step};
+use super::stages::FakeStages;
 use super::vm::FakeVm;
 use crate::core::host::HostPtr;
 use crate::core::num;
@@ -1033,6 +1034,8 @@ pub struct World {
     prepare_holds: Mutex<std::collections::VecDeque<HeldCall>>,
     /// The keys the compute states answer of their dispatches ([`World::dispatch_variant`]).
     variants: Mutex<Variants>,
+    /// The platform's stage fills ([`World::stages`]).
+    stages: FakeStages,
 }
 
 /// The fake's key of the pipeline a compute dispatch runs
@@ -1141,7 +1144,14 @@ impl World {
             prepared: Mutex::new(Vec::new()),
             prepare_holds: Mutex::new(std::collections::VecDeque::new()),
             variants: Mutex::new(Variants::default()),
+            stages: FakeStages::new(),
         })
+    }
+
+    /// The platform's stage fills: what its refusals of a stage hand the stage to
+    /// ([`super::stages`]).
+    pub fn stages(&self) -> &FakeStages {
+        &self.stages
     }
 
     /// The compute states' makes ahead so far, in the order the calls came ([`Prepared`]).

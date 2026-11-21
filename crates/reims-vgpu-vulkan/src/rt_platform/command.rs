@@ -745,8 +745,9 @@ impl RtCommandBuffer {
             Ok(encoder) => {
                 let concurrent = dispatch_type == rt::DispatchType::Concurrent;
                 let (mark, kept) = (self.opened(), self.kept.clone());
+                let fills = Arc::clone(self.device.stage_fills());
                 Some(RtObj::new(RtComputeEncoder::new(
-                    encoder, mark, kept, concurrent,
+                    encoder, mark, kept, concurrent, fills,
                 )))
             }
             Err(error) => {

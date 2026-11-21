@@ -709,10 +709,15 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
 
     /// Noted beside the call log
     /// ([`World::prepared`](super::super::objects::World::prepared)), and held where the test
-    /// asked; it makes nothing.
+    /// asked; it makes nothing. Where the test had it refuse for a stage
+    /// ([`FakeStages::refuse_next_prepare`](crate::core::testkit::stages::FakeStages::refuse_next_prepare)),
+    /// it hands the stage to the fills, and waits for nothing.
     fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
-        self.world()
-            .note_prepared(prepared(self, dispatch, threads, lengths));
+        let world = self.world();
+        world.note_prepared(prepared(self, dispatch, threads, lengths));
+        if let Some(stage) = world.stages().prepare_refusal() {
+            let _ = world.stages().fills().fill(stage);
+        }
     }
 
     /// The world's key of the dispatch

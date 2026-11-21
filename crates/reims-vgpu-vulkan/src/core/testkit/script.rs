@@ -13,7 +13,9 @@
 //! - `Die`: Metal, IOGPU or the driver crashed, which ends the process whatever thread it is on:
 //!   a death marker;
 //! - `Hold`: the call takes as long as the test makes it, on the thread that made it (a driver's
-//!   cold pipeline make inside a draw, say), and then the model answers ([`HeldCall`]).
+//!   cold pipeline make inside a draw, say), and then the model answers ([`HeldCall`]);
+//! - `Stage`: the platform refuses a dispatch for a stage whose compile is not in its store, and
+//!   the dispatch waits for the stage's fill ([`super::stages`]).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -81,6 +83,11 @@ pub enum Step {
     /// The call is held, with nothing of the fake's locked, until the test lets it go; then the
     /// model answers.
     Hold(HeldCall),
+    /// A dispatch the platform refuses for this stage, whose compile is not in its store: the
+    /// dispatch waits for the stage's fill ([`FakeStages`](super::stages::FakeStages)), then is
+    /// made, where the fill filled the store, else answered as refused. Another call takes it as
+    /// `Default`.
+    Stage(u64),
 }
 
 /// A call the fake holds on the thread that made it until the test lets it go ([`Step::Hold`]).
@@ -151,6 +158,7 @@ impl std::fmt::Debug for Step {
                 .finish(),
             Step::Die(s) => f.debug_tuple("Die").field(s).finish(),
             Step::Hold(h) => f.debug_tuple("Hold").field(h).finish(),
+            Step::Stage(s) => f.debug_tuple("Stage").field(s).finish(),
         }
     }
 }

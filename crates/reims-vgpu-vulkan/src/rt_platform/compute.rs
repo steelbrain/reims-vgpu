@@ -35,16 +35,21 @@
 //!   usage with a bit past sample (4); an index, a length or a size past rt's 32 bits; a list of
 //!   another length than its range; and a command after `endEncoding`. A nil entry of a serial
 //!   encoder's resources, or of a heap list, is skipped, as Metal skips it.
+//! - **A stage's fill holds a dispatch.** Where rt refuses a dispatch for a stage whose compile is
+//!   not in its store, the dispatch waits for that stage's fill (`super::stage`, [`held`]) and is
+//!   made once more after the fill filled the store; after any other end it is rt's refusal.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
 //! before the refused one are bound.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use metal2vulkan_runtime as rt;
 
 use crate::core::platform::blit::ResourceRef;
 use crate::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use crate::core::platform::stage::{StageFills, held};
 use crate::core::platform::types::{MtlSize, NsRange};
 use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
@@ -55,6 +60,7 @@ use super::command::{Kept, OpenMark};
 use super::copied::Used;
 use super::diag::Use;
 use super::fault::{EncoderKind, EncoderNames, Naming};
+use super::stage::{StageKey, stage_of};
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtObj, RtPlatform};
 
@@ -71,6 +77,8 @@ pub struct RtComputeEncoder {
     kept: Kept,
     /// Whether its dispatch type is concurrent.
     concurrent: bool,
+    /// Its device's stage fills, which its dispatches wait for.
+    fills: Arc<StageFills<StageKey>>,
 }
 
 /// An encoder's rt encoder, until `endEncoding` ends it, its pipeline state, and what it names.
@@ -87,12 +95,13 @@ struct Open {
 
 impl RtComputeEncoder {
     /// The encoder over rt's `encoder`, open as `mark` marks it, its pipeline states kept in
-    /// `kept`; `concurrent` where its dispatch type is.
+    /// `kept`; `concurrent` where its dispatch type is; its dispatches wait for `fills`.
     pub fn new(
         encoder: rt::ComputeCommandEncoder,
         mark: OpenMark,
         kept: Kept,
         concurrent: bool,
+        fills: Arc<StageFills<StageKey>>,
     ) -> RtComputeEncoder {
         let names = EncoderNames::new(EncoderKind::Compute);
         RtComputeEncoder {
@@ -104,6 +113,7 @@ impl RtComputeEncoder {
             mark,
             kept,
             concurrent,
+            fills,
         }
     }
 
@@ -124,7 +134,9 @@ impl RtComputeEncoder {
             } => {
                 set(*pipeline)?;
                 let groups = size(threadgroups_per_grid)?;
-                e.dispatch_threadgroups(groups, size(threads_per_threadgroup)?)?;
+                let threads = size(threads_per_threadgroup)?;
+                let dispatch = || e.dispatch_threadgroups(groups, threads);
+                held(&self.fills, dispatch, stage_of)?;
             }
             ComputeCmd::DispatchThreadgroupsIndirect {
                 indirect_buffer,
@@ -135,7 +147,9 @@ impl RtComputeEncoder {
                 set(*pipeline)?;
                 let threads = size(threads_per_threadgroup)?;
                 let offset = indirect_buffer_offset;
-                e.dispatch_threadgroups_with_indirect_buffer(buffer.rt(), offset, threads)?;
+                let dispatch =
+                    || e.dispatch_threadgroups_with_indirect_buffer(buffer.rt(), offset, threads);
+                held(&self.fills, dispatch, stage_of)?;
             }
             ComputeCmd::DispatchThreads {
                 threads_per_grid,
@@ -143,7 +157,8 @@ impl RtComputeEncoder {
             } => {
                 set(*pipeline)?;
                 let grid = size(threads_per_grid)?;
-                e.dispatch_threads(grid, size(threads_per_threadgroup)?)?;
+                let threads = size(threads_per_threadgroup)?;
+                held(&self.fills, || e.dispatch_threads(grid, threads), stage_of)?;
             }
             ComputeCmd::DispatchThreadsIndirect { .. }
             | ComputeCmd::SetStageInRegionIndirect { .. } => {

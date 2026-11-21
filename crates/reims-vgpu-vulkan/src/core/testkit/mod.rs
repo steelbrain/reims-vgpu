@@ -24,6 +24,7 @@ pub mod logs;
 pub mod objects;
 pub mod platform;
 pub mod script;
+pub mod stages;
 pub mod threads;
 pub mod vm;
 
@@ -35,3 +36,4 @@ pub use objects::{
 };
 pub use platform::FakePlatform;
 pub use script::{HeldCall, Policy, Script, Step};
+pub use stages::FakeStages;
