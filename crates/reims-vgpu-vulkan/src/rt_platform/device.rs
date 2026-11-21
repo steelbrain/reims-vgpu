@@ -291,6 +291,12 @@ impl RtDevice {
         &self.loss
     }
 
+    /// Its history of released ranges (`super::fault`), which the tables' objects record their
+    /// releases in as they go.
+    pub fn releases(&self) -> &super::fault::Releases {
+        self.loss.watch().releases()
+    }
+
     /// Walks `tables`, a decoder's, at its loss too, placing the loss's fault among their live
     /// objects (`super::fault`).
     pub fn watch_faults(&self, tables: Arc<dyn super::fault::LiveObjects>) {

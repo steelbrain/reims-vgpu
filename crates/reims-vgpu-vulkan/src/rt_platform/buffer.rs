@@ -487,6 +487,9 @@ pub struct RtBuffer {
     /// The copy of host pages it lies over (`super::copied`), which a command buffer that uses it
     /// syncs; `None` for any other.
     copied: Option<Arc<super::copied::Copied>>,
+    /// The guest's object id for it, which its release's entry in the device's history names
+    /// (`super::fault`).
+    named: super::fault::Named,
 }
 
 /// What a deferred buffer's memory is made of at its first use (the module's docs, "Deferred
@@ -509,6 +512,11 @@ impl RtBuffer {
     /// The blocks its device knows (`super::fault`).
     pub(super) fn device_known(&self) -> &KnownBlocks {
         self.device.known_blocks()
+    }
+
+    /// The guest's object id for it (`super::fault`).
+    pub(super) fn named(&self) -> &super::fault::Named {
+        &self.named
     }
 
     /// rt's buffer; a deferred one's made now where it is not yet, and where rt refuses its
@@ -664,7 +672,18 @@ fn deferred_refused(length: u64) -> ! {
 }
 
 impl Drop for RtBuffer {
+    /// Records its range's release in its device's history where a table named it and rt made it
+    /// (`super::fault`), then runs a no-copy buffer's deallocator.
     fn drop(&mut self) {
+        let id = self.named.id();
+        if id != 0
+            && let Some(made) = self.rt.get()
+        {
+            let kind = self.named.kind(super::fault::ObjectKind::Buffer);
+            let storage = (self.options >> 4) & 0xf;
+            let releases = self.device.releases();
+            releases.push(kind, id, storage, (made.gpu_address(), made.length()));
+        }
         if let Some(slot) = self.deallocator.take() {
             run(&slot);
         }
@@ -1023,6 +1042,7 @@ pub fn deferred_of_length(
     crate::answer::count_made(DEFERRED);
     crate::answer::count_made(DEFERRED_UNMADE);
     Some(RtObj::new(RtBuffer {
+        named: super::fault::Named::default(),
         rt: OnceLock::new(),
         deferred: Some(Deferred {
             length,
@@ -1179,6 +1199,7 @@ pub(super) fn buffer_of(
     deallocator: Option<Slot>,
 ) -> RtObj<RtBuffer> {
     RtObj::new(RtBuffer {
+        named: super::fault::Named::default(),
         rt: OnceLock::from(rt),
         deferred: None,
         device: device.clone_ref(),
@@ -1202,6 +1223,7 @@ pub(super) fn with_export(
     exported: super::export::Exported,
 ) -> RtObj<RtBuffer> {
     RtObj::new(RtBuffer {
+        named: super::fault::Named::default(),
         rt: OnceLock::from(rt),
         deferred: None,
         device: device.clone_ref(),

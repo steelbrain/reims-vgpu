@@ -21,13 +21,20 @@
 //!   object is named by its kind, guest object id, context, storage mode, length and GPU address;
 //!   a block by what it is (rt's pool allocation, a known block, a heap's block or a buffer's
 //!   import, by rt's numbers), its storage mode, the kind of import it is, its length and its GPU
-//!   address.
+//!   address. Then where the address lies in the history of released ranges ([`history`],
+//!   [`History::text`]): the latest released range the history keeps that held it, with the
+//!   address's offset in it, or, where none did, the nearest below and above, as of the live
+//!   objects; each named as at the loss, with when it was released, in seconds since 1970 on the
+//!   wall clock, and how long before the loss that was, or after it, for one released as the
+//!   line was made.
 //! - **Each instruction pointer**, placed as an access is, with the note that none of the ranges
 //!   the host sees holds shader code: a pipeline's code lies in the driver's own memory, of which
 //!   the host sees nothing, so the placement says only what lies around the address.
 //! - **What the placement saw**: the live objects of each kind, the decoders and contexts whose
 //!   tables were walked and those not walked, the live textures with no GPU range the platform
-//!   knows, the mapped blocks from each source, and what the host does not see.
+//!   knows, the mapped blocks from each source, what the host does not see, and the released
+//!   ranges the history keeps of each kind, with how many it keeps at most and how many older ones
+//!   it dropped past that.
 //!
 //! What the host sees at the loss:
 //!
@@ -49,11 +56,55 @@
 //! import by the pages' pointer that no live object or known block lies in (one rt still holds for
 //! work in flight after its buffer went).
 //!
+//! **The history of released ranges** ([`Releases`]): the device's last [`RELEASES_KEPT`]
+//! released ranges of the tables' objects, oldest first; a release past them drops the oldest,
+//! counted. An object's range is recorded as its platform object goes (the guest released it and
+//! the host let go of it): a buffer rt made, a heap, a two-copy `Managed` texture's CPU-copy
+//! buffer, and a texture over a buffer while that buffer is there (one whose buffer went first is
+//! not recorded: the buffer's range, recorded as it went, holds its bytes). Each entry
+//! ([`Release`]) holds the object's kind, its guest object id, whose bits from 40 are its context
+//! ([`Named`]: told as a decoder's table stores the object, `reims_vgpu`'s
+//! `graphics::fault_walk::name`), its storage mode, its range's first byte's GPU address and
+//! length, and when it was released, in nanoseconds since 1970 on the wall clock. An object no
+//! table stored, the host's own, is not recorded. rt frees an object's range once no work in
+//! flight holds it, so a range released just before the loss may still have been work in
+//! flight's. rt's own ranges, its pool's allocations and blocks, imports among them, are not in
+//! it.
+//!
+//! A release costs a read of the wall clock and one push under the history's own lock, which is
+//! held for that alone. The loss's time is the wall clock's as the loss's line is written, by the
+//! first command buffer whose error names the loss.
+//!
+//! **The command buffers in flight** ([`Flights`]): a command buffer joins its device's list as
+//! its commit hands it to rt, and leaves it as its first completed handler runs (`super::command`'s
+//! commit), so the list holds those committed and not complete. Each is kept with the object id of
+//! the guest's command buffer (`CommandBuffer::names_work`), whose bits from 40 are its context, or
+//! none for the host's own; its commit's time on the wall clock; and its encoders' names
+//! ([`EncoderNames`]), in their order. An encoder's names are its kind; a render encoder's pass's
+//! attachments, each by its texture's guest id; and, by guest id, the heaps its `useHeap:` calls
+//! declare, the buffers and textures its `useResource:` calls declare, and the buffers its
+//! `set*Buffer:` calls bind, refused or not. Of each list an encoder keeps the first [`IDS_KEPT`]
+//! ids, each once, and counts the names of others past them, and those of objects with no guest
+//! id ([`Ids`]). An encoder's names join its command buffer's as it ends, or as it goes unended
+//! ([`Naming`]). A command buffer cut in parts is one entry for each part rt has.
+//!
+//! At the loss, two lines follow the fault's ([`Flights::lines`]): the first [`FLIGHTS_LISTED`]
+//! command buffers committed and not complete, the oldest committed first, each with its context,
+//! its commit's time against the loss and its encoders' kinds in order (runs of one kind counted,
+//! the first [`KINDS_LISTED`] runs listed), and a count of the rest; then the oldest's render
+//! passes, the first [`PASSES_LISTED`], and the resources its encoders name, the first
+//! [`IDS_KEPT`] of each list. The list costs, for each command buffer, a read of the wall clock
+//! and an entry added and removed under the list's lock; for each encoder, one push under its
+//! command buffer's lock; and for each buffer bound or object declared, under the encoder's lock,
+//! which each command takes already, a load of its id and a look through the at most [`IDS_KEPT`]
+//! ids its list keeps.
+//!
 //! **What is kept before the loss.** The tables are walked at the loss, with no record of them
-//! kept before it. The rest is kept as it changes, one entry a range: rt's pool allocations'
-//! ranges, which [`Allocations`] keeps as rt's `BlockMappings` tells it of them (it maps nothing
-//! and refuses nothing, so rt's allocations and their mappings are as without it), and each
-//! import's range, beside the record of where it was imported (`super::diag`'s `imported`).
+//! kept before it beside the history of their objects' releases. The rest is kept as it changes,
+//! one entry a range: rt's pool allocations' ranges, which [`Allocations`] keeps as rt's
+//! `BlockMappings` tells it of them (it maps nothing and refuses nothing, so rt's allocations and
+//! their mappings are as without it), and each import's range, beside the record of where it was
+//! imported (`super::diag`'s `imported`).
 //!
 //! **Bounded waits.** The lines are written on the thread that reads the first failed command
 //! buffer's error, rt's completion thread among them, which a lock's holder may be waiting for: a
@@ -66,18 +117,21 @@
 //! 0x1000, and one instruction pointer, `INSTRUCTION_POINTER_FAULT` at a precision of 0x10. The
 //! access lay in no live object and no mapped block the host saw.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use metal2vulkan_runtime as rt;
 
 use crate::core::num::rem0;
+use crate::core::platform::os::Clock as _;
 use crate::core::platform::resource::{GpuResource as _, Heap as _};
 use crate::core::sync::Mutex;
 
 use super::RtObj;
 use super::buffer::{KnownBlocks, RtBuffer};
+use super::diag::Point;
 use super::heap::RtHeap;
 use super::texture::RtTexture;
 
@@ -331,6 +385,646 @@ fn block_text(block: &MappedBlock) -> String {
     )
 }
 
+/// The wall clock now, in nanoseconds since 1970: a release's time and a commit's, and the
+/// loss's (the module's docs).
+pub(super) fn wall_now() -> u64 {
+    crate::os::OsClock::new().now_wall().as_nanos()
+}
+
+/// `nanos`, nanoseconds, as the line gives seconds: to the microsecond.
+fn seconds(nanos: u64) -> String {
+    format!(
+        "{}.{:06}",
+        nanos / 1_000_000_000,
+        nanos % 1_000_000_000 / 1_000
+    )
+}
+
+/// The time `at` against the loss's, `loss`, both on the wall clock, as the line says it.
+fn against(at: u64, loss: u64) -> String {
+    match loss.checked_sub(at) {
+        Some(before) => format!("{} s before the loss", seconds(before)),
+        None => format!("{} s after the loss", seconds(at - loss)),
+    }
+}
+
+/// The bits an object id's context lies above (the wire's `RGFX_CONTEXT_OBJ_ID_SHIFT`): a
+/// context's object ids are its number shifted so far, and up.
+const CONTEXT_SHIFT: u32 = 40;
+
+/// The context the guest's object id `id` lies in.
+fn context_of(id: u64) -> u32 {
+    u32::try_from(id >> CONTEXT_SHIFT).unwrap_or(u32::MAX)
+}
+
+/// The guest's object id of a buffer, texture or heap of the platform's, told as a decoder's table
+/// stores the object (`reims_vgpu`'s `graphics::fault_walk::name`, [`name_buffer`] and the rest),
+/// which the history names it by as it goes ([`Releases`]), and a command buffer's line where an
+/// encoder named it ([`EncoderNames`]): 0, none, for one no table stored, the host's own. The last
+/// id told is kept. The `Shared` buffer over a two-copy `Managed` texture's CPU copy is told the
+/// texture's id.
+#[derive(Debug, Default)]
+pub struct Named {
+    /// The guest's object id, 0 for none.
+    id: AtomicU64,
+    /// Whether it is the CPU-copy buffer of the `Managed` texture whose id it holds.
+    copy: AtomicBool,
+}
+
+impl Named {
+    /// The guest's object id, 0 for none.
+    pub fn id(&self) -> u64 {
+        self.id.load(Ordering::Relaxed)
+    }
+
+    /// The kind of object it is as the history records it: `object`, or a `Managed` texture's
+    /// CPU-copy buffer where it was told it is one.
+    pub fn kind(&self, object: ObjectKind) -> ObjectKind {
+        match self.copy.load(Ordering::Relaxed) {
+            true => ObjectKind::ManagedCopy,
+            false => object,
+        }
+    }
+
+    /// Tells it `id`: one store.
+    fn name(&self, id: u64) {
+        self.id.store(id, Ordering::Relaxed);
+    }
+
+    /// Tells it that it is the CPU-copy buffer of `Managed` texture `id`: two stores.
+    fn name_copy(&self, id: u64) {
+        self.copy.store(true, Ordering::Relaxed);
+        self.id.store(id, Ordering::Relaxed);
+    }
+}
+
+/// Tells `buffer` the guest's id `id`, under which a decoder's table stores it ([`Named`]).
+pub fn name_buffer(buffer: &RtObj<RtBuffer>, id: u64) {
+    buffer.named().name(id);
+}
+
+/// Tells `buffer` that it is the `Shared` buffer over the CPU copy of the two-copy `Managed`
+/// texture `id`, which a decoder's table stores under that id ([`Named`]).
+pub fn name_managed_copy(buffer: &RtObj<RtBuffer>, id: u64) {
+    buffer.named().name_copy(id);
+}
+
+/// Tells `texture` the guest's id `id`, under which a decoder's table stores it ([`Named`]).
+pub fn name_texture(texture: &RtObj<RtTexture>, id: u64) {
+    texture.named().name(id);
+}
+
+/// Tells `heap` the guest's id `id`, under which a decoder's table stores it ([`Named`]).
+pub fn name_heap(heap: &RtObj<RtHeap>, id: u64) {
+    heap.named().name(id);
+}
+
+/// How many released ranges a device's history keeps ([`Releases`]): the last so many, each older
+/// one dropped, counted.
+pub const RELEASES_KEPT: usize = 4096;
+
+/// A released range as the history keeps it ([`Releases`]): an object of the tables, as its
+/// platform object went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Release {
+    /// What it was.
+    pub kind: ObjectKind,
+    /// The guest's object id, whose bits from 40 are its context.
+    pub id: u64,
+    /// Its `MTLStorageMode`.
+    pub storage: u64,
+    /// Its first byte's GPU address.
+    pub gpu_address: u64,
+    /// Its length in bytes.
+    pub len: u64,
+    /// When it was released: nanoseconds since 1970, on the wall clock.
+    pub at: u64,
+}
+
+impl Release {
+    /// The context it was of.
+    pub fn context(&self) -> u32 {
+        context_of(self.id)
+    }
+}
+
+impl Ranged for Release {
+    fn span(&self) -> (u64, u64) {
+        (self.gpu_address, self.len)
+    }
+}
+
+/// The released ranges kept, oldest first, and how many older ones were dropped past them.
+#[derive(Default)]
+struct Ring {
+    /// The last [`RELEASES_KEPT`], oldest first.
+    kept: VecDeque<Release>,
+    /// How many older ones were dropped past them.
+    dropped: u64,
+}
+
+/// A device's history of released GPU ranges (the module's docs, "The history of released
+/// ranges"): the last [`RELEASES_KEPT`], and how many older ones were dropped past them. A handle:
+/// its clones are the same history, which the device's fault watch holds
+/// ([`FaultWatch::releases`]).
+#[derive(Clone, Default)]
+pub struct Releases(Arc<Mutex<Ring>>);
+
+impl Releases {
+    /// Records the release of the object `id` of `kind` and storage mode `storage`, its range
+    /// the `len` bytes at GPU address `gpu_address`, now: a read of the wall clock and one push
+    /// under the history's lock, held for that alone; past [`RELEASES_KEPT`], the oldest is
+    /// dropped, counted.
+    pub fn push(&self, kind: ObjectKind, id: u64, storage: u64, (gpu_address, len): (u64, u64)) {
+        self.push_at(Release {
+            kind,
+            id,
+            storage,
+            gpu_address,
+            len,
+            at: wall_now(),
+        });
+    }
+
+    /// Records `release`: the history's room for [`RELEASES_KEPT`] is made at its first.
+    fn push_at(&self, release: Release) {
+        let mut ring = self.0.lock();
+        if ring.kept.capacity() < RELEASES_KEPT {
+            ring.kept.reserve_exact(RELEASES_KEPT);
+        }
+        if ring.kept.len() >= RELEASES_KEPT {
+            ring.kept.pop_front();
+            ring.dropped += 1;
+        }
+        ring.kept.push_back(release);
+    }
+
+    /// The released ranges kept, the newest first, and how many older ones were dropped.
+    pub fn kept(&self) -> (Vec<Release>, u64) {
+        let ring = self.0.lock();
+        (ring.kept.iter().rev().copied().collect(), ring.dropped)
+    }
+}
+
+/// A released range as the line names it, released at `release.at`, against the loss at `loss`.
+fn release_text(release: &Release, loss: u64) -> String {
+    let what = object_text(&LiveObject {
+        context: release.context(),
+        id: release.id,
+        kind: release.kind,
+        storage: release.storage,
+        gpu_address: release.gpu_address,
+        len: release.len,
+        gone: false,
+    });
+    format!(
+        "{what}, released at {} s since 1970 ({})",
+        seconds(release.at),
+        against(release.at, loss)
+    )
+}
+
+/// Where an address lies among the released ranges the history keeps ([`history`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct History<'a> {
+    /// The latest released range that held it, with the address's offset in it.
+    pub held: Option<(&'a Release, u64)>,
+    /// The nearest released ranges below and above it, where none held it.
+    pub nearest: Option<Nearest<'a, Release>>,
+}
+
+/// Where `address` lies among `releases`, the history's, the newest first ([`Releases::kept`]):
+/// the latest that held it, else the nearest below and above, of two at the same distance the
+/// shorter, then the later released.
+pub fn history(address: u64, releases: &[Release]) -> History<'_> {
+    let held = (releases.iter()).find_map(|release| {
+        let offset = offset_in(release.gpu_address, release.len, address)?;
+        Some((release, offset))
+    });
+    History {
+        held,
+        nearest: held.is_none().then(|| nearest(releases, address)),
+    }
+}
+
+impl History<'_> {
+    /// Where the address lies among the released ranges as the line says it, each range's release
+    /// against the loss at `loss`.
+    pub fn text(&self, loss: u64) -> String {
+        let name = |release: &Release| release_text(release, loss);
+        match (&self.held, &self.nearest) {
+            (Some((release, offset)), _) => format!(
+                "in the history of released ranges, the last kept that held it, at offset \
+                 {offset:#x}: {}",
+                name(release)
+            ),
+            (None, Some(nearest)) => format!(
+                "in the history of released ranges, none kept held it ({})",
+                nearest.text(name)
+            ),
+            (None, None) => "in the history of released ranges, none kept held it".to_owned(),
+        }
+    }
+}
+
+/// What the history keeps, as the line says it: how many of each kind, and how many it keeps at
+/// most and dropped past that.
+fn kept_text(released: &[Release], dropped: u64) -> String {
+    let count = |kind| released.iter().filter(|r| r.kind == kind).count();
+    format!(
+        "The history of released ranges keeps the last {RELEASES_KEPT}, and holds {} ({dropped} \
+         older dropped past them): {} buffers, {} textures over a buffer, {} heaps, {} two-copy \
+         Managed textures' CPU-copy buffers",
+        released.len(),
+        count(ObjectKind::Buffer),
+        count(ObjectKind::Texture),
+        count(ObjectKind::Heap),
+        count(ObjectKind::ManagedCopy),
+    )
+}
+
+/// How many command buffers committed and not complete at a loss its line lists, the oldest
+/// first ([`Flights::lines`]); the rest are counted.
+pub const FLIGHTS_LISTED: usize = 16;
+
+/// How many runs of one kind of encoder the line lists of a command buffer's encoders; the rest
+/// are counted.
+pub const KINDS_LISTED: usize = 32;
+
+/// How many ids of each list an encoder keeps ([`Ids`]), and the oldest command buffer's line
+/// lists of each of its lists.
+pub const IDS_KEPT: usize = 32;
+
+/// How many render passes the oldest command buffer's line lists; the rest are counted.
+pub const PASSES_LISTED: usize = 16;
+
+/// The kind of an encoder of a command buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderKind {
+    /// `MTLBlitCommandEncoder`.
+    Blit,
+    /// `MTLComputeCommandEncoder`.
+    Compute,
+    /// `MTLRenderCommandEncoder`.
+    Render,
+}
+
+impl EncoderKind {
+    /// Its name on the line.
+    fn name(self) -> &'static str {
+        match self {
+            EncoderKind::Blit => "blit",
+            EncoderKind::Compute => "compute",
+            EncoderKind::Render => "render",
+        }
+    }
+}
+
+/// The guest's object ids an encoder names in one of its lists ([`EncoderNames`]): each once, in
+/// the order first named, the first [`IDS_KEPT`]; past them, the names of others counted; and the
+/// names of objects with no guest id ([`Named`]), counted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ids {
+    /// The ids named, each once, in the order first named: the first [`IDS_KEPT`].
+    kept: Vec<u64>,
+    /// How many names of ids past those kept.
+    past: u64,
+    /// How many names of objects with no guest id.
+    unnumbered: u64,
+}
+
+impl Ids {
+    /// Notes a name of `id`, 0 for an object with no guest id: a look through the at most
+    /// [`IDS_KEPT`] ids kept.
+    pub fn add(&mut self, id: u64) {
+        if id == 0 {
+            self.unnumbered += 1;
+        } else if !self.kept.contains(&id) {
+            match self.kept.len() < IDS_KEPT {
+                true => self.kept.push(id),
+                false => self.past += 1,
+            }
+        }
+    }
+
+    /// Notes `other`'s ids and counts in this list.
+    fn join(&mut self, other: &Ids) {
+        for &id in &other.kept {
+            self.add(id);
+        }
+        self.past += other.past;
+        self.unnumbered += other.unnumbered;
+    }
+
+    /// The list as the line says it.
+    fn text(&self) -> String {
+        if self.kept.is_empty() && self.past == 0 && self.unnumbered == 0 {
+            return "none".to_owned();
+        }
+        let mut parts = (self.kept.iter())
+            .map(|id| format!("{id:#x}"))
+            .collect::<Vec<_>>();
+        if self.past > 0 {
+            parts.push(format!(
+                "{} more names past the first {IDS_KEPT} ids",
+                self.past
+            ));
+        }
+        if self.unnumbered > 0 {
+            parts.push(format!(
+                "{} names of objects with no guest id",
+                self.unnumbered
+            ));
+        }
+        parts.join(", ")
+    }
+}
+
+/// What an encoder of a command buffer names (the module's docs, "The command buffers in
+/// flight").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncoderNames {
+    /// Its kind.
+    pub kind: EncoderKind,
+    /// A render encoder's pass's attachments: each one's point and its texture's guest id, 0 for
+    /// one with none.
+    pub attachments: Vec<(Point, u64)>,
+    /// The heaps its `useHeap:` calls declare.
+    pub heaps: Ids,
+    /// The buffers its `useResource:` calls declare.
+    pub declared_buffers: Ids,
+    /// The textures its `useResource:` calls declare.
+    pub declared_textures: Ids,
+    /// The buffers its `set*Buffer:` calls bind (`setTessellationFactorBuffer:` among them).
+    pub bound_buffers: Ids,
+}
+
+impl EncoderNames {
+    /// An encoder of `kind` that names nothing yet.
+    pub fn new(kind: EncoderKind) -> EncoderNames {
+        EncoderNames {
+            kind,
+            attachments: Vec::new(),
+            heaps: Ids::default(),
+            declared_buffers: Ids::default(),
+            declared_textures: Ids::default(),
+            bound_buffers: Ids::default(),
+        }
+    }
+}
+
+/// A command buffer's encoders' names, in their order: each joins as its encoder ends or goes
+/// ([`Naming`]), and the commit takes them ([`Flight`]). A handle: its clones, which its encoders
+/// hold, are the same list.
+#[derive(Clone, Default)]
+pub struct Encoded(Arc<Mutex<Vec<EncoderNames>>>);
+
+impl Encoded {
+    /// Adds an encoder's names: one push under the list's lock.
+    pub fn push(&self, names: EncoderNames) {
+        self.0.lock().push(names);
+    }
+
+    /// The names so far, taken.
+    pub fn take(&self) -> Vec<EncoderNames> {
+        std::mem::take(&mut *self.0.lock())
+    }
+}
+
+/// An encoder's names from its make, which join its command buffer's ([`Encoded`]) as it ends,
+/// or as it goes unended.
+pub struct Naming {
+    /// Its command buffer's list.
+    into: Encoded,
+    /// Its names, until they join the list.
+    names: Option<EncoderNames>,
+}
+
+impl Naming {
+    /// The names `names` of an encoder made now, which join `into` as it ends or goes.
+    pub fn new(into: &Encoded, names: EncoderNames) -> Naming {
+        Naming {
+            into: into.clone(),
+            names: Some(names),
+        }
+    }
+
+    /// Its names, until they joined the list.
+    pub fn names(&mut self) -> Option<&mut EncoderNames> {
+        self.names.as_mut()
+    }
+
+    /// The encoder ended: its names join the list, once.
+    pub fn end(&mut self) {
+        if let Some(names) = self.names.take() {
+            self.into.push(names);
+        }
+    }
+}
+
+impl Drop for Naming {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// A command buffer committed and not complete (the module's docs, "The command buffers in
+/// flight").
+#[derive(Debug)]
+pub struct Flight {
+    /// The object id of the guest's command buffer, `None` for one of the host's own.
+    pub cb: Option<u64>,
+    /// When it was committed: nanoseconds since 1970, on the wall clock.
+    pub committed: u64,
+    /// Its encoders' names, in their order.
+    pub encoders: Vec<EncoderNames>,
+}
+
+impl Flight {
+    /// The command buffer as the line names it.
+    fn who(&self) -> String {
+        match self.cb {
+            Some(cb) => format!(
+                "the guest's command buffer {cb:#x} of context {}",
+                context_of(cb)
+            ),
+            None => "a command buffer of the host's own".to_owned(),
+        }
+    }
+
+    /// Its encoders' kinds in order, as the line says them: each run of one kind once, with its
+    /// count where more than one; the first [`KINDS_LISTED`] runs, then a count of the rest.
+    fn kinds(&self) -> String {
+        if self.encoders.is_empty() {
+            return "with no encoders".to_owned();
+        }
+        let mut runs: Vec<(EncoderKind, usize)> = Vec::new();
+        for encoder in &self.encoders {
+            match runs.last_mut() {
+                Some((kind, n)) if *kind == encoder.kind => *n += 1,
+                _ => runs.push((encoder.kind, 1)),
+            }
+        }
+        let listed = (runs.iter().take(KINDS_LISTED))
+            .map(|&(kind, n)| match n {
+                1 => kind.name().to_owned(),
+                n => format!("{n} {}", kind.name()),
+            })
+            .collect::<Vec<_>>();
+        let rest = (runs.iter().skip(KINDS_LISTED))
+            .map(|&(_, n)| n)
+            .sum::<usize>();
+        let rest = match rest {
+            0 => String::new(),
+            rest => format!(", and {rest} more not listed"),
+        };
+        format!(
+            "its encoders ({}): {}{rest}",
+            self.encoders.len(),
+            listed.join(", ")
+        )
+    }
+
+    /// What its encoders name, as the oldest's line says it: its render passes' attachments by
+    /// texture, the first [`PASSES_LISTED`] passes, then the heaps and resources its encoders
+    /// declare and the buffers they bind.
+    fn names(&self) -> String {
+        let (mut passes, mut more_passes) = (Vec::new(), 0);
+        let mut lists: [Ids; 4] = Default::default();
+        for (at, encoder) in self.encoders.iter().enumerate() {
+            let of = [
+                &encoder.heaps,
+                &encoder.declared_buffers,
+                &encoder.declared_textures,
+                &encoder.bound_buffers,
+            ];
+            for (list, of) in lists.iter_mut().zip(of) {
+                list.join(of);
+            }
+            if encoder.kind != EncoderKind::Render {
+                continue;
+            }
+            if passes.len() >= PASSES_LISTED {
+                more_passes += 1;
+                continue;
+            }
+            let attachments = (encoder.attachments.iter())
+                .map(|&(point, id)| {
+                    let point = match point {
+                        Point::Color(i) => format!("colour {i}"),
+                        Point::Depth => "depth".to_owned(),
+                        Point::Stencil => "stencil".to_owned(),
+                    };
+                    match id {
+                        0 => format!("{point} a texture with no guest id"),
+                        id => format!("{point} texture {id:#x}"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let attachments = match attachments.is_empty() {
+                true => "no attachments".to_owned(),
+                false => attachments.join(", "),
+            };
+            passes.push(format!("encoder {}: {attachments}", at + 1));
+        }
+        let passes = match (passes.is_empty(), more_passes) {
+            (true, _) => "no render passes".to_owned(),
+            (false, 0) => format!("its render passes' attachments: {}", passes.join("; ")),
+            (false, more) => format!(
+                "its render passes' attachments: {}; and {more} more passes not listed",
+                passes.join("; ")
+            ),
+        };
+        let [heaps, buffers, textures, bound] = lists.map(|list| list.text());
+        format!(
+            "{passes}; the heaps its encoders declare (useHeap:): {heaps}; the buffers they \
+             declare (useResource:): {buffers}; the textures they declare (useResource:): \
+             {textures}; the buffers they bind: {bound}"
+        )
+    }
+}
+
+/// A device's command buffers committed and not complete (the module's docs, "The command buffers
+/// in flight"), by the number of their commit: each added before rt has it, and removed as its
+/// first completed handler runs, or as rt refuses its commit.
+#[derive(Default)]
+pub struct Flights(Mutex<(u64, BTreeMap<u64, Flight>)>);
+
+impl Flights {
+    /// Adds `flight`, committed now: its number, which removes it, never 0.
+    pub fn add(&self, flight: Flight) -> u64 {
+        let mut flights = self.0.lock();
+        flights.0 += 1;
+        let number = flights.0;
+        flights.1.insert(number, flight);
+        number
+    }
+
+    /// Removes the command buffer of number `number`, 0 for none: it completed, or rt refused
+    /// it. What it kept is let go of after the lock.
+    pub fn remove(&self, number: u64) {
+        if number == 0 {
+            return;
+        }
+        let gone = self.0.lock().1.remove(&number);
+        drop(gone);
+    }
+
+    /// How many command buffers are committed and not complete.
+    pub fn len(&self) -> usize {
+        self.0.lock().1.len()
+    }
+
+    /// Whether none is.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The lines of the device on `gpu` lost at `loss`, on the wall clock, each with its own `\n`
+    /// (the module's docs, "The command buffers in flight"): the command buffers committed and
+    /// not complete, the oldest first, and then, where there is one, what the oldest's encoders
+    /// name.
+    pub fn lines(&self, gpu: &str, loss: u64) -> Vec<String> {
+        let flights = self.0.lock();
+        let open = &flights.1;
+        let listed = (open.values().take(FLIGHTS_LISTED))
+            .map(|flight| {
+                format!(
+                    "{}, committed at {} s since 1970 ({}), {}",
+                    flight.who(),
+                    seconds(flight.committed),
+                    against(flight.committed, loss),
+                    flight.kinds()
+                )
+            })
+            .collect::<Vec<_>>();
+        let rest = match open.len().saturating_sub(FLIGHTS_LISTED) {
+            0 => String::new(),
+            rest => format!("; and {rest} more, not listed"),
+        };
+        let mut lines = vec![match open.len() {
+            0 => format!(
+                "reims-vgpu: the rt platform's device on {gpu}, at its loss, had no command \
+                 buffers committed and not complete\n"
+            ),
+            n => format!(
+                "reims-vgpu: the rt platform's device on {gpu}, at its loss, had {n} command \
+                 buffers committed and not complete, the oldest committed first: {}{rest}\n",
+                listed.join("; ")
+            ),
+        }];
+        if let Some(oldest) = open.values().next() {
+            lines.push(format!(
+                "reims-vgpu: the oldest command buffer committed and not complete at the loss of \
+                 the rt platform's device on {gpu}, {}: {}\n",
+                oldest.who(),
+                oldest.names()
+            ));
+        }
+        lines
+    }
+}
+
 impl Placement<'_> {
     /// The placement as the line says it: inside which live objects, each with the address's
     /// offset in it, or in none and the nearest below and above, then those the access's bytes
@@ -537,14 +1231,17 @@ impl rt::BlockMappings for Allocations {
     }
 }
 
-/// A device's watch for its loss's fault: rt's pool allocations, the blocks the device knows, and
-/// the decoders' tables to walk at the loss. A handle: its clones are the same watch.
+/// A device's watch for its loss's fault: rt's pool allocations, the blocks the device knows, its
+/// history of released ranges, and the decoders' tables to walk at the loss. A handle: its clones
+/// are the same watch.
 #[derive(Clone, Default)]
 pub struct FaultWatch {
     /// rt's pool allocations still mapped.
     allocations: Arc<Allocations>,
     /// The device's known blocks, its set's handle.
     known: KnownBlocks,
+    /// The device's history of released ranges.
+    releases: Releases,
     /// The decoders' tables.
     tables: Arc<Mutex<Vec<Arc<dyn LiveObjects>>>>,
 }
@@ -560,8 +1257,15 @@ impl FaultWatch {
         FaultWatch {
             allocations,
             known,
+            releases: Releases::default(),
             tables: Arc::default(),
         }
+    }
+
+    /// The device's history of released ranges, which the tables' objects record their releases
+    /// in as they go (`super::device`'s `RtDevice::releases`).
+    pub fn releases(&self) -> &Releases {
+        &self.releases
     }
 
     /// Walks `tables` too at the loss, and no longer those whose decoder went.
@@ -571,10 +1275,11 @@ impl FaultWatch {
         all.push(tables);
     }
 
-    /// The fault's lines for the device on `gpu`, its report `fault` (rt's `DeviceLoss::fault`),
-    /// each with its own `\n` (the module's docs): the report, each instruction pointer and each
-    /// access placed, and what the placement saw; one line where rt read no report.
-    pub fn lines(&self, gpu: &str, fault: Option<&rt::DeviceFault>) -> Vec<String> {
+    /// The fault's lines for the device on `gpu`, lost at `loss` on the wall clock, its report
+    /// `fault` (rt's `DeviceLoss::fault`), each with its own `\n` (the module's docs): the report,
+    /// each instruction pointer and each access placed, among what is live and what was released,
+    /// and what the placement saw; one line where rt read no report.
+    pub fn lines(&self, gpu: &str, fault: Option<&rt::DeviceFault>, loss: u64) -> Vec<String> {
         let head = format!("reims-vgpu: the rt platform's device on {gpu} faulted: ");
         let Some(fault) = fault else {
             return vec![format!(
@@ -595,12 +1300,14 @@ impl FaultWatch {
             fault.accesses.len(),
             fault.instructions.len()
         )];
+        let (released, dropped) = self.releases.kept();
         let (objects, blocks, seen) = self.seen();
         let placed = |at: &rt::FaultAddress| {
             let placement = place(at.address, at.precision, &objects, &blocks);
             let (start, end) = placement.range;
             let text = placement.text();
-            format!("{at:?}, the bytes [{start:#x}, {end:#x}): {text}")
+            let history = history(at.address, &released).text(loss);
+            format!("{at:?}, the bytes [{start:#x}, {end:#x}): {text}; {history}")
         };
         for at in &fault.instructions {
             let at = placed(at);
@@ -609,7 +1316,8 @@ impl FaultWatch {
         for at in &fault.accesses {
             lines.push(format!("{head}access {}\n", placed(at)));
         }
-        lines.push(format!("{head}{seen}\n"));
+        let kept = kept_text(&released, dropped);
+        lines.push(format!("{head}{seen}. {kept}\n"));
         lines
     }
 
@@ -723,6 +1431,14 @@ mod tests {
     use super::*;
 
     use ash::vk::DeviceFaultAddressTypeEXT as Kind;
+
+    /// A loss's time on the wall clock, as a test gives it: 1795560000.25 s since 1970, a quarter
+    /// second past 2026-11-24 22:40 UTC.
+    const LOSS: u64 = 1_795_560_000_250_000_000;
+
+    /// What an access's line says of the history where it keeps nothing.
+    const NONE_RELEASED: &str = "in the history of released ranges, none kept held it (nearest \
+                                 below: none; nearest above: none)";
 
     fn buffer(id: u64, gpu_address: u64, len: u64) -> LiveObject {
         LiveObject {
@@ -999,7 +1715,7 @@ mod tests {
             instructions: vec![at(Kind::INSTRUCTION_POINTER_FAULT, 0xde_fe1f_bef0, 0x10)],
             vendor: vec![("mmu".to_owned(), 0x1f, 0x2)],
         };
-        let lines = watch.lines("GPU (10de:2204)", Some(&fault));
+        let lines = watch.lines("GPU (10de:2204)", Some(&fault), LOSS);
         let head = "reims-vgpu: the rt platform's device on GPU (10de:2204) faulted: ";
         assert_eq!(lines.len(), 5);
         for line in &lines {
@@ -1021,7 +1737,8 @@ mod tests {
                  0x8cfe1faef0 bytes past its end; nearest above: none), in no mapped block we \
                  know (nearest below: buffer 0x100000003's block 44 (Shared, an import of host \
                  pages by their pointer, length 0x10000, at 0x6000000000), the address \
-                 0x7efe1ebef0 bytes past its end; nearest above: none); {NO_CODE_SEEN}\n"
+                 0x7efe1ebef0 bytes past its end; nearest above: none); {NONE_RELEASED}; \
+                 {NO_CODE_SEEN}\n"
             )
         );
         assert_eq!(
@@ -1032,7 +1749,7 @@ mod tests {
                  at 0x5200000000) at offset 0x810; inside texture 0x100000002 of context 3 \
                  (Private, length 0x400, at 0x5200000800) at offset 0x10, in mapped block rt's \
                  pool allocation 7 (Private, not an import, length 0x1000000, at 0x5200000000) at \
-                 offset 0x810\n"
+                 offset 0x810; {NONE_RELEASED}\n"
             )
         );
         assert_eq!(
@@ -1045,7 +1762,8 @@ mod tests {
                  (nearest below: rt's pool allocation 7 (Private, not an import, length \
                  0x1000000, at 0x5200000000), the address 0x19f00000 bytes past its end; nearest \
                  above: rt's pool allocation 8 (Shared, not an import, length 0x1000000, at \
-                 0x5300000000), its first byte 0xe5100000 bytes past the address)\n"
+                 0x5300000000), its first byte 0xe5100000 bytes past the address); \
+                 {NONE_RELEASED}\n"
             )
         );
         assert_eq!(
@@ -1060,23 +1778,498 @@ mod tests {
                  dma-buf imports, 1 blocks of live objects (heaps' blocks, buffers' imports). Not \
                  seen: rt's parameter ring, zero source and staging region, images rt makes with \
                  memory of their own, exports and surfaces, and an import by the pages' pointer \
-                 that no live object or known block lies in\n"
+                 that no live object or known block lies in. The history of released ranges keeps \
+                 the last 4096, and holds 0 (0 older dropped past them): 0 buffers, 0 textures \
+                 over a buffer, 0 heaps, 0 two-copy Managed textures' CPU-copy buffers\n"
             )
         );
         // An allocation rt unmapped is no longer among the blocks.
         allocations.0.lock().remove(&8);
-        let lines = watch.lines("GPU (10de:2204)", Some(&fault));
-        assert!(lines[3].ends_with(
+        let lines = watch.lines("GPU (10de:2204)", Some(&fault), LOSS);
+        assert!(lines[3].ends_with(&format!(
             "nearest above: buffer 0x100000003's block 44 (Shared, an import of host pages by \
              their pointer, length 0x10000, at 0x6000000000), its first byte 0xde5100000 bytes \
-             past the address)\n"
-        ));
+             past the address); {NONE_RELEASED}\n"
+        )));
+    }
+
+    /// A millisecond, in nanoseconds.
+    const MS: u64 = 1_000_000;
+
+    fn release(kind: ObjectKind, id: u64, storage: u64, (gpu_address, len): (u64, u64)) -> Release {
+        Release {
+            kind,
+            id,
+            storage,
+            gpu_address,
+            len,
+            at: 0,
+        }
+    }
+
+    /// The release of `release`, `before` nanoseconds before the loss.
+    fn before(release: Release, before: u64) -> Release {
+        Release {
+            at: LOSS - before,
+            ..release
+        }
+    }
+
+    /// An address a released range held names the latest the history keeps that held it, with
+    /// the address's offset in it, by the object's kind, guest id, context, storage mode, length
+    /// and GPU address, and when it was released against the loss. A fault's access line says so,
+    /// and the line of what the placement saw counts the history.
+    #[test]
+    fn a_fault_s_address_names_the_last_released_range_that_held_it() {
+        let releases = Releases::default();
+        let heap = release(
+            ObjectKind::Heap,
+            0x300_0000_0001,
+            2,
+            (0x52_0000_0000, 0x10_0000),
+        );
+        releases.push_at(before(heap, 100 * MS));
+        let older = release(
+            ObjectKind::Buffer,
+            0x300_0000_0002,
+            2,
+            (0x52_0000_0000, 0x1000),
+        );
+        releases.push_at(before(older, 50 * MS));
+        let newer = release(
+            ObjectKind::Buffer,
+            0x500_0000_0003,
+            0,
+            (0x52_0000_0000, 0x800),
+        );
+        releases.push_at(before(newer, 3 * MS));
+        let texture = release(
+            ObjectKind::Texture,
+            0x300_0000_0004,
+            2,
+            (0x60_0000_0100, 0x100),
+        );
+        releases.push_at(before(texture, 2 * MS));
+        let copy = release(
+            ObjectKind::ManagedCopy,
+            0x300_0000_0005,
+            0,
+            (0x70_0000_0000, 0x1_0000),
+        );
+        releases.push_at(before(copy, MS));
+        let (kept, dropped) = releases.kept();
+        assert_eq!((kept.len(), dropped), (5, 0));
+        // The newest first.
+        let ids = kept.iter().map(|r| r.id & 0xff).collect::<Vec<_>>();
+        assert_eq!(ids, [5, 4, 3, 2, 1]);
+        let contexts = kept.iter().map(Release::context).collect::<Vec<_>>();
+        assert_eq!(contexts, [3, 3, 5, 3, 3]);
+
+        let held = history(0x52_0000_0010, &kept);
+        assert_eq!(
+            held,
+            History {
+                held: Some((&kept[2], 0x10)),
+                nearest: None
+            }
+        );
+        let held = held.text(LOSS);
+        assert_eq!(
+            held,
+            "in the history of released ranges, the last kept that held it, at offset 0x10: \
+             buffer 0x50000000003 of context 5 (Shared, length 0x800, at 0x5200000000), released \
+             at 1795560000.247000 s since 1970 (0.003000 s before the loss)"
+        );
+        let text = |address| history(address, &kept).text(LOSS);
+        // Past the newer buffer's end, the older's; past both, the heap's.
+        assert_eq!(
+            text(0x52_0000_0900),
+            "in the history of released ranges, the last kept that held it, at offset 0x900: \
+             buffer 0x30000000002 of context 3 (Private, length 0x1000, at 0x5200000000), \
+             released at 1795560000.200000 s since 1970 (0.050000 s before the loss)"
+        );
+        assert_eq!(
+            text(0x52_000f_0000),
+            "in the history of released ranges, the last kept that held it, at offset 0xf0000: \
+             heap 0x30000000001 of context 3 (Private, length 0x100000, at 0x5200000000), \
+             released at 1795560000.150000 s since 1970 (0.100000 s before the loss)"
+        );
+        assert_eq!(
+            text(0x60_0000_01ff),
+            "in the history of released ranges, the last kept that held it, at offset 0xff: \
+             texture 0x30000000004 of context 3 (Private, length 0x100, at 0x6000000100), \
+             released at 1795560000.248000 s since 1970 (0.002000 s before the loss)"
+        );
+        assert_eq!(
+            text(0x70_0000_fff0),
+            "in the history of released ranges, the last kept that held it, at offset 0xfff0: \
+             the CPU-copy buffer of Managed texture 0x30000000005 of context 3 (Shared, length \
+             0x10000, at 0x7000000000), released at 1795560000.249000 s since 1970 (0.001000 s \
+             before the loss)"
+        );
+
+        // A fault's access line, and the line of what the placement saw.
+        let watch = FaultWatch::default();
+        for release in kept.iter().rev() {
+            watch.releases().push_at(*release);
+        }
+        let fault = rt::DeviceFault {
+            description: "a fault".to_owned(),
+            accesses: vec![rt::FaultAddress {
+                kind: Kind::READ_INVALID,
+                address: 0x52_0000_0010,
+                precision: 0x10,
+            }],
+            instructions: Vec::new(),
+            vendor: Vec::new(),
+        };
+        let lines = watch.lines("GPU (10de:2204)", Some(&fault), LOSS);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[1].ends_with(&format!("; {held}\n")), "{}", lines[1]);
+        assert!(
+            lines[2].ends_with(
+                ". The history of released ranges keeps the last 4096, and holds 5 (0 older \
+                 dropped past them): 2 buffers, 1 textures over a buffer, 1 heaps, 1 two-copy \
+                 Managed textures' CPU-copy buffers\n"
+            ),
+            "{}",
+            lines[2]
+        );
+    }
+
+    /// An address no released range held names the nearest the history keeps below it, with the
+    /// bytes from its end to the address, and above it, with the bytes from the address to its
+    /// first byte: of two at the same distance, the shorter, then the later released. A range
+    /// released after the loss's time, as its lines were made, is said to be.
+    #[test]
+    fn otherwise_the_nearest_released_range_below_and_above_is_named() {
+        let releases = Releases::default();
+        let buffer = |id, range| release(ObjectKind::Buffer, id, 0, range);
+        let first = buffer(0x300_0000_0001, (0x10_0000, 0x400));
+        releases.push_at(before(first, 300 * MS));
+        let again = buffer(0x300_0000_0002, (0x10_0000, 0x400));
+        releases.push_at(before(again, 100 * MS));
+        let short = release(ObjectKind::Heap, 0x300_0000_0003, 2, (0x40_0000, 0x1000));
+        releases.push_at(Release {
+            at: LOSS + 20 * MS,
+            ..short
+        });
+        let long = buffer(0x300_0000_0004, (0x40_0000, 0x10_0000));
+        releases.push_at(before(long, 10 * MS));
+        let (kept, _) = releases.kept();
+        let ids = kept.iter().map(|r| r.id & 0xff).collect::<Vec<_>>();
+        assert_eq!(ids, [4, 3, 2, 1]);
+        let between = history(0x20_0000, &kept);
+        assert_eq!(between.held, None);
+        let nearest = between.nearest.as_ref().expect("the nearest");
+        assert_eq!(nearest.below, Some((&kept[2], 0xf_fc00)));
+        assert_eq!(nearest.above, Some((&kept[1], 0x20_0000)));
+        assert_eq!(
+            between.text(LOSS),
+            "in the history of released ranges, none kept held it (nearest below: buffer \
+             0x30000000002 of context 3 (Shared, length 0x400, at 0x100000), released at \
+             1795560000.150000 s since 1970 (0.100000 s before the loss), the address 0xffc00 \
+             bytes past its end; nearest above: heap 0x30000000003 of context 3 (Private, length \
+             0x1000, at 0x400000), released at 1795560000.270000 s since 1970 (0.020000 s after \
+             the loss), its first byte 0x200000 bytes past the address)"
+        );
+        // Below every range kept, and above every one.
+        let low = history(0x1000, &kept).nearest.expect("the nearest");
+        assert_eq!((low.below, low.above), (None, Some((&kept[2], 0xf_f000))));
+        let high = history(0x100_0000, &kept).nearest.expect("the nearest");
+        assert_eq!(
+            (high.below, high.above),
+            (Some((&kept[0], 0xb0_0000)), None)
+        );
+        // An empty history.
+        assert_eq!(history(0x1000, &[]).text(LOSS), NONE_RELEASED);
+    }
+
+    /// The history keeps the last [`RELEASES_KEPT`] releases: each past them drops the oldest,
+    /// counted, and the line says how many it keeps at most, holds and dropped.
+    #[test]
+    fn the_history_keeps_its_last_releases_and_counts_those_dropped() {
+        let releases = Releases::default();
+        let n = RELEASES_KEPT as u64 + 3;
+        for id in 1..=n {
+            let range = (id << 20, 0x1000);
+            let released = release(ObjectKind::Buffer, 0x300_0000_0000 + id, 0, range);
+            releases.push_at(before(released, (n - id) * MS));
+        }
+        let (kept, dropped) = releases.kept();
+        assert_eq!((kept.len(), dropped), (RELEASES_KEPT, 3));
+        let id = |release: &Release| release.id - 0x300_0000_0000;
+        assert_eq!((id(&kept[0]), id(&kept[RELEASES_KEPT - 1])), (n, 4));
+        // An address the oldest dropped held is in none kept.
+        let dropped_held = history(1 << 20, &kept);
+        assert_eq!(dropped_held.held, None);
+        let above = dropped_held.nearest.and_then(|n| n.above);
+        assert_eq!(above.map(|(r, gap)| (id(r), gap)), Some((4, 0x30_0000)));
+        assert_eq!(
+            kept_text(&kept, dropped),
+            "The history of released ranges keeps the last 4096, and holds 4096 (3 older dropped \
+             past them): 4096 buffers, 0 textures over a buffer, 0 heaps, 0 two-copy Managed \
+             textures' CPU-copy buffers"
+        );
+    }
+
+    /// On the GPU the test holds, a buffer and a heap a decoder's table named go into their
+    /// device's history as their platform objects go, each by its guest id, whose bits from 40
+    /// are its context, its storage mode and its GPU range; a buffer named the CPU-copy buffer of
+    /// a `Managed` texture as that; a buffer no table named, the host's own, not at all.
+    #[test]
+    fn a_released_object_s_history_entry_carries_its_guest_id_and_context_on_vulkan() {
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::values::{HeapDesc, OptionSet};
+        use crate::core::raise::OnFault;
+
+        let platform = super::super::RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let of = |length, options| {
+            let made = device.new_buffer_of_length(on, length, options);
+            made.expect("never a raise").expect("a buffer")
+        };
+        let range = |buffer: &RtObj<RtBuffer>| (buffer.gpu_address(), buffer.length());
+        let from = wall_now();
+
+        let private = of(0x1000, 0x20);
+        name_buffer(&private, 0x300_0000_0007);
+        let private_range = range(&private);
+        drop(private);
+        let copy = of(0x100, 0);
+        name_managed_copy(&copy, 0x500_0000_0008);
+        let copy_range = range(&copy);
+        drop(copy);
+        drop(of(0x100, 0));
+        let desc = HeapDesc {
+            size: 0x10000,
+            heap_type: 1,
+            options: vec![OptionSet::ResourceOptions(0x20)],
+            pinned_gpu_address: None,
+        };
+        let heap = device.new_heap(&desc).expect("never a raise").heap;
+        let heap = heap.expect("a Private placement heap");
+        name_heap(&heap, 0x600_0000_0009);
+        let heap_range = (heap.gpu_address(), 0x10000);
+        drop(heap);
+
+        let (kept, dropped) = device.releases().kept();
+        assert_eq!(dropped, 0);
+        let entry = |r: &Release| (r.kind, r.id, r.context(), r.storage, (r.gpu_address, r.len));
+        assert_eq!(
+            kept.iter().map(entry).collect::<Vec<_>>(),
+            [
+                (ObjectKind::Heap, 0x600_0000_0009, 6, 2, heap_range),
+                (ObjectKind::ManagedCopy, 0x500_0000_0008, 5, 0, copy_range),
+                (ObjectKind::Buffer, 0x300_0000_0007, 3, 2, private_range),
+            ]
+        );
+        let now = wall_now();
+        assert!(
+            kept.iter().all(|r| (from..=now).contains(&r.at)),
+            "{kept:?}"
+        );
+    }
+
+    fn ids(of: &[u64]) -> Ids {
+        let mut ids = Ids::default();
+        for &id in of {
+            ids.add(id);
+        }
+        ids
+    }
+
+    /// An encoder's names join its command buffer's list as it ends, once, or as it goes unended,
+    /// in the order the encoders end; the commit takes them.
+    #[test]
+    fn an_encoder_s_names_join_its_command_buffer_s_as_it_ends_or_goes() {
+        let encoded = Encoded::default();
+        let mut blit = Naming::new(&encoded, EncoderNames::new(EncoderKind::Blit));
+        blit.end();
+        blit.end();
+        assert!(blit.names().is_none());
+        drop(blit);
+        let mut compute = Naming::new(&encoded, EncoderNames::new(EncoderKind::Compute));
+        let names = compute.names().expect("its names, until it ends");
+        names.bound_buffers.add(0x7);
+        drop(compute);
+        let taken = encoded.take();
+        let kinds = taken.iter().map(|e| e.kind).collect::<Vec<_>>();
+        assert_eq!(kinds, [EncoderKind::Blit, EncoderKind::Compute]);
+        assert_eq!(taken[1].bound_buffers, ids(&[0x7]));
+        assert!(encoded.take().is_empty());
+    }
+
+    /// The command buffers committed and not complete at a loss are listed the oldest first, each
+    /// by the guest's id and its context, or as the host's own, with its commit's time against the
+    /// loss and its encoders' kinds in order; the oldest's line names its passes' attachments by
+    /// texture and what its encoders declare and bind, each id once. One removed, completed, is
+    /// not listed; with none, the line says so.
+    #[test]
+    fn the_command_buffers_in_flight_at_a_loss_are_listed_oldest_first() {
+        let flights = Flights::default();
+        let gpu = "GPU (10de:2204)";
+        assert_eq!(
+            flights.lines(gpu, LOSS),
+            [
+                "reims-vgpu: the rt platform's device on GPU (10de:2204), at its loss, had no \
+                 command buffers committed and not complete\n"
+            ]
+        );
+        let render = EncoderNames {
+            attachments: vec![
+                (Point::Color(0), 0x300_0000_0020),
+                (Point::Color(1), 0),
+                (Point::Depth, 0x300_0000_0021),
+            ],
+            heaps: ids(&[0x300_0000_0030]),
+            bound_buffers: ids(&[0x300_0000_0040, 0, 0x300_0000_0040]),
+            ..EncoderNames::new(EncoderKind::Render)
+        };
+        let compute = EncoderNames {
+            declared_buffers: ids(&[0x300_0000_0041]),
+            declared_textures: ids(&[0x300_0000_0022]),
+            bound_buffers: ids(&[0x300_0000_0040, 0x300_0000_0042]),
+            ..EncoderNames::new(EncoderKind::Compute)
+        };
+        let oldest = flights.add(Flight {
+            cb: Some(0x300_0000_0010),
+            committed: LOSS - 40 * MS,
+            encoders: vec![
+                render,
+                compute,
+                EncoderNames::new(EncoderKind::Compute),
+                EncoderNames::new(EncoderKind::Blit),
+            ],
+        });
+        let completed = flights.add(Flight {
+            cb: Some(0x400_0000_0010),
+            committed: LOSS - 30 * MS,
+            encoders: Vec::new(),
+        });
+        flights.add(Flight {
+            cb: None,
+            committed: LOSS - 20 * MS,
+            encoders: vec![EncoderNames::new(EncoderKind::Blit)],
+        });
+        flights.add(Flight {
+            cb: Some(0x400_0000_0011),
+            committed: LOSS - 10 * MS,
+            encoders: Vec::new(),
+        });
+        assert!(oldest != 0 && completed != 0);
+        flights.remove(completed);
+        flights.remove(0);
+        assert_eq!(flights.len(), 3);
+        assert_eq!(
+            flights.lines(gpu, LOSS),
+            [
+                "reims-vgpu: the rt platform's device on GPU (10de:2204), at its loss, had 3 \
+                 command buffers committed and not complete, the oldest committed first: the \
+                 guest's command buffer 0x30000000010 of context 3, committed at \
+                 1795560000.210000 s since 1970 (0.040000 s before the loss), its encoders (4): \
+                 render, 2 compute, blit; a command buffer of the host's own, committed at \
+                 1795560000.230000 s since 1970 (0.020000 s before the loss), its encoders (1): \
+                 blit; the guest's command buffer 0x40000000011 of context 4, committed at \
+                 1795560000.240000 s since 1970 (0.010000 s before the loss), with no encoders\n",
+                "reims-vgpu: the oldest command buffer committed and not complete at the loss of \
+                 the rt platform's device on GPU (10de:2204), the guest's command buffer \
+                 0x30000000010 of context 3: its render passes' attachments: encoder 1: colour 0 \
+                 texture 0x30000000020, colour 1 a texture with no guest id, depth texture \
+                 0x30000000021; the heaps its encoders declare (useHeap:): 0x30000000030; the \
+                 buffers they declare (useResource:): 0x30000000041; the textures they declare \
+                 (useResource:): 0x30000000022; the buffers they bind: 0x30000000040, \
+                 0x30000000042, 1 names of objects with no guest id\n",
+            ]
+        );
+        flights.remove(oldest);
+        let lines = flights.lines(gpu, LOSS);
+        assert!(
+            lines[0].contains(", had 2 command buffers "),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(
+                ", a command buffer of the host's own: no render passes; the heaps its encoders \
+                 declare (useHeap:): none; the buffers they declare (useResource:): none; the \
+                 textures they declare (useResource:): none; the buffers they bind: none\n"
+            ),
+            "{}",
+            lines[1]
+        );
+    }
+
+    /// The in-flight lines list the first [`FLIGHTS_LISTED`] command buffers, a command buffer's
+    /// first [`KINDS_LISTED`] runs of encoders of one kind, the oldest's first [`PASSES_LISTED`]
+    /// passes and, of each of its lists, the first [`IDS_KEPT`] ids, and count the rest.
+    #[test]
+    fn the_in_flight_lines_cap_their_lists_and_count_the_rest() {
+        let flights = Flights::default();
+        let kind = |at: usize| match at % 2 {
+            0 => EncoderKind::Render,
+            _ => EncoderKind::Compute,
+        };
+        let mut encoders = (0..KINDS_LISTED + 2)
+            .map(|at| EncoderNames::new(kind(at)))
+            .collect::<Vec<_>>();
+        let many = (1..=IDS_KEPT as u64 + 3).collect::<Vec<_>>();
+        encoders[0].bound_buffers = ids(&many);
+        flights.add(Flight {
+            cb: Some(0x100_0000_0001),
+            committed: LOSS - 50 * MS,
+            encoders,
+        });
+        for at in 0..FLIGHTS_LISTED as u64 + 1 {
+            flights.add(Flight {
+                cb: Some(0x100_0000_0002 + at),
+                committed: LOSS - 40 * MS,
+                encoders: Vec::new(),
+            });
+        }
+        let lines = flights.lines("GPU (10de:2204)", LOSS);
+        assert_eq!(lines.len(), 2);
+        let runs = ["render", "compute"].repeat(KINDS_LISTED / 2).join(", ");
+        let encoders = format!(
+            "its encoders ({}): {runs}, and 2 more not listed;",
+            KINDS_LISTED + 2
+        );
+        assert!(lines[0].contains(&encoders), "{}", lines[0]);
+        assert_eq!(
+            lines[0].matches("the guest's command buffer ").count(),
+            FLIGHTS_LISTED
+        );
+        assert!(lines[0].contains(", had 18 command buffers committed and not complete, "));
+        assert!(
+            lines[0].ends_with("; and 2 more, not listed\n"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("; encoder 31: no attachments; and 1 more passes not listed; "),
+            "{}",
+            lines[1]
+        );
+        assert!(!lines[1].contains("encoder 33"), "{}", lines[1]);
+        let bound = (1..=IDS_KEPT)
+            .map(|id| format!("{id:#x}"))
+            .collect::<Vec<_>>();
+        assert!(
+            lines[1].ends_with(&format!(
+                "; the buffers they bind: {}, 3 more names past the first 32 ids\n",
+                bound.join(", ")
+            )),
+            "{}",
+            lines[1]
+        );
     }
 
     /// Where rt read no report of the fault, its one line says so.
     #[test]
     fn a_loss_with_no_fault_report_says_so() {
-        let lines = FaultWatch::default().lines("GPU (1002:744c)", None);
+        let lines = FaultWatch::default().lines("GPU (1002:744c)", None, LOSS);
         assert_eq!(
             lines,
             [

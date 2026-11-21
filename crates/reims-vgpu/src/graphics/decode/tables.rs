@@ -49,7 +49,7 @@ use super::managed::ManagedCopy;
 use super::surface_cache::Repitched;
 use super::surface_cache::shapes::ShapeUse;
 use super::video::PlanePlace;
-use super::{Drain, ObjHandle, drop_refused};
+use super::{Drain, ObjHandle, TableObject, drop_refused};
 
 /// A command queue's counts of the host's command buffers made on it ([`super::cmdbuf`]), and its
 /// lane ([`super::lane`]), which closes as the queue's entry goes.
@@ -539,6 +539,25 @@ pub(crate) struct Context<P: Platform> {
     pub(crate) escapes: EscapedCopies,
 }
 
+/// Tells the object `entry` holds, which a table stores under `id`, and its `Managed` CPU copy,
+/// where it has one, that id, which the rt platform's device names them by in its history of
+/// released ranges and its lines of the command buffers in flight at its loss
+/// (`super::super::fault_walk::name`): for a buffer, texture or heap, a downcast and an atomic
+/// store on the rt platform, two for a CPU copy; nothing on another platform or for another
+/// object.
+fn name_for_loss<P: Platform>(id: u64, entry: &Entry<P>) {
+    let object = match &entry.handle {
+        ObjHandle::Buffer(buffer) => TableObject::<P>::Buffer(buffer),
+        ObjHandle::Texture(texture) => TableObject::Texture(texture),
+        ObjHandle::Heap(heap) => TableObject::Heap(heap),
+        _ => return,
+    };
+    super::super::fault_walk::name(id, object);
+    if let Some(cpu) = (entry.managed.as_ref()).and_then(|copy| copy.cpu.as_ref()) {
+        super::super::fault_walk::name(id, TableObject::<P>::ManagedCopy(cpu));
+    }
+}
+
 impl<P: Platform> Context<P> {
     /// Calls `f` with each entry of the table, its id, whether it was removed and is kept for an
     /// open view, its handle and its `Managed` CPU copy's buffer, under a read of the table's lock
@@ -586,9 +605,11 @@ impl<P: Platform> Context<P> {
     /// Stores `entry` under `id`, in place of what the id named, and the pointer to it; what it
     /// replaced, to let go of where no view needs it. `seen_from` is the clock of the making
     /// message's view of this table, where it has one ([`View::at`]), which names the entry
-    /// though taken before its make ([`View::made`]).
+    /// though taken before its make ([`View::made`]). The entry's object is told `id` for its
+    /// device's loss ([`name_for_loss`]).
     pub(crate) fn insert(&self, id: u64, mut entry: Entry<P>, seen_from: Option<u64>) -> Made<P> {
         let mut t = self.tables.write();
+        name_for_loss(id, &entry);
         t.clock += 1;
         entry.made = t.clock;
         entry.seen = seen_from.map_or(t.clock, |at| at.min(t.clock));
@@ -613,6 +634,7 @@ impl<P: Platform> Context<P> {
         if !live() {
             return None;
         }
+        name_for_loss(id, &entry);
         t.clock += 1;
         entry.made = t.clock;
         entry.seen = seen_from.map_or(t.clock, |at| at.min(t.clock));

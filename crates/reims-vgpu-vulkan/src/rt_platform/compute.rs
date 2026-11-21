@@ -46,6 +46,7 @@ use super::blit::{NIL, Stop, report};
 use super::command::{Kept, OpenMark};
 use super::copied::Used;
 use super::diag::Use;
+use super::fault::{EncoderKind, EncoderNames, Naming};
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtObj, RtPlatform};
 
@@ -64,13 +65,16 @@ pub struct RtComputeEncoder {
     concurrent: bool,
 }
 
-/// An encoder's rt encoder, until `endEncoding` ends it, and its pipeline state.
+/// An encoder's rt encoder, until `endEncoding` ends it, its pipeline state, and what it names.
 struct Open {
     /// rt's encoder.
     rt: Option<rt::ComputeCommandEncoder>,
     /// The pipeline state set last, which the command buffer keeps: none before one is set, or
     /// once nil is.
     pipeline: Option<ObjId>,
+    /// What its commands name, for a lost device's lines (`super::fault`'s docs, "The command
+    /// buffers in flight"), which join its command buffer's as it ends or goes.
+    naming: Naming,
 }
 
 impl RtComputeEncoder {
@@ -82,10 +86,12 @@ impl RtComputeEncoder {
         kept: Kept,
         concurrent: bool,
     ) -> RtComputeEncoder {
+        let names = EncoderNames::new(EncoderKind::Compute);
         RtComputeEncoder {
             open: Mutex::new(Open {
                 rt: Some(encoder),
                 pipeline: None,
+                naming: Naming::new(kept.encoded(), names),
             }),
             mark,
             kept,
@@ -98,6 +104,7 @@ impl RtComputeEncoder {
         let Open {
             rt: encoder,
             pipeline,
+            ..
         } = open;
         let Some(e) = encoder.as_mut() else {
             return Err(Stop::Metal("a command after endEncoding"));
@@ -383,6 +390,41 @@ fn note_copies(used: &Used, cmd: &ComputeCmd<'_, RtPlatform>) {
     }
 }
 
+/// Notes in `names` what `cmd` names (`super::fault`'s docs, "The command buffers in flight"): the
+/// buffers it binds, and the heaps and resources it declares, by their guest ids.
+fn note_names(names: &mut EncoderNames, cmd: &ComputeCmd<'_, RtPlatform>) {
+    match cmd {
+        ComputeCmd::SetBuffers { buffers, .. }
+        | ComputeCmd::SetBuffersAttributeStrides { buffers, .. } => {
+            for buffer in buffers.iter().flatten() {
+                names.bound_buffers.add(buffer.named().id());
+            }
+        }
+        ComputeCmd::UseHeaps { heaps } => {
+            for heap in heaps.iter().flatten() {
+                names.heaps.add(heap.named().id());
+            }
+        }
+        ComputeCmd::UseResources { resources, .. } => note_declared(names, resources),
+        _ => {}
+    }
+}
+
+/// Notes in `names` the resources a `useResources:` call declares, by their guest ids (an
+/// indirect command buffer, which rt builds none of, as none).
+pub(super) fn note_declared(
+    names: &mut EncoderNames,
+    resources: &[Option<ResourceRef<'_, RtPlatform>>],
+) {
+    for resource in resources.iter().flatten() {
+        match resource {
+            ResourceRef::Buffer(buffer) => names.declared_buffers.add(buffer.named().id()),
+            ResourceRef::Texture(texture) => names.declared_textures.add(texture.named().id()),
+            ResourceRef::Icb(_) => {}
+        }
+    }
+}
+
 impl ComputeEncoder<RtPlatform> for RtObj<RtComputeEncoder> {
     /// rt's command (the module's docs); `endEncoding` ends rt's encoder.
     fn encode(&self, on: OnFault, cmd: ComputeCmd<'_, RtPlatform>) -> RaiseResult<()> {
@@ -393,10 +435,14 @@ impl ComputeEncoder<RtPlatform> for RtObj<RtComputeEncoder> {
             let ending = matches!(cmd, ComputeCmd::EndEncoding);
             note_copies(self.kept.copies(), &cmd);
             let mut open = self.open.lock();
+            if let Some(names) = open.naming.names() {
+                note_names(names, &cmd);
+            }
             let stopped = self.command(&mut open, cmd).err();
             if ending && let Some(e) = open.rt.take() {
                 e.end_encoding();
                 self.mark.end();
+                open.naming.end();
             }
             drop(open);
             report(sel, stopped);

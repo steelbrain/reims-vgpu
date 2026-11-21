@@ -277,10 +277,27 @@ pub struct RtTexture {
     /// The buffer it lies over and which bytes of it, and a view's of one: what the recorder
     /// writes for it ([`crate::recorder`]); unset for any other.
     over: OnceLock<(Weak<RtBuffer>, Range<u64>)>,
+    /// The guest's object id for it, which its release's entry in the device's history names
+    /// (`super::fault`).
+    named: super::fault::Named,
 }
 
 impl Drop for RtTexture {
+    /// Records its range's release in its device's history where a table named it and it lies
+    /// over a buffer that is still there (`super::fault`), then gives back its own index.
     fn drop(&mut self) {
+        let id = self.named.id();
+        if id != 0
+            && let Some((buffer, bytes)) = self.over.get()
+            && let Some(buffer) = buffer.upgrade()
+            && let Some(made) = buffer.made_rt()
+            && let Some(gpu_address) = made.gpu_address().checked_add(bytes.start)
+        {
+            let kind = self.named.kind(super::fault::ObjectKind::Texture);
+            let storage = (self.options >> 4) & 0xf;
+            let len = bytes.end.saturating_sub(bytes.start);
+            (self.device.releases()).push(kind, id, storage, (gpu_address, len));
+        }
         if let Some(index) = self.own {
             self.device.indices().give_back(index, self.read.take());
         }
@@ -333,6 +350,11 @@ impl RtTexture {
     /// among them: what the recorder writes for it ([`crate::recorder`]).
     pub(crate) fn over(&self) -> Option<&(Weak<RtBuffer>, Range<u64>)> {
         self.over.get()
+    }
+
+    /// The guest's object id for it (`super::fault`).
+    pub(super) fn named(&self) -> &super::fault::Named {
+        &self.named
     }
 
     /// Notes that it lies over `bytes` of `buffer`: once, as the buffers' piece makes it.
@@ -439,6 +461,7 @@ impl RtTexture {
             _ => self.usage,
         };
         self.device.made(sel, made, own, |texture| RtTexture {
+            named: super::fault::Named::default(),
             rt: texture,
             device: self.device.clone_ref(),
             options: self.options,
@@ -541,6 +564,7 @@ fn answered(
         super::unbuilt::refusal_detail(sel, error, Some(&what));
     }
     device.made(sel, made, own, |texture| RtTexture {
+        named: super::fault::Named::default(),
         rt: texture,
         device: device.clone_ref(),
         options: tracked(options),
@@ -581,6 +605,7 @@ pub(super) fn drawable(
     };
     let made = Made::new(Call::Drawable, &shape);
     RtObj::new(RtTexture {
+        named: super::fault::Named::default(),
         rt: texture,
         device: device.clone_ref(),
         options: tracked(STORAGE_PRIVATE),

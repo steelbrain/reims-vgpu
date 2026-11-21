@@ -1031,6 +1031,8 @@ pub struct Target {
     pub samples: u32,
     /// Its texture's index, 0 for one with none: rt reads a fetched attachment through it.
     pub index: u32,
+    /// Its texture's guest object id, 0 for none (`super::fault`'s `Named`).
+    pub id: u64,
     /// Its texture.
     pub made: Arc<Made>,
 }
@@ -2844,6 +2846,7 @@ mod tests {
             texture_type: 2,
             samples: 1,
             index,
+            id: 0,
             made: Arc::clone(made),
         };
         let render_only = Made::new(Call::Plain, &shape(0x4));

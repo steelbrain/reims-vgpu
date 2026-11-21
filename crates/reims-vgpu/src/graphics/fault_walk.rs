@@ -4,6 +4,10 @@
 //! reads the tables as they are then, waiting `fault::BOUND` in all at most for their locks, and
 //! names the contexts whose tables it did not have in time. A device of another platform is told
 //! nothing.
+//!
+//! As a table stores a buffer, texture or heap, the object is told the guest's id for it
+//! ([`name`]), which the device's history of released ranges and its lines of the command buffers
+//! in flight name it by (`fault::Named`).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -45,6 +49,36 @@ impl LiveObjects for Tables {
 
     fn live(&self) -> bool {
         self.0.is_live()
+    }
+}
+
+/// Tells `object`, which a decoder's table stores under `id`, that id (`fault::Named`), where the
+/// platform is the rt platform: a downcast, which each platform's build settles, and an atomic
+/// store, two for a `Managed` texture's CPU-copy buffer; nothing for any other platform.
+pub(super) fn name<P: Platform>(id: u64, object: TableObject<'_, P>) {
+    type Rt = RtPlatform;
+    match object {
+        TableObject::Buffer(buffer) => {
+            if let Some(buffer) = (buffer as &dyn Any).downcast_ref::<<Rt as Platform>::Buffer>() {
+                fault::name_buffer(buffer, id);
+            }
+        }
+        TableObject::Texture(texture) => {
+            let texture = (texture as &dyn Any).downcast_ref::<<Rt as Platform>::Texture>();
+            if let Some(texture) = texture {
+                fault::name_texture(texture, id);
+            }
+        }
+        TableObject::Heap(heap) => {
+            if let Some(heap) = (heap as &dyn Any).downcast_ref::<<Rt as Platform>::Heap>() {
+                fault::name_heap(heap, id);
+            }
+        }
+        TableObject::ManagedCopy(buffer) => {
+            if let Some(buffer) = (buffer as &dyn Any).downcast_ref::<<Rt as Platform>::Buffer>() {
+                fault::name_managed_copy(buffer, id);
+            }
+        }
     }
 }
 

@@ -10102,6 +10102,52 @@ mod tests {
         }
     }
 
+    /// On the Vulkan platform, a buffer a decoder's table stores is told the guest's id for it
+    /// (`super::tables`'s `name_for_loss`): as the guest's destroy lets go of it, its device's
+    /// history of released ranges records it by that id, whose bits from 40 are its context, with
+    /// the range it had.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test scaffolding: a real-time wait for the release
+    fn on_vulkan_a_destroyed_buffer_s_release_names_its_guest_id_and_context() {
+        use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+        use reims_vgpu_vulkan::RtPlatform;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::rt_platform::fault::ObjectKind;
+
+        use crate::platform::ApiPlatform as _;
+
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
+        // A platform of the test's own, whose device goes before the process exits.
+        let platform = crate::rt_test_end::platform();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<RtPlatform>::new(
+            Arc::clone(&platform),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
+        );
+        let id = (3 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 0x21;
+        assert_eq!(dec.decode(&device, &buffer_create(id)).unwrap(), Ok(()));
+        let Some(ObjHandle::Buffer(buffer)) = dec.object(id) else {
+            panic!("no buffer {id:#x}");
+        };
+        let range = (buffer.gpu_address(), buffer.length());
+        assert_eq!(dec.decode(&device, &destroy(id)).unwrap(), Ok(()));
+        let released = || {
+            let (kept, _) = device.releases().kept();
+            kept.into_iter().find(|release| release.id == id)
+        };
+        let mut waited = 0;
+        while released().is_none() && waited < 1000 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        let entry = released().expect("the buffer's release in its device's history");
+        assert_eq!(
+            (entry.kind, entry.context(), entry.storage),
+            (ObjectKind::Buffer, 3, 0)
+        );
+        assert_eq!((entry.gpu_address, entry.len), range);
+    }
+
     fn destroy(obj_id: u64) -> Vec<u8> {
         reims_vgpu_graphics::wire::RgfxObjectDestroy {
             header: RgfxMsgHeader {

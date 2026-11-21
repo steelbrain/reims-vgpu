@@ -132,10 +132,23 @@ pub struct RtHeap {
     /// import's release: the module's docs, "Its deallocator"). Behind a lock, as the heap is
     /// shared between threads and the deallocator is only `Send`.
     deallocator: Mutex<Option<NoCopyDeallocator>>,
+    /// The guest's object id for it, which its release's entry in the device's history names
+    /// (`super::fault`).
+    named: super::fault::Named,
 }
 
 impl Drop for RtHeap {
+    /// Records its range's release in its device's history where a table named it
+    /// (`super::fault`), then runs its deallocator.
     fn drop(&mut self) {
+        let id = self.named.id();
+        if id != 0 {
+            let kind = self.named.kind(super::fault::ObjectKind::Heap);
+            let storage = (self.options >> 4) & 0xf;
+            let gpu_address = self.block.gpu_address + self.offset;
+            let releases = self.device.releases();
+            releases.push(kind, id, storage, (gpu_address, self.size));
+        }
         if let Some(deallocator) = self.deallocator.get_mut().take() {
             deallocator();
         }
@@ -162,6 +175,11 @@ impl RtHeap {
     /// The blocks its device knows (`super::fault`).
     pub(super) fn device_known(&self) -> &super::buffer::KnownBlocks {
         self.device.known_blocks()
+    }
+
+    /// The guest's object id for it (`super::fault`).
+    pub(super) fn named(&self) -> &super::fault::Named {
+        &self.named
     }
 }
 
@@ -343,6 +361,7 @@ fn heap(
     deallocator: Option<NoCopyDeallocator>,
 ) -> RtObj<RtHeap> {
     RtObj::new(RtHeap {
+        named: super::fault::Named::default(),
         offset,
         size,
         placement,

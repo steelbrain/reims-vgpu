@@ -79,6 +79,7 @@ use super::command::{Kept, OpenMark};
 use super::compute::{declared, resource_usage, slots, small};
 use super::copied::Used;
 use super::diag::{self, Bound, Target, Use};
+use super::fault::{EncoderKind, EncoderNames, Naming};
 use super::render_pipeline::{Raster, RtRenderPipeline};
 use super::texture::RtTexture;
 use super::unbuilt::{Unbuilt, refuse};
@@ -109,6 +110,9 @@ struct Open {
     pipeline: Option<ObjId>,
     /// What the boot diagnostics read of a draw rt refuses (`diag::attachment_read`).
     seen: Seen,
+    /// What its pass and commands name, for a lost device's lines (`super::fault`'s docs, "The
+    /// command buffers in flight"), which join its command buffer's as it ends or goes.
+    naming: Naming,
 }
 
 /// What an encoder set that the boot diagnostics read of a refused draw: the textures bound, the
@@ -129,11 +133,16 @@ impl RtRenderEncoder {
         kept: Kept,
         targets: Vec<Target>,
     ) -> RtRenderEncoder {
+        let names = EncoderNames {
+            attachments: targets.iter().map(|t| (t.point, t.id)).collect(),
+            ..EncoderNames::new(EncoderKind::Render)
+        };
         RtRenderEncoder {
             open: Mutex::new(Open {
                 rt: Some(encoder),
                 pipeline: None,
                 seen: Seen::default(),
+                naming: Naming::new(kept.encoded(), names),
             }),
             mark,
             kept,
@@ -183,6 +192,7 @@ impl RtRenderEncoder {
             rt: encoder,
             pipeline,
             seen,
+            ..
         } = open;
         let Some(e) = encoder.as_mut() else {
             return Err(Stop::Metal("a command after endEncoding"));
@@ -825,6 +835,38 @@ fn note_copies(used: &Used, cmd: &RenderCmd<'_, RtPlatform>) {
     }
 }
 
+/// Notes in `names` what `cmd` names (`super::fault`'s docs, "The command buffers in flight"): the
+/// buffers it binds to a vertex or fragment slot or as the tessellation factor buffer, and the
+/// heaps and resources it declares, by their guest ids (rt keeps no mesh, object or tile buffers).
+fn note_names(names: &mut EncoderNames, cmd: &RenderCmd<'_, RtPlatform>) {
+    match cmd {
+        RenderCmd::SetFragmentBuffer { buffer, .. }
+        | RenderCmd::SetVertexBuffer { buffer, .. }
+        | RenderCmd::SetTessellationFactorBuffer { buffer, .. } => {
+            if let Some(buffer) = buffer {
+                names.bound_buffers.add(buffer.named().id());
+            }
+        }
+        RenderCmd::SetFragmentBuffers { buffers, .. }
+        | RenderCmd::SetVertexBuffersAttributeStrides { buffers, .. }
+        | RenderCmd::SetVertexBuffers { buffers, .. } => {
+            for buffer in buffers.iter().flatten() {
+                names.bound_buffers.add(buffer.named().id());
+            }
+        }
+        RenderCmd::UseHeaps { heaps } | RenderCmd::UseHeapsStages { heaps, .. } => {
+            for heap in heaps.iter().flatten() {
+                names.heaps.add(heap.named().id());
+            }
+        }
+        RenderCmd::UseResources { resources, .. }
+        | RenderCmd::UseResourcesStages { resources, .. } => {
+            super::compute::note_declared(names, resources);
+        }
+        _ => {}
+    }
+}
+
 impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
     /// rt's command (the module's docs); `endEncoding` ends rt's encoder.
     fn encode(&self, on: OnFault, cmd: RenderCmd<'_, RtPlatform>) -> RaiseResult<()> {
@@ -836,6 +878,9 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             note_copies(self.kept.copies(), &cmd);
             let primitive = drawn_primitive(&cmd);
             let mut open = self.open.lock();
+            if let Some(names) = open.naming.names() {
+                note_names(names, &cmd);
+            }
             let stopped = self.command(&mut open, cmd).err();
             if let Some(Stop::Rt(error @ rt::Error::Unsupported(rt::Gap::Draw { kind }))) = &stopped
             {
@@ -851,6 +896,7 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             if ending && let Some(e) = open.rt.take() {
                 e.end_encoding();
                 self.mark.end();
+                open.naming.end();
             }
             drop(open);
             report(sel, stopped);

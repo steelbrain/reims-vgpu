@@ -37,7 +37,13 @@
 //!   Where rt named the call, the fault's lines follow it (`super::fault`): the driver's report
 //!   of the fault (rt's `DeviceLoss::fault`, or that rt read none), and each address it names
 //!   placed among the decoders' live objects and the blocks the host sees, with the nearest below
-//!   and above where none holds it.
+//!   and above where none holds it, and among the tables' objects' ranges released before the
+//!   loss. Two lines follow, whether rt named the call or not: the command buffers committed and
+//!   not complete, the oldest committed first, each with its context, its commit's time and its
+//!   encoders' kinds, and what the oldest's encoders name: its render passes' attachments, the
+//!   heaps and resources they declare and the buffers they bind (`super::fault`'s docs, "The
+//!   command buffers in flight"). Each commit adds its command buffer to its device's list before
+//!   rt has it, and its first completed handler takes it off.
 //!   Each command buffer that fails with the device lost is counted, `rt-device-lost`, in the
 //!   process's degradation counts (docs/conventions.md). Then each command buffer rt ends as in
 //!   flight writes a line of its own, naming the work the guest knows it by, as its caller named
@@ -453,6 +459,10 @@ struct Failure {
     /// loss, as its caller named them, or the command buffer it was cut from held them
     /// (`names_work`).
     work: OnceLock<Arc<WorkNames>>,
+    /// Its number in its device's command buffers committed and not complete
+    /// (`super::fault::Flights`), from its commit until its first completed handler runs; 0 for
+    /// none.
+    flight: AtomicU64,
 }
 
 impl Failure {
@@ -468,10 +478,12 @@ impl Failure {
     }
 
     /// Its first completed handler's part: reads its error, then takes it off its device's
-    /// command buffers not complete ([`DeviceLoss`]).
+    /// command buffers not complete ([`DeviceLoss`]), and their list (`super::fault::Flights`).
     fn completed(&self, error: Option<rt::CommandBufferError>) {
         drop(self.read(error));
         self.loss.open.fetch_sub(1, Ordering::SeqCst);
+        let flight = self.flight.swap(0, Ordering::SeqCst);
+        self.loss.flights.remove(flight);
     }
 }
 
@@ -493,6 +505,9 @@ pub struct DeviceLoss {
     open: AtomicI64,
     /// What the loss's fault is placed among (`super::fault`).
     watch: super::fault::FaultWatch,
+    /// Its command buffers committed and not complete, which the loss's lines list
+    /// (`super::fault`'s docs, "The command buffers in flight").
+    flights: super::fault::Flights,
 }
 
 impl DeviceLoss {
@@ -511,6 +526,7 @@ impl DeviceLoss {
             in_flight: AtomicUsize::new(0),
             open: AtomicI64::new(0),
             watch,
+            flights: super::fault::Flights::default(),
         }
     }
 
@@ -564,12 +580,15 @@ impl DeviceLoss {
     }
 
     /// A command buffer failed with the device lost: counted, and the first writes the loss's
-    /// line, with rt's cause, which `cause` reads (the module's docs, "A lost device's line").
+    /// line, with rt's cause, which `cause` reads, and the lines that follow it (the module's
+    /// docs, "A lost device's line").
     fn lost(&self, cause: &dyn Fn() -> Option<rt::DeviceLoss>) {
         crate::answer::count_kind(DEVICE_LOST);
         if self.said.swap(true, Ordering::SeqCst) {
             return;
         }
+        // The loss's time, as the host has it (`super::fault`'s docs).
+        let when = super::fault::wall_now();
         let open = self.open.load(Ordering::SeqCst).max(0);
         let cause = cause();
         let at = match &cause {
@@ -584,9 +603,13 @@ impl DeviceLoss {
         ));
         // The driver's report of the fault, its addresses placed (`super::fault`).
         if let Some(cause) = &cause {
-            for line in self.watch.lines(&self.gpu, cause.fault.as_ref()) {
+            for line in self.watch.lines(&self.gpu, cause.fault.as_ref(), when) {
                 say_lost(&line);
             }
+        }
+        // The command buffers committed and not complete (`super::fault`).
+        for line in self.flights.lines(&self.gpu, when) {
+            say_lost(&line);
         }
     }
 }
@@ -654,6 +677,7 @@ impl RtCommandBuffer {
             loss: Arc::clone(device.loss()),
             cause: Box::new(move || rt_device.loss()),
             work: OnceLock::new(),
+            flight: AtomicU64::new(0),
         });
         RtCommandBuffer {
             rt: made,
@@ -776,8 +800,9 @@ impl RtCommandBuffer {
 /// (`super::diag`), which its commit counts, the tiled textures it used whose bytes its commit
 /// takes (`super::tiled`), whether its caller failed it for a deferred buffer's memory
 /// ([`Failed`]), the copies of host pages it used, which its commit and completion sync
-/// (`super::copied`), and its reads through the platform's own indices, finished as it completes
-/// (`super::texture`'s `Reads`).
+/// (`super::copied`), its reads through the platform's own indices, finished as it completes
+/// (`super::texture`'s `Reads`), and its encoders' names, which its commit takes for its device's
+/// list of command buffers in flight (`super::fault`'s `Encoded`).
 #[derive(Clone, Default)]
 pub struct Kept(
     Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>,
@@ -786,6 +811,7 @@ pub struct Kept(
     Failed,
     super::copied::Used,
     Reads,
+    super::fault::Encoded,
 );
 
 /// Whether a command buffer's caller failed it for a deferred buffer's memory rt refused
@@ -821,6 +847,11 @@ impl Kept {
     /// render a colour attachment.
     pub fn reads(&self) -> &Reads {
         &self.5
+    }
+
+    /// Its encoders' names, each joined as its encoder ends (`super::fault`'s `Naming`).
+    pub fn encoded(&self) -> &super::fault::Encoded {
+        &self.6
     }
 
     /// An encoder of it used `texture` as `how` says: a use for the boot diagnostics
@@ -1062,6 +1093,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 Ok(match self.rt.blit_command_encoder() {
                     Ok(encoder) => {
                         let kept = self.kept.clone();
+                        let blit = super::fault::EncoderNames::new(super::fault::EncoderKind::Blit);
+                        kept.encoded().push(blit);
                         Some(RtObj::new(RtBlitEncoder::new(encoder, self.opened(), kept)))
                     }
                     Err(error) => {
@@ -1143,6 +1176,8 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
             if !kept.is_empty() {
                 seen.push(Box::new(move |_made: &rt::CommandBuffer| drop(kept)));
             }
+            // Its encoders' names, for its entry in the device's command buffers in flight.
+            let encoders = self.kept.encoded().take();
             // Its reads through own indices finish first of its completed handlers, as its work
             // has: a handler of core's may let go of an object they read.
             let reads = self.kept.reads().take();
@@ -1165,10 +1200,18 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 self.kept.takes().take(&self.device);
                 // Not complete until its first completed handler runs, which a refusal never runs.
                 let loss = &self.failure.loss;
+                let number = loss.flights.add(super::fault::Flight {
+                    cb: self.failure.work.get().map(|work| work.cb()),
+                    committed: super::fault::wall_now(),
+                    encoders,
+                });
+                self.failure.flight.store(number, Ordering::SeqCst);
                 loss.open.fetch_add(1, Ordering::SeqCst);
                 let committed = self.rt.commit();
                 if committed.is_err() {
                     loss.open.fetch_sub(1, Ordering::SeqCst);
+                    let flight = self.failure.flight.swap(0, Ordering::SeqCst);
+                    loss.flights.remove(flight);
                 }
                 committed
             };
@@ -1579,6 +1622,7 @@ mod tests {
             loss: Arc::clone(loss),
             cause: Box::new(|| None),
             work: OnceLock::new(),
+            flight: AtomicU64::new(0),
         };
         let (first, second) = (failure(&loss), failure(&loss));
         assert_eq!(first.read(None), None);
@@ -1621,6 +1665,7 @@ mod tests {
                 })
             }),
             work: OnceLock::new(),
+            flight: AtomicU64::new(0),
         };
         let (first, second, third) = (failure(), failure(), failure());
         // Three committed (`RtCommandBuffer::commit`'s count).
@@ -1661,6 +1706,7 @@ mod tests {
             loss: Arc::clone(&other),
             cause: Box::new(|| None),
             work: OnceLock::new(),
+            flight: AtomicU64::new(0),
         };
         unnamed.completed(Some(DeviceLost { in_flight: true }));
         assert_eq!(
@@ -1698,6 +1744,7 @@ mod tests {
                 loss: Arc::clone(&loss),
                 cause: Box::new(|| None),
                 work: OnceLock::new(),
+                flight: AtomicU64::new(0),
             };
             if let Some(work) = work {
                 let _ = failure.work.set(Arc::clone(work));
@@ -1800,6 +1847,82 @@ mod tests {
         assert_eq!((told.0, answered(told.1)), failed);
         let lines = said_lost(reported);
         assert_eq!(lines.len(), 1, "{lines:?}");
+    }
+
+    /// On the GPU the test holds, a command buffer committed and not complete is on its device's
+    /// list of those in flight, by the guest's id and its context, with its encoders' kinds in
+    /// order and the buffers they bind by guest id; once it completes, it is off the list.
+    #[test]
+    fn a_command_buffer_in_flight_is_listed_with_its_context_and_encoders_on_vulkan() {
+        use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let buffer = device.new_buffer_of_length(on, 64, 0);
+        let buffer = buffer.expect("never a raise").expect("a buffer");
+        super::super::fault::name_buffer(&buffer, 0x500_0000_0041);
+        let shared = device.new_shared_event().expect("a shared event");
+        let made = queue.command_buffer(on).expect("never a raise");
+        let made = made.expect("a command buffer");
+        made.names_work(&Arc::new(WorkNames::new(0x500_0000_0009)));
+        assert_eq!(made.encode_wait(Some(EventRef::Shared(&shared)), 1), Ok(()));
+        let blit = made.blit_encoder(on).expect("never a raise");
+        let blit = blit.expect("a blit encoder");
+        let fill = BlitCmd::FillBuffer {
+            buffer: &buffer,
+            range: NsRange::new(0, 16),
+            value: 1,
+        };
+        assert_eq!(blit.encode(on, fill), Ok(()));
+        assert_eq!(blit.encode(on, BlitCmd::EndEncoding), Ok(()));
+        let compute = made.compute_encoder(on).expect("never a raise");
+        let compute = compute.expect("a compute encoder");
+        let bind = ComputeCmd::SetBuffers {
+            buffers: &[Some(&buffer), None],
+            offsets: &[0, 0],
+            range: NsRange::new(0, 2),
+        };
+        assert_eq!(compute.encode(on, bind), Ok(()));
+        assert_eq!(compute.encode(on, ComputeCmd::EndEncoding), Ok(()));
+        assert_eq!(made.commit(on), Ok(()));
+
+        let flights = &device.loss().flights;
+        let gpu = "GPU (1234:def0)";
+        let lines = flights.lines(gpu, super::super::fault::wall_now());
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(
+            lines[0].starts_with(
+                "reims-vgpu: the rt platform's device on GPU (1234:def0), at its loss, had 1 \
+                 command buffers committed and not complete, the oldest committed first: the \
+                 guest's command buffer 0x50000000009 of context 5, committed at "
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with(" s before the loss), its encoders (2): blit, compute\n"),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(
+            lines[1],
+            "reims-vgpu: the oldest command buffer committed and not complete at the loss of the \
+             rt platform's device on GPU (1234:def0), the guest's command buffer 0x50000000009 of \
+             context 5: no render passes; the heaps its encoders declare (useHeap:): none; the \
+             buffers they declare (useResource:): none; the textures they declare \
+             (useResource:): none; the buffers they bind: 0x50000000041\n"
+        );
+        assert_eq!(shared.set_signaled_value(1), Ok(()));
+        assert_eq!(made.wait_until_completed(on), Ok(()));
+        assert_eq!(made.status(), CommandBufferStatus::COMPLETED);
+        let mut waited = 0;
+        while !flights.is_empty() && waited < 1000 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        assert!(flights.is_empty(), "{:#?}", flights.lines(gpu, 0));
     }
 
     /// On the GPU the test holds: a command buffer its caller failed for a deferred buffer's
