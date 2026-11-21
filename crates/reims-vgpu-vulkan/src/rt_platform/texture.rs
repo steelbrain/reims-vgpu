@@ -291,9 +291,15 @@ pub struct RtTexture {
 }
 
 impl Drop for RtTexture {
-    /// Records its range's release in its device's history where a table named it and it lies
+    /// Counts its release where a completed handler's run is timed (`super::handler_times`),
+    /// records its range's release in its device's history where a table named it and it lies
     /// over a buffer that is still there (`super::fault`), then gives back its own index.
     fn drop(&mut self) {
+        let kind = super::handler_times::texture_kind(self.made.made_as());
+        let device = self.device.rt();
+        super::handler_times::released(kind, || {
+            super::handler_times::texture_bytes(device, self.rt.descriptor())
+        });
         let id = self.named.id();
         if id != 0
             && let Some((buffer, bytes)) = self.over.get()

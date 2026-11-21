@@ -95,6 +95,9 @@
 //!   (`super::export`, on Unix; Windows makes none), timed alone with rt's host clock
 //!   (`exported_block_made`): their count, those over 5 ms, and the longest with its bytes. Each
 //!   is an allocation of its own: rt dedicates an exported block's memory to it.
+//! - **Completed handlers on rt's completion thread.** The platform's completed handlers that
+//!   held rt's completion thread, timed (`super::handler_times`): how many, their p50, p99 and
+//!   longest, those over 1 ms and over 16 ms, and the longest one's releases by kind and bytes.
 //! - **rt's timed take parts.** rt's `Timed` metrics of its block takes and makes (`takes`,
 //!   `take_lock_waits`, `take_makes`, `take_maps`, `maker_makes`, `zero_writes`,
 //!   `long_take_zero_writes`): for each, its calls, those over 5 ms, and its longest call with
@@ -2264,6 +2267,8 @@ pub fn write() {
         let _ = writeln!(out, "{}", own_reused_line());
     }
     let _ = writeln!(out, "{}", export_makes_line(&EXPORT_MAKES.lock()));
+    let handlers = super::handler_times::line();
+    let _ = writeln!(out, "reims-vgpu: rt-diag {handlers}");
     for (kind, t) in OVERS.lock().iter() {
         let n = |a: &AtomicU64| a.load(Relaxed);
         let _ = writeln!(

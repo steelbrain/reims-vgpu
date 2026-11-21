@@ -138,9 +138,11 @@ pub struct RtHeap {
 }
 
 impl Drop for RtHeap {
-    /// Records its range's release in its device's history where a table named it
+    /// Counts its release where a completed handler's run is timed (`super::handler_times`),
+    /// records its range's release in its device's history where a table named it
     /// (`super::fault`), then runs its deallocator.
     fn drop(&mut self) {
+        super::handler_times::released("heap", || self.size);
         let id = self.named.id();
         if id != 0 {
             let kind = self.named.kind(super::fault::ObjectKind::Heap);

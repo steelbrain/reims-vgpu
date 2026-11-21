@@ -50,6 +50,7 @@ pub mod export;
 pub mod fault;
 pub mod format;
 pub mod gauge_log;
+pub mod handler_times;
 pub mod heap;
 pub mod icb;
 pub mod library;

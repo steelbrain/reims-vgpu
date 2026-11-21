@@ -386,7 +386,8 @@ impl Handed {
 /// on"): on rt's completion thread, unless `merges` (the first of them merges a copy back) or
 /// handlers handed on are yet to run, when it hands them on to [`HANDED_ON`], `handed` holding
 /// them yet to run until they ran. Each run there is a step of the exit gate
-/// (`crate::exit_gate`), and parks for good once the process's exit closed it.
+/// (`crate::exit_gate`), and parks for good once the process's exit closed it. A run on rt's
+/// thread is timed (`super::handler_times`).
 fn hand_on(
     handlers: impl FnOnce(&rt::CommandBuffer) + Send + 'static,
     merges: bool,
@@ -394,7 +395,7 @@ fn hand_on(
 ) -> impl FnOnce(&rt::CommandBuffer) + Send + 'static {
     move |made: &rt::CommandBuffer| {
         if !merges && HANDED.load(Ordering::SeqCst) == 0 {
-            handlers(made);
+            super::handler_times::time(|| handlers(made));
             return;
         }
         HANDED.fetch_add(1, Ordering::SeqCst);

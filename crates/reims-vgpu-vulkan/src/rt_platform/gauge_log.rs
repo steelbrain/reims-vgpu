@@ -24,6 +24,9 @@
 //!   and exports among them, the live buffers and textures, and the releases that wait for the
 //!   command buffers committed before them. A look at which none changed writes no line
 //!   ([`Lines`]).
+//! - **The completed handlers' line.** Each look also writes the line of the completed handlers
+//!   that held rt's completion thread (`super::handler_times`), where it changed since the line
+//!   before, whether or not a device is made.
 
 use std::sync::Once;
 use std::time::Duration;
@@ -112,10 +115,16 @@ pub(super) fn start() {
             .name("reims-vgpu-gauges".into())
             .spawn(|| {
                 let mut lines = Lines::default();
+                let mut handlers = String::new();
                 loop {
                     std::thread::sleep(PERIOD);
                     if !log::log_enabled!(target: TARGET, log::Level::Debug) {
                         continue;
+                    }
+                    let now = super::handler_times::line();
+                    if now != handlers {
+                        log::debug!(target: TARGET, "{now}");
+                        handlers = now;
                     }
                     let Some(gauges) = super::device::gauges() else {
                         continue;

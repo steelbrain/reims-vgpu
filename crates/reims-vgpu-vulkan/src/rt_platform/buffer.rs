@@ -672,9 +672,12 @@ fn deferred_refused(length: u64) -> ! {
 }
 
 impl Drop for RtBuffer {
-    /// Records its range's release in its device's history where a table named it and rt made it
+    /// Counts its release where a completed handler's run is timed (`super::handler_times`),
+    /// records its range's release in its device's history where a table named it and rt made it
     /// (`super::fault`), then runs a no-copy buffer's deallocator.
     fn drop(&mut self) {
+        let length = || self.rt.get().map_or(0, |made| made.length());
+        super::handler_times::released("buffer", length);
         let id = self.named.id();
         if id != 0
             && let Some(made) = self.rt.get()

@@ -47,7 +47,10 @@ pub struct RtSampler {
 }
 
 impl Drop for RtSampler {
+    /// Counts its release where a completed handler's run is timed (`super::handler_times`),
+    /// then gives back its own index, where it holds one.
     fn drop(&mut self) {
+        super::handler_times::released("sampler", || 0);
         if let Some(index) = self.own {
             self.device.sampler_indices().give_back(index);
         }

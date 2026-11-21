@@ -199,7 +199,10 @@ impl Lease {
 }
 
 impl Drop for Lease {
+    /// Counts a pipeline state's release where a completed handler's run is timed, as each holds
+    /// one lease (`super::handler_times`), then gives back its samplers' indices.
     fn drop(&mut self) {
+        super::handler_times::released("pipeline-state", || 0);
         let device = &self.device;
         (device.numbering()).give_back(device.sampler_indices(), &self.samplers);
     }
