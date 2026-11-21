@@ -27,9 +27,15 @@ reims-vgpu-video-conformance = { path = "conformance" }
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 
-# On Windows, `GetThreadTimes` and `GetProcessTimes` read it (`fuzz_support/windows.rs`).
+# On Windows, `GetThreadTimes` and `GetProcessTimes` read it (`fuzz_support/windows.rs`), and
+# `K32GetProcessMemoryInfo` reads the commit charge of VA-API's teardown tests
+# (`src/vaapi/va/teardown.rs`).
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 # The tests of VA-API's bounded waits hold the GPU with a compute shader of their own, on Vulkan
 # (`src/vaapi/va/spin.rs`).

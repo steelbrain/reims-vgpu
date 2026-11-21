@@ -7,8 +7,14 @@
 //! `RVG_VAAPI_NODE` names (`/dev/dri/renderD128` where it is unset). The stream is the Annex B
 //! file `RVG_VA_H264` names, or else 4K noise the driver's own encoder makes; vaon12 on the UHD
 //! Graphics 630 has no H.264 encoder, so there `RVG_VA_H264` names a stream.
+//!
+//! The churn test makes short decoders one after another beside a long one, as a guest's short
+//! sessions come and go beside a long playback, compares their pictures with the long one's,
+//! and on Windows reads the process's memory after each, to check that what the short decoders
+//! leave held does not grow with their number (`super::display::Display::context_let_go`).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 use crate::codec::encode::{EncoderSettings, InputFrame, Plane, Profile};
 
@@ -24,6 +30,12 @@ const FRAMES: u64 = 16;
 
 /// The decoders each thread makes and lets go.
 const ROUNDS: usize = 4;
+
+/// The short decoders the churn test makes and lets go beside its long one.
+const SHORT: usize = 10;
+
+/// The access units each short decoder decodes, from the stream's first.
+const SHORT_SAMPLES: usize = 8;
 
 pub(super) fn display() -> Display {
     #[cfg(windows)]
@@ -166,6 +178,192 @@ fn a_decoder_let_go_while_another_decodes_leaves_it_whole() {
         }
     });
     assert_eq!(read.load(Ordering::Relaxed), 2 * ROUNDS * pictures);
+}
+
+/// The process's memory, in bytes: its commit charge (`PrivateUsage`), and what DXGI counts it
+/// holding on the first adapter, in the local and the non-local segment groups.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct Used {
+    commit: u64,
+    local: u64,
+    non_local: u64,
+}
+
+#[cfg(windows)]
+impl Used {
+    fn now() -> Used {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+        let size = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS_EX>()).unwrap();
+        counters.cb = size;
+        // SAFETY: the process's pseudo-handle, and counters of the size given, which the call
+        // writes, `PROCESS_MEMORY_COUNTERS_EX` beginning as `PROCESS_MEMORY_COUNTERS` does.
+        let read = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+                size,
+            )
+        };
+        assert_ne!(
+            read,
+            0,
+            "K32GetProcessMemoryInfo: {}",
+            std::io::Error::last_os_error()
+        );
+        let [local, non_local] = super::d3d12::video_memory_used().expect("DXGI's count");
+        Used {
+            commit: u64::try_from(counters.PrivateUsage).unwrap(),
+            local,
+            non_local,
+        }
+    }
+}
+
+/// Returns once the releases asked for on `display` so far are made (`Display::release`): a
+/// release behind them says it ran.
+fn releases_made(display: &Display) {
+    let (made, ran) = mpsc::channel();
+    display.release(move |_| {
+        let _ = made.send(());
+    });
+    ran.recv().expect("a release made");
+}
+
+/// Decodes `samples` with `decoder`, tagged from `id`, and flushes it, its pictures read back as
+/// they come. The pictures it read back.
+fn decode(decoder: &mut H264Decoder, samples: &[Vec<u8>], id: &mut u64) -> usize {
+    let mut read = 0;
+    for sample in samples {
+        for frame in decoder.decode(sample, *id).expect("a decode") {
+            frame.read_back().expect("a read back");
+            read += 1;
+        }
+        *id += 1;
+    }
+    for frame in decoder.flush().expect("a flush") {
+        frame.read_back().expect("a read back");
+        read += 1;
+    }
+    read
+}
+
+/// The hashes of the pictures `decoder` decodes of `samples`, tagged from 0, and flushes, each
+/// read back as it comes and copied out cropped, as NV12.
+fn pictures(decoder: &mut H264Decoder, samples: &[Vec<u8>]) -> Vec<u64> {
+    use std::hash::{DefaultHasher, Hasher};
+
+    let hash = |frame: &super::frame::Frame| {
+        let (width, height) = (frame.width() as usize, frame.height() as usize);
+        let width = width.next_multiple_of(2);
+        let mut y = vec![0; width * height];
+        let mut uv = vec![0; width * height.div_ceil(2)];
+        frame
+            .copy_nv12_to(&mut y, width, &mut uv, width)
+            .expect("a copy");
+        let mut hasher = DefaultHasher::new();
+        hasher.write(&y);
+        hasher.write(&uv);
+        hasher.finish()
+    };
+    let mut hashes = Vec::new();
+    for (id, sample) in (0u64..).zip(samples) {
+        hashes.extend(decoder.decode(sample, id).expect("a decode").iter().map(hash));
+    }
+    hashes.extend(decoder.flush().expect("a flush").iter().map(hash));
+    hashes
+}
+
+/// What each short 4K H.264 decoder let go added to DXGI's local count of the process on the
+/// UHD Graphics 630 with its context held, its pool's surfaces and its config destroyed at once,
+/// beside a long decoder: the mean step over this test's last nine short decoders, **measured**
+/// with those teardowns so (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12 video driver,
+/// 2026-11-20, potluck job m3-max-61642, 651,022,336 - 336,875,520 bytes over nine). The count is
+/// to grow by less than one such context over those nine.
+#[cfg(windows)]
+const HELD_CONTEXT_LOCAL: u64 = 34_905_201;
+
+/// Sets its flag when dropped: the long decoder's end, where the test passes or fails.
+struct Ends<'a>(&'a AtomicBool);
+
+impl Drop for Ends<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Short decoders made and let go one after another beside a long one, which decodes all the
+/// while, decode the pictures the long one decoded of the same access units, and on Windows
+/// leave DXGI's count of the process's memory where the first left it.
+#[test]
+#[ignore = "needs a VA-API driver that decodes H.264 at 4K, on its GPU: run on a VA-API host"]
+fn short_decoders_let_go_beside_a_long_one_decode_alike_and_hold_no_more() {
+    let display = display();
+    let stream = Stream::new(&display);
+    let short = &stream.samples[..SHORT_SAMPLES.min(stream.samples.len())];
+    let ended = AtomicBool::new(false);
+    let (decoding, first) = mpsc::channel();
+    std::thread::scope(|s| {
+        let long = s.spawn(|| {
+            let mut decoder = stream.decoder(&display);
+            decoding.send(pictures(&mut decoder, short)).unwrap();
+            let mut id = u64::try_from(short.len()).unwrap();
+            let mut passes = 0;
+            while !ended.load(Ordering::Relaxed) {
+                let read = decode(&mut decoder, &stream.samples, &mut id);
+                assert!(read > 0, "the long decoder's pass {passes} read nothing");
+                passes += 1;
+            }
+            passes
+        });
+        let end = Ends(&ended);
+        let reference = first.recv().expect("the long decoder's first pictures");
+        assert!(
+            reference.len() > 1,
+            "{} pictures of {} access units",
+            reference.len(),
+            short.len()
+        );
+        #[cfg(windows)]
+        let mut readings = vec![Used::now()];
+        for n in 0..SHORT {
+            let mut decoder = stream.decoder(&display);
+            assert_eq!(
+                pictures(&mut decoder, short),
+                reference,
+                "short decoder {n}'s pictures"
+            );
+            #[cfg(windows)]
+            let live = Used::now();
+            drop(decoder);
+            releases_made(&display);
+            #[cfg(windows)]
+            {
+                let after = Used::now();
+                eprintln!("short decoder {n}: live {live:?}, let go {after:?}");
+                readings.push(after);
+            }
+        }
+        drop(end);
+        let passes = long.join().unwrap();
+        eprintln!("the long decoder's passes of the stream beside the short ones: {passes}");
+        #[cfg(windows)]
+        {
+            releases_made(&display);
+            eprintln!("every decoder let go: {:?}", Used::now());
+            let grown = readings[SHORT].local.saturating_sub(readings[1].local);
+            assert!(
+                grown < HELD_CONTEXT_LOCAL,
+                "DXGI's local count grew {grown} bytes over the short decoders after the first, \
+                 a held context's {HELD_CONTEXT_LOCAL}"
+            );
+        }
+    });
 }
 
 /// The pictures decoded in

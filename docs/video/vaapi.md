@@ -644,14 +644,14 @@ The thread starts with the first order and ends after `vaTerminate`.
 Where it cannot start, the log says so, and orders are made on their
 callers' threads with no bound.
 
-**On Windows a teardown waits for the display's other contexts**
-(`Display::release_teardown`): the destroy of a context, of a config or
-of a pool's surfaces, asked for while another context lives on the
-display, is held, and made once the last live context's teardown is
-asked for, in the order asked. **Measured** on the UHD Graphics 630
-(vaon12 of Mesa 26.2.7 over Intel's Direct3D 12 video driver,
-2026-11-17), two threads each decoding a 4K H.264 stream of 240 pictures
-on one display, their decoders let go round after round or kept
+**On Windows a context's teardown waits for the display's other
+contexts** (`Display::release_teardown`): the destroy of a context asked
+for while another context lives on the display is held, and made once
+the last live context's end is asked for, in the order asked. A config's
+and a pool's surfaces' destroys are made at once. **Measured** on the UHD
+Graphics 630 (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12 video
+driver, 2026-11-17), two threads each decoding a 4K H.264 stream of 240
+pictures on one display, their decoders let go round after round or kept
 (`src/vaapi/va/teardown.rs`): a decoder let go while another lived ended
 the process in an access violation inside Intel's `igd12dxva64.dll` at
 the other's next `vaEndPicture` (under Mesa's
@@ -668,11 +668,39 @@ With the teardowns held until no context lived, and with the decoders
 kept until both threads ended, every run passed, as one thread making
 and letting go decoders one after another (2,880 pictures) did. QEMU's
 fault as a guest's 4K H.264 session ended beside its next was in the same
-call, in `D3D12Core.dll` called from `igd12dxva64.dll`. A teardown held
-keeps its surfaces' memory until then; the log says so once a process.
-On Linux the same test passed on the Radeon 780M (radeonsi, Mesa 26.2.6)
-with every teardown made at once, so there a teardown is a release as
-any other.
+call, in `D3D12Core.dll` called from `igd12dxva64.dll`. **Measured**
+there again (2026-11-20, potluck job m3-max-61642, each way run twice)
+with the context's destroy alone held: the pool's surfaces destroyed at
+once, or the surfaces and the config, passed as well.
+
+**A decoder's context is kept for a decoder of its shape**
+(`Context::new_decoder`, `Display::context_let_go`): on Windows a
+decoder's context let go while another context lives is kept, with its
+config, and the next decoder of the same config, size, number of render
+targets and DPB (H.264's `num_ref_frames`, HEVC's
+`sps_max_dec_pic_buffering_minus1`) takes it back instead of making one.
+What the kept contexts hold is then bounded by the most decoders of one
+shape that lived at once, rather than growing with every session that
+ends beside a long one. **Measured** on the same GPU (2026-11-20, job
+m3-max-61642, the churn test in `src/vaapi/va/teardown.rs`: 10 short 4K
+H.264 decoders of 8 access units each, one after another beside a long
+one): with each short decoder's context held and its surfaces and config
+destroyed at once, DXGI's local count of the process grew by 34,905,201
+bytes for each short decoder let go (336,875,520 to 651,022,336 bytes
+over the last nine), and went back to 224,808,960 bytes once no context
+lived. The process's commit charge grew by about 45 MB for each short
+decoder in every way tried, the teardowns held or not, and stayed grown
+after every decoder was let go. **Read from code** (Mesa 26.2.4): the VA
+frontend's `vlVaCreateContext` reads no render target; its decoder is
+made at the first picture, and for H.264 destroyed and made again where a
+picture's `num_ref_frames` differs from the one it was made for
+(`picture_h264.c`); Direct3D 12's decoder makes its heap again where a
+picture's size or DPB outgrows it (`d3d12_video_dec.cpp`). A context is
+taken back only for the same values, so neither happens to it. The log
+says once a process that a context was kept. On Linux the two-thread
+test passed on the Radeon 780M (radeonsi, Mesa 26.2.6) with every
+teardown made at once, so there a teardown is a release as any other and
+no context is kept.
 
 **What the gate costs** is the driver's lock's: a call that waits holds
 the gate as long as the driver held its lock for it, and every other call
@@ -1403,8 +1431,10 @@ host session's on the fake platform (`video_host`'s tests).
 
 The module's ignored tests need a VA-API GPU and the installed headers:
 the binding's layouts against libva's headers, the import check's sweep,
-the bounded waits ("Waiting for the GPU", "Its tests"), and two threads'
-decoders let go while the other decodes ("On Windows a teardown waits for
+the bounded waits ("Waiting for the GPU", "Its tests"), two threads'
+decoders let go while the other decodes, and short decoders let go beside
+a long one, whose pictures they are to match and, on Windows, whose
+memory they are to leave flat ("On Windows a context's teardown waits for
 the display's other contexts"; on a driver with no H.264 encoder, such as
 vaon12 on the UHD Graphics 630, `RVG_VA_H264` names an Annex B stream to
 decode):

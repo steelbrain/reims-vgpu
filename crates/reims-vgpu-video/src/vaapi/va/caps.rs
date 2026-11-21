@@ -617,6 +617,20 @@ fn listed(count: i32) -> usize {
 pub(crate) struct Config {
     display: Display,
     pub(crate) id: ffi::VAConfigID,
+    /// On Windows, what it was made of, which a decoder's context kept on its display must
+    /// match to be taken back ([`Context::new_decoder`]).
+    #[cfg(windows)]
+    made_of: ConfigShape,
+}
+
+/// What a config was made of: its profile, its entrypoint and its attributes' types and values,
+/// in the order given.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfigShape {
+    profile: Profile,
+    entrypoint: Entrypoint,
+    attribs: Vec<(ffi::VAConfigAttribType, u32)>,
 }
 
 impl Config {
@@ -626,6 +640,12 @@ impl Config {
         entrypoint: Entrypoint,
         attribs: &mut [ffi::VAConfigAttrib],
     ) -> Result<Self, Error> {
+        #[cfg(windows)]
+        let made_of = ConfigShape {
+            profile,
+            entrypoint,
+            attribs: attribs.iter().map(|a| (a.type_, a.value)).collect(),
+        };
         let mut id = ffi::VA_INVALID_ID;
         let count = i32::try_from(attribs.len()).unwrap_or(0);
         check(
@@ -646,6 +666,8 @@ impl Config {
         Ok(Self {
             display: display.clone_ref(),
             id,
+            #[cfg(windows)]
+            made_of,
         })
     }
 }
@@ -669,11 +691,52 @@ pub(crate) struct Context {
     pub(crate) id: ffi::VAContextID,
     /// Held so that the config outlives the context: it drops after
     /// [`Context`]'s `drop` has destroyed the context.
-    _config: Arc<Config>,
+    config: Arc<Config>,
     /// Whether a picture of the context was ended (`vaEndPicture`), which
     /// for a decoder's context on radeonsi begins its session
     /// (`super::buffer::render_decode`).
     ended: AtomicBool,
+    /// On Windows, a decoder's context's shape ([`Context::new_decoder`]): on drop it is kept
+    /// for a decoder of its shape while another context lives on the display.
+    #[cfg(windows)]
+    shape: Option<ContextShape>,
+}
+
+/// What a decoder's context is made of and for, which decides whether a context kept on
+/// Windows is taken back for it ([`Context::new_decoder`]).
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContextShape {
+    config: ConfigShape,
+    width: u32,
+    height: u32,
+    targets: usize,
+    references: u32,
+}
+
+/// On Windows, a decoder's context let go while another context lived on its display, with the
+/// config it was made on, kept for a decoder of its shape ([`Context::new_decoder`],
+/// [`Display::context_let_go`]).
+#[cfg(windows)]
+pub(crate) struct KeptContext {
+    pub(super) shape: ContextShape,
+    id: ffi::VAContextID,
+    config: Arc<Config>,
+    /// Whether a picture of the context was ended ([`Context::first_end`]).
+    ended: bool,
+}
+
+#[cfg(windows)]
+impl KeptContext {
+    /// Destroys the context, as [`Context`]'s drop does, behind the releases asked for before.
+    pub(super) fn destroy(self, display: &Display) {
+        let id = self.id;
+        // SAFETY: made by vaCreateContext on this display, destroyed once, here, before its
+        // config, whose destroy is made behind this as `self.config` drops.
+        display.release(move |raw| unsafe {
+            ffi::vaDestroyContext(raw, id);
+        });
+    }
 }
 
 impl Context {
@@ -710,9 +773,69 @@ impl Context {
         Ok(Self {
             display: display.clone_ref(),
             id,
-            _config: config,
+            config,
             ended: AtomicBool::new(false),
+            #[cfg(windows)]
+            shape: None,
         })
+    }
+
+    /// A decoder's context, as [`Context::new`] makes one, on Windows kept on drop while
+    /// another context lives on the display, and taken back by a decoder of its shape: the
+    /// same config's profile, entrypoint and attributes, the same size and number of render
+    /// targets, and the same `references`, the count the picture parameters carry that the
+    /// driver sizes its decoder by (H.264's `num_ref_frames`, HEVC's
+    /// `sps_max_dec_pic_buffering_minus1`). A context taken back keeps the config it was made
+    /// on, and `config` goes.
+    ///
+    /// **Measured** on the UHD Graphics 630 (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12
+    /// video driver, 2026-11-20; `super::teardown`'s churn test, beside a 4K H.264 decoder that
+    /// lived throughout): each short 4K H.264 decoder let go with its context held, its pool's
+    /// surfaces and its config destroyed at once, added 35 MB to DXGI's local count of the
+    /// process until no context lived. **Read from code** (Mesa 26.2.4,
+    /// `frontends/va/context.c`, `picture_h264.c`, `drivers/d3d12/d3d12_video_dec.cpp`): the
+    /// frontend's `vlVaCreateContext` reads no render target; its decoder is made at the first
+    /// picture, and for H.264 destroyed and made again where a picture's `num_ref_frames`
+    /// differs from the one it was made for; Direct3D 12's decoder makes its heap again where a
+    /// picture's size or DPB (`num_ref_frames + 1`, HEVC's
+    /// `sps_max_dec_pic_buffering_minus1 + 1`) outgrows it. Both would end a decoder while
+    /// another context lives, which the shape keeps from happening.
+    pub(crate) fn new_decoder(
+        display: &Display,
+        config: impl Into<Arc<Config>>,
+        width: u32,
+        height: u32,
+        render_targets: &mut [ffi::VASurfaceID],
+        references: u32,
+    ) -> Result<Self, Error> {
+        let config = config.into();
+        #[cfg(windows)]
+        {
+            let shape = ContextShape {
+                config: config.made_of.clone(),
+                width,
+                height,
+                targets: render_targets.len(),
+                references,
+            };
+            if let Some(kept) = display.take_context(&shape) {
+                return Ok(Self {
+                    display: display.clone_ref(),
+                    id: kept.id,
+                    config: kept.config,
+                    ended: AtomicBool::new(kept.ended),
+                    shape: Some(shape),
+                });
+            }
+            let mut context = Self::new(display, config, width, height, render_targets)?;
+            context.shape = Some(shape);
+            Ok(context)
+        }
+        #[cfg(unix)]
+        {
+            let _ = references;
+            Self::new(display, config, width, height, render_targets)
+        }
     }
 
     /// Whether no picture of the context was ended before: `true` once,
@@ -725,6 +848,16 @@ impl Context {
 impl Drop for Context {
     fn drop(&mut self) {
         let id = self.id;
+        #[cfg(windows)]
+        if let Some(shape) = self.shape.take() {
+            self.display.context_let_go(KeptContext {
+                shape,
+                id,
+                config: Arc::clone(&self.config),
+                ended: *self.ended.get_mut(),
+            });
+            return;
+        }
         // SAFETY: made by vaCreateContext on this display, destroyed once,
         // here, before its config, whose destroy is made behind this.
         self.display

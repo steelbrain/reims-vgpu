@@ -18,9 +18,11 @@ use crate::core::sync::Mutex;
 
 use super::calls::{Calls, Late};
 use super::caps::Answers;
+#[cfg(windows)]
+use super::caps::{ContextShape, KeptContext};
 use super::ffi;
 #[cfg(windows)]
-use super::held::{Asked, Held};
+use super::held::{Asked, Held, Kept};
 use super::import_check::{ImportWrite, ImportWrites};
 use super::surface::SurfaceFormat;
 use super::wait;
@@ -175,10 +177,11 @@ struct DisplayInner {
     adapter: Option<[u8; 8]>,
     #[cfg(windows)]
     d3d12: OnceLock<Result<super::d3d12::Device, String>>,
-    /// On Windows, the display's live contexts and the teardowns held while one lives
-    /// ([`Display::release_teardown`]).
+    /// On Windows, the display's live contexts, and the contexts' teardowns held and the
+    /// decoders' contexts kept while one lives ([`Display::release_teardown`],
+    /// [`Display::context_let_go`]).
     #[cfg(windows)]
-    teardowns: Mutex<Held<HeldRelease>>,
+    teardowns: Mutex<Held<HeldRelease, KeptContext>>,
 }
 
 /// A teardown held on Windows ([`Display::release_teardown`]).
@@ -196,7 +199,8 @@ pub(crate) enum Teardown {
     Surfaces,
 }
 
-/// Whether a teardown was held yet in this process, which the log says once.
+/// Whether a context's teardown was held, or a decoder's context kept, yet in this process,
+/// which the log says once.
 #[cfg(windows)]
 static HELD_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -490,8 +494,8 @@ impl Display {
         self.inner.calls.release(release);
     }
 
-    /// Counts a context made on the display, which on Windows holds the teardowns asked for
-    /// while it lives ([`Display::release_teardown`]).
+    /// Counts a context made on the display, which on Windows holds the contexts' teardowns
+    /// asked for while it lives ([`Display::release_teardown`]).
     pub(crate) fn context_made(&self) {
         #[cfg(windows)]
         {
@@ -501,20 +505,23 @@ impl Display {
 
     /// `release`, the teardown `kind`, made as [`Display::release`] makes a release.
     ///
-    /// On Windows it is held while another context lives on the display, and made, behind the
-    /// teardowns held before it, once the teardown of the display's last live context is asked
-    /// for. **Measured** on the UHD Graphics 630 (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12
-    /// video driver, 2026-11-17), two threads each decoding a 4K H.264 stream on one display,
-    /// their decoders let go round after round or kept (`super::teardown`): a decoder let go
-    /// while another lived ended the process in an access violation inside Intel's
-    /// `igd12dxva64.dll` at the other's next `vaEndPicture`, or had that call fail, in every run
-    /// of every shape tried: with the other decoder idle and its last picture done and read
-    /// back; with no teardown between another context's `vaBeginPicture` and its
-    /// `vaEndPicture`'s return; with each context's pictures submitted alone, once the other
-    /// contexts' last pictures were done. With teardowns held until no context lived, and with
-    /// the decoders kept until both threads ended, every run passed, as one thread making and
-    /// letting go decoders one after another did. A teardown held keeps its surfaces' memory
-    /// meanwhile. `super::held` counts the live contexts and keeps the teardowns held.
+    /// On Windows a context's is held while another context lives on the display, and made,
+    /// behind the teardowns held and the contexts kept before it ([`Display::context_let_go`]),
+    /// once the last live context's end is asked for. **Measured** on the UHD Graphics 630
+    /// (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12 video driver, 2026-11-17), two threads
+    /// each decoding a 4K H.264 stream on one display, their decoders let go round after round
+    /// or kept (`super::teardown`): a decoder let go while another lived ended the process in an
+    /// access violation inside Intel's `igd12dxva64.dll` at the other's next `vaEndPicture`, or
+    /// had that call fail, in every run of every shape tried: with the other decoder idle and its
+    /// last picture done and read back; with no teardown between another context's
+    /// `vaBeginPicture` and its `vaEndPicture`'s return; with each context's pictures submitted
+    /// alone, once the other contexts' last pictures were done. With teardowns held until no
+    /// context lived, and with the decoders kept until both threads ended, every run passed, as
+    /// one thread making and letting go decoders one after another did. **Measured** again
+    /// there (2026-11-20, each way run twice), with the context's teardown alone held: a pool's
+    /// surfaces destroyed at once, or its surfaces and the config, passed as well. So a config's
+    /// and a pool's surfaces' teardowns are made at once. `super::held` counts the live contexts
+    /// and keeps what is held.
     pub(crate) fn release_teardown(
         &self,
         kind: Teardown,
@@ -523,26 +530,58 @@ impl Display {
         #[cfg(windows)]
         {
             let asked = self.inner.teardowns.lock().ask(kind, Box::new(release));
-            match asked {
-                Asked::Held => {
-                    if !HELD_LOGGED.swap(true, Ordering::Relaxed) {
-                        log::info!(
-                            "hardware video: VA-API: a session's teardown is held while another \
-                             session lives on the display, and made once none does"
-                        );
-                    }
-                }
-                Asked::Now(now) => {
-                    for teardown in now {
-                        self.release(teardown);
-                    }
-                }
-            }
+            self.made(asked);
         }
         #[cfg(unix)]
         {
             let _ = kind;
             self.release(release);
+        }
+    }
+
+    /// A decoder's context let go (`Context::new_decoder`): kept while another context lives
+    /// on the display, for a decoder of its shape to take back ([`Display::take_context`]),
+    /// else destroyed, behind what was held and kept before it, as a context's teardown is
+    /// made ([`Display::release_teardown`]). A context kept holds what its decoder holds, and
+    /// is taken back rather than another made beside it, so what the contexts kept hold is
+    /// bounded by the most decoders of one shape that lived at once.
+    #[cfg(windows)]
+    pub(crate) fn context_let_go(&self, context: KeptContext) {
+        let asked = self.inner.teardowns.lock().let_go(context);
+        self.made(asked);
+    }
+
+    /// A decoder's context of `shape` kept on the display ([`Display::context_let_go`]), taken
+    /// back and counted live.
+    #[cfg(windows)]
+    pub(crate) fn take_context(&self, shape: &ContextShape) -> Option<KeptContext> {
+        self.inner
+            .teardowns
+            .lock()
+            .take(|kept| kept.shape == *shape)
+    }
+
+    /// What [`Held`] made of what was let go: nothing yet where it was kept, else each release
+    /// made and each context kept destroyed, in order.
+    #[cfg(windows)]
+    fn made(&self, asked: Asked<HeldRelease, KeptContext>) {
+        match asked {
+            Asked::Kept => {
+                if !HELD_LOGGED.swap(true, Ordering::Relaxed) {
+                    log::info!(
+                        "hardware video: VA-API: a session's context is kept while another \
+                         session lives on the display, and destroyed once none does"
+                    );
+                }
+            }
+            Asked::Now(now) => {
+                for kept in now {
+                    match kept {
+                        Kept::Release(release) => self.release(release),
+                        Kept::Context(context) => context.destroy(self),
+                    }
+                }
+            }
         }
     }
 }

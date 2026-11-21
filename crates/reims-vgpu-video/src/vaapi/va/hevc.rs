@@ -277,7 +277,10 @@ impl Accelerator for VaHevc {
             dpb_size + 1 + SPARE_SURFACES,
         )?;
         let mut targets = pool.ids();
-        let context = Context::new(&self.display, config, width, height, &mut targets)?;
+        // The DPB the driver sizes the decoder by: `sps_max_dec_pic_buffering_minus1`.
+        let references = u32::from(sps.highest_ordering().max_dec_pic_buffering_minus1);
+        let context =
+            Context::new_decoder(&self.display, config, width, height, &mut targets, references)?;
         self.session = Some(Session {
             profile,
             context: Some(context),

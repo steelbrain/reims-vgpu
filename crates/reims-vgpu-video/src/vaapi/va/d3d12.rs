@@ -712,8 +712,8 @@ impl Device {
     }
 }
 
-/// The DXGI adapter of `luid`.
-pub(super) fn adapter_of(luid: [u8; 8]) -> Result<Com, String> {
+/// A DXGI factory, as `IDXGIFactory4`.
+fn factory() -> Result<Com, String> {
     let create_factory = system_function("dxgi.dll", c"CreateDXGIFactory1")?;
     // SAFETY: the function is `CreateDXGIFactory1` (dxgi.h).
     let create_factory =
@@ -721,7 +721,12 @@ pub(super) fn adapter_of(luid: [u8; 8]) -> Result<Com, String> {
     let mut factory = null_mut();
     // SAFETY: the IID is IDXGIFactory4's.
     let result = unsafe { create_factory(&IID_IDXGI_FACTORY4, &mut factory) };
-    let factory = Com::made("CreateDXGIFactory1", result, factory)?;
+    Com::made("CreateDXGIFactory1", result, factory)
+}
+
+/// The DXGI adapter of `luid`.
+pub(super) fn adapter_of(luid: [u8; 8]) -> Result<Com, String> {
+    let factory = factory()?;
     let [l0, l1, l2, l3, h0, h1, h2, h3] = luid;
     let luid = Luid {
         low: u32::from_le_bytes([l0, l1, l2, l3]),
@@ -739,6 +744,65 @@ pub(super) fn adapter_of(luid: [u8; 8]) -> Result<Com, String> {
         by_luid(factory.raw(), luid, &IID_IDXGI_ADAPTER, &mut adapter)
     };
     Com::made("EnumAdapterByLuid", result, adapter)
+}
+
+/// What this process holds on the first adapter DXGI lists, as DXGI counts it, in bytes: in the
+/// adapter's local segment group and in its non-local one (`IDXGIAdapter3::QueryVideoMemoryInfo`'s
+/// `CurrentUsage`).
+#[cfg(test)]
+pub(super) fn video_memory_used() -> Result<[u64; 2], String> {
+    /// `DXGI_QUERY_VIDEO_MEMORY_INFO`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct VideoMemoryInfo {
+        budget: u64,
+        current_usage: u64,
+        available_for_reservation: u64,
+        current_reservation: u64,
+    }
+    const IID_IDXGI_ADAPTER3: Guid = guid(
+        0x6459_67a4,
+        0x1392,
+        0x4310,
+        [0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd],
+    );
+    const FACTORY1_ENUM_ADAPTERS1: usize = 12;
+    const ADAPTER3_QUERY_VIDEO_MEMORY_INFO: usize = 14;
+    /// `DXGI_MEMORY_SEGMENT_GROUP_LOCAL` and `DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL`.
+    const SEGMENT_GROUPS: [u32; 2] = [0, 1];
+
+    let factory = factory()?;
+    let mut adapter = null_mut();
+    // SAFETY: the method is IDXGIFactory1's `EnumAdapters1`, which IDXGIFactory4 inherits, given
+    // the adapter's index and where to write it.
+    let result = unsafe {
+        let enum_adapters: unsafe extern "system" fn(
+            *mut c_void,
+            u32,
+            *mut *mut c_void,
+        ) -> Hresult = factory.method(FACTORY1_ENUM_ADAPTERS1);
+        enum_adapters(factory.raw(), 0, &mut adapter)
+    };
+    let adapter =
+        Com::made("EnumAdapters1", result, adapter)?.query(&IID_IDXGI_ADAPTER3, "IDXGIAdapter3")?;
+    let mut used = [0; 2];
+    for (group, used) in SEGMENT_GROUPS.into_iter().zip(&mut used) {
+        let mut info = VideoMemoryInfo::default();
+        // SAFETY: the method is IDXGIAdapter3's `QueryVideoMemoryInfo`, given the adapter's node
+        // 0, a segment group and where to write what it holds.
+        let result = unsafe {
+            let query: unsafe extern "system" fn(
+                *mut c_void,
+                u32,
+                u32,
+                *mut VideoMemoryInfo,
+            ) -> Hresult = adapter.method(ADAPTER3_QUERY_VIDEO_MEMORY_INFO);
+            query(adapter.raw(), 0, group, &mut info)
+        };
+        check("QueryVideoMemoryInfo", result)?;
+        *used = info.current_usage;
+    }
+    Ok(used)
 }
 
 /// The device of the display opened on `luid`, made at its first use and kept; `Err` with why
