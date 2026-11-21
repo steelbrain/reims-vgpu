@@ -34,6 +34,10 @@
 //!   ends with the device lost: rt's own call, or a window swapchain's that met the loss first,
 //!   which the swapchain reports to rt, rt's `Device::report_loss`), and how many of its command
 //!   buffers were committed and not complete then, the one failing among them ([`DeviceLoss`]).
+//!   Where rt named the call, the fault's lines follow it (`super::fault`): the driver's report
+//!   of the fault (rt's `DeviceLoss::fault`, or that rt read none), and each address it names
+//!   placed among the decoders' live objects and the blocks the host sees, with the nearest below
+//!   and above where none holds it.
 //!   Each command buffer that fails with the device lost is counted, `rt-device-lost`, in the
 //!   process's degradation counts (docs/conventions.md). Then each command buffer rt ends as in
 //!   flight writes a line of its own, naming the work the guest knows it by, as its caller named
@@ -487,18 +491,32 @@ pub struct DeviceLoss {
     /// takes it off where rt refuses it), and its first completed handler takes it off once its
     /// error is read, so a failing command buffer counts itself.
     open: AtomicI64,
+    /// What the loss's fault is placed among (`super::fault`).
+    watch: super::fault::FaultWatch,
 }
 
 impl DeviceLoss {
-    /// The loss of a device of the GPU `gpu`, before any.
+    /// The loss of a device of the GPU `gpu`, before any, its fault placed among nothing.
     pub fn new(gpu: String) -> DeviceLoss {
+        DeviceLoss::watching(gpu, super::fault::FaultWatch::default())
+    }
+
+    /// The loss of a device of the GPU `gpu`, before any, its fault placed among what `watch`
+    /// sees (`super::fault`).
+    pub fn watching(gpu: String, watch: super::fault::FaultWatch) -> DeviceLoss {
         DeviceLoss {
             gpu,
             hung: AtomicBool::new(false),
             said: AtomicBool::new(false),
             in_flight: AtomicUsize::new(0),
             open: AtomicI64::new(0),
+            watch,
         }
+    }
+
+    /// What its fault is placed among (`super::fault`).
+    pub(super) fn watch(&self) -> &super::fault::FaultWatch {
+        &self.watch
     }
 
     /// rt ended a command buffer as in flight at the loss, the guest's names for its work `work`
@@ -553,7 +571,8 @@ impl DeviceLoss {
             return;
         }
         let open = self.open.load(Ordering::SeqCst).max(0);
-        let at = match cause() {
+        let cause = cause();
+        let at = match &cause {
             Some(rt::DeviceLoss { call, result, .. }) => format!(" at {call} ({result:?})"),
             None => " with no call rt named".to_owned(),
         };
@@ -563,6 +582,12 @@ impl DeviceLoss {
              makes the device again ({DEVICE_LOST})\n",
             self.gpu
         ));
+        // The driver's report of the fault, its addresses placed (`super::fault`).
+        if let Some(cause) = &cause {
+            for line in self.watch.lines(&self.gpu, cause.fault.as_ref()) {
+                say_lost(&line);
+            }
+        }
     }
 }
 
@@ -1576,7 +1601,9 @@ mod tests {
     /// naming its GPU, the Vulkan call rt names as its loss and what it returned, and how many of
     /// its command buffers were committed and not complete then, the failing one among them; each
     /// command buffer that fails so is counted, once however often its error is read (the
-    /// module's docs, "A lost device's line"). Where rt names no call, the line says so.
+    /// module's docs, "A lost device's line"). The fault's lines follow it, here the one that rt
+    /// read no report (`super::fault`). Where rt names no call, the line says so, and no fault's
+    /// line follows.
     #[test]
     fn a_lost_device_writes_one_line_and_counts_each_command_buffer() {
         use rt::CommandBufferError::{DeviceLost, NotRun};
@@ -1616,6 +1643,14 @@ mod tests {
                  again (rt-device-lost)\n"
             ]
         );
+        assert_eq!(
+            said_lost(" on A GPU (1234:5678) faulted: "),
+            [
+                "reims-vgpu: the rt platform's device on A GPU (1234:5678) faulted: rt read no \
+                 report of the fault (the device has no VK_EXT_device_fault, the read failed, or a \
+                 window's swapchain reported the loss)\n"
+            ]
+        );
         assert_eq!(counted(DEVICE_LOST), before + 2);
         assert_eq!(loss.open.load(Ordering::SeqCst), 0);
         // Another device, whose loss rt names no call for.
@@ -1636,6 +1671,7 @@ mod tests {
                  buffer fails from here on, and nothing makes the device again (rt-device-lost)\n"
             ]
         );
+        assert_eq!(said_lost(" on B GPU (1234:9abc) faulted: "), Vec::<String>::new());
     }
 
     /// Each command buffer rt ends as in flight at its device's loss writes a line after the

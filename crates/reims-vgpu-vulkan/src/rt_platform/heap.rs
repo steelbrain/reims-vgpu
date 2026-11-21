@@ -152,6 +152,17 @@ impl RtHeap {
     pub fn block_id(&self) -> rt::BlockId {
         self.block.id
     }
+
+    /// The block it is a range of, its first byte's offset there and its size, for a lost
+    /// device's fault (`super::fault`).
+    pub(super) fn fault_span(&self) -> (&rt::Block, u64, u64) {
+        (&self.block, self.offset, self.size)
+    }
+
+    /// The blocks its device knows (`super::fault`).
+    pub(super) fn device_known(&self) -> &super::buffer::KnownBlocks {
+        self.device.known_blocks()
+    }
 }
 
 /// What a heap's descriptor makes of it: its storage mode's block class, its size, whether it is

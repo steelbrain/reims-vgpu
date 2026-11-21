@@ -499,6 +499,18 @@ struct Deferred {
 }
 
 impl RtBuffer {
+    /// rt's buffer where it is made: a deferred one's is not until its first use (the module's
+    /// docs, "Deferred memory"). What a lost device's fault is placed among (`super::fault`),
+    /// which makes nothing.
+    pub(super) fn made_rt(&self) -> Option<&rt::Buffer> {
+        self.rt.get()
+    }
+
+    /// The blocks its device knows (`super::fault`).
+    pub(super) fn device_known(&self) -> &KnownBlocks {
+        self.device.known_blocks()
+    }
+
     /// rt's buffer; a deferred one's made now where it is not yet, and where rt refuses its
     /// memory the process ends ([`deferred_refused`]): the caller's use answers no refusal.
     pub fn rt(&self) -> &rt::Buffer {
@@ -784,6 +796,25 @@ impl KnownBlocks {
     /// Whether `id` is a live dma-buf import of the device's ([`HostMappings`]).
     fn is_dma_buf(&self, id: rt::BlockId) -> bool {
         self.mapped.of(id).is_some()
+    }
+
+    /// Whether `id` is a live dma-buf import of the device's, for a lost device's fault
+    /// (`super::fault`).
+    pub(super) fn is_live_dma_buf(&self, id: rt::BlockId) -> bool {
+        self.is_dma_buf(id)
+    }
+
+    /// The device's live dma-buf imports, known or not, for a lost device's fault
+    /// (`super::fault`).
+    pub(super) fn live_dma_bufs(&self) -> Vec<rt::BlockId> {
+        self.mapped.0.lock().keys().copied().collect()
+    }
+
+    /// Each block known now, for a lost device's fault (`super::fault`); `None` where the set's
+    /// lock was not had within `bound`.
+    pub(super) fn fault_blocks(&self, bound: std::time::Duration) -> Option<Vec<rt::BlockInfo>> {
+        let known = self.known.try_lock_for(bound)?;
+        Some(known.values().map(|block| **block).collect())
     }
 }
 
@@ -1543,7 +1574,7 @@ fn made_import(
     skip: u64,
 ) -> (rt::Block, u64) {
     imports_rise();
-    super::diag::imported(block.id, sel);
+    super::diag::imported(&block, sel);
     crate::answer::count_made(codes);
     (block, offset + skip)
 }

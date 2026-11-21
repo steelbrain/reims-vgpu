@@ -678,8 +678,18 @@ pub struct Origin {
     copy: bool,
 }
 
-/// The blocks imported, by rt's number, which rt never reuses, with where.
-static IMPORTED: Mutex<BTreeMap<rt::BlockId, Origin>> = Mutex::new(BTreeMap::new());
+/// An import block as [`imported`] noted it: where it was imported, and its range and storage
+/// mode, for a lost device's fault (`super::fault`, [`import_range`]).
+#[derive(Clone, Copy)]
+struct Imported {
+    origin: Origin,
+    gpu_address: u64,
+    len: u64,
+    class: rt::MemoryClass,
+}
+
+/// The blocks imported, by rt's number, which rt never reuses, with where and their ranges.
+static IMPORTED: Mutex<BTreeMap<rt::BlockId, Imported>> = Mutex::new(BTreeMap::new());
 
 /// The imports by origin.
 static IMPORTS: Mutex<BTreeMap<Origin, u64>> = Mutex::new(BTreeMap::new());
@@ -697,15 +707,48 @@ pub fn copy_made(block: rt::BlockId) {
 
 /// Notes block `block`, imported now for `sel` (`super::buffer::import_pages`): a copy of the
 /// pages where [`copy_made`] noted it, else the pages themselves.
-pub fn imported(block: rt::BlockId, sel: &'static str) {
+pub fn imported(block: &rt::BlockInfo, sel: &'static str) {
     let origin = Origin {
         sel,
         message: MESSAGE.get(),
         thread: thread_class(),
-        copy: COPIES.lock().remove(&block),
+        copy: COPIES.lock().remove(&block.id),
     };
-    IMPORTED.lock().insert(block, origin);
+    let imported = Imported {
+        origin,
+        gpu_address: block.gpu_address,
+        len: block.len,
+        class: block.class,
+    };
+    IMPORTED.lock().insert(block.id, imported);
     *IMPORTS.lock().entry(origin).or_insert(0) += 1;
+}
+
+/// An import block's range and storage mode, and whether it is a copy of its pages
+/// ([`import_range`]).
+pub(super) struct ImportRange {
+    /// Its first byte's GPU address.
+    pub(super) gpu_address: u64,
+    /// Its length in bytes.
+    pub(super) len: u64,
+    /// Its storage mode.
+    pub(super) class: rt::MemoryClass,
+    /// Whether it is a copy of its pages ([`copy_made`]) rather than the pages themselves.
+    pub(super) copy: bool,
+}
+
+/// Import block `block`'s range, where it is an import the device made ([`imported`]), for a lost
+/// device's fault (`super::fault`). The record is kept for the process's life, as the origins'
+/// are: it says nothing of whether the import lives, so the fault asks only of blocks it knows
+/// live (a live buffer's, a live dma-buf import).
+pub(super) fn import_range(block: rt::BlockId) -> Option<ImportRange> {
+    let imported = *IMPORTED.lock().get(&block)?;
+    Some(ImportRange {
+        gpu_address: imported.gpu_address,
+        len: imported.len,
+        class: imported.class,
+        copy: imported.origin.copy,
+    })
 }
 
 /// This thread's name without the number that ends it (`-0x...` or `-N`), kept once.
@@ -783,7 +826,7 @@ impl Over {
     /// apart: `None` where the buffer's block was not imported. rt copies one whether or not it
     /// maps the block for the host: a buffer without contents (a dma-buf import) is counted too.
     fn of(buffer: &rt::Buffer, shape: &Shape, offset: u64, bytes_per_row: u64) -> Option<Over> {
-        let origin = *IMPORTED.lock().get(&buffer.block())?;
+        let origin = IMPORTED.lock().get(&buffer.block())?.origin;
         let kind = OverKind {
             format: shape.format,
             width: shape.width,

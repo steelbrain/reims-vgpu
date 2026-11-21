@@ -47,6 +47,7 @@ pub mod diag;
 pub mod event;
 #[cfg(unix)]
 pub mod export;
+pub mod fault;
 pub mod format;
 pub mod gauge_log;
 pub mod heap;

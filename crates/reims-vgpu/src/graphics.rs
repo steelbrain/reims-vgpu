@@ -163,6 +163,7 @@ mod decode;
 mod device_info;
 #[cfg(windows)]
 mod drawn;
+mod fault_walk;
 #[cfg(target_os = "linux")]
 mod nvidia;
 mod present;
@@ -571,6 +572,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 guest_ram,
             );
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
+            // The device walks the decoder's tables at its loss, placing the driver's fault
+            // among their live objects (`fault_walk`).
+            fault_walk::watch::<P>(&gpu_device, decoder.table_walk());
             decoder.set_unified_memory(unified_memory);
             if let Some(ledger) = &pool_ledger {
                 decoder.set_pool(ledger.clone());

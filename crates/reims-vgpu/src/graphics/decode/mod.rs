@@ -829,6 +829,74 @@ pub(crate) fn context_of(obj_id: u64) -> u32 {
     (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
 }
 
+/// An object of a context's table, as the walk at its device's loss sees it ([`TableWalk`]).
+pub(crate) enum TableObject<'a, P: Platform> {
+    /// A buffer.
+    Buffer(&'a P::Buffer),
+    /// A texture.
+    Texture(&'a P::Texture),
+    /// A heap.
+    Heap(&'a P::Heap),
+    /// The `Shared` buffer over a two-copy `Managed` texture's CPU copy, under the texture's id.
+    ManagedCopy(&'a P::Buffer),
+}
+
+/// A decoder's tables, held weakly, for the walk at its device's loss (`super::fault_walk`).
+pub(crate) struct TableWalk<P: Platform>(Weak<Shared<P>>);
+
+impl<P: Platform> TableWalk<P> {
+    /// Whether the decoder's state is still there.
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    /// Calls `f` with each buffer, texture, heap and `Managed` CPU-copy buffer of each context's
+    /// table, its context, its id and whether it was removed and kept for an open view, waiting
+    /// `bound` at most in all for the locks: the map of contexts, held through the walk, so no
+    /// context is let go of here, and each table's. Answers the contexts walked, those whose
+    /// table was not had in time, and whether the map was not.
+    pub(crate) fn each(
+        &self,
+        bound: std::time::Duration,
+        f: &mut dyn FnMut(u32, u64, bool, TableObject<'_, P>),
+    ) -> (usize, Vec<u32>, bool) {
+        let Some(shared) = self.0.upgrade() else {
+            return (0, Vec::new(), false);
+        };
+        let clock = shared.platform.clock();
+        let start = clock.now_mono().as_nanos();
+        let left = || {
+            let spent = clock.now_mono().as_nanos().saturating_sub(start);
+            bound.saturating_sub(std::time::Duration::from_nanos(spent))
+        };
+        let Some(contexts) = shared.contexts.try_lock_for(left()) else {
+            return (0, Vec::new(), true);
+        };
+        let (mut walked, mut unwalked) = (0, Vec::new());
+        for context in contexts.values() {
+            let cid = context.id;
+            let had = context.each_object(left(), &mut |id, gone, handle, cpu| {
+                if let Some(cpu) = cpu {
+                    f(cid, id, gone, TableObject::ManagedCopy(cpu));
+                }
+                let object = match handle {
+                    ObjHandle::Buffer(b) => TableObject::Buffer(b),
+                    ObjHandle::Texture(t) => TableObject::Texture(t),
+                    ObjHandle::Heap(h) => TableObject::Heap(h),
+                    _ => return,
+                };
+                f(cid, id, gone, object);
+            });
+            if had {
+                walked += 1;
+            } else {
+                unwalked.push(cid);
+            }
+        }
+        (walked, unwalked, false)
+    }
+}
+
 /// What the decoder keeps for every context, behind locks of its own (the module doc's list).
 pub(crate) struct Shared<P: Platform> {
     /// The platform whose device the decoder drives, held for the descriptor builders
@@ -1309,6 +1377,12 @@ impl<P: Platform> Recent<P> {
 pub(crate) type WalkHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl<P: Platform> GraphicsDecoder<P> {
+    /// The decoder's tables, held weakly, for the walk at its device's loss
+    /// (`super::fault_walk`).
+    pub(crate) fn table_walk(&self) -> TableWalk<P> {
+        TableWalk(Arc::downgrade(&self.shared))
+    }
+
     /// A new decoder for `platform` over its `region`, with no objects. The first one made turns
     /// on the contexts' counts where the log names their target ([`work`]), and the host's
     /// summary where the log names its ([`super::summary`]).

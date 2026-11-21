@@ -535,6 +535,30 @@ pub(crate) struct Context<P: Platform> {
 }
 
 impl<P: Platform> Context<P> {
+    /// Calls `f` with each entry of the table, its id, whether it was removed and is kept for an
+    /// open view, its handle and its `Managed` CPU copy's buffer, under a read of the table's lock
+    /// had within `bound`; false where the lock was not had in it (a device's loss,
+    /// `super::TableWalk`).
+    pub(super) fn each_object(
+        &self,
+        bound: std::time::Duration,
+        f: &mut dyn FnMut(u64, bool, &ObjHandle<P>, Option<&P::Buffer>),
+    ) -> bool {
+        let Some(tables) = self.tables.try_read_for(bound) else {
+            return false;
+        };
+        fn cpu<P: Platform>(entry: &Entry<P>) -> Option<&P::Buffer> {
+            (entry.managed.as_ref()).and_then(|copy| copy.cpu.as_ref())
+        }
+        for (&id, owned) in &tables.live {
+            f(id, false, &owned.entry().handle, cpu(owned.entry()));
+        }
+        for (removed, _) in &tables.gone {
+            f(removed.id(), true, &removed.entry().handle, cpu(removed.entry()));
+        }
+        true
+    }
+
     /// A context with no objects.
     pub(crate) fn new(id: u32) -> Self {
         Context {

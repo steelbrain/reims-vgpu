@@ -291,6 +291,12 @@ impl RtDevice {
         &self.loss
     }
 
+    /// Walks `tables`, a decoder's, at its loss too, placing the loss's fault among their live
+    /// objects (`super::fault`).
+    pub fn watch_faults(&self, tables: Arc<dyn super::fault::LiveObjects>) {
+        self.loss.watch().watch(tables);
+    }
+
     /// Whether it is lost, which nothing makes again: rt's `Device::loss` names a cause. rt sets
     /// it at its own Vulkan call that meets the loss, before any of its command buffers ends with
     /// the device lost, and a window's swapchain reports a loss its own call meets first
@@ -428,6 +434,10 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         ));
     };
     let mut options = rt::DeviceOptions::default();
+    // rt's pool allocations, noted as rt maps them and forgotten as it unmaps them, among which a
+    // lost device's fault is placed (`super::fault`).
+    let allocations = Arc::new(super::fault::Allocations::default());
+    options.block_mappings = Some(Arc::clone(&allocations) as Arc<dyn rt::BlockMappings>);
     options.pipeline_cache_dir = crate::os::user_cache_directory().map(|dir| dir.join(CACHE));
     options.pipeline_cache_cap = Some(SHADER_CACHE_CAPACITY);
     let fences = {
@@ -490,6 +500,8 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         "{} ({:04x}:{:04x})",
         facts.name, facts.vendor_id, facts.device_id
     );
+    let known = KnownBlocks::default();
+    let watch = super::fault::FaultWatch::new(allocations, known.clone());
     Ok(RtObj::new(RtDevice {
         rt: device,
         facts,
@@ -498,12 +510,12 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         sampler_indices: OwnIndices::new(rt::IndexClass::Sampler),
         numbering: Numbering::default(),
         shaders: OnceLock::new(),
-        known: KnownBlocks::default(),
+        known,
         instance,
         drm,
         present_fences,
         host_gpu,
-        loss: Arc::new(DeviceLoss::new(gpu)),
+        loss: Arc::new(DeviceLoss::watching(gpu, watch)),
     }))
 }
 
