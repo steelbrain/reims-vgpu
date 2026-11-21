@@ -634,6 +634,14 @@ fn linear_alignment(device: &rt::Device, format: u64) -> Option<u64> {
     device.minimum_linear_texture_alignment(pf).ok()
 }
 
+/// rt's `minimumTextureBufferAlignmentForPixelFormat:` of the raw pixel format `format`, the
+/// offset alignment its `Buffer::new_texture` holds a texture buffer of it to; none where rt has
+/// no format of it or makes no texture buffer of it.
+fn texture_buffer_alignment(device: &rt::Device, format: u64) -> Option<u64> {
+    let pf = crate::gpu::runtime_pixel_format(format)?;
+    device.minimum_texture_buffer_alignment(pf).ok()
+}
+
 /// `MTLResourceStorageModePrivate`, as resource options.
 const STORAGE_PRIVATE: u64 = 0x20;
 
@@ -1501,12 +1509,15 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     }
 }
 
-/// The identity of `device` ([`answers::identity`]): rt's linear alignment of each SDK format rt
-/// has a format of, none where it refuses one.
+/// The identity of `device` ([`answers::identity`]): rt's linear and texture-buffer alignments
+/// of each SDK format rt has a format of, none where it refuses one.
 fn identity_of(device: &RtObj<RtDevice>) -> IdentityCaps {
-    answers::identity(&device.facts, &device.caps, |format| {
-        linear_alignment(&device.rt, format)
-    })
+    answers::identity(
+        &device.facts,
+        &device.caps,
+        |format| linear_alignment(&device.rt, format),
+        |format| texture_buffer_alignment(&device.rt, format),
+    )
 }
 
 #[cfg(test)]
@@ -1646,10 +1657,10 @@ mod tests {
     }
 
     /// The rt platform's device on the GPU the test holds: made once and answered at every ask,
-    /// its registry ID opening it again; its answers bounded by its GPU; its queues, events and
-    /// fences made; the guest's texture indices granted, twice without a refusal; a heap texture's
-    /// size rt's, and a shape rt or Metal refuses a counted raise, never 0 bytes at 0; every
-    /// creator of an unbuilt piece nil and counted.
+    /// its registry ID opening it again; its answers bounded by its GPU, its texture-buffer
+    /// alignments rt's; its queues, events and fences made; the guest's texture indices granted,
+    /// twice without a refusal; a heap texture's size rt's, and a shape rt or Metal refuses a
+    /// counted raise, never 0 bytes at 0; every creator of an unbuilt piece nil and counted.
     #[test]
     fn the_device_and_its_answers_on_vulkan() {
         use crate::core::platform::device::GpuDevice as _;
@@ -1691,6 +1702,23 @@ mod tests {
             caps.min_linear_alignment_bgra8(),
             Ok(device.linear_row_alignment())
         );
+        // Each texture-buffer format answers rt's texture-buffer alignment of it, where rt
+        // answers one, and none answers 0; a format Metal answers none of answers none.
+        let texel_formats = crate::core::platform::caps::TEXTURE_BUFFER_FORMATS;
+        for answers in &identity.formats {
+            let rt_answer = texture_buffer_alignment(device.rt(), answers.format);
+            let answered = answers.texture_buffer_alignment;
+            assert_ne!(answered, Some(0), "format {}", answers.format);
+            match texel_formats.contains(&answers.format) {
+                true if rt_answer.is_some() => assert_eq!(answered, rt_answer),
+                true => {}
+                false => assert_eq!(answered, None, "format {}", answers.format),
+            }
+        }
+        let texel_answers: Vec<(u64, u64)> = (identity.formats.iter())
+            .filter_map(|f| Some((f.format, f.texture_buffer_alignment?)))
+            .collect();
+        eprintln!("texture-buffer alignments (format, bytes): {texel_answers:?}");
         assert!(device.own_memory_budget() > 0);
         assert!(device.memory_heaps_total() >= device.own_memory_budget());
         assert!(device.linear_row_alignment() > 0);

@@ -4,8 +4,8 @@
 //!
 //! **Metal's answers, as the Vulkan platform gives them.** rt answers the device-level questions
 //! only where they depend on the device (`hasUnifiedMemory`, `supportsTextureSampleCount:`,
-//! `minimumLinearTextureAlignmentForPixelFormat:`); the rest of a Metal device's answers are the
-//! consumer's. So each is the Vulkan platform's answer where that answer is the platform's own
+//! `minimumLinearTextureAlignmentForPixelFormat:`, `minimumTextureBufferAlignmentForPixelFormat:`);
+//! the rest of a Metal device's answers are the consumer's. So each is the Vulkan platform's answer where that answer is the platform's own
 //! (its stand-ins, `crate::gpu::caps::stand_in`, and its fixed answers), and otherwise Metal's
 //! answer on an Apple M3 Max, recorded on 2026-11-07 ([`metal`]), held to the
 //! device's Vulkan limits where one bounds it ([`caps`]). The guest's device info is made from
@@ -33,7 +33,13 @@
 //!   `maxArgumentBufferSamplerCount` the indices of rt's sampler class;
 //! - the linear texture alignments (the device's, an IOSurface's, a linear texture's) are the
 //!   largest of rt's `minimumLinearTextureAlignmentForPixelFormat:` answers, as the runtime's were
-//!   the largest of its, and BGRA8's is rt's.
+//!   the largest of its, and BGRA8's is rt's;
+//! - `minimumTextureBufferAlignmentForPixelFormat:` of each format Metal answers it of is rt's
+//!   (its `Device::minimum_texture_buffer_alignment`: the device's texel-buffer offset alignment
+//!   for the format's texel, which rt's `Buffer::new_texture` holds a texture buffer's offset to),
+//!   so a guest that places a texture buffer by the answer is not refused. A format rt makes
+//!   textures of but no texture buffer of answers the largest of rt's answers, never 0, which a
+//!   guest may divide by: a texture buffer of it is rt's refusal at any offset.
 //!
 //! A feature answered here that rt does not build yet is refused where the guest uses it (a
 //! pipeline of it is rt's `Gap`), counted (`super::unbuilt`).
@@ -302,11 +308,18 @@ pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
 /// families `caps` claims and every family they contain, the feature sets of those, the
 /// architecture's name as the Vulkan platform makes it, each SDK format's alignments
 /// (`linear` answers rt's `minimumLinearTextureAlignmentForPixelFormat:` of a raw format, `None`
-/// where rt makes no texture of it), the sizes and the flags (the module docs).
+/// where rt makes no texture of it; `texel` rt's `minimumTextureBufferAlignmentForPixelFormat:`,
+/// `None` where rt makes no texture buffer of it), the sizes and the flags (the module docs).
+///
+/// A format of [`TEXTURE_BUFFER_FORMATS`] answers `texel`'s alignment. Where `texel` answers none
+/// of it but `linear` answers, it answers the largest of `texel`'s answers of those formats
+/// (Metal's 16 where `texel` answers none of them): never 0, which a guest may divide by. Any
+/// other format answers none, as before: Metal asserts at it, or rt makes no texture of it.
 pub fn identity(
     facts: &Facts,
     caps: &DeviceCaps,
     linear: impl Fn(u64) -> Option<u64>,
+    texel: impl Fn(u64) -> Option<u64>,
 ) -> IdentityCaps {
     let mut claimed = [false; 20];
     for (&family, answer) in FAMILIES.iter().zip(&caps.families) {
@@ -315,6 +328,10 @@ pub fn identity(
         }
     }
     let families = identity::closed(claimed);
+    let texel_largest = (TEXTURE_BUFFER_FORMATS.iter())
+        .filter_map(|&format| texel(format))
+        .max()
+        .unwrap_or(METAL_LINEAR_ALIGNMENT);
     let [
         feature_profile,
         half_fp_config,
@@ -334,11 +351,13 @@ pub fn identity(
             .iter()
             .map(|&format| {
                 let linear_alignment = linear(format);
+                let texture_buffer_alignment = match TEXTURE_BUFFER_FORMATS.contains(&format) {
+                    true => texel(format).or(linear_alignment.map(|_| texel_largest)),
+                    false => None,
+                };
                 FormatAnswers {
                     format,
-                    texture_buffer_alignment: (TEXTURE_BUFFER_FORMATS.contains(&format)
-                        && linear_alignment.is_some())
-                    .then_some(METAL_LINEAR_ALIGNMENT),
+                    texture_buffer_alignment,
                     linear_alignment,
                     sparse_tiles: None,
                 }
@@ -520,7 +539,12 @@ pub(crate) mod tests {
     fn the_identity_claims_the_families_caps_contain() {
         let facts = roomy();
         let caps = caps(&facts);
-        let id = identity(&facts, &caps, |format| (format == 80).then_some(64));
+        let id = identity(
+            &facts,
+            &caps,
+            |format| (format == 80).then_some(64),
+            |format| (format == 80).then_some(4),
+        );
         let claimed: Vec<i64> = (SDK_FAMILIES.iter().zip(id.families))
             .filter_map(|(&f, yes)| (yes == Some(true)).then_some(f))
             .collect();
@@ -539,7 +563,7 @@ pub(crate) mod tests {
                 bgra8.linear_alignment,
                 bgra8.sparse_tiles
             ),
-            (Some(16), Some(64), None)
+            (Some(4), Some(64), None)
         );
         let rgba8 = id.formats.iter().find(|f| f.format == 70).unwrap();
         assert_eq!(
@@ -558,6 +582,37 @@ pub(crate) mod tests {
             id.architecture_name.as_deref(),
             Some("vulkan_1002_15bf_abababababababababababababababab")
         );
+    }
+
+    /// A texture-buffer format answers rt's texture-buffer alignment of it; one rt makes textures
+    /// of but no texture buffer of, the largest of rt's answers, never 0 (Metal's 16 where rt
+    /// answers none); a format Metal answers no texture-buffer alignment of, none, whatever rt
+    /// answers.
+    #[test]
+    fn the_texture_buffer_alignments_are_rt_s() {
+        let facts = roomy();
+        let caps = caps(&facts);
+        let linear = |format: u64| matches!(format, 70 | 80 | 115 | 252).then_some(64);
+        let texel = |format: u64| match format {
+            80 => Some(4),
+            125 => Some(16),
+            252 => Some(4),
+            _ => None,
+        };
+        let answer = |id: &IdentityCaps, format: u64| {
+            let answers = id.formats.iter().find(|f| f.format == format).unwrap();
+            answers.texture_buffer_alignment
+        };
+        let id = identity(&facts, &caps, linear, texel);
+        assert_eq!(answer(&id, 80), Some(4));
+        assert_eq!(answer(&id, 125), Some(16));
+        assert_eq!(answer(&id, 115), Some(16));
+        assert_eq!(answer(&id, 70), Some(16));
+        assert_eq!(answer(&id, 252), None);
+        assert_eq!(answer(&id, 10), None);
+        let id = identity(&facts, &caps, linear, |_| None);
+        assert_eq!(answer(&id, 80), Some(METAL_LINEAR_ALIGNMENT));
+        assert_eq!(answer(&id, 125), None);
     }
 
     /// The registry ID folds the UUID's halves, so two devices of UUIDs that differ in either half
