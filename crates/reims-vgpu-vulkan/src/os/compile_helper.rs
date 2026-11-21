@@ -17,8 +17,7 @@
 //! **No caller's thread waits.** [`Helper::start`] returns at once. The helper's own thread,
 //! `reims-vgpu.compile-helper`, waits for the lock, starts the process and watches it. Once the
 //! process has ended and the lock is free, it calls the caller's `on_end` with how the process
-//! ended ([`HelperEnd`]). [`Helper::wait`] is for a caller with nothing else to do. Dropping a
-//! [`Helper`] cancels it, and waits for nothing.
+//! ended ([`HelperEnd`]). Dropping a [`Helper`] cancels it, and waits for nothing.
 //!
 //! **The talk.** rt owns what the two processes say: in the VM's process `Device::fill_stage`
 //! writes the request to the helper's stdin and reads the compile's cache from its stdout, and the
@@ -54,13 +53,6 @@
 //! - Windows: a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no other limit, whose
 //!   one handle the library's process holds. Its end closes the job, which ends the helper. The
 //!   process joins the job just after its start, before the talk begins.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "its caller, the handler of rt's stage refusal, lands with the helper's binary"
-    )
-)]
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -175,8 +167,16 @@ struct State {
     /// Whether it was cancelled.
     cancelled: bool,
     /// Its process's id, once the process has started.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the tests' `Helper::pid` alone")
+    )]
     pid: Option<u32>,
-    /// How it ended, once it has.
+    /// How it ended, once it has. The library takes it in its `on_end`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the tests' `Helper::wait` alone")
+    )]
     end: Option<HelperEnd>,
 }
 
@@ -226,6 +226,7 @@ impl Helper {
     }
 
     /// The process's id, once it has started.
+    #[cfg(test)]
     pub(crate) fn pid(&self) -> Option<u32> {
         self.shared.state.lock().pid
     }
@@ -238,6 +239,7 @@ impl Helper {
     }
 
     /// Waits for the helper's end.
+    #[cfg(test)]
     pub(crate) fn wait(&self) -> HelperEnd {
         let clock = OsClock::new();
         let mut state = self.shared.state.lock();
@@ -426,6 +428,10 @@ fn end_process(child: &mut Child) {
 
 /// The helper's side: arms what ends the helper with the library's process where the OS needs the
 /// helper's part, on macOS (the module's doc). The helper's main calls it first.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "its caller, the helper's main, lands with the helper's binary")
+)]
 pub(crate) fn end_with_parent() -> io::Result<()> {
     host::watch_parent()
 }

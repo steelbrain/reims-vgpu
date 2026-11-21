@@ -520,6 +520,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     let watch = super::fault::FaultWatch::new(allocations, known.clone());
     let loss = Arc::new(DeviceLoss::watching(gpu, watch));
     let order = || Arc::clone(loss.flights());
+    let stage_fills = Arc::new(super::stage::fills(device.clone(), uuid));
     Ok(RtObj::new(RtDevice {
         rt: device,
         facts,
@@ -534,7 +535,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         present_fences,
         host_gpu,
         loss,
-        stage_fills: Arc::new(super::stage::fills()),
+        stage_fills,
     }))
 }
 

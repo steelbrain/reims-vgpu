@@ -1,59 +1,165 @@
-//! A stage's fill on the rt platform: a helper process that compiles it ([`helper_start`]).
+//! A stage's fill on the rt platform: a helper process that compiles it ([`fills`]).
 //!
-//! rt refuses, in the VM's process, a stage whose compile is not in its store and weighs past its
-//! bound, and the device's fills ([`StageFills`]) start one fill a stage. Each fill here is a
-//! helper process (`os::compile_helper`): the caller's `talk` is the fill, which rt carries out
-//! over the helper's stdin and stdout, and the caller's `on_end` maps how the helper ended to the
-//! fill's end, recording a breach with rt where the helper was killed at a cap. A cancel of the
-//! fill kills the helper.
+//! rt refuses, in the VM's process, a kernel's `VkPipeline` whose module weighs past its stage
+//! bound and whose compile its cache directory does not hold (`Error::StageUnfilled`), naming the
+//! pipeline by its request ([`StageKey`], [`stage_of`]), and the device's fills ([`StageFills`])
+//! start one fill a request. Each fill here is a helper process (`os::compile_helper`), the
+//! program [`HELPER`] beside the process's executable ([`helper_run`]):
+//! - **The talk** is rt's `Device::fill_stage` over the helper's stdin and stdout, which keeps the
+//!   compile's cache data in the cache directory for the pipeline's later makes, and answers the
+//!   helper's own times (`StageSpans`): its device's creation and its compile, logged with the
+//!   talk's wall time and the module's weight (`StageRequest::weight`).
+//! - **The fill's end** ([`fill_end`]) is the talk's answer first: data kept fills the stage, and
+//!   a compile the driver failed is a breach rt kept. Otherwise it is how the helper ended: killed
+//!   at its memory or time cap, a breach recorded with rt (`Device::record_stage_breach`), so the
+//!   pipeline's makes refuse it (`Gap::StageSize`) with no helper asked again; cancelled; or
+//!   failed, with nothing recorded (no helper, one of another build's wire, one that found no
+//!   device of the request's or enabled other features, a cache directory that took no entry,
+//!   a helper that ended before its reply).
+//! - A cancel of the fill kills the helper.
 //!
 //! Where there is no helper to run, no fill starts, and the stage's fill ends
 //! [`FillEnd::Failed`] at once: nothing is recorded, and a make of the stage refuses as before.
-//!
-//! A device's fills ([`fills`]) are keyed by [`StageKey`], what rt's stage refusal names
-//! ([`stage_of`]). Until rt's refusal carries its request, the key has no values: no refusal names
-//! a stage, and no fill starts.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::process::{ChildStdin, ChildStdout};
 use std::sync::Arc;
 
 use metal2vulkan_runtime as rt;
 
+use crate::core::platform::os::Clock;
 use crate::core::platform::stage::{Cancel, FillDone, FillEnd, StageFills, Start};
-use crate::os::compile_helper::{Helper, HelperEnd, HelperRun};
+use crate::os::OsClock;
+use crate::os::compile_helper::{Helper, HelperEnd, HelperRun, Limits};
 
-/// A stage that no refusal names yet: rt's refusal does not carry its request.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum NoStage {}
+/// The helper's program, beside the process's executable, with the OS's executable suffix.
+pub(crate) const HELPER: &str = "reims-vgpu-compile";
 
-/// What a stage's refusal names, and a device's fills are keyed by.
-pub type StageKey = NoStage;
+/// The lock file every helper on the host takes ([`HelperRun::lock`]), in the library's cache
+/// directory (`crate::os::cache_directory`).
+const LOCK: &str = "compile-helper.lock";
 
-/// The stage whose compile rt's refusal `error` waits for, where it is such a refusal: none yet.
+/// What a stage's refusal names, and a device's fills are keyed by: rt's request of the
+/// `VkPipeline`, equal for every refusal of one pipeline.
+pub type StageKey = rt::StageRequest;
+
+/// The request whose fill rt's refusal `error` waits for, where it is such a refusal
+/// (`Error::StageUnfilled`).
 pub(crate) fn stage_of(error: &rt::Error) -> Option<StageKey> {
-    let _ = error;
-    None
+    match error {
+        rt::Error::StageUnfilled(request) => Some(request.clone()),
+        _ => None,
+    }
 }
 
-/// A device's fills: none starts while no refusal names a stage.
-pub(crate) fn fills() -> StageFills<StageKey> {
-    StageFills::new(Box::new(|stage: &StageKey, _: FillDone| -> Cancel {
-        match *stage {}
-    }))
+/// The fills of `device`, whose physical device's `deviceUUID` is `uuid`: each runs the helper
+/// ([`helper_run`]), hands its pipes to rt's `fill_stage`, and records the breach of a helper
+/// killed at a cap (the module's docs).
+pub(crate) fn fills(device: rt::Device, uuid: [u8; 16]) -> StageFills<StageKey> {
+    let talks = device.clone();
+    StageFills::new(stage_start(
+        move || helper_run(uuid),
+        move |request: &StageKey, to_helper, from_helper| {
+            let clock = OsClock::new();
+            let began = clock.now_mono();
+            let filled = talks.fill_stage(request, to_helper, from_helper);
+            if let Ok(spans) = &filled {
+                let took = clock.now_mono().saturating_duration_since(began);
+                log::info!(
+                    target: super::TARGET,
+                    "stage {request:?}: filled by its helper in {} ms: weight {}, its device {} \
+                     ms, its compile {} ms",
+                    took.as_millis(),
+                    request.weight(),
+                    spans.device_nanos / 1_000_000,
+                    spans.compile_nanos / 1_000_000
+                );
+            }
+            filled
+        },
+        move |request, breach| device.record_stage_breach(request, breach),
+    ))
+}
+
+/// What runs the helper of a device whose `deviceUUID` is `uuid`: the program [`HELPER`] beside
+/// the process's executable, given the UUID in hex, at the host's caps, taking the lock file
+/// [`LOCK`] in the library's cache directory, which it makes where it is missing.
+///
+/// Err: why there is no helper to run, as said.
+fn helper_run(uuid: [u8; 16]) -> Result<HelperRun, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("the process's executable: {e}"))?;
+    let name = format!("{HELPER}{}", std::env::consts::EXE_SUFFIX);
+    let program = exe.with_file_name(name);
+    if !program.is_file() {
+        return Err(format!("{} is not there", program.display()));
+    }
+    let dir = crate::os::cache_directory().ok_or("the host names no cache directory")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let hex: String = uuid.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(HelperRun {
+        program,
+        args: vec![OsString::from(hex)],
+        envs: Vec::new(),
+        limits: Limits::of_host(),
+        lock: dir.join(LOCK),
+    })
+}
+
+/// A start of fills of stages past rt's bound: each runs the helper `run` names
+/// ([`helper_start`]), whose talk is `talk`, rt's fill or a test's; its end is [`fill_end`]'s,
+/// and a breach it names is recorded with `record`.
+fn stage_start<K, S>(
+    run: impl Fn() -> Result<HelperRun, String> + Send + Sync + 'static,
+    talk: impl Fn(&K, ChildStdin, ChildStdout) -> Result<S, rt::StageFill> + Send + Sync + 'static,
+    record: impl Fn(&K, rt::StageBreach) + Send + Sync + 'static,
+) -> Start<K>
+where
+    K: Clone + fmt::Debug + Send + 'static,
+    S: Send + 'static,
+{
+    helper_start(run, talk, move |key: &K, end, said| {
+        let (fill, breach) = fill_end(end, said.as_ref());
+        if let Some(breach) = breach {
+            record(key, breach);
+        }
+        if fill != FillEnd::Filled {
+            let said = match said {
+                Some(Err(refused)) => format!("; its fill: {refused}"),
+                Some(Ok(_)) | None => String::new(),
+            };
+            log::warn!(
+                target: super::TARGET,
+                "stage {key:?}: its helper's fill ended {fill:?}, the helper {end:?}{said}"
+            );
+        }
+        fill
+    })
+}
+
+/// The end of a stage's fill whose helper ended as `end`, and whose talk answered `said` (none
+/// where no talk ran), with the breach to record with rt, if any (the module's docs).
+fn fill_end<S>(
+    end: &HelperEnd,
+    said: Option<&Result<S, rt::StageFill>>,
+) -> (FillEnd, Option<rt::StageBreach>) {
+    match (said, end) {
+        (Some(Ok(_)), _) => (FillEnd::Filled, None),
+        // rt kept the breach itself.
+        (Some(Err(rt::StageFill::Compile(_))), _) => (FillEnd::Breached, None),
+        (_, HelperEnd::OverMemory { .. }) => (FillEnd::Breached, Some(rt::StageBreach::Memory)),
+        (_, HelperEnd::OverTime) => (FillEnd::Breached, Some(rt::StageBreach::Time)),
+        (_, HelperEnd::Cancelled) => (FillEnd::Cancelled, None),
+        (_, HelperEnd::Ended(_) | HelperEnd::NotStarted(_) | HelperEnd::Unwatched(_)) => {
+            (FillEnd::Failed, None)
+        }
+    }
 }
 
 /// A start of fills ([`Start`]) that runs each in a helper process: what `run` names, or no fill
 /// where it fails, as it says. The helper's talk is `talk`, and the fill's end is what `on_end`
 /// makes of the helper's end and the talk's result.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "its caller, the handler of rt's stage refusal, lands with the helper's binary"
-    )
-)]
-pub(crate) fn helper_start<K, T>(
+fn helper_start<K, T>(
     run: impl Fn() -> Result<HelperRun, String> + Send + Sync + 'static,
     talk: impl Fn(&K, ChildStdin, ChildStdout) -> T + Send + Sync + 'static,
     on_end: impl Fn(&K, &HelperEnd, Option<T>) -> FillEnd + Send + Sync + 'static,
@@ -166,6 +272,19 @@ mod tests {
         std::env::temp_dir().join(format!("rvg-stage-{pid}-{test}.lock"))
     }
 
+    /// An exit status of `code`.
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        #[cfg(unix)]
+        let raw = code << 8;
+        #[cfg(windows)]
+        let raw = code.cast_unsigned();
+        std::process::ExitStatus::from_raw(raw)
+    }
+
     /// A talk that writes the stage's key, then reads what the helper writes to its end.
     fn echo(key: &u32, mut stdin: ChildStdin, mut stdout: ChildStdout) -> Vec<u8> {
         stdin.write_all(format!("stage {key}").as_bytes()).unwrap();
@@ -247,6 +366,101 @@ mod tests {
         assert!(said.unwrap().ends_with(b"stage 9"));
         assert_eq!(fills.fill(9).end(), Some(FillEnd::Filled));
         let _ = std::fs::remove_file(lock_file(test));
+    }
+
+    /// The talk's answer decides first: data kept fills the stage, and a failed compile is a
+    /// breach rt kept. Otherwise a cap's kill is a breach to record, a cancel is a cancel, and
+    /// every other end fails the fill with nothing recorded.
+    #[test]
+    fn a_fill_ends_by_its_talk_first_then_by_its_helper() {
+        use rt::{StageBreach, StageFill};
+        type Said = Result<(), StageFill>;
+        let ok: Said = Ok(());
+        let compile: Said = Err(StageFill::Compile(ash::vk::Result::ERROR_DEVICE_LOST));
+        let (version, ended): (Said, Said) = (Err(StageFill::Version), Err(StageFill::Ended));
+        let over_memory = HelperEnd::OverMemory { bytes: 9 << 30 };
+        let exited = || HelperEnd::Ended(exit_status(0));
+        let not_started = HelperEnd::NotStarted("no lock".to_owned());
+        assert_eq!(fill_end(&exited(), Some(&ok)), (FillEnd::Filled, None));
+        assert_eq!(fill_end(&over_memory, Some(&ok)), (FillEnd::Filled, None));
+        assert_eq!(fill_end(&exited(), Some(&compile)), (FillEnd::Breached, None));
+        assert_eq!(fill_end(&HelperEnd::OverTime, Some(&compile)), (FillEnd::Breached, None));
+        let memory = (FillEnd::Breached, Some(StageBreach::Memory));
+        assert_eq!(fill_end(&over_memory, Some(&ended)), memory);
+        assert_eq!(fill_end::<()>(&over_memory, None), memory);
+        let time = (FillEnd::Breached, Some(StageBreach::Time));
+        assert_eq!(fill_end(&HelperEnd::OverTime, Some(&ended)), time);
+        let cancelled = (FillEnd::Cancelled, None);
+        assert_eq!(fill_end(&HelperEnd::Cancelled, Some(&ended)), cancelled);
+        let failed = (FillEnd::Failed, None);
+        assert_eq!(fill_end(&exited(), Some(&version)), failed);
+        assert_eq!(fill_end(&exited(), Some(&ended)), failed);
+        assert_eq!(fill_end::<()>(&not_started, None), failed);
+        let unwatched = HelperEnd::Unwatched("its status".to_owned());
+        assert_eq!(fill_end(&unwatched, Some(&ended)), failed);
+    }
+
+    /// A helper of another build's wire, which rt's fill answers `StageFill::Version`, fails the
+    /// stage's fill with no breach recorded, and the end is kept: no helper is asked again.
+    #[test]
+    fn a_helper_of_another_wire_version_fails_its_fill_with_nothing_recorded() {
+        let test = "a_helper_of_another_wire_version_fails_its_fill_with_nothing_recorded";
+        stand_in();
+        let (records, recorded) = mpsc::channel();
+        let (talks, talked) = mpsc::channel();
+        let fills = StageFills::new(stage_start(
+            move || Ok(run_of(test, "echo")),
+            move |key: &u32, stdin, stdout| {
+                talks.send(echo(key, stdin, stdout)).unwrap();
+                Err::<(), _>(rt::StageFill::Version)
+            },
+            move |key, breach| records.send((*key, breach)).unwrap(),
+        ));
+        assert_eq!(fills.fill(5).wait(), FillEnd::Failed);
+        assert!(talked.recv_timeout(WAIT).unwrap().ends_with(b"stage 5"));
+        assert_eq!(fills.fill(5).end(), Some(FillEnd::Failed));
+        assert!(talked.try_recv().is_err());
+        assert!(recorded.try_recv().is_err());
+        let _ = std::fs::remove_file(lock_file(test));
+    }
+
+    /// A helper killed at its time cap breaches its stage: the breach is recorded, and the fill
+    /// ends breached.
+    #[test]
+    fn a_helper_past_its_time_cap_records_a_time_breach() {
+        let test = "a_helper_past_its_time_cap_records_a_time_breach";
+        stand_in();
+        let (records, recorded) = mpsc::channel();
+        let fills = StageFills::new(stage_start(
+            move || {
+                let mut run = run_of(test, "sleep");
+                run.limits.time = Duration::from_millis(300);
+                Ok(run)
+            },
+            |_: &u32, stdin, mut stdout| {
+                drop(stdin);
+                io::copy(&mut stdout, &mut io::sink()).unwrap_or(0);
+                Err::<(), _>(rt::StageFill::Ended)
+            },
+            move |key, breach| records.send((*key, breach)).unwrap(),
+        ));
+        assert_eq!(fills.fill(3).wait(), FillEnd::Breached);
+        assert_eq!(recorded.recv_timeout(WAIT).unwrap(), (3, rt::StageBreach::Time));
+        let _ = std::fs::remove_file(lock_file(test));
+    }
+
+    /// A refusal other than a stage's names no stage.
+    #[test]
+    fn only_a_stage_s_refusal_names_a_stage() {
+        assert!(stage_of(&rt::Error::Quiesced).is_none());
+    }
+
+    /// Where no helper lies beside the process's executable, as beside a test binary, there is
+    /// none to run, and it says where it looked.
+    #[test]
+    fn a_process_with_no_helper_beside_it_runs_none() {
+        let why = helper_run([7; 16]).unwrap_err();
+        assert!(why.contains(HELPER), "{why}");
     }
 
     /// A cancel of the fills ends the fill at once and kills its helper, whose end then reaches

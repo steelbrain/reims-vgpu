@@ -53,6 +53,7 @@
 //!   declares) or by an earlier make.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use metal2vulkan::Budget;
@@ -65,6 +66,7 @@ use metal2vulkan_runtime as rt;
 
 use crate::core::platform::compute::Dispatch;
 use crate::core::platform::resource::ComputePipeline;
+use crate::core::platform::stage::StageFills;
 use crate::core::platform::types::{MtlSize, NsErrorText};
 use crate::core::platform::values::{FullComputePipelineDesc, LinkedFunctionsDesc, StageInputDesc};
 use crate::core::platform::{Handle, Platform};
@@ -74,6 +76,7 @@ use crate::core::trace;
 
 use super::device::RtDevice;
 use super::library::RtFunction;
+use super::stage::{StageKey, stage_of};
 use super::state::value;
 use super::texture::OwnIndices;
 use super::unbuilt::{
@@ -213,6 +216,8 @@ pub struct RtComputePipeline {
     unique_identifier: u64,
     /// The texture slots the kernel may write ([`written_slots`]).
     written: Box<[u32]>,
+    /// Its device's stage fills, which its makes ahead start.
+    fills: Arc<StageFills<StageKey>>,
 }
 
 impl RtComputePipeline {
@@ -369,6 +374,10 @@ fn make(
     }
     if let Err(error) = &made {
         super::diag::keep_refused_compute(sel, error, descriptor);
+        // The kernel's compile for its helper starts now, for the state's next make.
+        if let Some(stage) = stage_of(error) {
+            let _fill = device.stage_fills().fill(stage);
+        }
     }
     let (rt, lease) = taking.made(sel, made)?;
     let written = written_slots(rt.texture_accesses());
@@ -377,6 +386,7 @@ fn make(
         lease,
         unique_identifier: next_identifier(),
         written,
+        fills: Arc::clone(device.stage_fills()),
     }))
 }
 
@@ -557,13 +567,19 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     /// rt's make ahead (`prepare_dispatch`) of the `VkPipeline` the dispatch would make at its
     /// first use, at its threadgroup size, threadgroup memory lengths and grid tiles. A value past
     /// rt's 32 bits makes nothing: the dispatch, or the length's set, refuses it
-    /// (`super::compute`). rt's one refusal here, of a kernel past its stage bound, is the
-    /// dispatch's own, which the dispatch meets in its walk.
+    /// (`super::compute`). rt's one refusal here is of a kernel past its stage bound whose compile
+    /// the cache directory does not hold, and its fill starts (`super::stage`): the dispatch waits
+    /// for that fill in its walk.
     fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
-        if let Some(args) = RtDispatch::of(dispatch, threads, lengths) {
-            let _stage_refusal =
-                self.rt
-                    .prepare_dispatch(args.dispatch, args.threads, &args.lengths);
+        let Some(args) = RtDispatch::of(dispatch, threads, lengths) else {
+            return;
+        };
+        let state = &self.rt;
+        let prepared = state.prepare_dispatch(args.dispatch, args.threads, &args.lengths);
+        if let Err(error) = prepared
+            && let Some(stage) = stage_of(&error)
+        {
+            let _fill = self.fills.fill(stage);
         }
     }
 
