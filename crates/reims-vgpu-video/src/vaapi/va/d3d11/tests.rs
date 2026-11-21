@@ -480,6 +480,63 @@ fn pairs_let_go_together_share_one_flush() {
     );
 }
 
+/// `AddRef`, every COM object's method 1.
+const ADD_REF: usize = 1;
+/// `Release`, every COM object's method 2.
+const RELEASE: usize = 2;
+
+/// The references `object` has beside the one `Com` holds: `AddRef`, then `Release`, which
+/// answers the object's count after it, ours among them.
+fn references_beside_ours(object: &Com) -> u32 {
+    // SAFETY: `AddRef` and `Release` are every COM object's methods 1 and 2: the reference
+    // added is released at once, and the one `Com` holds stays.
+    let count = unsafe {
+        let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = object.method(ADD_REF);
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = object.method(RELEASE);
+        add_ref(object.raw());
+        release(object.raw())
+    };
+    count - 1
+}
+
+/// A plane draw let go of lets go of the adapter's Direct3D 12 device, and of everything its
+/// devices made on it: once a draw from a pool texture, its targets, the texture and the draws are
+/// let go of, as a session's and its decoder's are at the video's teardown, the Direct3D 12
+/// device made on the adapter (one a process, which `D3D12CreateDevice` answers while it lives)
+/// has no reference but ours. Direct3D 11 destroys a released object only at a later flush of its
+/// device's immediate context (the module doc): the draws' open of the texture, and its views,
+/// would otherwise keep the Direct3D 11 device over Direct3D 12, and through it the Direct3D 12
+/// device and the texture's memory, until the process exits. Run holding the GPU, on the default
+/// adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn a_plane_draw_let_go_leaves_no_reference_on_the_adapters_device() {
+    let alone = Device::new(None).expect("a Direct3D 12 device");
+    assert_eq!(
+        references_beside_ours(&alone.device),
+        0,
+        "the adapter's Direct3D 12 device, made alone, has no reference but ours"
+    );
+    drop(alone);
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    for ten_bit in [false, true] {
+        let texture = source(ten_bit);
+        let to = draw.targets((64, 48), ten_bit).expect("the targets");
+        draw.draw(&texture, (0, 0), &to, (64, 48))
+            .expect("the draw");
+        drop(to);
+        drop(texture);
+    }
+    drop(draw);
+    let after = Device::new(None).expect("a Direct3D 12 device");
+    assert_eq!(
+        references_beside_ours(&after.device),
+        0,
+        "the adapter's Direct3D 12 device, made once the plane draws are let go of, has no \
+         reference but ours"
+    );
+}
+
 /// A picture's extent covers its targets where it is their size, or more, each way, and only
 /// then.
 #[test]
