@@ -21,9 +21,13 @@
 #
 # Environment: PRIORITY (the jobs' potluck priority, default 4), LANE (their `lane` label, default
 # windows-tests), BUILD_RAM and TEST_RAM (GiB each job reserves, its commit charge's limit on
-# Windows: default 12 and 20), OUT (where the jobs' logs go, default target/windows-tests). The
+# Windows: default 12 and 26), OUT (where the jobs' logs go, default target/windows-tests). The
 # workspace stays held for an hour after the tests, for a run again with `potluck dispatch
 # --workspace`; the script prints it.
+#
+# TEST_RAM's default is 1.25 times the largest commit charge the tests' job was measured at: runs
+# peaked at 14.7 to 18.1 GiB, then one at 20.7 GiB (potluck job m3-max-56017), and a job that
+# reserved 20 was ended over memory at 20.1 GiB (m3-max-61085).
 #
 # In a job, on Windows, it runs as `windows-tests.sh --job build|test [-p PACKAGE]... [-- ARGS]`.
 set -u
@@ -172,7 +176,7 @@ while [ -z "$workspace" ]; do
   fi
   sleep 15
 done
-test=$(dispatch test --workspace "$workspace" --gpu "$gpu" --ram "${TEST_RAM:-20}" --timeout 20m --hold 1h \
+test=$(dispatch test --workspace "$workspace" --gpu "$gpu" --ram "${TEST_RAM:-26}" --timeout 20m --hold 1h \
   -- --job test "${job_args[@]}" -- "$@") || exit 1
 echo "windows-tests: tests $test queued in $workspace (log $out/$head-test.log)"
 if ! wait_job "$build" "$out/$head-build.log"; then
