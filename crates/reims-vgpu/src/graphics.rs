@@ -371,18 +371,18 @@ fn deferred_budget(features: u64, own_memory: u64) -> u64 {
 /// 38034).
 ///
 /// Where the GPU has memory of its own the caches are that memory, beside everything else the
-/// platform places there for the guest. In the per-shape form the budget trims only the shapes no
-/// texture references (`decode::surface_cache`, "Within a budget"): the caches' buffers and their
-/// referenced shapes are a floor it does not go under. On a 4 GiB Radeon RX 550 (RADV) with no
-/// budget, QEMU asked the card for more than it has in a browser's 3D page (by 201-270 MiB) and in
-/// a video (by up to 1283 MiB, most of it the host's video decoder's); what the card did not take
-/// stayed in the host's memory after it had room, and where long-lived allocations stayed so, a
-/// later benchmark scene ran at 17.2-17.5 frames a second, against 29.4-32.6 where few did (jobs
-/// m3-max-63976 and 64138). At each such moment the caches' floor was 2912-3634 MiB, and their
-/// unreferenced shapes 353-670 MiB, more than the 3D page's over-ask. Two thirds of the card, about
-/// 2.7 GB, is under every such floor, so the budget trims every unreferenced shape it may there; in
-/// those walks it would have trimmed elsewhere only where QEMU asked within 415 MiB of the card's
-/// room, where half would have trimmed in a scroll that asked 2.2 GB of it too.
+/// platform places there for the guest. In the per-shape form the budget trims only clean shapes no
+/// texture references, never a dirty or plane one (`decode::surface_cache`, "Within a budget"): the
+/// caches' buffers and their other shapes are a floor it does not go under. On a 4 GiB Radeon RX
+/// 550 (RADV) with no budget, QEMU asked the card for more than it has in a browser's 3D page (by
+/// 201-270 MiB) and in a video (by up to 1283 MiB, most of it the host's video decoder's), the
+/// caches' buffers and referenced shapes holding 2912-3634 MiB at each such moment (jobs
+/// m3-max-63976 and 64138). Two thirds of the card, about 2.7 GB, is under that, so there the
+/// budget trims every shape it may; in those walks it would have trimmed elsewhere only where QEMU
+/// asked within 415 MiB of the card's room, where half would have trimmed in a scroll that asked
+/// 2.2 GB of it too. With it, a walk trimmed 193 MiB, and the 3D page still asked 169-203 MiB past
+/// the card: its 462 MiB of unreferenced shapes were dirty or planes, which stay until a copy out
+/// writes them back (job m3-max-64350).
 fn cache_budget(own_memory: u64, unified: bool) -> u64 {
     if unified {
         own_memory / 2
