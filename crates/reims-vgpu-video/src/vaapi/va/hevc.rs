@@ -20,10 +20,6 @@ use crate::codec::hevc::{
     sps::Sps,
 };
 
-/// Surfaces a pool makes beyond the DPB and the current picture, so that
-/// a frame the caller still holds does not stall the next decode.
-const SPARE_SURFACES: usize = 2;
-
 /// An entry of `RefPicList[][]` that names no picture (va_dec_hevc.h).
 const NO_REFERENCE: u8 = 0xff;
 
@@ -46,10 +42,11 @@ pub struct HevcDecoder {
 }
 
 impl HevcDecoder {
-    /// The frames a caller may hold at once, beyond those the decoder holds
-    /// itself, before a decode finds no free surface (`Error::OutOfSurfaces`):
-    /// the pool's spare surfaces.
-    pub const SPARE_FRAMES: usize = SPARE_SURFACES;
+    /// The frames a caller is to hold at once, beyond those the decoder holds itself. The
+    /// decoder's pool makes a surface for a picture as it needs one, whether the DPB, the
+    /// caller or the picture being decoded holds it, up to a bound past which a decode finds no
+    /// free surface (`Error::OutOfSurfaces`).
+    pub const SPARE_FRAMES: usize = 2;
 
     /// A decoder for samples described by an `hvcC` record (ISO/IEC
     /// 14496-15, 8.3.3.1), whose parameter sets it takes. The record's
@@ -131,6 +128,13 @@ impl HevcDecoder {
     /// The VA profile the decoder runs, once it has started a picture.
     pub fn profile(&self) -> Option<Profile> {
         self.inner.accelerator().session.as_ref().map(|s| s.profile)
+    }
+
+    /// How many surfaces of its own the decoder's session made, once it has started a picture.
+    #[cfg(test)]
+    pub(super) fn surfaces_made(&self) -> Option<usize> {
+        let session = self.inner.accelerator().session.as_ref()?;
+        Some(session.pool.made())
     }
 }
 
@@ -256,7 +260,7 @@ impl Accelerator for VaHevc {
     type Picture = Surface;
     type Error = Error;
 
-    fn configure(&mut self, sps: &Sps, dpb_size: usize) -> Result<(), Error> {
+    fn configure(&mut self, sps: &Sps, _dpb_size: usize) -> Result<(), Error> {
         self.session = None;
         let profile = select_profile(&self.display, sps)?;
         let (_, format) = profile_for(sps);
@@ -276,7 +280,6 @@ impl Accelerator for VaHevc {
             &mut attribs,
             format,
             (width, height),
-            dpb_size + 1 + SPARE_SURFACES,
             references,
         )?;
         self.session = Some(Session {

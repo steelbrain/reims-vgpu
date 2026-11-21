@@ -505,7 +505,11 @@ answers for its device, `rt_platform::HostGpu`). The arm
   "A decode").
 - **Surfaces.** A picture holds its decode surface until it lands, and
   the session holds no more pictures unlanded than the decoder's spare
-  surfaces (`SPARE_FRAMES`, 2), so a decode always finds a free surface.
+  frames (`SPARE_FRAMES`, 2). The decoder's pool makes a surface only for
+  a picture decoded into one of its own ("Surfaces and readback"): a
+  reference, or a picture given no cache target. So a session whose
+  pictures land in caches holds surfaces only for its references and the
+  pictures not landed yet.
 - **The display** opens once per runtime device and logs its driver, the
   open's time and thread, and the import check's answers.
 
@@ -708,11 +712,13 @@ once a process that one was held.
 (`Context::new_decoder`, `Display::context_let_go`): on Windows a
 decoder's context let go while another context lives is kept, with its
 config and the pool of surfaces its decoder decoded into, and the next
-decoder of the same profile, config attributes, surface format, size,
-number of surfaces and DPB (H.264's `num_ref_frames`, HEVC's
+decoder of the same profile, config attributes, surface format, size
+and DPB (H.264's `num_ref_frames`, HEVC's
 `sps_max_dec_pic_buffering_minus1`) takes the three back instead of
-making its own. So beside a live context a decoder of a shape kept makes
-no config, pool or context, and one let go destroys none, and what the
+making its own. The pool taken back holds the surfaces its last decoder
+made, and makes more as pictures need them. So beside a live context a
+decoder of a shape kept makes no config, pool or context, and one let
+go destroys none, and what the
 kept contexts hold is bounded by the most decoders of one shape that
 lived at once, rather than growing with every session that ends beside a
 long one. A pool kept lets go of its video-processing context first (the
@@ -866,12 +872,35 @@ by radeonsi; a driver that reads them is their hardware test.
 
 ### Surfaces and readback
 
-- Each session makes a pool of NV12 surfaces at the coded size, sized
-  DPB + 1 + 2 spare. They are the context's render targets.
-- A `Frame` holds its surface until it is dropped; a caller that holds
+- Each session has a pool of surfaces at the coded size (NV12, or P010
+  for HEVC Main 10). It starts with none, and the session's context is
+  made with no render targets. The pool makes a surface when a picture is
+  to be decoded into one of its own and none is free, and lends the one
+  freed last first. So it holds as many surfaces as were in use at once:
+  the DPB's references, the picture being decoded and the frames the
+  caller holds. A session whose every picture is decoded into a target
+  makes none.
+- A `Frame` holds its surface until it is dropped. A caller that holds
   frames makes the pool grow, up to 48 surfaces, then `OutOfSurfaces`.
-  Surfaces made after the context are decoded into fine: main-720p
-  matched with the caller holding 24 frames.
+- Surfaces made after the context are decoded into fine: main-720p
+  matched with the caller holding 24 frames. **Read from code** (Mesa
+  26.2.4, `frontends/va/context.c`): `vlVaCreateContext` reads no render
+  target.
+- **Measured** (2026-11-21, `surface::lazy`'s tests on the GPU, at 1080p
+  NV12 and 4K NV12 and P010): a surface's make takes 0.001 ms or less
+  (median) on radeonsi (Mesa 26.2.6) on a Radeon 780M and an RX 7900 XTX,
+  and 0.004 ms on iHD 26.3.5 on an Iris Xe. radeonsi makes no buffer for a
+  surface until its first use: the process's GPU memory (DRM fdinfo,
+  `drm-total-*`) grew by 0.0 MiB once 8 were made, and by 31, 108 and
+  203 MiB on the 780M (41, 144 and 279 on the XTX) once each held an
+  image. iHD makes each surface's buffer at its full size when it is made
+  (`drm-total-*` +28, +96 and +192 MiB for 8) and backs none of it until
+  first use (`drm-resident-*` +0.0, then +28, +96 and +192). Streams of
+  each driver's own encoder decoded to the same pictures with surfaces
+  made as needed as with five made up front, making two or three, and the
+  first access unit took the same time either way within the runs' spread
+  (H.264 1080p on the XTX 12.95 ms as needed, 13.18 up front; HEVC Main 10
+  4K on the Iris 10.06, 10.01).
 - Readback waits for the decode ("Waiting for the GPU"), has the GPU copy
   the frame into host memory of the pool's, and copies the cropped
   rectangle row by row into the caller's planes at the caller's strides;

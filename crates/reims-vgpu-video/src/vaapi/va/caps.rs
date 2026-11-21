@@ -18,7 +18,7 @@ use crate::core::sync::MutexGuard;
 use super::display::{Display, Error, Teardown, check};
 use super::ffi;
 use super::ffi::encode as enc;
-use super::surface::{SurfaceFormat, SurfacePool};
+use super::surface::{SurfaceFormat, SurfacePool, made_with_context};
 
 /// A `VAProfile`. Drivers may report profiles newer than this crate, so
 /// any value is kept, and [`Profile::name`] names the ones va.h 1.24 has.
@@ -686,7 +686,7 @@ pub(crate) struct Context {
 
 /// What a decoder's context is made of and for, which decides whether a context kept on
 /// Windows is taken back for it ([`Context::new_decoder`]): its config's profile and its
-/// attributes' types and values, in the order given, the format, size and number of its pool's
+/// attributes' types and values, in the order given, the format and size of its pool's
 /// surfaces, and the references its decoder is sized by.
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -696,7 +696,6 @@ pub(crate) struct ContextShape {
     format: SurfaceFormat,
     width: u32,
     height: u32,
-    surfaces: usize,
     references: u32,
 }
 
@@ -773,15 +772,18 @@ impl Context {
     }
 
     /// A decoder's context, on a config of `profile`, the entrypoint `VLD` and `attribs`, and
-    /// the pool of `surfaces` surfaces of `format`, `width` by `height`, that it decodes into,
-    /// its render targets. On Windows the context is kept on drop, with its config and its pool,
-    /// while another context lives on the display, and taken back, with them, by a decoder of
-    /// its shape (`ContextShape`): the same profile and attributes, the same format, size and
-    /// number of surfaces, and the same `references`, the count the picture parameters carry
+    /// the pool of surfaces of `format`, `width` by `height`, that its decoder decodes into. The
+    /// pool makes no surface until a picture needs one (`SurfacePool::get`), so the context has
+    /// no render targets, and a decoder whose every picture is decoded into a target over the
+    /// caller's memory makes no surface at all. On Windows the context is kept on drop, with its
+    /// config and its pool, while another context lives on the display, and taken back, with
+    /// them, by a decoder of its shape (`ContextShape`): the same profile and attributes, the
+    /// same format and size, and the same `references`, the count the picture parameters carry
     /// that the driver sizes its decoder by (H.264's `num_ref_frames`, HEVC's
     /// `sps_max_dec_pic_buffering_minus1`). So beside a live context a decoder of a shape kept
     /// makes no config, pool or context, and one let go destroys none
-    /// ([`Display::release_teardown`]).
+    /// ([`Display::release_teardown`]); a pool taken back holds the surfaces its last decoder
+    /// made, and makes more as a picture needs one.
     ///
     /// **Measured** on the UHD Graphics 630 (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12
     /// video driver, 2026-11-20; `super::teardown`'s churn test, beside a 4K H.264 decoder that
@@ -801,7 +803,6 @@ impl Context {
         attribs: &mut [ffi::VAConfigAttrib],
         format: SurfaceFormat,
         (width, height): (u32, u32),
-        surfaces: usize,
         references: u32,
     ) -> Result<(Self, SurfacePool), Error> {
         #[cfg(windows)]
@@ -811,7 +812,6 @@ impl Context {
             format,
             width,
             height,
-            surfaces,
             references,
         };
         #[cfg(windows)]
@@ -829,7 +829,7 @@ impl Context {
         #[cfg(unix)]
         let _ = references;
         let config = Config::new(display, profile, Entrypoint::VLD, attribs)?;
-        let pool = SurfacePool::new(display, format, width, height, surfaces)?;
+        let pool = SurfacePool::new(display, format, width, height, made_with_context())?;
         let mut targets = pool.ids();
         #[cfg_attr(unix, allow(unused_mut))]
         let mut context = Self::new(display, config, width, height, &mut targets)?;

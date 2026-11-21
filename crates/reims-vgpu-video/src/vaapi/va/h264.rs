@@ -16,10 +16,6 @@ use crate::codec::h264::{
     SliceParams, slice::SliceType, sps::Sps,
 };
 
-/// Surfaces a pool makes beyond the DPB and the current picture, so that
-/// a frame the caller still holds does not stall the next decode.
-const SPARE_SURFACES: usize = 2;
-
 /// The most macroblocks of an H.264 picture the decoder takes: iHD and
 /// radeonsi answer 4096x4096 as their largest H.264 decode, yet decode
 /// nothing of a picture of 65,536 (256 by 256), every call answering
@@ -37,10 +33,11 @@ pub struct H264Decoder {
 }
 
 impl H264Decoder {
-    /// The frames a caller may hold at once, beyond those the decoder holds
-    /// itself, before a decode finds no free surface (`Error::OutOfSurfaces`):
-    /// the pool's spare surfaces.
-    pub const SPARE_FRAMES: usize = SPARE_SURFACES;
+    /// The frames a caller is to hold at once, beyond those the decoder holds itself. The
+    /// decoder's pool makes a surface for a picture as it needs one, whether the DPB, the
+    /// caller or the picture being decoded holds it, up to a bound past which a decode finds no
+    /// free surface (`Error::OutOfSurfaces`).
+    pub const SPARE_FRAMES: usize = 2;
 
     /// A decoder for samples described by an `avcC` record (ISO/IEC
     /// 14496-15, 5.3.3.1), whose parameter sets it takes. The record's
@@ -118,6 +115,13 @@ impl H264Decoder {
     /// The VA profile the decoder runs, once it has started a picture.
     pub fn profile(&self) -> Option<Profile> {
         self.inner.accelerator().session.as_ref().map(|s| s.profile)
+    }
+
+    /// How many surfaces of its own the decoder's session made, once it has started a picture.
+    #[cfg(test)]
+    pub(super) fn surfaces_made(&self) -> Option<usize> {
+        let session = self.inner.accelerator().session.as_ref()?;
+        Some(session.pool.made())
     }
 
     /// The VA context the decoder's session decodes on, once it has started a picture.
@@ -269,7 +273,7 @@ impl Accelerator for VaH264 {
     type Picture = Surface;
     type Error = Error;
 
-    fn configure(&mut self, sps: &Sps, dpb_frames: usize) -> Result<(), Error> {
+    fn configure(&mut self, sps: &Sps, _dpb_frames: usize) -> Result<(), Error> {
         self.session = None;
         let profile = select_profile(&self.display, sps)?;
         let (width, height) = (sps.coded_width(), sps.coded_height());
@@ -285,7 +289,6 @@ impl Accelerator for VaH264 {
             &mut attribs,
             SurfaceFormat::Nv12,
             (width, height),
-            dpb_frames + 1 + SPARE_SURFACES,
             references,
         )?;
         self.session = Some(Session {

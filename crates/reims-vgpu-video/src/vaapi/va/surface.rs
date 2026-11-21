@@ -2,6 +2,12 @@
 //! one at a time, and their readback into caller-provided planes. 8-bit
 //! 4:2:0 is NV12, and 10-bit 4:2:0 is P010.
 //!
+//! A pool makes a surface only when one is asked of it and none is free
+//! ([`SurfacePool::get`]), so it holds no more surfaces than were lent at
+//! once: a decoder's pool starts with none (`Context::new_decoder`), and one
+//! whose every picture is decoded into a target over the caller's memory
+//! ([`SurfacePool::lend_target`]) makes none.
+//!
 //! A frame's wait for its decode, and the staged copy back's run after it,
 //! end at one deadline (`super::wait`). Past it the pool is stalled: that
 //! frame fails, each later frame of the pool, and each surface asked of it,
@@ -34,6 +40,8 @@ use super::target::{Target, TargetFormat, TargetShape};
 use super::vpp_ffi as vpp;
 use super::wait::{self, Unfinished, Work};
 
+#[cfg(test)]
+mod lazy;
 #[cfg(test)]
 #[cfg(windows)]
 mod shared;
@@ -132,10 +140,32 @@ struct PoolInner {
     textures: Mutex<Vec<(ffi::VASurfaceID, Arc<SharedTexture>)>>,
 }
 
+#[derive(Debug, Default)]
 struct PoolState {
     /// Every surface the pool made, lent or not.
     all: Vec<ffi::VASurfaceID>,
     free: Vec<ffi::VASurfaceID>,
+}
+
+impl PoolState {
+    /// A surface to lend: the one freed last, where one is free; else one `make` makes, given
+    /// how many the pool made before it, where that is fewer than [`MAX_SURFACES`]; else
+    /// [`Error::OutOfSurfaces`]. A surface made is the pool's from then on; a make that fails
+    /// leaves the pool as it was.
+    fn take_or_make(
+        &mut self,
+        make: impl FnOnce(usize) -> Result<ffi::VASurfaceID, Error>,
+    ) -> Result<ffi::VASurfaceID, Error> {
+        if let Some(id) = self.free.pop() {
+            return Ok(id);
+        }
+        if self.all.len() >= MAX_SURFACES {
+            return Err(Error::OutOfSurfaces);
+        }
+        let id = make(self.all.len())?;
+        self.all.push(id);
+        Ok(id)
+    }
 }
 
 /// How frames are read back (`super::readback`): staged through host
@@ -174,7 +204,8 @@ impl Drop for PoolInner {
 }
 
 impl SurfacePool {
-    /// Makes `count` surfaces of `format`, `width` by `height`.
+    /// A pool of surfaces of `format`, `width` by `height`, with `count` of them made now: none
+    /// for a pool that makes each as it is asked for one ([`Self::get`]).
     pub(crate) fn new(
         display: &Display,
         format: SurfaceFormat,
@@ -187,10 +218,7 @@ impl SurfacePool {
             format,
             width,
             height,
-            state: Mutex::new(PoolState {
-                all: Vec::new(),
-                free: Vec::new(),
-            }),
+            state: Mutex::new(PoolState::default()),
             readback: Mutex::new(Readback::Unknown),
             times: Mutex::new(ReadbackTimes::default()),
             #[cfg(unix)]
@@ -201,11 +229,11 @@ impl SurfacePool {
             #[cfg(windows)]
             textures: Mutex::new(Vec::new()),
         });
-        #[cfg(unix)]
-        let made = create_surfaces(display, format, width, height, count)?;
-        #[cfg(windows)]
-        let made = shared_surfaces(&inner, count)?;
-        {
+        if count > 0 {
+            #[cfg(unix)]
+            let made = create_surfaces(display, format, width, height, count)?;
+            #[cfg(windows)]
+            let made = shared_surfaces(&inner, count)?;
             let mut state = inner.state.lock();
             state.all.extend(&made);
             state.free.extend(made.iter().rev());
@@ -218,32 +246,32 @@ impl SurfacePool {
         self.inner.state.lock().all.clone()
     }
 
-    /// A free surface, making one more when none is free; none from a
-    /// stalled pool.
+    /// How many surfaces the pool made, lent or not.
+    #[cfg(test)]
+    pub(crate) fn made(&self) -> usize {
+        self.inner.state.lock().all.len()
+    }
+
+    /// A free surface, making one more when none is free (`PoolState::take_or_make`); none from
+    /// a stalled pool.
     pub(crate) fn get(&self) -> Result<Surface, Error> {
         self.inner.stalled()?;
-        let mut state = self.inner.state.lock();
-        let id = match state.free.pop() {
-            Some(id) => id,
-            None => {
-                if state.all.len() >= MAX_SURFACES {
-                    return Err(Error::OutOfSurfaces);
-                }
-                let inner = &self.inner;
-                #[cfg(unix)]
-                let made =
-                    create_surfaces(&inner.display, inner.format, inner.width, inner.height, 1)?;
-                // On Windows, of the kind the pool was made of.
-                #[cfg(windows)]
-                let made = if inner.textures.lock().is_empty() {
-                    create_surfaces(&inner.display, inner.format, inner.width, inner.height, 1)?
-                } else {
-                    shared_surfaces(inner, 1)?
-                };
-                state.all.extend(&made);
-                made[0]
-            }
-        };
+        let inner = &self.inner;
+        let id = inner.state.lock().take_or_make(|made_before| {
+            #[cfg(unix)]
+            let _ = made_before;
+            #[cfg(unix)]
+            let made = create_surfaces(&inner.display, inner.format, inner.width, inner.height, 1)?;
+            // On Windows, of the kind the pool's first surface is: shared where it could be made
+            // so, else the driver's own (`shared_surfaces`).
+            #[cfg(windows)]
+            let made = if made_before == 0 || !inner.textures.lock().is_empty() {
+                shared_surfaces(inner, 1)?
+            } else {
+                create_surfaces(&inner.display, inner.format, inner.width, inner.height, 1)?
+            };
+            Ok(made[0])
+        })?;
         Ok(Surface {
             id,
             pool: self.inner.clone(),
@@ -330,6 +358,25 @@ thread_local! {
     /// memory of the test's own (`super::target_probe`), in place of one the driver allocates.
     pub(crate) static MAKE_SURFACE: std::cell::RefCell<Option<MakeSurface>> =
         const { std::cell::RefCell::new(None) };
+
+    /// The surfaces a decoder's pool made on this thread makes with its context, which are the
+    /// context's render targets, for tests that compare such a pool with one that makes each
+    /// surface as a picture needs one: none where unset, as for every decoder's pool
+    /// ([`made_with_context`]).
+    pub(crate) static UP_FRONT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The surfaces a decoder's pool makes with its context (`Context::new_decoder`): none, each
+/// made as a picture needs one ([`SurfacePool::get`]); in tests, as many as `UP_FRONT` says.
+pub(crate) fn made_with_context() -> usize {
+    #[cfg(test)]
+    {
+        UP_FRONT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
 }
 
 fn create_surfaces(

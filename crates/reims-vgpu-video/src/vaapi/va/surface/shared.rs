@@ -63,6 +63,13 @@ fn a_stand_in_copy_gives_the_surface_what_the_other_holds() {
             "{}: a later surface not shared",
             format.name()
         );
+        // A pool made with none, as a decoder's is, makes its first surface shared too.
+        let empty = SurfacePool::new(&display, format, SIZE.0, SIZE.1, 0).expect("a pool");
+        assert!(
+            empty.get().expect("a surface").texture().is_some(),
+            "{}: an empty pool's first surface not shared",
+            format.name()
+        );
         put(&display, &from, format, 0x5a);
         put(&display, &to, format, 0xa5);
         let held = read(&from, format);

@@ -404,6 +404,15 @@ impl Decoder {
         frame.sync().map_err(|e| format!("picture {id}: {e}"))?;
         Ok(frame)
     }
+
+    /// How many surfaces of its own the decoder's session made, once it has started a picture.
+    #[cfg(test)]
+    fn surfaces_made(&self) -> Option<usize> {
+        match self {
+            Decoder::H264(decoder) => decoder.surfaces_made(),
+            Decoder::Hevc(decoder) => decoder.surfaces_made(),
+        }
+    }
 }
 
 /// The check of `codec` into `format` (module docs) on `display`: `Err` with why it failed, or
@@ -594,13 +603,14 @@ mod tests {
     }
 
     /// Each picture's crop as decoded into targets over three memories in turn, each a new import,
-    /// each scribbled over once read, while the decoder may still reference its picture.
+    /// each scribbled over once read, while the decoder may still reference its picture; and how
+    /// many surfaces of its own the decoder made.
     fn into_targets(
         display: &Display,
         codec: TargetCodec,
         record: &[u8],
         samples: &[Vec<u8>],
-    ) -> Vec<Vec<u8>> {
+    ) -> (Vec<Vec<u8>>, Option<usize>) {
         let mut decoder = decoder(display, codec, record);
         let shape = TargetShape {
             format: TargetFormat::Nv12,
@@ -624,8 +634,9 @@ mod tests {
             drop(frame);
             laid.scribble();
         }
+        let made = decoder.surfaces_made();
         drop(decoder);
-        out
+        (out, made)
     }
 
     /// Where the check passes a codec, a stream of the driver's own encoder (with motion and
@@ -650,7 +661,7 @@ mod tests {
                 continue;
             };
             let reference = read_back(&display, codec, &record, &samples);
-            let targets = into_targets(&display, codec, &record, &samples);
+            let (targets, _) = into_targets(&display, codec, &record, &samples);
             assert_eq!(reference.len(), targets.len(), "{codec:?}: the pictures");
             for (n, (r, t)) in reference.iter().zip(&targets).enumerate() {
                 assert!(
@@ -663,6 +674,38 @@ mod tests {
                 targets.len()
             );
         }
+    }
+
+    /// A decoder whose every picture is decoded into a target over the caller's memory makes no
+    /// surface of its own (`super::super::surface`), where the check passes the codec.
+    #[test]
+    #[ignore = "needs a VA-API GPU: run on the VA-API host"]
+    fn a_decoder_whose_every_picture_goes_into_a_target_makes_no_surface() {
+        let display = display();
+        let checks = TargetChecks::check(&display);
+        let mut compared = 0;
+        for (codec, profile) in [
+            (TargetCodec::H264, Encoded::H264High),
+            (TargetCodec::Hevc, Encoded::HevcMain),
+        ] {
+            if let Err(why) = checks.passed(codec, TargetFormat::Nv12) {
+                eprintln!("{codec:?}: not run: the check answered {why}");
+                continue;
+            }
+            let Some((record, samples)) = encoded(&display, profile) else {
+                eprintln!("{codec:?}: not run: the driver encodes no {profile:?}");
+                continue;
+            };
+            let (pictures, made) = into_targets(&display, codec, &record, &samples);
+            assert!(!pictures.is_empty(), "{codec:?}: no picture");
+            assert_eq!(made, Some(0), "{codec:?}: surfaces of the decoder's own");
+            eprintln!(
+                "{codec:?}: {} pictures into targets, no surface of the decoder's own",
+                pictures.len()
+            );
+            compared += 1;
+        }
+        eprintln!("{compared} codecs run");
     }
 
     /// The check's streams decode to their samples on the driver's own surfaces, read back by the
