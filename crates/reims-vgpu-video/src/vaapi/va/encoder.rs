@@ -453,7 +453,7 @@ impl VideoEncoder {
 }
 
 /// How an input imported for an encoder lays out its planes in its memory, from the luma plane's
-/// first byte ([`VideoEncoder::input_layout`]).
+/// first byte (`VideoEncoder::input_layout`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputLayout {
     /// How the planes' samples lie.
@@ -468,7 +468,7 @@ pub struct InputLayout {
 }
 
 impl InputLayout {
-    /// The linear layout of an input of `shape` ([`VideoEncoder::input_layout`]).
+    /// The linear layout of an input of `shape` (`VideoEncoder::input_layout`).
     pub fn linear(shape: TargetShape) -> InputLayout {
         let pitch = (u64::from(shape.coded.0) * shape.format.bytes_per_sample())
             .next_multiple_of(TARGET_ALIGNMENT);
@@ -510,9 +510,9 @@ fn driver_layout(
         && chroma.object == luma.object
         && luma.offset == 0
         && chroma.pitch == pitch
-        && pitch % Y_TILE_WIDTH == 0
+        && pitch.is_multiple_of(Y_TILE_WIDTH)
         && pitch >= u64::from(width) * shape.format.bytes_per_sample()
-        && chroma.offset % (pitch * Y_TILE_ROWS) == 0
+        && chroma.offset.is_multiple_of(pitch * Y_TILE_ROWS)
         && rows >= u64::from(height)
         && luma.object_size >= chroma_end;
     tiled.then_some(InputLayout {

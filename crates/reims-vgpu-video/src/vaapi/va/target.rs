@@ -37,7 +37,7 @@
 //! - **An encoder's input** is imported the same way (`VideoEncoder::import_input`, of the
 //!   encoder's input shape): another device writes a frame into its memory, its margin to the
 //!   coded size filled, and the encoder codes the picture from it (`VideoEncoder::encode_target`).
-//!   It may be laid out in Intel's Y tiles instead ([`Target::import_as`]).
+//!   It may be laid out in Intel's Y tiles instead (`Target::import_as`).
 //! - **Intel's Y tiles** ([`TargetTiling::IntelY`]): both planes at one pitch, a multiple of 128
 //!   bytes, the luma plane from a tile's first byte and the chroma plane a whole number of rows
 //!   of tiles after it, the surface declared as tall as the luma plane's rows to the chroma
@@ -365,9 +365,9 @@ fn y_tiled(size: u64, shape: TargetShape, luma: TargetPlane, chroma: TargetPlane
         && height != 0
         && chroma.bytes_per_row == pitch
         && pitch >= row
-        && pitch % Y_TILE_WIDTH == 0
-        && luma.offset % Y_TILE_BYTES == 0
-        && span % (pitch * Y_TILE_ROWS) == 0;
+        && pitch.is_multiple_of(Y_TILE_WIDTH)
+        && luma.offset.is_multiple_of(Y_TILE_BYTES)
+        && span.is_multiple_of(pitch * Y_TILE_ROWS);
     if !fits {
         return None;
     }

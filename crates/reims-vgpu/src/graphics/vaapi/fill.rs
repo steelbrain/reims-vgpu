@@ -198,7 +198,10 @@ fn plane_fills(
         TargetTiling::Linear => (TILING_LINEAR, 1, 4),
         TargetTiling::IntelY => (TILING_INTEL_Y, Y_TILE_ROWS, Y_TILE_WIDTH),
     };
-    if pitch < coded_bytes || pitch % pitch_of != 0 || chroma_at % BINDING_ALIGNMENT != 0 {
+    if pitch < coded_bytes
+        || !pitch.is_multiple_of(pitch_of)
+        || !chroma_at.is_multiple_of(BINDING_ALIGNMENT)
+    {
         return Err(format!(
             "an input of {coded_bytes} bytes a row at a pitch of {pitch}, its chroma at byte \
              {chroma_at}, as {:?}",
