@@ -33,6 +33,12 @@ guest. Anything not measured is marked **unknown**.
 make qemu          # cargo xtask dist, then build/qemu/qemu-system-x86_64
 ```
 
+Beside the binary it copies the dist tree's `bin/reims-vgpu-compile`, the
+library's stage helper, which the library starts from beside the process's
+executable to compile a kernel's pipeline past rt's stage bound
+(`crates/reims-vgpu-vulkan/src/rt_platform/stage.rs`). A QEMU without it
+beside it refuses those pipelines.
+
 `make qemu` runs `cargo xtask dist`, which writes the library into the dist
 tree, `<target>/dist-vulkan` (`target`, or `CARGO_TARGET_DIR`), on Vulkan:
 on a Mac on Mesa's KosmicKrisp (below). Then it configures `vendor/qemu` out of tree in
@@ -2295,6 +2301,7 @@ PKG_CONFIG_PATH=$PWD/../../target/dist-vulkan/lib/pkgconfig ../../vendor/qemu/co
   --target-list=aarch64-softmmu --enable-hvf --enable-reims-vgpu --enable-gnutls \
   --disable-docs --disable-bsd-user --disable-linux-user --disable-tools
 make qemu-system-aarch64
+cp -p ../../target/dist-vulkan/bin/reims-vgpu-compile .   # the stage helper, above
 ```
 
 configure's summary says `reims-vgpu support: YES` and `HVF support: YES`,

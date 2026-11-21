@@ -38,7 +38,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{LIB, Options, c_api_args, install, layout, pc_file, strs, strs_with, write};
+use super::{
+    LIB, Options, c_api_args, helper_args, install, install_helper, layout, pc_file, strs,
+    strs_with, write,
+};
 use crate::tools::Tools;
 use crate::util::Res;
 
@@ -98,15 +101,29 @@ fn shadowing_cflags(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
 pub fn cargo_args(o: &Options) -> Vec<String> {
     let mut args = vec!["build".to_owned()];
     args.extend(c_api_args(o));
-    args.push("--config".to_owned());
-    args.push(format!(
-        "env.MACOSX_DEPLOYMENT_TARGET=\"{DEPLOYMENT_TARGET}\""
-    ));
-    args.push("--config".to_owned());
-    args.push(format!("env.{TARGET_CFLAGS}=\"{}\"", sdl_cflags()));
-    args.push("--config".to_owned());
-    args.push(format!("env.{KACHE_BUILD_SCRIPT_CACHE}=\"0\""));
+    args.extend(configs());
     args
+}
+
+/// The `cargo build` arguments that build the helper ([`super::HELPER`]) in the profile, with
+/// the library's `[env]` entries ([`cargo_args`]), so the crates the two share are built once.
+pub fn helper_build_args(o: &Options) -> Vec<String> {
+    let mut args = vec!["build".to_owned()];
+    args.extend(helper_args(o));
+    args.extend(configs());
+    args
+}
+
+/// The `--config` arguments of [`cargo_args`]: its `[env]` entries.
+fn configs() -> Vec<String> {
+    vec![
+        "--config".to_owned(),
+        format!("env.MACOSX_DEPLOYMENT_TARGET=\"{DEPLOYMENT_TARGET}\""),
+        "--config".to_owned(),
+        format!("env.{TARGET_CFLAGS}=\"{}\"", sdl_cflags()),
+        "--config".to_owned(),
+        format!("env.{KACHE_BUILD_SCRIPT_CACHE}=\"0\""),
+    ]
 }
 
 /// The variable that, `0`, turns kache's build-script cache off (module doc): kache then installs
@@ -204,7 +221,7 @@ pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path
     }
     tools.run(&cargo, &cargo_args(o))?;
     let built = target_dir.join(o.profile.dir());
-    let [archive, dylib, pc, include] = layout().map(|p| o.out.join(p));
+    let [archive, dylib, pc, include, helper] = layout().map(|p| o.out.join(p));
 
     localize(
         tools,
@@ -226,6 +243,7 @@ pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path
     let otool = tools.output("xcrun", &strs_with(&["otool", "-L"], &dylib))?;
     let libs = libs_private(&otool, INSTALL_NAME)?;
     write(&pc, &pc_file(env!("CARGO_PKG_VERSION"), &libs))?;
+    install_helper(tools, &helper_build_args(o), &built, &helper)?;
     Ok(o.out.clone())
 }
 
@@ -507,6 +525,7 @@ mod tests {
         let target = root.join("target");
         put(&target.join("release/libreims_vgpu_c.a"), "archive");
         put(&target.join("release/libreims_vgpu_c.dylib"), "dylib");
+        put(&target.join("release/reims-vgpu-compile"), "helper");
         let header = root.join("reims_vgpu.h");
         put(&header, "header");
         (root.clone(), target, header)
@@ -528,8 +547,10 @@ mod tests {
         assert!(read("lib/pkgconfig/reims-vgpu.pc").contains(
             "Libs.private: -weak_framework AppKit -framework Metal -lSystem -liconv -lobjc\n"
         ));
+        assert_eq!(read("bin/reims-vgpu-compile"), "helper");
         assert_eq!(mode(&out.join("lib/libreims_vgpu.dylib")), 0o755);
         assert_eq!(mode(&out.join("lib/libreims_vgpu.a")), 0o644);
+        assert_eq!(mode(&out.join("bin/reims-vgpu-compile")), 0o755);
         let dylib = out.join("lib/libreims_vgpu.dylib");
         let d = dylib.to_str().unwrap();
         let work = target.join("dist-localized");
@@ -556,8 +577,13 @@ mod tests {
             std::fs::read_to_string(work.join("sdl-cflags-release")).unwrap(),
             sdl_cflags()
         );
+        assert!(calls[8].ends_with(&format!(
+            " build --profile release -p reims-vgpu-c -p reims-vgpu-vulkan \
+             --bin reims-vgpu-compile --config env.MACOSX_DEPLOYMENT_TARGET=\"11.0\" {}",
+            renames()
+        )));
         assert_eq!(
-            calls[2..],
+            calls[2..8],
             [
                 format!(
                     "xcrun ld -r -arch arm64 -platform_version macos 11.0 11.0 \
@@ -577,6 +603,7 @@ mod tests {
                 format!("xcrun otool -L {d}"),
             ]
         );
+        assert_eq!(calls.len(), 9, "{calls:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

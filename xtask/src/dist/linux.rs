@@ -29,7 +29,10 @@ use super::archive::{
     LOCALIZED, api_functions, check_globals, defined_globals, native_static_libs, nm_args,
 };
 use super::order;
-use super::{LIB, Options, c_api_args, install, layout, pc_file, strs, strs_with, write};
+use super::{
+    LIB, Options, c_api_args, helper_args, install, install_helper, layout, pc_file, strs,
+    strs_with, write,
+};
 use crate::tools::Tools;
 use crate::util::Res;
 
@@ -75,7 +78,7 @@ pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     tools.run(&cargo, &cargo_args(o))?;
     let built = target_dir.join(o.profile.dir());
-    let [archive, shared, pc, include] = layout().map(|p| o.out.join(p));
+    let [archive, shared, pc, include, helper] = layout().map(|p| o.out.join(p));
 
     localize(
         tools,
@@ -90,7 +93,15 @@ pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path
     // in the target dir, not the one installed.
     let libs = native_static_libs(&tools.output(&cargo, &static_libs_args(o))?)?;
     write(&pc, &pc_file(env!("CARGO_PKG_VERSION"), &libs))?;
+    install_helper(tools, &helper_build_args(o), &built, &helper)?;
     Ok(o.out.clone())
+}
+
+/// The `cargo build` arguments that build the helper ([`super::HELPER`]) in the profile.
+pub fn helper_build_args(o: &Options) -> Vec<String> {
+    let mut args = vec!["build".to_owned()];
+    args.extend(helper_args(o));
+    args
 }
 
 /// Writes `archive`, the archive installed, from `built`, Cargo's, in `work` (module doc): its
@@ -223,6 +234,7 @@ mod tests {
         let target = root.join("target");
         put(&target.join("release/libreims_vgpu_c.a"), "archive");
         put(&target.join("release/libreims_vgpu_c.so"), "shared");
+        put(&target.join("release/reims-vgpu-compile"), "helper");
         let header = root.join("reims_vgpu.h");
         put(&header, "header");
         (root.clone(), target, header)
@@ -298,8 +310,10 @@ mod tests {
             read("lib/pkgconfig/reims-vgpu.pc")
                 .contains("Libs.private: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc\n")
         );
+        assert_eq!(read("bin/reims-vgpu-compile"), "helper");
         assert_eq!(mode(&out.join("lib/libreims_vgpu.so")), 0o755);
         assert_eq!(mode(&out.join("lib/libreims_vgpu.a")), 0o644);
+        assert_eq!(mode(&out.join("bin/reims-vgpu-compile")), 0o755);
         let work = target.join("dist-localized");
         let keep = work.join("keep-global-symbols");
         assert_eq!(
@@ -338,7 +352,15 @@ mod tests {
             "{}",
             calls[6]
         );
-        assert_eq!(calls.len(), 7, "{calls:?}");
+        assert!(
+            calls[7].ends_with(
+                " build --profile release -p reims-vgpu-c -p reims-vgpu-vulkan \
+                 --bin reims-vgpu-compile"
+            ),
+            "{}",
+            calls[7]
+        );
+        assert_eq!(calls.len(), 8, "{calls:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

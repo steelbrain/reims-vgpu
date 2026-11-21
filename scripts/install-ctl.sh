@@ -25,7 +25,8 @@
 #      build fetches what it needs); cargo fetches metal2vulkan itself, at the
 #      commit the library's Cargo.toml names;
 #   3. builds the library (cargo xtask dist) on Vulkan and QEMU on it, in
-#      ~/.cache/reims-ctl, and installs QEMU into
+#      ~/.cache/reims-ctl, and installs QEMU, with the library's stage helper
+#      beside its binaries, into
 #      ~/.local/share/reims-ctl/qemu/<build>, linking qemu/current to it. A
 #      build never replaces another: a running VM keeps the binary it started
 #      with;
@@ -674,6 +675,12 @@ mac_vulkan_links() {
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 DIST="$TARGET/dist-vulkan"
+# The library's stage helper, which compiles a kernel past rt's stage bound in
+# a process of its own: the library starts it from beside QEMU's binary
+# (crates/reims-vgpu-vulkan/src/rt_platform/stage.rs), and the dist tree has it
+# in its bin.
+HELPER=reims-vgpu-compile
+[[ $WINDOWS == 1 ]] && HELPER+=.exe
 # Where QEMU builds and is staged: the cache directory, else, where its path
 # holds a space (a Windows user's folder: "paths" above), the target directory.
 QEMU_BUILDS="$CACHE"
@@ -683,6 +690,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
   say "Building the library (cargo xtask dist --platform vulkan)"
   (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist --platform vulkan)
   [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $(shown "$DIST/lib/pkgconfig/reims-vgpu.pc")"
+  [[ -x "$DIST/bin/$HELPER" ]] || die "cargo xtask dist wrote no $(shown "$DIST/bin/$HELPER")"
 
   BUILD="$QEMU_BUILDS/qemu-build-$PLATFORM"
   PC="$DIST/lib/pkgconfig"
@@ -732,13 +740,15 @@ if [[ $SKIP_QEMU == 0 ]]; then
     staged="$(find "$STAGE" -path "*/bin/$QEMU_BINARY" -print -quit)"
     [[ -n $staged ]] || die "QEMU's install has no bin/$QEMU_BINARY"
     PREFIX="${staged%/bin/*}" PREFIX="${PREFIX#"$STAGE"}"
-    # The CLANG64 DLLs QEMU and qemu-img load, copied beside them: reims-ctl
-    # starts QEMU outside MSYS2, and an update of MSYS2's packages then changes
-    # no build a VM runs. libva's and its vaon12 driver too, with what they
-    # load, which the library opens by name when the device's video starts
-    # (so ldd lists none of them): libva looks for the driver beside itself.
+    cp "$DIST/bin/$HELPER" "$STAGE$PREFIX/bin/"
+    # The CLANG64 DLLs QEMU, qemu-img and the stage helper load, copied beside
+    # them: reims-ctl starts QEMU outside MSYS2, and an update of MSYS2's
+    # packages then changes no build a VM runs. libva's and its vaon12 driver
+    # too, with what they load, which the library opens by name when the
+    # device's video starts (so ldd lists none of them): libva looks for the
+    # driver beside itself.
     {
-      for exe in "$QEMU_BINARY" qemu-img.exe; do
+      for exe in "$QEMU_BINARY" qemu-img.exe "$HELPER"; do
         ldd "$STAGE$PREFIX/bin/$exe" | awk '$3 ~ "^/clang64/" { print $3 }'
       done
       for dll in libva libva_win32 vaon12_drv_video; do
@@ -748,6 +758,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
     } | sort -u | while read -r dll; do cp "$dll" "$STAGE$PREFIX/bin/"; done
   else
     DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
+    cp "$DIST/bin/$HELPER" "$STAGE$PREFIX/bin/"
   fi
   if [[ $OS == Darwin ]]; then
     mac_vulkan_links "$STAGE$PREFIX/lib"
@@ -790,6 +801,8 @@ else
   for bin in "${QEMU_BINARIES[@]}"; do
     [[ -x $QEMU_DIR/bin/$bin ]] || warn "the installed QEMU has no $bin, which $([[ $bin == qemu-system-aarch64* ]] && echo arm64 || echo x86-64) VMs run on: run this without --skip-qemu to build it"
   done
+  # A QEMU installed before the library had a stage helper has none beside it.
+  [[ -x $QEMU_DIR/bin/$HELPER ]] || warn "the installed QEMU has no $HELPER beside it, so its VMs' heaviest GPU programs are refused: run this without --skip-qemu to build it"
 fi
 
 # ------------------------------------------------------------------ reims-ctl

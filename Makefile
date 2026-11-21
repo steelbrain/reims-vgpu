@@ -8,7 +8,8 @@
 #   make qemu   the library as a plain library (cargo xtask dist), then
 #               vendor/qemu's qemu-system-x86_64 with reims-graphics-pci on
 #               its C API, linked statically through pkg-config, in
-#               build/qemu (docs/qemu.md)
+#               build/qemu (docs/qemu.md), with a copy of the dist tree's
+#               stage helper, reims-vgpu-compile, beside it
 #   make vulkan-links
 #               on a Mac, links in build/lib to Homebrew's Vulkan loader and
 #               Mesa's KosmicKrisp driver, which the library's rt platform
@@ -32,6 +33,10 @@ RUST_TARGET_REL := $(or $(CARGO_TARGET_DIR),target)
 RUST_TARGET := $(if $(filter /%,$(RUST_TARGET_REL)),$(RUST_TARGET_REL),$(CURDIR)/$(RUST_TARGET_REL))
 # The dist tree cargo xtask dist writes (xtask/src/dist.rs).
 RUST_DIST := $(RUST_TARGET)/dist-vulkan
+# The library's stage helper, in the dist tree's bin, which the library starts
+# from beside the process's executable
+# (crates/reims-vgpu-vulkan/src/rt_platform/stage.rs).
+HELPER := reims-vgpu-compile$(if $(filter Windows_NT,$(OS)),.exe)
 
 .PHONY: all qemu vulkan-links clean
 
@@ -91,6 +96,7 @@ qemu: all vendor/qemu/configure vulkan-links
 	fi
 	@git -C "$(QEMU_SRC)" rev-parse HEAD >"$(QEMU_BUILD)/qemu-source" 2>/dev/null || rm -f "$(QEMU_BUILD)/qemu-source"
 	ninja -C "$(QEMU_BUILD)" $(filter-out -j,$(filter -j%,$(MAKEFLAGS))) qemu-system-x86_64
+	cp -p "$(RUST_DIST)/bin/$(HELPER)" "$(QEMU_BUILD)/$(HELPER)"
 
 # On a Mac, the library's rt platform loads the Vulkan loader and Mesa's
 # KosmicKrisp driver only from beside the process's executable or from ../lib

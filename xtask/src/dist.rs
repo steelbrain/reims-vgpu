@@ -7,6 +7,9 @@
 //!   `lib/libreims_vgpu.dll` on Windows. How each OS builds and names them is its own module's:
 //!   `macos`, `linux`, `windows`.
 //! - `include/reims_vgpu.h`, the committed header.
+//! - `bin/reims-vgpu-compile` (`.exe` on Windows), the program the library starts beside its
+//!   host's executable to compile a kernel past rt's stage bound ([`HELPER`]). A host's install
+//!   puts it beside the host's executable.
 //! - `lib/pkgconfig/reims-vgpu.pc`. Its `Libs.private` names every library a static link of the
 //!   archive needs.
 //! - `share/doc/reims-vgpu/`: the license, `LICENSE` and the texts in `LICENSES/` it points at,
@@ -54,6 +57,9 @@ pub const LIB: &str = "reims_vgpu";
 pub const PACKAGE: &str = "reims-vgpu";
 /// The header, under the name it is committed and installed with.
 pub const HEADER: &str = "reims_vgpu.h";
+/// The stage helper's program (`reims_vgpu_vulkan::rt_platform::stage`), `reims-vgpu-vulkan`'s,
+/// in the tree's `bin` with the OS's executable suffix ([`helper_file`]).
+pub const HELPER: &str = "reims-vgpu-compile";
 /// The file that states the license, in the repository and in the tree's [`doc_dir`].
 pub const LICENSE: &str = "LICENSE";
 /// The directory of the license's texts, `<SPDX identifier>.txt` each, in the repository and in
@@ -159,6 +165,36 @@ pub fn c_api_args(o: &Options) -> Vec<String> {
     ])
 }
 
+/// The helper's file name, in the build and in the tree: [`HELPER`] with the OS's executable
+/// suffix.
+pub fn helper_file() -> String {
+    format!("{HELPER}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// The Cargo arguments every OS's build of the helper starts its own with, after the subcommand:
+/// [`HELPER`] in the profile, with `reims-vgpu-c` selected beside its package, so the crates the
+/// two share are resolved with the library's build's features, and built once.
+pub fn helper_args(o: &Options) -> Vec<String> {
+    strs(&[
+        "--profile",
+        o.profile.0.as_str(),
+        "-p",
+        "reims-vgpu-c",
+        "-p",
+        "reims-vgpu-vulkan",
+        "--bin",
+        HELPER,
+    ])
+}
+
+/// Builds the helper with Cargo's `args` and installs it from `built`, the profile's directory of
+/// the build, to `to`, with mode 0755.
+fn install_helper(tools: &mut dyn Tools, args: &[String], built: &Path, to: &Path) -> Res<()> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    tools.run(&cargo, args)?;
+    install(&built.join(helper_file()), to, 0o755)
+}
+
 /// `reims-vgpu.pc`. Its prefix is the file's grandparent directory (`${pcfiledir}`), so the tree
 /// can be moved.
 pub fn pc_file(version: &str, libs_private: &[String]) -> String {
@@ -179,13 +215,14 @@ pub fn pc_file(version: &str, libs_private: &[String]) -> String {
 }
 
 /// The files `dist` writes under its output directory, relative to it: the archive, the shared
-/// library (`native::SHARED_LIBRARY_EXTENSION`), the package and the header.
-pub fn layout() -> [String; 4] {
+/// library (`native::SHARED_LIBRARY_EXTENSION`), the package, the header and the helper.
+pub fn layout() -> [String; 5] {
     [
         format!("lib/lib{LIB}.a"),
         format!("lib/lib{LIB}.{}", native::SHARED_LIBRARY_EXTENSION),
         format!("lib/pkgconfig/{PACKAGE}.pc"),
         format!("include/{HEADER}"),
+        format!("bin/{}", helper_file()),
     ]
 }
 
@@ -628,10 +665,12 @@ mod tests {
     #[test]
     fn layout_matches_what_the_pc_file_names() {
         let pc = pc_file("0", &[]);
-        let [archive, _shared, pcpath, header] = layout();
+        let [archive, _shared, pcpath, header, helper] = layout();
         assert_eq!(archive, "lib/libreims_vgpu.a");
         assert_eq!(pcpath, "lib/pkgconfig/reims-vgpu.pc");
         assert_eq!(header, "include/reims_vgpu.h");
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        assert_eq!(helper, format!("bin/reims-vgpu-compile{suffix}"));
         assert!(
             pc.contains("libdir=${prefix}/lib\n") && pc.contains("includedir=${prefix}/include\n")
         );
