@@ -8783,21 +8783,25 @@ mod tests {
     /// covers its address.
     static CONTEXT_RANGE_PINS: Mutex<()> = Mutex::new(());
 
-    /// A decoder on the Vulkan platform with a queue (1), and, as a process in slot 0 picks
-    /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), the create
-    /// of a device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes
-    /// no pin of. rt makes a texture buffer only over a buffer its consumer places, which the host
-    /// does not yet place for a device-placed one (`Refusal::TextureBufferNotOverBuffer`, rt's own
-    /// refusal, not Metal's): the create is refused, counted under rt's own refusals' code
-    /// (`rt-refused-ours`), so no range of its lies among the pins the tests make after it.
+    /// A decoder on the Vulkan platform, the guest's texture ids kept on its device as a graphics
+    /// device keeps them, with a queue (1), and, as a process in slot 0 picks (`RgfxIdSpace`, next
+    /// fit from the slot's base, a pick of Metal's span of a pin), a device-placed 1 MiB texture
+    /// buffer (10) at the slot's first pick, which the host takes no pin of. rt makes a texture
+    /// buffer only over a buffer its consumer places, so the host makes it over a 1 MiB buffer of
+    /// its own (`reims_vgpu_vulkan::rt_platform::texture`'s `make_texture_buffer`), at rt's
+    /// address for it: made, the guest's index its own, and not rt's own refusal
+    /// (`rt-refused-ours`). What the tests that start from it pin about the ranges the host
+    /// placed covers that buffer's.
     fn decoder_with_a_texture_buffer() -> (
         GraphicsDecoder<reims_vgpu_vulkan::RtPlatform>,
         <reims_vgpu_vulkan::RtPlatform as Platform>::Device,
     ) {
         use crate::platform::ApiPlatform as _;
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        use reims_vgpu_vulkan::core::platform::resource::{GpuResource as _, Texture as _};
         let platform = reims_vgpu_vulkan::RtPlatform::process();
         let device = platform.metal_device(None).unwrap();
+        crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
         let mut dec = GraphicsDecoder::new(
             Arc::clone(&platform),
             Arc::new(crate::platform::test_region(&*platform, 0x10000)),
@@ -8840,17 +8844,22 @@ mod tests {
         let refused = crate::platform::counted("rt-refused-ours");
         assert_eq!(
             dec.decode(&device, texture.as_bytes()).unwrap(),
-            Err(DecodeError::Refused),
-            "rt makes no texture buffer the device places"
+            Ok(()),
+            "the device's texture buffer, over a buffer of the host's own"
         );
-        assert_eq!(crate::platform::counted("rt-refused-ours") - refused, 1);
-        assert!(dec.object(10).is_none());
+        assert_eq!(crate::platform::counted("rt-refused-ours"), refused);
+        let Some(ObjHandle::Texture(made)) = dec.object(10) else {
+            panic!("no texture buffer 10");
+        };
+        let answers = (made.texture_type(), made.width(), made.resource_index());
+        assert_eq!(answers, (9, 1 << 18, 1));
+        assert_eq!(made.storage_mode(), 0, "Shared, the descriptor's");
         (dec, device)
     }
 
     /// A guest's pin meets no range the Vulkan platform's runtime placed for itself: a buffer
-    /// pinned at the pick after a texture buffer's is made, the texture buffer refused (rt makes
-    /// none the device places).
+    /// pinned at the pick after a texture buffer's is made, the texture buffer made over a buffer
+    /// of the host's own, whose range is among those the pin must miss.
     #[test]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
@@ -8862,7 +8871,8 @@ mod tests {
     }
 
     /// The pins of `picks` (address, length), each after a pin at the guest's first pick and a
-    /// queue's range made and a texture buffer refused (`decoder_with_a_texture_buffer`): each made,
+    /// queue's range made and a texture buffer made over a buffer of the host's own
+    /// (`decoder_with_a_texture_buffer`), whose range the pins meet as any of the host's: each made,
     /// in no block the rt platform's device knows, at rt's address, counted under rt's code
     /// (`rt-gpu-address-unpinned`), the guest's among them.
     fn pins_in_no_known_block_lie_at_rt_s_own(picks: &[(u64, u64)]) {
@@ -8950,8 +8960,8 @@ mod tests {
 
     /// The host's own ranges lie outside the guest's GPU addresses: a buffer the host places
     /// itself meets none of `[RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END)`, and, with it, a queue's
-    /// range made and a texture buffer refused, the first pick of every unit the kext hands the
-    /// contexts out in and the last unit's last pick are made. On rt the buffer lies at the
+    /// range made and a texture buffer made over a buffer of the host's own, the first pick of
+    /// every unit the kext hands the contexts out in and the last unit's last pick are made. On rt the buffer lies at the
     /// driver's device address, below the range on some drivers and above its end on others
     /// (`reims_vgpu_vulkan::rt_platform::buffer`, "A pinned address").
     #[test]

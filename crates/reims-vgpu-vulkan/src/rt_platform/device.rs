@@ -1193,8 +1193,10 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         recorded_answer
     }
 
-    /// rt's texture of the descriptor ([`super::texture::make`]); nil where rt refuses it,
-    /// counted, never a raise.
+    /// rt's texture of the descriptor ([`super::texture::make`]); a texture buffer rt's over a
+    /// buffer of the platform's own that the texture holds
+    /// ([`super::texture::make_texture_buffer`]). Nil where rt refuses it, counted, never a
+    /// raise.
     fn new_texture(
         &self,
         on: OnFault,
@@ -1206,7 +1208,11 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
             || -> RaiseResult<Option<<RtPlatform as Platform>::Texture>> {
                 let _ = on;
                 let sel = "newTextureWithDescriptor:";
-                Ok(super::texture::make(self, sel, &descriptor.desc()))
+                let desc = descriptor.desc();
+                if desc.texture_type == super::texture::TYPE_TEXTURE_BUFFER {
+                    return Ok(super::texture::make_texture_buffer(self, sel, descriptor));
+                }
+                Ok(super::texture::make(self, sel, &desc))
             },
         );
         crate::recorder::rec_done!(recorded_call, recorded_answer);

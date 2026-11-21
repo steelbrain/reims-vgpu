@@ -2435,7 +2435,7 @@ impl RtObj<RtBuffer> {
     /// The texture `sel` makes of `descriptor` over the buffer's bytes from `offset`, rows
     /// `bytes_per_row` apart (`super::texture::make_over`), which keeps what bytes of the buffer
     /// it lies over (`RtTexture::over`).
-    fn texture(
+    pub(super) fn texture(
         &self,
         sel: &'static str,
         descriptor: &RtObj<TextureFields>,

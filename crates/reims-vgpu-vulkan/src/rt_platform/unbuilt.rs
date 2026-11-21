@@ -256,9 +256,10 @@ pub enum RtRefusal {
     /// [`RtRefusal::Ours`] does not name.
     Refused,
     /// A call rt refuses on a rule of its own, not Metal's (`Error::Refused`, its basis rt's in
-    /// metal2vulkan-runtime's `error.rs`): a texture buffer the device places
-    /// (`Refusal::TextureBufferNotOverBuffer`), which rt makes only over a buffer its consumer
-    /// places.
+    /// metal2vulkan-runtime's `error.rs`): a texture buffer not over a buffer its consumer
+    /// places (`Refusal::TextureBufferNotOverBuffer`). The device's texture buffer no longer
+    /// reaches it, made over a buffer of the platform's own (`super::texture`'s
+    /// `make_texture_buffer`); a heap's still does.
     Ours,
     /// One of the device's or rt's fixed limits (`Error::Limit`).
     Limit,

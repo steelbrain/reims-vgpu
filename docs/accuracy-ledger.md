@@ -77,9 +77,14 @@ code instead, `rt-refused-texture-format-<n>`; a pipeline state's imageblock len
 `rt-refused-heap-texture-place`. `rt-refused-metal` counts `Error::Refused`, Metal's refusals
 and those of rt's own rules that no code of their own names; each refusal's basis, Metal's or
 rt's, is in metal2vulkan-runtime's `error.rs`. `rt-refused-ours` counts rt's own refusal of a
-texture buffer the device places (`newTextureWithDescriptor:` of `MTLTextureTypeTextureBuffer`,
-`Refusal::TextureBufferNotOverBuffer`): rt makes a texture buffer only over a buffer its
-consumer places, and the host places none for it yet: nil. Among rt's gaps (`rt-refused-gap`),
+texture buffer not over a buffer its consumer places (`Refusal::TextureBufferNotOverBuffer`):
+rt makes a texture buffer only over a buffer. The device's (`newTextureWithDescriptor:` of
+`MTLTextureTypeTextureBuffer`) is made over a buffer of the host's own, of the texture's bytes
+(its row rounded up to the device's `minimumTextureBufferAlignmentForPixelFormat:`) and the
+descriptor's storage mode, which the texture holds and which the guest names by no object ID,
+GPU address or resource index (`rt_platform/texture.rs`, `make_texture_buffer`), so it no longer
+reaches the code. A heap's (`MTLHeap`'s `newTextureWithDescriptor:` of that type) still does:
+nil. Among rt's gaps (`rt-refused-gap`),
 nothing encoded: a blit copy to or from a texture buffer (`Gap::TextureCopy`), and a copy
 between regions of two textures over one buffer whose bytes meet where rt cannot cut the copy
 into ordered slabs, or between two textures whose memory meets where one is placed in a heap

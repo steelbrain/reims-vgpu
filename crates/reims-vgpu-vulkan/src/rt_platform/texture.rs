@@ -4,7 +4,9 @@
 //! `replaceRegion:`; and textures over a buffer's bytes, made by the buffers' piece
 //! (`super::buffer`) through [`make_over`], of the buffer's storage mode, a tiled one of more
 //! levels among them, an image of the platform's own that takes the bytes at its first use
-//! (`super::tiled`). Textures in heaps and over IOSurfaces are their pieces'.
+//! (`super::tiled`). A texture buffer the device makes is rt's over a buffer of the platform's
+//! own, which it holds ([`make_texture_buffer`]): rt makes texture buffers only over buffers.
+//! Textures in heaps and over IOSurfaces are their pieces'.
 //!
 //! **Images for views.** A shape's image of an IOSurface plane (`reims_vgpu`'s
 //! `ApiPlatform::shape_image`) is rt's texture for views (the device's `new_texture_for_views`):
@@ -162,6 +164,10 @@ const HAZARD_TRACKED: u64 = 0x200;
 /// The resource options' storage mode, bits 4 to 7.
 pub(super) const STORAGE_BITS: u64 = 0xf0;
 
+/// `MTLTextureTypeTextureBuffer`, which the device makes over a buffer of its own
+/// ([`make_texture_buffer`]).
+pub(super) const TYPE_TEXTURE_BUFFER: u64 = 9;
+
 /// What a texture's make asked of rt, for the process's first line of each kind of rt's
 /// refusals of it (`super::unbuilt::refusal_detail`): the guest's descriptor `desc` (its pixel
 /// format, size, levels, array length, sample count, texture type and usage, Metal's numbers),
@@ -275,6 +281,10 @@ pub struct RtTexture {
     /// The buffer it lies over and which bytes of it, and a view's of one: what the recorder
     /// writes for it ([`crate::recorder`]); unset for any other.
     over: OnceLock<(Weak<RtBuffer>, Range<u64>)>,
+    /// The buffer of the platform's own it lies over, a device-placed texture buffer's
+    /// ([`make_texture_buffer`]), and a view's of one: held, so it goes with the last of them;
+    /// unset for any other.
+    held: OnceLock<RtObj<RtBuffer>>,
     /// The guest's object id for it, which its release's entry in the device's history names
     /// (`super::fault`).
     named: super::fault::Named,
@@ -465,6 +475,10 @@ impl RtTexture {
             tiled: self.tiled.clone(),
             copied: self.copied.clone(),
             over: self.over.clone(),
+            held: match self.held.get() {
+                Some(buffer) => OnceLock::from(buffer.clone_ref()),
+                None => OnceLock::new(),
+            },
         })
     }
 }
@@ -481,6 +495,49 @@ pub fn make(
     let make = |d: &rt::TextureDescriptor, index: Option<u32>| device.rt().new_texture(d, index);
     let diag = |shape: &Shape| Made::new(Call::Plain, shape);
     made_of(device, sel, desc, options, make, diag)
+}
+
+/// `newTextureWithDescriptor:` of a texture buffer (`MTLTextureTypeTextureBuffer`) of
+/// `descriptor` on `device`, for `sel`: Metal's call composed of two of rt's, as rt makes a
+/// texture buffer only over a buffer its consumer places (`Buffer::new_texture`) and refuses one
+/// of its device (`Refusal::TextureBufferNotOverBuffer`). First a buffer of the texture's bytes
+/// ([`super::buffer::of_length`]), of the descriptor's resource options, so of its storage mode:
+/// its row of `width` texels, `bytesPerRow` the row rounded up to rt's texture-buffer alignment
+/// of the format (`Device::minimum_texture_buffer_alignment`, the device's
+/// `minimumTextureBufferAlignmentForPixelFormat:`); then the texture over it from offset 0, rows
+/// `bytesPerRow` apart, as the buffer's `newTextureWithDescriptor:offset:bytesPerRow:` makes it,
+/// at the index [`make`] would give it. The texture holds the buffer ([`RtTexture::held`]), which
+/// goes with it. The buffer is the platform's: the guest names it by no object id, GPU address or
+/// resource index, and the call stays the device's in a recording. Nil where rt refuses the
+/// format as a texture buffer, the buffer or the texture, counted under `sel`.
+pub(super) fn make_texture_buffer(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    descriptor: &RtObj<super::TextureFields>,
+) -> Option<RtObj<RtTexture>> {
+    let desc = descriptor.desc();
+    let d = match rt_texture_descriptor(&desc) {
+        Ok(d) => d,
+        Err(why) => return refused_metal(sel, &why),
+    };
+    let options = desc.resource_options.unwrap_or(0);
+    let alignment = match device.rt().minimum_texture_buffer_alignment(d.pixel_format) {
+        Ok(alignment) => alignment.max(1),
+        Err(error) => {
+            let diag = |shape: &Shape| Made::new(Call::Plain, shape);
+            return answered(device, sel, &desc, options, None, Err(error), diag);
+        }
+    };
+    // rt answers an alignment only of a format not of blocks, whose first word is a texel's bytes.
+    let texel = device.rt().pixel_format_info(desc.pixel_format).words[0];
+    let row = u64::from(d.width).saturating_mul(texel);
+    let bytes_per_row = row.next_multiple_of(alignment);
+    let length = bytes_per_row.max(alignment);
+    let raw = options & super::buffer::FIELDS;
+    let buffer = super::buffer::of_length(device, sel, length, raw)?;
+    let texture = buffer.texture(sel, descriptor, 0, bytes_per_row)?;
+    let _ = texture.held.set(buffer);
+    Some(texture)
 }
 
 /// A texture of `desc` over a buffer's or a heap's memory of the resource options `held`, for
@@ -567,6 +624,7 @@ fn answered(
         tiled: OnceLock::new(),
         copied: OnceLock::new(),
         over: OnceLock::new(),
+        held: OnceLock::new(),
     })
 }
 
@@ -606,6 +664,7 @@ pub(super) fn drawable(
         tiled: OnceLock::new(),
         copied: OnceLock::new(),
         over: OnceLock::new(),
+        held: OnceLock::new(),
     })
 }
 
@@ -2156,6 +2215,58 @@ mod tests {
         let plain = make(70);
         let _of_plain = view(&plain, 71);
         assert_eq!(counted(plain_srgb), plain_before);
+    }
+
+    /// On the GPU the test holds: the device's texture buffer (`newTextureWithDescriptor:` of
+    /// `MTLTextureTypeTextureBuffer`), which rt makes only over a buffer, lies over a buffer of the
+    /// platform's own ([`make_texture_buffer`]) of the descriptor's storage mode, Shared and
+    /// Private, its bytes the row rounded up to rt's texture-buffer alignment, which the texture
+    /// holds; none is rt's own refusal (`rt-refused-ours`). A format rt makes no texture buffer
+    /// of is nil, counted, and not under that code.
+    #[test]
+    fn the_device_s_texture_buffer_lies_over_a_buffer_of_its_own_on_vulkan() {
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::raise::OnFault;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let counted = |code: &str| {
+            (crate::answer::degradation_counts().into_iter())
+                .find(|(c, _)| c == code)
+                .map_or(0, |(_, n)| n)
+        };
+        let ours = counted(RtRefusal::Ours.code());
+        let rgba8 = rt::PixelFormat::RGBA8Unorm;
+        let alignment = (device.rt().minimum_texture_buffer_alignment(rgba8))
+            .expect("rt makes RGBA8 texture buffers");
+        let make = |pixel_format, resource_options| {
+            let desc = TextureDesc {
+                texture_type: TYPE_TEXTURE_BUFFER,
+                pixel_format,
+                width: 1001,
+                usage: 0x1,
+                resource_options: Some(resource_options),
+                ..TextureDesc::default()
+            };
+            let made = device.new_texture(OnFault::Return, &platform.texture_descriptor(&desc));
+            made.expect("never a raise")
+        };
+        for storage in [0, STORAGE_PRIVATE] {
+            let texture = make(70, storage).expect("a texture buffer");
+            let answers = (texture.texture_type(), texture.width(), texture.storage_mode());
+            assert_eq!(answers, (TYPE_TEXTURE_BUFFER, 1001, storage >> 4));
+            let held = texture.held.get().expect("the buffer it lies over");
+            assert_eq!(held.byte_length(), 4004_u64.next_multiple_of(alignment));
+            assert_eq!(held.resource_options() & STORAGE_BITS, storage);
+            let (over, bytes) = texture.over().expect("the bytes it lies over");
+            assert!(std::ptr::eq(over.as_ptr(), &**held));
+            assert_eq!(bytes.end, 4004);
+        }
+        // BC1, compressed: rt makes no texture buffer of it, counted under its format's code.
+        let bc1 = "rt-refused-texture-format-130";
+        let refused = counted(bc1);
+        assert!(make(130, 0).is_none());
+        assert_eq!(counted(bc1), refused + 1);
+        assert_eq!(counted(RtRefusal::Ours.code()), ours);
     }
 
     /// On the GPU the test holds: a refused view's detail names the view asked (its pixel format,
