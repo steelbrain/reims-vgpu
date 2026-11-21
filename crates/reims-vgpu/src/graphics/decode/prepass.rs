@@ -55,6 +55,14 @@
 //! - **Nothing the guest sees changes.** A make ahead reports nothing: every result, error and
 //!   value is its dispatch's own, decided in the walk as before; only how soon the walk has it
 //!   changes.
+//! - **Whether every dispatch is made.** The read also says whether each dispatch it read runs a
+//!   pipeline the platform answered made, and the buffer runs no compute command it does not read
+//!   (an indirect `dispatchThreads`, or an indirect command buffer's commands): such a buffer's
+//!   walk waits for no make, nor for a stage's fill (`reims_vgpu_vulkan::core::platform::stage`),
+//!   which only a pipeline not made can be refused for. Only such a buffer is walked on its
+//!   queue's service thread, which takes the queue's next messages once it is done
+//!   (`graphics.rs`'s `carry_out`); any other goes to its queue's lane, whose thread steps out of
+//!   the lane's walks while it waits (`decode::lane`).
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
@@ -64,10 +72,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
-    RGFX_OP_COMPUTE_DISPATCH_THREADS, RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
-    RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH, RgfxComputeOpDispatchThreadgroups,
-    RgfxComputeOpDispatchThreadgroupsIndirect, RgfxComputeOpDispatchThreads,
-    RgfxComputeOpSetComputePipelineState, RgfxComputeOpSetThreadgroupMemoryLength,
+    RGFX_OP_COMPUTE_DISPATCH_THREADS, RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT,
+    RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER, RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT,
+    RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH,
+    RgfxComputeOpDispatchThreadgroups, RgfxComputeOpDispatchThreadgroupsIndirect,
+    RgfxComputeOpDispatchThreads, RgfxComputeOpSetComputePipelineState,
+    RgfxComputeOpSetThreadgroupMemoryLength,
 };
 use reims_vgpu_graphics::ops::{
     RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxCommandBuffer,
@@ -339,13 +349,32 @@ fn make_next<P: Platform>(shared: &Shared<P>) {
     }
 }
 
+/// A command buffer's dispatches as its pre-pass read them ([`GraphicsDecoder::prepass`]).
+pub(crate) struct Ahead<P: Platform> {
+    /// The shapes it hands over, where it hands any.
+    pub(crate) prepass: Option<Prepass<P>>,
+    /// Every dispatch it read runs a pipeline the platform answered made, and it runs no compute
+    /// command the read skips (the module doc, "Whether every dispatch is made"): false for a
+    /// message the read cannot read.
+    pub(crate) made: bool,
+}
+
 impl<P: Platform> GraphicsDecoder<P> {
     /// The pre-pass of the `COMMAND_BUFFER` `message` (the module doc): the shapes of its
     /// dispatches whose pipelines no buffer handed before, read through the message's views of the
-    /// table; `None` where it hands none.
-    pub(crate) fn prepass(&self, message: &[u8]) -> Option<Prepass<P>> {
-        let m = read::<RgfxCommandBuffer>(message)?;
-        let ops = ops_of(message, &m)?;
+    /// table, and whether every dispatch it runs is made.
+    pub(crate) fn prepass(&self, message: &[u8]) -> Ahead<P> {
+        let unread = Ahead {
+            prepass: None,
+            made: false,
+        };
+        let Some(m) = read::<RgfxCommandBuffer>(message) else {
+            return unread;
+        };
+        let Some(ops) = ops_of(message, &m) else {
+            return unread;
+        };
+        let mut made = true;
         let mut items = VecDeque::new();
         let mut state: Option<(u64, &Entry<P>)> = None;
         let mut lengths: Vec<(u64, u64)> = Vec::new();
@@ -409,6 +438,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                             (Dispatch::ThreadgroupsIndirect, threads)
                         })
                 }
+                RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT
+                | RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER
+                | RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT => {
+                    made = false;
+                    None
+                }
                 _ => None,
             };
             let (Some((dispatch, threads)), Some((obj_id, entry))) = (dispatch, state) else {
@@ -421,11 +456,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             let ObjHandle::ComputePipeline(handle) = &entry.handle else {
                 continue;
             };
-            let Some((key, made)) = handle.dispatch_variant(dispatch, threads, &lengths) else {
+            let Some((key, is_made)) = handle.dispatch_variant(dispatch, threads, &lengths) else {
+                made = false;
                 no_variant += 1;
                 continue;
             };
-            if made {
+            made &= is_made;
+            if is_made {
                 // Made already: noted as handed, with no slot of the buffer's and no compile.
                 self.shared.handed.is_new(key, true);
                 continue;
@@ -452,11 +489,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         reims_vgpu_vulkan::answer::count_kind_by(PAST_MOST, past_most);
         reims_vgpu_vulkan::answer::count_kind_by(NO_VARIANT, no_variant);
         if items.is_empty() {
-            return None;
+            return Ahead {
+                prepass: None,
+                made,
+            };
         }
         let handed = items.len();
         reims_vgpu_vulkan::answer::count_kind_by(HANDED, handed as u64);
-        Some(Prepass {
+        let prepass = Some(Prepass {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     items,
@@ -468,6 +508,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             cb_obj_id: m.cb_obj_id,
             handed,
             closed: false,
-        })
+        });
+        Ahead { prepass, made }
     }
 }

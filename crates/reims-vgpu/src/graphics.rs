@@ -135,7 +135,7 @@ use crate::graphics::answers::PipelineAnswers;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
-use crate::graphics::decode::prepass::{Prepass, WalkEnd};
+use crate::graphics::decode::prepass::{Ahead, Prepass, WalkEnd};
 use crate::graphics::decode::shares::ListenSink;
 use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
@@ -1461,6 +1461,10 @@ struct Walk {
     /// Its message is [`INLINE_WALK_ALONE_MAX`] bytes at most, and the guest had published
     /// nothing behind it on its queue's ring as it was taken ([`QueueClaim::nothing_published`]).
     alone: bool,
+    /// It runs no compute encoder, or its pre-pass found every dispatch it runs made
+    /// (`decode::prepass`, "Whether every dispatch is made"): its walk waits for no make, nor
+    /// for a stage's fill.
+    made: bool,
 }
 
 /// The display's hold of the region block a surface's texture lies over, as a compositor holds
@@ -2717,28 +2721,34 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let to_lane = self.goes_to_lane(&message) && !alone;
             let queue = poster.queue_obj_id();
             let begun = refusing(|| decoder.begin_taken(&self.device, &message, queue, to_lane));
-            let prepass = match &begun {
+            let (prepass, made) = match &begun {
                 Ok(Ok(b)) if b.computes() => self.hand_prepass(&decoder, &message),
-                _ => None,
+                _ => (None, true),
             };
-            let begun = (begun, prepass, Walk { to_lane, alone });
+            let begun = (begun, prepass, Walk { to_lane, alone, made });
             self.carry_out(decoder, begun, carried, poster.clone(), message, claim);
         });
     }
 
     /// The pre-pass of the `COMMAND_BUFFER` `message` `decoder` began
-    /// ([`GraphicsDecoder::prepass`]): each shape it hands over is one compile of the pool's,
-    /// which its walk does not wait for. A shape the pool takes no compile of, its threads gone,
-    /// is left to the walk.
-    fn hand_prepass(&self, decoder: &GraphicsDecoder<P>, message: &[u8]) -> Option<Prepass<P>> {
-        let prepass = decoder.prepass(message)?;
-        let of = CompileOf::new(CompileKind::Prepass, prepass.cb_obj_id());
-        for _ in 0..prepass.handed() {
-            if self.pool.submit(of, prepass.job()).is_err() {
-                break;
+    /// ([`GraphicsDecoder::prepass`]), and whether every dispatch the buffer runs is made: each
+    /// shape it hands over is one compile of the pool's, which its walk does not wait for. A
+    /// shape the pool takes no compile of, its threads gone, is left to the walk.
+    fn hand_prepass(
+        &self,
+        decoder: &GraphicsDecoder<P>,
+        message: &[u8],
+    ) -> (Option<Prepass<P>>, bool) {
+        let Ahead { prepass, made } = decoder.prepass(message);
+        if let Some(prepass) = &prepass {
+            let of = CompileOf::new(CompileKind::Prepass, prepass.cb_obj_id());
+            for _ in 0..prepass.handed() {
+                if self.pool.submit(of, prepass.job()).is_err() {
+                    break;
+                }
             }
         }
-        Some(prepass)
+        (prepass, made)
     }
 
     /// The rest of the `COMMAND_BUFFER` `message`'s work once it is begun (`begun`, on `decoder`,
@@ -2773,6 +2783,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// and the lane's thread was not woken for it. Where its commit would wait after all, it
     /// goes to the lane as a short buffer does, its thread woken there.
     ///
+    /// None of these is walked here where a dispatch of its runs a pipeline its pre-pass did not
+    /// find made ([`Walk::made`]): that walk may wait for the pipeline's make, or for its stage's
+    /// fill, a minute or two (`reims_vgpu_vulkan::core::platform::stage`), and here the queue's
+    /// next messages would wait behind it. It goes to the lane, whose thread waits out of the
+    /// lane's walks (`decode::lane`), the queue's next buffers taken and walked meanwhile.
+    ///
     /// A buffer carried out here lets its queue's `claim` go first, once begun
     /// ([`QueueClaim::let_go`]): a buffer the guest published behind it and asked `CB_SUBMITTED`
     /// of is offered to the host then, and one rung for during the walk at its doorbell, each
@@ -2795,6 +2811,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let expected = walk.to_lane;
         let begun_whole = matches!(&begun, Ok(Ok(_)));
         let here = match &begun {
+            Ok(Ok(_)) if !walk.made => false,
             Ok(Ok(b)) if b.ordered() => decoder.turn_is_next(),
             Ok(Ok(_)) => {
                 (message.len() <= self.inline_walk_max.load(Ordering::Relaxed) || walk.alone)

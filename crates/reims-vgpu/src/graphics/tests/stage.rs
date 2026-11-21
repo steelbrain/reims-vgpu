@@ -1,12 +1,15 @@
 //! A dispatch the platform refuses for a stage whose compile is not in its store
 //! (`reims_vgpu_vulkan::core::platform::stage`): its walk waits for the stage's fill, and the
 //! dispatch is made once more after the fill filled the store, or refused after any other end; a
-//! make ahead's refusal starts the fill that the walk's dispatch then joins.
+//! make ahead's refusal starts the fill that the walk's dispatch then joins. A buffer whose
+//! dispatch may wait so is walked on its queue's lane, never on the queue's service thread.
 
 use reims_vgpu_vulkan::core::platform::stage::FillEnd;
 use reims_vgpu_vulkan::core::testkit::Step;
 
-use super::prepass::{begin, command_buffer_of, completed, end, set_state, threads, with_states};
+use super::prepass::{
+    CONTEXT, begin, command_buffer_of, completed, end, set_state, threads, with_states,
+};
 use super::*;
 
 /// The fake's selector of a [`threads`] dispatch.
@@ -100,4 +103,73 @@ fn a_make_ahead_refused_for_its_stage_starts_the_fill_its_dispatch_joins() {
     assert!(world.stages().end(7, FillEnd::Filled));
     assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
     assert!(world.stages().refused().is_empty());
+}
+
+/// A short command buffer whose dispatch runs a pipeline its pre-pass did not find made is walked
+/// on its queue's lane, where its make or its stage's fill would hold no message of the queue's;
+/// once the pipeline is made, the same buffer is walked on the queue's service thread
+#[test]
+fn a_short_buffer_whose_dispatch_is_not_made_is_walked_on_its_lane() {
+    let (device, platform, _guest, mut ring) = with_states(&[11]);
+    let world = platform.world();
+    let threads = walk_threads(&device);
+    ring.send(&device, dispatching(100));
+    assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+    // Its job done, its turn passed: the lane's thread waits for a job.
+    let wakes = || device.control.decoder().lane_wakes(obj(CONTEXT, 1));
+    assert!(
+        eventually(|| wakes().is_some_and(|w| w.2 == 1)),
+        "the lane: {:?}",
+        wakes()
+    );
+    // The fake numbers its keys as they are asked for: the dispatch's is the first.
+    world.variants_made([0]);
+    ring.send(&device, dispatching(101));
+    assert_eq!(completed(&platform, &mut ring, 101), RGFX_CB_OK);
+    let walked = threads.lock().clone();
+    assert_eq!(walked.len(), 2, "walks seen: {walked:?}");
+    assert!(
+        walked[0].starts_with("reims-vgpu.graphics-lane-"),
+        "the buffer whose dispatch was not made walked on {:?}",
+        walked[0]
+    );
+    assert!(
+        walked[1].starts_with("reims-vgpu.graphics-queue-"),
+        "the buffer whose dispatch was made walked on {:?}",
+        walked[1]
+    );
+}
+
+/// A short command buffer whose dispatch waits for its stage's fill waits on its queue's lane: the
+/// queue's next buffer is taken and walked meanwhile, and completes after it, in its turn
+#[test]
+fn a_dispatch_held_on_its_stage_s_fill_holds_no_message_of_its_queue() {
+    let (device, platform, _guest, mut ring) = with_states(&[11]);
+    let world = platform.world();
+    let threads = walk_threads(&device);
+    world.script.push(THREADS, Step::Stage(7));
+    ring.send(&device, dispatching(100));
+    assert!(
+        eventually(|| world.stages().started() == [7]),
+        "no fill started"
+    );
+    ring.send(&device, command_buffer_of(101, &[begin(), end()]));
+    assert!(
+        eventually(|| threads.lock().len() == 2),
+        "the queue's next buffer waited behind the held walk: {:?}",
+        threads.lock()
+    );
+    assert!(
+        none_completes(&platform, &mut ring),
+        "a buffer completed while the first waited for its stage's fill"
+    );
+    assert!(world.stages().end(7, FillEnd::Filled));
+    assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+    assert_eq!(completed(&platform, &mut ring, 101), RGFX_CB_OK);
+    let walked = threads.lock().clone();
+    assert!(
+        walked[0].starts_with("reims-vgpu.graphics-lane-"),
+        "the held buffer walked on {:?}",
+        walked[0]
+    );
 }
