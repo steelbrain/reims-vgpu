@@ -262,7 +262,9 @@ pub enum RtRefusal {
     Thread,
     /// The translator's refusal (`Error::Translation`).
     Translation,
-    /// A Metal feature rt does not build yet, a known gap of its own (`Error::Unsupported`).
+    /// A Metal feature rt does not build yet, a known gap of its own (`Error::Unsupported`), or a
+    /// kernel past rt's stage bound that no helper has compiled (`Error::StageUnfilled`): the
+    /// platform runs no helper, so rt makes no such kernel's pipeline.
     Gap,
     /// A call after the device was quiesced (`Error::Quiesced`).
     Quiesced,
@@ -300,7 +302,7 @@ impl RtRefusal {
             rt::Error::NoSuchBlock(_) => RtRefusal::NoSuchBlock,
             rt::Error::Thread(_) => RtRefusal::Thread,
             rt::Error::Translation { .. } => RtRefusal::Translation,
-            rt::Error::Unsupported(_) => RtRefusal::Gap,
+            rt::Error::Unsupported(_) | rt::Error::StageUnfilled(_) => RtRefusal::Gap,
             rt::Error::Quiesced => RtRefusal::Quiesced,
             _ => RtRefusal::Other,
         }

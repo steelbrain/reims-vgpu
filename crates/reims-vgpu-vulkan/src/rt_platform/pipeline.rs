@@ -557,11 +557,13 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     /// rt's make ahead (`prepare_dispatch`) of the `VkPipeline` the dispatch would make at its
     /// first use, at its threadgroup size, threadgroup memory lengths and grid tiles. A value past
     /// rt's 32 bits makes nothing: the dispatch, or the length's set, refuses it
-    /// (`super::compute`).
+    /// (`super::compute`). rt's one refusal here, of a kernel past its stage bound, is the
+    /// dispatch's own, which the dispatch meets in its walk.
     fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
         if let Some(args) = RtDispatch::of(dispatch, threads, lengths) {
-            self.rt
-                .prepare_dispatch(args.dispatch, args.threads, &args.lengths);
+            let _stage_refusal =
+                self.rt
+                    .prepare_dispatch(args.dispatch, args.threads, &args.lengths);
         }
     }
 

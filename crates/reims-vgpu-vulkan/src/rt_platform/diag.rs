@@ -952,7 +952,8 @@ pub(crate) fn gaps_named(name: &str) -> u64 {
 /// The refusals of Metal's that rt answers, its limits, and the translator's refusals, by variant.
 static REFUSALS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
-/// Counts a refusal of rt's `error`: a gap under its gap's kind, a draw's by its draw kind; a
+/// Counts a refusal of rt's `error`: a gap under its gap's kind, a kernel's past the stage bound
+/// that no helper has compiled under `StageUnfilled`, a draw's by its draw kind; a
 /// refusal of Metal's and a limit under their variant, `Refused-<variant>` and `Limit-<variant>`;
 /// the translator's under the feature it refused, `Translation-<feature>`; any other error not.
 pub fn refusal(error: &rt::Error) {
@@ -960,14 +961,15 @@ pub fn refusal(error: &rt::Error) {
         return;
     };
     let map = match error {
-        rt::Error::Unsupported(_) => &GAPS,
+        rt::Error::Unsupported(_) | rt::Error::StageUnfilled(_) => &GAPS,
         _ => &REFUSALS,
     };
     *map.lock().entry(name).or_insert(0) += 1;
 }
 
-/// The kind [`refusal`] counts rt's `error` under: a gap's kind, a draw's `Draw-<kind>`, a linear
-/// plane pass's `LinearPlanePass-<kind>`, an indirect command buffer's
+/// The kind [`refusal`] counts rt's `error` under: a gap's kind, a kernel's past the stage bound
+/// that no helper has compiled `StageUnfilled`, a draw's `Draw-<kind>`, a linear plane pass's
+/// `LinearPlanePass-<kind>`, an indirect command buffer's
 /// `IndirectCommandBuffers-<kind>`, a refusal of Metal's `Refused-<variant>`, a limit
 /// `Limit-<variant>`, and the translator's `Translation-<feature>`, the variant of the feature it
 /// refused, or of its error where it refused no feature (`Translation-InvalidInput`); `None` for
@@ -983,6 +985,7 @@ pub fn refusal_name(error: &rt::Error) -> Option<String> {
             format!("IndirectCommandBuffers-{kind:?}")
         }
         rt::Error::Unsupported(gap) => variant(&format!("{gap:?}")).to_owned(),
+        rt::Error::StageUnfilled(_) => "StageUnfilled".to_owned(),
         rt::Error::Refused(r) => format!("Refused-{}", variant(&format!("{r:?}"))),
         rt::Error::Limit(l) => format!("Limit-{}", variant(&format!("{l:?}"))),
         rt::Error::Translation {

@@ -234,6 +234,7 @@ dependencies = [
  "ash",
  "libc",
  "metal2vulkan",
+ "sha2 0.11.1",
  "windows-sys",
 ]
 
