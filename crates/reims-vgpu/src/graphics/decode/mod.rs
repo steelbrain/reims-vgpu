@@ -257,6 +257,7 @@ use pipeline_key::PipelineKey;
 use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
+#[cfg(test)]
 pub(crate) use surface_cache::LARGEST as surface_cache_largest;
 pub(crate) use surface_cache::shapes::ShapesLive;
 pub(crate) use surface_cache::{CacheLive, CachesLive, FillHook, FillWait};
