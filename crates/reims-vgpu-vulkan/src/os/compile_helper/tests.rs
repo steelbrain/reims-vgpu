@@ -9,8 +9,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::{
-    Beside, Footprints, GUEST_RAM, Helper, HelperEnd, HelperRun, Limits, MEMORY_FLOOR, MEMORY_MOST,
-    Seats, TIME_MOST, admits, end_with_parent, hold_guest_ram, host, seat_cap,
+    Beside, Footprints, GUEST_RAM, Helper, HelperEnd, HelperRun, Limits, MEMORY_MOST, Seats,
+    TIME_MOST, admits, end_with_parent, hold_guest_ram, host, seat_cap,
 };
 use crate::core::platform::os::Clock;
 use crate::os::OsClock;
@@ -238,7 +238,7 @@ fn a_helper_alone_is_capped_by_the_room_at_its_seat() {
         memory: 4 << 30,
         time: Duration::from_secs(60),
     };
-    let room = MEMORY_FLOOR + (64 << 20);
+    let room = 256 << 20;
     let seats = seats_of("roomcap", 1, move || Some(room));
     let (ends, ended) = mpsc::channel();
     let on_end = move |_: &HelperEnd, seen, _| ends.send(seen).unwrap();
@@ -267,6 +267,26 @@ fn a_helper_alone_is_capped_by_the_room_at_its_seat() {
         "{end:?}"
     );
     roomy.remove_files();
+}
+
+/// A helper alone on a host whose room reads nothing runs at a cap of nothing: it passes its cap
+/// at its first read, and is killed over the room.
+#[test]
+fn a_helper_alone_with_no_room_is_killed_over_the_room_at_once() {
+    let test = "a_helper_alone_with_no_room_is_killed_over_the_room_at_once";
+    stand_in(test);
+    let seats = seats_of("noroom", 1, || Some(0));
+    let clock = OsClock::new();
+    let start = clock.now_mono();
+    let helper = Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
+    let end = helper.wait();
+    assert!(
+        matches!(end, HelperEnd::OverRoom { bytes, cap: 0 } if bytes > 0),
+        "{end:?}"
+    );
+    let took = clock.now_mono().saturating_duration_since(start);
+    assert!(took < Duration::from_secs(20), "{took:?}");
+    seats.remove_files();
 }
 
 /// A helper still running at its time cap is killed there.
@@ -457,8 +477,8 @@ fn a_helper_takes_a_seat_beside_others_only_where_all_their_caps_fit() {
 }
 
 /// Alone, a helper always takes a seat, at a cap no larger than the room read at its seat: the
-/// smaller of the ceiling and the room, and no less than the floor (nor more than the ceiling)
-/// where the room reads less; at the ceiling where no room is said, and beside others.
+/// smaller of the ceiling and the room, however little the room is; at the ceiling where no room
+/// is said, and beside others.
 #[test]
 fn a_helper_alone_always_runs_at_a_cap_no_larger_than_the_room() {
     const GIB: u64 = 1 << 30;
@@ -473,11 +493,10 @@ fn a_helper_alone_always_runs_at_a_cap_no_larger_than_the_room() {
     assert_eq!(seat_cap(ceiling, alone(Some(16 * GIB))), ceiling);
     assert_eq!(seat_cap(ceiling, alone(Some(ceiling))), ceiling);
     assert_eq!(seat_cap(ceiling, alone(Some(5 * GIB))), 5 * GIB);
-    assert_eq!(seat_cap(ceiling, alone(Some(GIB + 1))), GIB + 1);
-    assert_eq!(MEMORY_FLOOR, GIB);
-    assert_eq!(seat_cap(ceiling, alone(Some(GIB / 2))), MEMORY_FLOOR);
-    assert_eq!(seat_cap(ceiling, alone(Some(0))), MEMORY_FLOOR);
-    assert_eq!(seat_cap(GIB / 2, alone(Some(0))), GIB / 2);
+    assert_eq!(seat_cap(ceiling, alone(Some(GIB / 2))), GIB / 2);
+    assert_eq!(seat_cap(ceiling, alone(Some(1))), 1);
+    assert_eq!(seat_cap(ceiling, alone(Some(0))), 0);
+    assert_eq!(seat_cap(GIB / 2, alone(Some(GIB))), GIB / 2);
     assert_eq!(seat_cap(ceiling, alone(None)), ceiling);
     let beside = Beside {
         held: 1,

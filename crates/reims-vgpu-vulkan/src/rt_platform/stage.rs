@@ -405,7 +405,7 @@ mod tests {
 
     use super::*;
     use crate::core::platform::stage::StageFills;
-    use crate::os::compile_helper::{Limits, MEMORY_FLOOR, end_with_parent};
+    use crate::os::compile_helper::{Limits, end_with_parent};
 
     /// A refusal of a stage is counted under its site's code, and one of no stage is not
     #[test]
@@ -673,19 +673,18 @@ mod tests {
         assert_eq!(fill_end(&over_room, Some(&ok)), (FillEnd::Filled, None));
     }
 
-    /// A helper killed at a cap the host's room set below the ceiling fails its fill with no
-    /// breach recorded, as the stage fits on a host with room, and the end is kept: no helper is
-    /// asked again in the process's run.
+    /// A helper killed at a cap the host's room set below the ceiling, here a room of nothing,
+    /// fails its fill with no breach recorded, as the stage fits on a host with room, and the end
+    /// is kept: no helper is asked again in the process's run.
     #[test]
     fn a_helper_past_a_cap_the_room_set_fails_its_fill_with_nothing_recorded() {
         let test = "a_helper_past_a_cap_the_room_set_fails_its_fill_with_nothing_recorded";
         stand_in();
         let (records, recorded) = mpsc::channel();
         let (talks, talked) = mpsc::channel();
-        // The stand-in grows to 2 GiB, past the room's cap and short of the ceiling.
-        let room = MEMORY_FLOOR + (64 << 20);
+        // The stand-in passes a cap of nothing at its first read.
         let fills = StageFills::new(stage_start(
-            move || Ok(grow_run(test, 4 << 30, room)),
+            move || Ok(grow_run(test, 1 << 30, 0)),
             move |key: &u32, stdin, stdout| {
                 talks.send(*key).unwrap();
                 no_reply(key, stdin, stdout)

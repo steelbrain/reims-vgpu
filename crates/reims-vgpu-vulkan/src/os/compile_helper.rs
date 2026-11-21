@@ -62,9 +62,9 @@
 //! **The memory cap** is the helper's own, set at its seat ([`seat_cap`]): the ceiling,
 //! [`Limits::memory`], for a helper beside others, which [`admits`] fit in the room, and where the
 //! OS says no room; for a helper alone, the smaller of the ceiling and the room read at its seat,
-//! and no less than [`MEMORY_FLOOR`] (nor more than the ceiling) where the room reads less. It has
-//! one form on every OS: every [`POLL`] the helper's thread reads the process's footprint, and
-//! kills it once that is past its cap:
+//! however little that is: where the room is under what the helper needs, it passes its cap at
+//! its first reads and is killed. It has one form on every OS: every [`POLL`] the helper's thread
+//! reads the process's footprint, and kills it once that is past its cap:
 //! - Linux: resident and swapped memory (`VmRSS` and `VmSwap` of `/proc/<pid>/status`), so swap,
 //!   zram's among it, does not hide what the helper holds. An address-space limit (`RLIMIT_AS`)
 //!   would count the virtual ranges a GPU driver reserves at device creation, which no memory
@@ -129,14 +129,6 @@ use crate::os::OsClock;
 
 /// The most memory a helper may hold on any host: 8 GiB.
 const MEMORY_MOST: u64 = 8 << 30;
-
-/// The least memory cap a helper alone runs at where the host's room reads less, the ceiling
-/// allowing: 1 GiB. A helper holds a runtime device of its own before it compiles, so a cap far
-/// under the lightest fills' peaks would kill every helper before its compile ends. Measured on
-/// 2026-11-21, the helpers' peak footprints of one guest app's eight fills ran from 582 MiB on a
-/// Radeon 780M (RADV) and 709 MiB on an RTX 3090 (NVIDIA) up: at this floor the lightest still fill
-/// where the room reads nothing.
-pub(crate) const MEMORY_FLOOR: u64 = 1 << 30;
 
 /// The longest a helper may run: 10 minutes.
 const TIME_MOST: Duration = Duration::from_secs(10 * 60);
@@ -271,13 +263,13 @@ fn admits(held: usize, cap: u64, room: Option<u64>, ours: u64) -> bool {
 }
 
 /// The memory cap of a helper whose ceiling is `ceiling` ([`Limits::memory`]), seated as `beside`
-/// says: alone, the smaller of the ceiling and the room read at its seat, and no less than
-/// [`MEMORY_FLOOR`] nor more than the ceiling where the room reads less; the ceiling beside others,
-/// which [`admits`] fit in the room, and where the OS says no room, as nothing then says the host
-/// is short.
+/// says: alone, the smaller of the ceiling and the room read at its seat, so a helper never holds
+/// more than the host had free then, a room of nothing among it; the ceiling beside others, which
+/// [`admits`] fit in the room, and where the OS says no room, as nothing then says the host is
+/// short.
 fn seat_cap(ceiling: u64, beside: Beside) -> u64 {
     match (beside.held, beside.room) {
-        (0, Some(room)) => ceiling.min(room.max(MEMORY_FLOOR)),
+        (0, Some(room)) => ceiling.min(room),
         _ => ceiling,
     }
 }
