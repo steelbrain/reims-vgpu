@@ -167,3 +167,49 @@ fn a_decoder_let_go_while_another_decodes_leaves_it_whole() {
     });
     assert_eq!(read.load(Ordering::Relaxed), 2 * ROUNDS * pictures);
 }
+
+/// The pictures decoded in
+/// [`a_display_let_go_after_its_decodes_leaves_no_reference_on_the_adapters_device`].
+#[cfg(windows)]
+const LET_GO_PICTURES: usize = 16;
+
+/// A display let go of lets go of the adapter's Direct3D 12 device, and of everything vaon12 made
+/// on it: once a decoder decoded the first pictures of the stream into its pool, each read back as
+/// a CPU copy does, and the pictures, the decoder and the display are let go of, the Direct3D 12
+/// device made on the adapter (one a process, which `D3D12CreateDevice` answers while it lives)
+/// has no reference but ours, within 5 s of the display's drop (its `vaTerminate` may be made on
+/// its call thread). Run holding the GPU, on vaon12 on the default adapter.
+#[cfg(windows)]
+#[test]
+#[ignore = "needs vaon12 and RVG_VA_H264: run on the Windows host"]
+fn a_display_let_go_after_its_decodes_leaves_no_reference_on_the_adapters_device() {
+    use super::d3d12::{
+        default_adapter_device_references, default_adapter_device_references_once_let_go,
+    };
+    assert_eq!(
+        default_adapter_device_references(),
+        0,
+        "the adapter's Direct3D 12 device, made alone, has no reference but ours"
+    );
+    let display = display();
+    let stream = Stream::new(&display);
+    let mut decoder = stream.decoder(&display);
+    let mut frames = Vec::new();
+    for (id, sample) in (0u64..).zip(stream.samples.iter().take(LET_GO_PICTURES)) {
+        frames.extend(decoder.decode(sample, id).expect("a decode"));
+    }
+    frames.extend(decoder.flush().expect("the flush"));
+    assert!(!frames.is_empty(), "pictures decoded");
+    for frame in &frames {
+        frame.read_back().expect("a read back");
+    }
+    drop(frames);
+    drop(decoder);
+    drop(display);
+    assert_eq!(
+        default_adapter_device_references_once_let_go(),
+        0,
+        "the adapter's Direct3D 12 device, made once the display is let go of, has no reference \
+         but ours"
+    );
+}

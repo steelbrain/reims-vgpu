@@ -97,6 +97,8 @@ pub(super) const IID_ID3D12_FENCE: Guid = guid(
 
 // The vtable indices of the methods called (the SDK's `<interface>Vtbl` structures).
 const QUERY_INTERFACE: usize = 0;
+#[cfg(test)]
+const ADD_REF: usize = 1;
 const RELEASE: usize = 2;
 const FACTORY4_ENUM_ADAPTER_BY_LUID: usize = 26;
 pub(super) const DEVICE_CREATE_COMMAND_QUEUE: usize = 8;
@@ -748,4 +750,48 @@ pub(crate) fn device_of(
     kept.get_or_init(|| Device::new(luid))
         .as_ref()
         .map_err(Clone::clone)
+}
+
+#[cfg(test)]
+impl Com {
+    /// The references the object has beside the one this holds: `AddRef`, then `Release`, which
+    /// answers the object's count after it, ours among them.
+    pub(super) fn references_beside_ours(&self) -> u32 {
+        // SAFETY: `AddRef` and `Release` are every COM object's methods 1 and 2: the reference
+        // added is released at once, and the one this holds stays.
+        let count = unsafe {
+            let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = self.method(ADD_REF);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = self.method(RELEASE);
+            add_ref(self.raw());
+            release(self.raw())
+        };
+        count - 1
+    }
+}
+
+/// The references the default adapter's Direct3D 12 device has beside one of ours: the device
+/// `D3D12CreateDevice` answers while one lives (one a process and adapter), with what holds it,
+/// else a new one, with none. Tests only.
+#[cfg(test)]
+pub(super) fn default_adapter_device_references() -> u32 {
+    let device = Device::new(None).expect("a Direct3D 12 device");
+    device.device.references_beside_ours()
+}
+
+/// [`default_adapter_device_references`] once they are none, or as they are 5 s on, for a test
+/// whose last release may be made on another thread (a display's `vaTerminate`, ordered behind
+/// its call thread's calls). Tests only.
+#[cfg(test)]
+pub(super) fn default_adapter_device_references_once_let_go() -> u32 {
+    use crate::core::runtime::{Runtime as _, StdRuntime};
+    // The tests' clock: std's, which the library does not read.
+    let clock = StdRuntime;
+    let start = clock.now();
+    loop {
+        let left = default_adapter_device_references();
+        if left == 0 || clock.elapsed_since(start) >= Duration::from_secs(5) {
+            return left;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

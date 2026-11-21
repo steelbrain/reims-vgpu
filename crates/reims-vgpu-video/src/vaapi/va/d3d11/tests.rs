@@ -10,13 +10,17 @@ use std::time::Duration;
 
 use crate::core::runtime::{Runtime as _, StdRuntime};
 
-use super::super::d3d12::{Com, Device, Guid, Hresult, SharedTexture, check, guid};
+use super::super::d3d12::{
+    Com, Device, Guid, Hresult, SharedTexture, check, default_adapter_device_references,
+    default_adapter_device_references_once_let_go, guid,
+};
 use super::super::display::Display;
 use super::super::frame::{Frame, PlaneRows};
 use super::super::h264::H264Decoder;
 use super::super::hevc::HevcDecoder;
 use super::super::readback::{ReadbackWay, read_back_by};
 use super::super::surface::SurfaceFormat;
+use super::super::teardown::Stream;
 use super::{PlaneDraw, PlaneTargets, covers};
 
 /// The streams of the directories `RVG_VA_STREAMS` lists (as `PATH` lists them): each H.264
@@ -480,25 +484,6 @@ fn pairs_let_go_together_share_one_flush() {
     );
 }
 
-/// `AddRef`, every COM object's method 1.
-const ADD_REF: usize = 1;
-/// `Release`, every COM object's method 2.
-const RELEASE: usize = 2;
-
-/// The references `object` has beside the one `Com` holds: `AddRef`, then `Release`, which
-/// answers the object's count after it, ours among them.
-fn references_beside_ours(object: &Com) -> u32 {
-    // SAFETY: `AddRef` and `Release` are every COM object's methods 1 and 2: the reference
-    // added is released at once, and the one `Com` holds stays.
-    let count = unsafe {
-        let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = object.method(ADD_REF);
-        let release: unsafe extern "system" fn(*mut c_void) -> u32 = object.method(RELEASE);
-        add_ref(object.raw());
-        release(object.raw())
-    };
-    count - 1
-}
-
 /// A plane draw let go of lets go of the adapter's Direct3D 12 device, and of everything its
 /// devices made on it: once a draw from a pool texture, its targets, the texture and the draws are
 /// let go of, as a session's and its decoder's are at the video's teardown, the Direct3D 12
@@ -511,13 +496,11 @@ fn references_beside_ours(object: &Com) -> u32 {
 #[test]
 #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
 fn a_plane_draw_let_go_leaves_no_reference_on_the_adapters_device() {
-    let alone = Device::new(None).expect("a Direct3D 12 device");
     assert_eq!(
-        references_beside_ours(&alone.device),
+        default_adapter_device_references(),
         0,
         "the adapter's Direct3D 12 device, made alone, has no reference but ours"
     );
-    drop(alone);
     let draw = PlaneDraw::new(None).expect("the plane draws");
     for ten_bit in [false, true] {
         let texture = source(ten_bit);
@@ -528,12 +511,65 @@ fn a_plane_draw_let_go_leaves_no_reference_on_the_adapters_device() {
         drop(texture);
     }
     drop(draw);
-    let after = Device::new(None).expect("a Direct3D 12 device");
     assert_eq!(
-        references_beside_ours(&after.device),
+        default_adapter_device_references(),
         0,
         "the adapter's Direct3D 12 device, made once the plane draws are let go of, has no \
          reference but ours"
+    );
+}
+
+/// The pictures drawn from at once in [`a_video_let_go_leaves_no_reference_on_the_adapters_device`].
+const VIDEO_PICTURES: usize = 16;
+
+/// A video let go of lets go of the adapter's Direct3D 12 device, and of everything vaon12 and the
+/// draws' devices made on it: once a decoder decoded the first pictures of `RVG_VA_H264` into its
+/// pool, each drawn from its shared texture into targets as the host's video draws it, and the
+/// pictures, the targets, the decoder, the draws and the display are let go of, as they are at
+/// the video's teardown, the Direct3D 12 device made on the adapter (one a process, which
+/// `D3D12CreateDevice` answers while it lives) has no reference but ours, within 5 s of the
+/// display's drop (its `vaTerminate` may be made on its call thread). Run holding the GPU, on
+/// vaon12 on the default adapter.
+#[test]
+#[ignore = "needs vaon12 and RVG_VA_H264: run on the Windows host"]
+fn a_video_let_go_leaves_no_reference_on_the_adapters_device() {
+    assert_eq!(
+        default_adapter_device_references(),
+        0,
+        "the adapter's Direct3D 12 device, made alone, has no reference but ours"
+    );
+    let display = Display::open_adapter(None, StdRuntime::shared()).expect("a VA display");
+    let stream = Stream::new(&display);
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    let mut decoder = stream.decoder(&display);
+    let mut frames = Vec::new();
+    for (id, sample) in (0u64..).zip(stream.samples.iter().take(VIDEO_PICTURES)) {
+        frames.extend(decoder.decode(sample, id).expect("a decode"));
+    }
+    frames.extend(decoder.flush().expect("the flush"));
+    assert!(!frames.is_empty(), "pictures decoded");
+    let mut targets: Option<PlaneTargets> = None;
+    for frame in &frames {
+        frame.sync().expect("the decode");
+        let texture = frame.texture().expect("a picture in a shared texture");
+        let size = (frame.width(), frame.height());
+        let to = targets.get_or_insert_with(|| {
+            draw.targets(size, texture.is_10_bit())
+                .expect("the targets")
+        });
+        draw.draw(&texture, frame.crop_origin(), to, size)
+            .expect("the draw");
+    }
+    drop(targets);
+    drop(frames);
+    drop(decoder);
+    drop(draw);
+    drop(display);
+    assert_eq!(
+        default_adapter_device_references_once_let_go(),
+        0,
+        "the adapter's Direct3D 12 device, made once the video is let go of, has no reference \
+         but ours"
     );
 }
 
