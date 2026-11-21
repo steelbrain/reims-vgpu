@@ -20,8 +20,13 @@
 //! and the host need wait for nothing ([`Host::try_surface_download`]). Ring 0's threads,
 //! `reims-vgpu.graphics-ring0-*`, serve the lanes, each lane with a job on one of them.
 //! The replies (a pipeline's reflection, a `COMPLETE`) come back on the control completion ring.
-//! Every other ring is a command queue's own (below), so each ring keeps a single producer and a
-//! single consumer, and their `consumer_idle` handshakes never race.
+//! A queue's thread that waits for ring 0's messages while no thread takes ring 0 takes those of
+//! contexts' lanes itself, as the control thread would (below): ring 0's take
+//! (`Shared::taking`) is held by one thread at a time, from a message's take until it is handed
+//! and counted, so ring 0 is taken and handed in ring order whichever thread takes it.
+//! Every other ring is a command queue's own (below), so each ring keeps a single producer and
+//! one consumer at a time, one thread sleeps on each, and their `consumer_idle` handshakes never
+//! race.
 //! `reims-vgpu.graphics-refresh` runs at the display's refresh rate ([`Screen::mode`]): at each
 //! refresh it has the screen show the scanout again while the guest has one
 //! ([`Screen::present`]), sends `VBLANK` while the guest has it on, stamped with the refresh's
@@ -62,7 +67,10 @@
 //! context's lane holds a `BUFFER_AT_OFFSET` or an `OBJECT_DESTROY` of no queue it waits for that
 //! no thread of the lane's carries out yet, the creates and destroys the bundle posts ahead of
 //! each commit: it carries that out itself, as the lane's job, in place of sleeping while a
-//! ring-0 thread is woken for it (`lanes`, "A command buffer's thread"). An
+//! ring-0 thread is woken for it (`lanes`, "A command buffer's thread"); and where the control
+//! thread has not taken the ring-0 messages it waits for and no thread takes ring 0, it takes
+//! them itself, in ring order, those of contexts' lanes, handing each to its lane as the control
+//! thread would, in place of sleeping while the control thread is woken for them. An
 //! `OBJECT_DESTROY` of the queue, a
 //! `CONTEXT_CLOSE` of its process (the host then
 //! drops the process's objects, [`Host::context_closed`]), a reset and the device's end, end a
@@ -1051,6 +1059,15 @@ pub(crate) struct Shared {
     doorbell: OnceLock<Doorbell>,
     /// The control submission ring, held while the control thread takes a message.
     submit: Mutex<Submit>,
+    /// Ring 0's take ([`Shared::take_one`]): held by the thread that takes a message off the
+    /// control submission ring from before its take until it is carried out or handed to its
+    /// lane, counted and its answers posted, and while a reset is told to the host
+    /// ([`Shared::tell_reset`]), so ring 0's messages are carried out and handed in ring order,
+    /// each after the host is told of every reset before it, whichever thread takes them: the
+    /// control thread, a queue's thread waiting at the gate while no thread takes ring 0
+    /// ([`Shared::take_for`]), or a doorbell's ([`Shared::download_on_doorbell`]). Taken before
+    /// the control submission ring's lock, and only tried off the control thread.
+    taking: Mutex<()>,
     /// The control completion ring.
     completion: Mutex<Producer>,
     /// Where posts onto the control completion ring wait for room.
@@ -1082,8 +1099,9 @@ pub(crate) struct Shared {
     /// Held by the thread that posts the owed `POINTER_MOTION`s ([`Shared::post_motion`]), so
     /// they go out in their order; a thread that finds it held leaves them to its holder.
     motion_posting: Mutex<()>,
-    /// The control submission ring's count through the last message the control thread has
-    /// carried out, handed to the host or handed to a lane: a command buffer waits for it to pass
+    /// The control submission ring's count through the last message the control thread, or a
+    /// thread that held ring 0's take ([`Self::taking`]), has carried out, handed to the host or
+    /// handed to a lane: a command buffer waits for it to pass
     /// the last message published before it that is its context's or every buffer's
     /// ([`backlog`]), and for its context's lane to carry out its context's ([`lanes`]).
     control_done: AtomicU64,
@@ -1608,6 +1626,32 @@ struct Submit {
     asleep: bool,
 }
 
+/// Who takes a message off ring 0 ([`Shared::take_one`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taker {
+    /// The control thread: every message, in turn.
+    Control,
+    /// A queue's thread, its queue made at this reset count, waiting at the gate for ring 0's
+    /// count ([`Shared::take_for`]): only a message of a context's lane
+    /// ([`Shared::queue_takes`]).
+    Queue(u64),
+}
+
+/// What a take of ring 0 did ([`Shared::take_one`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Took {
+    /// It took a message, carried it out or handed it to its lane, counted it, and posted its
+    /// answers.
+    One,
+    /// Nothing: a reset is owed, which the control thread tells the host before it takes more
+    /// ([`Shared::tell_reset`]).
+    Reset,
+    /// Nothing: the ring is empty, broken, or the device not started or ended; or, for a queue's
+    /// thread, the next message is one it leaves to the control thread, or its queue was made
+    /// before a reset.
+    Stop,
+}
+
 /// One of the device's displays: what shows it, and what the guest set of it.
 pub(crate) struct Display {
     /// What shows it.
@@ -1708,6 +1752,7 @@ impl Device {
                 backlog: Backlog::with_room(),
                 asleep: false,
             }),
+            taking: Mutex::new(()),
             completion: Mutex::new(producer),
             room: Room::default(),
             room_poll_ns: AtomicU64::new(u64::try_from(ROOM_POLL.as_nanos()).unwrap_or(u64::MAX)),
@@ -2951,11 +2996,16 @@ impl Shared {
     }
 
     /// Tells the host of a reset it has not been told of ([`Host::device_reset`]), on the control
-    /// thread, before the thread takes anything the guest published after it.
+    /// thread, before the thread takes anything the guest published after it, and with ring 0's
+    /// take held ([`Self::taking`]), so no other thread takes such a message meanwhile.
     fn tell_reset(&self) {
+        if !self.reset_owed.load(Ordering::Acquire) {
+            return;
+        }
+        let _taking = self.taking.lock();
         if self.reset_owed.swap(false, Ordering::AcqRel) {
-            // After every message a lane began before the reset, as the control thread's own
-            // message in flight comes before it.
+            // After every message a lane began before the reset, as the message of ring 0's in
+            // flight, whichever thread took it, comes before it.
             self.lanes.wait_begun(self.epoch.load(Ordering::Acquire));
             self.host.device_reset();
             // At debug: reims-vgpu's own line of the reset, at info, carries its counts.
@@ -3016,104 +3066,130 @@ impl Shared {
     fn take_messages(&self) {
         loop {
             self.tell_reset();
-            let (answer, epoch, room) = {
-                let mut submit = self.submit.lock();
-                if !self.started() || submit.broken || self.ending() {
-                    return;
-                }
-                if self.reset_owed.load(Ordering::Acquire) {
-                    continue;
-                }
-                let epoch = self.epoch.load(Ordering::Acquire);
-                let next = submit.consumer.next(&self.region);
-                // A guest post waiting for room, told with nothing held: after this take, or
-                // after the last, where the ring is empty.
-                let room = next.is_ok() && self.room_wanted(&submit.consumer);
-                if let Ok(Some(message)) = &next {
-                    let through = submit.consumer.consumed();
-                    submit.backlog.took(message, through);
-                    let obj_id = message
-                        .bytes
-                        .get(16..24)
-                        .and_then(|b| <[u8; 8]>::try_from(b).ok())
-                        .map_or(0, u64::from_le_bytes);
-                    self.host.trace(
-                        "r0take",
-                        &[
-                            u64::from(message.header.r#type),
-                            message.header.seqno,
-                            obj_id,
-                        ],
-                    );
-                }
-                match next {
-                    Ok(Some(message)) if control::is_unheld(&message) => {
-                        let through = submit.consumer.consumed();
-                        drop(submit);
-                        if room {
-                            self.post_room(epoch);
-                        }
-                        // A context's object-lifecycle message and a present go to their lane,
-                        // which answers them; the rest is carried out here.
-                        let answer = match Key::of(&message) {
-                            Some(key) => {
-                                if let Some(message) = self.download_here(key, message, epoch) {
-                                    self.hand(key, message, through, epoch);
-                                }
-                                None
-                            }
-                            None => control::unheld(self, &message, epoch),
-                        };
-                        // A reset meanwhile restarted the count; this message's is moot. The look
-                        // and the move are made with the ring held, as a reset's move to 0 is, so
-                        // no reset comes between them.
-                        let submit = self.submit.lock();
-                        if self.epoch.load(Ordering::Acquire) == epoch {
-                            #[cfg(test)]
-                            {
-                                let stop = self.before_count.lock().clone();
-                                if let Some(stop) = stop {
-                                    stop(through);
-                                }
-                            }
-                            self.control_done.store(through, Ordering::Release);
-                            self.gate.counted(through);
-                        }
-                        drop(submit);
-                        (answer, epoch, false)
-                    }
-                    Ok(Some(message)) => {
-                        let answer = control::answer(self, &message);
-                        let done = submit.consumer.consumed();
-                        self.control_done.store(done, Ordering::Release);
-                        self.gate.counted(done);
-                        (answer, epoch, room)
-                    }
-                    Ok(None) => {
-                        drop(submit);
-                        if room {
-                            self.post_room(epoch);
-                        }
-                        return;
-                    }
-                    Err(broken) => {
-                        log::error!(
-                            target: "reims_vgpu_graphics", kind:% = broken;
-                            "the control submission ring is broken ({broken}): it takes nothing \
-                             more until the device is reset"
-                        );
-                        submit.broken = true;
-                        return;
-                    }
-                }
-            };
-            if room {
-                self.post_room(epoch);
-            }
-            if let Some(answer) = answer {
-                self.post_waiting(&answer, epoch);
+            let taking = self.taking.lock();
+            let took = self.take_one(Taker::Control);
+            drop(taking);
+            if took == Took::Stop {
+                return;
             }
         }
+    }
+
+    /// One take of ring 0's ([`Self::take_messages`]) by `taker`, which holds ring 0's take
+    /// ([`Self::taking`]): the next message the guest published, carried out or handed to its
+    /// lane and counted, and its answers posted. A queue's thread takes only a message of a
+    /// context's lane ([`Self::queue_takes`]), at its queue's reset count; what it leaves, an empty
+    /// ring and a broken one among them, stays on the ring for the control thread, which finds it
+    /// as it would have.
+    fn take_one(&self, taker: Taker) -> Took {
+        let (answer, epoch, room) = {
+            let mut submit = self.submit.lock();
+            if !self.started() || submit.broken || self.ending() {
+                return Took::Stop;
+            }
+            if self.reset_owed.load(Ordering::Acquire) {
+                return Took::Reset;
+            }
+            let epoch = self.epoch.load(Ordering::Acquire);
+            let next = match taker {
+                Taker::Control => submit.consumer.next(&self.region),
+                Taker::Queue(at) if at == epoch => match submit.consumer.peek(&self.region) {
+                    Ok(Some(message)) if Self::queue_takes(&message) => {
+                        submit.consumer.take(&self.region, &message);
+                        Ok(Some(message))
+                    }
+                    _ => return Took::Stop,
+                },
+                Taker::Queue(_) => return Took::Stop,
+            };
+            // A guest post waiting for room, told with no ring held: after this take, or
+            // after the last, where the ring is empty.
+            let room = next.is_ok() && self.room_wanted(&submit.consumer);
+            if let Ok(Some(message)) = &next {
+                let through = submit.consumer.consumed();
+                submit.backlog.took(message, through);
+                let obj_id = message
+                    .bytes
+                    .get(16..24)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map_or(0, u64::from_le_bytes);
+                self.host.trace(
+                    "r0take",
+                    &[
+                        u64::from(message.header.r#type),
+                        message.header.seqno,
+                        obj_id,
+                    ],
+                );
+            }
+            match next {
+                Ok(Some(message)) if control::is_unheld(&message) => {
+                    let through = submit.consumer.consumed();
+                    drop(submit);
+                    if room {
+                        self.post_room(epoch);
+                    }
+                    // A context's object-lifecycle message and a present go to their lane,
+                    // which answers them; the rest is carried out here.
+                    let answer = match Key::of(&message) {
+                        Some(key) => {
+                            if let Some(message) = self.download_here(key, message, epoch) {
+                                self.hand(key, message, through, epoch);
+                            }
+                            None
+                        }
+                        None => control::unheld(self, &message, epoch),
+                    };
+                    // A reset meanwhile restarted the count; this message's is moot. The look
+                    // and the move are made with the ring held, as a reset's move to 0 is, so
+                    // no reset comes between them.
+                    let submit = self.submit.lock();
+                    if self.epoch.load(Ordering::Acquire) == epoch {
+                        #[cfg(test)]
+                        {
+                            let stop = self.before_count.lock().clone();
+                            if let Some(stop) = stop {
+                                stop(through);
+                            }
+                        }
+                        self.control_done.store(through, Ordering::Release);
+                        self.gate.counted(through);
+                    }
+                    drop(submit);
+                    (answer, epoch, false)
+                }
+                Ok(Some(message)) => {
+                    let answer = control::answer(self, &message);
+                    let done = submit.consumer.consumed();
+                    self.control_done.store(done, Ordering::Release);
+                    self.gate.counted(done);
+                    (answer, epoch, room)
+                }
+                Ok(None) => {
+                    drop(submit);
+                    if room {
+                        self.post_room(epoch);
+                    }
+                    return Took::Stop;
+                }
+                Err(broken) => {
+                    log::error!(
+                        target: "reims_vgpu_graphics", kind:% = broken;
+                        "the control submission ring is broken ({broken}): it takes nothing \
+                         more until the device is reset"
+                    );
+                    submit.broken = true;
+                    return Took::Stop;
+                }
+            }
+        };
+        if room {
+            self.post_room(epoch);
+        }
+        if let Some(answer) = answer {
+            self.post_waiting(&answer, epoch);
+        }
+        Took::One
     }
 
     /// Whether every ring-0 message of context `context`'s through count `through` is carried out:
@@ -3646,12 +3722,18 @@ impl Shared {
     /// download is the next message after all it carried out, and no answer of its comes after
     /// this one; no answer given elsewhere waits to be posted ([`CompleteAnswer::answer`]); the
     /// block's lane has nothing left; the control completion ring has room; and
-    /// each lock is tried, the control submission ring's, the completion ring's and the lanes'.
+    /// each lock is tried, ring 0's take ([`Self::taking`]), the control submission ring's, the
+    /// completion ring's and the lanes'.
     /// Otherwise the message stays, and the control thread, which the write wakes, takes it as
     /// it takes any. No buffer waits for a download's count (`backlog`: a download is no
     /// buffer's), so the queue gate is not told of it. Allocates and frees nothing.
     fn download_on_doorbell(&self) {
         let raise = {
+            // Not while a queue's thread takes ring 0 ([`Self::take_for`]), whose message in
+            // flight comes before the download.
+            let Some(_taking) = self.taking.try_lock() else {
+                return;
+            };
             let Some(mut submit) = self.submit.try_lock() else {
                 return;
             };
@@ -4261,21 +4343,22 @@ impl Shared {
                 Ok(None) | Err(_) => return,
             };
             // Order this command buffer after the creates its process posted before it. Creates
-            // ride ring 0, whose sole consumer is the control thread; command buffers ride the
-            // queues' own rings (this thread). A create a buffer uses is posted before it in guest
-            // order, so it is within ring 0's producer at the moment this thread takes the buffer.
-            // Wait for the control thread to have carried out or handed to a lane every message
-            // up to the last of them, of the buffer's context's or every buffer's ([`Backlog`]),
-            // and for the context's lane to have carried out the context's ([`lanes`]), so the
-            // resource is registered before the buffer's ops name it. This thread only reads ring
-            // 0; it never consumes it, so it keeps one consumer and its `consumer_idle` handshake
-            // is untouched. It sleeps at the gate, woken once `control_done` reaches what it
-            // waits for, then once its context's lane has carried out its own, or at a reset, the
-            // queue's end or the device's ([`gate`]), but carries out itself a job of the lane's
-            // it waits for that no thread of the lane's carries out yet, where it may
-            // ([`Self::helps`]). A buffer the host answered on a doorbell's
-            // thread waits no more: that thread found ring 0 carried out through what the buffer
-            // waits for.
+            // ride ring 0, which the control thread takes; command buffers ride the queues' own
+            // rings (this thread). A create a buffer uses is posted before it in guest order, so
+            // it is within ring 0's producer at the moment this thread takes the buffer. Wait for
+            // every message up to the last of them, of the buffer's context's or every buffer's
+            // ([`Backlog`]), to be carried out or handed to a lane, and for the context's lane to
+            // have carried out the context's ([`lanes`]), so the resource is registered before
+            // the buffer's ops name it. It sleeps at the gate, woken once `control_done` reaches
+            // what it waits for, then once its context's lane has carried out its own, or at a
+            // reset, the queue's end or the device's ([`gate`]), but carries out itself a job of
+            // the lane's it waits for that no thread of the lane's carries out yet, where it may
+            // ([`Self::helps`]), and takes ring 0's messages it waits for itself where no thread
+            // takes ring 0, as the control thread would ([`Self::take_for`]): it takes them with
+            // ring 0's take held, as one consumer, and leaves ring 0's `consumer_idle` handshake
+            // to the control thread, which alone sleeps on it. A buffer the host answered on a
+            // doorbell's thread waits no more: that thread found ring 0 carried out through what
+            // the buffer waits for.
             let answered = consuming.take() == Some(message.header.seqno);
             let (waits_for, own) = if answered {
                 (0, 0)
@@ -4305,28 +4388,45 @@ impl Shared {
             });
             // A job of its context's lane it waits for, which no thread of the lane's carries out
             // yet, it carries out itself, in place of sleeping while a ring-0 thread is woken for
-            // it ([`Self::help_lane`]).
-            while self.gate.wait_offering(
-                || {
-                    if self.ending()
-                        || queue.ended()
-                        || self.epoch.load(Ordering::Acquire) != queue.epoch
-                    {
-                        Look::Done
-                    } else if (self.lanes).has_help(queue.context, own, |m| self.helps(m)) {
-                        Look::Help
-                    } else if self.control_done.load(Ordering::Acquire) < waits_for {
-                        Look::Count(waits_for)
-                    } else if !self.lanes.through(queue.context, own) {
-                        Look::Lane(queue.context, own)
-                    } else {
-                        Look::Done
+            // it ([`Self::help_lane`]); and ring 0's messages it waits for, where no thread takes
+            // ring 0, it takes itself, in place of sleeping while the control thread is woken for
+            // them ([`Self::take_for`]), but not again at the count it last stopped short at,
+            // where it waits for the control thread to take the message it left.
+            let mut left_at = None;
+            loop {
+                let waited = self.gate.wait_offering(
+                    || {
+                        let done = self.control_done.load(Ordering::Acquire);
+                        if self.ending()
+                            || queue.ended()
+                            || self.epoch.load(Ordering::Acquire) != queue.epoch
+                        {
+                            Look::Done
+                        } else if (self.lanes).has_help(queue.context, own, |m| self.helps(m)) {
+                            Look::Help
+                        } else if done < waits_for {
+                            if left_at != Some(done) && !self.taking.is_locked() {
+                                Look::Take
+                            } else {
+                                Look::Count(waits_for)
+                            }
+                        } else if !self.lanes.through(queue.context, own) {
+                            Look::Lane(queue.context, own)
+                        } else {
+                            Look::Done
+                        }
+                    },
+                    offer.as_ref(),
+                );
+                match waited {
+                    Waited::Done => break,
+                    Waited::Help => self.help_lane(queue.context, own),
+                    Waited::Take => {
+                        if !self.take_for(queue.epoch, waits_for) {
+                            left_at = Some(self.control_done.load(Ordering::Acquire));
+                        }
                     }
-                },
-                offer.as_ref(),
-            ) == Waited::Help
-            {
-                self.help_lane(queue.context, own);
+                }
             }
             if let Some(offer) = &offer {
                 message.bytes = offer.withdraw();
@@ -4397,6 +4497,35 @@ impl Shared {
         {
             log::debug!(target: guest_times::TARGET, "{line}");
         }
+    }
+
+    /// On the thread of a queue made at reset count `epoch` whose command buffer waits for ring
+    /// 0's count `waits_for`, where no thread takes ring 0 ([`Self::taking`]): takes ring 0's
+    /// messages itself, in ring order, as the control thread would, while the count is short of
+    /// `waits_for` and the next message is one of a context's lane ([`Self::queue_takes`]), in
+    /// place of sleeping until the control thread is woken to take them. Answers false where it
+    /// stopped short of `waits_for`, at a message it leaves or a reset, so the thread waits for
+    /// the control thread's count from there; true where it took through `waits_for`, or another
+    /// thread held ring 0's take.
+    fn take_for(&self, epoch: u64, waits_for: u64) -> bool {
+        let Some(_taking) = self.taking.try_lock() else {
+            return true;
+        };
+        while self.control_done.load(Ordering::Acquire) < waits_for {
+            if self.take_one(Taker::Queue(epoch)) != Took::One {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a queue's thread may take ring-0 `message` ([`Self::take_for`]): one the control
+    /// thread hands to a context's lane with no ring held, asking nothing of the host where a
+    /// lane's thread can be started ([`Self::hand`]). A present (whose hand asks the host for its
+    /// surface's textures), a block's message (a download may be carried out at its take), a
+    /// display command and anything the control thread carries out itself are left to it.
+    fn queue_takes(message: &Message) -> bool {
+        control::is_unheld(message) && matches!(Key::of(message), Some(Key::Context(_)))
     }
 
     /// On the thread of a queue of context `context` whose command buffer waits for the context's

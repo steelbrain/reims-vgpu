@@ -16,9 +16,9 @@
 //! An object of another process's reaches a buffer only through a block the kext shares with the
 //! buffer's context: an IOSurface's, whose `BLOCK_SHARE` names that context and is posted before
 //! the process learns of the block, after the surface's `SURFACE_PAGES`, and after every message
-//! the process that made the surface posted before it handed the surface on. The control thread
-//! carries ring 0 out in order, so a buffer that waits for its context's share waits for those
-//! too. Shared events and textures do not cross processes.
+//! the process that made the surface posted before it handed the surface on. Ring 0 is carried
+//! out in order, whichever thread takes it, so a buffer that waits for its context's share waits
+//! for those too. Shared events and textures do not cross processes.
 //!
 //! No buffer waits for a display command (`GET_DISPLAYS` to `SET_DISPLAY_POWER`), a
 //! `SURFACE_DOWNLOAD` or the kext's `PIPELINE_ANSWERS`: a buffer reads nothing they make. A
@@ -31,9 +31,10 @@
 //! buffer waits for a message of any other type, and for one too short to hold its field: the
 //! host refuses either, and the order is as it was.
 //!
-//! **The index.** The queues' threads read ring 0 ahead of the control thread, under its lock,
-//! each message once ([`Backlog::read`]); the control thread indexes a message it takes that
-//! no look read before ([`Backlog::took`]), so a message being carried out is in the index. The
+//! **The index.** The queues' threads read ring 0 ahead of its take, under its lock, each message
+//! once ([`Backlog::read`]); the thread that takes a message, the control thread or a queue's,
+//! indexes one no look read before ([`Backlog::took`]), so a message being carried out is in the
+//! index. The
 //! kext alone writes ring 0, and leaves a published message as it is until the host takes it; a
 //! message read otherwise only orders a buffer before a create it names, which the decoder
 //! refuses. Where the walk meets a message the protocol refuses, every buffer waits for every
@@ -125,7 +126,7 @@ impl Backlog {
 
     /// Reads what the guest published on ring 0 since the last look, at most `most` messages of
     /// it, `done` answering whether every message of a context through a count is carried out
-    /// (by the control thread, or by the context's lane); false where `most` were read and more
+    /// (by ring 0's taker, or by the context's lane); false where `most` were read and more
     /// are left, which a look after it reads on.
     pub(super) fn read(
         &mut self,
@@ -160,9 +161,9 @@ impl Backlog {
         true
     }
 
-    /// The count a command buffer of `context` waits for the control thread to carry out or hand
-    /// to the context's lane: through the last message read of its context's or of every
-    /// buffer's.
+    /// The count a command buffer of `context` waits for ring 0's taker (the control thread, or
+    /// a queue's thread) to carry out or hand to the context's lane: through the last message read
+    /// of its context's or of every buffer's.
     pub(super) fn waits_for(&self, context: u32) -> u64 {
         self.own(context).max(self.every)
     }
@@ -179,8 +180,8 @@ impl Backlog {
         self.read = self.read.max(through);
     }
 
-    /// The control thread took `message`, through count `through`: read here where no look
-    /// read it.
+    /// Ring 0's taker took `message`, through count `through`: read here where no look read
+    /// it.
     pub(super) fn took(&mut self, message: &Message, through: u64) {
         if through <= self.read {
             return;

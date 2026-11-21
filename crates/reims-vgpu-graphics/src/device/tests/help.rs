@@ -2,17 +2,26 @@
 //! command buffer's thread"): a `BUFFER_AT_OFFSET` or an `OBJECT_DESTROY` of no queue that no
 //! thread of the lane's carries out yet. The lane keeps its order, each job is carried out once,
 //! and the buffer is handed over after every message of its context's published before its take.
+//!
+//! It also takes the ring-0 messages it waits for where no thread takes ring 0
+//! (`Shared::take_for`), as the control thread would, while the next is one of a context's lane:
+//! ring 0 is taken, carried out and answered in ring order whichever thread takes each message.
 
 use super::*;
 use crate::ops::RgfxCommandBuffer;
 
-/// A host that records each message it is handed ([`Seen`]), takes `slow`'s while over some of
-/// ring 0's, and completes each command buffer at once.
+/// A host that records each message it is handed ([`Seen`]) and each of ring 0's takes, takes
+/// `slow`'s while over some of ring 0's messages, answers each where `answers` is set, and
+/// completes each command buffer at once.
 #[derive(Clone, Default)]
 struct HelpHost {
     seen: Arc<Mutex<Vec<Seen>>>,
     /// The microseconds the host takes over a ring-0 message, by seqno.
     slow: Arc<Mutex<HashMap<u64, u64>>>,
+    /// Ring 0's takes (`r0take`, [`Host::trace`]), each as a [`Seen`] of the taking thread.
+    takes: Arc<Mutex<Vec<Seen>>>,
+    /// Whether the host answers each ring-0 message it is handed with a `COMPLETE`.
+    answers: Arc<AtomicBool>,
 }
 
 /// A message a [`HelpHost`] was handed: its type, its seqno (ring 0's, or the queue ring's for a
@@ -35,6 +44,19 @@ impl HelpHost {
             .filter(|s| s.r#type != RGFX_CMD_COMMAND_BUFFER && sent.contains(&s.seqno))
             .collect()
     }
+
+    /// Ring 0's takes of the messages of seqnos `sent`, in the order they were taken.
+    fn takes(&self, sent: &[u64]) -> Vec<Seen> {
+        (self.takes.lock().iter())
+            .filter(|s| sent.contains(&s.seqno))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The seqnos of `seen`, in its order.
+fn seqnos(seen: &[Seen]) -> Vec<u64> {
+    seen.iter().map(|s| s.seqno).collect()
 }
 
 impl Host for HelpHost {
@@ -52,6 +74,18 @@ impl Host for HelpHost {
             seqno: header.seqno,
             thread: thread_name(),
         });
+        if header.r#type != RGFX_CMD_COMMAND_BUFFER && self.answers.load(Ordering::SeqCst) {
+            let done = RgfxComplete {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_EVT_COMPLETE,
+                    size: size_of::<RgfxComplete>() as u32,
+                    seqno: header.seqno,
+                },
+                status: RGFX_STATUS_OK,
+                reserved_14: 0,
+            };
+            completion.post(done.as_bytes());
+        }
         if header.r#type == RGFX_CMD_COMMAND_BUFFER {
             let (cb, _) = RgfxCommandBuffer::read_from_prefix(message).unwrap();
             let done = RgfxCbComplete {
@@ -67,6 +101,15 @@ impl Host for HelpHost {
                 error_code: 0,
             };
             completion.post(done.as_bytes());
+        }
+    }
+    fn trace(&self, kind: &'static str, values: &[u64]) {
+        if kind == "r0take" {
+            self.takes.lock().push(Seen {
+                r#type: values[0] as u32,
+                seqno: values[1],
+                thread: thread_name(),
+            });
         }
     }
 }
@@ -92,6 +135,147 @@ fn queue_rig(host: &HelpHost) -> Rig {
 /// Whether `seen` came on the tests' queue's service thread.
 fn on_queue(seen: &Seen) -> bool {
     (seen.thread.as_deref()).is_some_and(|name| name.starts_with("reims-vgpu.graphics-queue-"))
+}
+
+/// Publishes `command` on ring 0 as [`Rig::send`] does, but rings no doorbell: as a message the
+/// guest published while the control thread is awake, or one whose doorbell has not yet woken
+/// it. The command's `seqno`.
+fn publish_unrung(rig: &mut Rig, mut command: Vec<u8>) -> u64 {
+    rig.seqno += 1;
+    command[8..16].copy_from_slice(&rig.seqno.to_le_bytes());
+    set_size_of(&mut command);
+    rig.publish(&command);
+    rig.seqno
+}
+
+/// Waits, [`PATIENCE`] polls at most, for the control thread to sleep: ring 0's `consumer_idle`
+/// set and the thread past its last look at the ring.
+fn wait_control_asleep(rig: &Rig) {
+    assert!(
+        eventually(|| rig.device.shared.submit.lock().asleep),
+        "the control thread never slept"
+    );
+    assert_eq!(control_idle(rig), 1);
+}
+
+/// Ring 0's `consumer_idle`.
+fn control_idle(rig: &Rig) -> u32 {
+    rig.region()
+        .atomic_u32(RGFX_CONTROL_SUBMIT_OFFSET + 0x80)
+        .load(Ordering::SeqCst)
+}
+
+/// With the control thread asleep, as one the guest's doorbell has not yet woken, a command
+/// buffer's thread takes the ring-0 messages of its context's lane it waits for itself, in ring
+/// order, each once, and hands them to the lane, which carries them out and answers them in that
+/// order; the buffer is handed over after them, and ring 0's `consumer_idle` stays set, the control
+/// thread's to clear.
+#[test]
+fn a_buffer_s_thread_takes_the_ring_0_messages_it_waits_for_in_ring_order() {
+    let host = HelpHost::default();
+    let mut rig = queue_rig(&host);
+    host.answers.store(true, Ordering::SeqCst);
+    wait_control_asleep(&rig);
+    let sent: Vec<u64> = [
+        (RGFX_CMD_BUFFER_AT_OFFSET, object(2)),
+        (RGFX_CMD_EVENT_CREATE, object(3)),
+        (RGFX_CMD_OBJECT_DESTROY, object(2)),
+        (RGFX_CMD_BUFFER_CREATE, object(4)),
+    ]
+    .into_iter()
+    .map(|(r#type, obj)| publish_unrung(&mut rig, object_message(r#type, obj)))
+    .collect();
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    let done = first_queue_completion(&rig).expect("the buffer's thread took ring 0's messages");
+    assert_eq!(done.cb_obj_id, 100);
+
+    let takes = host.takes(&sent);
+    assert_eq!(seqnos(&takes), sent, "{takes:?}");
+    assert!(takes.iter().all(on_queue), "{takes:?}");
+    let ring0 = host.ring0(&sent);
+    assert_eq!(seqnos(&ring0), sent, "{ring0:?}");
+    let seen = host.seen();
+    let buffer = (seen.iter())
+        .position(|s| s.r#type == RGFX_CMD_COMMAND_BUFFER)
+        .expect("the buffer was handed over");
+    let last = (seen.iter())
+        .rposition(|s| s.r#type != RGFX_CMD_COMMAND_BUFFER && sent.contains(&s.seqno))
+        .unwrap();
+    assert!(last < buffer, "{seen:?}");
+    let answers: Vec<u64> = (sent.iter())
+        .map(|_| {
+            let (seqno, status) = rig.complete();
+            assert_eq!(status, RGFX_STATUS_OK);
+            seqno
+        })
+        .collect();
+    assert_eq!(answers, sent);
+    assert_eq!(
+        control_idle(&rig),
+        1,
+        "the buffer's thread cleared consumer_idle"
+    );
+}
+
+/// A command buffer's thread takes only ring-0 messages of a context's lane: at any other, here a
+/// `GET_DISPLAYS`, which the control thread answers itself, it stops and leaves it on the ring,
+/// and the buffer waits; the control thread, woken by the guest's doorbell, takes it and what
+/// follows, so ring 0 is taken, carried out and answered in ring order, whichever thread took each
+/// message.
+#[test]
+fn a_buffer_s_thread_leaves_ring_0_at_a_message_of_no_context_s_lane() {
+    let host = HelpHost::default();
+    let mut rig = queue_rig(&host);
+    host.answers.store(true, Ordering::SeqCst);
+    wait_control_asleep(&rig);
+    let first = publish_unrung(
+        &mut rig,
+        object_message(RGFX_CMD_BUFFER_AT_OFFSET, object(2)),
+    );
+    let displays = publish_unrung(&mut rig, get_displays());
+    let last = publish_unrung(
+        &mut rig,
+        object_message(RGFX_CMD_BUFFER_AT_OFFSET, object(3)),
+    );
+    let sent = [first, displays, last];
+    publish_command_buffer(&rig, QUEUE, 100, 1, true);
+    assert!(
+        eventually(|| host.takes(&sent).len() == 1),
+        "the buffer's thread did not take the create before GET_DISPLAYS"
+    );
+    assert_eq!(rig.complete(), (first, RGFX_STATUS_OK));
+    assert!(
+        rig.quiet_for(50),
+        "GET_DISPLAYS was answered with the control thread asleep"
+    );
+    let takes = host.takes(&sent);
+    assert_eq!(seqnos(&takes), [first], "{takes:?}");
+    assert!(on_queue(&takes[0]), "{takes:?}");
+    assert!(
+        !host
+            .seen()
+            .iter()
+            .any(|s| s.r#type == RGFX_CMD_COMMAND_BUFFER),
+        "the buffer was handed over before GET_DISPLAYS was taken"
+    );
+    assert_eq!(control_idle(&rig), 1);
+
+    rig.device
+        .mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+    let done = first_queue_completion(&rig).expect("the buffer completed");
+    assert_eq!(done.cb_obj_id, 100);
+    let takes = host.takes(&sent);
+    assert_eq!(seqnos(&takes), sent, "{takes:?}");
+    assert_eq!(
+        takes[1].thread.as_deref(),
+        Some("reims-vgpu.graphics-control"),
+        "{takes:?}"
+    );
+    let answer = rig.event().expect("GET_DISPLAYS' answer");
+    let header = RgfxMsgHeader::read_from_prefix(&answer).unwrap().0;
+    assert_eq!((header.r#type, header.seqno), (RGFX_EVT_DISPLAYS, displays));
+    assert_eq!(rig.complete(), (last, RGFX_STATUS_OK));
+    assert_eq!(seqnos(&host.ring0(&sent)), [first, last]);
 }
 
 /// With ring 0's threads holding off, as threads not yet woken, a command buffer's thread carries
@@ -239,10 +423,11 @@ impl Rng {
 }
 
 /// Random runs of a context's ring-0 messages, each followed by a command buffer of its queue,
-/// some of the messages slow, some runs with ring 0's threads holding off until the buffer is
-/// handed over: every message is carried out once, in ring order, and each buffer after every
-/// message published before it. A run of creates and destroys alone is carried out on the
-/// buffer's thread while ring 0's threads hold off. `RGFX_HELP_FUZZ_SEED` sets the seed.
+/// some of the messages slow, some published with no doorbell (left to the buffer's thread or an
+/// awake control thread to take), some runs with ring 0's threads holding off until the buffer is
+/// handed over: every message is taken once and carried out once, in ring order, and each buffer
+/// after every message published before it. A run of creates and destroys alone is carried out on
+/// the buffer's thread while ring 0's threads hold off. `RGFX_HELP_FUZZ_SEED` sets the seed.
 #[test]
 fn buffers_wait_for_their_context_s_messages_over_random_interleavings() {
     let seed = std::env::var("RGFX_HELP_FUZZ_SEED")
@@ -250,6 +435,8 @@ fn buffers_wait_for_their_context_s_messages_over_random_interleavings() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0x6865_6c64);
     let mut rng = Rng(seed);
+    // Which messages ring no doorbell, drawn apart, so `rng`'s runs stay the seed's.
+    let mut unrung = Rng(seed ^ 0x0075_7275_6e67);
     let host = HelpHost::default();
     let mut rig = queue_rig(&host);
     let lanes = Arc::clone(&rig.device.shared.lanes);
@@ -280,7 +467,12 @@ fn buffers_wait_for_their_context_s_messages_over_random_interleavings() {
         let mut sent = Vec::new();
         for r#type in kinds {
             next_obj += 1;
-            let seqno = rig.send(object_message(r#type, object(next_obj)));
+            let message = object_message(r#type, object(next_obj));
+            let seqno = if unrung.below(3) == 0 {
+                publish_unrung(&mut rig, message)
+            } else {
+                rig.send(message)
+            };
             if rng.below(4) == 0 {
                 host.slow.lock().insert(seqno, rng.below(1500));
             }
@@ -310,6 +502,11 @@ fn buffers_wait_for_their_context_s_messages_over_random_interleavings() {
         ring0.iter().map(|s| s.seqno).collect::<Vec<_>>(),
         all,
         "seed {seed:#x}: ring 0's messages out of order, missed or carried out twice"
+    );
+    assert_eq!(
+        seqnos(&host.takes(&all)),
+        all,
+        "seed {seed:#x}: ring 0's messages taken out of order, missed or taken twice"
     );
     let index = |r#type: u32, seqno: u64| {
         (seen.iter())

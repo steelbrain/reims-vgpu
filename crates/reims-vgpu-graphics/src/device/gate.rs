@@ -21,6 +21,13 @@
 //! out itself ([`Lanes::help`](super::lanes::Lanes::help)), it does that in place of sleeping:
 //! its look finds [`Look::Help`], and the wait returns for it to, unfiled, then begins again.
 //!
+//! **Ring 0's messages.** Where the control thread has not taken every message the thread waits
+//! for and no thread takes ring 0, the thread takes them itself, in ring order, as the control
+//! thread would ([`Shared::take_for`](super::Shared::take_for)), in place of sleeping until the
+//! control thread is woken: its look finds [`Look::Take`], and the wait returns for it to,
+//! unfiled, then begins again. Where it stops short, at a message it leaves to the control
+//! thread, it waits for the control thread's count.
+//!
 //! **An offer.** A queue's thread that waits with a `COMMAND_BUFFER` taken files it with itself
 //! ([`Offer`], [`Gate::wait_offering`]). A lane whose move ends the wait offers the buffer to the
 //! host on its own thread before it wakes the waiting one ([`Gate::carried_out_offering`]), so a
@@ -165,6 +172,10 @@ pub(super) enum Look {
     /// Its context's lane holds a job it waits for that the thread may carry out itself
     /// ([`Lanes::help`](super::lanes::Lanes::help)): it goes to do so, then waits again.
     Help,
+    /// The control thread has not taken every message it waits for, and no thread takes ring 0:
+    /// it goes to take them itself ([`Shared::take_for`](super::Shared::take_for)), then waits
+    /// again.
+    Take,
     /// It waits no more.
     Done,
 }
@@ -176,6 +187,8 @@ pub(super) enum Waited {
     Done,
     /// It has a job of its context's lane to carry out, and then waits again ([`Look::Help`]).
     Help,
+    /// It has ring 0's messages to take, and then waits again ([`Look::Take`]).
+    Take,
 }
 
 impl Gate {
@@ -206,6 +219,7 @@ impl Gate {
             let filed = match look() {
                 Look::Done => return Waited::Done,
                 Look::Help => return Waited::Help,
+                Look::Take => return Waited::Take,
                 Look::Count(count) => {
                     let key = (count, state.next);
                     state.counts.insert(key, file());
