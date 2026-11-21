@@ -41,7 +41,8 @@ conventions the code follows.
 
 **The codebase is its own reference.** Its unit tests record what it does.
 Every merge ends green: the merged tree passes what the tree before it
-passed. A change meant to alter behaviour changes the tests that hold the
+passed, except the Windows tests on the mini, which never hold a merge
+("Landing work"). A change meant to alter behaviour changes the tests that hold the
 old behaviour in the same commit, and the diff is reviewed with the change.
 
 ## Start here
@@ -295,6 +296,11 @@ Three tiers:
   branch's merges.
 - When a batch fails, take the failing lane out and run the rest as the next
   batch; the lane rejoins once fixed.
+- **The Windows tests never hold a merge.** homelab-mac-mini-2018's UHD 630
+  is the one Windows GPU, so a batch whose other checks pass merges without
+  waiting for its Windows tests there. They run after the merge, and what
+  they find is fixed forward on the integration branch. No lane holds other
+  work for a slot on the mini.
 - Log each lane's finish and merge times in the checklist file. If a finished
   lane waits more than one pipeline run for its own run to start, fix the
   pipeline before starting more lanes.
