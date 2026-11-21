@@ -60,14 +60,27 @@
 //! pipeline cache blob's among them, [`CACHE_BYTES_WRITTEN_CODE`] (`Metrics::cache_bytes_written`),
 //! as amounts: rt counts the writes it kept by their bytes alone.
 //!
+//! **Its translations.** Beside the cache's bytes the counts line carries, as amounts, the
+//! functions rt's translator lowered, [`TRANSLATIONS_CODE`] (`Metrics::translations`), and the
+//! lowered kernels pipeline states took from the cache directory in their stead,
+//! [`TRANSLATIONS_LOADED_CODE`] (`Metrics::translations_loaded`), and the most bytes of the
+//! device's pipeline cache blob, [`PIPELINE_CACHE_MOST_CODE`] (below), so that a boot's reader can
+//! tell a boot on a cold directory, which lowers what a warm one loads, and set the bytes it wrote
+//! beside its blob's size. The counts line carries only the codes counted above zero, so an absent
+//! code reads as 0.
+//!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
 //! the texture blocks held whole (`texture_block_held_bytes`), and the Private blocks taken and
-//! not given back (`private_take_bytes`). A gauge rises and falls, so the counts line carries the
-//! highest each reached at a look, `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to
-//! it ([`note_gauges`]). The counts' fold looks ([`fold_metrics`]), and so does the gauges' thread
-//! where it runs (`super::gauge_log`, every 5 s).
+//! not given back (`private_take_bytes`). A fifth is the size of the data in the device's
+//! `VkPipelineCache` (`pipeline_cache_bytes`), which rt measures when its reaper last looked, once
+//! creation was quiet, and which falls when the reaper replaces a cache past 32 MiB with a fresh
+//! one. A gauge rises and falls, so the counts line carries the highest each reached at a look,
+//! `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it ([`note_gauges`]). The counts'
+//! fold looks ([`fold_metrics`]), and so does the gauges' thread where it runs
+//! (`super::gauge_log`, every 5 s): a value rt held between two looks, the blob's among them,
+//! is not seen.
 
 use std::sync::{Arc, OnceLock};
 
@@ -137,6 +150,14 @@ pub const CACHE_WRITES_DROPPED_CODE: &str = "rt-cache-writes-dropped";
 /// amount on the counts line ([`fold_metrics`]).
 pub const CACHE_BYTES_WRITTEN_CODE: &str = "rt-cache-bytes-written";
 
+/// The code of the functions rt's translator lowered (`Metrics::translations`), an amount on the
+/// counts line ([`fold_metrics`]).
+pub const TRANSLATIONS_CODE: &str = "rt-translations";
+
+/// The code of the lowered kernels pipeline states took from rt's cache directory in place of a
+/// lowering (`Metrics::translations_loaded`), an amount on the counts line ([`fold_metrics`]).
+pub const TRANSLATIONS_LOADED_CODE: &str = "rt-translations-loaded";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -153,8 +174,13 @@ pub const TEXTURE_BLOCK_HELD_MOST_CODE: &str = "rt-texture-block-held-bytes-most
 /// (`Gauges::private_take_bytes`, [`note_gauges`]).
 pub const PRIVATE_TAKE_MOST_CODE: &str = "rt-private-take-bytes-most";
 
+/// The code of the most bytes of data in the device's `VkPipelineCache` at a look
+/// (`Gauges::pipeline_cache_bytes`, [`note_gauges`]): rt's size of it when its reaper last looked,
+/// read only at the looks.
+pub const PIPELINE_CACHE_MOST_CODE: &str = "rt-pipeline-cache-bytes-most";
+
 /// The gauges the counts line carries at their highest ([`highest_gauges`]).
-const HIGHEST_GAUGES: usize = 4;
+const HIGHEST_GAUGES: usize = 5;
 
 /// The highest of each of [`highest_gauges`]'s gauges a look saw, in its order, over the
 /// process's devices.
@@ -166,8 +192,9 @@ static GAUGES_HIGHEST: crate::core::sync::Mutex<[u64; HIGHEST_GAUGES]> =
 pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 
 /// The metrics the counts line carries ([`folded_counts`]): the over-copy metrics, then the
-/// command buffers held for room, the cache writes dropped and the cache bytes written.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 3;
+/// command buffers held for room, the cache writes dropped, the cache bytes written, the
+/// translations and the translations loaded.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 5;
 
 /// The counters of the device the process made last ([`open`]), which [`fold_metrics`] reads,
 /// with what it folded so far of each of their metrics, in [`folded_counts`]'s order.
@@ -177,9 +204,9 @@ type Folding = Option<(rt::Counters, [u64; FOLDED_METRICS])>;
 static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::new(None);
 
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
-/// device, its command buffers held for room and its cache writes rose by since the last fold
-/// ([`folded_counts`]), so the counts line carries their totals, then looks at its gauges
-/// ([`note_gauges`]) (the module's docs). Nothing before the device is made.
+/// device, its command buffers held for room, its cache writes and its translations rose by since
+/// the last fold ([`folded_counts`]), so the counts line carries their totals, then looks at its
+/// gauges ([`note_gauges`]) (the module's docs). Nothing before the device is made.
 pub fn fold_metrics() {
     let gauges = {
         let mut latest = COUNTERS.lock();
@@ -201,14 +228,16 @@ pub(super) fn note_gauges(g: &rt::Gauges) {
 
 /// The gauges of `g` the counts line carries at their highest, each with its code: the
 /// preprocess regions used ([`PREPROCESS_USED_MOST_CODE`]) and idle
-/// ([`PREPROCESS_IDLE_MOST_CODE`]), the texture blocks held ([`TEXTURE_BLOCK_HELD_MOST_CODE`])
-/// and the Private blocks taken ([`PRIVATE_TAKE_MOST_CODE`]).
+/// ([`PREPROCESS_IDLE_MOST_CODE`]), the texture blocks held ([`TEXTURE_BLOCK_HELD_MOST_CODE`]),
+/// the Private blocks taken ([`PRIVATE_TAKE_MOST_CODE`]) and the pipeline cache's data
+/// ([`PIPELINE_CACHE_MOST_CODE`]).
 fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
     [
         (PREPROCESS_USED_MOST_CODE, g.preprocess_used_bytes),
         (PREPROCESS_IDLE_MOST_CODE, g.preprocess_idle_bytes),
         (TEXTURE_BLOCK_HELD_MOST_CODE, g.texture_block_held_bytes),
         (PRIVATE_TAKE_MOST_CODE, g.private_take_bytes),
+        (PIPELINE_CACHE_MOST_CODE, g.pipeline_cache_bytes),
     ]
 }
 
@@ -238,14 +267,17 @@ fn follow(counters: rt::Counters) {
 
 /// The metrics of `m` the counts line carries, each with its code: the over-copy metrics
 /// ([`over_copy_counts`]), then the command buffers held for room ([`HELD_FOR_ROOM_CODE`]), the
-/// cache writes dropped ([`CACHE_WRITES_DROPPED_CODE`]) and the cache bytes written
-/// ([`CACHE_BYTES_WRITTEN_CODE`]).
+/// cache writes dropped ([`CACHE_WRITES_DROPPED_CODE`]), the cache bytes written
+/// ([`CACHE_BYTES_WRITTEN_CODE`]), the translations ([`TRANSLATIONS_CODE`]) and the translations
+/// loaded ([`TRANSLATIONS_LOADED_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
         (HELD_FOR_ROOM_CODE, m.held_for_room),
         (CACHE_WRITES_DROPPED_CODE, m.cache_writes_dropped),
         (CACHE_BYTES_WRITTEN_CODE, m.cache_bytes_written),
+        (TRANSLATIONS_CODE, m.translations),
+        (TRANSLATIONS_LOADED_CODE, m.translations_loaded),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -1681,7 +1713,8 @@ mod tests {
     /// Each fold counts what each over-copy metric rose by since the last, under its code, so the
     /// counts line carries the metrics' totals: the over-copies and their bytes, those over an
     /// imported block, and each cause's, by the cause's name; and after them the command buffers
-    /// held for room, the cache writes dropped and the cache bytes written.
+    /// held for room, the cache writes dropped, the cache bytes written, the translations and the
+    /// translations loaded.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -1698,6 +1731,8 @@ mod tests {
             HELD_FOR_ROOM_CODE,
             CACHE_WRITES_DROPPED_CODE,
             CACHE_BYTES_WRITTEN_CODE,
+            TRANSLATIONS_CODE,
+            TRANSLATIONS_LOADED_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -1716,6 +1751,7 @@ mod tests {
         m.held_for_room = 2;
         m.cache_writes_dropped = 1;
         m.cache_bytes_written = 65_536;
+        m.translations = 7;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -1725,13 +1761,17 @@ mod tests {
         m.held_for_room = 5;
         m.cache_writes_dropped = 3;
         m.cache_bytes_written = 98_304;
+        m.translations = 9;
+        m.translations_loaded = 4;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
         assert_eq!(
             rose,
-            [3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304]
+            [
+                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4
+            ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
         let unique: std::collections::BTreeSet<&str> = named.iter().copied().collect();
@@ -1742,16 +1782,18 @@ mod tests {
         );
     }
 
-    /// Four of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by its
+    /// Five of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by its
     /// rise over the highest a look saw, so that one that falls leaves its count as it was and
-    /// one that rises past it raises it.
+    /// one that rises past it raises it, the pipeline cache's data falling as its reaper replaces
+    /// a full cache with a fresh one.
     #[test]
-    fn four_gauges_count_at_their_highest() {
+    fn five_gauges_count_at_their_highest() {
         let codes = [
             PREPROCESS_USED_MOST_CODE,
             PREPROCESS_IDLE_MOST_CODE,
             TEXTURE_BLOCK_HELD_MOST_CODE,
             PRIVATE_TAKE_MOST_CODE,
+            PIPELINE_CACHE_MOST_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -1763,13 +1805,17 @@ mod tests {
         g.preprocess_idle_bytes = 64 << 20;
         g.texture_block_held_bytes = 48 << 20;
         g.private_take_bytes = 16 << 20;
+        g.pipeline_cache_bytes = 30 << 20;
         let mut highest = [0; HIGHEST_GAUGES];
         raise_to(&mut highest, highest_gauges(&g));
         g.preprocess_used_bytes = 12 << 20;
         g.preprocess_idle_bytes = 0;
         g.texture_block_held_bytes = 32 << 20;
+        g.pipeline_cache_bytes = 1 << 20;
         raise_to(&mut highest, highest_gauges(&g));
-        assert_eq!(highest, [12 << 20, 64 << 20, 48 << 20, 16 << 20]);
+        g.pipeline_cache_bytes = 31 << 20;
+        raise_to(&mut highest, highest_gauges(&g));
+        assert_eq!(highest, [12 << 20, 64 << 20, 48 << 20, 16 << 20, 31 << 20]);
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
         assert_eq!(rose, highest);

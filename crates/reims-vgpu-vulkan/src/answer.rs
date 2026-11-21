@@ -378,8 +378,8 @@ static COUNTS_WRITTEN: crate::core::sync::Mutex<String> =
 /// log's count of the lines it wrote at debug after their kind's first
 /// ([`crate::core::logging::write_repeats`]). A device's reset and the process's exit write them
 /// (`reims-vgpu`'s reset, [`crate::exit_gate`]). The rt platform's over-copy amounts, its
-/// command buffers held for room, its cache writes and four of its gauges at their highest are
-/// folded into the counts first (`rt_platform::device::fold_metrics`).
+/// command buffers held for room, its cache writes, its translations and five of its gauges at
+/// their highest are folded into the counts first (`rt_platform::device::fold_metrics`).
 pub fn write_counts() {
     crate::core::logging::write_repeats();
     {
