@@ -443,7 +443,7 @@ impl DeviceLoss {
 static SAID_LOST: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Writes a lost device's `line` on stderr, as the platform's other degradation lines
-/// (`super::unbuilt`); a test reads them ([`SAID_LOST`]).
+/// (`super::unbuilt`); a test reads them (`SAID_LOST`).
 fn say_lost(line: &str) {
     super::unbuilt::say(line);
     #[cfg(test)]
