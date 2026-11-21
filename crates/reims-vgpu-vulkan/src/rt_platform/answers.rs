@@ -175,6 +175,9 @@ pub struct Facts {
     pub linear_alignment_largest: u64,
     /// rt's `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8; none where rt refuses it.
     pub linear_alignment_bgra8: Option<u64>,
+    /// rt's floor's `maxIndirectCommandsTokenCount`, where the device enables
+    /// `VK_EXT_device_generated_commands` (`super::icb`); none where it does not.
+    pub indirect_tokens: Option<u32>,
 }
 
 /// The registry ID the rt platform gives the device of `uuid`, its `deviceUUID`: its two halves'
@@ -413,6 +416,7 @@ pub(crate) mod tests {
             },
             linear_alignment_largest: 16,
             linear_alignment_bgra8: Some(16),
+            indirect_tokens: Some(128),
         }
     }
 

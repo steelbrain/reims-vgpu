@@ -18,11 +18,17 @@
 //! - **Nothing to record**: `optimizeContentsFor{CPU,GPU}Access:` (rt lays a texture out one way,
 //!   and Metal's optimize changes no texel), and `invalidateCompressedTexture:` (rt keeps no
 //!   lossless compression whose contents an invalidate would drop).
+//! - **Indirect command buffers** (`super::icb`): a reset of a range of commands
+//!   (`resetCommandsInBuffer:withRange:`) is rt's, each command then drawing nothing; an optimize
+//!   (`optimizeIndirectCommandBuffer:withRange:`) and a synchronize of one are rt's, which record
+//!   nothing. A range past the buffer's commands is rt's refusal of Metal's
+//!   (`Refusal::CommandRange`), counted (`rt-refused-metal`), and so is one past 32 bits.
 //! - **Unbuilt**: a fill of a texture with bytes ([`Unbuilt::FillTexture`]); a fill of a
 //!   texture with a colour, a fill of a buffer with a 4-byte pattern of more than one byte value,
 //!   a copy between textures with blit options, and a copy between a buffer and a texture with
 //!   blit options other than one plane's (`MTLBlitOptionRowLinearPVRTC`, as rt makes no PVRTC
-//!   texture, or more than one option) ([`Unbuilt::Blit`]). Each encodes nothing, counted.
+//!   texture, or more than one option) ([`Unbuilt::Blit`]); a copy between indirect command
+//!   buffers ([`Unbuilt::Icb`]). Each encodes nothing, counted.
 //! - **The guest's RAM** is copied by no blit: the device copies none
 //!   (`GpuDevice::copies_guest_ram`), so each copy of it answers false.
 //!
@@ -659,12 +665,17 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
                 counts,
             )?;
         }
-        BlitCmd::CopyIndirectCommandBuffer { source, .. } => source.unreachable(),
+        BlitCmd::CopyIndirectCommandBuffer { .. } => return Err(Stop::Unbuilt(Unbuilt::Icb)),
         BlitCmd::OptimizeIndirectCommandBuffer {
             indirect_command_buffer,
-            ..
-        } => indirect_command_buffer.unreachable(),
-        BlitCmd::ResetCommandsInBuffer { buffer, .. } => buffer.unreachable(),
+            range,
+        } => {
+            let range = super::icb::commands(range)?;
+            e.optimize_indirect_command_buffer(indirect_command_buffer.rt(), range)?;
+        }
+        BlitCmd::ResetCommandsInBuffer { buffer, range } => {
+            e.reset_commands_in_buffer(buffer.rt(), super::icb::commands(range)?)?;
+        }
         BlitCmd::FillBufferPattern4 {
             buffer,
             range,
@@ -701,7 +712,9 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             Some(ResourceRef::Texture(texture)) => {
                 e.synchronize_resource(rt::Resource::Texture(texture.rt()))?;
             }
-            Some(ResourceRef::Icb(icb)) => icb.unreachable(),
+            Some(ResourceRef::Icb(icb)) => {
+                e.synchronize_resource(rt::Resource::IndirectCommandBuffer(icb.rt()))?;
+            }
         },
         BlitCmd::SynchronizeTexture { texture, .. } => {
             e.synchronize_resource(rt::Resource::Texture(texture.rt()))?;

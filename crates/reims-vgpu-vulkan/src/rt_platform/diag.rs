@@ -952,6 +952,12 @@ pub const SURFACE_PLANE_COPY_BYTES_CODE: &str = "rt-surface-plane-copy-bytes";
 /// The refusals of rt's gaps by kind.
 static GAPS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
+/// For the tests: the refusals of rt's gaps counted under `name` ([`refusal_name`]).
+#[cfg(test)]
+pub(crate) fn gaps_named(name: &str) -> u64 {
+    GAPS.lock().get(name).copied().unwrap_or(0)
+}
+
 /// The refusals of Metal's that rt answers, its limits, and the translator's refusals, by variant.
 static REFUSALS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
@@ -969,17 +975,21 @@ pub fn refusal(error: &rt::Error) {
     *map.lock().entry(name).or_insert(0) += 1;
 }
 
-/// The kind [`refusal`] counts rt's `error` under: a gap's kind, a draw's `Draw-<kind>`, a
-/// refusal of Metal's `Refused-<variant>`, a limit `Limit-<variant>`, and the translator's
-/// `Translation-<feature>`, the variant of the feature it refused, or of its error where it
-/// refused no feature (`Translation-InvalidInput`); `None` for any other error. Each is a variant's
-/// name alone, no name of the guest's.
+/// The kind [`refusal`] counts rt's `error` under: a gap's kind, a draw's `Draw-<kind>`, a linear
+/// plane pass's `LinearPlanePass-<kind>`, an indirect command buffer's
+/// `IndirectCommandBuffers-<kind>`, a refusal of Metal's `Refused-<variant>`, a limit
+/// `Limit-<variant>`, and the translator's `Translation-<feature>`, the variant of the feature it
+/// refused, or of its error where it refused no feature (`Translation-InvalidInput`); `None` for
+/// any other error. Each is a variant's name alone, no name of the guest's.
 pub fn refusal_name(error: &rt::Error) -> Option<String> {
     use metal2vulkan::error::Error as Translator;
     Some(match error {
         rt::Error::Unsupported(rt::Gap::Draw { kind }) => format!("Draw-{kind:?}"),
         rt::Error::Unsupported(rt::Gap::LinearPlanePass { kind }) => {
             format!("LinearPlanePass-{kind:?}")
+        }
+        rt::Error::Unsupported(rt::Gap::IndirectCommandBuffers { kind }) => {
+            format!("IndirectCommandBuffers-{kind:?}")
         }
         rt::Error::Unsupported(gap) => variant(&format!("{gap:?}")).to_owned(),
         rt::Error::Refused(r) => format!("Refused-{}", variant(&format!("{r:?}"))),
@@ -2761,10 +2771,10 @@ mod tests {
         assert!(line.contains(shown), "{line}");
     }
 
-    /// A gap is counted by its kind, a draw's by its draw kind and a linear plane pass's by its
-    /// shape, a refusal of Metal's and a limit by their variant, and the translator's by the
-    /// feature it refused, else its error's variant, with no name of the guest's; another error is
-    /// not.
+    /// A gap is counted by its kind, a draw's by its draw kind, a linear plane pass's by its shape
+    /// and an indirect command buffer's by its kind, a refusal of Metal's and a limit by their
+    /// variant, and the translator's by the feature it refused, else its error's variant, with no
+    /// name of the guest's; another error is not.
     #[test]
     fn refusals_count_by_kind() {
         use metal2vulkan::error::{
@@ -2776,6 +2786,9 @@ mod tests {
         refusal(&rt::Error::Unsupported(rt::Gap::CubicSampler));
         refusal(&rt::Error::Unsupported(rt::Gap::LinearPlanePass {
             kind: rt::LinearPlanePassKind::DepthStencil,
+        }));
+        refusal(&rt::Error::Unsupported(rt::Gap::IndirectCommandBuffers {
+            kind: rt::IndirectCommandsKind::Tokens,
         }));
         refusal(&rt::Error::Refused(rt::Refusal::BufferTooLong {
             length: 8,
@@ -2801,6 +2814,10 @@ mod tests {
         assert!(gaps.get("CubicSampler").is_some_and(|&n| n >= 1));
         assert!(
             gaps.get("LinearPlanePass-DepthStencil")
+                .is_some_and(|&n| n >= 1)
+        );
+        assert!(
+            gaps.get("IndirectCommandBuffers-Tokens")
                 .is_some_and(|&n| n >= 1)
         );
         drop(gaps);

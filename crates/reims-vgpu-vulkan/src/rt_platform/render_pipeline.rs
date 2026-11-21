@@ -12,7 +12,8 @@
 //!   (`rt-refused-metal`). So does a function made unspecialized that declares function constants,
 //!   as a compute state's kernel does. The display's value is its two functions and colour 0's
 //!   format. Its label is not rt's, and neither is its resource index, which a state answers only
-//!   where it supports indirect command buffers, which rt's states never do.
+//!   where it supports indirect command buffers: rt's commands set no pipeline state of their own
+//!   (`super::icb`).
 //! - **A layout the value does not set is none**: the guest's bundle sends a vertex descriptor's
 //!   layouts of a stride other than 0, Metal's default, and an attribute of a buffer with none is
 //!   Metal's assertion ("references a buffer ... that has no stride"), which the translator
@@ -420,7 +421,8 @@ fn make(
 }
 
 impl RenderPipeline for RtObj<RtRenderPipeline> {
-    /// 0: rt makes no state for indirect command buffers.
+    /// 0: rt's indirect commands set no pipeline state of their own (`super::icb`), so no shader
+    /// reaches a state through it.
     fn gpu_resource_id(&self) -> u64 {
         crate::recorder::plain_resource_id(self, || 0)
     }

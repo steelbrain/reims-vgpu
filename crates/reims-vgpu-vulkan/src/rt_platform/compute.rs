@@ -150,14 +150,12 @@ impl RtComputeEncoder {
             ComputeCmd::EndEncoding
             | ComputeCmd::CompressedTextureReinterpretationFlush
             | ComputeCmd::SetImageblockWidth { .. } => {}
-            ComputeCmd::ExecuteCommandsIndirect {
-                indirect_commandbuffer,
-                ..
-            } => indirect_commandbuffer.unreachable(),
-            ComputeCmd::ExecuteCommandsInBuffer {
-                indirect_command_buffer,
-                ..
-            } => indirect_command_buffer.unreachable(),
+            ComputeCmd::ExecuteCommandsIndirect { .. }
+            | ComputeCmd::ExecuteCommandsInBuffer { .. } => {
+                return Err(Stop::Metal(
+                    "an indirect command buffer of draws executed in a compute encoder",
+                ));
+            }
             ComputeCmd::MemoryBarrierWithResources { .. }
             | ComputeCmd::MemoryBarrierWithScope { .. } => e.memory_barrier(),
             ComputeCmd::SetBufferOffset { offset, index }
@@ -342,7 +340,7 @@ pub(super) fn declared<'r>(
             kept.reads().note(t.index_use());
             rt::Resource::Texture(t.rt())
         }
-        ResourceRef::Icb(icb) => icb.unreachable(),
+        ResourceRef::Icb(icb) => rt::Resource::IndirectCommandBuffer(icb.rt()),
     }
 }
 

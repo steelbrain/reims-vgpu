@@ -94,7 +94,8 @@
 //!   submissions itself, so `set_completion_joins_next` keeps the trait's default: never marked.
 //!   A command buffer is kept whole ([`KeptWhole`], in its order) while an encoder is open, under
 //!   protection options or once an encoder was made under them, once it signals an event as it
-//!   is scheduled, and once committed. rt builds no indirect command buffer, rate map, residency
+//!   is scheduled, and once committed. rt's indirect command buffers are read by the GPU as an
+//!   execution runs, whichever part holds it (`super::icb`), and rt builds no rate map, residency
 //!   or command predication, so no other reason holds; and it notes no way Metal's GPU fails a
 //!   command buffer from an encoder on, so `commit_part` never answers [`PartCut::Fails`] and
 //!   `fold`, the Vulkan platform's with nothing noted, lets the later part go. The guest buffer's
@@ -762,7 +763,8 @@ impl RtCommandBuffer {
             KeptWhole::ProtectionOptions => protection,
             KeptWhole::ScheduledSignal => scheduled_signal,
             KeptWhole::Committed => committed,
-            // rt builds no indirect command buffer, rate map, residency or command predication.
+            // The GPU reads rt's indirect command buffers as an execution runs, and rt builds no
+            // rate map, residency or command predication.
             KeptWhole::Execution | KeptWhole::Progress | KeptWhole::Predication => false,
         };
         KeptWhole::ALL.into_iter().find(|&reason| holds(reason))

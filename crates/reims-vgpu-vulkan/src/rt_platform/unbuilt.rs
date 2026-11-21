@@ -98,8 +98,11 @@ pub enum Unbuilt {
     /// Rasterization rate maps, their descriptors and layers: rt has none. A layer's creation
     /// answers nil, and a descriptor keeps no layer.
     RateMap,
-    /// Indirect command buffers, and the reservation of their resource indices (type 5): rt has
-    /// none. A creation answers nil.
+    /// What of indirect command buffers rt does not build (`super::icb`): commands the CPU
+    /// encodes (`indirectRenderCommandAtIndex:`, `indirectComputeCommandAtIndex:`), which answer
+    /// nil; a CPU reset (`resetWithRange:`), which resets nothing; a blit's copy between buffers,
+    /// which encodes nothing; a buffer of a resource index, which answers nil; and the
+    /// reservation of their resource indices (type 5), which reserves nothing.
     Icb,
     /// Dynamic libraries (`newDynamicLibrary:error:`): rt has none. A creation answers nil.
     DynamicLibrary,
@@ -175,7 +178,7 @@ impl Unbuilt {
             Unbuilt::Blit => "a colour fill, a pattern fill or a copy with blit options",
             Unbuilt::RenderPass => "a render pass's memory lengths, tiles or samples",
             Unbuilt::RateMap => "a rasterization rate map",
-            Unbuilt::Icb => "an indirect command buffer",
+            Unbuilt::Icb => "an indirect command buffer's CPU encode, reset, copy or index",
             Unbuilt::DynamicLibrary => "a dynamic library",
             Unbuilt::ResourceType => "a reservation of resource indices of another type",
             Unbuilt::TessellationFactorScale => "a tessellation factor scale other than 1",

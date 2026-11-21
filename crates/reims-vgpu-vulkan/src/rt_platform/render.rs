@@ -20,6 +20,19 @@
 //!   `setVertexBuffers:offsets:attributeStrides:withRange:`) bind as the calls without them: only a
 //!   layout of `MTLBufferLayoutStrideDynamic` reads a stride, and rt refuses such a state as it is
 //!   made.
+//! - **Executions of an indirect command buffer** (`executeCommandsInBuffer:withRange:`, and
+//!   `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:` of a range the GPU reads from
+//!   the buffer as the execution runs) are rt's (`super::icb`): each command draws with the
+//!   encoder's pipeline state and render states and the buffers the command's encoding bound, and
+//!   the command buffer keeps the buffer's records, and a range buffer, until it retires. Without
+//!   a pipeline state set it is Metal's refusal, as a draw is; rt refuses a range past the
+//!   buffer's commands and a range buffer's offset that is not a multiple of 4 or without 8
+//!   bytes after it (`Refusal::CommandRange`), counted (`rt-refused-metal`), and a state made
+//!   without `supportIndirectCommandBuffers` or one whose commands carry more buffer slots than
+//!   rt's push range holds or the device's tokens take (`Gap::IndirectCommandBuffers`, the
+//!   module `super::icb`'s "The commands' slots"), counted (`rt-refused-gap`), each drawing
+//!   nothing. The first line of each kind of rt's refusals of an execution names the buffer's
+//!   bind counts and the device's tokens (`super::icb::ExecutionDetail`).
 //! - **`useResources:`** in each form is rt's `use_resource` of each resource it names but nil, as
 //!   the compute encoder's is (`super::compute`): the command buffer keeps the resource until it
 //!   retires, and rt records nothing. A tiled texture it names is a use of it (`super::tiled`), and
@@ -57,8 +70,9 @@
 //! - **Metal's refusals**, each encoding nothing, counted (`rt-refused-metal`): a draw with no
 //!   pipeline state set, or with nil set since; a value no Metal enumeration has (a primitive,
 //!   index or fill type, a cull mode, a winding, a depth clip mode, a store action, a visibility
-//!   result mode, a resource usage); an index, a count or a base past rt's 32 bits; a list of
-//!   another length than its range; and a command after `endEncoding`.
+//!   result mode, a resource usage); an index, a count or a base past rt's 32 bits, and a range
+//!   of commands past them; a list of another length than its range; and a command after
+//!   `endEncoding`.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
 //! before the refused one are bound.
@@ -396,12 +410,21 @@ impl RtRenderEncoder {
             | RenderCmd::SetTileTextures { .. } => {}
             RenderCmd::ExecuteCommandsIndirect {
                 indirect_commandbuffer,
-                ..
-            } => indirect_commandbuffer.unreachable(),
+                indirect_range_buffer,
+                indirect_buffer_offset,
+            } => {
+                set(*pipeline)?;
+                let (commands, ranges) = (indirect_commandbuffer.rt(), indirect_range_buffer.rt());
+                e.execute_commands_in_buffer_with_range(commands, ranges, indirect_buffer_offset)?;
+            }
             RenderCmd::ExecuteCommandsInBuffer {
                 indirect_command_buffer,
-                ..
-            } => indirect_command_buffer.unreachable(),
+                execution_range,
+            } => {
+                set(*pipeline)?;
+                let range = super::icb::commands(execution_range)?;
+                e.execute_commands_in_buffer(indirect_command_buffer.rt(), range)?;
+            }
             RenderCmd::MemoryBarrierWithScope { .. } => e.memory_barrier()?,
             RenderCmd::SetBlendColorRed {
                 red,
@@ -647,6 +670,22 @@ fn drawn_primitive(cmd: &RenderCmd<'_, RtPlatform>) -> Option<u64> {
     }
 }
 
+/// What an execution `cmd` asks of rt ([`super::icb::ExecutionDetail`]), for the process's first
+/// line of each kind of rt's refusals of one; none for a command other than an execution.
+fn execution(cmd: &RenderCmd<'_, RtPlatform>) -> Option<super::icb::ExecutionDetail> {
+    match cmd {
+        RenderCmd::ExecuteCommandsInBuffer {
+            indirect_command_buffer: icb,
+            ..
+        }
+        | RenderCmd::ExecuteCommandsIndirect {
+            indirect_commandbuffer: icb,
+            ..
+        } => Some(*icb.detail()),
+        _ => None,
+    }
+}
+
 /// What a draw asked of rt, for the process's first line of each kind of rt's refusals of it
 /// (`super::unbuilt::refusal_detail`), as structure alone: its primitive type (Metal's number;
 /// none for a command other than a draw of one) and the rasterization fields of the pipeline
@@ -877,6 +916,7 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             let ending = matches!(cmd, RenderCmd::EndEncoding);
             note_copies(self.kept.copies(), &cmd);
             let primitive = drawn_primitive(&cmd);
+            let execution = execution(&cmd);
             let mut open = self.open.lock();
             if let Some(names) = open.naming.names() {
                 note_names(names, &cmd);
@@ -892,6 +932,17 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
                     rt::DrawKind::FetchedAttachment => self.fetched_attachment(&open.seen),
                     _ => {}
                 }
+            }
+            let icb_gap = |error: &rt::Error| {
+                matches!(
+                    error,
+                    rt::Error::Unsupported(rt::Gap::IndirectCommandBuffers { .. })
+                )
+            };
+            if let (Some(Stop::Rt(error)), Some(what)) = (&stopped, &execution)
+                && icb_gap(error)
+            {
+                super::unbuilt::refusal_detail(sel, error, Some(what));
             }
             if ending && let Some(e) = open.rt.take() {
                 e.end_encoding();
@@ -925,18 +976,23 @@ mod tests {
     use crate::core::num::ToU64 as _;
     use crate::core::platform::Platform as _;
     use crate::core::platform::blit::ResourceRef;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
     use crate::core::platform::descriptor::RenderPassDescriptor as _;
     use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::icb::IndirectCommandBuffer as _;
     use crate::core::platform::resource::{Buffer as _, Library as _, Texture as _};
     use crate::core::platform::types::{ClearColor, CommandBufferStatus, MtlSize, NsRange};
+    use crate::core::platform::values::IcbDesc;
     use crate::core::platform::values::{
         AttributeDesc, BufferLayoutDesc, ColorAttachmentDesc, ColorAttachmentSet,
         FullRenderPipelineDesc, PassSet, TextureDesc, VertexDesc,
     };
     use crate::rt_platform::unbuilt::RtRefusal;
-    use crate::rt_platform::{PassFields, RtCommandBuffer, RtDevice, RtFunction, RtTexture};
+    use crate::rt_platform::{
+        PassFields, RtCommandBuffer, RtComputePipeline, RtDevice, RtFunction, RtIcb, RtTexture,
+    };
 
     /// A vertex function fed through a vertex descriptor: attribute 0 a `float2` position, 1 a
     /// normalized `uchar4` colour.
@@ -957,6 +1013,16 @@ mod tests {
 
     /// A kernel that writes each texel of texture 0 its grid reaches (`tex_write`).
     const TEXWRITE: &[u8] = include_bytes!("../../../../tests/shaders/compute_texwrite.metallib");
+
+    /// Kernels that encode indexed triangles into the indirect command buffer whose
+    /// `gpuResourceID` buffer 0 holds, command `tid` drawing the three 16-bit indices of buffer 3
+    /// from `3 * tid` with the `float4` positions of buffer 1 at vertex buffer 0 and its own
+    /// `float4` colour of buffer 2 at fragment buffer 0 (`icb_encode`), and at vertex buffers 0 to
+    /// 28 (`icb_encode_wide`); vertex functions that place each vertex at its position read from
+    /// vertex buffer 0 (`icb_vertex`) or as the sum of buffers 0 to 27 (`icb_vertex_28`) or 0 to
+    /// 28 (`icb_vertex_29`); and a fragment function that returns the colour at fragment buffer 0
+    /// (`icb_fragment`).
+    const ICB: &[u8] = include_bytes!("../../../../tests/shaders/icb_indexed.metallib");
 
     /// `MTLPrimitiveTypeTriangle`.
     const TRIANGLE: u64 = 3;
@@ -1926,5 +1992,426 @@ mod tests {
             }
         }
         eprintln!("the pixel formats a declared write refused draws after: {refused:?}");
+    }
+
+    /// `MTLIndirectCommandTypeDrawIndexed`.
+    const DRAW_INDEXED: u64 = 2;
+
+    /// A descriptor of indexed draws that inherit the pipeline state and bind `vertex` vertex
+    /// buffers and one fragment buffer each.
+    fn icb_desc(vertex: u64) -> IcbDesc {
+        IcbDesc {
+            command_types: DRAW_INDEXED,
+            inherit_pipeline_state: true,
+            max_vertex_buffer_bind_count: vertex,
+            max_fragment_buffer_bind_count: 1,
+            ..IcbDesc::default()
+        }
+    }
+
+    /// `device`'s `maxIndirectCommandsTokenCount`, rt's floor's reading of it; `None` on a device
+    /// without `VK_EXT_device_generated_commands`.
+    fn tokens(device: &RtObj<RtDevice>) -> Option<u32> {
+        device.facts().indirect_tokens
+    }
+
+    /// The state of `vertex` and `icb_fragment` on `device` into one `RGBA8Unorm` colour
+    /// attachment, made for indirect command buffers where `flagged`.
+    fn icb_state(device: &RtObj<RtDevice>, vertex: &str, flagged: bool) -> RtObj<RtRenderPipeline> {
+        let vertex = function(device, ICB, vertex);
+        let fragment = function(device, ICB, "icb_fragment");
+        let mut desc = FullRenderPipelineDesc::new(&vertex, Some(&fragment));
+        desc.colors = vec![(
+            0,
+            ColorAttachmentDesc {
+                pixel_format: 70,
+                ..ColorAttachmentDesc::default()
+            },
+        )];
+        desc.support_indirect_command_buffers = flagged;
+        let state = device.new_render_pipeline_state_full(&desc);
+        state.expect("a render state").expect("a render state")
+    }
+
+    /// The buffers a kernel of [`ICB`] encodes commands of: for each of `colours`, a triangle over
+    /// the whole of a target, (-1, -1), (3, -1), (-1, 3), as three `float4` positions, its three
+    /// 16-bit indices and its colour as a `float4`.
+    struct IcbScene {
+        positions: RtObj<RtBuffer>,
+        colours: RtObj<RtBuffer>,
+        indices: RtObj<RtBuffer>,
+    }
+
+    impl IcbScene {
+        fn new(device: &RtObj<RtDevice>, colours: &[[f32; 4]]) -> IcbScene {
+            let floats = |values: &[f32]| -> Vec<u8> {
+                values.iter().flat_map(|v| v.to_le_bytes()).collect()
+            };
+            let corner = [
+                [-1.0f32, -1.0, 0.0, 1.0],
+                [3.0, -1.0, 0.0, 1.0],
+                [-1.0, 3.0, 0.0, 1.0],
+            ];
+            let positions: Vec<f32> = (colours.iter())
+                .flat_map(|_| corner.iter().flatten().copied())
+                .collect();
+            let indices: Vec<u8> = (0..3 * colours.len())
+                .flat_map(|i| u16::try_from(i).expect("a 16-bit index").to_le_bytes())
+                .collect();
+            let colours: Vec<f32> = colours.iter().flatten().copied().collect();
+            IcbScene {
+                positions: shared(device, &floats(&positions)),
+                colours: shared(device, &floats(&colours)),
+                indices: shared(device, &indices),
+            }
+        }
+
+        /// `count` threads of `kernel` encode commands 0 to `count` of `icb`, declared written,
+        /// in a command buffer `made` that completes.
+        fn encode(
+            &self,
+            (device, made): (&RtObj<RtDevice>, &RtObj<RtCommandBuffer>),
+            kernel: &RtObj<RtComputePipeline>,
+            icb: &RtObj<RtIcb>,
+            count: u64,
+        ) {
+            let on = OnFault::Return;
+            let arguments = shared(device, &icb.gpu_resource_id().to_le_bytes());
+            let encoder = made.compute_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a compute encoder");
+            let buffers = [
+                Some(&arguments),
+                Some(&self.positions),
+                Some(&self.colours),
+                Some(&self.indices),
+            ];
+            let declared = [Some(ResourceRef::Icb(icb))];
+            let cmds = [
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(kernel),
+                },
+                ComputeCmd::SetBuffers {
+                    buffers: &buffers,
+                    offsets: &[0; 4],
+                    range: NsRange::new(0, 4),
+                },
+                ComputeCmd::UseResources {
+                    resources: &declared,
+                    usage: 2,
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: MtlSize::new(count, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(count, 1, 1),
+                },
+                ComputeCmd::EndEncoding,
+            ];
+            for cmd in cmds {
+                assert_eq!(encoder.encode(on, cmd), Ok(()));
+            }
+            assert_eq!(made.commit(on), Ok(()));
+            assert_eq!(made.wait_until_completed(on), Ok(()));
+            assert_eq!(made.status(), CommandBufferStatus::COMPLETED);
+        }
+    }
+
+    /// The commands that set `state` and execute commands `location` to `location + length` of
+    /// `icb`.
+    fn executed<'a>(
+        state: &'a RtObj<RtRenderPipeline>,
+        icb: &'a RtObj<RtIcb>,
+        (location, length): (u64, u64),
+    ) -> Vec<RenderCmd<'a, RtPlatform>> {
+        vec![
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(state),
+            },
+            RenderCmd::ExecuteCommandsInBuffer {
+                indirect_command_buffer: icb,
+                execution_range: NsRange::new(location, length),
+            },
+        ]
+    }
+
+    /// Indirect command buffers are rt's (`super::super::icb`): a buffer of indexed draws that
+    /// inherit the pipeline state is made with Metal's answers, a kernel encodes its commands
+    /// through its `gpuResourceID`, and an execution of a range the CPU gives or a buffer holds
+    /// draws those commands with the encoder's pipeline state, the last drawn on top; an empty
+    /// range draws nothing. A blit's reset of a command leaves it drawing nothing until a kernel
+    /// encodes it again, and an optimize and a synchronize record nothing. A range past the
+    /// commands, a range buffer's offset off a multiple of 4 or without 8 bytes after it, and an
+    /// execution with no pipeline state set or in a compute encoder are Metal's refusals; a state
+    /// made without `supportIndirectCommandBuffers` and a buffer of other commands, of commands
+    /// that set their own pipeline state, of 32 vertex buffers or of no commands are rt's gaps;
+    /// the CPU's encodes, reset and copies and a buffer of a resource index are unbuilt; each is
+    /// counted and draws or makes nothing. On a device without
+    /// `VK_EXT_device_generated_commands` the make answers nil, rt's gap, which the test prints
+    /// and stops at.
+    #[test]
+    fn indirect_command_buffers_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let done = CommandBufferStatus::COMPLETED;
+        let (metal, gap) = (RtRefusal::Refused.code(), RtRefusal::Gap.code());
+        let unbuilt = Unbuilt::Icb.code();
+        let before = (counted(metal), counted(gap), counted(unbuilt));
+        let make = |desc: &IcbDesc, count: u64| {
+            let made = device.new_indirect_command_buffer(desc, count, 0);
+            made.expect("never a raise")
+        };
+        let Some(icb) = make(&icb_desc(1), 2) else {
+            assert_eq!(
+                tokens(&device),
+                None,
+                "a device of the extension made no buffer"
+            );
+            assert_eq!(counted(gap), before.1 + 1);
+            println!("no VK_EXT_device_generated_commands: the make answers nil, rt's gap");
+            return;
+        };
+        assert_eq!(icb.size(), 2);
+        assert_ne!(icb.gpu_resource_id(), 0);
+        assert_eq!(icb.resource_index(), 0);
+        let other = make(&icb_desc(1), 1).expect("a second buffer");
+        assert!(other.unique_identifier() > icb.unique_identifier());
+
+        // Draws of no index buffer, commands that set their own pipeline state, 32 vertex
+        // buffers and no commands: rt's gaps. A resource index: unbuilt.
+        let drawing = IcbDesc {
+            command_types: 1,
+            ..icb_desc(1)
+        };
+        let own_states = IcbDesc {
+            inherit_pipeline_state: false,
+            ..icb_desc(1)
+        };
+        let indexed = IcbDesc {
+            resource_index: Some(0),
+            ..icb_desc(1)
+        };
+        for (desc, count) in [(&drawing, 2), (&own_states, 2), (&icb_desc(32), 2)] {
+            assert!(make(desc, count).is_none());
+        }
+        assert!(make(&icb_desc(1), 0).is_none());
+        assert!(make(&indexed, 2).is_none());
+        assert_eq!(counted(gap), before.1 + 4);
+        assert_eq!(counted(unbuilt), before.2 + 1);
+
+        let target = device.new_texture(
+            on,
+            &platform.texture_descriptor(&TextureDesc {
+                width: 4,
+                height: 4,
+                usage: 5,
+                ..TextureDesc::default()
+            }),
+        );
+        let target = target.expect("never a raise").expect("a render target");
+        // The texels of a pass of its own that clears the target to opaque red, then `cmds`.
+        let drawn = |cmds| {
+            assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
+            let mut texels = [0u8; 64];
+            target.read_pixels(&mut texels, 16);
+            texels
+        };
+        let every = |texel: [u8; 4]| -> [u8; 64] { std::array::from_fn(|i| texel[i % 4]) };
+        let (red, green, blue) = ([255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]);
+
+        // Command 0 a green triangle over the target, command 1 a blue one.
+        let scene = IcbScene::new(&device, &[[0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]]);
+        let kernel = function(&device, ICB, "icb_encode");
+        let kernel = device.new_compute_pipeline_state_for_function(Some(&kernel));
+        let kernel = kernel.expect("a compute state").expect("a compute state");
+        scene.encode((&device, &made()), &kernel, &icb, 2);
+        let state = &icb_state(&device, "icb_vertex", true);
+        assert_eq!(drawn(executed(state, &icb, (0, 2))), every(blue));
+        assert_eq!(drawn(executed(state, &icb, (0, 1))), every(green));
+        assert_eq!(drawn(executed(state, &icb, (1, 1))), every(blue));
+        assert_eq!(drawn(executed(state, &icb, (0, 0))), every(red));
+        // A word no execution reads, then the ranges (0, 1) at byte 4 and (1, 1) at byte 12.
+        let ranges = &shared(&device, &words(&[0xeeee_eeee, 0, 1, 1, 1]));
+        let ranged = |offset: u64| {
+            vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(state),
+                },
+                RenderCmd::ExecuteCommandsIndirect {
+                    indirect_commandbuffer: &icb,
+                    indirect_range_buffer: ranges,
+                    indirect_buffer_offset: offset,
+                },
+            ]
+        };
+        assert_eq!(drawn(ranged(4)), every(green));
+        assert_eq!(drawn(ranged(12)), every(blue));
+        assert_eq!(counted(metal), before.0);
+        assert_eq!(counted(gap), before.1 + 4);
+
+        // Metal's refusals: a range past the commands and one past 32 bits, a range buffer's
+        // offset off a multiple of 4 and one 4 bytes before its end, no pipeline state set.
+        assert_eq!(drawn(executed(state, &icb, (1, 2))), every(red));
+        assert_eq!(drawn(executed(state, &icb, (u64::MAX, 2))), every(red));
+        assert_eq!(drawn(ranged(2)), every(red));
+        assert_eq!(drawn(ranged(16)), every(red));
+        let unset = executed(state, &icb, (0, 2)).split_off(1);
+        assert_eq!(drawn(unset), every(red));
+        assert_eq!(counted(metal), before.0 + 5);
+        // rt's gap: a state made without `supportIndirectCommandBuffers`.
+        let unflagged = &icb_state(&device, "icb_vertex", false);
+        assert_eq!(drawn(executed(unflagged, &icb, (0, 2))), every(red));
+        assert_eq!(counted(gap), before.1 + 5);
+
+        // A blit's reset of command 1, an optimize and a synchronize: command 0 draws alone.
+        let blit = |cmds: Vec<BlitCmd<'_, RtPlatform>>| {
+            let commands = made();
+            let encoder = commands.blit_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a blit encoder");
+            for cmd in cmds {
+                assert_eq!(encoder.encode(on, cmd), Ok(()));
+            }
+            assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+            assert_eq!(commands.commit(on), Ok(()));
+            assert_eq!(commands.wait_until_completed(on), Ok(()));
+            assert_eq!(commands.status(), done);
+        };
+        blit(vec![
+            BlitCmd::ResetCommandsInBuffer {
+                buffer: &icb,
+                range: NsRange::new(1, 1),
+            },
+            BlitCmd::OptimizeIndirectCommandBuffer {
+                indirect_command_buffer: &icb,
+                range: NsRange::new(0, 2),
+            },
+            BlitCmd::SynchronizeResource {
+                resource: Some(ResourceRef::Icb(&icb)),
+            },
+        ]);
+        assert_eq!(drawn(executed(state, &icb, (0, 2))), every(green));
+        assert_eq!(drawn(executed(state, &icb, (1, 1))), every(red));
+        // A reset past the commands: Metal's refusal. A copy between buffers: unbuilt.
+        blit(vec![
+            BlitCmd::ResetCommandsInBuffer {
+                buffer: &icb,
+                range: NsRange::new(1, 2),
+            },
+            BlitCmd::CopyIndirectCommandBuffer {
+                source: &icb,
+                source_range: NsRange::new(0, 1),
+                destination: &icb,
+                destination_index: 1,
+            },
+        ]);
+        assert_eq!(counted(metal), before.0 + 6);
+        assert_eq!(counted(unbuilt), before.2 + 2);
+        // The kernel encodes command 1 again.
+        scene.encode((&device, &made()), &kernel, &icb, 2);
+        assert_eq!(drawn(executed(state, &icb, (0, 2))), every(blue));
+
+        // The CPU's encodes and reset: unbuilt.
+        assert!(matches!(icb.render_command(0), Ok(None)));
+        assert!(matches!(icb.compute_command(0), Ok(None)));
+        assert_eq!(icb.reset_with_range(0, 2), Ok(()));
+        assert_eq!(counted(unbuilt), before.2 + 5);
+        assert_eq!(drawn(executed(state, &icb, (0, 2))), every(blue));
+
+        // An execution in a compute encoder: Metal's refusal.
+        let commands = made();
+        let encoder = commands.compute_encoder(on).expect("never a raise");
+        let encoder = encoder.expect("a compute encoder");
+        let execution = ComputeCmd::ExecuteCommandsInBuffer {
+            indirect_command_buffer: &icb,
+            execution_range: NsRange::new(0, 2),
+        };
+        assert_eq!(encoder.encode(on, execution), Ok(()));
+        assert_eq!(encoder.encode(on, ComputeCmd::EndEncoding), Ok(()));
+        assert_eq!(commands.commit(on), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+        assert_eq!(commands.status(), done);
+        assert_eq!(counted(metal), before.0 + 7);
+        assert_eq!(counted(gap), before.1 + 5);
+    }
+
+    /// The most buffer slots of a command whose state's vertex function reads all but one of them
+    /// and whose fragment function reads one that rt's push range holds: the slot words of the
+    /// state's 256-byte push range, on every device (measured on an RTX 3090 and a Radeon RX 7900
+    /// XTX).
+    const PUSHED_SLOTS: u32 = 25;
+
+    /// An execution carries each buffer slot its state's functions read below the buffer's bind
+    /// counts as a slot word of rt's push range, and takes a token of the device's for each and
+    /// three more: one of a state of more slots than the push range holds is rt's gap
+    /// (`IndirectCommandBuffers` of `DrawInput`), and one of more than the device's
+    /// `maxIndirectCommandsTokenCount` leaves is too (of `Tokens`); each draws nothing and is
+    /// counted. Commands of 24 to 30 slots (`icb_vertex_23` to `icb_vertex_29`, and the fragment
+    /// function's one), each executed on its own: those of at most [`PUSHED_SLOTS`] draw where the
+    /// device's tokens take them.
+    #[test]
+    fn an_execution_of_more_slots_than_rt_carries_draws_nothing_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let Some(tokens) = tokens(&device) else {
+            println!("no VK_EXT_device_generated_commands: no execution to measure");
+            return;
+        };
+        let gap = RtRefusal::Gap.code();
+        let made_icb = device.new_indirect_command_buffer(&icb_desc(29), 1, 0);
+        let icb = made_icb
+            .expect("never a raise")
+            .expect("a buffer of 29 vertex buffers");
+        let scene = IcbScene::new(&device, &[[0.0, 1.0, 0.0, 1.0]]);
+        let kernel = function(&device, ICB, "icb_encode_wide");
+        let kernel = device.new_compute_pipeline_state_for_function(Some(&kernel));
+        let kernel = kernel.expect("a compute state").expect("a compute state");
+        scene.encode((&device, &made()), &kernel, &icb, 1);
+        let target = device.new_texture(
+            on,
+            &platform.texture_descriptor(&TextureDesc {
+                width: 4,
+                height: 4,
+                usage: 5,
+                ..TextureDesc::default()
+            }),
+        );
+        let target = target.expect("never a raise").expect("a render target");
+        let kinds = ["DrawInput", "Tokens"].map(|kind| format!("IndirectCommandBuffers-{kind}"));
+        let named = || (kinds.each_ref()).map(|name| crate::rt_platform::diag::gaps_named(name));
+        let (mut seen, mut wanted) = (Vec::new(), Vec::new());
+        for vertex in 23..=29u32 {
+            let slots = vertex + 1;
+            let state = icb_state(&device, &format!("icb_vertex_{vertex}"), true);
+            let before = (counted(gap), named());
+            let cmds = executed(&state, &icb, (0, 1));
+            assert_eq!(
+                run(&made(), &pass(&target, 2), cmds),
+                CommandBufferStatus::COMPLETED
+            );
+            let mut texels = [0u8; 64];
+            target.read_pixels(&mut texels, 16);
+            let after = named();
+            let drawn = texels.chunks(4).all(|texel| texel == [0, 255, 0, 255]);
+            let red = texels.chunks(4).all(|texel| texel == [255, 0, 0, 255]);
+            let kinds = [after[0] - before.1[0], after[1] - before.1[1]];
+            seen.push((slots, drawn, red, counted(gap) - before.0, kinds));
+            let pushed = slots <= PUSHED_SLOTS;
+            let taken = slots + 3 <= tokens;
+            let kinds = [u64::from(!pushed), u64::from(pushed && !taken)];
+            let fits = pushed && taken;
+            wanted.push((slots, fits, !fits, u64::from(!fits), kinds));
+        }
+        // Each: slots, drawn, nothing drawn, gaps, and gaps of DrawInput and of Tokens.
+        println!("{tokens} tokens: {seen:?}");
+        assert_eq!(seen, wanted, "{tokens} tokens");
     }
 }

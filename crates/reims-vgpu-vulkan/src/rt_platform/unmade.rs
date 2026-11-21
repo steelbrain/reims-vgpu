@@ -70,8 +70,6 @@ pub mod kinds {
     pub enum DynamicLibrary {}
     /// `id<MTLRasterizationRateMap>`.
     pub enum RateMap {}
-    /// `id<MTLIndirectCommandBuffer>`.
-    pub enum Icb {}
     /// `id<MTLIndirectRenderCommand>`.
     pub enum IndirectRenderCommand {}
     /// `id<MTLIndirectComputeCommand>`.
@@ -95,36 +93,6 @@ impl<P: Platform> function_table::VisibleFunctionTable<P> for Unmade<kinds::Visi
         _functions: &[Option<&P::FunctionHandle>],
         _range: NsRange,
     ) -> RaiseResult<()> {
-        self.unreachable()
-    }
-}
-
-impl<P: Platform> icb::IndirectCommandBuffer<P> for Unmade<kinds::Icb> {
-    fn gpu_resource_id(&self) -> u64 {
-        self.unreachable()
-    }
-    fn compute_command(
-        &self,
-        _command_index: u64,
-    ) -> RaiseResult<Option<P::IndirectComputeCommand<'_>>> {
-        self.unreachable()
-    }
-    fn render_command(
-        &self,
-        _command_index: u64,
-    ) -> RaiseResult<Option<P::IndirectRenderCommand<'_>>> {
-        self.unreachable()
-    }
-    fn reset_with_range(&self, _location: u64, _length: u64) -> RaiseResult<()> {
-        self.unreachable()
-    }
-    fn resource_index(&self) -> u64 {
-        self.unreachable()
-    }
-    fn size(&self) -> u64 {
-        self.unreachable()
-    }
-    fn unique_identifier(&self) -> u64 {
         self.unreachable()
     }
 }

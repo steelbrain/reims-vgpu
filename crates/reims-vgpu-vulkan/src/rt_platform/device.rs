@@ -596,6 +596,7 @@ fn facts(
         linear_alignment_bgra8: device
             .minimum_linear_texture_alignment(rt::PixelFormat::BGRA8Unorm)
             .ok(),
+        indirect_tokens: floor.indirect_commands.map(|limits| limits.tokens),
     }
 }
 
@@ -1162,8 +1163,9 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
 
     /// Textures' (type 0) and sampler states' (type 1) indices as rt's grants of their class
     /// ([`grant`]), each also kept from the platform's own ([`OwnIndices::reserve`]);
-    /// indirect command buffers' (type 5) are unbuilt ([`Unbuilt::Icb`]), and those of another
-    /// type ([`Unbuilt::ResourceType`]): each reserves nothing. Never a raise.
+    /// indirect command buffers' (type 5) are unbuilt ([`Unbuilt::Icb`]: rt gives a buffer no
+    /// index), and those of another type ([`Unbuilt::ResourceType`]): each reserves nothing.
+    /// Never a raise.
     fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()> {
         let recorded_call = crate::recorder::rec_call!(
             "reserveResourceIndicesForResourceType:indices:indexCount:",
@@ -1351,7 +1353,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         recorded_answer
     }
 
-    /// Unbuilt: nil ([`Unbuilt::Icb`]).
+    /// rt's buffer (`super::icb`); nil where rt refuses it, counted.
     fn new_indirect_command_buffer(
         &self,
         desc: &IcbDesc,
@@ -1367,12 +1369,8 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         );
         let recorded_answer =
             crate::recorder::run(|| -> RaiseResult<Option<<RtPlatform as Platform>::Icb>> {
-                let _ = (desc, max_count, options);
-                refuse_create(
-                    Unbuilt::Icb,
-                    "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:",
-                );
-                Ok(None)
+                let _ = options;
+                Ok(super::icb::make(self, desc, max_count))
             });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
