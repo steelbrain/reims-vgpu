@@ -45,10 +45,10 @@
 //! the walk declined 137 surfaces and rt made no such copy.
 //!
 //! The platform decides a surface's form from the device's answers for its description and the
-//! images it makes of it, so the description of each surface declined is kept
-//! ([`CopyForms`]), and a later cache whose surface would be made of the same one asks for none:
-//! it is declined unmade, counted (`surfaces_unasked`, `video-surface-copy-form-unasked`), and
-//! its shapes are made as a declined cache's are. Each new video cache otherwise made a surface
+//! images it makes of it, so the description of each surface declined is kept (`CopyForms`, on
+//! Unix), and a later cache whose surface would be made of the same one asks for none: it is
+//! declined unmade, counted (`surfaces_unasked`, `video-surface-copy-form-unasked`), and its
+//! shapes are made as a declined cache's are. Each new video cache otherwise made a surface
 //! for the platform to let go of at once: 128 to 137 a walk on the RX 550 (m3-max-63574,
 //! m3-max-63824), each an exported block of a picture's planes, about 25 MB at 3840 by 2160
 //! 10-bit.

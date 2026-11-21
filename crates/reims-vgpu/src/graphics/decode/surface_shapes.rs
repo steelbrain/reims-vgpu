@@ -1968,7 +1968,11 @@ mod tests {
         let mark = r.p.call_log().mark();
         plane_texture(&mut r, 21, 0);
         let calls = r.p.call_log().since(mark);
-        assert_eq!(surface_planes(&calls), 2, "the first cache's surface was made");
+        assert_eq!(
+            surface_planes(&calls),
+            2,
+            "the first cache's surface was made"
+        );
         other_video_cache(&mut r, OTHER, 11);
 
         let mark = r.p.call_log().mark();
