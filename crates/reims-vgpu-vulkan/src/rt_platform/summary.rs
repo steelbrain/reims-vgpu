@@ -18,9 +18,10 @@
 //!   over a buffer and its image of its own, by the cause rt gives each, those of none left out;
 //! - `counted`, more of what rt counted, by their fields' names: new textures' images zeroed,
 //!   their bytes and the barriers that moved them home after it; the acquires of another API's
-//!   writes; the barriers rt recorded; the releases of a texture or block an unsent upload held,
-//!   their bytes, and the sends of uploads they started; the sends of groups a queue held behind
-//!   its submissions in flight, and the GPU's nanoseconds from the end of the work submitted
+//!   writes; the barriers rt recorded; the bytes its commits' copy-ins copied from Managed
+//!   buffers' bytes into their device copies; the releases of a texture or block an unsent upload
+//!   held, their bytes, and the sends of uploads they started; the sends of groups a queue held
+//!   behind its submissions in flight, and the GPU's nanoseconds from the end of the work submitted
 //!   before each to its own start; and a pipeline's makes split in two, the nanoseconds of the
 //!   driver's `vkCreate*Pipelines` calls and of rt's calls into the translator; and the command
 //!   buffers whose GPU times stay 0, those that found no timestamp pair and those whose pair read
@@ -108,6 +109,7 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         texture_clear_barriers,
         external_acquires,
         barriers,
+        managed_bytes_captured,
         held_releases,
         held_release_bytes,
         held_release_starts,
@@ -225,11 +227,13 @@ mod tests {
         before.texture_clears = 5;
         before.texture_clear_bytes = 1_000_000;
         before.barriers = 40;
+        before.managed_bytes_captured = 1_000_000;
         now.texture_clears = 7;
         now.texture_clear_bytes = 1_000_000 + 524_288;
         now.texture_clear_barriers = 1;
         now.external_acquires = 2;
         now.barriers = 40 + 9;
+        now.managed_bytes_captured = 1_000_000 + 98_304;
         now.held_releases = 3;
         now.held_release_bytes = 16_777_216 + 65_536;
         now.held_release_starts = 1;
@@ -265,9 +269,10 @@ mod tests {
              buffers 12 in 1.7 ms on the GPU; bytes copied 4672: staging 64, attachment reads 512, \
              over-copies 4096 (dma-buf 4000, pitch 96); counted texture_clears 2, \
              texture_clear_bytes 524288, texture_clear_barriers 1, external_acquires 2, barriers \
-             9, held_releases 3, held_release_bytes 16842752, held_release_starts 1, held_starts \
-             6, held_start_gap_nanos 250000, pipeline_creation_nanos 7250000, translation_nanos \
-             3125000, untimed_command_buffers 4, stamps_not_available 1; gauges textures 12, \
+             9, managed_bytes_captured 98304, held_releases 3, held_release_bytes 16842752, \
+             held_release_starts 1, held_starts 6, held_start_gap_nanos 250000, \
+             pipeline_creation_nanos 7250000, translation_nanos 3125000, untimed_command_buffers \
+             4, stamps_not_available 1; gauges textures 12, \
              textures_copied_over 2, texture_block_bytes 20971520, texture_own_bytes 33554432, \
              spilled_bytes 0, texture_block_held_bytes 50331648, texture_block_sparse_bytes \
              16777216, texture_block_sparse_blocks 1, private_take_held_bytes 33554432, \
@@ -284,9 +289,10 @@ mod tests {
         assert!(
             part.ends_with(
                 "over-copies 0; counted texture_clears 0, texture_clear_bytes 0, \
-                 texture_clear_barriers 0, external_acquires 0, barriers 0, held_releases 0, \
-                 held_release_bytes 0, held_release_starts 0, held_starts 0, held_start_gap_nanos \
-                 0, pipeline_creation_nanos 0, translation_nanos 0, untimed_command_buffers 0, \
+                 texture_clear_barriers 0, external_acquires 0, barriers 0, \
+                 managed_bytes_captured 0, held_releases 0, held_release_bytes 0, \
+                 held_release_starts 0, held_starts 0, held_start_gap_nanos 0, \
+                 pipeline_creation_nanos 0, translation_nanos 0, untimed_command_buffers 0, \
                  stamps_not_available 0; gauges textures 0, textures_copied_over 0, \
                  texture_block_bytes 0, texture_own_bytes 0, spilled_bytes 0, \
                  texture_block_held_bytes 0, texture_block_sparse_bytes 0, \
