@@ -74,11 +74,21 @@ Vulkan call) answers the same way, counted under the error's kind, `rt-refused-<
 and rt's error. A texture rt makes none of for its pixel format is counted under its format's
 code instead, `rt-refused-texture-format-<n>`; a pipeline state's imageblock length rt refuses,
 `rt-refused-imageblock-length`; and a heap texture rt refuses on its place in its block,
-`rt-refused-heap-texture-place`. `rt-refused-metal` counts `Error::Refused`, Metal's refusals
-and those of rt's own rules that no code of their own names; each refusal's basis, Metal's or
-rt's, is in metal2vulkan-runtime's `error.rs`. `rt-refused-ours` counts rt's own refusal of a
-texture buffer not over a buffer its consumer places (`Refusal::TextureBufferNotOverBuffer`):
-rt makes a texture buffer only over a buffer. The device's (`newTextureWithDescriptor:` of
+`rt-refused-heap-texture-place`. rt's refusals (`Error::Refused`) are counted by the basis rt
+declares for each (`Error::basis`, metal2vulkan-runtime's `error/basis.rs`;
+`RtRefusal::of_basis`): `rt-refused-metal` counts those of Metal's own rules, documented or
+measured, with the platform's own refusals of Metal's, and a heap texture's place that Metal's
+own rule refuses too. No refusal of rt's declares the device's basis, and rt's limits and gaps
+keep their own codes whatever their basis. `rt-refused-ours` counts those rt declares its own
+(a gap, cap or deadline of rt's, or the misuse of an extension of rt's): among them an indirect
+argument offset off a multiple of 4 or without the arguments' bytes after it
+(`Refusal::IndirectOffset`), a pass attachment's slice past its texture's
+(`Refusal::AttachmentPlace`), a buffer offset set on an empty slot (`Refusal::NoBufferAtIndex`),
+a Managed buffer's modified range past its end (`Refusal::ModifiedRange`), a wait in a
+scheduled handler or on rt's own thread (`Refusal::InScheduledHandler`,
+`Refusal::WaitOnOwnThread`), and a texture buffer not over a buffer its consumer places
+(`Refusal::TextureBufferNotOverBuffer`): rt makes a texture buffer only over a buffer. The
+device's (`newTextureWithDescriptor:` of
 `MTLTextureTypeTextureBuffer`) is made over a buffer of the host's own, of the texture's bytes
 (its row rounded up to the device's `minimumTextureBufferAlignmentForPixelFormat:`) and the
 descriptor's storage mode, which the texture holds and which the guest names by no object ID,

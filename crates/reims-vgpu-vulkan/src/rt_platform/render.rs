@@ -14,8 +14,8 @@
 //!   buffer at the offset as the draw runs, so arguments of no vertices, indices or patches draw
 //!   nothing, and rt's command buffer keeps the buffer until it retires. An offset rt refuses (one
 //!   not a multiple of 4, or without the arguments' 16 or 20 bytes after it in the buffer) is
-//!   rt's refusal of Metal's (`Refusal::IndirectOffset`), counted (`rt-refused-metal`), and a patch
-//!   index buffer rt's gap, as the direct patch draw's is.
+//!   rt's refusal on a rule of its own (`Refusal::IndirectOffset`), counted (`rt-refused-ours`),
+//!   and a patch index buffer rt's gap, as the direct patch draw's is.
 //! - **Attribute strides** (`setVertexBufferOffset:attributeStride:atIndex:`,
 //!   `setVertexBuffers:offsets:attributeStrides:withRange:`) bind as the calls without them: only a
 //!   layout of `MTLBufferLayoutStrideDynamic` reads a stride, and rt refuses such a state as it is
@@ -1575,9 +1575,9 @@ mod tests {
     /// Indirect draws of primitives, indexed primitives and patches each draw what the arguments
     /// written into their buffer say, read at the draw's offset as the draw runs: a vertex start,
     /// an index start and a base vertex, a patch start. Arguments of no vertices or patches draw
-    /// nothing. An offset off a multiple of 4, or without the arguments' bytes after it, is
-    /// Metal's refusal, and a patch index buffer rt's gap, each counted and drawing nothing.
-    /// None is counted unbuilt.
+    /// nothing. An offset off a multiple of 4, or without the arguments' bytes after it, is rt's
+    /// refusal on a rule of its own (`Refusal::IndirectOffset`), and a patch index buffer rt's gap,
+    /// each counted and drawing nothing. None is counted unbuilt or as Metal's refusal.
     #[test]
     fn indirect_draws_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1590,8 +1590,8 @@ mod tests {
         };
         let done = CommandBufferStatus::COMPLETED;
         let (metal, gap) = (RtRefusal::Refused.code(), RtRefusal::Gap.code());
-        let unbuilt = Unbuilt::RenderCommand.code();
-        let before = (counted(metal), counted(gap), counted(unbuilt));
+        let (unbuilt, ours) = (Unbuilt::RenderCommand.code(), RtRefusal::Ours.code());
+        let before = (counted(metal), counted(gap), counted(unbuilt), counted(ours));
         let target = device.new_texture(
             on,
             &platform.texture_descriptor(&TextureDesc {
@@ -1653,9 +1653,11 @@ mod tests {
         assert_eq!(counted(metal), before.0);
 
         // An offset 2 bytes past a multiple of 4, and one 12 bytes before the buffer's end.
+        assert_eq!(counted(ours), before.3);
         assert_eq!(drawn(draw(2)), every(red));
         assert_eq!(drawn(draw(44)), every(red));
-        assert_eq!(counted(metal), before.0 + 2);
+        assert_eq!(counted(ours), before.3 + 2);
+        assert_eq!(counted(metal), before.0);
 
         // Patch 0's control points all (0, 0), which draws no pixel; patch 1's a triangle over
         // the target. Factors of 1 (`half`, edges and inside) for every patch, Metal's default
@@ -1704,7 +1706,8 @@ mod tests {
         assert_eq!(drawn(patch_draw(20, false)), every(red));
         assert_eq!(drawn(patch_draw(4, true)), every(red));
         assert_eq!(counted(gap), before.1 + 1);
-        assert_eq!(counted(metal), before.0 + 2);
+        assert_eq!(counted(ours), before.3 + 2);
+        assert_eq!(counted(metal), before.0);
         assert_eq!(counted(unbuilt), before.2);
     }
 
@@ -1712,7 +1715,7 @@ mod tests {
     /// slices clears and stores both slices, and a draw whose vertex function writes no
     /// `[[render_target_array_index]]` renders into slice 0 alone. The length is counted nowhere.
     /// A length of 2 from the texture's last slice, which leaves the pass no second slice, is
-    /// Metal's refusal: nil, counted.
+    /// rt's refusal on a rule of its own (`Refusal::AttachmentPlace`): nil, counted.
     #[test]
     fn a_layered_pass_renders_each_slice_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1724,8 +1727,8 @@ mod tests {
             made.expect("a command buffer")
         };
         let done = CommandBufferStatus::COMPLETED;
-        let (metal, unbuilt) = (RtRefusal::Refused.code(), Unbuilt::RenderPass.code());
-        let before = (counted(metal), counted(unbuilt));
+        let (ours, unbuilt) = (RtRefusal::Ours.code(), Unbuilt::RenderPass.code());
+        let before = (counted(ours), counted(unbuilt));
         // `MTLTextureType2DArray` of 2 slices, `RGBA8Unorm`, shader read and render target usage.
         let target = device.new_texture(
             on,
@@ -1811,10 +1814,10 @@ mod tests {
         assert_eq!(counted(unbuilt), before.1);
 
         // Two slices from slice 1, the last.
-        assert_eq!(counted(metal), before.0);
+        assert_eq!(counted(ours), before.0);
         let refused = made().render_encoder(on, &layered(1, opaque(1.0, 0.0, 0.0), 2));
         assert!(matches!(refused, Ok(None)));
-        assert_eq!(counted(metal), before.0 + 1);
+        assert_eq!(counted(ours), before.0 + 1);
     }
 
     /// A pass whose colour attachment, a 4-sample texture, resolves into its resolve texture

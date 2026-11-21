@@ -157,8 +157,9 @@ mod tests {
         let ran = told.recv_timeout(Duration::from_secs(10));
         assert_ne!(ran.expect("the notification of a value reached ran"), asker);
 
-        let metal = RtRefusal::Refused.code();
-        let before = counted(metal);
+        // rt's refusal on a rule of its own (`Refusal::WaitOnOwnThread`).
+        let (metal, ours) = (RtRefusal::Refused.code(), RtRefusal::Ours.code());
+        let before = (counted(metal), counted(ours));
         let (tell, told) = mpsc::channel::<bool>();
         let again = event.clone_ref();
         let wait = move || {
@@ -167,6 +168,7 @@ mod tests {
         assert_eq!(event.notify_listener(&listener, 5, Box::new(wait)), Ok(()));
         let waited = told.recv_timeout(Duration::from_secs(10));
         assert_eq!(waited, Ok(false));
-        assert_eq!(counted(metal), before + 1);
+        assert_eq!(counted(ours), before.1 + 1);
+        assert_eq!(counted(metal), before.0);
     }
 }

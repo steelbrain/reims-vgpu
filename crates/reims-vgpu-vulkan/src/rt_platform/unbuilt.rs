@@ -12,7 +12,11 @@
 //! A call of a built piece that rt refuses (its `Error`: a limit, a refusal of Metal's, a known
 //! gap, a failed Vulkan call) answers the same way, counted under the error's kind,
 //! `rt-refused-<kind>` ([`RtRefusal::code`]), its first line naming the call and rt's error as
-//! structure alone ([`said`]), as the `NSError` a creator answers names it. The first of each of
+//! structure alone ([`said`]), as the `NSError` a creator answers names it. A refusal of rt's
+//! (`Error::Refused`) is counted by the basis rt declares for it (`Error::basis`, in
+//! metal2vulkan-runtime's `error/basis.rs`, [`RtRefusal::of_basis`]): Metal's own, documented or
+//! measured, under `rt-refused-metal`, and a rule of rt's own under `rt-refused-ours`, but for a
+//! heap texture's place that Metal's own rule refuses too, which is Metal's. The first of each of
 //! rt's kinds by its name in the boot diagnostics (`Draw-AttachmentRead`, `TextureCopy`,
 //! `RenderPass`, `Limit-TextureSamples`, `Translation-Lowering`), whichever count it goes to,
 //! writes a line of its own too: rt's error as [`said`] gives it and, but for the translator's
@@ -252,14 +256,17 @@ pub enum RtRefusal {
     BelowFloor,
     /// A failed Vulkan call (`Error::Vulkan`).
     Vulkan,
-    /// A call rt refuses as Metal's refusal (`Error::Refused`), or on a rule of rt's own that
-    /// [`RtRefusal::Ours`] does not name.
+    /// A call rt refuses as Metal's refusal (`Error::Refused` of a basis of Metal's, documented
+    /// or measured, [`RtRefusal::of_basis`]), and a heap texture's place rt refuses that Metal's
+    /// own rule refuses too, off the texture's alignment or past the heap's end; and what the
+    /// platform refuses before rt as Metal's refusal.
     Refused,
-    /// A call rt refuses on a rule of its own, not Metal's (`Error::Refused`, its basis rt's in
-    /// metal2vulkan-runtime's `error.rs`): a texture buffer not over a buffer its consumer
-    /// places (`Refusal::TextureBufferNotOverBuffer`). The device's texture buffer no longer
-    /// reaches it, made over a buffer of the platform's own (`super::texture`'s
-    /// `make_texture_buffer`); a heap's still does.
+    /// A call rt refuses on a rule of its own, not Metal's (`Error::Refused` of rt's own basis,
+    /// [`RtRefusal::of_basis`]), such as a texture buffer not over a buffer its consumer places
+    /// (`Refusal::TextureBufferNotOverBuffer`), which the device's texture buffer no longer
+    /// reaches, made over a buffer of the platform's own (`super::texture`'s
+    /// `make_texture_buffer`), or an indirect argument offset rt's Vulkan commands do not read at
+    /// (`Refusal::IndirectOffset`).
     Ours,
     /// One of the device's or rt's fixed limits (`Error::Limit`).
     Limit,
@@ -305,8 +312,10 @@ impl RtRefusal {
             rt::Error::Loader(_) | rt::Error::NoDirectDriverLoading => RtRefusal::Loader,
             rt::Error::BelowFloor(_) => RtRefusal::BelowFloor,
             rt::Error::Vulkan { .. } => RtRefusal::Vulkan,
-            rt::Error::Refused(rt::Refusal::TextureBufferNotOverBuffer) => RtRefusal::Ours,
-            rt::Error::Refused(_) => RtRefusal::Refused,
+            rt::Error::Refused(rt::Refusal::HeapTexturePlace { .. }) if !metal_places(error) => {
+                RtRefusal::Refused
+            }
+            rt::Error::Refused(refusal) => RtRefusal::of_basis(refusal.basis()),
             rt::Error::Limit(_) => RtRefusal::Limit,
             rt::Error::NoSuchBlock(_) => RtRefusal::NoSuchBlock,
             rt::Error::Thread(_) => RtRefusal::Thread,
@@ -314,6 +323,18 @@ impl RtRefusal {
             rt::Error::Unsupported(_) | rt::Error::StageUnfilled(_) => RtRefusal::Gap,
             rt::Error::Quiesced => RtRefusal::Quiesced,
             _ => RtRefusal::Other,
+        }
+    }
+
+    /// The kind of a refusal of rt's (`Error::Refused`) of the basis `basis`, as rt declares it
+    /// (`Error::basis`): a rule of rt's own, [`RtRefusal::Ours`]; Metal's, documented or
+    /// measured, [`RtRefusal::Refused`]. So is the device's basis, which no refusal of rt's
+    /// declares at its pin (rt's `Limit` and `Gap` declare it, counted under their own kinds), and
+    /// a basis rt adds later, each counted where it was before rt declared bases.
+    pub fn of_basis(basis: rt::RefusalBasis) -> RtRefusal {
+        match basis {
+            rt::RefusalBasis::Ours => RtRefusal::Ours,
+            _ => RtRefusal::Refused,
         }
     }
 
@@ -572,8 +593,8 @@ pub const HEAP_TEXTURE_PLACE: &str = "rt-refused-heap-texture-place";
 /// whose place there is off the image's alignment: a heap pinned in a block at an offset that is
 /// not a multiple of it. Counted under
 /// [`HEAP_TEXTURE_PLACE`] and under the code of the make that runs on the thread where one names
-/// one, apart from Metal's refusals, and the process's first writes its line on stderr. `None` for
-/// any other error, which the caller counts.
+/// one, apart from Metal's refusals, and the process's first writes its line on stderr; its kind
+/// rt's own rule's, [`RtRefusal::Ours`]. `None` for any other error, which the caller counts.
 fn heap_texture_place(sel: &'static str, error: &rt::Error) -> Option<RtRefusal> {
     static SAID_HEAP_PLACE: AtomicBool = AtomicBool::new(false);
     if !metal_places(error) {
@@ -590,7 +611,7 @@ fn heap_texture_place(sel: &'static str, error: &rt::Error) -> Option<RtRefusal>
              refused ({HEAP_TEXTURE_PLACE}), the first of its kind\n"
         ));
     }
-    Some(RtRefusal::Refused)
+    Some(RtRefusal::Ours)
 }
 
 /// Whether `error` is rt's `HeapTexturePlace` of a place Metal's own rule places
@@ -795,8 +816,9 @@ mod tests {
 
     /// rt's refusal of a heap texture's place that Metal's own rule places (its offset a multiple
     /// of the image's alignment, its bytes inside the heap) is counted under its own code, not as
-    /// Metal's refusal, and under the code of a make running on the thread; one off the alignment
-    /// or past the heap's end is Metal's refusal.
+    /// Metal's refusal, and under the code of a make running on the thread, its kind rt's own
+    /// rule's; one off the alignment or past the heap's end is Metal's refusal, though rt
+    /// declares its own basis for every heap texture's place.
     #[test]
     fn a_heap_texture_s_place_is_counted_apart_where_metal_places_it() {
         let place = |offset, size| {
@@ -812,11 +834,11 @@ mod tests {
         let sel = "newTextureWithDescriptor:offset:";
         assert_eq!(
             rt_refused_texture(sel, &place(0, 0xc_0000)),
-            RtRefusal::Refused
+            RtRefusal::Ours
         );
         let (kind, relayed) =
             relaying_gaps(|| rt_refused_texture_create(sel, &place(0x14_0000, 0xc_0000)));
-        assert_eq!(kind, RtRefusal::Refused);
+        assert_eq!(kind, RtRefusal::Ours);
         assert!(relayed);
         let making = "test-refused-heap-place";
         let ours = counted(making);
@@ -835,6 +857,68 @@ mod tests {
         );
         assert_eq!(counted(HEAP_TEXTURE_PLACE), before + 3);
         assert!(counted(metal) >= metals + 2, "{metal}");
+        // rt declares its own basis for each; the platform's kind tells Metal's own rule apart.
+        let placed = rt::Refusal::HeapTexturePlace {
+            offset: 0,
+            size: 0x1000,
+            align: 0x10000,
+            heap_len: 0x20_0000,
+        };
+        assert_eq!(placed.basis(), rt::RefusalBasis::Ours);
+        assert_eq!(RtRefusal::of(&place(0, 0x1000)), RtRefusal::Ours);
+        assert_eq!(RtRefusal::of(&place(0x8000, 0x1000)), RtRefusal::Refused);
+    }
+
+    /// rt's refusal is counted by the basis rt declares for it: a rule of rt's own under
+    /// `rt-refused-ours`, Metal's, documented or measured, under `rt-refused-metal`, and the
+    /// device's, which no refusal of rt's declares, where every refusal of rt's was counted
+    /// before, as Metal's.
+    #[test]
+    fn rt_s_refusal_is_counted_by_its_basis() {
+        use rt::RefusalBasis as Basis;
+        let arms = [
+            (Basis::Ours, RtRefusal::Ours, "rt-refused-ours"),
+            (Basis::MetalDocumented, RtRefusal::Refused, "rt-refused-metal"),
+            (Basis::MetalMeasured, RtRefusal::Refused, "rt-refused-metal"),
+            (Basis::Device, RtRefusal::Refused, "rt-refused-metal"),
+        ];
+        for (basis, kind, code) in arms {
+            assert_eq!(RtRefusal::of_basis(basis), kind, "{basis:?}");
+            assert_eq!(kind.code(), code, "{basis:?}");
+        }
+        // One refusal of rt's of each basis it declares for refusals, each counted under its
+        // basis's code.
+        let refusals = [
+            (rt::Refusal::WaitOnOwnThread, Basis::Ours),
+            (rt::Refusal::TextureBufferNotOverBuffer, Basis::Ours),
+            (rt::Refusal::Committed, Basis::MetalDocumented),
+            (rt::Refusal::EmptyBuffer, Basis::MetalMeasured),
+        ];
+        for (refusal, basis) in refusals {
+            assert_eq!(refusal.basis(), basis, "{refusal:?}");
+            let error = rt::Error::Refused(refusal);
+            let kind = RtRefusal::of_basis(basis);
+            assert_eq!(error.basis(), Some(basis), "{refusal:?}");
+            assert_eq!(RtRefusal::of(&error), kind, "{refusal:?}");
+            let (before, other) = match kind {
+                RtRefusal::Ours => (counted("rt-refused-ours"), counted("rt-refused-metal")),
+                _ => (counted("rt-refused-metal"), counted("rt-refused-ours")),
+            };
+            assert_eq!(rt_refused("test", &error), kind, "{refusal:?}");
+            let (after, other_after) = match kind {
+                RtRefusal::Ours => (counted("rt-refused-ours"), counted("rt-refused-metal")),
+                _ => (counted("rt-refused-metal"), counted("rt-refused-ours")),
+            };
+            assert_eq!(after, before + 1, "{refusal:?}");
+            assert_eq!(other_after, other, "{refusal:?}");
+        }
+        // A limit and a gap of rt's own basis stay under their own kinds.
+        let limit = rt::Error::Limit(rt::Limit::BlockIds);
+        assert_eq!(limit.basis(), Some(Basis::Ours));
+        assert_eq!(RtRefusal::of(&limit), RtRefusal::Limit);
+        let gap = rt::Error::Unsupported(rt::Gap::ImageblockLength);
+        assert_eq!(gap.basis(), Some(Basis::Ours));
+        assert_eq!(RtRefusal::of(&gap), RtRefusal::Gap);
     }
 
     /// A creator with an `error:` out-parameter answers an `NSError` naming the piece and its

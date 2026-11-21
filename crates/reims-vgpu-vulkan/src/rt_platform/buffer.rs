@@ -2867,8 +2867,12 @@ mod tests {
         assert_eq!(managed.did_modify_range(on, NsRange::new(0, 64)), Ok(()));
         assert_eq!(shared.did_modify_range(on, NsRange::new(32, 64)), Ok(()));
         assert_eq!(counted(metal), before + 3);
+        // Past the Managed buffer's end: rt's refusal on a rule of its own
+        // (`Refusal::ModifiedRange`).
+        let ours = (RtRefusal::Ours.code(), counted(RtRefusal::Ours.code()));
         assert_eq!(managed.did_modify_range(on, NsRange::new(32, 64)), Ok(()));
-        assert_eq!(counted(metal), before + 4);
+        assert_eq!(counted(ours.0), ours.1 + 1);
+        assert_eq!(counted(metal), before + 3);
 
         // A no-copy buffer 16 bytes into memory of the host's own.
         let layout = Layout::from_size_align(0x20000, 0x10000).expect("a layout");

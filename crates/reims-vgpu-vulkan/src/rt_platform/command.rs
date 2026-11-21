@@ -2139,8 +2139,9 @@ mod tests {
         assert_eq!(nil.wait_until_completed(on), Ok(()));
         assert_eq!(nil.status(), CommandBufferStatus::COMPLETED);
 
-        // A wait in a scheduled handler.
-        let before = counted(metal);
+        // A wait in a scheduled handler: rt's refusal on a rule of its own.
+        let (ours, before) = (RtRefusal::Ours.code(), counted(metal));
+        let ours_before = counted(ours);
         let waiter = made(&queue);
         let returned = Arc::new(AtomicBool::new(false));
         let (done, me) = (Arc::clone(&returned), waiter.clone_ref());
@@ -2152,7 +2153,8 @@ mod tests {
         assert_eq!(waiter.commit(on), Ok(()));
         assert_eq!(waiter.wait_until_completed(on), Ok(()));
         assert!(returned.load(Ordering::Acquire));
-        assert_eq!(counted(metal), before + 1);
+        assert_eq!(counted(ours), ours_before + 1);
+        assert_eq!(counted(metal), before);
     }
 
     /// Parts on the GPU the test holds: kept whole while an encoder is open; cut once it ended,

@@ -5,10 +5,11 @@
 //! - **Gaps by kind.** Each refusal of rt's `Gap`, by the gap's kind, a draw's by its draw kind
 //!   and a linear plane pass's by its shape ([`refusal`]), which the counts line holds as one
 //!   `rt-refused-gap`.
-//! - **Refusals by variant.** Each refusal of Metal's that rt answers (`Error::Refused`) and each of
-//!   its limits (`Error::Limit`), by its variant, `Refused-<variant>` and `Limit-<variant>`
-//!   ([`refusal`]), which the counts line holds as `rt-refused-metal` and `rt-refused-limit` with
-//!   the platform's own refusals of those kinds; and each of the translator's refusals
+//! - **Refusals by variant.** Each refusal rt answers (`Error::Refused`) and each of its limits
+//!   (`Error::Limit`), by its variant, `Refused-<variant>` and `Limit-<variant>` ([`refusal`]),
+//!   which the counts line holds as `rt-refused-metal` or `rt-refused-ours`, by the basis rt
+//!   declares for the refusal (`super::unbuilt::RtRefusal::of_basis`), and as `rt-refused-limit`,
+//!   with the platform's own refusals of those kinds; and each of the translator's refusals
 //!   (`Error::Translation`), by the feature it refused, `Translation-<feature>` (the feature's
 //!   variant), or the translator's error's variant where it refused no feature, which the counts
 //!   line holds as one `rt-refused-translation`.

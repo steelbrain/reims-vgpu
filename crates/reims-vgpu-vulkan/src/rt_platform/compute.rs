@@ -805,6 +805,7 @@ mod tests {
         let (unbuilt, predication) = (Unbuilt::ComputeCommand.code(), Unbuilt::Predication.code());
         let (before, unbuilt_before, predication_before) =
             (counted(metal), counted(unbuilt), counted(predication));
+        let ours = (RtRefusal::Ours.code(), counted(RtRefusal::Ours.code()));
         let made = queue.command_buffer(on).expect("never a raise");
         let made = made.expect("a command buffer");
         let encoder = made.compute_encoder(on).expect("never a raise");
@@ -889,9 +890,10 @@ mod tests {
         assert_eq!(counted(unbuilt), unbuilt_before + 2);
         assert_eq!(counted(predication), predication_before + 5);
         // A dispatch with none set, a nil indirect buffer, a dispatch with nil set, lengths
-        // apart, usage 8, an index past 32 bits, rt's refusal of an empty slot's offset, and a
-        // command after `endEncoding`.
-        assert_eq!(counted(metal), before + 8);
+        // apart, usage 8, an index past 32 bits, and a command after `endEncoding`; and rt's
+        // refusal on a rule of its own of an empty slot's offset (`Refusal::NoBufferAtIndex`).
+        assert_eq!(counted(metal), before + 7);
+        assert_eq!(counted(ours.0), ours.1 + 1);
 
         // A nil resource of a concurrent encoder, and a dispatch type Metal names none of.
         let before = counted(metal);
