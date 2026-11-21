@@ -1173,9 +1173,8 @@ mod tests {
                 answers.lock().push(answer);
             }));
         }
-        let all_wait = || {
-            started.load(Ordering::SeqCst) == LANE_THREADS && lane.walks_and_turn_waits().0 == 0
-        };
+        let all_wait =
+            || started.load(Ordering::SeqCst) == LANE_THREADS && lane.walks_and_turn_waits().0 == 0;
         assert!(
             until(all_wait),
             "{} jobs started, {} walking",
@@ -1190,7 +1189,10 @@ mod tests {
             until(|| next.load(Ordering::SeqCst)),
             "the lane's next job waited behind the held dispatches"
         );
-        assert!(answers.lock().is_empty(), "a held dispatch went on before its fill");
+        assert!(
+            answers.lock().is_empty(),
+            "a held dispatch went on before its fill"
+        );
         assert!(stages.end(7, FillEnd::Filled));
         assert!(until(|| answers.lock().len() == LANE_THREADS));
         assert!(answers.lock().iter().all(|answer| *answer == Ok(2)));
