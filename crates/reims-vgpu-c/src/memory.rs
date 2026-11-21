@@ -28,8 +28,9 @@ mod windows;
 pub struct RvgMemoryRange {
     pub physical_address: u64,
     pub physical_length: u64,
-    /// `physical_length` bytes, mapped (`mach_vm_allocate`d or equivalent) for as long as any
-    /// device made over the map lives.
+    /// `physical_length` bytes, mapped (`mach_vm_allocate`d or equivalent), and not unmapped,
+    /// mapped anew or discarded, until the process exits: the host GPU's imports of them, which
+    /// the device makes, can outlive the device's release.
     pub host_address: *mut c_void,
 }
 
@@ -146,8 +147,8 @@ pub(crate) unsafe fn memory_map(
             },
             None => None,
         };
-        // SAFETY: the header's contract on `host_address`: mapped while any device made over
-        // the map lives, and, with a file, a shared mapping of it from `offset`.
+        // SAFETY: the header's contract on `host_address`: mapped, and not unmapped or mapped
+        // anew, until the process exits, and, with a file, a shared mapping of it from `offset`.
         unsafe {
             m.push_with_file(
                 r.physical_address,

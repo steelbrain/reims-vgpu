@@ -525,8 +525,9 @@ typedef struct {
 typedef struct {
   uint64_t physical_address;
   uint64_t physical_length;
-  // `physical_length` bytes, mapped (`mach_vm_allocate`d or equivalent) for as long as any
-  // device made over the map lives.
+  // `physical_length` bytes, mapped (`mach_vm_allocate`d or equivalent), and not unmapped,
+  // mapped anew or discarded, until the process exits: the host GPU's imports of them, which
+  // the device makes, can outlive the device's release.
   void *host_address;
 } RvgMemoryRange;
 
@@ -589,9 +590,9 @@ typedef struct {
   // is a copy of its pages in the region. On a host GPU that shares the CPU's memory the device
   // answers `recommendedMaxWorkingSetSize` as three quarters of the RAM the map holds, rounded
   // down to 16 KiB, or the host GPU's answer where that is less; with no map, and on a GPU of
-  // its own memory, the host GPU's. The map's pages stay the guest's RAM while the device lives:
-  // a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes NULL. Its ranges
-  // may not overlap.
+  // its own memory, the host GPU's. The map's pages stay the guest's RAM, mapped, until the
+  // process exits (`RvgMemoryRange`): a host that discards guest RAM (a balloon, virtio-mem,
+  // hot-unplug) passes NULL. Its ranges may not overlap.
   const RvgMemoryMap *memory_map;
   // With `memory_map`: the files behind its ranges, NULL for none, one entry per range, each
   // duplicated during the create. Refused (RVG_ERR_INVALID_ARGUMENT), in this order: files

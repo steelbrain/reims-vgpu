@@ -100,6 +100,15 @@ and, for an `fd` of 0 or more, for a file `fstat` cannot read, a file holding fe
 plus the range's length bytes, and an `offset` that is not a multiple of the host's page size. Each
 refusal logs a line saying which, and no file is duplicated until every entry has passed.
 
+The memory map's host memory stays mapped, and is not unmapped, mapped anew or discarded, until
+the process exits, past the device's release: the host GPU's runtime frees the device's imports of
+the guest's pages (an app's no-copy memory, the heaps over its pages) on a thread of its own once
+no GPU work uses them, which can be after the release returns, and Vulkan leaves undefined an
+import whose memory is unmapped under it. QEMU keeps the guest's RAM mapped until it exits (the
+machine holds its memory backend), and the VMs reims-ctl makes neither discard nor replace the
+guest's RAM while they run: they have no balloon, free page reporting, virtio-mem or memory
+hot-unplug, and their RAM is a shared mapping, which KSM does not merge.
+
 ### Thread safety
 
 - Every function may be called from any thread, on the same handle from several threads at once,

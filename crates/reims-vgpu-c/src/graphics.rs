@@ -336,9 +336,9 @@ pub struct RvgGraphicsDeviceConfig {
     /// is a copy of its pages in the region. On a host GPU that shares the CPU's memory the device
     /// answers `recommendedMaxWorkingSetSize` as three quarters of the RAM the map holds, rounded
     /// down to 16 KiB, or the host GPU's answer where that is less; with no map, and on a GPU of
-    /// its own memory, the host GPU's. The map's pages stay the guest's RAM while the device lives:
-    /// a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes NULL. Its ranges
-    /// may not overlap.
+    /// its own memory, the host GPU's. The map's pages stay the guest's RAM, mapped, until the
+    /// process exits (`RvgMemoryRange`): a host that discards guest RAM (a balloon, virtio-mem,
+    /// hot-unplug) passes NULL. Its ranges may not overlap.
     pub memory_map: *const RvgMemoryMap,
     /// With `memory_map`: the files behind its ranges, NULL for none, one entry per range, each
     /// duplicated during the create. Refused (RVG_ERR_INVALID_ARGUMENT), in this order: files

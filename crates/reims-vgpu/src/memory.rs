@@ -52,10 +52,12 @@ impl MemoryMap {
     ///
     /// # Safety
     /// `host .. host + length` is host memory (`mach_vm_allocate`d or equivalent) that stays
-    /// mapped while any graphics device made over the map lives: the device remaps it and reads
-    /// and writes the guest's memory through it. With `file`, that memory is a
-    /// shared mapping (on Windows a view) of `file.file` from `file.offset`, and the file holds at
-    /// least `length` bytes from there.
+    /// mapped, and is not unmapped, mapped anew or discarded, while any graphics device made over
+    /// the map lives and after it, for as long as the platform's imports of it may live: on the
+    /// Vulkan platform, whose runtime frees them on a thread of its own, until the process exits.
+    /// The device remaps it and reads and writes the guest's memory through it. With `file`, that
+    /// memory is a shared mapping (on Windows a view) of `file.file` from `file.offset`, and the
+    /// file holds at least `length` bytes from there.
     pub unsafe fn push_with_file(
         &mut self,
         guest_physical_address: u64,

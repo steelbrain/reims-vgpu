@@ -308,8 +308,9 @@ pub struct GraphicsConfig {
     /// 16 KiB for a guest that takes `RGFX_FEATURE_PAGES_16K`); `None` keeps each surface's GPU
     /// view a copy of its pages in the region. On a GPU that shares the CPU's memory the device
     /// answers `recommendedMaxWorkingSetSize` from the RAM the map holds (`device_info`'s
-    /// `lane_working_set`). The pages stay the guest's RAM while the device lives: a host that
-    /// discards guest RAM (a balloon, hot-unplug) gives none.
+    /// `lane_working_set`). The pages stay the guest's RAM, mapped, while the device lives and
+    /// after it, as [`MemoryMap::push_with_file`] says: a host that discards guest RAM (a
+    /// balloon, hot-unplug) gives none.
     pub memory_map: Option<MemoryMap>,
     /// The guest's architecture, which the device's answer of `isFramebufferReadSupported` follows
     /// (`device_info`'s `lane_flags`).
