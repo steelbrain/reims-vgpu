@@ -69,19 +69,20 @@ fn now() -> PoolNow {
 
 /// A clock that stands still until the test moves it on ([`Hand::on`]): a pool on it gives a
 /// piece back only once the test has moved the clock past the piece's delay, so a step the test
-/// takes before that comes first however slowly a loaded host runs it.
+/// takes before that comes first however slowly a loaded host runs it. The Private blocks' tests
+/// run their workers' idle time on it too.
 #[derive(Default)]
-struct Hand(Arc<std::sync::atomic::AtomicU64>);
+pub(super) struct Hand(Arc<std::sync::atomic::AtomicU64>);
 
 impl Hand {
     /// The clock, at the nanoseconds the test moved it to.
-    fn clock(&self) -> PoolNow {
+    pub(super) fn clock(&self) -> PoolNow {
         let nanos = Arc::clone(&self.0);
         Box::new(move || MonoTime::from_nanos(nanos.load(std::sync::atomic::Ordering::SeqCst)))
     }
 
     /// Moves the clock on by `by`.
-    fn on(&self, by: Duration) {
+    pub(super) fn on(&self, by: Duration) {
         let by = u64::try_from(by.as_nanos()).unwrap();
         self.0.fetch_add(by, std::sync::atomic::Ordering::SeqCst);
     }
@@ -438,8 +439,10 @@ fn the_release_gives_every_block_back_and_asks_the_host_nothing() {
 
 #[test]
 fn the_release_gives_a_held_piece_back_only_once_its_hold_ends() {
+    // The clock stands: the release's bound, past which the held piece's block never goes back,
+    // cannot pass before the hold's drop however slowly a loaded host runs this test.
     let host = Arc::new(Host::default());
-    let (mut pool, blocks) = pool(range(64), &host, LONG);
+    let (mut pool, blocks) = pool_at(range(64), &host, LONG, Hand::default().clock());
     pool.grow(BLOCK_LEN);
     host.wait_for(1);
     pool.added(BASE).unwrap();
@@ -598,26 +601,31 @@ fn a_block_taken_again_is_mapped_anew() {
 #[test]
 fn ready_blocks_past_two_are_freed_with_no_word_to_the_host() {
     let delay = Duration::from_millis(30);
-    let host = Arc::new(Host::default());
-    let (pool, blocks) = pool(range(64), &host, delay);
+    let (host, hand) = (Arc::new(Host::default()), Hand::default());
+    let (pool, blocks) = pool_at(range(64), &host, delay, hand.clock());
     let n = KEPT_CALLS + 3;
     for _ in 0..KEPT + 3 {
         pool.grow(BLOCK_LEN);
     }
+    // The clock stands: no piece above the headroom comes due before the pool's taker has taken
+    // the rest, so the first `n` calls are the adds of all of them.
     host.wait_for(n);
     for i in 0..KEPT + 3 {
         pool.added(BASE + i * BLOCK_LEN).unwrap();
     }
-    // The three above the headroom go back, lowest first, each asked out of the guest before it
-    // goes.
+    // Past the delay, the three above the headroom go back, lowest first, each asked out of the
+    // guest before it goes.
+    hand.on(delay);
     for i in 0..3 {
         let at = PAST + i * BLOCK_LEN;
         let calls = n + 1 + usize::try_from(i).unwrap();
         assert_eq!(host.wait_for(calls)[calls - 1], Call::Remove(at, BLOCK_LEN));
         pool.removed(at).unwrap();
     }
-    // The source keeps two ready and frees the oldest, asking no one.
+    // The source keeps two ready and frees the oldest, asking no one: neither past more delays
+    // nor in the real wait after, which gives a pool that asked the host more the time to.
     wait_counts(&blocks, KEPT_CALLS, 2);
+    hand.on(delay * 4);
     std::thread::sleep(delay * 4);
     assert_eq!(host.calls().len(), n + 3);
     assert!(pool.source().is_some());
@@ -657,7 +665,16 @@ fn a_piece_given_back_and_taken_again_reads_zero() {
 
 /// The pool at `range(64)` with one live piece, at `BASE`, and a ledger of it.
 fn live_pool(host: &Arc<Host>, delay: Duration) -> (Pool, Arc<HostBlocks>, PoolLedger) {
-    let (pool, blocks) = pool(range(64), host, delay);
+    live_pool_at(host, delay, now())
+}
+
+/// [`live_pool`], on `clock`.
+fn live_pool_at(
+    host: &Arc<Host>,
+    delay: Duration,
+    clock: PoolNow,
+) -> (Pool, Arc<HostBlocks>, PoolLedger) {
+    let (pool, blocks) = pool_at(range(64), host, delay, clock);
     pool.grow(BLOCK_LEN);
     host.wait_for(1);
     pool.added(BASE).unwrap();
@@ -1608,11 +1625,11 @@ fn spin_until(what: &str, done: impl Fn() -> bool) {
 /// A keep of a piece's block, which an import of its bytes holds until the platform frees the
 /// import, late, holds the block at the release's end as a hold does: the release's end sleeps
 /// on the pool's bell while the keep lives, and gives the block back to the source once the
-/// keep's drop rang it
+/// keep's drop rang it; the clock stands, so the release's bound cannot pass before that drop
 #[test]
 fn the_release_gives_a_kept_piece_back_only_once_its_keep_goes() {
     let host = Arc::new(Host::default());
-    let (pool, blocks, ledger) = live_pool(&host, LONG);
+    let (pool, blocks, ledger) = live_pool_at(&host, LONG, Hand::default().clock());
     answer(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
     let keep = ledger.over_held(1, 0, TAKE_ALIGN, |_, keep| keep);
     let keep = keep.expect("a keep of the block");

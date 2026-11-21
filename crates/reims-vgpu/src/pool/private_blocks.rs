@@ -668,7 +668,9 @@ fn micros(d: Duration) -> u64 {
 }
 
 #[cfg(test)]
-// Test scaffolding: real time bounds the waits, and helper threads stand in for the device's.
+// Test scaffolding: real time bounds the waits and runs the workers' idle time, but for a test
+// that counts the workers within it, which runs on a clock that stands (the pool tests' `Hand`);
+// helper threads stand in for the device's.
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use std::sync::LazyLock;
@@ -677,6 +679,7 @@ mod tests {
     use std::time::Instant;
 
     use super::super::addresses::{PRIVATE_BASE, PRIVATE_END};
+    use super::super::tests::Hand;
     use super::super::{BlockError, BlockInfo, MonoTime};
     use super::*;
 
@@ -780,7 +783,12 @@ mod tests {
     }
 
     fn ledger(source: Option<Arc<Source>>) -> PrivateBlocks {
-        PrivateBlocks::new(source.map(|s| s as Arc<dyn BlockSource>), now())
+        ledger_at(source, now())
+    }
+
+    /// [`ledger`], on `clock`.
+    fn ledger_at(source: Option<Arc<Source>>, clock: PoolNow) -> PrivateBlocks {
+        PrivateBlocks::new(source.map(|s| s as Arc<dyn BlockSource>), clock)
     }
 
     /// A take's answer and the name of the thread that gave it.
@@ -1001,11 +1009,13 @@ mod tests {
     }
 
     /// A context's takes are answered in its order: a take behind its context's earlier one
-    /// waits for it, counted, while another context's take waits for neither.
+    /// waits for it, counted, while another context's take waits for neither. The clock stands,
+    /// so the other context's worker, idle from its answer, is still there at the count of the
+    /// workers however slowly a loaded host runs this test.
     #[test]
     fn a_context_s_takes_are_answered_in_its_order_and_another_s_wait_for_none_of_them() {
         let source = Source::shut();
-        let blocks = ledger(Some(source.clone()));
+        let blocks = ledger_at(Some(source.clone()), Hand::default().clock());
         let first = take(&blocks, 3, GATED);
         source.wait_waiting(1);
         let second = take(&blocks, 3, 0x1_0000);
@@ -1021,6 +1031,8 @@ mod tests {
         assert_eq!(answered(&first).unwrap().0, (1 << 40) + (2 << 30));
         assert_eq!(answered(&second).unwrap().0, (1 << 40) + (3 << 30));
         assert_eq!(blocks.workers(), 2);
+        // Idle on a clock that stands, the workers go only at the release.
+        blocks.close();
     }
 
     /// A take its context's close or the device's reset ended is never answered: the block its
