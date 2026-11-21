@@ -776,7 +776,7 @@ impl Context {
     /// the pool of `surfaces` surfaces of `format`, `width` by `height`, that it decodes into,
     /// its render targets. On Windows the context is kept on drop, with its config and its pool,
     /// while another context lives on the display, and taken back, with them, by a decoder of
-    /// its shape ([`ContextShape`]): the same profile and attributes, the same format, size and
+    /// its shape (`ContextShape`): the same profile and attributes, the same format, size and
     /// number of surfaces, and the same `references`, the count the picture parameters carry
     /// that the driver sizes its decoder by (H.264's `num_ref_frames`, HEVC's
     /// `sps_max_dec_pic_buffering_minus1`). So beside a live context a decoder of a shape kept
