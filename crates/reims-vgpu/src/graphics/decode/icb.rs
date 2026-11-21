@@ -3992,4 +3992,433 @@ mod tests {
         let c = icb.render_command(0).unwrap().unwrap();
         assert_eq!(c.draw_args().unwrap().vertex_count, 7);
     }
+
+    /// On the rt platform, through the decoder: a command buffer whose first work is a render pass
+    /// that executes an indirect command buffer over a range a buffer holds, which a blit of an
+    /// earlier command buffer wrote, then a compute dispatch, the command buffer's first, that
+    /// reads a texture through a sampler state. The pass draws the range's commands, the kernel
+    /// reads each texel, and both command buffers complete.
+    ///
+    /// rt runs an execution over a range a buffer holds as a count kernel ahead of the pass, which
+    /// is then the command buffer's first compute pipeline. The test guards rt 70dfe08320, which
+    /// binds rt's set 1 with that kernel: before it, the kernel's bind marked the compute bind
+    /// point bound without set 1, and each dispatch after it in the command buffer read its
+    /// textures and samplers through an unbound set (at metal2vulkan 5a04298008 the rendering
+    /// sample's indirect path lost the device on an RTX 3090 and an RX 7900 XTX, and rt's own test
+    /// of the pattern crashed lavapipe). On a device without `VK_EXT_device_generated_commands` the
+    /// make answers nil, rt's gap, which the test prints and stops at.
+    #[test]
+    fn on_vulkan_a_dispatch_after_a_held_range_execution_reads_its_texture_and_sampler() {
+        use reims_vgpu_graphics::ops::blit::{
+            RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RgfxBlitOpCopyBufferToBuffer,
+        };
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_DISPATCH_THREADS, RGFX_OP_COMPUTE_SET_BUFFERS,
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RGFX_OP_COMPUTE_SET_SAMPLER_STATES,
+            RGFX_OP_COMPUTE_SET_TEXTURES, RGFX_OP_COMPUTE_USE_RESOURCES, RgfxComputeBufferBinding,
+            RgfxComputeOpDispatchThreads, RgfxComputeOpSetBuffers,
+            RgfxComputeOpSetComputePipelineState, RgfxComputeOpSetSamplerStates,
+            RgfxComputeOpSetTextures, RgfxComputeOpUseResources, RgfxComputeResourceRef,
+            RgfxComputeSamplerBinding, RgfxComputeTextureBinding,
+        };
+        use reims_vgpu_graphics::ops::render::{
+            RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            RgfxOpExecuteCommandsIndirect, RgfxOpSetRenderPipelineState,
+        };
+        use reims_vgpu_graphics::ops::{
+            RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_BLIT,
+            RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
+            RGFX_RESOURCE_KIND_ICB, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpHeader,
+            RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+        };
+        use reims_vgpu_graphics::wire::{
+            RGFX_CB_OK, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE, RgfxCbComplete,
+            RgfxQueueCreate,
+        };
+        use reims_vgpu_vulkan::RtPlatform;
+        use reims_vgpu_vulkan::core::platform::host_range::HostRange;
+        use reims_vgpu_vulkan::core::platform::resource::{
+            Buffer as _, Library as _, Texture as _,
+        };
+        use reims_vgpu_vulkan::core::platform::values::{
+            ColorAttachmentDesc, FullRenderPipelineDesc, SamplerDesc, TextureDesc,
+        };
+        use reims_vgpu_vulkan::core::raise::OnFault;
+
+        use crate::platform::ApiPlatform as _;
+
+        const ICB_LIBRARY: &[u8] =
+            include_bytes!("../../../../../tests/shaders/icb_indexed.metallib");
+        const SAMPLE_LIBRARY: &[u8] =
+            include_bytes!("../../../../../tests/shaders/compute_sample.metallib");
+        const QUEUE: u64 = 1;
+        const ICB: u64 = 2;
+        const ARGUMENTS: u64 = 3;
+        const POSITIONS: u64 = 4;
+        const COLOURS: u64 = 5;
+        const INDICES: u64 = 6;
+        const RANGES: u64 = 7;
+        const STAGING: u64 = 8;
+        const OUT: u64 = 9;
+        const ENCODE: u64 = 10;
+        const SAMPLE: u64 = 11;
+        const DRAW: u64 = 12;
+        const TARGET: u64 = 13;
+        const SAMPLED: u64 = 14;
+        const SAMPLER: u64 = 15;
+        const ENCODED: u64 = 20;
+        const EXECUTED: u64 = 21;
+
+        /// `values`' little-endian bytes.
+        fn words(values: &[u32]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        /// `values`' little-endian bytes.
+        fn floats(values: &[f32]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        /// One op: its header, then its body.
+        fn op(tag: u16, body: &[u8]) -> Vec<u8> {
+            let header = RgfxOpHeader {
+                tag,
+                flags: 0,
+                len: (size_of::<RgfxOpHeader>() + body.len()) as u32,
+            };
+            [header.as_bytes(), body].concat()
+        }
+
+        /// `setComputePipelineState:` of `pipeline_obj_id`.
+        fn pipeline(pipeline_obj_id: u64) -> Vec<u8> {
+            let set = RgfxComputeOpSetComputePipelineState { pipeline_obj_id };
+            op(RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, set.as_bytes())
+        }
+
+        /// A buffer's binding at offset 0.
+        fn binding(buffer_obj_id: u64) -> RgfxComputeBufferBinding {
+            RgfxComputeBufferBinding {
+                buffer_obj_id,
+                offset: 0,
+            }
+        }
+
+        /// `setBuffers:offsets:withRange:` from index 0: its head, then `bindings`.
+        fn buffers(bindings: &[RgfxComputeBufferBinding]) -> Vec<u8> {
+            let head = RgfxComputeOpSetBuffers {
+                location: 0,
+                length: bindings.len() as u64,
+            };
+            let body = [head.as_bytes(), bindings.as_bytes()].concat();
+            op(RGFX_OP_COMPUTE_SET_BUFFERS, &body)
+        }
+
+        /// `dispatchThreads:threadsPerThreadgroup:` of `count` threads in one threadgroup.
+        fn threads(count: u64) -> Vec<u8> {
+            let dispatch = RgfxComputeOpDispatchThreads {
+                grid_width: count,
+                grid_height: 1,
+                grid_depth: 1,
+                threads_width: count,
+                threads_height: 1,
+                threads_depth: 1,
+            };
+            op(RGFX_OP_COMPUTE_DISPATCH_THREADS, dispatch.as_bytes())
+        }
+
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
+        let on = OnFault::Return;
+        // A platform of the test's own, whose device goes before the process exits.
+        let platform = crate::rt_test_end::platform();
+        let device = platform.metal_device(None).unwrap();
+        // Indexed draws that inherit the pipeline state, of one vertex and one fragment buffer.
+        let indexed = IcbDesc {
+            command_types: 2, // MTLIndirectCommandTypeDrawIndexed
+            inherit_pipeline_state: true,
+            max_vertex_buffer_bind_count: 1,
+            max_fragment_buffer_bind_count: 1,
+            ..IcbDesc::default()
+        };
+        let made = device.new_indirect_command_buffer(&indexed, 2, 0);
+        let Some(icb) = made.expect("never a raise") else {
+            assert_eq!(
+                device.facts().indirect_tokens,
+                None,
+                "a device of the extension made no buffer"
+            );
+            println!("no VK_EXT_device_generated_commands: the make answers nil, rt's gap");
+            return;
+        };
+
+        // A Shared buffer that holds `bytes`.
+        let shared = |bytes: &[u8]| {
+            let made = device.new_buffer_of_length(on, bytes.len() as u64, 0);
+            let made = made.expect("never a raise").expect("a buffer");
+            // SAFETY: the Shared buffer's contents are mapped, `bytes` long, and no command uses
+            // the buffer yet.
+            unsafe {
+                let at = made.contents().as_ptr::<u8>();
+                at.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
+            }
+            made
+        };
+        // Command 0 a green triangle over the target, command 1 a blue one: each three `float4`
+        // positions, (-1, -1), (3, -1) and (-1, 3), its three 16-bit indices and its colour.
+        let corners = [
+            [-1.0f32, -1.0, 0.0, 1.0],
+            [3.0, -1.0, 0.0, 1.0],
+            [-1.0, 3.0, 0.0, 1.0],
+        ];
+        let positions = floats([corners; 2].as_flattened().as_flattened());
+        let indices: Vec<u8> = (0u16..6).flat_map(u16::to_le_bytes).collect();
+        let colours = floats(&[0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0]);
+
+        let texture = |desc: TextureDesc| {
+            let made = device.new_texture(on, &platform.texture_descriptor(&desc));
+            made.expect("never a raise").expect("a texture")
+        };
+        let target = texture(TextureDesc {
+            width: 4,
+            height: 4,
+            usage: 5, // shader read, render target
+            ..TextureDesc::default()
+        });
+        // A row of four texels, of which the kernel's thread `i` reads the `i`th.
+        let texels: [[u8; 4]; 4] = [
+            [0x10, 0x20, 0x30, 0x40],
+            [0x50, 0x60, 0x70, 0x80],
+            [0x90, 0xa0, 0xb0, 0xc0],
+            [0xd0, 0xe0, 0xf0, 0xff],
+        ];
+        let sampled = texture(TextureDesc {
+            width: 4,
+            ..TextureDesc::default()
+        });
+        let row = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 1, 1));
+        let bytes = HostRange::of_slice(texels.as_flattened());
+        let replaced = sampled.replace_region(row, 0, 0, bytes, 16, 0);
+        replaced.expect("never a raise");
+        // `sample_k` reads left of the texture, at `(i + 0.5) / 4 - 1`: repeated, texel `i`.
+        let sampler = device.new_sampler_state(&SamplerDesc {
+            s_address_mode: Some(2), // MTLSamplerAddressModeRepeat
+            ..SamplerDesc::default()
+        });
+        let sampler = sampler.expect("never a raise").expect("a sampler state");
+
+        let library = |bytes: &[u8]| {
+            let made = device.new_library(bytes).expect("never a raise");
+            made.expect("a library").expect("a library")
+        };
+        let icbs = library(ICB_LIBRARY);
+        let samples = library(SAMPLE_LIBRARY);
+        let function = |library: &<RtPlatform as Platform>::Library, name: &str| {
+            let made = library.new_function(on, name).expect("never a raise");
+            made.expect("a function")
+        };
+        let kernel = |function: &<RtPlatform as Platform>::Function| {
+            let made = device.new_compute_pipeline_state_for_function(Some(function));
+            made.expect("a compute state").expect("a compute state")
+        };
+        let encode = kernel(&function(&icbs, "icb_encode"));
+        let sample = kernel(&function(&samples, "sample_k"));
+        let vertex = function(&icbs, "icb_vertex");
+        let fragment = function(&icbs, "icb_fragment");
+        let mut desc = FullRenderPipelineDesc::<RtPlatform>::new(&vertex, Some(&fragment));
+        desc.colors = vec![(
+            0,
+            ColorAttachmentDesc {
+                pixel_format: 70, // RGBA8Unorm
+                ..ColorAttachmentDesc::default()
+            },
+        )];
+        desc.support_indirect_command_buffers = true;
+        let draw = device.new_render_pipeline_state_full(&desc);
+        let draw = draw.expect("a render state").expect("a render state");
+
+        let mut dec = GraphicsDecoder::<RtPlatform>::new(
+            Arc::clone(&platform),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
+        );
+        // Each command buffer one of rt's: a part committed at the pass's end would put the
+        // dispatch in a command buffer of its own.
+        dec.set_split_after(Some(std::time::Duration::from_secs(3600)));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&completed);
+        let record = move |m: RgfxCbComplete| sink.lock().push((m.cb_obj_id, m.status));
+        dec.set_completion_sink(Arc::new(record));
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: QUEUE,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(dec.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
+        let arguments = shared(&icb.gpu_resource_id().to_le_bytes());
+        let handles = [
+            (ICB, ObjHandle::Icb(icb)),
+            (ARGUMENTS, ObjHandle::Buffer(arguments)),
+            (POSITIONS, ObjHandle::Buffer(shared(&positions))),
+            (COLOURS, ObjHandle::Buffer(shared(&colours))),
+            (INDICES, ObjHandle::Buffer(shared(&indices))),
+            (RANGES, ObjHandle::Buffer(shared(&words(&[0, 0])))),
+            // The range the blit writes: commands 0 and 1.
+            (STAGING, ObjHandle::Buffer(shared(&words(&[0, 2])))),
+            (OUT, ObjHandle::Buffer(shared(&words(&[0xdead_beef; 4])))),
+            (ENCODE, ObjHandle::ComputePipeline(encode)),
+            (SAMPLE, ObjHandle::ComputePipeline(sample)),
+            (DRAW, ObjHandle::RenderPipeline(draw)),
+            (TARGET, ObjHandle::Texture(target)),
+            (SAMPLED, ObjHandle::Texture(sampled)),
+            (SAMPLER, ObjHandle::Sampler(sampler)),
+        ];
+        for (obj_id, handle) in handles {
+            assert_eq!(dec.insert(obj_id, handle).unwrap(), Ok(()));
+        }
+
+        // Decodes the `COMMAND_BUFFER` message of the queue's command buffer `cb_obj_id`, which
+        // carries `ops`.
+        let commit = |dec: &mut GraphicsDecoder<RtPlatform>, cb_obj_id: u64, ops: &[Vec<u8>]| {
+            let ops = ops.concat();
+            let m = RgfxCommandBuffer {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_COMMAND_BUFFER,
+                    size: (RGFX_COMMAND_BUFFER_OPS_OFFSET as usize + ops.len()) as u32,
+                    seqno: cb_obj_id,
+                },
+                queue_obj_id: QUEUE,
+                cb_obj_id,
+                op_bytes: ops.len() as u64,
+            };
+            let message = [m.as_bytes(), ops.as_slice()].concat();
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        };
+        // Whether command buffer `cb_obj_id` completes, waiting for it.
+        let completes = |cb_obj_id: u64| {
+            let done = || completed.lock().iter().any(|&(id, _)| id == cb_obj_id);
+            crate::graphics::tests::eventually(done)
+        };
+        let compute = RgfxComputePassDesc::default();
+
+        // The earlier command buffer: a blit writes the range, then `icb_encode` encodes
+        // commands 0 and 1 through the indirect command buffer's `gpuResourceID`.
+        let copy = RgfxBlitOpCopyBufferToBuffer {
+            source_buffer_obj_id: STAGING,
+            destination_buffer_obj_id: RANGES,
+            source_offset: 0,
+            destination_offset: 0,
+            size: 8,
+        };
+        let scene = [ARGUMENTS, POSITIONS, COLOURS, INDICES].map(binding);
+        let used = {
+            let head = RgfxComputeOpUseResources { count: 1, usage: 2 };
+            let record = RgfxComputeResourceRef {
+                kind: RGFX_RESOURCE_KIND_ICB,
+                reserved_04: 0,
+                obj_id: ICB,
+            };
+            [head.as_bytes(), record.as_bytes()].concat()
+        };
+        let encoding = [
+            op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            op(RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, copy.as_bytes()),
+            op(RGFX_OP_ENCODER_END, &[]),
+            op(RGFX_OP_ENCODER_BEGIN_COMPUTE, compute.as_bytes()),
+            pipeline(ENCODE),
+            buffers(&scene),
+            op(RGFX_OP_COMPUTE_USE_RESOURCES, &used),
+            threads(2),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ];
+        commit(&mut dec, ENCODED, &encoding);
+        assert!(
+            completes(ENCODED),
+            "the encoding command buffer never completed"
+        );
+
+        // The command buffer under test: the pass, its first work, clears the target to red and
+        // executes the range the blit wrote; then `sample_k`, its first dispatch, samples.
+        let pass = RgfxRenderPassDesc {
+            color_count: 1,
+            ..RgfxRenderPassDesc::default()
+        };
+        let colour = RgfxRenderPassColorAttachment {
+            texture_obj_id: TARGET,
+            load_action: 2,  // Clear
+            store_action: 1, // Store
+            clear_color_bits: [1.0f64.to_bits(), 0, 0, 1.0f64.to_bits()],
+            ..RgfxRenderPassColorAttachment::default()
+        };
+        let begin = [pass.as_bytes(), colour.as_bytes()].concat();
+        let state = RgfxOpSetRenderPipelineState {
+            pipeline_obj_id: DRAW,
+        };
+        let held = RgfxOpExecuteCommandsIndirect {
+            indirect_command_buffer_obj_id: ICB,
+            indirect_range_buffer_obj_id: RANGES,
+            indirect_buffer_offset: 0,
+        };
+        let textures = {
+            let head = RgfxComputeOpSetTextures {
+                location: 0,
+                length: 1,
+            };
+            let record = RgfxComputeTextureBinding {
+                texture_obj_id: SAMPLED,
+            };
+            [head.as_bytes(), record.as_bytes()].concat()
+        };
+        let samplers = {
+            let head = RgfxComputeOpSetSamplerStates {
+                location: 0,
+                length: 1,
+            };
+            let record = RgfxComputeSamplerBinding {
+                sampler_obj_id: SAMPLER,
+            };
+            [head.as_bytes(), record.as_bytes()].concat()
+        };
+        let executing = [
+            op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin),
+            op(RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, state.as_bytes()),
+            op(RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT, held.as_bytes()),
+            op(RGFX_OP_ENCODER_END, &[]),
+            op(RGFX_OP_ENCODER_BEGIN_COMPUTE, compute.as_bytes()),
+            pipeline(SAMPLE),
+            op(RGFX_OP_COMPUTE_SET_TEXTURES, &textures),
+            op(RGFX_OP_COMPUTE_SET_SAMPLER_STATES, &samplers),
+            buffers(&[binding(OUT)]),
+            threads(4),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ];
+        commit(&mut dec, EXECUTED, &executing);
+        assert!(
+            completes(EXECUTED),
+            "the executing command buffer never completed"
+        );
+        // Neither lost the device.
+        assert_eq!(
+            *completed.lock(),
+            [(ENCODED, RGFX_CB_OK), (EXECUTED, RGFX_CB_OK)]
+        );
+
+        // Commands 0 and 1 drawn, the last, blue, on top.
+        let Some(ObjHandle::Texture(target)) = dec.object(TARGET) else {
+            panic!("no target");
+        };
+        let mut drawn = [0u8; 64];
+        target.read_pixels(&mut drawn, 16);
+        let blue: [u8; 64] = std::array::from_fn(|i| [0, 0, 255, 255][i % 4]);
+        assert_eq!(drawn, blue);
+        let Some(ObjHandle::Buffer(out)) = dec.object(OUT) else {
+            panic!("no output buffer");
+        };
+        // SAFETY: a Shared buffer of 16 bytes, read after the command buffer that wrote it
+        // completed.
+        let written = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), 16) };
+        // Thread `i`'s texel `i`, as `pack_float_to_unorm4x8` packs it, little-endian.
+        assert_eq!(written, texels.as_flattened());
+    }
 }
