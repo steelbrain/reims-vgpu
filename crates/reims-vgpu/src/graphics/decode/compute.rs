@@ -449,6 +449,7 @@ pub(crate) fn decode_op<P: Platform>(
             }
             enc.encode(on, ComputeCmd::SetComputePipelineState { state })?;
             objs.pipeline_bound(m.pipeline_obj_id);
+            objs.pipeline_set(false, m.pipeline_obj_id);
         }
         RGFX_OP_COMPUTE_SET_BUFFER_OFFSET => {
             let m: RgfxComputeOpSetBufferOffset = body(tag, payload)?;

@@ -35,7 +35,14 @@
 //!   which the swapchain reports to rt, rt's `Device::report_loss`), and how many of its command
 //!   buffers were committed and not complete then, the one failing among them ([`DeviceLoss`]).
 //!   Each command buffer that fails with the device lost is counted, `rt-device-lost`, in the
-//!   process's degradation counts (docs/conventions.md). The device is lost from rt's
+//!   process's degradation counts (docs/conventions.md). Then each command buffer rt ends as in
+//!   flight writes a line of its own, naming the work the guest knows it by, as its caller named
+//!   it (`CommandBuffer::names_work`): the guest's command buffer, by its object id, and the
+//!   object ids of the first compute and the first render pipeline state its encoders set, or
+//!   `none`; one the caller named nothing for, the host's own, says so. A command buffer cut in
+//!   parts writes one line however many of its parts are lost in flight. The first
+//!   [`IN_FLIGHT_NAMED`] write theirs, and the next a line that the rest are counted only: each is
+//!   counted, `rt-device-lost-in-flight`. The device is lost from rt's
 //!   `Device::loss` on ([`RtDevice::is_lost`]): its swapchains make no Vulkan call on it but their
 //!   ends' destroys (`super::swapchain`'s docs, "A lost device").
 //!   One its caller failed for a deferred buffer's memory rt refused
@@ -106,7 +113,7 @@ use metal2vulkan_runtime as rt;
 
 use crate::core::platform::command::{
     CommandBuffer, CompletedHandler, CompletedInfo, EscapedCopies, KeptWhole, PartCut,
-    ScheduledHandler, run_completed,
+    ScheduledHandler, WorkNames, run_completed,
 };
 use crate::core::platform::event::EventRef;
 use crate::core::platform::types::{CommandBufferStatus, NsErrorText};
@@ -140,6 +147,15 @@ const ERROR_TIMEOUT: i64 = 2;
 /// The degradation code of a command buffer that fails with its device lost (the module's docs,
 /// "A lost device's line").
 const DEVICE_LOST: &str = "rt-device-lost";
+
+/// The degradation code of a command buffer rt ends as in flight at its device's loss, counted
+/// once however many of its parts it ends so (the module's docs, "A lost device's line").
+const DEVICE_LOST_IN_FLIGHT: &str = "rt-device-lost-in-flight";
+
+/// How many command buffers lost in flight on a device write a line naming their work (the
+/// module's docs, "A lost device's line"): the first few, of a loss that ends every command buffer
+/// in flight, and the next writes that the rest are counted only.
+const IN_FLIGHT_NAMED: usize = 8;
 
 /// `MTLCommandBufferErrorOutOfMemory`.
 const ERROR_OUT_OF_MEMORY: i64 = 8;
@@ -369,15 +385,20 @@ struct Failure {
     loss: Arc<DeviceLoss>,
     /// rt's cause of its device's loss (rt's `Device::loss`), which the loss's line names.
     cause: Box<dyn Fn() -> Option<rt::DeviceLoss> + Send + Sync>,
+    /// The guest's names for its work, which its line names where rt ends it as in flight at the
+    /// loss, as its caller named them, or the command buffer it was cut from held them
+    /// (`names_work`).
+    work: OnceLock<Arc<WorkNames>>,
 }
 
 impl Failure {
     /// The answer of rt's `error`, made at the first that is not `None` and kept.
     fn read(&self, error: Option<rt::CommandBufferError>) -> Option<NsErrorText> {
         let error = error?;
+        let work = self.work.get().map(Arc::as_ref);
         Some(
             self.error
-                .get_or_init(|| ns_error(error, &self.loss, &*self.cause))
+                .get_or_init(|| ns_error(error, &self.loss, &*self.cause, work))
                 .clone(),
         )
     }
@@ -399,6 +420,9 @@ pub struct DeviceLoss {
     hung: AtomicBool,
     /// Whether the loss's line was written.
     said: AtomicBool,
+    /// How many command buffers rt ended as in flight at the loss came to write their lines
+    /// ([`Self::lost_in_flight`]).
+    in_flight: AtomicUsize,
     /// Its command buffers committed and not complete: a commit adds one before rt has it (and
     /// takes it off where rt refuses it), and its first completed handler takes it off once its
     /// error is read, so a failing command buffer counts itself.
@@ -412,8 +436,53 @@ impl DeviceLoss {
             gpu,
             hung: AtomicBool::new(false),
             said: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
             open: AtomicI64::new(0),
         }
+    }
+
+    /// rt ended a command buffer as in flight at the loss, the guest's names for its work `work`
+    /// where its caller named them: counted, once however many of its parts it ends so, and, of
+    /// the first [`IN_FLIGHT_NAMED`], each writes a line naming them; the next writes that the
+    /// rest are counted only (the module's docs, "A lost device's line").
+    fn lost_in_flight(&self, work: Option<&WorkNames>) {
+        if work.is_some_and(|work| !work.first_told()) {
+            return;
+        }
+        crate::answer::count_kind(DEVICE_LOST_IN_FLIGHT);
+        let n = self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let line = match (n.cmp(&IN_FLIGHT_NAMED), work) {
+            (std::cmp::Ordering::Greater, _) => return,
+            (std::cmp::Ordering::Equal, _) => format!(
+                "reims-vgpu: more command buffers were lost in flight on the rt platform's \
+                 device on {}: the degradation counts give how many in all \
+                 ({DEVICE_LOST_IN_FLIGHT})\n",
+                self.gpu
+            ),
+            (std::cmp::Ordering::Less, Some(work)) => {
+                let named = |id: u64| match id {
+                    0 => "none".to_owned(),
+                    id => format!("{id:#x}"),
+                };
+                let (compute, render) = work.firsts();
+                format!(
+                    "reims-vgpu: the guest's command buffer {:#x} was lost in flight on the rt \
+                     platform's device on {}, its encoders' first compute pipeline state {} and \
+                     first render pipeline state {} ({DEVICE_LOST_IN_FLIGHT})\n",
+                    work.cb(),
+                    self.gpu,
+                    named(compute),
+                    named(render)
+                )
+            }
+            (std::cmp::Ordering::Less, None) => format!(
+                "reims-vgpu: a command buffer of the host's own, which the guest does not \
+                 number, was lost in flight on the rt platform's device on {} \
+                 ({DEVICE_LOST_IN_FLIGHT})\n",
+                self.gpu
+            ),
+        };
+        say_lost(&line);
     }
 
     /// A command buffer failed with the device lost: counted, and the first writes the loss's
@@ -499,6 +568,7 @@ impl RtCommandBuffer {
             error: OnceLock::new(),
             loss: Arc::clone(device.loss()),
             cause: Box::new(move || rt_device.loss()),
+            work: OnceLock::new(),
         });
         RtCommandBuffer {
             rt: made,
@@ -598,6 +668,9 @@ impl RtCommandBuffer {
                 let part = RtCommandBuffer::new(made, self.queue.clone(), self.device.clone_ref());
                 if let Some(escapes) = self.escapes.get() {
                     let _ = part.escapes.set(escapes.clone());
+                }
+                if let Some(work) = self.failure.work.get() {
+                    let _ = part.failure.work.set(Arc::clone(work));
                 }
                 Some(RtObj::new(part))
             }
@@ -813,14 +886,19 @@ fn status(status: rt::CommandBufferStatus) -> CommandBufferStatus {
 /// rt's error as Metal's `NSError` (the module's docs): `Timeout` for the first command buffer
 /// lost in flight on the device whose loss is `loss`, `Internal` for any other; a command buffer
 /// that fails with its device lost tells `loss`, with rt's cause, which `cause` reads
-/// ([`DeviceLoss::lost`]).
+/// ([`DeviceLoss::lost`]), and one lost in flight the guest's names for its work, `work`, where
+/// its caller named them ([`DeviceLoss::lost_in_flight`]).
 fn ns_error(
     error: rt::CommandBufferError,
     loss: &DeviceLoss,
     cause: &dyn Fn() -> Option<rt::DeviceLoss>,
+    work: Option<&WorkNames>,
 ) -> NsErrorText {
-    if let rt::CommandBufferError::DeviceLost { .. } = error {
+    if let rt::CommandBufferError::DeviceLost { in_flight } = error {
         loss.lost(cause);
+        if in_flight {
+            loss.lost_in_flight(work);
+        }
     }
     let code = match error {
         rt::CommandBufferError::DeviceLost { in_flight: true }
@@ -1360,6 +1438,13 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     fn reaches_escaped(&self, escapes: &EscapedCopies) {
         let _ = self.escapes.set(escapes.clone());
     }
+
+    /// Keeps `names`, the guest's names for its work, which its line names where rt ends it, or a
+    /// part cut from it, as in flight at its device's loss (the module's docs, "A lost device's
+    /// line"); the first named alone is kept.
+    fn names_work(&self, names: &Arc<WorkNames>) {
+        let _ = self.failure.work.set(Arc::clone(names));
+    }
 }
 
 #[cfg(test)]
@@ -1392,7 +1477,7 @@ mod tests {
         let codes = |errors: &[rt::CommandBufferError]| {
             let loss = DeviceLoss::new("a GPU".to_owned());
             (errors.iter())
-                .map(|&e| ns_error(e, &loss, &|| None))
+                .map(|&e| ns_error(e, &loss, &|| None, None))
                 .inspect(|e| assert_eq!(e.domain, ERROR_DOMAIN))
                 .map(|e| e.code)
                 .collect::<Vec<_>>()
@@ -1408,6 +1493,7 @@ mod tests {
             error: OnceLock::new(),
             loss: Arc::clone(loss),
             cause: Box::new(|| None),
+            work: OnceLock::new(),
         };
         let (first, second) = (failure(&loss), failure(&loss));
         assert_eq!(first.read(None), None);
@@ -1446,6 +1532,7 @@ mod tests {
                     result: ash::vk::Result::ERROR_DEVICE_LOST,
                 })
             }),
+            work: OnceLock::new(),
         };
         let (first, second, third) = (failure(), failure(), failure());
         // Three committed (`RtCommandBuffer::commit`'s count).
@@ -1477,6 +1564,7 @@ mod tests {
             error: OnceLock::new(),
             loss: Arc::clone(&other),
             cause: Box::new(|| None),
+            work: OnceLock::new(),
         };
         unnamed.completed(Some(DeviceLost { in_flight: true }));
         assert_eq!(
@@ -1487,6 +1575,82 @@ mod tests {
                  buffer fails from here on, and nothing makes the device again (rt-device-lost)\n"
             ]
         );
+    }
+
+    /// Each command buffer rt ends as in flight at its device's loss writes a line after the
+    /// device's, naming the guest's command buffer and the first compute and render pipeline
+    /// states its encoders set, `none` for a kind it set none of, as its caller named them; one cut
+    /// in parts, which share its names, writes one however many of them are lost in flight, and
+    /// one its caller named nothing for says it is the host's own. One rt ends held, not in
+    /// flight, writes none. Of the first [`IN_FLIGHT_NAMED`] each writes its line, the next that
+    /// the rest are counted only, and each is counted once (the module's docs, "A lost device's
+    /// line").
+    #[test]
+    fn each_command_buffer_lost_in_flight_names_the_guest_s_work() {
+        use rt::CommandBufferError::DeviceLost;
+        let gpu = "C GPU (1234:def0)";
+        let before = counted(DEVICE_LOST_IN_FLIGHT);
+        let loss = Arc::new(DeviceLoss::new(gpu.to_owned()));
+        let failure = |work: Option<&Arc<WorkNames>>| {
+            loss.open.fetch_add(1, Ordering::SeqCst);
+            let failure = Failure {
+                error: OnceLock::new(),
+                loss: Arc::clone(&loss),
+                cause: Box::new(|| None),
+                work: OnceLock::new(),
+            };
+            if let Some(work) = work {
+                let _ = failure.work.set(Arc::clone(work));
+            }
+            failure
+        };
+        let lost = |failure: Failure, in_flight: bool| {
+            failure.completed(Some(DeviceLost { in_flight }));
+        };
+        let in_flight = || {
+            (said_lost(&format!(" device on {gpu}")).into_iter())
+                .filter(|line| line.contains(" in flight "))
+                .collect::<Vec<_>>()
+        };
+        // Its encoders set compute pipeline states 0xb, then 0xc, and a render one, 0xd, after.
+        let both = Arc::new(WorkNames::new(0x2a));
+        both.note_firsts(0xb, 0);
+        both.note_firsts(0xc, 0xd);
+        assert_eq!(both.firsts(), (0xb, 0xd));
+        // Its two parts lost in flight, one held, one that set neither, and one of the host's.
+        lost(failure(Some(&both)), true);
+        lost(failure(Some(&both)), true);
+        lost(failure(Some(&Arc::new(WorkNames::new(0x2c)))), false);
+        lost(failure(Some(&Arc::new(WorkNames::new(0x2b)))), true);
+        lost(failure(None), true);
+        let named = [
+            "reims-vgpu: the guest's command buffer 0x2a was lost in flight on the rt platform's \
+             device on C GPU (1234:def0), its encoders' first compute pipeline state 0xb and first \
+             render pipeline state 0xd (rt-device-lost-in-flight)\n",
+            "reims-vgpu: the guest's command buffer 0x2b was lost in flight on the rt platform's \
+             device on C GPU (1234:def0), its encoders' first compute pipeline state none and \
+             first render pipeline state none (rt-device-lost-in-flight)\n",
+            "reims-vgpu: a command buffer of the host's own, which the guest does not number, was \
+             lost in flight on the rt platform's device on C GPU (1234:def0) \
+             (rt-device-lost-in-flight)\n",
+        ];
+        assert_eq!(in_flight(), named);
+        assert_eq!(counted(DEVICE_LOST_IN_FLIGHT), before + 3);
+        // Seven more: the first five write theirs, the sixth that the rest are counted only.
+        for cb in 0x30..0x37 {
+            lost(failure(Some(&Arc::new(WorkNames::new(cb)))), true);
+        }
+        let lines = in_flight();
+        assert_eq!(lines.len(), IN_FLIGHT_NAMED + 1, "{lines:#?}");
+        assert_eq!(lines[..3], named);
+        assert!(lines[7].contains("command buffer 0x34 was lost in flight"));
+        assert_eq!(
+            lines[8],
+            "reims-vgpu: more command buffers were lost in flight on the rt platform's device on \
+             C GPU (1234:def0): the degradation counts give how many in all \
+             (rt-device-lost-in-flight)\n"
+        );
+        assert_eq!(counted(DEVICE_LOST_IN_FLIGHT), before + 10);
     }
 
     /// The lost devices' lines the process wrote that hold `part`.

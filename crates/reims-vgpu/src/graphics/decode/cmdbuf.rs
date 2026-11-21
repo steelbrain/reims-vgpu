@@ -141,7 +141,7 @@ use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_vulkan::core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_vulkan::core::platform::command::{
     CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, KeptWhole, PartCut,
-    ScheduledHandler,
+    ScheduledHandler, WorkNames,
 };
 use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor;
@@ -751,6 +751,9 @@ struct Walked<P: Platform> {
     /// Whether the platform refused a cache's buffer its memory at a use the walk made
     /// ([`GraphicsDecoder::out_of_memory`]).
     out_of_memory: bool,
+    /// The first compute and render pipeline states its encoders set, 0 for none
+    /// ([`GraphicsDecoder::pipeline_set`]).
+    firsts: (u64, u64),
     /// From the hand-over to its walk's start.
     began: Duration,
     /// Its walk.
@@ -909,6 +912,9 @@ pub(crate) struct Begun<P: Platform> {
     ahead: Option<Vec<u64>>,
     /// It holds a compute encoder ([`Take::computes`]).
     computes: bool,
+    /// The names of its work, which the platform keeps for the line of a lost device that loses
+    /// it in flight ([`WorkNames`]), its walk noting the firsts of them.
+    work_names: Arc<WorkNames>,
 }
 
 /// A command buffer's turn of its completion post, taken by the first of its completion handler
@@ -1941,6 +1947,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         if let Some(escapes) = self.escapes(context_of(m.queue_obj_id)) {
             cb.reaches_escaped(&escapes);
         }
+        // A lost device names it, and the first pipeline states its encoders set, where it loses
+        // it in flight ([`WorkNames`]).
+        let work_names = Arc::new(WorkNames::new(m.cb_obj_id));
+        cb.names_work(&work_names);
         super::work::command_buffer(self.context);
         let in_flight = InFlight::new(&counts.in_flight, &counts.out);
         // Its queue's commit marks rise to it, where its begin on a queue's service thread did
@@ -2051,6 +2061,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             completions: Arc::clone(&counts.completions),
             ahead,
             computes: take.computes,
+            work_names,
         };
         // A thread of its process that waits for it to be scheduled may ask for its record from
         // now, where it would have got it here had it asked for its `CB_SUBMITTED`.
@@ -2103,8 +2114,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             ordered,
             completions,
             ahead,
+            work_names,
             ..
         } = begun;
+        // Its walk notes the first pipeline states its encoders set in its names
+        // ([`Self::pipeline_set`]).
+        *self.work_names.borrow_mut() = Some(work_names);
         let Some(ops) = read::<RgfxCommandBuffer>(message).and_then(|m| ops_of(message, &m)) else {
             return Ok(Err(DecodeError::Malformed));
         };
@@ -2262,6 +2277,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         if self.out_of_memory.take() | out_of_memory {
             cb.fail_out_of_memory();
         }
+        self.name_firsts();
         let commit = || {
             if let Some(submission) = submission {
                 cb.add_submission_handler(ON, submission)?;
@@ -2437,6 +2453,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             self.order_release(device, queue_obj_id, marks, seqno, names, Some(queue))?;
             return Ok(false);
         };
+        // A lost device names the guest's command buffer it stands for, where it loses it in
+        // flight ([`WorkNames`]): no encoder of it sets a pipeline state.
+        cb.names_work(&Arc::new(WorkNames::new(m.cb_obj_id)));
         let in_flight = InFlight::new(&counts.in_flight, &counts.out);
         let mut events = EventOps::default();
         let carried = event_ops(ops);
@@ -2753,6 +2772,17 @@ impl<P: Platform> GraphicsDecoder<P> {
         signals.push(op.event_obj_id, op.value);
     }
 
+    /// Notes the first pipeline states the walk set ([`Self::pipeline_set`]) in its command
+    /// buffer's names, before a commit of what it walked: a first noted before stays
+    /// ([`WorkNames::note_firsts`]). A dealt walk's chunks note theirs in their order instead
+    /// ([`Self::commit_dealt`]).
+    fn name_firsts(&self) {
+        if let Some(names) = self.work_names.borrow().as_ref() {
+            let (compute, render) = self.firsts.get();
+            names.note_firsts(compute, render);
+        }
+    }
+
     /// At an encoder's end, `rest` the ops left after it: where the part of the buffer walked
     /// since the last is long enough to cut ([`Estimate::cuts`]: [`Self::split_after`] where no
     /// command buffer its queue committed is incomplete, else by its estimated GPU time,
@@ -2808,6 +2838,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cut = (walked, clock.now_mono());
         cb.add_completion_seen_handler(ON, parts.part_handler(place, Some(cut)))?;
         let joins = !behind && joins_next::<P>(cb, s);
+        self.name_firsts();
         match cb.split(ON)? {
             Some(next) => {
                 *cb = next;
@@ -2965,6 +2996,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.encoder_shapes.borrow_mut().clear();
         self.slot_shapes.borrow_mut().clear();
         self.slot_pipeline.set(0);
+        self.firsts.set((0, 0));
     }
 
     /// [`Self::walk_ops`]' walk of `ops`, the whole of a command buffer's op stream or a range
@@ -3175,6 +3207,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 shapes: std::mem::take(&mut *self.shapes_written.borrow_mut()),
                 over: std::mem::take(&mut *self.over_caches.borrow_mut()),
                 out_of_memory: self.out_of_memory.take(),
+                firsts: self.firsts.take(),
                 began: began.saturating_duration_since(deal.handed),
                 walk,
             };
@@ -3227,6 +3260,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 shapes: std::mem::take(&mut *self.shapes_written.borrow_mut()),
                 over: std::mem::take(&mut *self.over_caches.borrow_mut()),
                 out_of_memory: self.out_of_memory.take(),
+                firsts: self.firsts.take(),
                 began: began.saturating_duration_since(handed),
                 walk: clock.now_mono().saturating_duration_since(began),
             };
@@ -3312,6 +3346,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 shapes,
                 over,
                 out_of_memory,
+                firsts: (compute, render),
                 began,
                 walk,
             } = chunk;
@@ -3321,6 +3356,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             deal.next = j + 1;
             if out_of_memory {
                 self.out_of_memory.set(true);
+            }
+            // Its firsts follow those of the chunks before it, before any of it is committed.
+            if let Some(names) = self.work_names.borrow().as_ref() {
+                names.note_firsts(compute, render);
             }
             self.laid_written.borrow_mut().extend(written);
             self.shapes_written.borrow_mut().extend(shapes);
@@ -12386,6 +12425,110 @@ mod tests {
                 )
             ]
         );
+    }
+
+    /// A command buffer's names for its work, which the platform keeps for the line of a lost
+    /// device that loses it in flight ([`WorkNames`]): its object id, and the first compute and
+    /// the first render pipeline state its encoders set, in their order, whether it is walked
+    /// whole, cut in parts or dealt to two threads, a helper walking its chunks first; each of its
+    /// parts holds the same names. A pipeline state set to nil is none, and a buffer that sets
+    /// none names none.
+    #[test]
+    fn a_command_buffer_names_its_first_pipeline_states_in_its_encoders_order() {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
+        };
+        use reims_vgpu_vulkan::core::platform::resource::Library as _;
+        use reims_vgpu_vulkan::core::platform::values::RenderPipelineDesc;
+        // Compute pipeline states 70 and 71, and render ones 80 and 81.
+        let pipelines = |p: &FakePlatform, dec: &mut GraphicsDecoder<FakePlatform>| {
+            let device = p.device();
+            let library = device.new_library(&[0; 8]).unwrap().unwrap().unwrap();
+            let f = library.new_function(OnFault::Die, "f").unwrap().unwrap();
+            for id in [70, 71] {
+                let state = device.new_compute_pipeline_state_for_function(Some(&f));
+                let state = ObjHandle::ComputePipeline(state.unwrap().unwrap());
+                assert_eq!(dec.insert(id, state).unwrap(), Ok(()));
+            }
+            for id in [80, 81] {
+                let state = device.new_render_pipeline_state(&RenderPipelineDesc {
+                    label: None,
+                    vertex: &f,
+                    fragment: &f,
+                    color0_pixel_format: 80,
+                    resource_index: None,
+                });
+                let state = ObjHandle::RenderPipeline(state.unwrap().unwrap());
+                assert_eq!(dec.insert(id, state).unwrap(), Ok(()));
+            }
+        };
+        let compute = |pipeline_obj_id: u64| {
+            let pass = RgfxComputePassDesc::default();
+            let mut ops = op(RGFX_OP_ENCODER_BEGIN_COMPUTE, pass.as_bytes());
+            let set = RgfxComputeOpSetComputePipelineState { pipeline_obj_id };
+            ops.extend(op(
+                RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+                set.as_bytes(),
+            ));
+            ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+            ops
+        };
+        let render = |pipeline_obj_id: u64| {
+            let mut ops = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
+            let set = RgfxOpSetRenderPipelineState { pipeline_obj_id };
+            ops.extend(op(RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, set.as_bytes()));
+            ops.extend(draw_ops(2, 0, 0));
+            ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+            ops
+        };
+        // The parts committed, the names they share, then completed.
+        let named = |p: &FakePlatform| {
+            let parts = p.world().committed();
+            let names: Vec<Arc<WorkNames>> = (parts.iter())
+                .map(|part| p.world().work_names(*part).expect("named"))
+                .collect();
+            assert!(
+                names.iter().all(|n| Arc::ptr_eq(n, &names[0])),
+                "its parts share its names"
+            );
+            p.world().complete_all(CompleteOn::Caller);
+            (parts.len(), names[0].cb(), names[0].firsts())
+        };
+        let ops = [render(0), compute(71), compute(70), render(81), render(80)].concat();
+
+        let (p, mut dec) = setup();
+        pipelines(&p, &mut dec);
+        let device = p.device();
+        let message = command_buffer_message(400, 40, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(named(&p), (1, 400, (71, 81)), "walked whole");
+        let message = command_buffer_message(401, 41, &[render(0), render(0)].concat());
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(named(&p), (1, 401, (0, 0)), "none set");
+
+        let Split { p, mut dec, .. } = splitting();
+        pipelines(&p, &mut dec);
+        let device = p.device();
+        let message = command_buffer_message(402, 42, &ops);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(named(&p), (5, 402, (71, 81)), "a part an encoder");
+
+        // A chunk a pass, the helper's, the odd ones, walked first: the first render pipeline
+        // state set is the second chunk's, though this thread may set the third's first.
+        let Split { p, mut dec, .. } = dealing();
+        pipelines(&p, &mut dec);
+        let device = p.device();
+        let mut passes = vec![render(0), render(81), render(80)];
+        passes.resize(8, render(0));
+        let message = command_buffer_message(403, 43, &passes.concat());
+        let mark = p.call_log().mark();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let helped = walk_calls(&p, mark)
+            .iter()
+            .filter(|(helper, ..)| *helper)
+            .count();
+        assert!(helped > 0, "the helper walked chunks of it");
+        assert_eq!(named(&p), (8, 403, (0, 81)), "dealt");
     }
 
     /// A dealt buffer's chunks go to the two threads the longest first, each to the thread dealt

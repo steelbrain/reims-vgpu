@@ -48,7 +48,9 @@ use super::script::{HeldCall, Script, Step};
 use super::vm::FakeVm;
 use crate::core::host::HostPtr;
 use crate::core::num;
-use crate::core::platform::command::{CompletedHandler, CompletedInfo, ScheduledHandler};
+use crate::core::platform::command::{
+    CompletedHandler, CompletedInfo, ScheduledHandler, WorkNames,
+};
 use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::event::Notification;
 use crate::core::platform::os::{Clock, Deadline};
@@ -372,6 +374,9 @@ pub struct CommandBufferModel {
     /// (`CommandBuffer::set_completion_joins_next`), as it was last set; read by
     /// [`World::joins_next`]. The fake completes it as told all the same.
     pub joins_next: bool,
+    /// The guest's names for its work (`CommandBuffer::names_work`), as its caller named them or
+    /// the command buffer it was cut from held them; read by [`World::work_names`].
+    pub work_names: Option<Arc<WorkNames>>,
 }
 
 impl std::fmt::Debug for CommandBufferModel {
@@ -1692,6 +1697,16 @@ impl World {
         let h = self.find(id)?;
         match &h.obj().state.lock().model {
             Model::CommandBuffer(m) => Some(m.joins_next),
+            _ => None,
+        }
+    }
+
+    /// The guest's names for the work of command buffer `id` ([`CommandBufferModel::work_names`]);
+    /// `None` where it holds none, or for no such live buffer.
+    pub fn work_names(&self, id: ObjId) -> Option<Arc<WorkNames>> {
+        let h = self.find(id)?;
+        match &h.obj().state.lock().model {
+            Model::CommandBuffer(m) => m.work_names.clone(),
             _ => None,
         }
     }

@@ -4,6 +4,8 @@
 //! (`fake::calllog`) and consult the script (`fake::script`) before the model; `status`, `error`
 //! and `device` are free and read the model.
 
+use std::sync::Arc;
+
 use super::super::calllog::Arg;
 use super::super::objects::{CommandBufferModel, Fk, Model, completion_read, kind};
 use super::super::platform::FakePlatform;
@@ -34,6 +36,18 @@ impl CommandQueue<FakePlatform> for Fk<kind::CommandQueue> {
 /// The name the fake logs [`CommandBuffer::fail_out_of_memory`] under: no selector of Metal's
 /// names it.
 pub const FAIL_OUT_OF_MEMORY: &str = "failOutOfMemory";
+
+/// `to`, a command buffer made from `from` (`split`, `part`), keeps the names of `from`'s work, as
+/// the Vulkan platform's parts do ([`CommandBuffer::names_work`]).
+fn names_on(from: &Fk<kind::CommandBuffer>, to: &Fk<kind::CommandBuffer>) {
+    let names = match &from.state().model {
+        Model::CommandBuffer(m) => m.work_names.clone(),
+        _ => None,
+    };
+    if let (Some(names), Model::CommandBuffer(m)) = (names, &mut to.state().model) {
+        m.work_names = Some(names);
+    }
+}
 
 impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
     /// As the Vulkan platform does: the read of the buffer and `block` run in the refusal scope the
@@ -153,7 +167,8 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
                 CommandBufferModel::default(),
             )))
         })?;
-        if next.is_some() {
+        if let Some(next) = &next {
+            names_on(self, next);
             super::super::objects::commit_obj(self.obj());
         }
         Ok(next)
@@ -165,11 +180,15 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         if !self.world().splits() {
             return Ok(None);
         }
-        self.make(Policy::On(on), "part", vec![], |w| {
+        let next = self.make(Policy::On(on), "part", vec![], |w| {
             Some(w.new_obj::<kind::CommandBuffer>(Model::CommandBuffer(
                 CommandBufferModel::default(),
             )))
-        })
+        })?;
+        if let Some(next) = &next {
+            names_on(self, next);
+        }
+        Ok(next)
     }
 
     /// Logged: as scripted ([`PartCut`], [`crate::core::testkit::script::Step::value`]), else
@@ -222,6 +241,18 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
     /// the buffer as it scripts.
     fn fail_out_of_memory(&self) {
         self.set_logged(FAIL_OUT_OF_MEMORY, vec![]);
+    }
+
+    /// Not logged, as no selector of Metal's names it and it changes nothing the buffer does:
+    /// kept on the model, the first named alone, and handed on to the command buffers `split` and
+    /// `part` make from it, as the Vulkan platform keeps them
+    /// ([`World::work_names`](super::super::objects::World::work_names)).
+    fn names_work(&self, names: &Arc<WorkNames>) {
+        if let Model::CommandBuffer(m) = &mut self.state().model
+            && m.work_names.is_none()
+        {
+            m.work_names = Some(Arc::clone(names));
+        }
     }
 
     fn encode_signal(

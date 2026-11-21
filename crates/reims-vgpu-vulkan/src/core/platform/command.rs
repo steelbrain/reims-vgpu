@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::event::EventRef;
 use super::types::{CommandBufferStatus, NsErrorText};
@@ -66,6 +67,69 @@ impl EscapedCopies {
     /// The copies held now.
     pub fn copies(&self) -> Vec<EscapedCopy> {
         self.0.lock().iter().map(|(c, _)| Arc::clone(c)).collect()
+    }
+}
+
+/// No Metal counterpart: the guest's names for a command buffer's work, which the platform's line
+/// for a command buffer it loses in flight gives (the Vulkan platform's `rt_platform/command.rs`,
+/// "A lost device's line"): the command buffer's object id, and the object ids of the first
+/// compute and the first render pipeline state its encoders' ops set, in their order, 0 while
+/// none is noted. The caller makes them at the command buffer's begin and names them to the
+/// platform before any encoder ([`CommandBuffer::names_work`]), which keeps them, as each part
+/// cut from the buffer does; it notes the firsts ([`Self::note_firsts`]) from one thread at a
+/// time, before it commits the work that set them, so a part's commit carries what was noted
+/// before it to the thread that sees the part fail.
+#[derive(Debug)]
+pub struct WorkNames {
+    /// The command buffer's object id.
+    cb: u64,
+    /// The first compute pipeline state its encoders set, 0 for none yet.
+    first_compute: AtomicU64,
+    /// The first render pipeline state its encoders set, 0 for none yet.
+    first_render: AtomicU64,
+    /// Whether the platform gave its line: once however many of its parts it loses.
+    told: AtomicBool,
+}
+
+impl WorkNames {
+    /// The names of command buffer `cb`'s work, with no pipeline state noted.
+    pub fn new(cb: u64) -> WorkNames {
+        WorkNames {
+            cb,
+            first_compute: AtomicU64::new(0),
+            first_render: AtomicU64::new(0),
+            told: AtomicBool::new(false),
+        }
+    }
+
+    /// The command buffer's object id.
+    pub fn cb(&self) -> u64 {
+        self.cb
+    }
+
+    /// Notes `compute` and `render`, each 0 for none, as the first compute and render pipeline
+    /// states set where none of its kind is noted yet: the caller notes them in its encoders'
+    /// order. A load each, and a store for a first.
+    pub fn note_firsts(&self, compute: u64, render: u64) {
+        for (first, id) in [(&self.first_compute, compute), (&self.first_render, render)] {
+            if id != 0 && first.load(Ordering::Relaxed) == 0 {
+                first.store(id, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The first compute and the first render pipeline state noted, each 0 for none.
+    pub fn firsts(&self) -> (u64, u64) {
+        (
+            self.first_compute.load(Ordering::Relaxed),
+            self.first_render.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Whether this is the first ask, after which the platform has given the command buffer's
+    /// line: it gives it once, however many of its parts it loses.
+    pub fn first_told(&self) -> bool {
+        !self.told.swap(true, Ordering::Relaxed)
     }
 }
 
@@ -428,5 +492,12 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// its GPU writes dropped. Nothing by default, where the platform keeps no copy.
     fn reaches_escaped(&self, escapes: &EscapedCopies) {
         let _ = escapes;
+    }
+    /// The platform's own, no Metal call: before any encoder, the caller's names for the buffer's
+    /// work ([`WorkNames`]), which it keeps, as each part cut from it does ([`Self::split`],
+    /// [`Self::part`]), for the line it gives where it loses the buffer in flight. Nothing by
+    /// default, for a platform that gives no such line.
+    fn names_work(&self, names: &Arc<WorkNames>) {
+        let _ = names;
     }
 }

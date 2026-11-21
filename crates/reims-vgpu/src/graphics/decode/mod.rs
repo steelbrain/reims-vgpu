@@ -147,7 +147,9 @@ use reims_vgpu_graphics::wire::{
 use reims_vgpu_video::core::device_memory::{DeviceMemory, MemoryLife};
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::memory::map::MemoryMap;
-use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::command::{
+    CommandBuffer as _, CommandQueue as _, WorkNames,
+};
 use reims_vgpu_vulkan::core::platform::device::{GpuDevice, NoCopyDeallocator};
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
@@ -1229,6 +1231,13 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The encoder being walked is a blit encoder, which writes only the destinations its ops
     /// name ([`Self::texture_written`]), whatever its textures' usage.
     laid_blit: Cell<bool>,
+    /// The names of the work of the command buffer the message walks, from its begin, which a
+    /// lost device gives where it loses it in flight ([`WorkNames`]); none on a twin, whose
+    /// walk's chunks the message's walk notes in their order.
+    work_names: RefCell<Option<Arc<WorkNames>>>,
+    /// The first compute and the first render pipeline state the walk set, 0 for none, since its
+    /// begin or, in a dealt walk, its chunk's start ([`Self::pipeline_set`]).
+    firsts: Cell<(u64, u64)>,
 }
 
 impl<P: Platform> Drop for GraphicsDecoder<P> {
@@ -1409,6 +1418,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             slot_shapes: RefCell::new(Vec::new()),
             slot_pipeline: Cell::new(0),
             laid_blit: Cell::new(false),
+            work_names: RefCell::new(None),
+            firsts: Cell::new((0, 0)),
         }
     }
 
@@ -1453,6 +1464,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.scheduled_at_doorbell.set(false);
         self.drain.get_mut().take();
         self.order_waits.get_mut().clear();
+        self.work_names.get_mut().take();
     }
 
     /// The message's command buffer took its place among the commit order's tickets, or got as
@@ -6838,6 +6850,17 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Err(r.reference(id))
             }
             _ => Err(bad_reference()),
+        }
+    }
+
+    /// The compute encoder being walked, or the render encoder where `render`, set the pipeline
+    /// state `id`: the walk's first of its kind is kept, which the walk notes in its command
+    /// buffer's names before it commits it ([`WorkNames`]); a read of the walk's own after.
+    pub(crate) fn pipeline_set(&self, render: bool, id: u64) {
+        match self.firsts.get() {
+            (0, drawn) if !render => self.firsts.set((id, drawn)),
+            (dispatched, 0) if render => self.firsts.set((dispatched, id)),
+            _ => {}
         }
     }
 

@@ -684,6 +684,7 @@ pub(crate) fn decode_op<P: Platform>(
                 },
             )?;
             objs.pipeline_bound(m.pipeline_obj_id);
+            objs.pipeline_set(true, m.pipeline_obj_id);
         }
         RGFX_OP_RENDER_SET_VERTEX_BUFFER => {
             let m: RgfxOpSetVertexBuffer = body(tag, payload)?;
