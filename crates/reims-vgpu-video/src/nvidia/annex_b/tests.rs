@@ -236,7 +236,9 @@ fn a_stream_started_at_a_p_picture_answers_picture_errors_until_its_idr_picture(
         for (n, unit) in units.iter().enumerate().skip(2) {
             let decoded = decoder.decode(unit);
             if n < 5 {
-                let error = decoded.err().expect("a P picture with no reference is refused");
+                let error = decoded
+                    .err()
+                    .expect("a P picture with no reference is refused");
                 assert!(error.is_picture_error(), "{codec:?} picture {n}: {error}");
                 continue;
             }
@@ -313,10 +315,16 @@ fn a_failed_picture_is_copied_and_decoded_on_from_or_refused() {
                     (3, true) => {
                         assert_eq!(read.ok(), Some(1080), "{codec:?}: copied as NVDEC left it");
                         let status = picture.copied_failed();
-                        assert!(matches!(status, Some(8 | 9)), "{codec:?}: its status: {status:?}");
+                        assert!(
+                            matches!(status, Some(8 | 9)),
+                            "{codec:?}: its status: {status:?}"
+                        );
                     }
                     (3, false) => {
-                        assert!(matches!(read, Err(Error::DecodeFailed(_))), "{codec:?}: {read:?}");
+                        assert!(
+                            matches!(read, Err(Error::DecodeFailed(_))),
+                            "{codec:?}: {read:?}"
+                        );
                         assert_eq!(picture.copied_failed(), None);
                     }
                     // The pictures after it decode from it, as NVDEC left it.

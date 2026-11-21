@@ -156,9 +156,15 @@ mod tests {
         assert!(picture(&hevc::Error::MissingReference.into()));
         assert!(picture(&hevc::Error::Unrecovered.into()));
         let unsupported = Error::from(h264::Error::Unsupported("data partitioning"));
-        assert!(matches!(unsupported, Error::Unsupported(_)), "{unsupported}");
+        assert!(
+            matches!(unsupported, Error::Unsupported(_)),
+            "{unsupported}"
+        );
         let skipped = Error::from(hevc::Error::SkippedLeadingPicture);
-        assert!(matches!(skipped, Error::SkippedLeadingPicture(_)), "{skipped}");
+        assert!(
+            matches!(skipped, Error::SkippedLeadingPicture(_)),
+            "{skipped}"
+        );
         for error in [
             Error::from(h264::Error::AvccVersion),
             Error::from(hevc::Error::HvccVersion),

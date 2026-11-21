@@ -502,9 +502,13 @@ fn a_picture_of_the_stream_that_does_not_decode_lands_nothing_and_completes() {
         buffer(&p, 16384, STORAGE_SHARED),
         buffer(&p, 16384, STORAGE_SHARED),
     );
-    let none = s.decode(&decode(&bitstream, &[], planes(&first, &first, 96))).unwrap();
+    let none = s
+        .decode(&decode(&bitstream, &[], planes(&first, &first, 96)))
+        .unwrap();
     assert_eq!(none.value, 1);
-    let next = s.decode(&decode(&bitstream, &[], planes(&second, &second, 96))).unwrap();
+    let next = s
+        .decode(&decode(&bitstream, &[], planes(&second, &second, 96)))
+        .unwrap();
     assert_eq!(next.value, 2);
     assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
     assert!(!none.landed.as_deref().is_some_and(Landed::failed));

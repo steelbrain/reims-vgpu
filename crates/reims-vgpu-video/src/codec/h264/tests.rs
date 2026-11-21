@@ -1318,7 +1318,9 @@ fn a_stream_started_at_a_p_picture_answers_picture_errors_until_an_i_picture() -
     assert!(d.decode(&sample(&[sps(&spec), pps(false)]), 0)?.is_empty());
     for n in 1..4 {
         let refused = d.decode(&sample(&[slice(&p(n, 2 * n), &spec)]), u64::from(n));
-        let error = refused.err().expect("a P picture with no reference is refused");
+        let error = refused
+            .err()
+            .expect("a P picture with no reference is refused");
         assert!(error.is_picture_error(), "{error:?}");
     }
     let units = [sps(&spec), pps(false), slice(&idr(), &spec)];

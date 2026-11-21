@@ -1023,9 +1023,15 @@ fn a_stream_started_at_a_p_picture_answers_picture_errors_until_an_irap_picture(
     };
     let p = |lsb| sample(&[picture(&spec, nal_type::TRAIL_R, 1, lsb, 0)]);
     let mut d = decoder();
-    assert!(d.decode(&sample(&[sps(&spec), pps(&PpsSpec::default())]), 0)?.is_empty());
+    assert!(
+        d.decode(&sample(&[sps(&spec), pps(&PpsSpec::default())]), 0)?
+            .is_empty()
+    );
     for (id, lsb) in [(1, 4), (2, 8), (3, 12)] {
-        let error = d.decode(&p(lsb), id).err().expect("a P picture with no reference is refused");
+        let error = d
+            .decode(&p(lsb), id)
+            .err()
+            .expect("a P picture with no reference is refused");
         assert!(error.is_picture_error(), "{error:?}");
     }
     let mut units = vec![sps(&spec), pps(&PpsSpec::default())];
