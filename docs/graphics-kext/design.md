@@ -6140,7 +6140,11 @@ surfaces are not ordered (measured on the MBP16's AMD 5300M, macOS 26.7.1: a
 blit of the surface committed just after another process committed a 212 ms
 pass over it waited for the pass in all three cases, and read or left what
 the order says; a blit of another surface took 2.4-4 ms; the Intel 630
-runs one process's work at a time, so it orders all of it). Queues and
+runs one process's work at a time, so it orders all of it; dgpu-oracle.md,
+Q16). Behind a queue of work, a read waits out the writing process's whole
+queue ahead of the write, and on the 5300M nothing that process committed
+after the write, where the 630 runs both processes' work first in, first out
+(measured, the same Mac: dgpu-oracle.md, Q48). Queues and
 processes here reach the host on rings of their own, which the host takes
 apart, so the order the host takes buffers in is not the order they were
 committed in. The bundle names the order instead, as it posts each buffer:

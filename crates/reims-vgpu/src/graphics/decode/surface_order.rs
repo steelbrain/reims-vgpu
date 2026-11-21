@@ -7,7 +7,9 @@
 //! it. The host makes the buffer wait for each on the GPU, on the named queue's surface timeline:
 //! a shared event each buffer of the queue that holds the op signals to its own seqno as it ends.
 //! A queue's buffers signal in their ring's order, each after the work before it on the queue, so
-//! the timeline at a seqno means the queue's buffers up to that one have finished.
+//! the timeline at a seqno means the queue's buffers up to that one have finished. So a reader
+//! waits out the writer's queue ahead of the write, as another process's read of a surface does on
+//! the 5300M and the 630 (measured: docs/graphics-kext/dgpu-oracle.md, Q16 and Q48).
 //!
 //! - **No wait where none is needed.** A named buffer of the buffer's own queue is in its ring's
 //!   order already. One the host has seen finish (its completed handler raised the queue's

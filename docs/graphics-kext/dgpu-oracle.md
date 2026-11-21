@@ -2605,6 +2605,62 @@ itself, as the AMD's does *(class 2: the Macs diverge, and the AMD's answer make
 device's table stays unsupported: a table of the wire belongs to a pipeline
 (`FUNCTION_TABLE_CREATE`).
 
+## Q48: another process's read of an IOSurface behind the writing process's backlog
+
+Probe: `oracle_backlog DEVICE ARM 6 20`, 11-21, on the AMD Radeon Pro 5300M and the Intel UHD
+Graphics 630 under macOS 26.7.1 (25G241), off screen: m3-max-64081. It takes Q16's `xproc raw`
+from one long pass to a queue of work. Process A commits 8 busy compute buffers on one queue, each
+calibrated to about 20 ms of GPU time, then a ninth that writes 1000 + round into a 1024 x 1024
+R32Uint surface S: by `commitAndWaitUntilSubmitted` in arms 1 and 2, by a plain `commit` in arm 3.
+In arm 2 A then commits 4 more busy buffers. Then process B commits a blit that copies S into a
+buffer, by `commitAndWaitUntilSubmitted`. On odd rounds the ninth writes an unrelated surface
+instead, as a control. Each GPU ran 3 rounds and 3 controls of each arm. Times are ms from B's
+commit, on one clock for both processes, and B's buffer completed in every round. A's busy buffers
+ran 20.9 to 21.1 ms each on the 5300M; on the 630, 19.7 to 20.2 ms in arms 2 and 3, and 10.8 to
+16.5 ms in arm 1, whose calibration came out short (16.6 ms).
+
+| what | AMD 5300M | Intel 630 |
+|---|---|---|
+| B's `commitAndWaitUntilSubmitted` returns; its scheduled handler | 0.08 to 0.37; 0.12 to 0.41 (1.03 to 1.32; 1.05 to 1.34 in a run's first round) | 0.05 to 0.08, and 1.06 in one round; 0.08 to 0.13, and 1.09 in that one (3.25 to 4.81; 3.27 to 4.81 in a run's first round) |
+| A's call for the ninth returns: `commitAndWaitUntilSubmitted` (arms 1 and 2); `commit` (arm 3) | 0.28 to 1.46; 0.002 to 0.012 | 0.09 to 1.00; 0.002 to 0.009 |
+| arm 1: B, the ninth writing S | completes 0.67 to 0.83 ms after A's ninth (at 163.6 to 170.1), reading A's write, 3 of 3 | 0.52 to 0.95 ms after A's ninth (at 90.5 to 125.6), reading A's write, 3 of 3 |
+| arm 1: the controls | at 0.99 to 1.97, 166.9 to 167.0 ms before A's ninth | 0.50 to 0.68 ms after A's ninth (at 86.9 to 116.5) |
+| arm 2: B, the ninth writing S | 0.80 to 0.83 ms after A's ninth (at 165.1 to 170.2), reading A's write; 19.06 to 19.26 ms before the first of A's 4 later buffers completes, 79.06 to 79.11 before the last, 3 of 3 | 79.24 to 79.48 ms after A's ninth (at 227.9 to 236.9), reading A's write; 0.46 to 0.66 ms after the last of the 4, 3 of 3 |
+| arm 2: the controls | at 1.90 to 1.99, before A's ninth and all 4 | 0.51 to 0.52 ms after the last of the 4 (at 236.1 to 236.9) |
+| arm 3: B, the ninth writing S | 0.82 and 0.83 ms after A's ninth (at 165.8 and 170.4), reading A's write, in 2 rounds; in 1, at 2.76, 166.68 ms before A's ninth, reading S as it was before the write | 0.49 to 0.65 ms after A's ninth (at 152.6 to 161.9), reading A's write, 3 of 3 |
+| arm 3: the controls | at 2.55 to 2.73, before A's ninth | 0.50 to 0.53 ms after A's ninth (at 161.7 to 162.1) |
+
+So on both GPUs a read committed after the writer's `commitAndWaitUntilSubmitted` returned waits
+out the writing process's whole queue ahead of the write, here 8 buffers of about 20 ms, and
+completes after the write *(class 3: both x86 GPUs; the M3 did not run it)*. Neither GPU holds
+back B's submission or scheduling for it: outside a run's first round both come within 0.41 ms of
+the commit (one 630 round 1.09 ms), as in Q16. What else the read waits for differs *(class 2)*:
+- **The 5300M orders the read by the surface alone.** A control, which reads S with nothing
+  pending on it, completes in 1 to 3 ms, ahead of A's queue. In arm 2 the read completes 19 ms
+  before the first of the 4 buffers A committed after the write, though A committed them before
+  B committed the read.
+- **The 630 runs the two processes' work first in, first out.** In each of its 18 rounds,
+  controls included, B completed after every buffer A committed before it, 0.46 to 0.95 ms after
+  the last.
+- **A writer committed by a plain `commit` is not always ordered on the 5300M.** `commit` returns
+  before Metal submits the buffer (Q16), and a read committed after it ran ahead of the write in 1
+  of 3 rounds. The 630's order put all 3 after it.
+
+What our stack does: a buffer that reads S names, at its post, the latest buffer of each other
+queue that writes S, and the host makes it wait on the GPU for that queue's surface timeline to
+reach the writer's seqno, which it reaches once the writer and every buffer before it on its
+queue have finished (`surface_order.rs`; design.md, "Surface order"). So the read waits out the
+writer's queue ahead of the write, as arm 1 does on both GPUs, and its `CB_SUBMITTED` and
+`CB_SCHEDULED` are not held back for it, as B's were not. The wait names no buffer the writer's
+queue committed after the writer, but the Vulkan platform runs every queue's work on one
+`VkQueue` in submission order (design.md, "A command buffer in parts"), so a read the host submits
+after them runs after them, as the 630 runs arm 2 *(class 2: the 630's answer)*. The 5300M's
+overtaking is the GPU's own order across processes, which a change of the runtime's queues may
+adopt. A writer committed by a plain `commit` is named before its `commit` returns
+(`RgfxIOSurface.h`), so a read committed after that waits for it every time, as on the 630:
+stricter than the 5300M, which left 1 of 3 such reads unordered, and kept as it is, since the wait
+is on the GPU and holds back no record (Q16, "A divergence the lane does not use").
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,
