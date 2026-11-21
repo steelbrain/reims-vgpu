@@ -56,6 +56,11 @@
 //! ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for those in progress, and a
 //! thread that takes its next compile once the exit began parks for good without running it, so
 //! no compile of the pool's is inside the driver's compiler as the driver's destructors run.
+//!
+//! **After a heavy make.** Each compile's wall time goes to the platform's OS layer as the
+//! compile ends ([`reims_vgpu_vulkan::os::make_ended`]). On Linux with glibc, a make of 250 ms or
+//! more asks a thread of the layer's own to hand back to Linux the heap the make's translation
+//! left free; the compile's thread only asks, and nothing the guest sees changes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -467,7 +472,8 @@ fn next_compile(shared: &Shared) -> Option<Queued> {
     }
 }
 
-/// Runs a compile the pool took, and logs its wait and its run time.
+/// Runs a compile the pool took, logs its wait and its run time, and hands its run time to the
+/// OS layer (the module docs, "After a heavy make").
 fn run(shared: &Shared, queued: Queued) {
     let Queued {
         of,
@@ -500,6 +506,7 @@ fn run(shared: &Shared, queued: Queued) {
     if of.kind == CompileKind::Prepass {
         shared.waiting.notify_one();
     }
+    reims_vgpu_vulkan::os::make_ended(ended.saturating_duration_since(started));
 }
 
 /// A gate the tests shut to hold every compile.

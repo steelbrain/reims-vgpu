@@ -1,14 +1,17 @@
 //! The OS services on Linux: the clocks ([`LinuxClock`]), threads ([`LinuxThreads`]), Mach VM's
 //! calls over `mmap` ([`LinuxVm`]), whose views of the guest's pages map the files the backing
-//! table names (`files`), dma-bufs of host memory lent to the device (`device_lend`), and what
+//! table names (`files`), dma-bufs of host memory lent to the device (`device_lend`), what
 //! the window system's Vulkan extensions take here (`crate::os`'s `wsi`: the surface
-//! extensions). No Objective-C runs here: core pushes no autorelease pool where none is
+//! extensions), and, with glibc, the heap a heavy pipeline make left free handed back to Linux
+//! (`heap_trim`). No Objective-C runs here: core pushes no autorelease pool where none is
 //! installed.
 
 mod budget;
 mod clock;
 mod device_lend;
 mod dma_buf;
+#[cfg(target_env = "gnu")]
+mod heap_trim;
 mod hints;
 mod import;
 mod lease;
@@ -20,6 +23,8 @@ use std::ffi::CStr;
 pub use clock::LinuxClock;
 pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
 pub(crate) use device_lend::{MappingsHeld, dma_bufs_of_host, hold_mappings, through_dma_bufs};
+#[cfg(target_env = "gnu")]
+pub use heap_trim::make_ended;
 #[cfg(test)]
 pub(crate) use import::{imports_need_files, several_dma_bufs_refused};
 pub(crate) use import::{learn_dma_buf_granule, views_need_files};
@@ -76,6 +81,12 @@ pub fn install_process_services() {
         }
     });
 }
+
+/// A compile-pool make ended after `took` of wall time: nothing where the allocator is not
+/// glibc's, whose heap `heap_trim` trims after a heavy make. Other allocators keep free memory
+/// otherwise, and are out of its scope.
+#[cfg(not(target_env = "gnu"))]
+pub fn make_ended(_took: std::time::Duration) {}
 
 /// The registry ID the platform answers for the runtime's default device in place of its own:
 /// none, as there is no Metal here to ask, so the runtime's own stands.

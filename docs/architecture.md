@@ -523,6 +523,10 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   end, its input and the host's window callbacks, one at a time. The process's main thread is never
   used or waited for. The render thread presents on a queue made for presenting, which the runtime
   keeps apart from the guest's queues where the device has one to spare.
+- On Linux with glibc, the heap's trim thread (`reims-vgpu.heap-trim`, 256 KiB, started by the
+  platform). It starts at the first pipeline make of 250 ms or more, and never ends. After such a
+  make it hands back to Linux the heap that the make's translation left free, one trim at a time
+  (`vulkan/src/os/linux/heap_trim.rs`).
 
 No thread of the library's that runs Rust code sending Objective-C messages has a Rust unwind
 handler at its base (D35): the platform starts them as pthreads (`vulkan/src/os/macos/threads.rs`).

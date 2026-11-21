@@ -14,7 +14,9 @@
 //! A display's window presents through a swapchain over the window system's Vulkan extensions
 //! (`wsi.rs`), each OS naming its own surface extensions. The user's cache directory, where the
 //! library keeps what later processes reuse, is each OS's own too ([`user_cache_directory`]), and
-//! so is how a pipeline compile's helper process is capped and ended (`compile_helper.rs`).
+//! so is how a pipeline compile's helper process is capped and ended (`compile_helper.rs`), and
+//! what follows a heavy pipeline make ([`make_ended`]: on Linux with glibc, the heap it left free
+//! handed back, `os/linux/heap_trim.rs`; nothing elsewhere).
 
 /// Pipeline compiles in a helper process, capped and ended with the library's process
 /// (`os/compile_helper.rs`).
@@ -51,6 +53,10 @@ use host_os::cache_directory as host_cache_directory;
 pub use compile_helper::{GuestRamHeld, hold_guest_ram};
 #[cfg(test)]
 pub(crate) use host_os::allocate_aliasable;
+/// A compile-pool make ended after `took` of wall time: on Linux with glibc, a make of 250 ms or
+/// more is followed by a trim of the heap on a thread of its own, which hands back to Linux the
+/// memory the make's translation left free (`os/linux/heap_trim.rs`); nothing on other hosts.
+pub use host_os::make_ended;
 pub use host_os::{
     GuestMemoryLease, OsClock, OsThreads, OsVm, default_driver_sizes, default_registry_id,
     install_process_services, lease_guest_memory,

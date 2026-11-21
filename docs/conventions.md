@@ -179,7 +179,11 @@ repeats the ones code cites.
     held the thread that carried it out), `managed-at-copy-unkept`, the
     `Managed` buffers' creates at their CPU copies' addresses that the
     platform made at others, kept there (docs/graphics-kext/design.md,
-    "Managed buffers at their copies"), and the display's
+    "Managed buffers at their copies"), the trims of the heap after heavy
+    pipeline makes on Linux with glibc (`heap-trims`, `heap-trim-us`, their
+    time in microseconds, and `heap-trim-returned-kib`, the resident KiB
+    they handed back: no degradation, `os/linux/heap_trim.rs`), and the
+    display's
     (`display-view-refused`, a draw of the display that kept the window's
     last frame, or a read of it that answered black, because the platform
     refused the display's view of the texture it shows: `graphics/sink.rs`,

@@ -187,7 +187,9 @@ pub fn out_of_host_memory_count() -> u64 {
 /// own span (`private-take-span`, with the source's time, `private-take-span-us`), with the
 /// longest a take held the thread that carried it out (`private-take-lane-us-most`); and the
 /// `Managed` buffers' creates at their CPU copies' addresses that the platform made at others,
-/// where they are kept (`managed-at-copy-unkept`).
+/// where they are kept (`managed-at-copy-unkept`); and, on Linux with glibc, the trims of the heap
+/// after heavy pipeline makes (`heap-trims`), their time in microseconds (`heap-trim-us`) and the
+/// resident KiB they handed back (`heap-trim-returned-kib`, `os/linux/heap_trim.rs`).
 static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
     crate::core::sync::Mutex::new(Vec::new());
 

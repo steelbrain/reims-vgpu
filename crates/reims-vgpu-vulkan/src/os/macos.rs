@@ -45,6 +45,11 @@ pub fn install_process_services() {
 /// window's `CAMetalLayer`, AppKit's view's or SDL's Metal view's alike.
 pub(crate) const WINDOW_SURFACE_EXTENSIONS: [&CStr; 1] = [ash::ext::metal_surface::NAME];
 
+/// A compile-pool make ended after `took` of wall time: nothing on macOS. Handing back the heap a
+/// heavy make left free is glibc's on Linux (`os/linux/heap_trim.rs`); macOS's allocator differs,
+/// and is out of its scope.
+pub fn make_ended(_took: std::time::Duration) {}
+
 /// `registryID` of the system default `MTLDevice` (`MTLCreateSystemDefaultDevice()`), asked
 /// of Metal once, on the first call that finds a device: `None` where Metal has none. It is
 /// the registry ID of the device MoltenVK runs the runtime's default device on where the Mac

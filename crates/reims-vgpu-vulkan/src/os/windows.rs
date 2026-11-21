@@ -43,6 +43,11 @@ pub type OsVm = WindowsVm;
 /// process's handles to raise, as Linux has on its open files.
 pub fn install_process_services() {}
 
+/// A compile-pool make ended after `took` of wall time: nothing on Windows. Handing back the heap
+/// a heavy make left free is glibc's on Linux (`os/linux/heap_trim.rs`); Windows' allocator
+/// differs, and is out of its scope.
+pub fn make_ended(_took: std::time::Duration) {}
+
 /// The registry ID the platform answers for the runtime's default device in place of its own:
 /// none, as there is no Metal here to ask, so the runtime's own stands.
 pub fn default_registry_id() -> Option<u64> {
