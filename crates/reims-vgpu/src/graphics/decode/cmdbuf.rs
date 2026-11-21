@@ -8786,8 +8786,10 @@ mod tests {
     /// A decoder on the Vulkan platform with a queue (1), and, as a process in slot 0 picks
     /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), the create
     /// of a device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes
-    /// no pin of. rt builds no texture buffers: the create is refused, counted under rt's code
-    /// (`rt-refused-gap`), so no range of its lies among the pins the tests make after it.
+    /// no pin of. rt makes a texture buffer only over a buffer its consumer places, which the host
+    /// does not yet place for a device-placed one (`Refusal::TextureBufferNotOverBuffer`, rt's own
+    /// refusal, not Metal's): the create is refused, counted under rt's own refusals' code
+    /// (`rt-refused-ours`), so no range of its lies among the pins the tests make after it.
     fn decoder_with_a_texture_buffer() -> (
         GraphicsDecoder<reims_vgpu_vulkan::RtPlatform>,
         <reims_vgpu_vulkan::RtPlatform as Platform>::Device,
@@ -8835,20 +8837,20 @@ mod tests {
             },
             ..RgfxTextureCreate::default()
         };
-        let refused = crate::platform::counted("rt-refused-gap");
+        let refused = crate::platform::counted("rt-refused-ours");
         assert_eq!(
             dec.decode(&device, texture.as_bytes()).unwrap(),
             Err(DecodeError::Refused),
-            "rt builds no texture buffers"
+            "rt makes no texture buffer the device places"
         );
-        assert_eq!(crate::platform::counted("rt-refused-gap") - refused, 1);
+        assert_eq!(crate::platform::counted("rt-refused-ours") - refused, 1);
         assert!(dec.object(10).is_none());
         (dec, device)
     }
 
     /// A guest's pin meets no range the Vulkan platform's runtime placed for itself: a buffer
-    /// pinned at the pick after a texture buffer's is made, the texture buffer refused (rt builds
-    /// none).
+    /// pinned at the pick after a texture buffer's is made, the texture buffer refused (rt makes
+    /// none the device places).
     #[test]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;

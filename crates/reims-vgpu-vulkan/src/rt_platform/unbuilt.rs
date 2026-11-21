@@ -252,8 +252,14 @@ pub enum RtRefusal {
     BelowFloor,
     /// A failed Vulkan call (`Error::Vulkan`).
     Vulkan,
-    /// A call Metal refuses (`Error::Refused`).
+    /// A call rt refuses as Metal's refusal (`Error::Refused`), or on a rule of rt's own that
+    /// [`RtRefusal::Ours`] does not name.
     Refused,
+    /// A call rt refuses on a rule of its own, not Metal's (`Error::Refused`, its basis rt's in
+    /// metal2vulkan-runtime's `error.rs`): a texture buffer the device places
+    /// (`Refusal::TextureBufferNotOverBuffer`), which rt makes only over a buffer its consumer
+    /// places.
+    Ours,
     /// One of the device's or rt's fixed limits (`Error::Limit`).
     Limit,
     /// A block no handle holds (`Error::NoSuchBlock`).
@@ -276,11 +282,12 @@ pub enum RtRefusal {
 
 impl RtRefusal {
     /// Every kind, once.
-    pub const ALL: [RtRefusal; 12] = [
+    pub const ALL: [RtRefusal; 13] = [
         RtRefusal::Loader,
         RtRefusal::BelowFloor,
         RtRefusal::Vulkan,
         RtRefusal::Refused,
+        RtRefusal::Ours,
         RtRefusal::Limit,
         RtRefusal::NoSuchBlock,
         RtRefusal::Thread,
@@ -297,6 +304,7 @@ impl RtRefusal {
             rt::Error::Loader(_) | rt::Error::NoDirectDriverLoading => RtRefusal::Loader,
             rt::Error::BelowFloor(_) => RtRefusal::BelowFloor,
             rt::Error::Vulkan { .. } => RtRefusal::Vulkan,
+            rt::Error::Refused(rt::Refusal::TextureBufferNotOverBuffer) => RtRefusal::Ours,
             rt::Error::Refused(_) => RtRefusal::Refused,
             rt::Error::Limit(_) => RtRefusal::Limit,
             rt::Error::NoSuchBlock(_) => RtRefusal::NoSuchBlock,
@@ -315,6 +323,7 @@ impl RtRefusal {
             RtRefusal::BelowFloor => "rt-refused-below-floor",
             RtRefusal::Vulkan => "rt-refused-vulkan",
             RtRefusal::Refused => "rt-refused-metal",
+            RtRefusal::Ours => "rt-refused-ours",
             RtRefusal::Limit => "rt-refused-limit",
             RtRefusal::NoSuchBlock => "rt-refused-no-such-block",
             RtRefusal::Thread => "rt-refused-thread",

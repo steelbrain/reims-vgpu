@@ -69,12 +69,21 @@ many times. The pieces, by code:
 
 A call of a built piece that rt refuses (a limit, Metal's own refusal, a gap of rt's, a failed
 Vulkan call) answers the same way, counted under the error's kind, `rt-refused-<kind>`
-(`RtRefusal::ALL`: `loader`, `below-floor`, `vulkan`, `metal`, `limit`, `no-such-block`,
+(`RtRefusal::ALL`: `loader`, `below-floor`, `vulkan`, `metal`, `ours`, `limit`, `no-such-block`,
 `thread`, `translation`, `gap`, `quiesced`, `no-device`, `other`), its first line naming the call
 and rt's error. A texture rt makes none of for its pixel format is counted under its format's
 code instead, `rt-refused-texture-format-<n>`; a pipeline state's imageblock length rt refuses,
 `rt-refused-imageblock-length`; and a heap texture rt refuses on its place in its block,
-`rt-refused-heap-texture-place`. The boot diagnostics (`rt_platform/diag.rs`, lines that start
+`rt-refused-heap-texture-place`. `rt-refused-metal` counts `Error::Refused`, Metal's refusals
+and those of rt's own rules that no code of their own names; each refusal's basis, Metal's or
+rt's, is in metal2vulkan-runtime's `error.rs`. `rt-refused-ours` counts rt's own refusal of a
+texture buffer the device places (`newTextureWithDescriptor:` of `MTLTextureTypeTextureBuffer`,
+`Refusal::TextureBufferNotOverBuffer`): rt makes a texture buffer only over a buffer its
+consumer places, and the host places none for it yet: nil. Among rt's gaps (`rt-refused-gap`),
+nothing encoded: a blit copy to or from a texture buffer (`Gap::TextureCopy`), and a copy
+between regions of two textures over one buffer whose bytes meet where rt cannot cut the copy
+into ordered slabs, or between two textures whose memory meets where one is placed in a heap
+(`Gap::OverlappingCopy`). The boot diagnostics (`rt_platform/diag.rs`, lines that start
 `reims-vgpu: rt-diag`) add what the call asked of rt where its site names it. Their refusals
 line counts the translator's refusals by the feature each refused, `Translation-<feature>`
 (metal2vulkan's `Feature`'s variant, as `Translation-DivergentInterpolation`), or by its
