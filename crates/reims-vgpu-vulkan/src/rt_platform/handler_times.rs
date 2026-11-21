@@ -86,7 +86,10 @@ impl Releases {
 
     /// The kinds, those of the most bytes first, then the most releases.
     fn kinds(&self) -> Vec<(&'static str, u64, u64)> {
-        let mut kinds: Vec<_> = (self.0.iter()).filter(|e| !e.0.is_empty()).copied().collect();
+        let mut kinds: Vec<_> = (self.0.iter())
+            .filter(|e| !e.0.is_empty())
+            .copied()
+            .collect();
         kinds.sort_by_key(|&(kind, n, bytes)| (Reverse(bytes), Reverse(n), kind));
         kinds
     }
@@ -242,7 +245,11 @@ impl Times {
             ms(self.max.load(Relaxed)),
             self.over_1_ms.load(Relaxed),
             self.over_16_ms.load(Relaxed),
-            if kinds.is_empty() { "none".to_owned() } else { kinds.join(", ") }
+            if kinds.is_empty() {
+                "none".to_owned()
+            } else {
+                kinds.join(", ")
+            }
         )
     }
 }
@@ -273,7 +280,11 @@ mod tests {
             assert!(b >= last, "{nanos}");
             last = b;
             assert!(top(b) >= nanos, "{nanos}");
-            assert!(top(b) - nanos <= nanos / 8, "{nanos} in {b} tops at {}", top(b));
+            assert!(
+                top(b) - nanos <= nanos / 8,
+                "{nanos} in {b} tops at {}",
+                top(b)
+            );
         }
         assert_eq!(bucket(u64::MAX), BUCKETS - 1);
         assert_eq!(top(BUCKETS - 1), u64::MAX);
