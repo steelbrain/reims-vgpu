@@ -2725,7 +2725,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 Ok(Ok(b)) if b.computes() => self.hand_prepass(&decoder, &message),
                 _ => (None, true),
             };
-            let begun = (begun, prepass, Walk { to_lane, alone, made });
+            let walk = Walk {
+                to_lane,
+                alone,
+                made,
+            };
+            let begun = (begun, prepass, walk);
             self.carry_out(decoder, begun, carried, poster.clone(), message, claim);
         });
     }
