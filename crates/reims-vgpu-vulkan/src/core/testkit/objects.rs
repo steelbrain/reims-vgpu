@@ -27,6 +27,7 @@
 
 use std::any::{Any, TypeId};
 use std::borrow::BorrowMut;
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -625,6 +626,28 @@ impl Drop for FakeObj {
     }
 }
 
+thread_local! {
+    /// How many deallocators this thread runs inside each other ([`run_deallocator`]).
+    static DEALLOCATING: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Runs `deallocator`, counted as running on its thread while it does ([`DEALLOCATING`]), so a
+/// handle it lets go of is noted ([`World::handles_dropped_in_deallocators`]): the Vulkan
+/// platform runs a no-copy buffer's or heap's deallocator from rt's release of its import of the
+/// bytes, which makes no call into rt and drops no handle of rt's (metal2vulkan-runtime's
+/// `import.rs`), so what a deallocator holds of the platform's goes elsewhere.
+fn run_deallocator(deallocator: NoCopyDeallocator) {
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            DEALLOCATING.set(DEALLOCATING.get() - 1);
+        }
+    }
+    DEALLOCATING.set(DEALLOCATING.get() + 1);
+    let _running = Running;
+    deallocator();
+}
+
 /// A counted, type-erased reference to a fake object (what models hold).
 pub struct AnyHandle(Arc<FakeObj>);
 
@@ -691,8 +714,13 @@ impl<K: Kind> Handle for Fk<K> {
 
 impl<K: Kind> Drop for Fk<K> {
     /// A release: the death [`World::die_at_release`] set for the object and the hold
-    /// [`World::hold_at_release`] set for it, where the thread is not unwinding already.
+    /// [`World::hold_at_release`] set for it, where the thread is not unwinding already. One
+    /// inside a deallocator is noted ([`World::handles_dropped_in_deallocators`]).
     fn drop(&mut self) {
+        if DEALLOCATING.get() > 0 {
+            let at = (K::CLASS, self.id());
+            self.obj().world.dropped_in_deallocators.lock().push(at);
+        }
         if !std::thread::panicking() && self.obj().world.take_release_death(self.id()) {
             crate::core::raise::Raise::platform("release")
                 .with_detail("the platform died letting go of the object")
@@ -896,6 +924,9 @@ pub struct World {
     /// ([`World::run_deallocators_late`]), in the order the objects died; `None` while they run at
     /// the death.
     late_deallocators: Mutex<Option<Vec<NoCopyDeallocator>>>,
+    /// The handles let go of while a deallocator ran, each its class and object, in the order
+    /// they went ([`World::handles_dropped_in_deallocators`]).
+    dropped_in_deallocators: Mutex<Vec<(&'static str, ObjId)>>,
     /// Committed command buffers whose work the platform has not taken, in commit order, while
     /// submissions are held ([`World::hold_submissions`]); `None` while they are not.
     held_submissions: Mutex<Option<Vec<Arc<FakeObj>>>>,
@@ -1038,6 +1069,7 @@ impl World {
             release_dies: Mutex::new(Vec::new()),
             release_holds: Mutex::new(Vec::new()),
             late_deallocators: Mutex::new(None),
+            dropped_in_deallocators: Mutex::new(Vec::new()),
             held_submissions: Mutex::new(None),
             release_at_commit: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
@@ -1394,9 +1426,16 @@ impl World {
         let held = held.unwrap_or_default();
         let ran = held.len();
         for deallocator in held {
-            deallocator();
+            run_deallocator(deallocator);
         }
         ran
+    }
+
+    /// The handles let go of while a deallocator ran, on its thread, each its class and object,
+    /// in the order they went: what the Vulkan platform's deallocators may not do, as rt runs them
+    /// from its release of an import, which drops no handle of rt's ([`run_deallocator`]).
+    pub fn handles_dropped_in_deallocators(&self) -> Vec<(&'static str, ObjId)> {
+        self.dropped_in_deallocators.lock().clone()
     }
 
     /// Runs `deallocator` at an object's death, or holds it where deallocators run late
@@ -1407,7 +1446,7 @@ impl World {
             Some(held) => held.push(deallocator),
             None => {
                 drop(late);
-                deallocator();
+                run_deallocator(deallocator);
             }
         }
     }

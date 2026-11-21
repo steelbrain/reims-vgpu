@@ -103,7 +103,9 @@ use reims_vgpu_vulkan::core::platform::values::{BufferDesc, OptionSet};
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 
+use super::surface_pages::TEARDOWN;
 use super::tables::{Entry, GuestBytes};
+use super::worker::Worker;
 use super::{
     DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, read_at, refusing, texture_desc,
 };
@@ -169,12 +171,46 @@ pub(crate) struct ManagedCopy<P: Platform> {
 enum BytesHold<P: Platform> {
     /// The `Shared` buffer whose contents the bytes are (`MANAGED_BUFFER_CREATE`), which holds
     /// what keeps them mapped: its block of the region, its heap, or a pages block's view.
-    Buffer(P::Buffer),
+    Buffer(CopyBufferHold<P>),
     /// What keeps the bytes of the heap they lie in mapped, where it lies over any but the
     /// region's ([`Entry::ram_kept`], `BUFFER_MANAGED_AT_OFFSET`).
     Kept {
         _kept: Option<super::tables::BytesKeep>,
     },
+}
+
+/// A `MANAGED_BUFFER_CREATE`'s hold of its CPU copy's `Shared` buffer ([`BytesHold::Buffer`]),
+/// which the deallocator of the no-copy buffer over its bytes keeps: the buffer is let go of on
+/// the surface worker ([`TEARDOWN`]), never where the hold goes.
+///
+/// The Vulkan platform runs the deallocator from rt's release of its import of the bytes, on rt's
+/// block-maker thread, or at the device's teardown on the thread that ends it, and that release
+/// makes no call into rt and drops no handle of rt's (metal2vulkan-runtime's `import.rs`). The
+/// CPU copy's buffer is such a handle, perhaps its device's last. So the hold hands it over: the
+/// release ends once the job is queued, a lock of the worker's alone taken and no wait, and a
+/// thread of the worker's, outside every callback of rt's, lets go of it after the release, where
+/// rt's teardown may run if it was the device's last handle. The hold keeps the worker, so the
+/// hand-over works after the decoder went too. The bytes stay mapped the hop longer, never
+/// shorter: rt reads none of them once it ran the release.
+///
+/// A release at the device's teardown never holds one: the buffer keeps the device alive, the
+/// platform's handle of it and rt's own, and rt tears a device down only once every handle of it
+/// and of every object made from it is gone, so a hold still in a release keeps its device from
+/// teardown until the release has run and the worker has let go of the buffer.
+struct CopyBufferHold<P: Platform> {
+    /// The CPU copy's guest object, which names it where its release is refused.
+    obj_id: u64,
+    /// Taken as it goes.
+    buffer: Option<P::Buffer>,
+    worker: Arc<Worker>,
+}
+
+impl<P: Platform> Drop for CopyBufferHold<P> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.worker.drop_later(TEARDOWN, self.obj_id, buffer);
+        }
+    }
 }
 
 /// A two-copy `Managed` texture whose GPU copy a recovery lost, to fill again from its CPU copy
@@ -496,7 +532,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cpu = cpu.clone_ref();
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
         let kind = super::unkept::Kind::managed(self.unified());
-        let keep = BytesHold::Buffer(cpu);
+        let keep = BytesHold::Buffer(CopyBufferHold {
+            obj_id: m.cpu_buffer_obj_id,
+            buffer: Some(cpu),
+            worker: Arc::clone(&self.shared.surface_worker),
+        });
         let Some(buffer) = kind.making(|| {
             self.buffer_over_bytes(device, bytes, m.length, options, pin, keep, zero_from)
         })?
@@ -2107,6 +2147,65 @@ mod tests {
             assert!(r.dec.span_in_use(pages::BLOCK + 0x1_0000, 0x1_0000));
             assert_eq!(r.modified(61, 32, 4), Ok(()));
             assert!(r.synchronize(61, RGFX_BLIT_RESOURCE_BUFFER).unwrap());
+        }
+    }
+
+    /// A `MANAGED_BUFFER_CREATE`'s deallocator, which the Vulkan platform runs from rt's release
+    /// of its import of the bytes, lets go of no handle of the platform's: the CPU copy's buffer
+    /// it holds, its last hold once the guest destroyed the copy, goes on the surface worker after
+    /// the deallocator ran, wherever the copy lies, whether the platform runs the deallocator at
+    /// the buffer's death or later. Nor do the deallocators of what the copies lie over: the
+    /// buffer over the pages block's view, and the heaps over the block's RAM and over the region.
+    #[test]
+    fn a_managed_buffer_s_deallocator_lets_go_of_its_cpu_copy_s_buffer_on_the_surface_worker() {
+        let destroy = |r: &mut Rig, obj_id: u64| {
+            let m = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(r.send(&m), Ok(()), "destroy {obj_id}");
+        };
+        for late in [false, true] {
+            let (mut r, ram, page) = pages_rig();
+            let copies = shared_copies(&mut r, &ram, page);
+            if late {
+                r.p.world().run_deallocators_late();
+            }
+            for (i, (cpu, _)) in copies.into_iter().enumerate() {
+                let obj_id = 60 + i as u64;
+                assert_eq!(r.send(&managed_over(obj_id, cpu, 0x300, MANAGED)), Ok(()));
+                let gone = match r.dec.named(cpu) {
+                    Some(ObjHandle::Buffer(b)) => Arc::downgrade(b.obj()),
+                    _ => panic!("no buffer {cpu:#x}"),
+                };
+                destroy(&mut r, cpu);
+                destroy(&mut r, obj_id);
+                r.dec.surface_worker().flush();
+                if late {
+                    assert!(
+                        gone.upgrade().is_some(),
+                        "copy {cpu}: the deallocator, not yet run, holds it"
+                    );
+                    r.dec.surface_worker().hold();
+                    assert_eq!(r.p.world().run_late_deallocators(), 1, "copy {cpu}");
+                    assert!(
+                        gone.upgrade().is_some(),
+                        "copy {cpu}: handed to the worker, which has not run"
+                    );
+                    r.dec.surface_worker().release();
+                    r.dec.surface_worker().flush();
+                }
+                assert!(gone.upgrade().is_none(), "copy {cpu}, late {late}");
+            }
+            destroy(&mut r, 20);
+            destroy(&mut r, 40);
+            r.dec.surface_worker().flush();
+            if late {
+                r.p.world().run_late_deallocators();
+                r.dec.surface_worker().flush();
+            }
+            let dropped = r.p.world().handles_dropped_in_deallocators();
+            assert!(dropped.is_empty(), "late {late}: {dropped:?}");
         }
     }
 

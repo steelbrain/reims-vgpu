@@ -418,10 +418,12 @@ pub(crate) const CACHED_BYTES: u64 = 1 << 30;
 /// out.
 pub(crate) const CACHED_PAGES_BYTES: u64 = CACHED_BYTES / CACHED_VIEWS as u64;
 
-/// The surface worker's key of a view's teardown ([`SurfaceView`]'s drop): no block's offset,
-/// so a teardown never waits behind a block's jobs, nor they behind it, and the teardowns run
+/// The surface worker's key of what is let go of there wherever its last hold goes: a view's
+/// mapping ([`SurfaceView`]'s drop), and a `Managed` buffer's CPU copy's buffer, which a
+/// deallocator the platform runs from its release holds (`managed`'s `CopyBufferHold`). No
+/// block's offset, so those never wait behind a block's jobs, nor they behind them, and they go
 /// one at a time, on one of the worker's threads at most.
-const TEARDOWN: u64 = u64::MAX;
+pub(super) const TEARDOWN: u64 = u64::MAX;
 
 /// One surface's view of its guest pages, which the buffers of its blocks lie over.
 ///
@@ -6204,6 +6206,11 @@ pub(super) mod tests {
             "the view went with the deallocator"
         );
         assert_eq!(r.torn_down(at), 1);
+        let dropped = r.p.world().handles_dropped_in_deallocators();
+        assert!(
+            dropped.is_empty(),
+            "let go of in a deallocator: {dropped:?}"
+        );
     }
 
     /// A `Managed` buffer placed in a heap over a pages block's view (`BUFFER_MANAGED_AT_OFFSET`),
@@ -6250,6 +6257,11 @@ pub(super) mod tests {
             "the view went with the deallocator"
         );
         assert_eq!(r.torn_down(at), 1);
+        let dropped = r.p.world().handles_dropped_in_deallocators();
+        assert!(
+            dropped.is_empty(),
+            "let go of in a deallocator: {dropped:?}"
+        );
     }
 
     /// A heap over a pages block of one run, over the guest's RAM itself, holds the platform's
@@ -6285,6 +6297,11 @@ pub(super) mod tests {
         );
         r.p.world().run_late_deallocators();
         assert_eq!(holds(), before);
+        let dropped = r.p.world().handles_dropped_in_deallocators();
+        assert!(
+            dropped.is_empty(),
+            "let go of in a deallocator: {dropped:?}"
+        );
     }
 
     /// A pages block's runs are checked as a surface's: runs outside guest RAM, not whole pages,
