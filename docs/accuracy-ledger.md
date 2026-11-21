@@ -86,7 +86,8 @@ argument offset off a multiple of 4 or without the arguments' bytes after it
 (`Refusal::AttachmentPlace`), a buffer offset set on an empty slot (`Refusal::NoBufferAtIndex`),
 a Managed buffer's modified range past its end (`Refusal::ModifiedRange`), a wait in a
 scheduled handler or on rt's own thread (`Refusal::InScheduledHandler`,
-`Refusal::WaitOnOwnThread`), and a texture buffer not over a buffer its consumer places
+`Refusal::WaitOnOwnThread`), a sampler state placed at an index the guest did not reserve
+(`Refusal::IndicesNotGranted`), and a texture buffer not over a buffer its consumer places
 (`Refusal::TextureBufferNotOverBuffer`): rt makes a texture buffer only over a buffer. The
 device's (`newTextureWithDescriptor:` of
 `MTLTextureTypeTextureBuffer`) is made over a buffer of the host's own, of the texture's bytes

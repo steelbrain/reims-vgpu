@@ -13,7 +13,9 @@
 //!   `OwnIndices::give_back`). Its `gpuResourceID` is rt's, the index and the
 //!   translator's word of its descriptor, and its `resourceIndex` the index.
 //!   `supportArgumentBuffers` changes nothing: every state has an index. rt refuses a cubic filter
-//!   (`rt-refused-gap`), and a state past the device's samplers (`rt-refused-limit`): nil, counted.
+//!   (`rt-refused-gap`), a state past the device's samplers (`rt-refused-limit`), and a state the
+//!   guest places at an index it did not reserve, on a rule of rt's own (`rt-refused-ours`): nil,
+//!   counted.
 //! - **A depth-stencil state** is rt's, which holds no Vulkan object: a draw under it sets its
 //!   tests as dynamic state. Its `gpuResourceID` is 0 and its `resourceIndex` raises, as the
 //!   host's stubs answer below Apple10 (measured on the M3 Max).
@@ -344,9 +346,9 @@ mod tests {
 
     /// Sampler and depth-stencil states on the GPU the test holds: one the guest does not place
     /// takes the platform's highest sampler index, the next the one below; one the guest places
-    /// at a reserved index takes it, and at an index not reserved is rt's refusal, nil, counted;
-    /// a value rt has none of and a cubic filter nil, counted. A depth-stencil state's ID is 0
-    /// and its index raises.
+    /// at a reserved index takes it, and at an index not reserved is rt's refusal on a rule of its
+    /// own (`Refusal::IndicesNotGranted`), nil, counted; a value rt has none of and a cubic filter
+    /// nil, counted. A depth-stencil state's ID is 0 and its index raises.
     #[test]
     fn states_on_vulkan() {
         let platform = RtPlatform::new();
@@ -374,19 +376,20 @@ mod tests {
             first.gpu_resource_id() >> 32
         );
 
-        let metal = Kind::Refused.code();
-        let before = counted(metal);
+        let (metal, ours) = (Kind::Refused.code(), Kind::Ours.code());
+        let before = (counted(metal), counted(ours));
         let unplaced = SamplerDesc {
             resource_index: Some(9),
             ..SamplerDesc::default()
         };
         assert!(sampler(&unplaced).is_none());
+        assert_eq!((counted(metal), counted(ours)), (before.0, before.1 + 1));
         let unknown = SamplerDesc {
             s_address_mode: Some(99),
             ..SamplerDesc::default()
         };
         assert!(sampler(&unknown).is_none());
-        assert_eq!(counted(metal), before + 2);
+        assert_eq!((counted(metal), counted(ours)), (before.0 + 1, before.1 + 1));
         let gap = Kind::Gap.code();
         let before = counted(gap);
         let cubic = SamplerDesc {
