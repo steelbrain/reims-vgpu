@@ -35,13 +35,12 @@ use metal2vulkan::bind::{
     ArgumentBufferLayout, ArgumentDescriptor, ArgumentLayoutError, ArgumentType,
 };
 use metal2vulkan::metal::{BindingAccess, DataType, TextureType};
-use metal2vulkan_runtime as rt;
 
 use crate::core::platform::types::{ArgumentKind, ArgumentLayout, ArgumentMember};
 use crate::core::platform::values::ArgumentDesc;
 
 use super::library::RtFunction;
-use super::unbuilt::{RtRefusal, refused_as, rt_refused_create};
+use super::unbuilt::{RtRefusal, refused_as, rt_refused_create, translation};
 
 /// `newArgumentEncoderWithArguments:`.
 const DESCRIPTORS: &str = "newArgumentEncoderWithArguments:";
@@ -119,7 +118,7 @@ fn answer(
             converted
         }
         Err(ArgumentLayoutError::Compile(error)) => {
-            rt_refused_create(sel, &rt::Error::Translation(error));
+            rt_refused_create(sel, &translation(error));
             None
         }
         Err(error) => {

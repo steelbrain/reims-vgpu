@@ -377,7 +377,7 @@ impl RtRenderEncoder {
                 depth_bias,
                 slope_scale,
                 clamp,
-            } => e.set_depth_bias(depth_bias, slope_scale, clamp)?,
+            } => e.set_depth_bias(depth_bias, slope_scale, clamp),
             RenderCmd::SetDepthStencilState {
                 depth_stencil_state,
             } => {

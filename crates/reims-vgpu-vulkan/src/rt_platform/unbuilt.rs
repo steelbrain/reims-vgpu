@@ -295,7 +295,7 @@ impl RtRefusal {
             rt::Error::Limit(_) => RtRefusal::Limit,
             rt::Error::NoSuchBlock(_) => RtRefusal::NoSuchBlock,
             rt::Error::Thread(_) => RtRefusal::Thread,
-            rt::Error::Translation(_) => RtRefusal::Translation,
+            rt::Error::Translation { .. } => RtRefusal::Translation,
             rt::Error::Unsupported(_) => RtRefusal::Gap,
             rt::Error::Quiesced => RtRefusal::Quiesced,
             _ => RtRefusal::Other,
@@ -392,7 +392,7 @@ fn detail_line(
 ) -> String {
     let (code, said) = (counted_code(error), said(error));
     let fields = match error {
-        rt::Error::Translation(_) => String::new(),
+        rt::Error::Translation { .. } => String::new(),
         _ => format!("; {error:?}"),
     };
     match what {
@@ -425,7 +425,10 @@ impl std::fmt::Display for Said<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use metal2vulkan::error::Error as Translator;
         match self.0 {
-            rt::Error::Translation(Translator::Unsupported(u)) => {
+            rt::Error::Translation {
+                error: Translator::Unsupported(u),
+                ..
+            } => {
                 write!(
                     f,
                     "the translator refused the feature {:?}, needing {:?}",
@@ -436,7 +439,7 @@ impl std::fmt::Display for Said<'_> {
                     None => Ok(()),
                 }
             }
-            rt::Error::Translation(_) => f.write_str("the translator refused it"),
+            rt::Error::Translation { .. } => f.write_str("the translator refused it"),
             error => write!(f, "{error}"),
         }
     }
@@ -589,6 +592,15 @@ fn metal_places(error: &rt::Error) -> bool {
     };
     let aligned = align != 0 && offset.is_multiple_of(align);
     aligned && offset.checked_add(size).is_some_and(|end| end <= heap_len)
+}
+
+/// rt's error of the translator's `error` where rt's own call did not give it, as rt makes one
+/// for a sampler state or a device: naming no function.
+pub fn translation(error: metal2vulkan::error::Error) -> rt::Error {
+    rt::Error::Translation {
+        error,
+        functions: Box::default(),
+    }
 }
 
 /// [`rt_refused_create`] of a creator with an `error:` out-parameter: the `NSError` it answers, in
@@ -870,18 +882,18 @@ mod tests {
             "{samples:?}"
         );
         let clamp = rt::Error::Unsupported(rt::Gap::Draw {
-            kind: rt::DrawKind::DepthBiasClamp,
+            kind: rt::DrawKind::DepthClamp,
         });
         assert_eq!(
             detail_line(
                 "drawPrimitives:vertexStart:vertexCount:",
                 &clamp,
-                "Draw-DepthBiasClamp",
+                "Draw-DepthClamp",
                 None
             ),
             "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it \
-             (a draw with DepthBiasClamp is not built; Unsupported(Draw { kind: DepthBiasClamp \
-             })); the first of Draw-DepthBiasClamp (rt-refused-gap)\n"
+             (a draw with DepthClamp is not built; Unsupported(Draw { kind: DepthClamp \
+             })); the first of Draw-DepthClamp (rt-refused-gap)\n"
         );
         let format = rt::Error::Unsupported(rt::Gap::TextureFormat {
             pixel_format: rt::PixelFormat::BGRA8Unorm,
@@ -908,7 +920,10 @@ mod tests {
         let refused = Unsupported::not_implemented(Feature::Lowering(LowerFamily::Texture))
             .at(at.with_attachment(Attachment::Color(1)))
             .naming(DiagName::new("air.a_guest_symbol"));
-        let error = rt::Error::Translation(Translator::Unsupported(refused));
+        let error = rt::Error::Translation {
+            error: Translator::Unsupported(refused),
+            functions: Box::default(),
+        };
         let name = crate::rt_platform::diag::refusal_name(&error).expect("a translator's name");
         assert_eq!(name, "Translation-Lowering");
         let sel = "newRenderPipelineStateWithDescriptor:error:";
@@ -918,7 +933,10 @@ mod tests {
              it (the translator refused the feature Lowering(Texture), needing NotImplemented, at \
              the color attachment 1); the first of Translation-Lowering (rt-refused-translation)\n"
         );
-        let cancelled = rt::Error::Translation(Translator::Cancelled);
+        let cancelled = rt::Error::Translation {
+            error: Translator::Cancelled,
+            functions: Box::default(),
+        };
         let name = crate::rt_platform::diag::refusal_name(&cancelled).expect("a translator's name");
         assert_eq!(
             detail_line(sel, &cancelled, &name, None),
@@ -954,7 +972,10 @@ mod tests {
                     symbol: DiagName::new(SECRET),
                 }),
             ]
-            .map(rt::Error::Translation)
+            .map(|error| rt::Error::Translation {
+                error,
+                functions: Box::default(),
+            })
         };
         for error in refusals() {
             assert!(error.to_string().contains(SECRET), "{error}");

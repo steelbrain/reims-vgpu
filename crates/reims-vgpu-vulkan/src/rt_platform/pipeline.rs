@@ -77,6 +77,7 @@ use super::state::value;
 use super::texture::OwnIndices;
 use super::unbuilt::{
     RtRefusal, Unbuilt, refuse_create, refused_error_as, rt_refused_error, rt_refused_imageblock,
+    translation,
 };
 use super::{RtObj, RtPlatform};
 
@@ -292,7 +293,7 @@ pub(super) fn specialized(
             let why = "a function that declares function constants was made unspecialized";
             Err(refused_error_as(sel, RtRefusal::Refused, &why))
         }
-        Err(error) => Err(rt_refused_error(sel, &rt::Error::Translation(error))),
+        Err(error) => Err(rt_refused_error(sel, &translation(error))),
     }
 }
 

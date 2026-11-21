@@ -941,10 +941,15 @@ pub fn refusal_name(error: &rt::Error) -> Option<String> {
         rt::Error::Unsupported(gap) => variant(&format!("{gap:?}")).to_owned(),
         rt::Error::Refused(r) => format!("Refused-{}", variant(&format!("{r:?}"))),
         rt::Error::Limit(l) => format!("Limit-{}", variant(&format!("{l:?}"))),
-        rt::Error::Translation(Translator::Unsupported(u)) => {
+        rt::Error::Translation {
+            error: Translator::Unsupported(u),
+            ..
+        } => {
             format!("Translation-{}", variant(&format!("{:?}", u.feature)))
         }
-        rt::Error::Translation(t) => format!("Translation-{}", variant(&format!("{t:?}"))),
+        rt::Error::Translation { error: t, .. } => {
+            format!("Translation-{}", variant(&format!("{t:?}")))
+        }
         _ => return None,
     })
 }
@@ -1561,7 +1566,7 @@ fn keep_refused_air(
     stages: &[(&str, Option<&rt::StageSource>)],
     fields: impl FnOnce() -> Vec<String>,
 ) {
-    let rt::Error::Translation(_) = error else {
+    let rt::Error::Translation { .. } = error else {
         return;
     };
     let Some(dir) = refused_air_dir() else {
@@ -2732,13 +2737,19 @@ mod tests {
             max: 4,
         }));
         refusal(&rt::Error::Limit(rt::Limit::BlockLen { len: 8, max: 4 }));
-        let translator = |u: Unsupported| rt::Error::Translation(Translator::Unsupported(u));
+        let translator = |u: Unsupported| rt::Error::Translation {
+            error: Translator::Unsupported(u),
+            functions: Box::default(),
+        };
         let lowering = Unsupported::not_implemented(Feature::Lowering(LowerFamily::Texture));
         refusal(&translator(lowering.naming(DiagName::new("a_function"))));
         refusal(&translator(Unsupported::not_implemented(
             Feature::Imageblocks,
         )));
-        refusal(&rt::Error::Translation(Translator::Cancelled));
+        refusal(&rt::Error::Translation {
+            error: Translator::Cancelled,
+            functions: Box::default(),
+        });
         refusal(&rt::Error::Quiesced);
         let gaps = GAPS.lock();
         assert!(gaps.get("Draw-AttachmentRead").is_some_and(|&n| n >= 1));

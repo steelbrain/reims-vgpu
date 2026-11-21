@@ -33,7 +33,7 @@ use crate::core::platform::types::NsErrorText;
 use crate::core::raise::{OnFault, RaiseResult};
 
 use super::texture::refused_metal;
-use super::unbuilt::{rt_refused_create, rt_refused_error};
+use super::unbuilt::{rt_refused_create, rt_refused_error, translation};
 use super::{RtObj, RtPlatform};
 
 /// `newLibraryWithData:error:`.
@@ -87,7 +87,7 @@ impl RtFunction {
 pub fn new_library(bytes: &[u8]) -> Result<RtObj<RtLibrary>, NsErrorText> {
     match rt::Library::from_metallib(bytes) {
         Ok(rt) => Ok(RtObj::new(RtLibrary { rt })),
-        Err(error) => Err(rt_refused_error(LIBRARY, &rt::Error::Translation(error))),
+        Err(error) => Err(rt_refused_error(LIBRARY, &translation(error))),
     }
 }
 
@@ -104,7 +104,7 @@ pub fn shader_library(
         Ok(rt) => Ok(shaders
             .get_or_init(|| RtObj::new(RtLibrary { rt }))
             .clone_ref()),
-        Err(error) => Err(rt_refused_error(SHADERS, &rt::Error::Translation(error))),
+        Err(error) => Err(rt_refused_error(SHADERS, &translation(error))),
     }
 }
 
@@ -124,7 +124,7 @@ impl RtObj<RtLibrary> {
             })),
             Err(TranslatorError::InvalidDescriptor(DescriptorError::EntryNotFound { .. })) => None,
             Err(error) => {
-                rt_refused_create(sel, &rt::Error::Translation(error));
+                rt_refused_create(sel, &translation(error));
                 None
             }
         }
