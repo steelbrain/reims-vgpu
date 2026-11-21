@@ -40,22 +40,6 @@ fn none_completes(platform: &FakePlatform, ring: &mut QueueRing) -> bool {
     !ring.has_event()
 }
 
-/// Whether `call`, on a thread of its own, returns within 5 s while the fill of `stage` runs; the
-/// fill is ended filled after, so that a call that waits for it returns either way.
-fn returns_unfilled(platform: &FakePlatform, stage: u64, call: impl FnOnce() + Send) -> bool {
-    let world = platform.world();
-    std::thread::scope(|scope| {
-        let (returned, returns) = std::sync::mpsc::channel();
-        scope.spawn(move || {
-            call();
-            let _ = returned.send(());
-        });
-        let returned = returns.recv_timeout(Duration::from_secs(5)).is_ok();
-        let _ = world.stages().end(stage, FillEnd::Filled);
-        returned
-    })
-}
-
 /// A dispatch refused for its stage holds its walk until the stage's fill ends, and its buffer
 /// completes only then, its dispatch sent once and made after the fill filled the store
 #[test]
@@ -196,7 +180,7 @@ fn a_dispatch_held_on_its_stage_s_fill_holds_no_message_of_its_queue() {
 
 /// A device's reset while a dispatch waits for its stage's fill waits for no fill: the fill ends
 /// cancelled and what runs it is cancelled, the held dispatch is refused and its walk ends, and
-/// the reset returns; once the reset is done, a refusal of the stage starts its fill again
+/// the reset goes on; once the reset is done, a refusal of the stage starts its fill again
 #[test]
 fn a_reset_ends_the_fill_a_dispatch_waits_for() {
     let (device, platform, _guest, mut ring) = with_states(&[11]);
@@ -207,13 +191,17 @@ fn a_reset_ends_the_fill_a_dispatch_waits_for() {
         eventually(|| world.stages().started() == [7]),
         "no fill started"
     );
-    assert!(
-        returns_unfilled(&platform, 7, || device.reset()),
-        "the reset waited for the fill a dispatch waits for"
-    );
-    assert_eq!(world.stages().cancels(), 1);
+    // The host hears of the reset on the device's control thread.
+    device.reset();
+    let cancelled = eventually(|| world.stages().cancels() == 1);
+    // Where the reset waits for the fill, the fill's end lets it go on.
+    let _ = world.stages().end(7, FillEnd::Filled);
+    assert!(cancelled, "the reset waited for the fill a dispatch waits for");
     assert_eq!(world.stages().refused(), [(THREADS, 7)]);
-    assert_eq!(world.stages().fills().fill(7).end(), None);
+    assert!(
+        eventually(|| world.stages().fills().fill(7).end().is_none()),
+        "the fills stayed suspended past the reset"
+    );
     assert_eq!(world.stages().started(), [7, 7]);
 }
 
