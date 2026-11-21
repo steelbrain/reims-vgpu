@@ -24,7 +24,8 @@
 //!   (`rt-refused-limit`).
 //! - **Its answers.** `maxTotalThreadsPerThreadgroup`, `staticThreadgroupMemoryLength`,
 //!   `threadExecutionWidth` (32, the SIMD-group width rt runs every kernel's SIMD groups at),
-//!   `supportIndirectCommandBuffers` (NO: rt makes no state for indirect command buffers) and
+//!   `supportIndirectCommandBuffers` (NO: rt refuses a compute state for indirect command
+//!   buffers, `Gap::IndirectCommandBuffers` of kind `ComputeCommands`) and
 //!   `imageblockMemoryLengthForDimensions:` are rt's. rt answers the last 0 for a kernel that
 //!   declares no imageblock; for one that does, it refuses (`Gap::ImageblockLength`), and the
 //!   answer is 0, counted (`rt-refused-gap`). `gpuResourceID` and `resourceIndex` are 0, as

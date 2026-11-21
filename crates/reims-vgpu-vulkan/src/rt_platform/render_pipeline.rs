@@ -17,17 +17,18 @@
 //!   layouts of a stride other than 0, Metal's default, and an attribute of a buffer with none is
 //!   Metal's assertion ("references a buffer ... that has no stride"), which the translator
 //!   refuses (`rt-refused-translation`).
-//! - **What rt refuses** is the creator's `NSError`, counted under its kind: a state for indirect
-//!   command buffers, a sample count Vulkan has no bit of, vertex amplification, and what of the
-//!   functions rt does not draw yet (`rt-refused-gap`); the translator's refusals
-//!   (`rt-refused-translation`).
+//! - **What rt refuses** is the creator's `NSError`, counted under its kind: a sample count Vulkan
+//!   has no bit of, vertex amplification, and what of the functions rt does not draw yet
+//!   (`rt-refused-gap`); the translator's refusals (`rt-refused-translation`). A state for
+//!   indirect command buffers is rt's on every device: it pulls every vertex attribute its vertex
+//!   function reads, and its vertex function skips the commands outside an execution's range.
 //! - **Its samplers' indices** are taken as a compute state's are, the vertex function's samplers
 //!   first, then the fragment function's.
 //! - **Its answers** are a drawing state's. `maxTotalThreadsPerThreadgroup` is 0 and
 //!   `threadgroupSizeMatchesTileSize` NO, as Metal's drawing state answers (metal2vulkan's
 //!   measurement on an M3 Max and an M4). The object and mesh stages' answers are 0, as Metal's
-//!   for a state with neither stage. `gpuResourceID` and `resourceIndex` are 0 and
-//!   `supportIndirectCommandBuffers` NO, rt's, as a compute state's. `uniqueIdentifier` is one of
+//!   for a state with neither stage. `gpuResourceID` and `resourceIndex` are 0.
+//!   `supportIndirectCommandBuffers` is rt's, the descriptor's. `uniqueIdentifier` is one of
 //!   the compute states' count. `imageblockSampleLength` and
 //!   `imageblockMemoryLengthForDimensions:` are rt's: the colour attachments' texels as Metal
 //!   packs them, and that times the dimensions' width and height and the sample count. Where rt
@@ -824,6 +825,15 @@ mod tests {
         });
         let drawn = full(&desc);
         assert!(drawn.samplers().is_empty());
+        assert!(!drawn.support_indirect_command_buffers());
+
+        // A state for indirect command buffers: rt's, answering the flag, on any device (an
+        // execution, not the state, needs the device's indirect commands).
+        desc.support_indirect_command_buffers = true;
+        let flagged = full(&desc);
+        assert!(flagged.support_indirect_command_buffers());
+        desc.support_indirect_command_buffers = false;
+        drop(flagged);
 
         // An attribute of a buffer the value sets no layout of: the translator's refusal.
         let translation = RtRefusal::Translation.code();
@@ -858,16 +868,12 @@ mod tests {
         assert!(device.new_render_pipeline_state_full(&refused).is_err());
         assert_eq!(counted(metal), before + 3);
 
-        // rt's gaps: indirect command buffers and a sample count Vulkan has no bit of.
+        // rt's gap: a sample count Vulkan has no bit of.
         let gap = RtRefusal::Gap.code();
         let before = counted(gap);
-        refused.raster_sample_count = 1;
-        refused.support_indirect_command_buffers = true;
-        assert!(device.new_render_pipeline_state_full(&refused).is_err());
-        refused.support_indirect_command_buffers = false;
         refused.raster_sample_count = 3;
         assert!(device.new_render_pipeline_state_full(&refused).is_err());
-        assert_eq!(counted(gap), before + 2);
+        assert_eq!(counted(gap), before + 1);
 
         // Mesh states: unbuilt.
         let mesh = Unbuilt::MeshPipeline.code();

@@ -1,5 +1,6 @@
 use metal2vulkan_runtime::{
-    ColorAttachmentDescriptor, FunctionDescriptor, Gap, Library, PixelFormat, StageSource,
+    ColorAttachmentDescriptor, FunctionDescriptor, Gap, IndirectCommandsKind, Library, PixelFormat,
+    StageSource,
 };
 
 use super::*;
@@ -244,7 +245,9 @@ fn on_vulkan_a_state_rt_refuses_holds_no_id() {
         matches!(
             refused,
             Err(PipelineError::Runtime(Error::Unsupported(
-                Gap::IndirectCommandBuffers
+                Gap::IndirectCommandBuffers {
+                    kind: IndirectCommandsKind::ComputeCommands
+                }
             )))
         ),
         "{:?}",

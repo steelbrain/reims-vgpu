@@ -603,7 +603,7 @@ impl DeviceLoss {
         ));
         // The driver's report of the fault, its addresses placed (`super::fault`).
         if let Some(cause) = &cause {
-            for line in self.watch.lines(&self.gpu, cause.fault.as_ref(), when) {
+            for line in self.watch.lines(&self.gpu, cause.fault.as_deref(), when) {
                 say_lost(&line);
             }
         }

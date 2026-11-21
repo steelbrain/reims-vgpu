@@ -1,6 +1,7 @@
 //! A lost device's fault, named and placed. rt reads the driver's report of the fault
 //! (`VK_EXT_device_fault`) once, at its device's first loss of its own, and keeps it with the loss
-//! (rt's `DeviceLoss::fault`), placing none of its addresses. After the loss's line
+//! (rt's `DeviceLoss::fault`), with rt's own placement of each address among rt's ranges
+//! (`DeviceFault::places`). After the loss's line
 //! (`super::command`'s docs, "A lost device's line"), the device writes the fault's lines on
 //! stderr ([`FaultWatch::lines`]), each starting `reims-vgpu: the rt platform's device on <GPU>
 //! faulted: `:
@@ -30,6 +31,12 @@
 //! - **Each instruction pointer**, placed as an access is, with the note that none of the ranges
 //!   the host sees holds shader code: a pipeline's code lies in the driver's own memory, of which
 //!   the host sees nothing, so the placement says only what lies around the address.
+//! - **rt's placement of each address** (`DeviceFault::places`), one line each, as rt's
+//!   `FaultPlace` displays it: the ranges of rt's own that meet the bytes (its pool's
+//!   allocations, its parameter ring's blocks, imports, exports, surfaces' buffers and indirect
+//!   command buffers' preprocess regions), live or among the last it freed, and the nearest below
+//!   and above. It answers another question than the host's placement above, which places among
+//!   the guest's objects and the blocks the host sees: both are written.
 //! - **What the placement saw**: the live objects of each kind, the decoders and contexts whose
 //!   tables were walked and those not walked, the live textures with no GPU range the platform
 //!   knows, the mapped blocks from each source, what the host does not see, and the released
@@ -1281,7 +1288,8 @@ impl FaultWatch {
     /// The fault's lines for the device on `gpu`, lost at `loss` on the wall clock, its report
     /// `fault` (rt's `DeviceLoss::fault`), each with its own `\n` (the module's docs): the report,
     /// each instruction pointer and each access placed, among what is live and what was released,
-    /// and what the placement saw; one line where rt read no report.
+    /// rt's placement of each address, and what the placement saw; one line where rt read no
+    /// report.
     pub fn lines(&self, gpu: &str, fault: Option<&rt::DeviceFault>, loss: u64) -> Vec<String> {
         let head = format!("reims-vgpu: the rt platform's device on {gpu} faulted: ");
         let Some(fault) = fault else {
@@ -1318,6 +1326,10 @@ impl FaultWatch {
         }
         for at in &fault.accesses {
             lines.push(format!("{head}access {}\n", placed(at)));
+        }
+        // rt's own placement of each address among its ranges, live and recently freed.
+        for place in &fault.places {
+            lines.push(format!("{head}rt places {place}\n"));
         }
         let kept = kept_text(&released, dropped);
         lines.push(format!("{head}{seen}. {kept}\n"));
@@ -1717,6 +1729,7 @@ mod tests {
             ],
             instructions: vec![at(Kind::INSTRUCTION_POINTER_FAULT, 0xde_fe1f_bef0, 0x10)],
             vendor: vec![("mmu".to_owned(), 0x1f, 0x2)],
+            places: Vec::new(),
         };
         let lines = watch.lines("GPU (10de:2204)", Some(&fault), LOSS);
         let head = "reims-vgpu: the rt platform's device on GPU (10de:2204) faulted: ";
@@ -1925,6 +1938,7 @@ mod tests {
             }],
             instructions: Vec::new(),
             vendor: Vec::new(),
+            places: Vec::new(),
         };
         let lines = watch.lines("GPU (10de:2204)", Some(&fault), LOSS);
         assert_eq!(lines.len(), 3, "{lines:#?}");
