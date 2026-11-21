@@ -14507,7 +14507,7 @@ pub(super) mod tests {
                 let message = surface_texture(obj_id, 10, 10, (width, 8));
                 assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
             }
-            let caches = r.dec.caches();
+            let mut caches = r.dec.caches();
             let (home, pages) = caches.wide_buffer(BLOCK).expect("a wide home");
             assert!(pages, "over the pages");
             let home = id_of(home);
