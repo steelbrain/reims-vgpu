@@ -40,20 +40,21 @@
 //!   (game_6000 at 92.7 against 105.6 fps, on a Core Ultra 9 275HX host with an RTX 5080 Laptop
 //!   GPU; measured).
 //! - **Woken as the buffer is begun.** A buffer whose walk goes to the lane (one longer than the
-//!   service thread walks itself) has the lane's thread that went idle last woken as its turn is
-//!   taken, before the rest of its begin ([`Lane::expect`]), and the thread waits for the job,
-//!   spinning for at most [`EXPECT_SPIN`], so its wake is made while the service thread begins
-//!   the buffer rather than after. Woken at the hand-off, the 4092 buffers Geekbench 7.1's
+//!   service thread walks itself, and not alone on its queue's ring as it is taken, where the
+//!   service thread walks one of up to 8 KiB) has the lane's thread that went idle last woken as
+//!   its turn is taken, before the rest of its begin ([`Lane::expect`]), and the thread waits for
+//!   the job, spinning for at most [`EXPECT_SPIN`], so its wake is made while the service thread
+//!   begins the buffer rather than after. Woken at the hand-off, the 4092 buffers Geekbench 7.1's
 //!   Super Resolution hands to its lanes waited 10.1 µs at the median, 58.0 ms of the pass, from
-//!   the hand-off to their walk's start, nearly all of it the parked thread's wake, against
-//!   9.6 µs at the median for the begin before it; woken as begun, 4.2 µs and 36.0 ms. The
-//!   wake's call moved into the begin (9.1 ms more of it), and the pass's 6296 buffers went from
-//!   their take to their walk's start in 123.9 ms where they took 136.7, 12.8 ± 3.7 ms sooner
-//!   (8 paired slices); over the benchmark's 11 workloads, 22.0 ± 6.5 ms sooner, for 27.1 ms of
-//!   spins, 4.1 µs at the median (Iris Xe host, m3-max-30439 against m3-max-30453; measured).
-//!   Only a thread woken for a job that is to come spins, and only until it comes, its buffer
-//!   is carried out where it was begun ([`Lane::withdraw`]), the lane closes, or the bound
-//!   passes; the jobs, their order and their turns are as they were.
+//!   the hand-off to their walk's start, nearly all of it the parked thread's wake, against 9.6 µs
+//!   at the median for the begin before it; woken as begun, 4.2 µs and 36.0 ms. The wake's call
+//!   moved into the begin (9.1 ms more of it), and the pass's 6296 buffers went from their take to
+//!   their walk's start in 123.9 ms where they took 136.7, 12.8 ± 3.7 ms sooner (8 paired slices);
+//!   over the benchmark's 11 workloads, 22.0 ± 6.5 ms sooner, for 27.1 ms of spins, 4.1 µs at the
+//!   median (Iris Xe host, m3-max-30439 against m3-max-30453; measured). Only a thread woken for a
+//!   job that is to come spins, and only until it comes, its buffer is carried out where it was
+//!   begun ([`Lane::withdraw`]), the lane closes, or the bound passes; the jobs, their order and
+//!   their turns are as they were.
 //! - **Hints.** Each thread gives the scheduler the walk hints as it starts
 //!   ([`Threads::give_walk_hints`]): a walk's speed is the frame rate. On Linux that is a
 //!   utilization floor of the CPU's full capacity, which the kernel's capacity-aware scheduling

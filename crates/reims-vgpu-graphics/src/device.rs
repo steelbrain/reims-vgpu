@@ -2101,6 +2101,14 @@ impl<'a> QueueClaim<'a> {
         }
     }
 
+    /// Whether the guest has published nothing on the queue's submission ring past the buffer
+    /// handed over: no message the service thread would take next, as it would beside work a
+    /// lane's thread carries out. False on a ring that is broken, or whose count is.
+    pub fn nothing_published(&self) -> bool {
+        let submit = self.queue.submit.lock();
+        !submit.broken && submit.consumer.has_pending(&self.shared.region) == Ok(false)
+    }
+
     /// The queue's `consuming` again, taken where the claim was let go, with the queue's
     /// submission ring no longer marked walking, as while this thread takes.
     fn retake(self) -> MutexGuard<'a, Option<u64>> {

@@ -928,6 +928,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 pages_buffers: Arc::default(),
                 reset_gate,
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
+                inline_walk_alone_max: AtomicUsize::new(INLINE_WALK_ALONE_MAX),
                 shared_pool: pool_ledger,
                 private_blocks: {
                     let clock = Arc::clone(&platform);
@@ -1404,6 +1405,11 @@ struct GraphicsControl<P: ApiPlatform> {
     /// where it would wait for nothing ([`Self::carry_out`]): [`INLINE_WALK_MAX`]; the tests that
     /// hold a walk to stand for a long one set it to 0, as a long buffer goes to its lane.
     inline_walk_max: AtomicUsize,
+    /// The longest `COMMAND_BUFFER` message, in bytes, carried out on its queue's service thread
+    /// where it would wait for nothing and its queue's ring holds nothing more
+    /// ([`Self::carry_out`]): [`INLINE_WALK_ALONE_MAX`]; set to 0 with [`Self::inline_walk_max`]
+    /// by the tests whose buffers go to their lanes.
+    inline_walk_alone_max: AtomicUsize,
     /// The ledger of the contexts' blocks of the guest's Shared pool, where the device offers it
     /// (`POOL_TAKE`, `POOL_GIVE`, [`Self::take_pool_block`]).
     shared_pool: Option<PoolLedger>,
@@ -1421,13 +1427,41 @@ struct GraphicsControl<P: ApiPlatform> {
 /// its walk.
 const INLINE_WALK_MAX: usize = 2048;
 
+/// The longest `COMMAND_BUFFER` message, in bytes, that is walked and committed on its queue's
+/// service thread where its commit would wait for nothing and its queue's ring holds nothing
+/// more as it is taken ([`GraphicsControl::carry_out`]): no buffer of the queue is there to be
+/// taken beside its walk, so a lane's thread would be woken only to walk it while the service
+/// thread sleeps. Over Geekbench 7.1's Metal compute pass on an RTX 5080 Laptop host, a compute
+/// buffer longer than [`INLINE_WALK_MAX`] went from its begin to its walk's start on its lane in
+/// 73.7 us at the mean and 90.3 at the median, most of it the lane thread's wake, where one walked
+/// on the service thread started 3.0 us after its begin (4127 and 5655 buffers with copies of
+/// their `Managed` bytes in; potluck job m3-max-62499's trace; measured). A walk of 2 to 8 KiB
+/// took 51 to 72 us at the median there: about a wake, which is what a buffer the guest
+/// publishes during the walk waits for its take, its commit coming after this one's in its turn
+/// either way.
+const INLINE_WALK_ALONE_MAX: usize = 8192;
+
 /// A `COMMAND_BUFFER` message as its queue's service thread began it
 /// ([`GraphicsDecoder::begin_taken`]), with its pre-pass where it hands one
-/// ([`GraphicsControl::hand_prepass`]): what [`GraphicsControl::carry_out`] walks and closes.
+/// ([`GraphicsControl::hand_prepass`]) and where the thread meant its walk to go: what
+/// [`GraphicsControl::carry_out`] walks and closes.
 type BegunBuffer<P> = (
     RaiseResult<Result<Begun<P>, DecodeError>>,
     Option<Prepass<P>>,
+    Walk,
 );
+
+/// Where a `COMMAND_BUFFER` message's queue's service thread meant its walk to go as it began
+/// it ([`GraphicsControl::begin_command_buffer`]), for [`GraphicsControl::carry_out`].
+#[derive(Clone, Copy)]
+struct Walk {
+    /// The lane's idle thread was woken for it as its turn was taken
+    /// ([`GraphicsControl::goes_to_lane`]), the buffer not alone.
+    to_lane: bool,
+    /// Its message is [`INLINE_WALK_ALONE_MAX`] bytes at most, and the guest had published
+    /// nothing behind it on its queue's ring as it was taken ([`QueueClaim::nothing_published`]).
+    alone: bool,
+}
 
 /// The display's hold of the region block a surface's texture lies over, as a compositor holds
 /// the IOSurface it shows: made as the present is taken ([`Presented::hold`]), and held by the
@@ -2581,7 +2615,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// ([`Self::carry_out`]), so the thread goes on to the queue's next buffer meanwhile, `message`
     /// going there as it is. A buffer longer than [`INLINE_WALK_MAX`] has the lane's idle thread
     /// woken for it as its turn is taken, so the thread wakes during the rest of its begin
-    /// (`decode::lane`, "Woken as the buffer is begun").
+    /// (`decode::lane`, "Woken as the buffer is begun"), unless it is alone on its queue's ring:
+    /// [`INLINE_WALK_ALONE_MAX`] bytes at most, with nothing published behind it as it is taken
+    /// ([`QueueClaim::nothing_published`]), so that it is walked here where its commit would wait
+    /// for nothing.
     fn begin_command_buffer(
         self: &Arc<Self>,
         poster: &CompletionPoster,
@@ -2598,14 +2635,19 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             let sinks = self.queue_sinks(poster);
             let mut decoder = (self.decoders).sender(Some(sender_context(poster, &message)), sinks);
-            let to_lane = self.goes_to_lane(&message);
+            // Alone on its ring as it is taken: nothing behind it waits for the service thread.
+            let alone = message.len() <= self.inline_walk_alone_max.load(Ordering::Relaxed)
+                && claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.nothing_published());
+            let to_lane = self.goes_to_lane(&message) && !alone;
             let queue = poster.queue_obj_id();
             let begun = refusing(|| decoder.begin_taken(&self.device, &message, queue, to_lane));
             let prepass = match &begun {
                 Ok(Ok(b)) if b.computes() => self.hand_prepass(&decoder, &message),
                 _ => None,
             };
-            let begun = (begun, prepass);
+            let begun = (begun, prepass, Walk { to_lane, alone });
             self.carry_out(decoder, begun, carried, poster.clone(), message, claim);
         });
     }
@@ -2651,6 +2693,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// for its walk and another for the turn its commit waited on. The queue's next buffer is
     /// begun once it is committed, a walk of a few dozen ops later.
     ///
+    /// So is a buffer of [`INLINE_WALK_ALONE_MAX`] bytes at most whose commit would wait for
+    /// nothing and which was alone on its queue's ring as it was taken ([`Walk::alone`]): no
+    /// buffer of the queue was there to be taken beside a lane's walk of it,
+    /// and the lane's thread was not woken for it. Where its commit would wait after all, it
+    /// goes to the lane as a short buffer does, its thread woken there.
+    ///
     /// A buffer carried out here lets its queue's `claim` go first, once begun
     /// ([`QueueClaim::let_go`]): a buffer the guest published behind it and asked `CB_SUBMITTED`
     /// of is offered to the host then, and one rung for during the walk at its doorbell, each
@@ -2663,19 +2711,19 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn carry_out(
         self: &Arc<Self>,
         decoder: GraphicsDecoder<P>,
-        (begun, prepass): BegunBuffer<P>,
+        (begun, prepass, walk): BegunBuffer<P>,
         carried: ArcRwLockReadGuard<RawRwLock, ()>,
         poster: CompletionPoster,
         message: Vec<u8>,
         claim: Option<&mut QueueClaim<'_>>,
     ) {
         let lane = decoder.lane();
-        let expected = self.goes_to_lane(&message);
+        let expected = walk.to_lane;
         let begun_whole = matches!(&begun, Ok(Ok(_)));
         let here = match &begun {
             Ok(Ok(b)) if b.ordered() => decoder.turn_is_next(),
             Ok(Ok(_)) => {
-                message.len() <= self.inline_walk_max.load(Ordering::Relaxed)
+                (message.len() <= self.inline_walk_max.load(Ordering::Relaxed) || walk.alone)
                     && decoder.commits_at_once()
             }
             _ => false,
@@ -2731,8 +2779,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     }
 
     /// Whether the `COMMAND_BUFFER` `message` goes to its queue's lane wherever it is not walked
-    /// in its turn with its turn next ([`Self::carry_out`]): it is longer than the service thread
-    /// walks itself, [`INLINE_WALK_MAX`] bytes.
+    /// in its turn with its turn next, nor alone on its ring ([`Self::carry_out`]): it is longer
+    /// than the service thread walks itself, [`INLINE_WALK_MAX`] bytes.
     fn goes_to_lane(&self, message: &[u8]) -> bool {
         message.len() > self.inline_walk_max.load(Ordering::Relaxed)
     }

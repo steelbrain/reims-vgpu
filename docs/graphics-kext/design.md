@@ -6495,7 +6495,12 @@ commit. Each outcome the new design allows is one of those two:
     2 KiB at most, whose commit would wait for nothing at its begin: its turn
     next, and no buffer of its process it is committed after still to commit;
     on the lane, each buffer of a drain paid a thread's wake for its walk and
-    another for the turn its commit waited on). Such a buffer lets go of its
+    another for the turn its commit waited on; and so is one of 8 KiB at most
+    whose commit would wait for nothing and behind which the guest had
+    published nothing on its ring as it was taken: no buffer of its queue was
+    there to be taken beside a lane thread's walk, and the thread's wake, 74 µs
+    at the mean on an RTX 5080 Laptop host, was about the walk's own time).
+    Such a buffer lets go of its
     queue's claim on its ring's messages once it is begun, and the service
     thread offers the queue's next buffer to the host there, as a doorbell's
     thread does, so a buffer that asks for its `CB_SUBMITTED` behind it is

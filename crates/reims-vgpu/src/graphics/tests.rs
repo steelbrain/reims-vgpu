@@ -3979,6 +3979,17 @@ type GateState = Arc<(
     reims_vgpu_vulkan::core::sync::Condvar,
 )>;
 
+/// Sends every command buffer of `device` that is not walked in its turn to its queue's lane, as a
+/// long one goes there (`GraphicsControl::carry_out`): none is walked on its queue's service
+/// thread for its length, alone on its ring or not.
+fn walk_on_lanes(device: &GraphicsDevice<FakePlatform>) {
+    device.control.inline_walk_max.store(0, Ordering::Relaxed);
+    device
+        .control
+        .inline_walk_alone_max
+        .store(0, Ordering::Relaxed);
+}
+
 struct WalkGate {
     state: GateState,
     /// The ops walked past the gate once a walk took it: other walks' while it is shut.
@@ -3992,7 +4003,7 @@ impl WalkGate {
     /// at it stands for a long one, so every buffer goes to its queue's lane, as a long one does
     /// (`GraphicsControl::carry_out`).
     fn on(device: &GraphicsDevice<FakePlatform>) -> WalkGate {
-        device.control.inline_walk_max.store(0, Ordering::Relaxed);
+        walk_on_lanes(device);
         WalkGate::in_place(device)
     }
 
@@ -4753,7 +4764,7 @@ fn a_waited_buffer_is_scheduled_before_its_submission() {
     let (device, platform, _guest, [mut held, _, _]) =
         two_processes_taking(&raised, RGFX_FEATURE_SCHEDULED_ASK);
     // Walked on its queue's lane, as a long buffer is (`GraphicsControl::carry_out`).
-    device.control.inline_walk_max.store(0, Ordering::Relaxed);
+    walk_on_lanes(&device);
     let draw = hold_next_draw(&platform);
     let commits = platform.call_log().count("commit");
     held.send(
@@ -4820,7 +4831,7 @@ fn a_held_walk_holds_up_its_process_s_other_queues_only_once_waited_for() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, [mut held, mut beside, mut other]) =
         two_processes_taking(&raised, RGFX_FEATURE_SCHEDULED_ASK);
-    device.control.inline_walk_max.store(0, Ordering::Relaxed);
+    walk_on_lanes(&device);
     let draw = hold_next_draw(&platform);
     held.send(
         &device,
@@ -5768,6 +5779,26 @@ fn walk_threads(
     threads
 }
 
+/// A command buffer of queue 1 of process 1 of `passes` empty blit passes, 16 bytes each past
+/// its message's header.
+fn empty_blits(cb_obj_id: u64, passes: usize) -> Vec<u8> {
+    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
+
+    let ops: Vec<(u16, &[u8])> = (0..passes)
+        .flat_map(|_| {
+            [
+                (RGFX_OP_ENCODER_BEGIN_BLIT, &[][..]),
+                (RGFX_OP_ENCODER_END, &[][..]),
+            ]
+        })
+        .collect();
+    command_buffer_of(obj(1, 1), cb_obj_id, &ops)
+}
+
+/// The empty blit passes of a long command buffer ([`empty_blits`]): its message is longer than
+/// its queue's service thread walks, alone on its ring or not (`GraphicsControl::carry_out`).
+const LONG_PASSES: usize = 600;
+
 /// A short command buffer whose commit would wait for nothing is walked and committed on its
 /// queue's service thread, not handed to a lane thread that would first be woken: here 8 sent
 /// back to back, as a guest's drain. A long one goes to its queue's lane, so the queue's next
@@ -5775,8 +5806,6 @@ fn walk_threads(
 /// behind its process's buffer on another queue answered its `CB_SUBMITTED` and still walked
 #[test]
 fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread() {
-    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
-
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, mut ring) = one_queue(&raised);
     let threads = walk_threads(&device);
@@ -5789,16 +5818,8 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
         assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
     }
     // A long one: past the bound of ops, empty blit passes.
-    let passes: Vec<(u16, &[u8])> = (0..200)
-        .flat_map(|_| {
-            [
-                (RGFX_OP_ENCODER_BEGIN_BLIT, &[][..]),
-                (RGFX_OP_ENCODER_END, &[][..]),
-            ]
-        })
-        .collect();
-    let long = command_buffer_of(obj(1, 1), 108, &passes);
-    assert!(long.len() > super::INLINE_WALK_MAX);
+    let long = empty_blits(108, LONG_PASSES);
+    assert!(long.len() > super::INLINE_WALK_ALONE_MAX);
     ring.send(&device, long);
     assert!(complete_until_event(&platform, &mut ring), "no completion");
     let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
@@ -5861,21 +5882,11 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
 /// it and committed after it, in its turn
 #[test]
 fn a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun() {
-    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
-
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, mut ring) = one_queue(&raised);
     let threads = walk_threads(&device);
-    let passes: Vec<(u16, &[u8])> = (0..200)
-        .flat_map(|_| {
-            [
-                (RGFX_OP_ENCODER_BEGIN_BLIT, &[][..]),
-                (RGFX_OP_ENCODER_END, &[][..]),
-            ]
-        })
-        .collect();
-    let long = |cb| command_buffer_of(obj(1, 1), cb, &passes);
-    assert!(long(100).len() > super::INLINE_WALK_MAX);
+    let long = |cb| empty_blits(cb, LONG_PASSES);
+    assert!(long(100).len() > super::INLINE_WALK_ALONE_MAX);
     let wakes = || device.control.decoder().lane_wakes(obj(1, 1)).unwrap();
     let complete = |ring: &mut QueueRing, cb| {
         assert!(complete_until_event(&platform, ring), "no completion");
@@ -5924,7 +5935,7 @@ fn a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun() {
     assert_eq!(wakes().1, 2, "the begin woke no thread for the held buffer");
     ring.send(&device, long(104));
     assert!(
-        gate.passed(400),
+        gate.passed(2 * LONG_PASSES as u32),
         "the buffer behind was not walked beside the held one"
     );
     assert_eq!(
@@ -5941,6 +5952,71 @@ fn a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun() {
     committed(&platform, 2);
     complete(&mut ring, 103);
     complete(&mut ring, 104);
+}
+
+/// A command buffer longer than its queue's service thread walks beside others, but of
+/// `INLINE_WALK_ALONE_MAX` bytes at most, whose commit would wait for nothing, is walked on that
+/// thread where the guest has published nothing behind it as it is taken: no buffer of its queue
+/// is there to be taken beside a lane thread's walk, and the lane's idle thread is not woken for
+/// it. With one published behind it as it is taken, it goes to its lane, whose idle thread it
+/// wakes as it is begun (`decode`'s `lane`, "Woken as the buffer is begun")
+#[test]
+fn a_buffer_alone_on_its_ring_is_walked_on_its_queue_s_service_thread() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let threads = walk_threads(&device);
+    // About 4.8 KiB, between the two bounds.
+    let mid = |cb| empty_blits(cb, 300);
+    assert!((super::INLINE_WALK_MAX + 1..=super::INLINE_WALK_ALONE_MAX).contains(&mid(100).len()));
+    let wakes = || device.control.decoder().lane_wakes(obj(1, 1)).unwrap();
+    let complete = |ring: &mut QueueRing, cb| {
+        assert!(complete_until_event(&platform, ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    };
+    // A long one makes the lane's thread, which then waits for a job.
+    ring.send(&device, empty_blits(100, LONG_PASSES));
+    complete(&mut ring, 100);
+    assert!(
+        eventually(|| wakes().2 == 1),
+        "the lane's thread: {:?}",
+        wakes()
+    );
+    ring.send(&device, mid(101));
+    complete(&mut ring, 101);
+    assert_eq!(
+        wakes().1,
+        0,
+        "a buffer alone on its ring woke the lane's thread"
+    );
+    // Two published before one doorbell: the first is taken with the second behind it.
+    ring.publish(mid(102));
+    ring.send(&device, mid(103));
+    complete(&mut ring, 102);
+    complete(&mut ring, 103);
+    assert_eq!(
+        wakes().1,
+        1,
+        "the begin woke no thread for the buffer with one behind it"
+    );
+    let walked = threads.lock().clone();
+    assert_eq!(walked.len(), 4, "walks seen: {walked:?}");
+    assert!(
+        walked[0].starts_with("reims-vgpu.graphics-lane-"),
+        "the long buffer walked on {:?}",
+        walked[0]
+    );
+    assert!(
+        walked[1].starts_with("reims-vgpu.graphics-queue-"),
+        "the buffer alone on its ring walked on {:?}",
+        walked[1]
+    );
+    assert!(
+        walked[2..]
+            .iter()
+            .any(|name| name.starts_with("reims-vgpu.graphics-lane-")),
+        "the buffer with one behind it walked off its lane: {walked:?}"
+    );
 }
 
 /// A command buffer that asks for its `CB_SUBMITTED` behind a short buffer its queue's service
