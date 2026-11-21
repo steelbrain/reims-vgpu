@@ -474,7 +474,7 @@ impl<P: Platform> Drop for MappingHold<P> {
         };
         match self.teardown.take() {
             Some(worker) if !self.here.load(Ordering::Acquire) => {
-                worker.drop_later(TEARDOWN, 0, held);
+                worker.drop_from_release(TEARDOWN, 0, held);
             }
             _ => drop(held),
         }

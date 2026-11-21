@@ -189,8 +189,10 @@ enum BytesHold<P: Platform> {
 /// CPU copy's buffer is such a handle, perhaps its device's last. So the hold hands it over: the
 /// release ends once the job is queued, a lock of the worker's alone taken and no wait, and a
 /// thread of the worker's, outside every callback of rt's, lets go of it after the release, where
-/// rt's teardown may run if it was the device's last handle. The hold keeps the worker, so the
-/// hand-over works after the decoder went too. The bytes stay mapped the hop longer, never
+/// rt's teardown may run if it was the device's last handle. Where the OS refuses the worker a
+/// thread, the buffer waits for one of the worker's threads running, and where none runs, the
+/// process ends at the refused spawn ([`Worker::drop_from_release`]). The hold keeps the worker,
+/// so the hand-over works after the decoder went too. The bytes stay mapped the hop longer, never
 /// shorter: rt reads none of them once it ran the release.
 ///
 /// A release at the device's teardown never holds one: the buffer keeps the device alive, the
@@ -213,7 +215,7 @@ struct CopyBufferHold<P: Platform> {
 impl<P: Platform> Drop for CopyBufferHold<P> {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            self.worker.drop_later(TEARDOWN, self.obj_id, buffer);
+            self.worker.drop_from_release(TEARDOWN, self.obj_id, buffer);
         }
     }
 }

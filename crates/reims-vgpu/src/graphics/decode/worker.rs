@@ -23,6 +23,8 @@
 //! waiting before it, and is counted (a cap hit, logged at debug); a thread runs a job of each
 //! waiting key in turn. Where the OS refuses a thread, the key waits as where every thread is
 //! busy, for the threads running, and its job runs where it is handed over only where none runs.
+//! What a release of the platform's may hand over ([`Worker::drop_from_release`]) never does:
+//! where no thread runs to take it, the process ends at the refused spawn, as core's threads do.
 //! - The surface worker's (`reims-vgpu.graphics-surfaces-<i>`) key is a block's offset: a
 //!   `SURFACE_PAGES` and a `BUFFER_OVER_PAGES` handed over (a pages block's first, or one behind
 //!   its block's or its context's still being made) are their block's, as are a released block's
@@ -85,6 +87,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use reims_vgpu_graphics::keep::{KEEP, Keep};
 use reims_vgpu_vulkan::core::platform::os::MonoTime;
+use reims_vgpu_vulkan::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 /// The most threads a [`Worker`] runs.
@@ -92,6 +95,12 @@ pub(crate) const POOL_THREADS: usize = 4;
 
 /// A job of a [`Worker`]'s.
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
+
+/// The call a refused thread ends the process at, as core's threads name it.
+#[cfg(not(windows))]
+const SPAWN: &str = "pthread_create";
+#[cfg(windows)]
+const SPAWN: &str = "CreateThread";
 
 thread_local! {
     /// The key of the worker job this thread runs, and whether the job may wait for it; `None`
@@ -229,6 +238,12 @@ impl Worker {
 
     /// Hands `job` over under `key`: it runs after the jobs handed over under `key` before it.
     pub(crate) fn submit(&self, key: u64, job: Job) {
+        self.hand_over(key, job, true);
+    }
+
+    /// [`Self::submit`]; `here` is whether the job may run where it is handed over, where the OS
+    /// refuses a thread and none runs. Where it may not, the process ends there.
+    fn hand_over(&self, key: u64, job: Job, here: bool) {
         let shared = &self.shared;
         let mut state = shared.state.lock();
         let jobs = state.keys.entry(key).or_default();
@@ -287,6 +302,20 @@ impl Worker {
         let Some(at) = state.ready.iter().position(|&k| k == key) else {
             return;
         };
+        if !here {
+            drop(state);
+            fatal_with_detail(
+                DeathId::Platform {
+                    kind: DeathKind::Abort,
+                    call: SPAWN,
+                },
+                &format!(
+                    "{}-{index} could not be started ({e}), and no thread of the worker's runs to \
+                     let go of what a release handed over",
+                    shared.name
+                ),
+            );
+        }
         state.ready.remove(at);
         let mut job = state.take(key);
         drop(state);
@@ -323,6 +352,18 @@ impl Worker {
     /// ([`super::drop_refused`]).
     pub(crate) fn drop_later<T: Send + 'static>(&self, key: u64, id: u64, value: T) {
         self.submit(key, Box::new(move || super::drop_refused(id, value)));
+    }
+
+    /// [`Self::drop_later`], for a value whose last hold may go inside a release of the
+    /// platform's (a deallocator's), which must drop no handle of the platform's: it is never let
+    /// go of where it is handed over. Where the OS refuses a thread and the worker runs none, the
+    /// process ends here, at the refused spawn.
+    pub(crate) fn drop_from_release<T: Send + 'static>(&self, key: u64, id: u64, value: T) {
+        self.hand_over(
+            key,
+            Box::new(move || super::drop_refused(id, value)),
+            false,
+        );
     }
 
     /// The jobs that found every thread busy and waited for one (tests only).
@@ -741,6 +782,55 @@ mod tests {
         );
         assert_eq!(wait.try_recv(), Ok(std::thread::current().id()));
         assert_eq!(worker.threads(), 0);
+        worker.flush();
+    }
+
+    /// Where the OS refuses a thread and the worker runs none, what a release hands over ends the
+    /// process at the refused spawn, never let go of where it is handed over; with a thread
+    /// running, it waits for that thread
+    #[test]
+    fn a_release_s_drop_whose_thread_is_refused_ends_the_process_where_none_runs() {
+        use reims_vgpu_vulkan::core::raise::death::DeathSite;
+        use reims_vgpu_vulkan::core::testkit::capture::catch_death;
+
+        /// Says when it is dropped, and where.
+        struct Sends(mpsc::Sender<Option<String>>);
+        impl Drop for Sends {
+            fn drop(&mut self) {
+                let _ = self
+                    .0
+                    .send(std::thread::current().name().map(str::to_owned));
+            }
+        }
+        let worker = Worker::new("reims-vgpu.test-worker");
+        worker.refuse_threads(true);
+        let (gone, went) = mpsc::channel();
+        assert_eq!(
+            catch_death(|| worker.drop_from_release(5, 0, Sends(gone.clone()))),
+            Err(DeathSite {
+                kind: DeathKind::Abort,
+                file: SPAWN,
+                line: 0
+            })
+        );
+        assert_eq!(
+            went.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "not let go of where handed over"
+        );
+        let worker = Worker::new("reims-vgpu.test-worker");
+        let (started, begun) = mpsc::channel();
+        let (job, go) = blocking(&started, 1);
+        worker.submit(1, job);
+        assert_eq!(begun.recv_timeout(Duration::from_secs(5)), Ok(1));
+        worker.refuse_threads(true);
+        worker.drop_from_release(5, 0, Sends(gone));
+        assert_eq!(went.try_recv(), Err(mpsc::TryRecvError::Empty), "waits");
+        drop(go);
+        assert_eq!(
+            went.recv_timeout(Duration::from_secs(5)),
+            Ok(Some("reims-vgpu.test-worker-0".to_owned()))
+        );
         worker.flush();
     }
 
