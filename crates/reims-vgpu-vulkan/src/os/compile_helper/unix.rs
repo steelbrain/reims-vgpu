@@ -1,5 +1,10 @@
-//! What Linux and macOS share of a helper's watch: the host's memory, and the talk's broken
-//! pipes.
+//! What Linux and macOS share of a helper's watch: the host's memory and CPUs, what of the guest's
+//! RAM is not resident, and the talk's broken pipes.
+
+use crate::core::num::{ToU64 as _, ToUsize as _};
+
+/// The most of a range `mincore` is asked of at once: 1 GiB.
+const MINCORE_CHUNK: u64 = 1 << 30;
 
 /// The host's physical memory, in bytes: its pages times their size; `None` where the system does
 /// not say.
@@ -14,6 +19,53 @@ pub(super) fn host_memory() -> Option<u64> {
     u64::try_from(pages)
         .ok()?
         .checked_mul(u64::try_from(size).ok()?)
+}
+
+/// The host's page size, in bytes; `None` where the system does not say.
+pub(super) fn page_size() -> Option<u64> {
+    // SAFETY: sysconf reads a constant of the system's, and takes no pointer.
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|&page| page > 0)
+}
+
+/// The host's logical CPUs online, whatever the process's affinity; `None` where the system does
+/// not say.
+pub(super) fn host_cpus() -> Option<u64> {
+    // SAFETY: sysconf reads a value of the system's, and takes no pointer.
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).ok()
+}
+
+/// How many bytes of `ranges` (each a host address and a length) are not resident in the host's
+/// memory, by `mincore`, page by page: what the guest takes as it touches them. A range it cannot
+/// read counts as resident, as does every range where the page size is not said.
+pub(super) fn unresident(ranges: &[(u64, u64)]) -> u64 {
+    let Some(page) = page_size() else {
+        return 0;
+    };
+    let mut pages = Vec::new();
+    let mut out = 0_u64;
+    for &(host, length) in ranges {
+        let end = host.saturating_add(length);
+        // mincore takes a page-aligned start.
+        let mut at = host - host % page;
+        while at < end {
+            let len = (end - at).min(MINCORE_CHUNK);
+            pages.clear();
+            pages.resize(len.div_ceil(page).to_usize(), 0_u8);
+            let address = std::ptr::with_exposed_provenance_mut::<libc::c_void>(at.to_usize());
+            // SAFETY: mincore only reads the residency of the pages from `address` for `len`
+            // bytes, writing one byte a page into `pages`, which holds one a page; an unmapped
+            // range fails with ENOMEM and writes nothing that counts.
+            let read = unsafe { libc::mincore(address, len.to_usize(), pages.as_mut_ptr().cast()) };
+            if read == 0 {
+                let not = pages.iter().filter(|&&page| page & 1 == 0).count();
+                out = out.saturating_add(not.to_u64().saturating_mul(page));
+            }
+            at += len;
+        }
+    }
+    out
 }
 
 /// Blocks `SIGPIPE` on the calling thread, the talk's, so its write to a helper that has ended

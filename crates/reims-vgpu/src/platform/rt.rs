@@ -41,7 +41,8 @@ impl ApiPlatform for RtPlatform {
     /// The files behind the map's ranges, registered while the device lives
     /// ([`lease_guest_ram`]): on Linux the views of a pages block's guest pages, an
     /// app's no-copy memory, are mapped from them, and where the GPU takes no pointer to those
-    /// pages, the device imports a dma-buf of them (`rt_platform::import_known`).
+    /// pages, the device imports a dma-buf of them (`rt_platform::import_known`). The ranges are
+    /// named to the compile helpers' room too, which leaves the guest its unresident RAM.
     fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
         lease_guest_ram(map)
     }
@@ -152,8 +153,14 @@ fn import_view(
 /// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
 /// guest's pages of them, and the dma-bufs of those pages. A range without a file is not
 /// registered, and a view of its pages is refused as a failed remap is. On macOS nothing is
-/// registered, since Mach makes a view by remapping addresses.
+/// registered, since Mach makes a view by remapping addresses. Every range is named to the room
+/// the compile helpers run side by side in too (`reims_vgpu_vulkan::os::hold_guest_ram`), which
+/// leaves the guest what of its RAM is not resident yet.
 fn lease_guest_ram(map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
+    let held = reims_vgpu_vulkan::os::hold_guest_ram(
+        (map.ranges().iter())
+            .map(|range| (range.host_address.addr().to_u64(), range.physical_length)),
+    );
     let ranges = map.ranges().iter().zip(map.files());
     let files = ranges.filter_map(|(range, file)| {
         let file = file.as_ref()?;
@@ -165,5 +172,5 @@ fn lease_guest_ram(map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
             offset: file.offset,
         })
     });
-    Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
+    Box::new((reims_vgpu_vulkan::os::lease_guest_memory(files), held))
 }

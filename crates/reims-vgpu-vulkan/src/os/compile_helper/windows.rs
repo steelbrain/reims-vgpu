@@ -1,5 +1,5 @@
-//! A helper's watch on Windows: its private commit, and a Job Object that ends it with the
-//! library's process.
+//! A helper's watch on Windows: its private commit, a Job Object that ends it with the library's
+//! process, and the host's memory and CPUs.
 
 use std::io;
 use std::os::windows::io::AsRawHandle;
@@ -16,15 +16,45 @@ use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows_sys::Win32::System::Threading::{
+    ALL_PROCESSOR_GROUPS, CREATE_NO_WINDOW, GetActiveProcessorCount,
+};
 
-/// The host's physical memory, in bytes; `None` where Windows does not say.
-pub(super) fn host_memory() -> Option<u64> {
+/// The host's memory status; `None` where Windows does not say.
+fn memory_status() -> Option<MEMORYSTATUSEX> {
     // SAFETY: a MEMORYSTATUSEX is plain data, which zero bytes make a valid one.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>()).ok()?;
     // SAFETY: `status` is a MEMORYSTATUSEX whose length is set, as the call asks.
-    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status.ullTotalPhys)
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
+}
+
+/// The host's physical memory, in bytes; `None` where Windows does not say.
+pub(super) fn host_memory() -> Option<u64> {
+    memory_status().map(|status| status.ullTotalPhys)
+}
+
+/// What the host can give now, in bytes: the smaller of its available physical memory and the
+/// physical memory no commit charge has taken, as a helper's footprint is its commit; `None`
+/// where Windows does not say.
+pub(super) fn free_memory() -> Option<u64> {
+    memory_status().map(|status| {
+        let charged = status.ullTotalPageFile.saturating_sub(status.ullAvailPageFile);
+        (status.ullAvailPhys).min(status.ullTotalPhys.saturating_sub(charged))
+    })
+}
+
+/// Nothing: the guest's RAM is a pagefile-backed section, charged in full at its creation, which
+/// the free memory ([`free_memory`]) leaves out already.
+pub(super) fn unresident(_: &[(u64, u64)]) -> u64 {
+    0
+}
+
+/// The host's logical CPUs, in every processor group; `None` where Windows does not say.
+pub(super) fn host_cpus() -> Option<u64> {
+    // SAFETY: GetActiveProcessorCount takes a group number, and no pointer.
+    let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+    (count > 0).then_some(u64::from(count))
 }
 
 /// Has the child run with no console window of its own, so a library's process with no console

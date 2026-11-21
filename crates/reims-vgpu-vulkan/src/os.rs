@@ -52,6 +52,9 @@ pub use host_os::{
     GuestMemoryLease, OsClock, OsThreads, OsVm, default_driver_sizes, default_registry_id,
     install_process_services, lease_guest_memory,
 };
+/// The guest's RAM named to the room the compile helpers run side by side in
+/// (`os/compile_helper.rs`), while a device made over it lives.
+pub use compile_helper::{GuestRamHeld, hold_guest_ram};
 /// Dma-bufs of host memory lent to a device outside the runtime, and that memory mapped from its
 /// files for one that pins a pointer's pages, on Linux (`os/linux/device_lend.rs`).
 #[cfg(target_os = "linux")]

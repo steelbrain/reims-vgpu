@@ -1,15 +1,16 @@
-//! A helper's start, caps, lock and end, with this test binary as the helper: each test runs
+//! A helper's start, caps, seats and end, with this test binary as the helper: each test runs
 //! itself again with [`STAND_IN`] naming what the stand-in does ([`stand_in`]). No GPU.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::{
-    Footprints, Helper, HelperEnd, HelperRun, Limits, MEMORY_MOST, TIME_MOST, end_with_parent, host,
+    Footprints, GUEST_RAM, Helper, HelperEnd, HelperRun, Limits, MEMORY_MOST, Seats, TIME_MOST,
+    admits, end_with_parent, hold_guest_ram, host,
 };
 use crate::core::platform::os::Clock;
 use crate::os::OsClock;
@@ -70,9 +71,9 @@ fn stand_in(test: &str) {
         }
         "sleep" => std::thread::sleep(STAND_IN_SLEEP),
         "parent" => {
-            let lock = lock_file("parent");
+            let seats = one_seat("parent");
             let helper =
-                Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
+                Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
             let pid = pid_of(&helper);
             let mut stdout = io::stdout();
             writeln!(stdout, "helper-pid {pid}").unwrap();
@@ -84,8 +85,8 @@ fn stand_in(test: &str) {
     std::process::exit(0);
 }
 
-/// A run of this test binary as a stand-in of `test` in `mode`.
-fn run_of(test: &str, mode: &str, limits: Limits, lock: &Path) -> HelperRun {
+/// A run of this test binary as a stand-in of `test` in `mode`, on `seats`.
+fn run_of(test: &str, mode: &str, limits: Limits, seats: &Seats) -> HelperRun {
     HelperRun {
         program: std::env::current_exe().unwrap(),
         args: [
@@ -98,17 +99,31 @@ fn run_of(test: &str, mode: &str, limits: Limits, lock: &Path) -> HelperRun {
         .to_vec(),
         envs: vec![(OsString::from(STAND_IN), OsString::from(mode))],
         limits,
-        lock: lock.to_path_buf(),
+        seats: seats.clone(),
+        label: format!("test {test}"),
     }
 }
 
-/// A lock file of this test process's own, named `tag`.
-fn lock_file(tag: &str) -> PathBuf {
-    lock_file_of(std::process::id(), tag)
+/// `count` seats of this test process's own, named `tag`, beside a room that `room` says.
+fn seats_of(
+    tag: &str,
+    count: usize,
+    room: impl Fn() -> Option<u64> + Send + Sync + 'static,
+) -> Seats {
+    Seats {
+        guard: guard_of(std::process::id(), tag),
+        count,
+        room: Arc::new(room),
+    }
 }
 
-/// The lock file named `tag` of the test process `pid`.
-fn lock_file_of(pid: u32, tag: &str) -> PathBuf {
+/// One seat of this test process's own, named `tag`, beside no room said.
+fn one_seat(tag: &str) -> Seats {
+    seats_of(tag, 1, || None)
+}
+
+/// The seats' guard named `tag` of the test process `pid`.
+fn guard_of(pid: u32, tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rvg-compile-helper-{pid}-{tag}.lock"))
 }
 
@@ -147,7 +162,7 @@ fn code(end: &HelperEnd) -> Option<i32> {
 fn a_helper_talks_over_its_pipes_and_ends_with_its_code() {
     let test = "a_helper_talks_over_its_pipes_and_ends_with_its_code";
     stand_in(test);
-    let lock = lock_file("talk");
+    let seats = one_seat("talk");
     // Past a pipe's buffer, so the talk's write waits for the helper's reads.
     let request: Vec<u8> = (0_u32..1 << 20)
         .map(|i| i.to_le_bytes()[0] ^ i.to_le_bytes()[1])
@@ -155,7 +170,7 @@ fn a_helper_talks_over_its_pipes_and_ends_with_its_code() {
     let sent = request.clone();
     let (ends, ended) = mpsc::channel();
     let helper = Helper::start(
-        run_of(test, "echo", ROOMY, &lock),
+        run_of(test, "echo", ROOMY, &seats),
         move |mut stdin, mut stdout| {
             stdin.write_all(&sent).unwrap();
             drop(stdin);
@@ -172,7 +187,7 @@ fn a_helper_talks_over_its_pipes_and_ends_with_its_code() {
     assert_eq!(seen, end);
     // The harness's own lines come first.
     assert!(said.unwrap().ends_with(&request));
-    let _ = std::fs::remove_file(lock);
+    seats.remove_files();
 }
 
 /// A helper whose footprint passes its cap is killed, and the end says the footprint read that
@@ -181,14 +196,14 @@ fn a_helper_talks_over_its_pipes_and_ends_with_its_code() {
 fn a_helper_past_its_memory_cap_is_killed_over_memory() {
     let test = "a_helper_past_its_memory_cap_is_killed_over_memory";
     stand_in(test);
-    let lock = lock_file("memory");
+    let seats = one_seat("memory");
     let limits = Limits {
         memory: 256 << 20,
         time: Duration::from_secs(60),
     };
     let (ends, ended) = mpsc::channel();
     let on_end = move |_: &HelperEnd, seen, _| ends.send(seen).unwrap();
-    let helper = Helper::start(run_of(test, "grow", limits, &lock), drain, on_end).unwrap();
+    let helper = Helper::start(run_of(test, "grow", limits, &seats), drain, on_end).unwrap();
     let pid = pid_of(&helper);
     let seen: Footprints = ended.recv_timeout(Duration::from_secs(30)).unwrap();
     match helper.wait() {
@@ -206,7 +221,7 @@ fn a_helper_past_its_memory_cap_is_killed_over_memory() {
         end => panic!("{end:?}"),
     }
     assert!(!host::alive(pid));
-    let _ = std::fs::remove_file(lock);
+    seats.remove_files();
 }
 
 /// A helper still running at its time cap is killed there.
@@ -214,21 +229,21 @@ fn a_helper_past_its_memory_cap_is_killed_over_memory() {
 fn a_helper_past_its_time_cap_is_killed_over_time() {
     let test = "a_helper_past_its_time_cap_is_killed_over_time";
     stand_in(test);
-    let lock = lock_file("time");
+    let seats = one_seat("time");
     let limits = Limits {
         memory: ROOMY.memory,
         time: Duration::from_secs(1),
     };
     let clock = OsClock::new();
     let start = clock.now_mono();
-    let helper = Helper::start(run_of(test, "sleep", limits, &lock), drain, |_, _, _| {}).unwrap();
+    let helper = Helper::start(run_of(test, "sleep", limits, &seats), drain, |_, _, _| {}).unwrap();
     let pid = pid_of(&helper);
     assert_eq!(helper.wait(), HelperEnd::OverTime);
     let took = clock.now_mono().saturating_duration_since(start);
     assert!(took >= limits.time, "{took:?}");
     assert!(took < Duration::from_secs(20), "{took:?}");
     assert!(!host::alive(pid));
-    let _ = std::fs::remove_file(lock);
+    seats.remove_files();
 }
 
 /// A cancel kills the helper at once, and its process is gone when the end is known.
@@ -236,8 +251,8 @@ fn a_helper_past_its_time_cap_is_killed_over_time() {
 fn a_cancelled_helper_is_killed_at_once() {
     let test = "a_cancelled_helper_is_killed_at_once";
     stand_in(test);
-    let lock = lock_file("cancel");
-    let helper = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
+    let seats = one_seat("cancel");
+    let helper = Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
     let pid = pid_of(&helper);
     assert!(host::alive(pid));
     let clock = OsClock::new();
@@ -247,18 +262,19 @@ fn a_cancelled_helper_is_killed_at_once() {
     let took = clock.now_mono().saturating_duration_since(start);
     assert!(took < Duration::from_secs(5), "{took:?}");
     assert!(!host::alive(pid));
-    let _ = std::fs::remove_file(lock);
+    seats.remove_files();
 }
 
-/// Helpers on one lock file run one at a time: the second starts only once the first has ended.
+/// Where the OS says no room, helpers run one at a time, free seats or not: the second starts only
+/// once the first has ended.
 #[test]
-fn helpers_on_one_lock_run_one_at_a_time() {
-    let test = "helpers_on_one_lock_run_one_at_a_time";
+fn with_no_room_said_helpers_run_one_at_a_time() {
+    let test = "with_no_room_said_helpers_run_one_at_a_time";
     stand_in(test);
-    let lock = lock_file("turns");
-    let first = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
+    let seats = seats_of("turns", 3, || None);
+    let first = Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
     pid_of(&first);
-    let second = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
+    let second = Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(second.pid(), None, "the second started beside the first");
     first.cancel();
@@ -266,20 +282,20 @@ fn helpers_on_one_lock_run_one_at_a_time() {
     pid_of(&second);
     second.cancel();
     assert_eq!(second.wait(), HelperEnd::Cancelled);
-    let _ = std::fs::remove_file(lock);
+    seats.remove_files();
 }
 
-/// A helper cancelled while it waits for the lock never starts.
+/// A helper cancelled while it waits for a seat never starts.
 #[test]
-fn a_helper_cancelled_while_it_waits_for_the_lock_never_starts() {
-    let test = "a_helper_cancelled_while_it_waits_for_the_lock_never_starts";
+fn a_helper_cancelled_while_it_waits_for_a_seat_never_starts() {
+    let test = "a_helper_cancelled_while_it_waits_for_a_seat_never_starts";
     stand_in(test);
-    let lock = lock_file("waiting");
-    let first = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
+    let seats = one_seat("waiting");
+    let first = Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
     pid_of(&first);
     let (ends, ended) = mpsc::channel();
     let second = Helper::start(
-        run_of(test, "sleep", ROOMY, &lock),
+        run_of(test, "sleep", ROOMY, &seats),
         drain,
         move |end, seen, said| ends.send((end.clone(), seen, said)).unwrap(),
     )
@@ -292,7 +308,146 @@ fn a_helper_cancelled_while_it_waits_for_the_lock_never_starts() {
     assert_eq!(ends, (HelperEnd::Cancelled, Footprints::default(), None));
     first.cancel();
     assert_eq!(first.wait(), HelperEnd::Cancelled);
-    let _ = std::fs::remove_file(lock);
+    seats.remove_files();
+}
+
+/// With room for every cap, as many helpers run side by side as there are seats, and the next
+/// waits for a seat.
+#[test]
+fn with_room_for_their_caps_helpers_run_side_by_side_on_every_seat() {
+    let test = "with_room_for_their_caps_helpers_run_side_by_side_on_every_seat";
+    stand_in(test);
+    let seats = seats_of("side", 3, || Some(1 << 40));
+    let start =
+        || Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
+    let first = start();
+    let others = [start(), start()];
+    pid_of(&first);
+    others.iter().for_each(|helper| _ = pid_of(helper));
+    let fourth = start();
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(fourth.pid(), None, "a fourth started on three seats");
+    first.cancel();
+    assert_eq!(first.wait(), HelperEnd::Cancelled);
+    pid_of(&fourth);
+    for helper in others.iter().chain([&fourth]) {
+        helper.cancel();
+        assert_eq!(helper.wait(), HelperEnd::Cancelled);
+    }
+    seats.remove_files();
+}
+
+/// Beside running helpers, a helper takes a free seat only where all their caps and its own fit in
+/// the room: with room for two caps and a half, two run, and the third waits for one to end.
+#[test]
+fn helpers_run_side_by_side_only_as_their_caps_fit_the_room() {
+    let test = "helpers_run_side_by_side_only_as_their_caps_fit_the_room";
+    stand_in(test);
+    // The stand-ins hold a few MiB each, far from half a cap.
+    let seats = seats_of("room", 3, || Some(ROOMY.memory * 5 / 2));
+    let start =
+        || Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
+    let first = start();
+    let second = start();
+    pid_of(&first);
+    pid_of(&second);
+    let third = start();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(third.pid(), None, "a third started past the room");
+    first.cancel();
+    assert_eq!(first.wait(), HelperEnd::Cancelled);
+    pid_of(&third);
+    for helper in [&second, &third] {
+        helper.cancel();
+        assert_eq!(helper.wait(), HelperEnd::Cancelled);
+    }
+    seats.remove_files();
+}
+
+/// A process's helpers take seats in the order they were started: of two that wait, the one
+/// started first runs first.
+#[test]
+fn helpers_take_seats_in_the_order_they_were_started() {
+    let test = "helpers_take_seats_in_the_order_they_were_started";
+    stand_in(test);
+    let seats = one_seat("order");
+    let start =
+        || Helper::start(run_of(test, "sleep", ROOMY, &seats), drain, |_, _, _| {}).unwrap();
+    let first = start();
+    pid_of(&first);
+    let second = start();
+    let third = start();
+    std::thread::sleep(Duration::from_millis(300));
+    first.cancel();
+    assert_eq!(first.wait(), HelperEnd::Cancelled);
+    pid_of(&second);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(third.pid(), None, "the third took the seat before the second");
+    second.cancel();
+    assert_eq!(second.wait(), HelperEnd::Cancelled);
+    pid_of(&third);
+    third.cancel();
+    assert_eq!(third.wait(), HelperEnd::Cancelled);
+    seats.remove_files();
+}
+
+/// A helper takes a seat beside others only where the caps of all, its own among them, fit in the
+/// room and what this process's running helpers hold now, which the room no longer counts; alone,
+/// it always takes one; with no room said, never beside another.
+#[test]
+fn a_helper_takes_a_seat_beside_others_only_where_all_their_caps_fit() {
+    const GIB: u64 = 1 << 30;
+    let cap = 8 * GIB;
+    assert!(admits(0, cap, None, 0));
+    assert!(admits(0, cap, Some(0), 0));
+    assert!(!admits(1, cap, None, 4 * GIB));
+    assert!(admits(1, cap, Some(16 * GIB), 0));
+    assert!(!admits(1, cap, Some(16 * GIB - 1), 0));
+    assert!(admits(1, cap, Some(12 * GIB), 4 * GIB));
+    assert!(!admits(2, cap, Some(20 * GIB), 3 * GIB));
+    assert!(admits(2, cap, Some(21 * GIB), 3 * GIB));
+    assert!(super::room_of_host().is_some(), "the host says no room");
+}
+
+/// The guest's RAM is named to the room while its hold lives, and no longer once it drops.
+#[test]
+fn the_guests_ram_is_named_to_the_room_while_its_hold_lives() {
+    let named = |held: &[(u64, u64)]| GUEST_RAM.lock().iter().any(|(_, ranges)| ranges == held);
+    let ranges = vec![(0x1000_0000, 1 << 20), (0x2000_0000, 2 << 20)];
+    let hold = hold_guest_ram(ranges.clone());
+    assert!(named(&ranges));
+    drop(hold);
+    assert!(!named(&ranges));
+}
+
+/// The guest's pages it has not touched are not resident, so the room leaves them to it; those
+/// it has touched are.
+#[cfg(unix)]
+#[test]
+fn the_guests_untouched_pages_are_unresident() {
+    const LEN: usize = 64 << 20;
+    // SAFETY: a new anonymous private mapping of LEN bytes, unmapped below.
+    let at = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(at, libc::MAP_FAILED);
+    let len = u64::try_from(LEN).unwrap();
+    let range = [(u64::try_from(at.addr()).unwrap(), len)];
+    assert_eq!(host::unresident(&range), len);
+    // SAFETY: the first half lies in the mapping, which nothing else holds.
+    unsafe { std::ptr::write_bytes(at.cast::<u8>(), 1, LEN / 2) };
+    // A transparent huge page can take up to 2 MiB more past the touched half.
+    let left = host::unresident(&range);
+    assert!((len / 2 - (2 << 20)..=len / 2).contains(&left), "{left}");
+    // SAFETY: the mapping made above, which nothing refers to past here.
+    assert_eq!(unsafe { libc::munmap(at, LEN) }, 0);
 }
 
 /// A helper ends with the process that started it, which exits without a word to it: on Linux
@@ -332,7 +487,12 @@ fn a_helper_ends_with_the_process_that_started_it() {
         panic!("the parent named no helper, and ended {status}: {said:?}");
     };
     assert!(status.success(), "{status}");
-    let _ = std::fs::remove_file(lock_file_of(parent.id(), "parent"));
+    Seats {
+        guard: guard_of(parent.id(), "parent"),
+        count: 1,
+        room: Arc::new(|| None),
+    }
+    .remove_files();
     let clock = OsClock::new();
     let start = clock.now_mono();
     while host::alive(pid) {
@@ -348,19 +508,20 @@ fn a_helper_ends_with_the_process_that_started_it() {
 /// A program that cannot start is said so, and no helper runs.
 #[test]
 fn a_helper_whose_program_is_missing_never_starts() {
-    let lock = lock_file("missing");
+    let seats = one_seat("missing");
     let run = HelperRun {
         program: std::env::temp_dir().join("rvg-no-such-helper"),
         args: Vec::new(),
         envs: Vec::new(),
         limits: ROOMY,
-        lock: lock.clone(),
+        seats: seats.clone(),
+        label: "test missing".to_owned(),
     };
     let helper = Helper::start(run, drain, |_, _, _| {}).unwrap();
     let end = helper.wait();
     assert!(matches!(end, HelperEnd::NotStarted(_)), "{end:?}");
     assert_eq!(helper.pid(), None);
-    let _ = std::fs::remove_file(lock);
+    seats.remove_files();
 }
 
 /// The memory cap is the smaller of 8 GiB and half the host's memory, and 8 GiB where the OS does

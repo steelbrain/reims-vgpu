@@ -1,10 +1,37 @@
-//! A helper's watch on macOS: its physical footprint from `proc_pid_rusage`, and the helper's
-//! watch of its parent's exit, as macOS has no signal at a parent's death.
+//! A helper's watch on macOS: its physical footprint from `proc_pid_rusage`, the helper's watch
+//! of its parent's exit, as macOS has no signal at a parent's death, and the host's free memory
+//! from `host_statistics64`.
 
 use std::io;
 use std::process::{Child, Command};
+use std::sync::OnceLock;
 
-pub(super) use super::unix::{host_memory, mask_broken_pipes};
+pub(super) use super::unix::{host_cpus, host_memory, mask_broken_pipes, unresident};
+
+/// What the host can give now, in bytes: its free pages less the speculative ones, which the
+/// file-backed count holds, its file-backed pages and its purgeable pages (`host_statistics64`'s
+/// `HOST_VM_INFO64`); `None` where it does not say.
+pub(super) fn free_memory() -> Option<u64> {
+    // The host port, asked once: each ask adds a reference to it.
+    static HOST: OnceLock<mach2::port::mach_port_t> = OnceLock::new();
+    // SAFETY: mach_host_self takes nothing.
+    let host = *HOST.get_or_init(|| unsafe { mach2::mach_init::mach_host_self() });
+    // SAFETY: a vm_statistics64 is plain data, which zero bytes make a valid one.
+    let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: `stats` is a vm_statistics64, the flavor HOST_VM_INFO64 fills, of `count` integers.
+    let read = unsafe {
+        libc::host_statistics64(host, libc::HOST_VM_INFO64, (&raw mut stats).cast(), &mut count)
+    };
+    if read != libc::KERN_SUCCESS {
+        return None;
+    }
+    let pages = u64::from(stats.free_count)
+        .saturating_sub(u64::from(stats.speculative_count))
+        .saturating_add(u64::from(stats.external_page_count))
+        .saturating_add(u64::from(stats.purgeable_count));
+    pages.checked_mul(super::unix::page_size()?)
+}
 
 /// Nothing of the child's: the helper watches its parent itself ([`watch_parent`]).
 pub(super) fn prepare(_command: &mut Command) {}

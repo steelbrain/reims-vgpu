@@ -54,13 +54,13 @@ use metal2vulkan_runtime as rt;
 use crate::core::platform::os::Clock;
 use crate::core::platform::stage::{Cancel, FillDone, FillEnd, Site, StageFills, Start};
 use crate::os::OsClock;
-use crate::os::compile_helper::{Footprints, Helper, HelperEnd, HelperRun, Limits};
+use crate::os::compile_helper::{Footprints, Helper, HelperEnd, HelperRun, Limits, Seats};
 
 /// The helper's program, beside the process's executable, with the OS's executable suffix.
 pub(crate) const HELPER: &str = "reims-vgpu-compile";
 
-/// The lock file every helper on the host takes ([`HelperRun::lock`]), in the library's cache
-/// directory (`crate::os::cache_directory`).
+/// The guard of the host's helpers' seats ([`Seats::guard`]), beside which the seats' lock files
+/// lie, in the library's cache directory (`crate::os::cache_directory`).
 const LOCK: &str = "compile-helper.lock";
 
 /// What a stage's refusal names, and a device's fills are keyed by: rt's request of the
@@ -159,8 +159,9 @@ pub(crate) fn fills(device: rt::Device, uuid: [u8; 16]) -> StageFills<StageKey> 
 }
 
 /// What runs the helper of a device whose `deviceUUID` is `uuid`: the program [`HELPER`] beside
-/// the process's executable, given the UUID in hex, at the host's caps, taking the lock file
-/// [`LOCK`] in the library's cache directory, which it makes where it is missing.
+/// the process's executable, given the UUID in hex, at the host's caps, taking one of the host's
+/// seats, whose guard is [`LOCK`] in the library's cache directory, which it makes where it is
+/// missing.
 ///
 /// Err: why there is no helper to run, as said.
 fn helper_run(uuid: [u8; 16]) -> Result<HelperRun, String> {
@@ -177,7 +178,8 @@ fn helper_run(uuid: [u8; 16]) -> Result<HelperRun, String> {
         args: vec![OsString::from(hex(&uuid))],
         envs: Vec::new(),
         limits: Limits::of_host(),
-        lock: dir.join(LOCK),
+        seats: Seats::of_host(dir.join(LOCK)),
+        label: String::new(),
     })
 }
 
@@ -323,7 +325,7 @@ where
     let talk = Arc::new(talk);
     let on_end = Arc::new(on_end);
     Box::new(move |key: &K, site: Site, done: FillDone| -> Cancel {
-        let run = match run() {
+        let mut run = match run() {
             Ok(run) => run,
             Err(why) => {
                 log::warn!(
@@ -338,6 +340,7 @@ where
             target: super::TARGET,
             "stage {key:?}: its helper's fill starts for {site}"
         );
+        run.label = format!("stage {key:?}");
         let (talk, on_end) = (Arc::clone(&talk), Arc::clone(&on_end));
         let (talks, ends) = (key.clone(), key.clone());
         let cap = run.limits.memory;
@@ -474,14 +477,19 @@ mod tests {
                 memory: 1 << 30,
                 time: Duration::from_secs(60),
             },
-            lock: lock_file(test),
+            seats: seats_of(test),
+            label: format!("test {test}"),
         }
     }
 
-    /// The lock file of this test process's `test`.
-    fn lock_file(test: &str) -> PathBuf {
+    /// The seats of this test process's `test`: one, so its helpers run one at a time.
+    fn seats_of(test: &str) -> Seats {
         let pid = std::process::id();
-        std::env::temp_dir().join(format!("rvg-stage-{pid}-{test}.lock"))
+        Seats {
+            guard: std::env::temp_dir().join(format!("rvg-stage-{pid}-{test}.lock")),
+            count: 1,
+            room: Arc::new(|| None),
+        }
     }
 
     /// An exit status of `code`.
@@ -528,7 +536,6 @@ mod tests {
     #[test]
     fn a_helper_that_does_not_start_ends_its_fill_as_on_end_says() {
         let test = "a_helper_that_does_not_start_ends_its_fill_as_on_end_says";
-        let lock = lock_file(test);
         let (ends, ended) = mpsc::channel();
         let fills = StageFills::new(helper_start(
             move || {
@@ -548,7 +555,7 @@ mod tests {
         assert_eq!(key, 4);
         assert!(matches!(end, HelperEnd::NotStarted(_)), "{end:?}");
         assert_eq!(said, None);
-        let _ = std::fs::remove_file(lock);
+        seats_of(test).remove_files();
     }
 
     /// The fill's talk runs with the helper's pipes and the stage's key, and what `on_end` makes
@@ -577,7 +584,7 @@ mod tests {
         // The harness's own lines come first.
         assert!(said.unwrap().ends_with(b"stage 9"));
         assert_eq!(fills.fill(9, Site::Dispatch).end(), Some(FillEnd::Filled));
-        let _ = std::fs::remove_file(lock_file(test));
+        seats_of(test).remove_files();
     }
 
     /// The talk's answer decides first: data kept fills the stage, and a failed compile is a
@@ -639,7 +646,7 @@ mod tests {
         assert_eq!(fills.fill(5, Site::Dispatch).end(), Some(FillEnd::Failed));
         assert!(talked.try_recv().is_err());
         assert!(recorded.try_recv().is_err());
-        let _ = std::fs::remove_file(lock_file(test));
+        seats_of(test).remove_files();
     }
 
     /// A helper killed at its time cap breaches its stage: the breach is recorded, and the fill
@@ -667,7 +674,7 @@ mod tests {
             recorded.recv_timeout(WAIT).unwrap(),
             (3, rt::StageBreach::Time)
         );
-        let _ = std::fs::remove_file(lock_file(test));
+        seats_of(test).remove_files();
     }
 
     /// A refusal other than a stage's names no stage.
@@ -727,6 +734,6 @@ mod tests {
         assert_eq!(fill.end(), Some(FillEnd::Cancelled));
         assert_eq!(ended.recv_timeout(WAIT).unwrap(), HelperEnd::Cancelled);
         assert_eq!(fill.end(), Some(FillEnd::Cancelled));
-        let _ = std::fs::remove_file(lock_file(test));
+        seats_of(test).remove_files();
     }
 }
