@@ -47,6 +47,11 @@
 //! rt counts each copy under one cause, so the causes sum to the over-copies; a copy over an
 //! imported block is counted under its import's cause too, so the imported ones are an axis of
 //! their own and no cause.
+//!
+//! **Its command buffers held for room.** rt keeps on its `VkQueue` only what the queue has room
+//! for, and holds a command buffer scheduled behind a group it could not join until there is room
+//! (rt's `Metrics::held_for_room`). The counts line carries how many as an amount too,
+//! [`HELD_FOR_ROOM_CODE`], folded with the over-copies ([`folded_counts`]).
 
 use std::sync::{Arc, OnceLock};
 
@@ -104,23 +109,32 @@ pub const OVER_COPIES_IMPORTED_CODE: &str = "rt-over-copies-imported";
 /// The code of their bytes (`Metrics::over_copy_bytes_imported`).
 pub const OVER_COPY_BYTES_IMPORTED_CODE: &str = "rt-over-copy-bytes-imported";
 
+/// The code of the command buffers rt held for room on its `VkQueue` (`Metrics::held_for_room`),
+/// an amount on the counts line ([`fold_metrics`]).
+pub const HELD_FOR_ROOM_CODE: &str = "rt-held-for-room";
+
 /// The over-copy metrics the counts line and the trace's `rtcounts` carry ([`over_copy_counts`]):
 /// the over-copies and their bytes, those over an imported block, and the 12 causes' pairs.
 pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 
+/// The metrics the counts line carries ([`folded_counts`]): the over-copy metrics, then the
+/// command buffers held for room.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 1;
+
 /// The counters of the device the process made last ([`open`]), which [`fold_metrics`] reads,
-/// with what it folded so far of each of their metrics, in [`over_copy_counts`]'s order.
-type Folding = Option<(rt::Counters, [u64; OVER_COPY_METRICS])>;
+/// with what it folded so far of each of their metrics, in [`folded_counts`]'s order.
+type Folding = Option<(rt::Counters, [u64; FOLDED_METRICS])>;
 
 /// The process's [`Folding`], once a device is made.
 static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::new(None);
 
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
-/// device rose by since the last fold, so the counts line carries their totals (the module's
-/// docs). Nothing before the device is made.
+/// device and its command buffers held for room rose by since the last fold ([`folded_counts`]),
+/// so the counts line carries their totals (the module's docs). Nothing before the device is
+/// made.
 pub fn fold_metrics() {
     if let Some((counters, folded)) = COUNTERS.lock().as_mut() {
-        fold(folded, over_copy_counts(&counters.metrics()));
+        fold(folded, folded_counts(&counters.metrics()));
     }
 }
 
@@ -130,9 +144,16 @@ pub fn fold_metrics() {
 fn follow(counters: rt::Counters) {
     let mut latest = COUNTERS.lock();
     if let Some((before, folded)) = latest.as_mut() {
-        fold(folded, over_copy_counts(&before.metrics()));
+        fold(folded, folded_counts(&before.metrics()));
     }
-    *latest = Some((counters, [0; OVER_COPY_METRICS]));
+    *latest = Some((counters, [0; FOLDED_METRICS]));
+}
+
+/// The metrics of `m` the counts line carries, each with its code: the over-copy metrics
+/// ([`over_copy_counts`]), then the command buffers held for room ([`HELD_FOR_ROOM_CODE`]).
+fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
+    let over = over_copy_counts(m);
+    std::array::from_fn(|i| over.get(i).copied().unwrap_or((HELD_FOR_ROOM_CODE, m.held_for_room)))
 }
 
 /// The over-copy metrics of `m`, each with its code (the module's docs): the over-copies and
@@ -179,9 +200,9 @@ pub(super) fn gauges() -> Option<rt::Gauges> {
     (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.gauges())
 }
 
-/// Counts the rise of each over-copy metric of `now` ([`over_copy_counts`]) over `folded` under
-/// its code, and keeps `now` as folded.
-fn fold(folded: &mut [u64; OVER_COPY_METRICS], now: [(&'static str, u64); OVER_COPY_METRICS]) {
+/// Counts the rise of each metric of `now` ([`folded_counts`]) over `folded` under its code, and
+/// keeps `now` as folded.
+fn fold(folded: &mut [u64; FOLDED_METRICS], now: [(&'static str, u64); FOLDED_METRICS]) {
     for ((code, now), was) in now.into_iter().zip(folded.iter_mut()) {
         crate::answer::count_kind_by(code, now.saturating_sub(*was));
         *was = now;
@@ -1545,7 +1566,8 @@ mod tests {
 
     /// Each fold counts what each over-copy metric rose by since the last, under its code, so the
     /// counts line carries the metrics' totals: the over-copies and their bytes, those over an
-    /// imported block, and each cause's, by the cause's name.
+    /// imported block, and each cause's, by the cause's name; and the command buffers held for
+    /// room after them.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -1559,6 +1581,7 @@ mod tests {
             "rt-over-copy-bytes-pitch",
             "rt-over-copies-image-memory",
             "rt-over-copy-bytes-image-memory",
+            HELD_FOR_ROOM_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -1574,17 +1597,19 @@ mod tests {
         m.over_copy_bytes_host_memory = 4096;
         m.over_copies_pitch = 1;
         m.over_copy_bytes_pitch = 4096;
-        let mut folded = [0; OVER_COPY_METRICS];
-        fold(&mut folded, over_copy_counts(&m));
+        m.held_for_room = 2;
+        let mut folded = [0; FOLDED_METRICS];
+        fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
         m.over_copy_bytes = 12288;
         m.over_copies_image_memory = 1;
         m.over_copy_bytes_image_memory = 4096;
-        fold(&mut folded, over_copy_counts(&m));
-        assert_eq!(folded, over_copy_counts(&m).map(|(_, n)| n));
+        m.held_for_room = 5;
+        fold(&mut folded, folded_counts(&m));
+        assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
-        assert_eq!(rose, [3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096]);
+        assert_eq!(rose, [3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5]);
         let named = over_copy_counts(&m).map(|(code, _)| code);
         let unique: std::collections::BTreeSet<&str> = named.iter().copied().collect();
         assert_eq!(unique.len(), OVER_COPY_METRICS, "{named:?}");
