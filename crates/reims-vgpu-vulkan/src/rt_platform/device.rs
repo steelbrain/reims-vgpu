@@ -536,8 +536,8 @@ pub(crate) fn shared_options(
     let mut options = rt::DeviceOptions::default();
     let (_, raw) = instance.raw();
     // SAFETY: the instance listed the device and is alive.
-    let names = unsafe { raw.enumerate_device_extension_properties(physical.raw()) }
-        .unwrap_or_default();
+    let names =
+        unsafe { raw.enumerate_device_extension_properties(physical.raw()) }.unwrap_or_default();
     let lists =
         |name: &std::ffi::CStr| (names.iter()).any(|p| p.extension_name_as_c_str() == Ok(name));
     let fences = crate::os::rt_present_fences(instance.extensions(), lists);

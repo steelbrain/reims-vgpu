@@ -642,7 +642,8 @@ mod tests {
         assert_eq!(uuid_of(Some(OsStr::new(&named.to_uppercase()))), Ok(uuid));
         let short = &named[..30];
         let signed = format!("+{}", &named[1..]);
-        for bad in ["", short, signed.as_str(), "zz9f8e7d6c5b4a39281706f5e4d3c2b1"] {
+        let not_hex = format!("zz{}", &named[2..]);
+        for bad in ["", short, signed.as_str(), not_hex.as_str()] {
             let refused = uuid_of(Some(OsStr::new(bad))).unwrap_err();
             assert!(refused.contains("names no deviceUUID"), "{bad}: {refused}");
         }
