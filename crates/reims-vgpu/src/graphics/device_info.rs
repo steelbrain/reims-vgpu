@@ -41,6 +41,18 @@ pub(crate) fn makes_mesh_pipelines(identity: &IdentityCaps) -> bool {
     identity.families[at(MTL_GPU_FAMILY_METAL3)] == Some(true)
 }
 
+/// Whether the device makes the guest's rasterization rate maps on its platform
+/// (`RGFX_FEATURE_RATE_MAPS`): where the platform answers a largest layer count of one or more,
+/// which the device info gives the guest, yes. rt makes none and answers 0, so the device offers
+/// no rate map, and the guest's `supportsRasterizationRateMapWithLayerCount:` answers no for every
+/// count and `newRasterizationRateMapWithDescriptor:` nil, with no message to the host.
+pub(crate) fn makes_rate_maps(identity: &IdentityCaps) -> bool {
+    identity
+        .sizes
+        .largest_rasterization_rate_map_layer_count
+        .is_some_and(|layers| layers >= 1)
+}
+
 /// 1 when the query answered a present `true`; 0 for a present `false` or a host
 /// gap (an `Err`). A gap is never reported as support.
 fn bit(answer: &RaiseResult<bool>) -> u8 {
@@ -245,7 +257,8 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// makes mesh pipelines: [`makes_mesh_pipelines`]). Mesh draws in an indirect command buffer are
 /// not: no mesh pipeline the bundle makes supports them, as on the x86 Macs. And rasterization
 /// rate maps (`RATE_MAP_CREATE`, `RATE_MAP_RESET` and `RATE_MAP_QUERY`, and a pass's map after its
-/// other records, `RGFX_PASS_FLAG_RATE_MAP`), whose layer counts are the platform's. Function
+/// other records, `RGFX_PASS_FLAG_RATE_MAP`), whose layer counts are the platform's, and which the
+/// device offers only where the platform makes a layer ([`makes_rate_maps`]). Function
 /// pointers (`FUNCTION_HANDLE_CREATE`, `FUNCTION_TABLE_CREATE` and `FUNCTION_TABLE_SET`, and a
 /// compute pass's table bindings) are carried in compute pipelines alone, so their piece stays out
 /// of this list until a render pipeline's are carried too, and so are dynamic libraries
@@ -784,6 +797,25 @@ mod tests {
             assert_eq!(family(&info, no), Some(0), "family {no}");
         }
         assert_eq!(family(&info, 7), None);
+    }
+
+    /// The device makes rate maps where the platform answers a layer count of one or more (the
+    /// fake, 2, as an M3 Max), and not where it answers 0, as rt does, or has no answer
+    #[test]
+    fn rate_maps_follow_the_platform_s_layer_count() {
+        let p = Arc::new(FakePlatform::new());
+        let mut identity = p.device().identity_caps();
+        assert_eq!(
+            identity.sizes.largest_rasterization_rate_map_layer_count,
+            Some(2)
+        );
+        assert!(makes_rate_maps(&identity));
+        identity.sizes.largest_rasterization_rate_map_layer_count = Some(1);
+        assert!(makes_rate_maps(&identity));
+        identity.sizes.largest_rasterization_rate_map_layer_count = Some(0);
+        assert!(!makes_rate_maps(&identity));
+        identity.sizes.largest_rasterization_rate_map_layer_count = None;
+        assert!(!makes_rate_maps(&identity));
     }
 
     /// The device makes mesh pipelines where the platform answers Metal3 (the fake, as an M3

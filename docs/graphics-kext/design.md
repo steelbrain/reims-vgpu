@@ -2217,9 +2217,10 @@ only where no negotiation can carry it.
   (`RGFX_PASS_FLAG_RATE_MAP`, `RgfxRenderPassRateMap`). The platform compiles
   each map, so its answers and its parameter data are the platform's, and the
   layer counts it makes maps of are the device info's
-  (`largest_rasterization_rate_map_layer_count`). Every host offers it, and
-  the kext takes it; a bundle on a host that did not offer it makes no map and
-  supports no layer count.
+  (`largest_rasterization_rate_map_layer_count`). A host offers it where that
+  count is one or more (`device_info::makes_rate_maps`), and the kext takes it;
+  a bundle on a host that did not offer it makes no map and supports no layer
+  count. rt makes no rate map and answers 0, so a host on rt does not offer it.
 - Bit 39, `FEATURES_HI`'s bit 7, is `FUNCTION_POINTERS`: a compute pipeline
   state's function handles and visible function tables. Ring 0 carries
   `FUNCTION_HANDLE_CREATE` (0x236, `RgfxFunctionHandleCreate`: the handle's

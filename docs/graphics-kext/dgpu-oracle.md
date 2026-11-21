@@ -1786,11 +1786,12 @@ the coordinate maps past the layers reading the last layer, and supporting 1 or 
 *(class 1)*.
 
 What our stack does: the host's map, the platform's compile (`RATE_MAP_CREATE`, design.md); the
-layer counts the platform supports, 1 and 2 (the M3's answer, as before, for 0); a map of no
-layers made, as the M3 makes it. The bundle ends the process where every Mac does, at a copy
-into a Private buffer, and where the M3's map does and the AMD's answers nothing the host can
-give: a coordinate map of a map of no layers or of an empty screen, and the physical-to-screen
-map of a `Mutable` map not yet reset.
+layer counts the platform supports, 1 and 2 (the M3's answer, as before, for 0), and on rt,
+which makes no rate map, none: the device then answers no for every count and offers no
+`RATE_MAPS`; a map of no layers made, as the M3 makes it. The bundle ends the process where
+every Mac does, at a copy into a Private buffer, and where the M3's map does and the AMD's
+answers nothing the host can give: a coordinate map of a map of no layers or of an empty
+screen, and the physical-to-screen map of a `Mutable` map not yet reset.
 
 ## Q29: function pointers
 

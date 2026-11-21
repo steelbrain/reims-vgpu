@@ -557,6 +557,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // answers `hasUnifiedMemory` alike, from the blob.
             let unified_memory = identity.flags.has_unified_memory.unwrap_or(false);
             let meshes = device_info::makes_mesh_pipelines(&identity);
+            let makes_rate_maps = device_info::makes_rate_maps(&identity);
             // The guest's RAM, as much of it as the host maps: the working set a GPU that shares
             // the CPU's memory answers follows it (`device_info`'s `lane_working_set`).
             let guest_ram = (config.memory_map.as_ref())
@@ -618,10 +619,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // host whose device takes the private render state Apple's OpenGL renderer sets makes
             // the guest's render pipelines with it (`PRIVATE_RENDER_STATE`). Every host carries a
             // texture's `didModifyData` to its platform (`TEXTURE_DID_MODIFY_DATA`), shows black
-            // while the guest's display sleeps (`DISPLAY_POWER`), and makes the guest's
-            // rasterization rate maps on its platform (`RATE_MAPS`), of the layer counts the device
-            // info answers, and its compute pipeline states' function handles and visible function
-            // tables (`FUNCTION_POINTERS`). A host that routes queues' doorbells takes the doorbell
+            // while the guest's display sleeps (`DISPLAY_POWER`), and makes its compute pipeline
+            // states' function handles and visible function tables (`FUNCTION_POINTERS`). A host
+            // whose platform makes rasterization rate maps makes the guest's on it (`RATE_MAPS`),
+            // of the layer counts the device info answers ([`device_info::makes_rate_maps`]): rt
+            // makes none. A host that routes queues' doorbells takes the doorbell
             // of a buffer that asks for its `CB_SUBMITTED` apart from the rest (`DOORBELL_ASKS`;
             // [`offers_doorbell_asks`]), so it may take the rest where it runs nothing of the
             // device's. Every host takes the guest's stamps of its command buffers
@@ -673,7 +675,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | RGFX_FEATURE_DISPLAY_SCALE
                 | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
                 | RGFX_FEATURE_DISPLAY_POWER
-                | RGFX_FEATURE_RATE_MAPS
+                | if makes_rate_maps {
+                    RGFX_FEATURE_RATE_MAPS
+                } else {
+                    0
+                }
                 | RGFX_FEATURE_FUNCTION_POINTERS
                 | RGFX_FEATURE_DYNAMIC_LIBRARIES
                 | RGFX_FEATURE_PIPELINE_KEYS

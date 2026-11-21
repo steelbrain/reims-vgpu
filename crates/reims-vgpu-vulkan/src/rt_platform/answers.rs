@@ -24,6 +24,11 @@
 //!   float filtering and MSAA), and no for what rt has none of (dynamic libraries, function
 //!   pointers, ray tracing);
 //! - no sparse tile answers: rt has no sparse textures;
+//! - no rasterization rate map layer count (`max_rasterization_rate_layer_count` 0, and so the
+//!   identity's `largest_rasterization_rate_map_layer_count`): rt makes no rate map (its
+//!   `newRasterizationRateMapWithDescriptor:` refuses, `Unbuilt::RateMap`), so the guest's
+//!   `supportsRasterizationRateMapWithLayerCount:` answers no for every count, as a device that
+//!   supports none does, and never yes to a map that then comes back nil;
 //! - `maxBufferLength` is rt's [`MAX_BUFFER_LENGTH`](metal2vulkan_runtime::MAX_BUFFER_LENGTH), and
 //!   `maxArgumentBufferSamplerCount` the indices of rt's sampler class;
 //! - the linear texture alignments (the device's, an IOSurface's, a linear texture's) are the
@@ -216,6 +221,8 @@ fn bgra8_refused() -> Raise {
 ///   `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8 rt's
 ///   ([`Facts::linear_alignment_bgra8`]), raised where rt refuses it. So a guest that lays a
 ///   linear texture out by the device's alignment lays it as the device rounds rows.
+/// - rt's: no rasterization rate map layer (`max_rasterization_rate_layer_count` 0), as rt makes
+///   no rate map (the module docs).
 /// - rt's: the heap buffer query of a page of Private storage
 ///   ([`Facts::heap_buffer_page_private`]), Metal's answer on every device: the length unrounded,
 ///   at a multiple of 256 bytes.
@@ -245,6 +252,7 @@ pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
         iosurface_read_only_texture_alignment_bytes: facts.linear_alignment_largest,
         iosurface_texture_alignment_bytes: facts.linear_alignment_largest,
         linear_texture_alignment_bytes: facts.linear_alignment_largest,
+        max_rasterization_rate_layer_count: 0,
         ..metal::LIMITS
     };
     let flags = Flags {
@@ -408,12 +416,19 @@ pub(crate) mod tests {
         }
     }
 
-    /// On a device of Metal's limits or more, the counts are Metal's, the flags Metal's but the
-    /// Vulkan platform's own, and the heap buffer query answers rt's of the page.
+    /// On a device of Metal's limits or more, the counts are Metal's but the rate map layers, of
+    /// which rt makes none, the flags Metal's but the Vulkan platform's own, and the heap buffer
+    /// query answers rt's of the page.
     #[test]
     fn a_roomy_device_answers_metal_s_counts() {
         let caps = caps(&roomy());
-        assert_eq!(caps.limits, metal::LIMITS);
+        assert_eq!(
+            caps.limits,
+            Limits {
+                max_rasterization_rate_layer_count: 0,
+                ..metal::LIMITS
+            }
+        );
         assert_eq!(
             caps.max_threads_per_threadgroup,
             MtlSize::new(1024, 1024, 1024)
@@ -533,6 +548,8 @@ pub(crate) mod tests {
         assert_eq!(id.flags.has_unified_memory, Some(true));
         assert_eq!(id.sizes.max_buffer_length, Some(1 << 31));
         assert_eq!(id.sizes.max_argument_buffer_sampler_count, Some(3999));
+        let rate_map_layers = id.sizes.largest_rasterization_rate_map_layer_count;
+        assert_eq!(rate_map_layers, Some(0));
         assert_eq!(
             id.architecture_name.as_deref(),
             Some("vulkan_1002_15bf_abababababababababababababababab")
