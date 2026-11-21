@@ -287,10 +287,12 @@ impl Drop for Com {
     }
 }
 
-/// A Direct3D 12 device on the display's adapter, and its copy queue.
+/// A Direct3D 12 device on the display's adapter, and its copy queue. While it lives, the device
+/// makes one video decode queue, which every ask for one gets (`super::decode_queue`).
 pub(crate) struct Device {
     pub(super) device: Com,
     copies: Mutex<Option<Copies>>,
+    _decode_queue: super::decode_queue::Hold,
 }
 
 /// The objects of the device's copies, made at its first copy.
@@ -436,8 +438,10 @@ impl Device {
                 &mut device,
             )
         };
+        let device = Com::made("D3D12CreateDevice", result, device)?;
         Ok(Device {
-            device: Com::made("D3D12CreateDevice", result, device)?,
+            _decode_queue: super::decode_queue::Hold::new(&device)?,
+            device,
             copies: Mutex::new(None),
         })
     }

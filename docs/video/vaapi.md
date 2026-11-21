@@ -644,6 +644,25 @@ The thread starts with the first order and ends after `vaTerminate`.
 Where it cannot start, the log says so, and orders are made on their
 callers' threads with no bound.
 
+**On Windows a device makes one video decode queue**
+(`src/vaapi/va/decode_queue.rs`): vaon12 makes a Direct3D 12 video
+decode queue for each decoder, one a VA context, on the process's one
+device on the adapter, and Intel's Direct3D 12 video driver decodes wrong
+pictures on a device's later video decode queue while an earlier one
+lives ([bugs.md](bugs.md), U33). So while a display's device lives
+(`d3d12::Device`), the device's `CreateCommandQueue` answers every ask
+for a video decode queue with one queue, a reference added for each
+asker, and makes every other queue as before; the vendor does not decide.
+**Measured** on the UHD Graphics 630 (2026-11-20, potluck job
+m3-max-62121): with it two decoders at once decoded a lone decoder's
+pictures, 3 runs of 3, and the churn test's ten short decoders the long
+one's, 3 runs of 3, where with a queue each one of the two, and every
+short decoder, decoded wrong pictures. 4K H.264 sessions decoding at
+once, each picture waited for and not read back, kept their rate: with
+one queue 25.4 to 27.4 pictures a second alone, 53.2 to 56.1 in all two
+at once and 113.6 to 116.0 four at once, against 22.9 to 26.9, 49.7 to
+52.2 and 101.8 to 111.9 with a queue each, 2 runs of each, alternated.
+
 **On Windows a teardown waits for the display's other contexts**
 (`Display::release_teardown`): the destroy of a context, of a config or
 of a pool's surfaces, asked for while a context lives on the display (for

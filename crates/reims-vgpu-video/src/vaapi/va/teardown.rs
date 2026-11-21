@@ -16,6 +16,9 @@
 //! The full-pace test runs rounds of decoders that each decode the stream at once, each picture
 //! waited for and not read back, so that each decoder of a round but the last is let go while
 //! the others decode at full pace.
+//!
+//! Two decoders that decode at once compare their pictures with a lone decoder's: on Windows,
+//! with one video decode queue on the device between them (`super::decode_queue`).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -486,6 +489,49 @@ fn short_decoders_let_go_beside_a_long_one_decode_alike_and_hold_no_more() {
             "the short decoders' pictures not the long one's, by decoder and place: {wrong:?}"
         );
     });
+}
+
+/// Two decoders decoding at once on one display, and so on Windows on one Direct3D 12 device,
+/// decode the pictures a decoder alone decodes of the same access units. On Windows each decoder
+/// of vaon12's asks the device for a video decode queue, and Intel's Direct3D 12 video driver
+/// decodes wrong pictures on a device's later decode queue while an earlier one lives: this holds
+/// there while the device answers them with one queue (`super::decode_queue`).
+#[test]
+#[ignore = "needs a VA-API driver that decodes H.264 at 4K, on its GPU: run on a VA-API host"]
+fn two_decoders_at_once_on_one_display_decode_what_one_alone_does() {
+    let display = display();
+    let stream = Stream::new(&display);
+    let samples = &stream.samples[..SHORT_SAMPLES.min(stream.samples.len())];
+    let reference = pictures(&mut stream.decoder(&display), samples);
+    assert!(
+        reference.len() > 1,
+        "{} pictures of {} access units",
+        reference.len(),
+        samples.len()
+    );
+    releases_made(&display);
+    let both = std::sync::Barrier::new(2);
+    let decoded: Vec<Vec<u64>> = std::thread::scope(|s| {
+        let decoders: Vec<_> = (0..2)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut decoder = stream.decoder(&display);
+                    both.wait();
+                    pictures(&mut decoder, samples)
+                })
+            })
+            .collect();
+        decoders.into_iter().map(|d| d.join().unwrap()).collect()
+    });
+    for (n, got) in decoded.iter().enumerate() {
+        let differ: Vec<usize> = (0..reference.len().max(got.len()))
+            .filter(|&at| got.get(at) != reference.get(at))
+            .collect();
+        assert!(
+            differ.is_empty(),
+            "decoder {n}'s pictures not the lone decoder's at {differ:?}"
+        );
+    }
 }
 
 /// The pictures decoded in
