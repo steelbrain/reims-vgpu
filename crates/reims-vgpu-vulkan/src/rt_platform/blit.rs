@@ -178,6 +178,8 @@ pub(super) enum Stop {
     Unbuilt(Unbuilt),
     /// rt refused it.
     Rt(rt::Error),
+    /// Counted where it stopped: a dispatch its stage's fill skipped (`super::compute`).
+    Counted,
 }
 
 impl From<rt::Error> for Stop {
@@ -735,6 +737,7 @@ pub(super) fn report(sel: &'static str, stopped: Option<Stop>) {
         Some(Stop::Rt(error)) => {
             rt_refused_texture(sel, &error);
         }
+        Some(Stop::Counted) => {}
     }
 }
 

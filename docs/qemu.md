@@ -37,7 +37,8 @@ Beside the binary it copies the dist tree's `bin/reims-vgpu-compile`, the
 library's stage helper, which the library starts from beside the process's
 executable to compile a kernel's pipeline past rt's stage bound
 (`crates/reims-vgpu-vulkan/src/rt_platform/stage.rs`). A QEMU without it
-beside it refuses those pipelines.
+beside it refuses those pipelines' makes, and skips a dispatch of one, whose
+command buffer then fails with Metal's `Internal` error (1).
 
 `make qemu` runs `cargo xtask dist`, which writes the library into the dist
 tree, `<target>/dist-vulkan` (`target`, or `CARGO_TARGET_DIR`), on Vulkan:

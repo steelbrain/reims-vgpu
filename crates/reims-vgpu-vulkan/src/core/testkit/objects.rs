@@ -378,6 +378,10 @@ pub struct CommandBufferModel {
     /// The guest's names for its work (`CommandBuffer::names_work`), as its caller named them or
     /// the command buffer it was cut from held them; read by [`World::work_names`].
     pub work_names: Option<Arc<WorkNames>>,
+    /// The error a command of it failed it with, the first kept: a dispatch its stage's fill
+    /// skipped, as the rt platform fails its command buffer with `Internal` (1). A completion
+    /// with no error of its own ends with this one, its status an error ([`complete_obj`]).
+    pub failed: Option<NsErrorText>,
 }
 
 impl std::fmt::Debug for CommandBufferModel {
@@ -389,6 +393,7 @@ impl std::fmt::Debug for CommandBufferModel {
             .field("seen", &self.seen.len())
             .field("scheduled", &self.scheduled.len())
             .field("submission", &self.submission.len())
+            .field("failed", &self.failed)
             .finish_non_exhaustive()
     }
 }
@@ -420,6 +425,8 @@ pub enum Model {
     Heap(HeapModel),
     /// A command buffer.
     CommandBuffer(CommandBufferModel),
+    /// A compute encoder: the command buffer that made it.
+    ComputeEncoder(ObjId),
     /// An `MTLEvent` or `MTLSharedEvent`: its signalled value.
     Event {
         /// The signalled value.
@@ -1907,17 +1914,24 @@ pub(crate) fn completion_read(info: CompletedInfo) -> CompletedInfo {
     info
 }
 
-/// [`World::complete`]'s body.
+/// [`World::complete`]'s body. A buffer a command of it failed ([`CommandBufferModel::failed`])
+/// and completed with no error ends with that one, its status an error.
 pub fn complete_obj(
     cb: &Arc<FakeObj>,
     status: CommandBufferStatus,
     error: Option<NsErrorText>,
     on: CompleteOn,
 ) {
-    let (handlers, signals, read_dies, gpu_times_ns) = {
+    let (handlers, signals, read_dies, gpu_times_ns, status, error) = {
         let mut s = cb.state.lock();
         let Model::CommandBuffer(m) = &mut s.model else {
             return;
+        };
+        let (status, error) = match (&m.failed, error) {
+            (Some(failed), None) if status == CommandBufferStatus::COMPLETED => {
+                (CommandBufferStatus::ERROR, Some(failed.clone()))
+            }
+            (_, error) => (status, error),
         };
         m.status = status;
         m.error = error.clone();
@@ -1928,6 +1942,8 @@ pub fn complete_obj(
             std::mem::take(&mut m.signal_on_complete),
             m.read_dies.take(),
             m.gpu_times_ns,
+            status,
+            error,
         )
     };
     for (ev, v) in &signals {

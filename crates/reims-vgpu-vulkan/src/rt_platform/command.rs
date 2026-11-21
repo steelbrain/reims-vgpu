@@ -58,7 +58,9 @@
 //!   One its caller failed for a deferred buffer's memory rt refused
 //!   (`CommandBuffer::fail_out_of_memory`, `super::buffer`'s "Deferred memory") ends with
 //!   `OutOfMemory` (8) where rt gave it no error of its own: its status, once rt's is completed,
-//!   is an error, and its error, then, that one.
+//!   is an error, and its error, then, that one. One a dispatch of which its stage's fill skipped
+//!   (`super::compute`, [`Kept::fail_internal`]) ends so with `Internal` (1). The first of the
+//!   two set is the one it ends with.
 //! - **Encoders**: blit encoders ([`super::blit`]), compute encoders ([`super::compute`]), of
 //!   the serial dispatch type or the descriptor's (another value is Metal's refusal, nil), and
 //!   render encoders ([`super::render`]) of the pass the descriptor keeps
@@ -823,15 +825,27 @@ pub struct Kept(
     super::fault::Encoded,
 );
 
-/// Whether a command buffer's caller failed it for a deferred buffer's memory rt refused
-/// (`CommandBuffer::fail_out_of_memory`; the module's docs, "What a completed handler learns").
+/// The code of Metal's error a command buffer was failed with, 0 for none, the first set kept: by
+/// its caller for a deferred buffer's memory rt refused (`CommandBuffer::fail_out_of_memory`), or
+/// by a dispatch of it that its stage's fill skipped ([`Kept::fail_internal`]) (the module's docs,
+/// "What a completed handler learns").
 #[derive(Clone, Default)]
-struct Failed(Arc<AtomicBool>);
+struct Failed(Arc<AtomicI64>);
 
 impl Failed {
-    /// Whether the command buffer was failed so.
+    /// The code the command buffer was failed with; `None` where it was not.
+    fn code(&self) -> Option<i64> {
+        Some(self.0.load(Ordering::Acquire)).filter(|&code| code != 0)
+    }
+
+    /// Whether the command buffer was failed.
     fn holds(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.code().is_some()
+    }
+
+    /// Fails the command buffer with `code`, unless it was failed already.
+    fn fail(&self, code: i64) {
+        let _ = self.0.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
@@ -870,6 +884,13 @@ impl Kept {
             Use::Rendered | Use::BlittedInto => true,
         };
         self.4.add(texture.copied(), writes);
+    }
+
+    /// Fails the command buffer with `Internal` (1), unless it was failed already: a dispatch of
+    /// it that its stage's fill skipped (`super::compute`; the module's docs, "What a completed
+    /// handler learns").
+    pub fn fail_internal(&self) {
+        self.3.fail(ERROR_INTERNAL);
     }
 
     /// Keeps `object`, whose identity is `id`, unless an object of that identity is kept.
@@ -970,18 +991,24 @@ fn status_of(made: &rt::CommandBuffer, failed: &Failed) -> CommandBufferStatus {
     }
 }
 
-/// `made`'s error as Metal's: rt's, as `failure` answers it, else `OutOfMemory` once completed
-/// where `failed` holds (the module's docs, "What a completed handler learns").
+/// `made`'s error as Metal's: rt's, as `failure` answers it, else, once completed, the one
+/// `failed` holds (the module's docs, "What a completed handler learns").
 fn error_of(made: &rt::CommandBuffer, failure: &Failure, failed: &Failed) -> Option<NsErrorText> {
     if let Some(error) = failure.read(made.error()) {
         return Some(error);
     }
     let completed = matches!(made.status(), rt::CommandBufferStatus::Completed);
-    (completed && failed.holds()).then(|| NsErrorText {
+    let code = failed.code().filter(|_| completed)?;
+    let description = match code {
+        ERROR_OUT_OF_MEMORY => {
+            "a buffer the command buffer used was refused its memory at that use"
+        }
+        _ => "a dispatch of the command buffer was skipped: its stage's fill failed or breached",
+    };
+    Some(NsErrorText {
         domain: ERROR_DOMAIN.to_owned(),
-        code: ERROR_OUT_OF_MEMORY,
-        description: "a buffer the command buffer used was refused its memory at that use"
-            .to_owned(),
+        code,
+        description: description.to_owned(),
     })
 }
 
@@ -1405,7 +1432,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
     /// Ends the command buffer with `OutOfMemory` (the module's docs, "What a completed handler
     /// learns").
     fn fail_out_of_memory(&self) {
-        self.kept.3.0.store(true, Ordering::Release);
+        self.kept.3.fail(ERROR_OUT_OF_MEMORY);
     }
 
     /// rt's wait, then the wait for its completed handlers handed on ([`hand_on`]); none,
@@ -1954,6 +1981,30 @@ mod tests {
             let told = told.lock().take().expect("the completed handler ran");
             assert_eq!((told.0, answered(told.1)), (status, error));
         }
+    }
+
+    /// On the GPU the test holds: a command buffer a dispatch of which its stage's fill skipped
+    /// ends with Metal's `MTLCommandBufferErrorInternal` (1) once rt completes it, its status an
+    /// error; the first failure set is the one it ends with, though its caller fails it for a
+    /// deferred buffer's memory after
+    #[test]
+    fn a_command_buffer_a_skipped_dispatch_failed_ends_with_internal_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = queue.command_buffer(on).expect("never a raise");
+        let made = made.expect("a command buffer");
+        made.kept.fail_internal();
+        made.fail_out_of_memory();
+        assert_eq!(made.commit(on), Ok(()));
+        assert_eq!(made.wait_until_completed(on), Ok(()));
+        let failed = (
+            CommandBufferStatus::ERROR,
+            Some((ERROR_DOMAIN.to_owned(), ERROR_INTERNAL)),
+        );
+        let answered = |e: Option<NsErrorText>| e.map(|e| (e.domain, e.code));
+        assert_eq!((made.status(), answered(made.error())), failed);
     }
 
     /// Command buffers on the GPU the test holds: handlers in core's order whatever the order

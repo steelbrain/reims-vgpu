@@ -144,8 +144,9 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         &self,
         on: OnFault,
     ) -> RaiseResult<Option<<FakePlatform as Platform>::ComputeEncoder>> {
+        let made_by = self.obj().id();
         self.make(Policy::On(on), "computeCommandEncoder", vec![], |w| {
-            Some(w.new_obj::<kind::ComputeEncoder>(Model::None))
+            Some(w.new_obj::<kind::ComputeEncoder>(Model::ComputeEncoder(made_by)))
         })
     }
 
@@ -358,11 +359,12 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         &self,
         desc: &crate::core::platform::values::ComputePassDesc,
     ) -> RaiseResult<Option<<FakePlatform as Platform>::ComputeEncoder>> {
+        let made_by = self.obj().id();
         self.make(
             Policy::Caught,
             "computeCommandEncoderWithDescriptor:",
             vec![Arg::val(desc)],
-            |w| Some(w.new_obj::<kind::ComputeEncoder>(Model::None)),
+            |w| Some(w.new_obj::<kind::ComputeEncoder>(Model::ComputeEncoder(made_by))),
         )
     }
 }

@@ -4,20 +4,26 @@
 //! consults the script (`fake::script`); see `fake::impls` for the outcome channels.
 
 use super::super::calllog::Arg;
-use super::super::objects::{Fk, kind};
+use super::super::objects::{Fk, Model, kind};
 use super::super::platform::FakePlatform;
 use super::res_ids;
 use crate::core::platform::Platform;
 use crate::core::platform::compute::*;
-use crate::core::platform::stage::held;
+use crate::core::platform::stage::{FillEnd, held};
+use crate::core::platform::types::NsErrorText;
 use crate::core::raise::{OnFault, RaiseResult};
 use crate::core::testkit::script::{Policy, Step};
+
+/// The description of the error a dispatch its stage's fill skipped fails its buffer with.
+const SKIPPED: &str = "a dispatch of it was skipped: its stage's fill failed or breached";
 
 impl Fk<kind::ComputeEncoder> {
     /// A dispatch, logged: the script's outcome. One refused for a stage ([`Step::Stage`]) waits
     /// for the stage's fill and is made once more after the fill filled the store, as the rt
     /// platform's dispatch ([`held`]); otherwise it is answered as refused, encoding nothing
-    /// ([`FakeStages::refused`](crate::core::testkit::stages::FakeStages::refused)).
+    /// ([`FakeStages::refused`](crate::core::testkit::stages::FakeStages::refused)), and after a
+    /// fill that failed or breached its command buffer fails, as the rt platform's
+    /// ([`Self::fail_its_command_buffer`]).
     fn dispatch(&self, sel: &'static str, args: Vec<Arg>) -> RaiseResult<()> {
         let stage = match self.call(sel, args) {
             Step::Stage(stage) => stage,
@@ -30,10 +36,37 @@ impl Fk<kind::ComputeEncoder> {
             || refusal.take().map_or(Ok(()), Err),
             |&stage| Some(stage),
         );
-        if let Err(stage) = made {
-            stages.note_refused(sel, stage);
+        if let Err(refused) = made {
+            stages.note_refused(sel, refused.error);
+            if let Some(FillEnd::Failed | FillEnd::Breached) = refused.fill {
+                self.fail_its_command_buffer();
+            }
         }
         Ok(())
+    }
+
+    /// Fails the command buffer that made it with Metal's `MTLCommandBufferErrorInternal` (1),
+    /// unless a command failed it before: its completion with no error of its own ends with
+    /// that one ([`CommandBufferModel::failed`]).
+    ///
+    /// [`CommandBufferModel::failed`]: super::super::objects::CommandBufferModel::failed
+    fn fail_its_command_buffer(&self) {
+        let made_by = match &self.state().model {
+            Model::ComputeEncoder(made_by) => *made_by,
+            _ => return,
+        };
+        let Some(cb) = self.world().find(made_by) else {
+            return;
+        };
+        if let Model::CommandBuffer(m) = &mut cb.obj().state().model
+            && m.failed.is_none()
+        {
+            m.failed = Some(NsErrorText {
+                domain: "MTLCommandBufferErrorDomain".into(),
+                code: 1,
+                description: SKIPPED.into(),
+            });
+        }
     }
 }
 

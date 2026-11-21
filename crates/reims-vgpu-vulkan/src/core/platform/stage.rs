@@ -17,6 +17,9 @@
 //! - **Nothing waits but a hold.** [`StageFills::fill`] returns at once. A walk's dispatch waits
 //!   for its fill ([`Fill::wait`]); a make is made again at its fill's end ([`Fill::on_end`]); a
 //!   make ahead waits for nothing.
+//! - **A refusal says its fill's end.** A dispatch [`held`] did not make answers its refusal with
+//!   how its stage's fill ended ([`Refused`]), which its platform answers by: on the rt platform,
+//!   a dispatch whose fill failed or breached is skipped, and its command buffer fails.
 //! - **A held wait goes through its thread's holder.** The thread that runs a walk may install a
 //!   holder ([`Holding`]), and a dispatch's wait for its fill ([`held`]) runs inside it: a lane's
 //!   thread steps out of the lane's walks while it waits, so the lane's other buffers walk on.
@@ -379,16 +382,27 @@ impl<K> Drop for StageFills<K> {
     }
 }
 
+/// What [`held`] answers for a call it did not make: the refusal that stands, and how the fill
+/// of the stage the call's first refusal named ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused<E> {
+    /// The refusal that stands: the first, or the second where the fill filled the store.
+    pub error: E,
+    /// How the stage's fill ended; `None` where the first refusal named no stage.
+    pub fill: Option<FillEnd>,
+}
+
 /// A platform call that a stage's fill holds, a dispatch: `attempt`; where it refuses for a stage
 /// whose compile is not in the store (`stage_of` names the stage), the wait for that stage's fill
 /// ([`StageFills::fill`]), then, where the fill filled the store, `attempt` once more, whose
 /// answer stands. Otherwise the first refusal stands: after a breach, a failed or a cancelled
-/// fill, and at once for a stage whose fill ended before.
+/// fill, and at once for a stage whose fill ended before. A refusal says how the fill ended
+/// ([`Refused`]).
 pub fn held<K, T, E>(
     fills: &StageFills<K>,
     mut attempt: impl FnMut() -> Result<T, E>,
     stage_of: impl FnOnce(&E) -> Option<K>,
-) -> Result<T, E>
+) -> Result<T, Refused<E>>
 where
     K: Eq + Hash + Clone + Send + 'static,
 {
@@ -397,7 +411,10 @@ where
         Err(refused) => refused,
     };
     let Some(stage) = stage_of(&refused) else {
-        return Err(refused);
+        return Err(Refused {
+            error: refused,
+            fill: None,
+        });
     };
     let fill = fills.fill(stage, Site::Dispatch);
     if fill.end().is_none() {
@@ -406,9 +423,14 @@ where
         });
     }
     // Ended already, unless the holder did not run the wait.
-    match fill.wait() {
-        FillEnd::Filled => attempt(),
-        FillEnd::Breached | FillEnd::Failed | FillEnd::Cancelled => Err(refused),
+    let end = fill.wait();
+    let after_fill = |error| Refused {
+        error,
+        fill: Some(end),
+    };
+    match end {
+        FillEnd::Filled => attempt().map_err(after_fill),
+        FillEnd::Breached | FillEnd::Failed | FillEnd::Cancelled => Err(after_fill(refused)),
     }
 }
 
@@ -704,7 +726,8 @@ mod tests {
     }
 
     /// A call refused for a stage waits for the stage's fill, and is made once more after the
-    /// fill filled the store, whose answer stands: a second refusal is not waited for again.
+    /// fill filled the store, whose answer stands: a second refusal is not waited for again, and
+    /// says the fill filled.
     #[test]
     fn a_held_call_is_made_again_once_after_its_fill() {
         let fake = Fake::default();
@@ -719,13 +742,18 @@ mod tests {
         }
         assert!(!call.is_finished());
         fake.end(FillEnd::Filled);
-        assert_eq!(call.join().unwrap(), Err(Some(7)));
+        let refused = Refused {
+            error: Some(7),
+            fill: Some(FillEnd::Filled),
+        };
+        assert_eq!(call.join().unwrap(), Err(refused));
         assert!(answers.lock().is_empty());
         assert_eq!(fake.starts(), 1);
     }
 
     /// A call refused for a stage whose fill ended otherwise than filled answers its refusal,
-    /// made once; a refusal that names no stage starts no fill.
+    /// made once, with the fill's end; a refusal that names no stage starts no fill, and names
+    /// no end.
     #[test]
     fn a_held_call_answers_its_refusal_after_a_breach() {
         let fake = Fake::default();
@@ -733,7 +761,7 @@ mod tests {
         let _ = fills.fill(3, Site::Dispatch);
         fake.end(FillEnd::Breached);
         let mut made = 0;
-        let answer: Result<(), Option<u32>> = held(
+        let answer: Result<(), Refused<Option<u32>>> = held(
             &fills,
             || {
                 made += 1;
@@ -741,9 +769,17 @@ mod tests {
             },
             |&stage| stage,
         );
-        assert_eq!((answer, made), (Err(Some(3)), 1));
-        let answer: Result<(), Option<u32>> = held(&fills, || Err(None), |&stage| stage);
-        assert_eq!(answer, Err(None));
+        let breached = Refused {
+            error: Some(3),
+            fill: Some(FillEnd::Breached),
+        };
+        assert_eq!((answer, made), (Err(breached), 1));
+        let answer: Result<(), Refused<Option<u32>>> = held(&fills, || Err(None), |&stage| stage);
+        let unnamed = Refused {
+            error: None,
+            fill: None,
+        };
+        assert_eq!(answer, Err(unnamed));
         assert_eq!(
             held(&fills, || Ok::<_, Option<u32>>(5), |&stage| stage),
             Ok(5)

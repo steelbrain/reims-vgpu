@@ -37,8 +37,10 @@
 //!   encoder's resources, or of a heap list, is skipped, as Metal skips it.
 //! - **A stage's fill holds a dispatch.** Where rt refuses a dispatch for a stage whose compile is
 //!   not in its store, counted (`super::stage`, `UNFILLED_AT_DISPATCH`), the dispatch waits for
-//!   that stage's fill ([`held`]) and is made once more after the fill filled the store; after any
-//!   other end it is rt's refusal.
+//!   that stage's fill ([`held`]) and is made once more after the fill filled the store. After a
+//!   fill that failed or breached it is skipped, encoding nothing, counted under its end's code
+//!   (`super::stage::skipped`), and its command buffer fails with Metal's `Internal` (1)
+//!   ([`Kept::fail_internal`]); after a cancelled fill it is rt's refusal.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
 //! before the refused one are bound.
@@ -50,7 +52,7 @@ use metal2vulkan_runtime as rt;
 
 use crate::core::platform::blit::ResourceRef;
 use crate::core::platform::compute::{ComputeCmd, ComputeEncoder};
-use crate::core::platform::stage::{StageFills, held};
+use crate::core::platform::stage::{Refused, StageFills, held};
 use crate::core::platform::types::{MtlSize, NsRange};
 use crate::core::platform::{Handle, ObjId, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
@@ -61,7 +63,7 @@ use super::command::{Kept, OpenMark};
 use super::copied::Used;
 use super::diag::Use;
 use super::fault::{EncoderKind, EncoderNames, Naming};
-use super::stage::{StageKey, unfilled_at_dispatch};
+use super::stage::{StageKey, skipped, unfilled_at_dispatch};
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtObj, RtPlatform};
 
@@ -118,8 +120,22 @@ impl RtComputeEncoder {
         }
     }
 
+    /// A dispatch at `sel` that [`held`] did not make, `refused`: skipped where its stage's fill
+    /// failed or breached ([`skipped`]), its command buffer failing with `Internal` (1)
+    /// ([`Kept::fail_internal`]); otherwise rt's refusal.
+    fn unmade(&self, sel: &'static str, refused: Refused<rt::Error>) -> Stop {
+        if let Some(end) = refused.fill
+            && skipped(sel, end)
+        {
+            self.kept.fail_internal();
+            return Stop::Counted;
+        }
+        Stop::Rt(refused.error)
+    }
+
     /// Encodes `cmd` but `endEncoding`, which the caller ends.
     fn command(&self, open: &mut Open, cmd: ComputeCmd<'_, RtPlatform>) -> Result<(), Stop> {
+        let sel = cmd.selector();
         let Open {
             rt: encoder,
             pipeline,
@@ -137,7 +153,8 @@ impl RtComputeEncoder {
                 let groups = size(threadgroups_per_grid)?;
                 let threads = size(threads_per_threadgroup)?;
                 let dispatch = || e.dispatch_threadgroups(groups, threads);
-                held(&self.fills, dispatch, unfilled_at_dispatch)?;
+                held(&self.fills, dispatch, unfilled_at_dispatch)
+                    .map_err(|refused| self.unmade(sel, refused))?;
             }
             ComputeCmd::DispatchThreadgroupsIndirect {
                 indirect_buffer,
@@ -150,7 +167,8 @@ impl RtComputeEncoder {
                 let offset = indirect_buffer_offset;
                 let dispatch =
                     || e.dispatch_threadgroups_with_indirect_buffer(buffer.rt(), offset, threads);
-                held(&self.fills, dispatch, unfilled_at_dispatch)?;
+                held(&self.fills, dispatch, unfilled_at_dispatch)
+                    .map_err(|refused| self.unmade(sel, refused))?;
             }
             ComputeCmd::DispatchThreads {
                 threads_per_grid,
@@ -160,7 +178,8 @@ impl RtComputeEncoder {
                 let grid = size(threads_per_grid)?;
                 let threads = size(threads_per_threadgroup)?;
                 let dispatch = || e.dispatch_threads(grid, threads);
-                held(&self.fills, dispatch, unfilled_at_dispatch)?;
+                held(&self.fills, dispatch, unfilled_at_dispatch)
+                    .map_err(|refused| self.unmade(sel, refused))?;
             }
             ComputeCmd::DispatchThreadsIndirect { .. }
             | ComputeCmd::SetStageInRegionIndirect { .. } => {

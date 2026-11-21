@@ -36,13 +36,17 @@
 //! counted by their site, each under a code of its own, apart from the refusals the calls end
 //! with: a state's make refused ([`UNFILLED_AT_MAKE`]), and a dispatch refused
 //! ([`UNFILLED_AT_DISPATCH`]) whether or not it is made after its fill. The make ahead's refusals
-//! are not counted: what the guest meets is its dispatch's.
+//! are not counted: what the guest meets is its dispatch's. A dispatch its stage's fill skips, one
+//! that failed or breached, is counted under its end's code ([`SKIPPED_FAILED`],
+//! [`SKIPPED_BREACHED`], [`skipped`]), and its command buffer fails with `Internal` (1)
+//! (`super::compute`).
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Write as _;
 use std::process::{ChildStdin, ChildStdout, ExitCode};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ash::vk;
 use metal2vulkan_runtime as rt;
@@ -70,6 +74,36 @@ pub(crate) const UNFILLED_AT_MAKE: &str = "stage-unfilled-make";
 /// The degradation code of a dispatch that rt refused so: it waits for its stage's fill, and is
 /// made after a fill that filled the store, else refused.
 pub(crate) const UNFILLED_AT_DISPATCH: &str = "stage-unfilled-dispatch";
+
+/// The degradation code of a dispatch skipped after its stage's fill failed (nothing recorded, the
+/// stage not filled): its command buffer fails with `Internal` (1) ([`skipped`]).
+pub(crate) const SKIPPED_FAILED: &str = "stage-skipped-failed";
+
+/// The degradation code of a dispatch skipped after its stage's fill breached (the breach
+/// recorded): its command buffer fails with `Internal` (1) ([`skipped`]).
+pub(crate) const SKIPPED_BREACHED: &str = "stage-skipped-breached";
+
+/// Whether a dispatch at `sel` whose stage's fill ended `end` is skipped: where the fill failed
+/// or breached, counted under [`SKIPPED_FAILED`] or [`SKIPPED_BREACHED`], the process's first of
+/// each code writing its line on stderr. A dispatch skipped so encodes nothing, and its command
+/// buffer fails with `Internal` (1) (`super::compute`).
+pub(crate) fn skipped(sel: &'static str, end: FillEnd) -> bool {
+    static SAID_FAILED: AtomicBool = AtomicBool::new(false);
+    static SAID_BREACHED: AtomicBool = AtomicBool::new(false);
+    let (code, said, how) = match end {
+        FillEnd::Failed => (SKIPPED_FAILED, &SAID_FAILED, "failed"),
+        FillEnd::Breached => (SKIPPED_BREACHED, &SAID_BREACHED, "breached"),
+        FillEnd::Filled | FillEnd::Cancelled => return false,
+    };
+    crate::answer::count_kind(code);
+    if !said.swap(true, Ordering::Relaxed) {
+        super::unbuilt::say(&format!(
+            "reims-vgpu: {sel}: skipped, its stage's fill {how}: its command buffer fails with \
+             Internal (1) ({code}), the first of its kind\n"
+        ));
+    }
+    true
+}
 
 /// The request whose fill rt's refusal `error` waits for, where it is such a refusal
 /// (`Error::StageUnfilled`).
@@ -374,6 +408,25 @@ mod tests {
         assert_eq!(unfilled_at_dispatch(&rt::Error::Quiesced), None);
         assert_eq!(count(UNFILLED_AT_DISPATCH), 1);
         assert_eq!(count(UNFILLED_AT_MAKE), 0);
+    }
+
+    /// A dispatch whose stage's fill failed or breached is skipped, counted under its end's code;
+    /// one after a fill that filled the store or was cancelled is not, and counts nothing.
+    #[test]
+    fn a_dispatch_is_skipped_after_a_failed_or_breached_fill_counted_by_its_end() {
+        let count = |code: &str| {
+            (crate::answer::counted_kinds().into_iter())
+                .find(|(kind, _)| *kind == code)
+                .map_or(0, |(_, n)| n)
+        };
+        let sel = "dispatchThreads:threadsPerThreadgroup:";
+        assert!(!skipped(sel, FillEnd::Filled));
+        assert!(!skipped(sel, FillEnd::Cancelled));
+        assert_eq!((count(SKIPPED_FAILED), count(SKIPPED_BREACHED)), (0, 0));
+        assert!(skipped(sel, FillEnd::Failed));
+        assert!(skipped(sel, FillEnd::Breached));
+        assert!(skipped(sel, FillEnd::Breached));
+        assert_eq!((count(SKIPPED_FAILED), count(SKIPPED_BREACHED)), (1, 2));
     }
 
     /// The variable that makes this test binary a stand-in helper, and names what it does.
