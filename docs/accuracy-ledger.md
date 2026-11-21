@@ -62,7 +62,7 @@ many times. The pieces, by code:
 | `rt-unbuilt-blit` | a texture fill with a colour, a buffer fill with a 4-byte pattern of more than one byte value, copies between textures with blit options, and copies between a buffer and a texture with blit options other than one plane of depth and stencil: nothing encoded |
 | `rt-unbuilt-render-pass` | imageblock and threadgroup memory lengths, tile sizes and sample positions of a render pass: the pass renders without them |
 | `rt-unbuilt-rate-map` | rasterization rate maps: a layer's creation answers nil. The device answers no layer count on rt and offers no `RATE_MAPS` (`rt_platform::answers`, `device_info::makes_rate_maps`), so a guest's map is nil in the guest and reaches no create |
-| `rt-unbuilt-icb` | indirect command buffers, and the reservation of their resource indices: nil |
+| `rt-unbuilt-icb` | what of indirect command buffers rt does not build (`rt_platform/icb.rs`): commands the CPU encodes (`indirectRenderCommandAtIndex:`, `indirectComputeCommandAtIndex:`), nil; a CPU `resetWithRange:`, which resets nothing; a blit's copy between buffers (`copyIndirectCommandBuffer:...`), nothing encoded; a descriptor of a resource index, nil; and the reservation of their resource indices (type 5), nothing reserved. The buffers themselves, their GPU-encoded commands, executions and blit resets are rt's |
 | `rt-unbuilt-dynamic-library` | dynamic libraries (`newDynamicLibrary:error:`): nil |
 | `rt-unbuilt-resource-type` | a reservation of resource indices of a type other than 0, 1 and 5: nothing reserved |
 | `rt-unbuilt-tessellation-factor-scale` | a tessellation factor scale other than 1: patch draws read the factors unscaled |
