@@ -644,11 +644,11 @@ The thread starts with the first order and ends after `vaTerminate`.
 Where it cannot start, the log says so, and orders are made on their
 callers' threads with no bound.
 
-**On Windows a context's teardown waits for the display's other
-contexts** (`Display::release_teardown`): the destroy of a context asked
-for while another context lives on the display is held, and made once
-the last live context's end is asked for, in the order asked. A config's
-and a pool's surfaces' destroys are made at once. **Measured** on the UHD
+**On Windows a teardown waits for the display's other contexts**
+(`Display::release_teardown`): the destroy of a context, of a config or
+of a pool's surfaces, asked for while a context lives on the display (for
+a context's, another context), is held, and made once the last live
+context's end is asked for, in the order asked. **Measured** on the UHD
 Graphics 630 (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12 video
 driver, 2026-11-17), two threads each decoding a 4K H.264 stream of 240
 pictures on one display, their decoders let go round after round or kept
@@ -668,20 +668,39 @@ With the teardowns held until no context lived, and with the decoders
 kept until both threads ended, every run passed, as one thread making
 and letting go decoders one after another (2,880 pictures) did. QEMU's
 fault as a guest's 4K H.264 session ended beside its next was in the same
-call, in `D3D12Core.dll` called from `igd12dxva64.dll`. **Measured**
-there again (2026-11-20, potluck job m3-max-61642, each way run twice)
-with the context's destroy alone held: the pool's surfaces destroyed at
-once, or the surfaces and the config, passed as well.
+call, in `D3D12Core.dll` called from `igd12dxva64.dll`.
+
+**Measured** there again (2026-11-20) with the context's destroy alone
+held: the two-thread test passed twice with the pool's surfaces destroyed
+at once, and twice with the surfaces and the config (potluck job
+m3-max-61642), but rounds of 1, 2 and 4 decoders on one display, each
+decoding the whole stream at once with each picture waited for and not
+read back, failed in every run of 6 (jobs m3-max-61922, 61930 and
+61939): in the round of 2 or of 4, where the decoders of a round end
+apart and each but the last is let go while the others decode, a
+decoder's `vaEndPicture` failed ("operation failed"). With the surfaces'
+destroy held too, 2 runs of 2 passed (m3-max-61948), as 4 runs of 4 did
+with every destroy held (m3-max-61878 and 61926). The full-pace test of
+`src/vaapi/va/teardown.rs` runs that shape. A destroy held keeps its
+memory until it is made, which the next paragraph bounds; the log says
+once a process that one was held.
 
 **A decoder's context is kept for a decoder of its shape**
 (`Context::new_decoder`, `Display::context_let_go`): on Windows a
 decoder's context let go while another context lives is kept, with its
-config, and the next decoder of the same config, size, number of render
-targets and DPB (H.264's `num_ref_frames`, HEVC's
-`sps_max_dec_pic_buffering_minus1`) takes it back instead of making one.
-What the kept contexts hold is then bounded by the most decoders of one
-shape that lived at once, rather than growing with every session that
-ends beside a long one. **Measured** on the same GPU (2026-11-20, job
+config and the pool of surfaces its decoder decoded into, and the next
+decoder of the same profile, config attributes, surface format, size,
+number of surfaces and DPB (H.264's `num_ref_frames`, HEVC's
+`sps_max_dec_pic_buffering_minus1`) takes the three back instead of
+making its own. So beside a live context a decoder of a shape kept makes
+no config, pool or context, and one let go destroys none, and what the
+kept contexts hold is bounded by the most decoders of one shape that
+lived at once, rather than growing with every session that ends beside a
+long one. A pool kept lets go of its video-processing context first (the
+one that copies a target into a lost frame's stand-in), which as a live
+context would keep what is held from ever being made; a pool that has
+stalled ("Waiting for the GPU") is neither kept nor taken back.
+**Measured** on the same GPU (2026-11-20, job
 m3-max-61642, the churn test in `src/vaapi/va/teardown.rs`: 10 short 4K
 H.264 decoders of 8 access units each, one after another beside a long
 one): with each short decoder's context held and its surfaces and config
@@ -696,8 +715,8 @@ made at the first picture, and for H.264 destroyed and made again where a
 picture's `num_ref_frames` differs from the one it was made for
 (`picture_h264.c`); Direct3D 12's decoder makes its heap again where a
 picture's size or DPB outgrows it (`d3d12_video_dec.cpp`). A context is
-taken back only for the same values, so neither happens to it. The log
-says once a process that a context was kept. On Linux the two-thread
+taken back only for the same values, so neither happens to it. On Linux
+the two-thread
 test passed on the Radeon 780M (radeonsi, Mesa 26.2.6) with every
 teardown made at once, so there a teardown is a release as any other and
 no context is kept.
@@ -1432,10 +1451,11 @@ host session's on the fake platform (`video_host`'s tests).
 The module's ignored tests need a VA-API GPU and the installed headers:
 the binding's layouts against libva's headers, the import check's sweep,
 the bounded waits ("Waiting for the GPU", "Its tests"), two threads'
-decoders let go while the other decodes, and short decoders let go beside
-a long one, whose pictures they are to match and, on Windows, whose
-memory they are to leave flat ("On Windows a context's teardown waits for
-the display's other contexts"; on a driver with no H.264 encoder, such as
+decoders let go while the other decodes, decoders let go while others
+decode at full pace, and short decoders let go beside a long one, whose
+pictures they are to match and, on Windows, whose memory they are to
+leave flat ("On Windows a teardown waits for the display's other
+contexts"; on a driver with no H.264 encoder, such as
 vaon12 on the UHD Graphics 630, `RVG_VA_H264` names an Annex B stream to
 decode):
 

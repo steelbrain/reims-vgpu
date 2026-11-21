@@ -1,5 +1,5 @@
-//! On Windows, the count of a display's live contexts, the context teardowns held while one
-//! lives, and the decoders' contexts kept then for a decoder of their shape
+//! On Windows, the count of a display's live contexts, the teardowns held while one lives, and
+//! the decoders' contexts kept then for a decoder of their shape
 //! ([`super::display::Display::release_teardown`], [`super::display::Display::context_let_go`]):
 //! the accounting alone, apart from libva and its driver, so that its tests run on every host.
 
@@ -15,7 +15,7 @@ pub(super) struct Held<R, S> {
 /// What a display keeps while a context lives on it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Kept<R, S> {
-    /// A context's teardown, held: made once no context lives.
+    /// A teardown, held: made once no context lives.
     Release(R),
     /// A context let go, kept: taken back by a context of its shape ([`Held::take`]), else
     /// destroyed once no context lives.
@@ -45,14 +45,14 @@ impl<R, S> Held<R, S> {
         self.live += 1;
     }
 
-    /// The teardown `kind`'s `release`, asked for: a context's held while another context
-    /// lives on the display, else made now, behind what was kept before it once none does; a
-    /// config's and a pool's surfaces' made now.
+    /// The teardown `kind`'s `release`, asked for: held while a context lives on the display (a
+    /// context's, while another does), else made now, behind what was kept before it once none
+    /// does.
     pub(super) fn ask(&mut self, kind: Teardown, release: R) -> Asked<R, S> {
-        if kind != Teardown::Context {
-            return Asked::Now(vec![Kept::Release(release)]);
+        if kind == Teardown::Context {
+            return self.ended(Kept::Release(release));
         }
-        self.ended(Kept::Release(release))
+        self.held(Kept::Release(release))
     }
 
     /// A context let go that a context of its shape may take back: kept while another context
@@ -78,6 +78,11 @@ impl<R, S> Held<R, S> {
     fn ended(&mut self, it: Kept<R, S>) -> Asked<R, S> {
         // A context not counted (none is) leaves the count at 0, not below it.
         self.live = self.live.saturating_sub(1);
+        self.held(it)
+    }
+
+    /// `it`: kept while a context lives, else made now behind what was kept.
+    fn held(&mut self, it: Kept<R, S>) -> Asked<R, S> {
         if self.live > 0 {
             self.kept.push(it);
             return Asked::Kept;
@@ -130,18 +135,32 @@ mod tests {
     }
 
     #[test]
-    fn a_configs_and_a_pools_teardown_asked_for_while_a_context_lives_are_made_now() {
+    fn a_configs_and_a_pools_teardown_asked_for_while_a_context_lives_are_held() {
         let mut held = Counted::new();
         held.context_made();
         held.context_made();
         assert_eq!(held.ask(Teardown::Context, 1), Asked::Kept);
+        assert_eq!(held.ask(Teardown::Config, 2), Asked::Kept);
+        assert_eq!(held.ask(Teardown::Surfaces, 3), Asked::Kept);
         assert_eq!(
-            held.ask(Teardown::Config, 2),
-            Asked::Now(vec![Kept::Release(2)])
+            held.ask(Teardown::Context, 4),
+            Asked::Now(vec![
+                Kept::Release(1),
+                Kept::Release(2),
+                Kept::Release(3),
+                Kept::Release(4)
+            ])
         );
+    }
+
+    #[test]
+    fn a_teardown_held_while_one_context_lives_is_made_as_it_is_let_go() {
+        let mut held = Counted::new();
+        held.context_made();
+        assert_eq!(held.ask(Teardown::Config, 1), Asked::Kept);
         assert_eq!(
-            held.ask(Teardown::Surfaces, 3),
-            Asked::Now(vec![Kept::Release(3)])
+            held.let_go("4k"),
+            Asked::Now(vec![Kept::Release(1), Kept::Context("4k")])
         );
     }
 

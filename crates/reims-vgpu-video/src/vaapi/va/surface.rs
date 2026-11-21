@@ -96,7 +96,10 @@ impl SurfaceFormat {
     }
 }
 
-/// A pool of surfaces of one format and coded size.
+/// A pool of surfaces of one format and coded size. On Windows a decoder's context holds its
+/// pool too, and is kept with it once let go, for a decoder of its shape
+/// (`Context::new_decoder`).
+#[cfg_attr(windows, derive(Clone))]
 pub(crate) struct SurfacePool {
     inner: Arc<PoolInner>,
 }
@@ -270,6 +273,27 @@ impl SurfacePool {
             format: TargetFormat::of(self.inner.format),
             coded: (self.inner.width, self.inner.height),
         }
+    }
+
+    /// Whether the pool is stalled (module docs).
+    #[cfg(windows)]
+    pub(crate) fn is_stalled(&self) -> bool {
+        self.inner.stalled.get().is_some()
+    }
+
+    /// Readies the pool to be kept with its decoder's context for a decoder of its shape
+    /// (`Context`'s drop): `false`, with nothing done, where it is stalled, which no decoder is
+    /// to decode into again; else `true`, its video-processing context let go first, which as a
+    /// context living on the display would keep what is kept there from ever being destroyed
+    /// (`Display::release_teardown`).
+    #[cfg(windows)]
+    pub(crate) fn ready_to_keep(&self) -> bool {
+        if self.is_stalled() {
+            return false;
+        }
+        let processing = self.inner.processing.lock().take();
+        drop(processing);
+        true
     }
 }
 

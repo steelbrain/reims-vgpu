@@ -12,6 +12,10 @@
 //! sessions come and go beside a long playback, compares their pictures with the long one's,
 //! and on Windows reads the process's memory after each, to check that what the short decoders
 //! leave held does not grow with their number (`super::display::Display::context_let_go`).
+//!
+//! The full-pace test runs rounds of decoders that each decode the stream at once, each picture
+//! waited for and not read back, so that each decoder of a round but the last is let go while
+//! the others decode at full pace.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -180,6 +184,54 @@ fn a_decoder_let_go_while_another_decodes_leaves_it_whole() {
     assert_eq!(read.load(Ordering::Relaxed), 2 * ROUNDS * pictures);
 }
 
+/// The rounds [`decoders_let_go_beside_others_at_full_pace_leave_them_whole`] runs, by how many
+/// decoders decode at once.
+const AT_ONCE: [usize; 4] = [2, 4, 2, 4];
+
+/// Decoders let go while others on the display decode at full pace leave them whole: in rounds
+/// of [`AT_ONCE`] decoders, each decodes the whole stream at once, each picture waited for and
+/// not read back, as the guest's path takes a picture on the GPU, so that the decoders of a
+/// round end apart and each but the last is let go while others decode. Every picture of every
+/// decoder decodes. **Measured** to fail on the UHD Graphics 630 (vaon12 of Mesa 26.2.7 over
+/// Intel's Direct3D 12 video driver, 2026-11-20) with a pool's surfaces destroyed at once beside
+/// a live context: a decoder's `vaEndPicture` failed in the round of 2 or of 4 in every run of 6
+/// (`super::display::Display::release_teardown`).
+#[test]
+#[ignore = "needs a VA-API driver that decodes H.264 at 4K, on its GPU: run on a VA-API host"]
+fn decoders_let_go_beside_others_at_full_pace_leave_them_whole() {
+    let display = display();
+    let stream = Stream::new(&display);
+    let pictures = stream.samples.len();
+    assert!(pictures > 1, "a stream of {pictures} pictures");
+    for at_once in AT_ONCE {
+        let synced = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..at_once {
+                s.spawn(|| {
+                    let mut decoder = stream.decoder(&display);
+                    let mut frames = Vec::new();
+                    for (id, sample) in (0u64..).zip(&stream.samples) {
+                        frames.extend(decoder.decode(sample, id).expect("a decode"));
+                        for frame in frames.drain(..) {
+                            frame.sync().expect("a picture's wait");
+                            synced.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    for frame in decoder.flush().expect("a flush") {
+                        frame.sync().expect("a picture's wait");
+                        synced.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            synced.load(Ordering::Relaxed),
+            at_once * pictures,
+            "the pictures of {at_once} decoders at once"
+        );
+    }
+}
+
 /// The process's memory, in bytes: its commit charge (`PrivateUsage`), and what DXGI counts it
 /// holding on the first adapter, in the local and the non-local segment groups.
 #[cfg(windows)]
@@ -298,8 +350,9 @@ const HELD_CONTEXT_LOCAL: u64 = 34_905_201;
 /// none of the last one's references: beside a decoder that lives throughout (so that, on
 /// Windows, a context let go is kept: `super::display::Display::context_let_go`), a decoder
 /// decodes the whole stream, its DPB left holding the stream's last pictures, and is let go; the
-/// next decoder, on Windows on the same context, decodes the stream's first access units into
-/// surfaces of its own, and its pictures are the first decoder's of them, frame 0 among them.
+/// next decoder, on Windows on the same context and into the same pool's surfaces, decodes the
+/// stream's first access units, and its pictures are the first decoder's of them, frame 0 among
+/// them.
 /// **Read from code** (Mesa 26.2.4, `d3d12_video_dec_h264.cpp`, `d3d12_video_dec_hevc.cpp` and
 /// `d3d12_video_dec_references_mgr.cpp`): before each picture the driver marks every DPB slot
 /// unused, marks those the picture's reference list names, and releases the rest, with their

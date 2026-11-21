@@ -3,7 +3,7 @@
 //! of NV12 surfaces for Main, P010 ones for Main 10.
 
 use super::buffer::{Buffer, render_decode};
-use super::caps::{Config, Context, Entrypoint, Profile};
+use super::caps::{Context, Entrypoint, Profile};
 use super::display::{Display, Error};
 use super::ffi;
 use super::frame::Frame;
@@ -268,23 +268,15 @@ impl Accelerator for VaHevc {
             type_: ffi::VAConfigAttribRTFormat,
             value: format.rt_format(),
         }];
-        let config = Config::new(&self.display, profile, Entrypoint::VLD, &mut attribs)?;
-        let pool = SurfacePool::new(
-            &self.display,
-            format,
-            width,
-            height,
-            dpb_size + 1 + SPARE_SURFACES,
-        )?;
-        let mut targets = pool.ids();
         // The DPB the driver sizes the decoder by: `sps_max_dec_pic_buffering_minus1`.
         let references = u32::from(sps.highest_ordering().max_dec_pic_buffering_minus1);
-        let context = Context::new_decoder(
+        let (context, pool) = Context::new_decoder(
             &self.display,
-            config,
-            width,
-            height,
-            &mut targets,
+            profile,
+            &mut attribs,
+            format,
+            (width, height),
+            dpb_size + 1 + SPARE_SURFACES,
             references,
         )?;
         self.session = Some(Session {

@@ -3,7 +3,7 @@
 //! and decodes into a pool of NV12 surfaces.
 
 use super::buffer::{Buffer, render_decode};
-use super::caps::{Config, Context, Entrypoint, Profile};
+use super::caps::{Context, Entrypoint, Profile};
 use super::display::{Display, Error};
 use super::ffi;
 use super::frame::Frame;
@@ -277,23 +277,15 @@ impl Accelerator for VaH264 {
             type_: ffi::VAConfigAttribRTFormat,
             value: ffi::VA_RT_FORMAT_YUV420,
         }];
-        let config = Config::new(&self.display, profile, Entrypoint::VLD, &mut attribs)?;
-        let pool = SurfacePool::new(
-            &self.display,
-            SurfaceFormat::Nv12,
-            width,
-            height,
-            dpb_frames + 1 + SPARE_SURFACES,
-        )?;
-        let mut targets = pool.ids();
         // The DPB the driver sizes the decoder by: the pictures' `num_ref_frames`.
         let references = u32::from(sps.max_num_ref_frames);
-        let context = Context::new_decoder(
+        let (context, pool) = Context::new_decoder(
             &self.display,
-            config,
-            width,
-            height,
-            &mut targets,
+            profile,
+            &mut attribs,
+            SurfaceFormat::Nv12,
+            (width, height),
+            dpb_frames + 1 + SPARE_SURFACES,
             references,
         )?;
         self.session = Some(Session {
