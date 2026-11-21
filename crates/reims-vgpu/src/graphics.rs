@@ -142,9 +142,8 @@ use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
     AheadSinks, Begun, CompiledPipeline, CompletionSink, DecodeError, Decoders, DrainAnswer,
     FinishedSink, GraphicsDecoder, Joined, LibraryJob, LibraryStart, MadeLibrary, PipelineJob,
-    PipelineKey, PipelineReply,
-    ReflectionSink, ScheduledSink, SignalSink, Sinks, SubmittedSink, SurfacePresent, Then,
-    compile_refusing, complete, make_library, refused_reply, refusing,
+    PipelineKey, PipelineReply, ReflectionSink, ScheduledSink, SignalSink, Sinks, SubmittedSink,
+    SurfacePresent, Then, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
@@ -3142,12 +3141,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// refusal, keeps a keyed create's answer for the next runs, stores the pipeline where no
     /// destroy, close or reset cancelled it meanwhile, lets the command buffers that wait for it
     /// go on, and posts its reply (its reflection, or a refusal) through `poster`.
-    fn settle(
-        &self,
-        compiled: CompiledPipeline<P>,
-        creating: Creating,
-        poster: &CompletionPoster,
-    ) {
+    fn settle(&self, compiled: CompiledPipeline<P>, creating: Creating, poster: &CompletionPoster) {
         let Creating {
             obj_id,
             seqno,
