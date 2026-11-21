@@ -58,10 +58,14 @@ pub const EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (exportable)";
 pub const EXPORTED_SURFACE_PLANE: &str = "newExportedSurface (a plane)";
 
 /// What the fake's exported surface lies in ([`EXPORTED_SURFACE_PLANE`]): memory that exports
-/// nothing, its planes in place, laid at the description's pitch and starts.
+/// nothing, its planes in place unless its world makes the copy form
+/// ([`World::copy_exported_surfaces`]), laid at the description's pitch and starts.
+///
+/// [`World::copy_exported_surfaces`]: crate::core::testkit::objects::World::copy_exported_surfaces
 #[cfg(unix)]
 struct FakeSurfaceMemory {
     handle: crate::core::platform::resource::SurfaceHandle,
+    in_place: bool,
     layout: Vec<crate::core::platform::resource::SurfacePlaneLayout>,
 }
 
@@ -69,8 +73,8 @@ struct FakeSurfaceMemory {
 impl FakeSurfaceMemory {
     /// The memory of `desc`'s planes: one pitch, the widest plane's row rounded up to its
     /// multiple, the first plane at 0 and each after it on its start multiple past the one
-    /// before and its rows of room.
-    fn of(desc: &crate::core::platform::resource::SurfaceDesc<'_>) -> Self {
+    /// before and its rows of room; in place as `in_place` says.
+    fn of(desc: &crate::core::platform::resource::SurfaceDesc<'_>, in_place: bool) -> Self {
         use crate::core::platform::resource::SurfacePlaneLayout;
         // `MTLPixelFormatR8Unorm`, `RG8Unorm`, `R16Unorm` and `RG16Unorm`'s texel bytes; 4 for
         // any other.
@@ -96,6 +100,7 @@ impl FakeSurfaceMemory {
             .collect();
         FakeSurfaceMemory {
             handle: desc.handle,
+            in_place,
             layout,
         }
     }
@@ -116,7 +121,7 @@ impl crate::core::platform::resource::SurfaceMemory for FakeSurfaceMemory {
     }
 
     fn in_place(&self) -> bool {
-        true
+        self.in_place
     }
 
     fn layout(&self) -> &[crate::core::platform::resource::SurfacePlaneLayout] {
@@ -377,7 +382,8 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     /// `None`, unlogged, as the platform's default, unless the world makes such surfaces
     /// ([`World::give_exported_surfaces`]): then each plane a Private texture of the plane's
     /// format, size and usage, logged and scripted under [`EXPORTED_SURFACE_PLANE`], in memory
-    /// that exports nothing ([`FakeSurfaceMemory`]); `None` where a plane's make answers none.
+    /// that exports nothing, in place unless the world makes the copy form
+    /// ([`FakeSurfaceMemory`]); `None` where a plane's make answers none.
     ///
     /// [`World::give_exported_surfaces`]: crate::core::testkit::objects::World::give_exported_surfaces
     #[cfg(unix)]
@@ -411,7 +417,8 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             };
             planes.push(made);
         }
-        let memory = Arc::new(FakeSurfaceMemory::of(desc));
+        let in_place = !self.world().copies_exported_surfaces();
+        let memory = Arc::new(FakeSurfaceMemory::of(desc, in_place));
         Ok(Some(crate::core::platform::resource::ExportedSurface {
             planes,
             memory,

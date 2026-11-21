@@ -1693,6 +1693,12 @@ mod tests {
     /// 10 is the cache.
     #[cfg(unix)]
     fn video_shaped() -> Rig {
+        video_shaped_made().0
+    }
+
+    /// [`video_shaped`], and the images its decoder makes ([`take_shapes`]).
+    #[cfg(unix)]
+    fn video_shaped_made() -> (Rig, Made) {
         use reims_vgpu_graphics::wire::{RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout};
         use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
         let mut layout = RgfxSurfacePagesLayout {
@@ -1709,7 +1715,7 @@ mod tests {
         }
         let mut r = rig(16);
         let page = r.page;
-        take_shapes(&r);
+        let made = take_shapes(&r);
         r.dec.set_unified_memory(true);
         r.dec.set_dma_buf_caches();
         let world = Arc::clone(r.p.world());
@@ -1726,7 +1732,7 @@ mod tests {
         );
         queues(&mut r);
         assert_eq!(r.buffer(10, BLOCK, 4 * page), Ok(()));
-        r
+        (r, made)
     }
 
     /// Texture `obj_id` over buffer 10 that shows plane `plane` of [`nv12_planes`] whole, as a
@@ -1805,6 +1811,12 @@ mod tests {
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (2, 2));
         assert_eq!(counts.planes_owed_busy, 0);
+        assert_eq!(
+            (counts.surfaces, counts.surfaces_declined),
+            (1, 0),
+            "a surface in place is kept"
+        );
+        assert!(r.dec.surface_caches.surface_targets(BLOCK).is_some());
 
         let mark = r.p.call_log().mark();
         assert_eq!(
@@ -1842,6 +1854,65 @@ mod tests {
             (2, 2),
             "none at a later use"
         );
+    }
+
+    /// A video cache's surface the platform made in its copy form (`surface_cache::exported`),
+    /// each plane its copy that it moves the bytes into and back, is declined as the first
+    /// texture over a plane is made: let go of, counted, and that texture's shape made as any
+    /// other cache's, of the platform's own image. The cache asks for no surface again, and a
+    /// decode into its planes is given none, so the host's video writes the cache's buffer
+    #[cfg(unix)]
+    #[test]
+    fn a_video_caches_surface_in_the_copy_form_is_declined() {
+        use reims_vgpu_vulkan::core::testkit::impls::device::EXPORTED_SURFACE_PLANE;
+        let (mut r, made) = video_shaped_made();
+        let world = Arc::clone(r.p.world());
+        world.copy_exported_surfaces(true);
+        let surface_planes = |calls: &[Call]| {
+            (calls.iter())
+                .filter(|c| c.sel == EXPORTED_SURFACE_PLANE)
+                .count()
+        };
+        let live = || {
+            let live = world.live("MTLTexture").into_iter();
+            live.map(|t| t.0).collect::<Vec<u64>>()
+        };
+        let before = live();
+        let mark = r.p.call_log().mark();
+        let luma = plane_texture(&mut r, 21, 0);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(surface_planes(&calls), 2, "the surface was made");
+        assert_eq!(made.lock().len(), 1, "luma's own image");
+        let new: Vec<u64> = (live().into_iter())
+            .filter(|t| !before.contains(t))
+            .collect();
+        assert_eq!(
+            new.len(),
+            2,
+            "the shape's image and the texture's view, the planes let go of: {new:?}"
+        );
+        assert!(new.contains(&luma), "{new:?}");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (counts.surfaces, counts.surfaces_declined, counts.surfaces_refused),
+            (0, 1, 0)
+        );
+        assert_eq!((counts.planes_made, counts.planes_filled_at_make), (0, 0));
+        assert!(
+            r.dec.surface_caches.surface_targets(BLOCK).is_none(),
+            "a decode lands in the cache's buffer"
+        );
+
+        let mark = r.p.call_log().mark();
+        let chroma = plane_texture(&mut r, 22, 1);
+        assert_eq!(
+            surface_planes(&r.p.call_log().since(mark)),
+            0,
+            "asked once a cache"
+        );
+        assert_ne!(chroma, luma);
+        assert_eq!(made.lock().len(), 2, "chroma's own image");
+        assert_eq!(r.dec.caches().counts().shapes.surfaces_declined, 1);
     }
 
     /// A picture smaller than its planes leaves the rest of them holding the cache's zeros, as a

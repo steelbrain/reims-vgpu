@@ -995,6 +995,9 @@ pub struct World {
     /// Whether the devices' `GpuDevice::new_exported_surface` makes a surface
     /// ([`World::give_exported_surfaces`]).
     exported_surfaces: AtomicBool,
+    /// Whether the surfaces the devices make answer their planes not in place
+    /// ([`World::copy_exported_surfaces`]).
+    exported_surfaces_copied: AtomicBool,
     /// What the devices' [`GpuDevice::recoveries`] answers ([`World::recover`]).
     ///
     /// [`GpuDevice::recoveries`]: crate::core::platform::device::GpuDevice::recoveries
@@ -1127,6 +1130,7 @@ impl World {
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
             exported_surfaces: AtomicBool::new(false),
+            exported_surfaces_copied: AtomicBool::new(false),
             recoveries: AtomicU64::new(0),
             linear_rows: AtomicU64::new(0),
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
@@ -1354,6 +1358,20 @@ impl World {
     /// Whether the devices make an exported surface ([`World::give_exported_surfaces`]).
     pub fn gives_exported_surfaces(&self) -> bool {
         self.exported_surfaces.load(Ordering::SeqCst)
+    }
+
+    /// Has the exported surfaces the devices make ([`World::give_exported_surfaces`]) answer
+    /// their planes not in place (`SurfaceMemory::in_place`), as a platform that makes a surface
+    /// in its copy form, each plane its copy that it moves the bytes into and back; in place at
+    /// first.
+    pub fn copy_exported_surfaces(&self, on: bool) {
+        self.exported_surfaces_copied.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether the devices' exported surfaces answer their planes not in place
+    /// ([`World::copy_exported_surfaces`]).
+    pub fn copies_exported_surfaces(&self) -> bool {
+        self.exported_surfaces_copied.load(Ordering::SeqCst)
     }
 
     /// Has the devices answer one recovery more ([`GpuDevice::recoveries`]), as a device whose
