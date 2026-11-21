@@ -654,7 +654,7 @@ fn guest_pages<P: ApiPlatform>(
     shape: Shape,
 ) -> (Arc<CoreMemoryMap<P>>, Lease, Ram) {
     let ram = guest_ram(shape.slabs() * SLAB * 2, true);
-    let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+    let lease = ram.lease(platform.guest_memory(&ram.map));
     let core = CoreMemoryMap::new(Arc::clone(platform), &ram.map.to_core()).expect("a memory map");
     decoder.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
     (core, lease, ram)

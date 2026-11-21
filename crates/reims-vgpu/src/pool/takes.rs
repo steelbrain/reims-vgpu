@@ -108,10 +108,10 @@ use parking_lot::MutexGuard;
 use reims_vgpu_vulkan::answer::count_kind_by;
 
 use super::{
-    Error, Live, Mapped, MemoryClass, MonoTime, Own, OwnTake, Piece, Placed, Shared, State,
-    TAKE_CLAIM_WAIT_MAX_NS_CODE, TAKE_CLAIM_WAIT_NS_CODE, TAKE_CLAIM_WAITS_CODE, TAKE_WAIT_CODES,
-    TAKE_WAITS_CODE, TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE, ZERO_HOLD_LONG,
-    ZERO_HOLD_MAX_NS_CODE, ZERO_HOLD_PART_MAX_NS_CODES, ZERO_HOLDS_LONG_CODE,
+    Error, Live, Mapped, MemoryClass, MonoTime, Own, OwnTake, Piece, PieceKeep, Placed, Shared,
+    State, TAKE_CLAIM_WAIT_MAX_NS_CODE, TAKE_CLAIM_WAIT_NS_CODE, TAKE_CLAIM_WAITS_CODE,
+    TAKE_WAIT_CODES, TAKE_WAITS_CODE, TAKE_ZERO_PREZEROED_BYTES_CODE, TAKE_ZEROED_BYTES_CODE,
+    ZERO_HOLD_LONG, ZERO_HOLD_MAX_NS_CODE, ZERO_HOLD_PART_MAX_NS_CODES, ZERO_HOLDS_LONG_CODE,
     ZERO_LONG_HOLD_PART_NS_CODES, ZERO_WRITE_MAX_NS_CODE, ZERO_WRITE_NS_CODE,
     ZEROED_AHEAD_BYTES_CODE,
 };
@@ -405,7 +405,7 @@ impl PoolLedger {
     /// reset that left the headroom's pieces empty, none. Whether it asked; waits for nothing.
     pub(crate) fn keep_headroom(&self) -> bool {
         let asked = self.shared.state.lock().keep_headroom();
-        self.shared.changed.notify_all();
+        self.shared.wake();
         log::info!(
             "pool: the guest's driver took the pool: {}",
             if asked {
@@ -463,14 +463,14 @@ impl PoolLedger {
         });
         if taker.working {
             drop(st);
-            self.shared.changed.notify_all();
+            self.shared.wake();
             return Ok(());
         }
         taker.working = true;
         st.workers = st.workers.saturating_add(1);
         drop(st);
         // The carve may have asked the pool's thread for a block, as headroom.
-        self.shared.changed.notify_all();
+        self.shared.wake();
         let hold = ThreadHold::of(&self.shared);
         let spawned = std::thread::Builder::new()
             .name("reims-vgpu.graphics-pool-take".into())
@@ -490,7 +490,7 @@ impl PoolLedger {
                 }
             }
             drop(st);
-            self.shared.changed.notify_all();
+            self.shared.wake();
             for job in jobs {
                 (job.answer)(None);
             }
@@ -550,7 +550,7 @@ impl PoolLedger {
         }
         let start = st.start_zeroer();
         drop(st);
-        self.shared.changed.notify_all();
+        self.shared.wake();
         if start {
             spawn_zeroer(&self.shared);
         }
@@ -576,7 +576,7 @@ impl PoolLedger {
             }
         }
         drop(st);
-        self.shared.changed.notify_all();
+        self.shared.wake();
         drop(ended);
         gone
     }
@@ -597,7 +597,7 @@ impl PoolLedger {
         }
         let start = st.start_zeroer();
         drop(st);
-        self.shared.changed.notify_all();
+        self.shared.wake();
         drop(ended);
         if start {
             spawn_zeroer(&self.shared);
@@ -605,15 +605,16 @@ impl PoolLedger {
     }
 
     /// What `f` makes of the host address of the `length` bytes from pool offset `offset`, where
-    /// they lie in one block context `context` holds, called with the pool's lock held, so the
-    /// block is not given back ([`Self::give`]) before what `f` makes over it is in the decoder's
-    /// tables. `None`, with `f` not called, where they do not.
+    /// they lie in one block context `context` holds, and of a keep of their piece's block, which
+    /// an import of the bytes holds until its release ([`super::PieceKeep`]), called with the
+    /// pool's lock held, so the block is not given back ([`Self::give`]) before what `f` makes
+    /// over it is in the decoder's tables. `None`, with `f` not called, where they do not.
     pub(crate) fn over_held<R>(
         &self,
         context: u32,
         offset: u64,
         length: u64,
-        f: impl FnOnce(NonNull<u8>) -> R,
+        f: impl FnOnce(NonNull<u8>, PieceKeep) -> R,
     ) -> Option<R> {
         let at = self.base().checked_add(offset)?;
         let end = at.checked_add(length)?;
@@ -623,7 +624,8 @@ impl PoolLedger {
             return None;
         }
         let host = st.host_of(at)?;
-        Some(f(host))
+        let keep = st.keep_of(at, &self.shared.bell)?;
+        Some(f(host, keep))
     }
 
     /// The pool's guest physical range: its first address and its length.
@@ -650,6 +652,16 @@ impl PoolLedger {
 }
 
 impl State {
+    /// A keep of the piece that holds the byte at guest physical address `at`
+    /// ([`super::PieceKeep`]).
+    pub(super) fn keep_of(&self, at: u64, bell: &Arc<super::Bell>) -> Option<PieceKeep> {
+        let (_, p) = self.pieces.range(..=at).next_back()?;
+        Some(PieceKeep {
+            kept: Some(Arc::clone(&p.kept)),
+            bell: Arc::clone(bell),
+        })
+    }
+
     /// The host address of the byte at guest physical address `at`, in the live piece that holds
     /// it.
     fn host_of(&self, at: u64) -> Option<NonNull<u8>> {
@@ -1007,7 +1019,7 @@ impl Shared {
             } else {
                 let now = (self.now)();
                 st.uncarve(at, serial, now);
-                self.changed.notify_all();
+                self.wake();
                 MutexGuard::unlocked(&mut st, || drop(job.answer));
             }
             // Its carve may have made a piece used, or another the headroom.
@@ -1029,7 +1041,7 @@ impl Shared {
         }
         st.workers = st.workers.saturating_sub(1);
         drop(st);
-        self.changed.notify_all();
+        self.wake();
     }
 
     /// A carve of `len` bytes for the take of `context` numbered `life`, which none fitted at its
@@ -1054,7 +1066,7 @@ impl Shared {
             }
             if let Some((at, serial)) = st.carve(context, len) {
                 // The carve may have asked the pool's thread for a block, as headroom.
-                self.changed.notify_all();
+                self.wake();
                 let waited = asked.map(|since| (self.now)().saturating_duration_since(since));
                 return Grown::At(at, serial, waited, None);
             }
@@ -1100,7 +1112,7 @@ impl Shared {
                 len,
             };
             st.own.push_back(Own { block, take });
-            self.changed.notify_all();
+            self.wake();
             let placed = loop {
                 // Its place first: a carve the pool's thread made for it is this take's to free.
                 if let Some(&Some(placed)) = st.waits.get(&wait) {
@@ -1138,7 +1150,7 @@ impl Shared {
                     // and a take that stands carves again.
                     let now = (self.now)();
                     st.uncarve(piece, serial, now);
-                    self.changed.notify_all();
+                    self.wake();
                     continue;
                 }
             };
@@ -1257,7 +1269,7 @@ impl Shared {
                 // The wake comes once the lock is let go of: a waiter it wakes finds the lock
                 // free, never the zeroer holding it, and the mark is in the state it reads.
                 if wake {
-                    self.changed.notify_all();
+                    self.wake();
                 }
                 count_kind_by(ZEROED_AHEAD_BYTES_CODE, len);
                 zero_written(written);
@@ -1268,7 +1280,7 @@ impl Shared {
         st.zeroer = false;
         st.workers = st.workers.saturating_sub(1);
         drop(st);
-        self.changed.notify_all();
+        self.wake();
     }
 
     /// Waits for every take worker to go: they go once the device's release closed the pool.
@@ -1323,7 +1335,7 @@ pub(super) fn spawn_zeroer(shared: &Arc<Shared>) {
         st.zeroer = false;
         st.workers = st.workers.saturating_sub(1);
         drop(st);
-        shared.changed.notify_all();
+        shared.wake();
     }
 }
 

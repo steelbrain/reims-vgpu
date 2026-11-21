@@ -164,6 +164,19 @@ pub(crate) struct ManagedCopy<P: Platform> {
     pub(super) gpu_as_of: AtomicU64,
 }
 
+/// What a no-copy `Managed` buffer over the guest's bytes holds until the platform runs its
+/// deallocator, so the bytes stay mapped until then ([`GraphicsDecoder::buffer_over_bytes`]).
+enum BytesHold<P: Platform> {
+    /// The `Shared` buffer whose contents the bytes are (`MANAGED_BUFFER_CREATE`), which holds
+    /// what keeps them mapped: its block of the region, its heap, or a pages block's view.
+    Buffer(P::Buffer),
+    /// What keeps the bytes of the heap they lie in mapped, where it lies over any but the
+    /// region's ([`Entry::ram_kept`], `BUFFER_MANAGED_AT_OFFSET`).
+    Kept {
+        _kept: Option<super::tables::BytesKeep>,
+    },
+}
+
 /// A two-copy `Managed` texture whose GPU copy a recovery lost, to fill again from its CPU copy
 /// ([`GraphicsDecoder::refill_managed`]).
 struct Refill<P: Platform> {
@@ -407,9 +420,14 @@ impl<P: Platform> GraphicsDecoder<P> {
             at,
             length: m.length,
         };
+        // The buffer holds what keeps the heap's bytes mapped, as the heap does: the heap may go
+        // first.
+        let keep = BytesHold::Kept {
+            _kept: self.ram_kept_of(m.heap_obj_id),
+        };
         let kind = super::unkept::Kind::managed(self.unified());
         let Some(buffer) = kind
-            .making(|| self.buffer_over_bytes(device, bytes, m.length, options, pin, None, None))?
+            .making(|| self.buffer_over_bytes(device, bytes, m.length, options, pin, keep, None))?
         else {
             return Ok(Err(DecodeError::Refused));
         };
@@ -478,8 +496,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cpu = cpu.clone_ref();
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
         let kind = super::unkept::Kind::managed(self.unified());
+        let keep = BytesHold::Buffer(cpu);
         let Some(buffer) = kind.making(|| {
-            self.buffer_over_bytes(device, bytes, m.length, options, pin, Some(cpu), zero_from)
+            self.buffer_over_bytes(device, bytes, m.length, options, pin, keep, zero_from)
         })?
         else {
             return Ok(Err(DecodeError::Refused));
@@ -518,9 +537,9 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// A no-copy buffer of `options` over the first `length` bytes of the guest's `bytes`, at the
     /// guest's `pin`: a `Managed` buffer over its CPU copy, whose bytes from `zero_from`, where
-    /// the guest said so, read zero. It keeps `keep`, where given, the `Shared` buffer whose
-    /// contents the bytes are, until the platform frees it, so a pages block's view they lie in
-    /// stays mapped.
+    /// the guest said so, read zero. It keeps `keep` ([`BytesHold`]) until the platform runs its
+    /// deallocator, once it let go of its import of the bytes, so the guest's RAM or a pages
+    /// block's view they lie in stays mapped until then.
     #[expect(
         clippy::too_many_arguments,
         reason = "the buffer's descriptor, its guest bytes and what it keeps"
@@ -532,7 +551,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         length: u64,
         options: u64,
         pin: Option<u64>,
-        keep: Option<P::Buffer>,
+        keep: BytesHold<P>,
         zero_from: Option<u64>,
     ) -> RaiseResult<Option<P::Buffer>> {
         let region = Arc::clone(&self.region);
@@ -541,9 +560,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             None => HostPtr::from_ptr(region.base().wrapping_add(bytes.at as usize)),
         };
         // SAFETY: the bytes lie in the guest's memory (the caller checked `length` against
-        // them): in the guest's RAM mapping, which stays mapped as long as the device, in a view
-        // `keep` keeps mapped, or in the region, which `region` keeps mapped; the deallocator
-        // holds both until the platform frees the buffer.
+        // them): in the guest's RAM or a pages block's view, which `keep` keeps mapped, or in the
+        // region, which `region` keeps mapped; the deallocator holds both until the platform runs
+        // it.
         let range = unsafe { HostRange::new(first, length) };
         device.new_buffer(BufferDesc {
             length,

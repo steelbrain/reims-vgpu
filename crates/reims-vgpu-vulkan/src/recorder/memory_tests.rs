@@ -163,6 +163,7 @@ where
             options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
             pinned_gpu_address: None,
         },
+        None,
     );
     let heap = made.unwrap().heap.unwrap();
     let id = id_at(heap.id().0).expect("the block is recorded");

@@ -753,6 +753,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                     options: opts,
                     gpu_address: (w.kept_pin(pinned)).unwrap_or_else(|| w.alloc_gpu_va(size)),
                     mem,
+                    deallocator: None,
                     common: common(w, None),
                 })))
             },
@@ -764,11 +765,13 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     }
 
     /// A heap of the value over `bytes`, logged with the bytes' pointer and length first; it
-    /// owns no memory of its own.
+    /// owns no memory of its own, and runs `deallocator` as it dies (or later, where the world
+    /// runs deallocators late).
     fn new_heap_over_host_memory(
         &self,
         bytes: HostRange<'_>,
         desc: &HeapDesc,
+        deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<HeapMade<FakePlatform>> {
         let opts = fold_options(&desc.options);
         let (size, pinned) = (desc.size, desc.pinned_gpu_address);
@@ -786,6 +789,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                     options: opts,
                     gpu_address: (w.kept_pin(pinned)).unwrap_or_else(|| w.alloc_gpu_va(size)),
                     mem: None,
+                    deallocator,
                     common: common(w, None),
                 })))
             },

@@ -311,7 +311,7 @@ pub struct TextureModel {
 }
 
 /// A heap's model.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct HeapModel {
     /// `size`.
     pub size: u64,
@@ -321,8 +321,23 @@ pub struct HeapModel {
     pub gpu_address: u64,
     /// Memory the fake owns for a CPU-visible heap.
     pub mem: Option<Arc<RawRegion>>,
+    /// A heap over host memory's deallocator, run when the heap dies.
+    pub deallocator: Option<NoCopyDeallocator>,
     /// Common resource state.
     pub common: ResourceCommon,
+}
+
+impl std::fmt::Debug for HeapModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeapModel")
+            .field("size", &self.size)
+            .field("options", &self.options)
+            .field("gpu_address", &self.gpu_address)
+            .field("mem", &self.mem)
+            .field("deallocator", &self.deallocator.is_some())
+            .field("common", &self.common)
+            .finish()
+    }
 }
 
 /// A command buffer's model.
@@ -586,15 +601,26 @@ impl Drop for FakeObj {
                 context: ReleaseContext::here(),
             });
         }
-        // A buffer's deallocator runs when Metal destroys the buffer.
+        // A buffer's deallocator runs when Metal destroys the buffer, and so does a heap's over
+        // host memory, unless the world runs them late.
         let model = std::mem::take(&mut self.state.get_mut().model);
-        if let Model::Buffer(mut b) = model {
-            if let Some(d) = b.deallocator.take() {
-                d();
+        match model {
+            Model::Buffer(mut b) => {
+                if let Some(d) = b.deallocator.take() {
+                    self.world.deallocate(d);
+                }
+                if let Some(d) = b.desc_deallocator.take() {
+                    let (contents, length) = (b.contents, b.length);
+                    self.world
+                        .deallocate(Box::new(move || (d.0)(contents, length)));
+                }
             }
-            if let Some(d) = b.desc_deallocator.take() {
-                (d.0)(b.contents, b.length);
+            Model::Heap(mut h) => {
+                if let Some(d) = h.deallocator.take() {
+                    self.world.deallocate(d);
+                }
             }
+            _ => {}
         }
     }
 }
@@ -866,6 +892,10 @@ pub struct World {
     release_dies: Mutex<Vec<ObjId>>,
     /// The objects whose next release holds its thread ([`World::hold_at_release`]).
     release_holds: Mutex<Vec<(ObjId, HeldCall)>>,
+    /// The deallocators of the objects that died while they run late
+    /// ([`World::run_deallocators_late`]), in the order the objects died; `None` while they run at
+    /// the death.
+    late_deallocators: Mutex<Option<Vec<NoCopyDeallocator>>>,
     /// Committed command buffers whose work the platform has not taken, in commit order, while
     /// submissions are held ([`World::hold_submissions`]); `None` while they are not.
     held_submissions: Mutex<Option<Vec<Arc<FakeObj>>>>,
@@ -1007,6 +1037,7 @@ impl World {
             on_new: Mutex::new(Vec::new()),
             release_dies: Mutex::new(Vec::new()),
             release_holds: Mutex::new(Vec::new()),
+            late_deallocators: Mutex::new(None),
             held_submissions: Mutex::new(None),
             release_at_commit: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
@@ -1342,6 +1373,43 @@ impl World {
     /// long to free the object's memory or an import of the guest's pages.
     pub fn hold_at_release(&self, id: ObjId, held: HeldCall) {
         self.release_holds.lock().push((id, held));
+    }
+
+    /// Runs the deallocator of each object that dies from now on (a no-copy buffer's, a heap's
+    /// over host memory) only at [`World::run_late_deallocators`], not at its death, as a
+    /// platform does whose import of the bytes outlives the object: the Vulkan platform runs it
+    /// from rt's release of its import, once rt freed it, which may be well after the last
+    /// release of the object.
+    pub fn run_deallocators_late(&self) {
+        let mut late = self.late_deallocators.lock();
+        if late.is_none() {
+            *late = Some(Vec::new());
+        }
+    }
+
+    /// Runs the deallocators held since [`World::run_deallocators_late`], in the order their
+    /// objects died, with no lock held; how many ran. Later deaths still hold theirs.
+    pub fn run_late_deallocators(&self) -> usize {
+        let held = self.late_deallocators.lock().as_mut().map(std::mem::take);
+        let held = held.unwrap_or_default();
+        let ran = held.len();
+        for deallocator in held {
+            deallocator();
+        }
+        ran
+    }
+
+    /// Runs `deallocator` at an object's death, or holds it where deallocators run late
+    /// ([`World::run_deallocators_late`]).
+    fn deallocate(&self, deallocator: NoCopyDeallocator) {
+        let mut late = self.late_deallocators.lock();
+        match late.as_mut() {
+            Some(held) => held.push(deallocator),
+            None => {
+                drop(late);
+                deallocator();
+            }
+        }
     }
 
     /// The hold this release of object `id` waits in ([`World::hold_at_release`]): once.

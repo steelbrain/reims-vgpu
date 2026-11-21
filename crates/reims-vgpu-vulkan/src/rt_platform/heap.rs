@@ -16,6 +16,13 @@
 //! (`rt-gpu-address-unpinned`, `super::buffer`'s docs): the heap lies at rt's address. The heap's
 //! size is the descriptor's rounded up to 16 KiB, as Metal's is; the heap holds its block.
 //!
+//! **Its deallocator.** A heap over the host's memory runs the deallocator its creator gave once
+//! nothing reads or writes the bytes: as the heap goes where it lies in a known block, whose
+//! mapping they are, and otherwise from rt's release of the import, once rt freed it, which may
+//! be well after the heap went (a command buffer or a resource that used it holds the import
+//! until it retires or goes). So what the deallocator holds keeps the bytes mapped for as long
+//! as rt's import of them lives, as `import_host_memory`'s contract asks.
+//!
 //! **What is placed in it.** A buffer is the heap's range at its offset (rt's `new_heap_buffer`,
 //! its bytes as they are, as Metal's heap buffers are); a texture is rt's image bound there (rt's
 //! `new_heap_texture`, which places textures in Private heaps alone: a Shared heap's texture is
@@ -66,10 +73,12 @@ use metal2vulkan_runtime as rt;
 
 use crate::core::num::ToUsize as _;
 use crate::core::platform::Handle as _;
+use crate::core::platform::device::NoCopyDeallocator;
 use crate::core::platform::host_range::HostRange;
 use crate::core::platform::resource::Heap;
 use crate::core::platform::values::{HeapDesc, PagesAccess};
 use crate::core::raise::RaiseResult;
+use crate::core::sync::Mutex;
 
 use super::buffer::{self, BIT_20, FIELDS, READ_ONLY, RtBuffer, known_at, take, unpinned};
 use super::device::RtDevice;
@@ -118,6 +127,19 @@ pub struct RtHeap {
     /// The copy of host pages it lies over (`super::copied`), which a command buffer that uses it,
     /// or a resource of it, syncs; `None` for any other.
     copied: Option<Arc<super::copied::Copied>>,
+    /// The deallocator of a heap over the host's memory that lies in a known block, which runs
+    /// as the heap goes; `None` for any other (one over rt's import of the pages runs it from the
+    /// import's release: the module's docs, "Its deallocator"). Behind a lock, as the heap is
+    /// shared between threads and the deallocator is only `Send`.
+    deallocator: Mutex<Option<NoCopyDeallocator>>,
+}
+
+impl Drop for RtHeap {
+    fn drop(&mut self) {
+        if let Some(deallocator) = self.deallocator.get_mut().take() {
+            deallocator();
+        }
+    }
 }
 
 impl RtHeap {
@@ -204,7 +226,7 @@ pub fn of_desc(device: &RtObj<RtDevice>, desc: &HeapDesc, held: u64) -> Option<R
     if read_only && !super::copied::drops(block.id) {
         buffer::read_only(SEL);
     }
-    Some(heap(device, block, offset, size, placement, options))
+    Some(heap(device, block, offset, size, placement, options, None))
 }
 
 /// A block of `class` of the `size` bytes of a heap of its own, for `sel`, zeroed: a Shared one
@@ -236,13 +258,15 @@ fn zeroed(
 
 /// A heap over the host's memory of `desc` on `device` (core's `new_heap_over_host_memory`), its
 /// descriptor's options `held`: Shared, over `bytes`, at the pin where they are a known block's
-/// mapping there, else over rt's import of their pages (the module's docs). Nil where Metal or rt
-/// refuses it, counted.
+/// mapping there, else over rt's import of their pages (the module's docs), `deallocator` run
+/// once nothing reads or writes them ("Its deallocator"). Nil where Metal or rt refuses it,
+/// counted, `deallocator` then dropped unrun.
 pub fn over_host_memory(
     device: &RtObj<RtDevice>,
     bytes: HostRange<'_>,
     desc: &HeapDesc,
     held: u64,
+    deallocator: Option<NoCopyDeallocator>,
 ) -> Option<RtObj<RtHeap>> {
     const SEL: &str = "newHeapWithDescriptor:";
     let (class, size, placement, options, read_only) = match shape(desc, held) {
@@ -260,8 +284,8 @@ pub fn over_host_memory(
     let first = bytes.ptr();
     let pin = desc.pinned_gpu_address;
     let at = |pin| known_at(device, pin, size, class, Some(first));
-    let (block, offset) = match pin.and_then(at) {
-        Some(known) => known,
+    let (block, offset, deallocator) = match pin.and_then(at) {
+        Some((block, offset)) => (block, offset, deallocator),
         None => {
             if let Some(pin) = pin {
                 unpinned(SEL, pin);
@@ -270,7 +294,14 @@ pub fn over_host_memory(
                 true => PagesAccess::ReadOnly,
                 false => PagesAccess::Writable,
             };
-            buffer::import_pages(device, SEL, first, size, access, || {})?
+            // rt's release of the import runs the deallocator, once rt freed it.
+            let then = move || {
+                if let Some(deallocator) = deallocator {
+                    deallocator();
+                }
+            };
+            let (block, offset) = buffer::import_pages(device, SEL, first, size, access, then)?;
+            (block, offset, None)
         }
     };
     // A copy just made is the heap's to hold from here (`super::copied::Fresh`).
@@ -278,10 +309,19 @@ pub fn over_host_memory(
     if read_only && !super::copied::drops(block.id) {
         buffer::read_only(SEL);
     }
-    Some(heap(device, block, offset, size, placement, options))
+    Some(heap(
+        device,
+        block,
+        offset,
+        size,
+        placement,
+        options,
+        deallocator,
+    ))
 }
 
-/// The heap's handle: `size` bytes at `offset` in `block`, answering `options`.
+/// The heap's handle: `size` bytes at `offset` in `block`, answering `options`, running
+/// `deallocator` as it goes where given.
 fn heap(
     device: &RtObj<RtDevice>,
     block: rt::Block,
@@ -289,6 +329,7 @@ fn heap(
     size: u64,
     placement: bool,
     options: u64,
+    deallocator: Option<NoCopyDeallocator>,
 ) -> RtObj<RtHeap> {
     RtObj::new(RtHeap {
         offset,
@@ -299,6 +340,7 @@ fn heap(
         purgeable: texture::purgeable_state(),
         copied: super::copied::of(block.id),
         block,
+        deallocator: Mutex::new(deallocator),
     })
 }
 
@@ -565,10 +607,10 @@ mod tests {
         let memory = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!memory.is_null());
         let imports = counted(IMPORTS_CODE);
-        // SAFETY: the memory stays allocated until the test's end, past the heap's life and rt's
-        // import's, which the device's teardown frees.
+        // SAFETY: the memory is never freed, so it stays allocated for the rest of the process,
+        // as a heap over it with no deallocator asks.
         let bytes = unsafe { HostRange::new(HostPtr::from_ptr(memory), 0x10000) };
-        let made = device.new_heap_over_host_memory(bytes, &placement(0x10000, 0, None));
+        let made = device.new_heap_over_host_memory(bytes, &placement(0x10000, 0, None), None);
         let over = made
             .expect("never a raise")
             .heap
@@ -587,7 +629,7 @@ mod tests {
         // SAFETY: the block's mapping lives while the test holds the block.
         let bytes = unsafe { HostRange::new(first, 0x4000) };
         let pin = block.gpu_address + 0x8000;
-        let made = device.new_heap_over_host_memory(bytes, &placement(0x4000, 0, Some(pin)));
+        let made = device.new_heap_over_host_memory(bytes, &placement(0x4000, 0, Some(pin)), None);
         let over_block = made
             .expect("never a raise")
             .heap

@@ -113,6 +113,11 @@ impl Drop for QueueCounts {
     }
 }
 
+/// What keeps bytes the platform imports mapped (a lease on the guest's RAM, a pages block's view,
+/// a keep of a pool piece's block): a deallocator over them holds it, so they are unmapped only
+/// once the platform let go of its import of them, wherever the last of its holds goes.
+pub(crate) type BytesKeep = Arc<dyn std::any::Any + Send + Sync>;
+
 /// Where a buffer over the guest's memory has its contents, as the host reaches them: `length`
 /// bytes from `at`, past `ram` where it has one (a byte of the guest's RAM mapping, which lives as
 /// long as the device, or of a pages block's view, which the buffer keeps mapped), else at region
@@ -148,6 +153,11 @@ pub(crate) struct Entry<P: Platform> {
     /// guest's RAM or the block's view, its first byte and length, which `span`, the block's, does
     /// not name.
     pub(crate) ram: Option<(HostPtr, u64)>,
+    /// What keeps `ram`'s bytes mapped, which the heap's deallocator holds too: the lease on the
+    /// guest's RAM for a pages block of one run, the block's view for one of more, or a keep of
+    /// the pool piece's block for a heap over the pool. What a no-copy buffer over them holds
+    /// (`BUFFER_MANAGED_AT_OFFSET`).
+    pub(crate) ram_kept: Option<BytesKeep>,
     /// A buffer whose contents are the guest's bytes: where they lie, which `span` names only for
     /// a buffer over its own block (`BUFFER_OVER_HOST_MEMORY`); `None` for any other object.
     pub(crate) bytes: Option<GuestBytes>,
@@ -207,6 +217,7 @@ impl<P: Platform> Entry<P> {
             place: None,
             queue: None,
             ram: None,
+            ram_kept: None,
             bytes: None,
             over_view: false,
             icb_dropped: None,

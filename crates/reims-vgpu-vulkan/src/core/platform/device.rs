@@ -28,7 +28,10 @@ use super::{Handle, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
 
 /// A deallocator Metal calls once when a no-copy buffer is freed (the
-/// `newBufferWithBytesNoCopy:…deallocator:` block). `None` is a nil block.
+/// `newBufferWithBytesNoCopy:…deallocator:` block), and the one a heap over host memory takes
+/// ([`GpuDevice::new_heap_over_host_memory`]): it runs once the platform no longer reads or
+/// writes the bytes, which may be well after the object went (the Vulkan platform runs it from
+/// rt's release of its import of them), so it holds what keeps them mapped. `None` is a nil block.
 pub type NoCopyDeallocator = Box<dyn FnOnce() + Send>;
 
 thread_local! {
@@ -83,8 +86,8 @@ pub trait GpuDevice<P: Platform>: Handle {
     -> RaiseResult<SizeAndAlign>;
     /// sel: newBufferWithBytesNoCopy:length:options:deallocator: — (nil
     /// deallocator),. Wraps host memory with no copy: `bytes` is the pointer and the length, and
-    /// its constructor's contract keeps it mapped until Metal runs `deallocator`, or, with no
-    /// deallocator, for as long as the buffer lives.
+    /// its constructor's contract keeps it mapped until the platform runs `deallocator`, which may
+    /// be well after the buffer went, or, with no deallocator, for the rest of the process.
     /// Reached both under a handler and with none: `on` says which this call is.
     fn new_buffer_over_host_memory(
         &self,
@@ -444,13 +447,16 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// as its memory, zero-copy, as Metal makes one over one address range (`setAddressRanges:`
     /// SPI): a resource placed at an offset lies in `bytes` from that offset, and the CPU's and
     /// the GPU's writes there are each other's. `bytes` starts on a page and covers the heap's
-    /// size rounded up to Metal's 16 KiB page, and its constructor's contract keeps it mapped for
-    /// as long as the heap lives. Nil where the platform makes no heap over it, as for
-    /// `new_heap`.
+    /// size rounded up to Metal's 16 KiB page, and its constructor's contract keeps it mapped
+    /// until the platform runs `deallocator`, once it reads and writes them no more: as the heap
+    /// goes, or later, where its import of their pages outlives the heap (the Vulkan platform's).
+    /// With no deallocator, `bytes` stays mapped for the rest of the process. Nil where the
+    /// platform makes no heap over it, as for `new_heap`, `deallocator` then dropped unrun.
     fn new_heap_over_host_memory(
         &self,
         bytes: HostRange<'_>,
         desc: &HeapDesc,
+        deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<HeapMade<P>>;
     /// sel: newSamplerStateWithDescriptor: — from a sampler descriptor made from `desc`.
     fn new_sampler_state(&self, desc: &SamplerDesc) -> RaiseResult<Option<P::SamplerState>>;

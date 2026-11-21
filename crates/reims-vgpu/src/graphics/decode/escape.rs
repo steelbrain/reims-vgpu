@@ -623,16 +623,16 @@ mod tests {
         use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
         use reims_vgpu_vulkan::core::raise::OnFault;
 
-        use super::super::surface_pages::Lease;
         use super::super::surface_pages::costs::{RAM, guest_ram};
 
         let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let page = platform.vm().page_size().max(4096);
-        // The guest's RAM, which outlives the decoder and its views.
+        // The guest's RAM, mapped until it and the last lease on it, which the decoder, its
+        // views and the platform's imports hold, have gone.
         let ram = guest_ram(16 * page, true);
-        let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+        let lease = ram.lease(platform.guest_memory(&ram.map));
         let core =
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
@@ -823,16 +823,16 @@ mod tests {
         use reims_vgpu_vulkan::core::raise::OnFault;
 
         use super::super::HEAP_PAGE;
-        use super::super::surface_pages::Lease;
         use super::super::surface_pages::costs::{RAM, guest_ram};
 
         let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let page = platform.vm().page_size().max(4096);
-        // The guest's RAM, which outlives the decoder and its views.
+        // The guest's RAM, mapped until it and the last lease on it, which the decoder, its
+        // views and the platform's imports hold, have gone.
         let ram = guest_ram(64 * page, true);
-        let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+        let lease = ram.lease(platform.guest_memory(&ram.map));
         let core =
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;

@@ -577,7 +577,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // process's own pages, which the bundle's no-copy buffers make at any length.
             decoder.set_max_buffer_length(info.sizes[RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH]);
             // The platform's lease on the guest's RAM, held by the views of the surfaces' pages
-            // made through the map, so it outlives the last of them.
+            // made through the map and by the deallocators of the platform's imports of its
+            // bytes, so it outlives the last of them.
             if let Some(map) = &config.memory_map {
                 let lease: GuestMemoryLease = Arc::from(platform.guest_memory(map));
                 let memory = CoreMemoryMap::new(Arc::clone(&platform), &map.to_core())
@@ -1237,8 +1238,8 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
             drop(std::mem::take(&mut self.windows));
         });
         // The host removed every piece of the pool before the release: the pool's thread ends,
-        // each block goes back to the source once no thread of the device's holds it, and the
-        // source frees them.
+        // each block goes back to the source once no thread of the device's holds it and the
+        // platform freed every import of its bytes (`pool`'s keeps), and the source frees them.
         drop(self.pool.take());
         // The contexts' Private takes in flight end unanswered, and their workers go, each
         // giving back the block it was taking: none calls the source past the release.

@@ -3,7 +3,8 @@
 //!
 //! `new_buffer_over_host_memory`, `replace_region`, `set_contents` and `fill_texture` are safe
 //! methods that take a `HostRange<'_>`. Its only constructor is `unsafe`: the caller proves the
-//! range stays mapped for the call, or, handed to a no-copy creator, until its deallocator runs.
+//! range stays mapped for the call, or, handed to a creator over host memory, until the
+//! platform runs the deallocator given with it.
 
 use std::marker::PhantomData;
 
@@ -26,8 +27,11 @@ impl<'a> HostRange<'a> {
     ///
     /// # Safety
     /// `ptr..ptr + len` stays mapped, and readable by the platform, for as long as the method it
-    /// is passed to may touch it: until the call returns, or, for a no-copy buffer's contents,
-    /// until Metal runs the buffer's deallocator (with none, for as long as the buffer lives).
+    /// is passed to may touch it: until the call returns, or, for a no-copy buffer's contents and
+    /// a heap's memory over host memory, until the platform runs the deallocator given with them,
+    /// which may be well after the object went (the Vulkan platform runs it from rt's release of
+    /// its import of the pages); with none, for the rest of the process. So the deallocator holds
+    /// what keeps the range mapped, and the range is unmapped only once it ran.
     #[allow(unsafe_code)] // architecture 17.3: the one unsafe constructor of host memory
     pub const unsafe fn new(ptr: HostPtr, len: u64) -> HostRange<'a> {
         HostRange {

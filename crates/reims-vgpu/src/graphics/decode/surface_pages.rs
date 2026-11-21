@@ -185,12 +185,15 @@
 //! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block, a slab of the guest's, can
 //! hold a `HEAP_OVER_PAGES`, the buffers placed in it costing what a heap over host memory's do. A
 //! block of one run holds it over that run where the guest's RAM is mapped for the host (the memory
-//! map's), not over the view, so the platform imports it as it does guest RAM; the RAM stays mapped
-//! as long as the device. A block of more than one run, as a guest's slab of plain pages mostly is,
-//! holds it over the block's view, made as a `BUFFER_OVER_PAGES`'s is, on the surface worker where
-//! it is not made yet. Either way the heap lies over the block, so the block is not released while
-//! it lives (its `BLOCK_RELEASE` is refused), and a context's close lets go of its objects before
-//! its pages blocks' views: the view outlives the heap with no hold of its own.
+//! map's), not over the view, so the platform imports it as it does guest RAM. A block of more
+//! than one run, as a guest's slab of plain pages mostly is, holds it over the block's view, made as
+//! a `BUFFER_OVER_PAGES`'s is, on the surface worker where it is not made yet. Either way the heap
+//! lies over the block, so the block is not released while it lives (its `BLOCK_RELEASE` is
+//! refused), and the heap's deallocator holds what keeps its bytes mapped, the platform's lease on
+//! the guest's RAM or the view, as its entry does (`Entry::ram_kept`, which a
+//! `BUFFER_MANAGED_AT_OFFSET` in it holds too): the platform runs it once it let go of its import
+//! of them, which may be well after the heap went, so the view, or a test's RAM, is unmapped only
+//! then.
 //!
 //! **Group dma-bufs.** On a device that imports each view as a dma-buf of its own and lists every
 //! import in every submission (RADV, `os::linux::dma_buf` of the Vulkan crate), each live pages
@@ -379,7 +382,7 @@ use reims_vgpu_vulkan::core::memory::PAGE_SIZE as MAPPING_PAGE;
 use reims_vgpu_vulkan::core::memory::map::MemoryMap;
 use reims_vgpu_vulkan::core::memory::mapping::Mapping;
 use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
-use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::device::{GpuDevice as _, NoCopyDeallocator};
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 use reims_vgpu_vulkan::core::platform::os::vm::{GroupHold, GroupLimits, HostAddr};
 use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Heap as _};
@@ -393,6 +396,7 @@ use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 use crate::platform::ViewImports;
 use crate::pool::HostAddresses;
 
+use super::tables::BytesKeep;
 use super::worker::{Job, Settle, Worker};
 
 /// The guest's least page: every run is whole pages of it, and of the host's ([`SurfaceViews`]'
@@ -2507,6 +2511,12 @@ impl<P: Platform> SurfaceViews<P> {
             .and_then(|p| p.ram)
     }
 
+    /// The platform's hold on the guest's RAM the views are made of, which keeps its mapping
+    /// mapped while it lives: what an import of a run of it holds ([`Self::private_ram`]).
+    pub(crate) fn lease(&self) -> Option<Lease> {
+        self.memory.as_ref().map(|(_, lease)| Arc::clone(lease))
+    }
+
     /// Whether the block at `block` is a pages block whose view is not made yet: its first
     /// `BUFFER_OVER_PAGES` makes it ([`Self::private_view`]).
     pub(crate) fn private_unmade(&self, block: u64) -> bool {
@@ -3415,15 +3425,16 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         if !self.read_only_pages_admit("HEAP_OVER_PAGES", m.block_offset, None) {
             return Ok(Err(super::DecodeError::Refused));
         }
-        let ram = (self.shared.surface_views.lock()).private_ram(
-            m.block_offset,
-            m.block_size,
-            self.context,
-        );
-        // One run: the guest's RAM itself. More: the block's view, made here where it is not yet
-        // (on the surface worker, `GraphicsControl::start_over_pages`).
+        let (ram, lease) = {
+            let views = self.shared.surface_views.lock();
+            let ram = views.private_ram(m.block_offset, m.block_size, self.context);
+            (ram, views.lease())
+        };
+        // One run: the guest's RAM itself, which the platform's lease on it keeps mapped. More:
+        // the block's view, made here where it is not yet (on the surface worker,
+        // `GraphicsControl::start_over_pages`).
         let pages = match ram {
-            Some(run) => Some(run),
+            Some((at, room)) => lease.map(|lease| (at, room, lease)),
             None => SurfaceViews::private_view(
                 &self.shared.surface_views,
                 &*self.platform,
@@ -3435,20 +3446,22 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             .map(|view| {
                 // A heap over the view: no regroup moves the block ("Regroups").
                 (self.shared.surface_views.lock()).heap_made(m.block_offset);
-                (view.base(), view.length())
+                let (at, room) = (view.base(), view.length());
+                let kept: BytesKeep = view;
+                (at, room, kept)
             }),
         };
-        let Some((at, length)) = pages.and_then(|(at, room)| {
+        let Some((at, length, kept)) = pages.and_then(|(at, room, kept)| {
             let length = m.size_bytes.checked_next_multiple_of(super::HEAP_PAGE)?;
-            (m.size_bytes != 0 && length <= room).then_some((at, length))
+            (m.size_bytes != 0 && length <= room).then_some((at, length, kept))
         }) else {
             return Ok(Err(super::DecodeError::Refused));
         };
-        // SAFETY: the bytes lie in the run or the view (checked above): the mapping of the
-        // guest's RAM, which stays mapped as long as the device, or the block's view, which its
-        // entry holds until the block's release, refused while the heap lies over the block, or
-        // its context's close, which lets go of the heap first (the module doc).
+        // SAFETY: the bytes lie in the run or the view (checked above), which `kept`, the lease on
+        // the guest's RAM or the view, keeps mapped while it lives; the deallocator holds it until
+        // the platform runs it.
         let bytes = unsafe { HostRange::new(at, length) };
+        let held = Arc::clone(&kept);
         let desc = HeapDesc {
             size: m.size_bytes,
             heap_type: super::host_heap_type(m.heap_type),
@@ -3456,10 +3469,11 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
         };
         let kind = super::unkept::Kind::Pages;
-        match kind
-            .making(|| device.new_heap_over_host_memory(bytes, &desc))?
-            .heap
-        {
+        let made = kind.making(|| {
+            let deallocator: NoCopyDeallocator = Box::new(move || drop(held));
+            device.new_heap_over_host_memory(bytes, &desc, Some(deallocator))
+        })?;
+        match made.heap {
             Some(heap) => {
                 let live = self.made_as(kind, desc.pinned_gpu_address, heap.gpu_address());
                 log::trace!(
@@ -3487,6 +3501,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
                     .over(Some((m.block_offset, m.block_size)))
                     .counted(live);
                 entry.ram = Some((at, length));
+                entry.ram_kept = Some(kept);
                 entry.listed = listed;
                 self.store(m.obj_id, entry);
                 Ok(Ok(()))
@@ -3588,7 +3603,8 @@ pub(crate) mod whys;
 pub(super) mod tests {
     use reims_vgpu_graphics::region::Region;
     use reims_vgpu_graphics::wire::{
-        RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
+        RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
+        RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
         RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES,
         RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
         RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
@@ -3596,9 +3612,9 @@ pub(super) mod tests {
         RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_ASK_CACHE,
         RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_COPY_ON_WRITE, RGFX_SURFACE_PAGES_PRIVATE,
         RGFX_SURFACE_PAGES_READ_ONLY, RGFX_SURFACE_PAGES_UNCHANGING, RGFX_SURFACE_PAGES_WHY_SHIFT,
-        RgfxBufferAtOffset, RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxMsgHeader,
-        RgfxObjectDestroy, RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout, RgfxTextureDescriptor,
-        RgfxTextureFromBuffer,
+        RgfxBufferAtOffset, RgfxBufferManagedAtOffset, RgfxBufferOverHostMemory,
+        RgfxManagedBufferCreate, RgfxMsgHeader, RgfxObjectDestroy, RgfxSurfacePagesLayout,
+        RgfxSurfacePlaneLayout, RgfxTextureDescriptor, RgfxTextureFromBuffer,
     };
     use reims_vgpu_vulkan::core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
     use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
@@ -3625,6 +3641,11 @@ pub(super) mod tests {
     /// A decoder over a region with a MiB of blocks, and `pages` host pages of guest RAM from
     /// [`RAM`] behind its memory map.
     pub(crate) fn rig(pages: u64) -> Rig {
+        rig_leased(pages, Arc::new(()))
+    }
+
+    /// [`rig`], the decoder's guest memory held by `lease`.
+    fn rig_leased(pages: u64, lease: Lease) -> Rig {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let page = p.vm().page_size();
@@ -3642,7 +3663,7 @@ pub(super) mod tests {
             });
         }
         let map = MemoryMap::new(Arc::clone(&p), &desc).unwrap();
-        dec.set_guest_memory(map, Arc::new(()));
+        dec.set_guest_memory(map, lease);
         Rig {
             p,
             device,
@@ -3839,6 +3860,47 @@ pub(super) mod tests {
                 heap_type: 1,
             };
             self.dec.decode(&self.device, m.as_bytes()).unwrap()
+        }
+
+        /// A `BUFFER_MANAGED_AT_OFFSET` of `length` bytes at `offset` in the heap `heap`, at an
+        /// address of its id's.
+        fn managed_at(
+            &mut self,
+            obj_id: u64,
+            heap: u64,
+            offset: u64,
+            length: u64,
+        ) -> Result<(), DecodeError> {
+            let m = RgfxBufferManagedAtOffset {
+                header: header(RGFX_CMD_BUFFER_MANAGED_AT_OFFSET),
+                obj_id,
+                gpu_address: 0x1_0000_0000 + (obj_id & 0xff) * 0x10_0000,
+                heap_obj_id: heap,
+                offset,
+                length,
+                options: STORAGE_MODE_MANAGED_OPTION,
+                reserved_3c: 0,
+            };
+            self.dec.decode(&self.device, m.as_bytes()).unwrap()
+        }
+
+        /// An `OBJECT_DESTROY` of `obj_id`.
+        fn destroy(&mut self, obj_id: u64) {
+            let destroy = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(
+                self.dec.decode(&self.device, destroy.as_bytes()).unwrap(),
+                Ok(())
+            );
+        }
+
+        /// The mapping teardowns of a view at `at` so far.
+        fn torn_down(&self, at: usize) -> usize {
+            (self.p.call_log().calls_to("mach_vm_deallocate").iter())
+                .filter(|c| c.args.first() == Some(&Arg::Ptr(at)))
+                .count()
         }
 
         /// The host's first byte of guest RAM.
@@ -6096,6 +6158,133 @@ pub(super) mod tests {
         }
         assert!(!r.dec.span_in_use(BLOCK, 0x2000));
         assert!(r.has_private_view(BLOCK));
+    }
+
+    /// `MTLResourceStorageModeManaged`, as a resource's options.
+    const STORAGE_MODE_MANAGED_OPTION: u32 = 1 << 4;
+
+    /// A heap over a pages block's view holds the view, and so its mapping, until the platform
+    /// runs its deallocator, which may be well after the heap went (the Vulkan platform runs it
+    /// from rt's release of its import of the view's bytes, once rt freed it): the heap's destroy,
+    /// the block's release and the cache letting go of the view unmap nothing before, and the view
+    /// goes once the deallocator ran
+    #[test]
+    fn a_heap_over_a_pages_block_s_view_keeps_it_mapped_until_its_deallocator_ran() {
+        let mut r = rig(64);
+        let page = r.page;
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(8, 1), (3, 2), (12, 1)], 4 * page, private),
+            RGFX_STATUS_OK
+        );
+        r.p.world().run_deallocators_late();
+        assert_eq!(r.pages_heap(20, BLOCK, 4 * page), Ok(()));
+        let view = r.private_view(BLOCK);
+        let (at, gone) = (view.base().addr(), Arc::downgrade(&view));
+        drop(view);
+        r.destroy(20);
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+        for i in 0..CACHED_VIEWS as u64 {
+            assert_eq!(
+                r.pages(BLOCK + 0x8000, &[(20 + i, 1)], page),
+                RGFX_STATUS_OK
+            );
+        }
+        r.dec.surface_worker().flush();
+        assert!(
+            gone.upgrade().is_some(),
+            "the heap's deallocator holds the view"
+        );
+        assert_eq!(r.torn_down(at), 0, "mapped until the deallocator ran");
+        r.p.world().run_late_deallocators();
+        r.dec.surface_worker().flush();
+        assert!(
+            gone.upgrade().is_none(),
+            "the view went with the deallocator"
+        );
+        assert_eq!(r.torn_down(at), 1);
+    }
+
+    /// A `Managed` buffer placed in a heap over a pages block's view (`BUFFER_MANAGED_AT_OFFSET`),
+    /// a no-copy buffer over the view's bytes, holds the view itself until the platform runs its
+    /// deallocator, though the heap, and the heap's own hold, went first
+    #[test]
+    fn a_managed_buffer_in_a_heap_over_a_view_keeps_it_mapped_until_its_deallocator_ran() {
+        let mut r = rig(64);
+        let page = r.page;
+        r.dec.set_unified_memory(false);
+        r.dec.hold_resource_ids(0, 0);
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(8, 1), (3, 2), (12, 1)], 4 * page, private),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.pages_heap(20, BLOCK, 4 * page), Ok(()));
+        assert_eq!(r.managed_at(21, 20, page, 0x100), Ok(()));
+        let view = r.private_view(BLOCK);
+        let (at, gone) = (view.base().addr(), Arc::downgrade(&view));
+        drop(view);
+        // The heap goes, its deallocator run at once.
+        r.destroy(20);
+        r.p.world().run_deallocators_late();
+        r.destroy(21);
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+        for i in 0..CACHED_VIEWS as u64 {
+            assert_eq!(
+                r.pages(BLOCK + 0x8000, &[(20 + i, 1)], page),
+                RGFX_STATUS_OK
+            );
+        }
+        r.dec.surface_worker().flush();
+        assert!(
+            gone.upgrade().is_some(),
+            "the buffer's deallocator holds the view"
+        );
+        assert_eq!(r.torn_down(at), 0, "mapped until the deallocator ran");
+        r.p.world().run_late_deallocators();
+        r.dec.surface_worker().flush();
+        assert!(
+            gone.upgrade().is_none(),
+            "the view went with the deallocator"
+        );
+        assert_eq!(r.torn_down(at), 1);
+    }
+
+    /// A heap over a pages block of one run, over the guest's RAM itself, holds the platform's
+    /// lease on the RAM, which keeps it mapped, until the platform runs its deallocator, as a
+    /// `Managed` buffer placed in it does: their destroys let go of the entries' holds alone, and
+    /// the deallocators of the rest
+    #[test]
+    fn a_heap_over_a_run_of_the_guest_s_ram_holds_its_lease_until_its_deallocator_ran() {
+        let lease: Lease = Arc::new(());
+        let mut r = rig_leased(16, Arc::clone(&lease));
+        let holds = || Arc::strong_count(&lease);
+        let page = r.page;
+        r.dec.set_unified_memory(false);
+        r.dec.hold_resource_ids(0, 0);
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        assert_eq!(
+            r.pages_flagged(BLOCK, 0, &[(2, 4)], 4 * page, private),
+            RGFX_STATUS_OK
+        );
+        r.p.world().run_deallocators_late();
+        let before = holds();
+        assert_eq!(r.pages_heap(20, BLOCK, 4 * page), Ok(()));
+        assert_eq!(holds(), before + 2, "the heap's entry and its deallocator");
+        assert_eq!(r.managed_at(21, 20, page, 0x100), Ok(()));
+        assert_eq!(holds(), before + 3, "and the buffer's deallocator");
+        r.destroy(20);
+        r.destroy(21);
+        r.dec.surface_worker().flush();
+        assert_eq!(
+            holds(),
+            before + 2,
+            "the deallocators, not yet run, hold it"
+        );
+        r.p.world().run_late_deallocators();
+        assert_eq!(holds(), before);
     }
 
     /// A pages block's runs are checked as a surface's: runs outside guest RAM, not whole pages,

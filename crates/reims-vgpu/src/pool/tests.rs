@@ -683,7 +683,7 @@ fn open_zeroer(pool: &Pool) {
     st.zero_shut = false;
     let start = st.start_zeroer();
     drop(st);
-    pool.shared.changed.notify_all();
+    pool.shared.wake();
     if start {
         takes::spawn_zeroer(&pool.shared);
     }
@@ -1103,7 +1103,7 @@ fn a_take_racing_the_zeroer_reads_zero_and_keeps_what_the_guest_writes() {
     assert_eq!(zeroed_by(&pool), [top, 0]);
     fill(&pool, 0, top, 0x5a);
     pool.shared.state.lock().zero_paused = false;
-    pool.shared.changed.notify_all();
+    pool.shared.wake();
     wait_zeroed(&pool, BASE, takes::ZERO_CHUNK);
     assert!(all(&pool, 0, top, 0x5a));
     assert!(all(&pool, top, takes::ZERO_CHUNK, 0));
@@ -1149,7 +1149,7 @@ fn a_take_over_the_claimed_chunk_waits_for_its_write_and_keeps_its_first_fit() {
     }
     assert!(rx.try_recv().is_err(), "answered past the claimed chunk");
     pool.shared.state.lock().zero_paused = false;
-    pool.shared.changed.notify_all();
+    pool.shared.wake();
     assert_eq!(answer(&rx), Some((0, 2 * TAKE_ALIGN)));
     assert!(all(&pool, 0, 2 * TAKE_ALIGN, 0));
     assert_eq!(zeroed_by(&pool)[0] - before, TAKE_ALIGN);
@@ -1183,7 +1183,7 @@ fn a_take_only_the_claimed_chunk_keeps_out_waits_for_its_write_and_asks_no_piece
     }
     assert!(rx.try_recv().is_err(), "answered over the claimed chunk");
     pool.shared.state.lock().zero_paused = false;
-    pool.shared.changed.notify_all();
+    pool.shared.wake();
     assert_eq!(answer(&rx), Some((0, BLOCK_LEN)));
     assert!(all(&pool, 0, BLOCK_LEN, 0));
     // The worker zeroed all but the zeroer's chunk.
@@ -1532,12 +1532,12 @@ fn a_give_finds_only_the_contexts_block_as_answered_and_frees_it_at_its_free() {
         true
     });
     assert_eq!(in_use, Give::InUse);
-    assert!(ledger.over_held(1, 0, len, |_| ()).is_some());
+    assert!(ledger.over_held(1, 0, len, |_, _| ()).is_some());
     let Give::Given(carve) = ledger.give(1, 0, len, free) else {
         panic!("not given");
     };
     // Going: no heap is made over it, and no second give finds it, until its free.
-    assert!(ledger.over_held(1, 0, len, |_| ()).is_none());
+    assert!(ledger.over_held(1, 0, len, |_, _| ()).is_none());
     assert_eq!(ledger.give(1, 0, len, free), Give::NotFound);
     assert_eq!(ledger.counts(), (1, len));
     ledger.free(&[carve]);
@@ -1553,12 +1553,12 @@ fn a_heap_is_made_only_over_bytes_in_one_block_the_context_holds() {
     assert_eq!(answer(&take(&ledger, 1, len)), Some((0, len)));
     let first = pool.find(BASE + TAKE_ALIGN, 1).unwrap().host;
     assert_eq!(
-        ledger.over_held(1, TAKE_ALIGN, TAKE_ALIGN, |p| p),
+        ledger.over_held(1, TAKE_ALIGN, TAKE_ALIGN, |p, _| p),
         Some(first)
     );
-    assert_eq!(ledger.over_held(1, TAKE_ALIGN, len, |p| p), None);
-    assert_eq!(ledger.over_held(2, 0, TAKE_ALIGN, |p| p), None);
-    assert_eq!(ledger.over_held(1, len, TAKE_ALIGN, |p| p), None);
+    assert_eq!(ledger.over_held(1, TAKE_ALIGN, len, |p, _| p), None);
+    assert_eq!(ledger.over_held(2, 0, TAKE_ALIGN, |p, _| p), None);
+    assert_eq!(ledger.over_held(1, len, TAKE_ALIGN, |p, _| p), None);
 }
 
 #[test]
@@ -1576,7 +1576,7 @@ fn a_close_lets_go_of_every_block_of_its_context_and_no_other() {
     assert_eq!(ledger.counts(), (1, TAKE_ALIGN));
     assert!(
         ledger
-            .over_held(2, TAKE_ALIGN, TAKE_ALIGN, |_| ())
+            .over_held(2, TAKE_ALIGN, TAKE_ALIGN, |_, _| ())
             .is_some()
     );
 }
@@ -1594,6 +1594,98 @@ fn a_free_after_the_reset_frees_nothing_carved_since() {
     assert_eq!(answer(&take(&ledger, 3, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
     ledger.free(&[carve]);
     assert_eq!(ledger.counts(), (1, TAKE_ALIGN));
+}
+
+/// Waits, yielding, until `done`, or the test fails after 10 s, saying `what`.
+fn spin_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::yield_now();
+    }
+}
+
+/// A keep of a piece's block, which an import of its bytes holds until the platform frees the
+/// import, late, holds the block at the release's end as a hold does: the release's end sleeps
+/// on the pool's bell while the keep lives, and gives the block back to the source once the
+/// keep's drop rang it
+#[test]
+fn the_release_gives_a_kept_piece_back_only_once_its_keep_goes() {
+    let host = Arc::new(Host::default());
+    let (pool, blocks, ledger) = live_pool(&host, LONG);
+    answer(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
+    let keep = ledger.over_held(1, 0, TAKE_ALIGN, |_, keep| keep);
+    let keep = keep.expect("a keep of the block");
+    // The headroom's pieces, asked once the take used the first.
+    host.wait_for(KEPT_CALLS + 1);
+    let bell = Arc::clone(&pool.shared.bell);
+    // The pool's thread ends in the device's release: from here only the release's end sleeps on
+    // the bell, and only while a piece is held or kept.
+    drop(pool);
+    let slept = bell.slept();
+    let release = std::thread::spawn(move || drop(ledger));
+    spin_until("the release's end sleeps on the keep", || {
+        bell.slept() > slept
+    });
+    assert!(!release.is_finished(), "the release waits for the keep");
+    assert_eq!(blocks.counts(), (KEPT_CALLS + 1, 0));
+    drop(keep);
+    release.join().unwrap();
+    assert_eq!(blocks.counts(), (0, 2));
+}
+
+/// A piece whose block a keep holds, as an import of its bytes does until the platform frees the
+/// import, late: on its way back past the delay and out of the guest, it stays the pool's, its
+/// block out of the source and its address taken, until the keep's drop, after which the pool's
+/// thread gives the block back
+#[test]
+fn a_kept_piece_goes_back_only_once_its_keep_goes() {
+    let delay = Duration::from_millis(50);
+    let (host, hand) = (Arc::new(Host::default()), Hand::default());
+    let (pool, blocks) = pool_at(range(64), &host, delay, hand.clock());
+    // The headroom's pieces and two above it: `PAST`, which the guest uses, and `kept`.
+    let n = KEPT_CALLS + 2;
+    for _ in 0..n {
+        pool.grow(BLOCK_LEN);
+    }
+    host.wait_for(n);
+    for i in 0..KEPT + 2 {
+        pool.added(BASE + i * BLOCK_LEN).unwrap();
+    }
+    let kept = PAST + BLOCK_LEN;
+    pool.piece_used(PAST).unwrap();
+    let keep = (pool.shared.state.lock()).keep_of(kept, &pool.shared.bell);
+    let keep = keep.expect("a keep of the block");
+    // Past the delay, the empty piece above the headroom is asked out of the guest.
+    hand.on(delay);
+    assert_eq!(host.wait_for(n + 1)[n], Call::Remove(kept, BLOCK_LEN));
+    pool.removed(kept).unwrap();
+    // The pool's thread looks for a block to give back before it sends a piece due on its way, and
+    // `PAST` comes due only once the host removed `kept`: by `PAST`'s remove, it found `kept`'s
+    // block kept.
+    pool.piece_empty(PAST).unwrap();
+    hand.on(delay);
+    assert_eq!(host.wait_for(n + 2)[n + 1], Call::Remove(PAST, BLOCK_LEN));
+    assert_eq!(blocks.counts(), (n, 0));
+    pool.removed(PAST).unwrap();
+    spin_until("`PAST`'s block back", || blocks.counts() == (n - 1, 1));
+    // `kept`'s address stays taken: of two blocks more, the first goes where `PAST` was, and the
+    // second past `kept`.
+    pool.grow(BLOCK_LEN);
+    pool.grow(BLOCK_LEN);
+    assert_eq!(
+        host.wait_for(n + 4)[n + 2..],
+        [
+            Call::Add(PAST, BLOCK_LEN),
+            Call::Add(kept + BLOCK_LEN, BLOCK_LEN),
+        ]
+    );
+    assert_eq!(blocks.counts(), (n + 1, 0));
+    assert!(pool.shared.state.lock().pieces.contains_key(&kept));
+    drop(keep);
+    spin_until("`kept`'s block back", || blocks.counts() == (n, 1));
+    assert!(!pool.shared.state.lock().pieces.contains_key(&kept));
+    assert_eq!(host.calls().len(), n + 4);
 }
 
 #[test]

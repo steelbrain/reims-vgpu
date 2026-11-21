@@ -68,8 +68,8 @@ use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use zerocopy::IntoBytes;
 
 use super::super::handler_cost::host_ns;
+use super::super::surface_pages::GUEST_PAGE;
 use super::super::surface_pages::costs::{RAM, XorShift, env_u64, guest_ram, surface_runs};
-use super::super::surface_pages::{GUEST_PAGE, Lease};
 use super::super::{GraphicsDecoder, no_raise};
 use super::{CachePages, CopyTrace, ON, STORAGE_PRIVATE, STORAGE_SHARED, runs_at};
 use crate::platform::ApiPlatform;
@@ -423,7 +423,7 @@ fn measure<P: ApiPlatform>(label: &str) {
     let only = std::env::var("RGK_BENCH_CASES").ok();
     let picked_in = env_u64("RGK_BENCH_SPREAD_MIB", ram_bytes / MIB).min(ram_bytes / MIB) * MIB;
     let ram = guest_ram(ram_bytes, env_u64("RGK_BENCH_TOUCH", 1) == 1);
-    let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+    let lease = ram.lease(platform.guest_memory(&ram.map));
     let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
     let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
     let region = Arc::new(crate::platform::test_region(&*platform, size.to_usize()));

@@ -48,6 +48,7 @@
 //! (upwards) or one run a page (downwards, scattered). `RGK_BENCH_LARGE_MIB` MiB a slab (default
 //! 64), `RGK_BENCH_LARGE_TAKES` slabs an order (default 8), and `RGK_BENCH_ORDERS` as above.
 
+use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -210,20 +211,58 @@ impl Step {
     }
 }
 
-/// The guest's RAM as the host maps it, and what keeps it.
+/// The guest's RAM as the host maps it, and what keeps it: its mapping, which the leases on it
+/// hold too ([`Ram::lease`]), so it is unmapped once the last of them and the RAM have gone, as
+/// QEMU's RAM stays mapped while anything of the device's may name it.
 pub(in crate::graphics::decode) struct Ram {
     pub(in crate::graphics::decode) map: MemoryMap,
     pub(in crate::graphics::decode) at: *mut u8,
+    mapping: Arc<RamMapping>,
+}
+
+impl Ram {
+    /// `held`, the platform's lease on the RAM (its `guest_memory` of [`Self::map`]), as the
+    /// decoder takes it, holding the RAM's mapping too: the views made through it, and the
+    /// platform's imports of the RAM, whose releases hold the lease or a view, keep the RAM
+    /// mapped until the last of them went, however late the platform runs them. The platform's
+    /// lease goes first ([`LeasedRam`]).
+    pub(in crate::graphics::decode) fn lease(&self, held: Box<dyn Any + Send + Sync>) -> Lease {
+        Arc::new(LeasedRam {
+            held: Some(held),
+            _mapping: Arc::clone(&self.mapping),
+        })
+    }
+}
+
+/// The RAM's own mapping: `length` bytes at `at`, unmapped as it goes.
+struct RamMapping {
+    at: usize,
     length: u64,
 }
 
-impl Drop for Ram {
-    /// Unmaps the RAM: the objects over it went before it.
+impl Drop for RamMapping {
+    /// Unmaps the RAM, which the last of its holds, the RAM and the leases on it, let go of.
     fn drop(&mut self) {
-        if self.at.is_null() {
+        if self.at == 0 {
             return;
         }
-        unmap(self.at, self.length);
+        unmap(std::ptr::with_exposed_provenance_mut(self.at), self.length);
+    }
+}
+
+/// The platform's lease on the RAM as the decoder takes it ([`Ram::lease`]).
+struct LeasedRam {
+    /// The platform's lease, taken as it goes.
+    held: Option<Box<dyn Any + Send + Sync>>,
+    _mapping: Arc<RamMapping>,
+}
+
+impl Drop for LeasedRam {
+    /// Lets go of the platform's lease before its hold of the RAM's mapping, which may be the
+    /// last: no registration of the platform's names the RAM's addresses once another mapping
+    /// may take them.
+    fn drop(&mut self) {
+        drop(self.held.take());
     }
 }
 
@@ -358,24 +397,26 @@ pub(in crate::graphics::decode) fn guest_ram(length: u64, touched: bool) -> Ram 
     let mut map = MemoryMap::new();
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: the RAM stays mapped until `Ram`'s drop, after every device and view made over
-        // it.
+        // SAFETY: the RAM stays mapped until the last of `Ram` and the leases on it goes
+        // ([`Ram::lease`]), after every device, view and import made over it.
         unsafe { map.push_with_file(RAM, length, at, Some(file)) };
-        Ram { map, at, length }
     }
     #[cfg(windows)]
     {
         // SAFETY: as above; the map holds the section.
         unsafe { map.push_with_file(RAM, length, at, Some(file)) };
-        Ram { map, at, length }
     }
     #[cfg(target_os = "macos")]
     {
         let () = file;
         // SAFETY: as above.
         unsafe { map.push(RAM, length, at) };
-        Ram { map, at, length }
     }
+    let mapping = Arc::new(RamMapping {
+        at: at.expose_provenance(),
+        length,
+    });
+    Ram { map, at, mapping }
 }
 
 fn header(r#type: u32) -> RgfxMsgHeader {
@@ -395,7 +436,7 @@ fn measure<P: ApiPlatform>(label: &str) {
     let iters = env_u64("RGK_BENCH_ITERS", 40);
     let only = std::env::var("RGK_BENCH_CASES").ok();
     let ram = guest_ram(ram_bytes, true);
-    let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+    let lease = ram.lease(platform.guest_memory(&ram.map));
     let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
     let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
     let region = Arc::new(crate::platform::test_region(&*platform, size.to_usize()));
@@ -596,7 +637,7 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
         }
         // Fresh RAM, a lease and a decoder of their own an order, as a booted guest's.
         let ram = guest_ram(ram_bytes, false);
-        let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+        let lease = ram.lease(platform.guest_memory(&ram.map));
         let core =
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
@@ -757,7 +798,7 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
             continue;
         }
         let ram = guest_ram(ram_bytes, false);
-        let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+        let lease = ram.lease(platform.guest_memory(&ram.map));
         let core =
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
@@ -842,7 +883,7 @@ fn map_only<P: ApiPlatform>(label: &str) {
     let iters = env_u64("RGK_BENCH_ITERS", 40);
     let only = std::env::var("RGK_BENCH_CASES").ok();
     let ram = guest_ram(ram_bytes, true);
-    let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+    let lease = ram.lease(platform.guest_memory(&ram.map));
     let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
     let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
     for case in cases(page) {

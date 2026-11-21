@@ -47,10 +47,18 @@
 //! gets it back: no guest access, no thread of the host's and no thread of the library's touches
 //! it.
 //!
+//! A piece is held, too, while an import of its bytes lives ([`PieceKeep`]): a heap over a
+//! context's block that the platform made over rt's import of the block's mapping, rather than in
+//! the block itself, whose release, which may run well after the heap went, holds the keep. So the
+//! block goes back, and the source may free it, only once every import of its bytes is freed, as
+//! rt's `import_host_memory` asks of the memory it imports. The last keep's drop rings the pool's
+//! bell ([`Bell`]), which wakes the pool's thread, so the block goes back as that keep goes:
+//! nothing looks for it on a timer, and nothing the guest waits for waits for it.
+//!
 //! At the device's release the host has removed every piece it added (QEMU does so as it tears
 //! the device down, before the release): from then on ([`Pool::close`]) the pool waits only for
-//! the holds and asks the host nothing, and it gives every block back before it lets go of the
-//! source.
+//! the holds and the keeps and asks the host nothing, and it gives every block back before it lets
+//! go of the source.
 //!
 //! # The block source
 //!
@@ -398,6 +406,8 @@ struct Piece {
     empty_since: Option<MonoTime>,
     /// Holds on it ([`PieceHold`]).
     holds: u64,
+    /// The keeps of it, each a clone ([`PieceKeep`]): it is kept while this is not the only one.
+    kept: Arc<()>,
     /// The contexts' blocks in it (`takes`).
     carves: u64,
     /// The bytes of it that read zero, as the zeroer zeroed them ahead of their takes, by offset
@@ -415,6 +425,95 @@ impl Piece {
     /// Whether the guest may put something in it: not being unmapped.
     fn usable(&self) -> bool {
         matches!(self.mapped, Mapped::Adding | Mapped::Live)
+    }
+
+    /// Whether an import of its bytes keeps it ([`PieceKeep`]).
+    fn kept(&self) -> bool {
+        Arc::strong_count(&self.kept) > 1
+    }
+
+    /// Whether a hold or a keep is on it, so its block does not go back.
+    fn held(&self) -> bool {
+        self.holds > 0 || self.kept()
+    }
+}
+
+/// What wakes the pool's thread and the release's end ([`Shared::wake`]): a count of the rings,
+/// under a lock of its own that is held for nothing else, so that a keep's drop takes no lock of
+/// the pool's ([`PieceKeep`]). A waiter reads the count before it looks at what it waits for, and
+/// sleeps only while the count is still the one it read, so a ring between its look and its
+/// sleep is not lost.
+#[derive(Default)]
+struct Bell {
+    rung: Mutex<u64>,
+    cv: Condvar,
+    /// How many times a waiter went to sleep: for the tests, which wait for the release's end to
+    /// sleep on a keep.
+    #[cfg(test)]
+    slept: std::sync::atomic::AtomicU64,
+}
+
+impl Bell {
+    /// The rings so far.
+    fn rung(&self) -> u64 {
+        *self.rung.lock()
+    }
+
+    /// One ring more, waking every waiter.
+    fn ring(&self) {
+        let mut rung = self.rung.lock();
+        *rung = rung.wrapping_add(1);
+        drop(rung);
+        self.cv.notify_all();
+    }
+
+    /// Sleeps while no ring came past `seen`, at most `most` where given (a waiter looks again
+    /// after any wake).
+    fn wait(&self, seen: u64, most: Option<Duration>) {
+        let mut rung = self.rung.lock();
+        if *rung != seen {
+            return;
+        }
+        #[cfg(test)]
+        self.slept.fetch_add(1, Ordering::SeqCst);
+        match most {
+            Some(most) => {
+                let _ = self.cv.wait_for(&mut rung, most);
+            }
+            None => self.cv.wait(&mut rung),
+        }
+    }
+
+    /// How many times a waiter went to sleep.
+    #[cfg(test)]
+    fn slept(&self) -> u64 {
+        self.slept.load(Ordering::SeqCst)
+    }
+}
+
+/// A keep of a piece's block for an import of its bytes, which the import's release holds
+/// ([`PoolLedger::over_held`]): while it lives, the block does not go back to the source, which
+/// may free it. The release may run on any thread, rt's block-maker thread among them, where it
+/// makes no call into the runtime and drops none of its handles; and a thread may hold the
+/// pool's lock across a call into rt (`over_held`'s), which can wait for that thread. So the
+/// keep's drop takes no lock of the pool's and holds nothing whose drop could be the pool's last,
+/// whose clock holds the platform: it lets go of its count of the piece and rings the pool's bell
+/// ([`Bell`]), which wakes the pool's thread to give the block back.
+pub(crate) struct PieceKeep {
+    kept: Option<Arc<()>>,
+    bell: Arc<Bell>,
+}
+
+impl Drop for PieceKeep {
+    fn drop(&mut self) {
+        drop(self.kept.take());
+        self.bell.ring();
+    }
+}
+
+impl std::fmt::Debug for PieceKeep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PieceKeep").finish_non_exhaustive()
     }
 }
 
@@ -595,21 +694,21 @@ impl State {
         Some((at, p.block.len))
     }
 
-    /// The block of a piece on its way back that the host removed and no hold is on, the piece
-    /// taken out of the pool.
+    /// The block of a piece on its way back that the host removed and no hold or keep is on, the
+    /// piece taken out of the pool.
     fn next_back(&mut self) -> Option<BlockId> {
         let at = (self.pieces.iter())
-            .find(|(_, p)| p.going.is_some() && p.holds == 0 && p.mapped == Mapped::Removed)
+            .find(|(_, p)| p.going.is_some() && !p.held() && p.mapped == Mapped::Removed)
             .map(|(&at, _)| at)?;
         self.take_piece(at)
     }
 
     /// At the device's release, once the host removed every piece: the blocks of the pieces on
-    /// their way back that no hold is on, the pieces taken out of the pool. The rest wait for
-    /// their holds at the release's end ([`Shared::take_all_out`]).
+    /// their way back that no hold or keep is on, the pieces taken out of the pool. The rest wait
+    /// for their holds and keeps at the release's end ([`Shared::take_all_out`]).
     fn take_out_going(&mut self) -> Vec<BlockId> {
         let going: Vec<u64> = (self.pieces.iter())
-            .filter(|(_, p)| p.going.is_some() && p.holds == 0)
+            .filter(|(_, p)| p.going.is_some() && !p.held())
             .map(|(&at, _)| at)
             .collect();
         (going.into_iter())
@@ -643,6 +742,8 @@ impl State {
                 "pool: the piece at {at:#x} still waits to go back after 1 s: {}",
                 if p.holds > 0 {
                     "a thread of the device's holds it"
+                } else if p.kept() {
+                    "an import of its bytes, not yet freed, keeps it"
                 } else {
                     "the host has not removed it"
                 }
@@ -662,6 +763,9 @@ struct Shared {
     now: PoolNow,
     state: Mutex<State>,
     changed: Condvar,
+    /// What the pool's thread and the release's end sleep on ([`Bell`]), rung at every change
+    /// ([`Shared::wake`]) and by a keep's drop ([`PieceKeep`]).
+    bell: Arc<Bell>,
     /// The take workers' and the zeroer's threads, which the device's release waits for.
     threads: Arc<Threads>,
 }
@@ -749,7 +853,7 @@ impl Drop for PieceHold {
             p.holds = p.holds.saturating_sub(1);
         }
         drop(st);
-        self.shared.changed.notify_all();
+        self.shared.wake();
     }
 }
 
@@ -808,6 +912,7 @@ impl Pool {
                 ..State::default()
             }),
             changed: Condvar::new(),
+            bell: Arc::default(),
             threads: Arc::default(),
         });
         let spawn = |name: &str, f: fn(&Arc<Shared>, &dyn BlockSource)| {
@@ -843,7 +948,7 @@ impl Pool {
     pub fn grow(&self, length: u64) {
         let ask = Ask { length };
         self.shared.state.lock().asks.push_back(ask);
-        self.shared.changed.notify_all();
+        self.shared.wake();
     }
 
     /// A ledger of the pool's blocks the guest's contexts hold ([`PoolLedger`]): takes, gives and
@@ -871,7 +976,7 @@ impl Pool {
         );
         drop(st);
         // A take may wait for it.
-        self.shared.changed.notify_all();
+        self.shared.wake();
         Ok(())
     }
 
@@ -884,7 +989,7 @@ impl Pool {
         let p = (st.pieces.get_mut(&physical_address)).ok_or(Error::InvalidArgument)?;
         p.mapped = Mapped::Removed;
         drop(st);
-        self.shared.changed.notify_all();
+        self.shared.wake();
         Ok(())
     }
 
@@ -901,7 +1006,7 @@ impl Pool {
         }
         st.use_piece(physical_address);
         drop(st);
-        self.shared.changed.notify_all();
+        self.shared.wake();
         Ok(())
     }
 
@@ -921,7 +1026,7 @@ impl Pool {
         let now = (self.shared.now)();
         st.empty_piece(physical_address, now);
         drop(st);
-        self.shared.changed.notify_all();
+        self.shared.wake();
         Ok(())
     }
 
@@ -981,7 +1086,7 @@ impl Pool {
         st.closed = true;
         st.source = None;
         drop(st);
-        self.shared.changed.notify_all();
+        self.shared.wake();
         for t in [self.thread.take(), self.ahead.take()]
             .into_iter()
             .flatten()
@@ -1026,14 +1131,23 @@ impl Drop for Pool {
 }
 
 impl Shared {
+    /// Tells the pool's waiters its state changed: those on its lock's condvar, and the pool's
+    /// thread and the release's end, which sleep on its bell ([`Bell`]).
+    fn wake(&self) {
+        self.changed.notify_all();
+        self.bell.ring();
+    }
+
     /// The pool's thread: places each block taken, the take workers' first, and has the host map
     /// it, making the zeroer where none runs (`takes`, "Zeros ahead"); and gives back the pieces
     /// that stayed empty past their delay, a step at a time as each comes due, waiting for no
-    /// hold and no remove; until the pool closes, where it gives back those on their way back
-    /// that no hold is on.
+    /// hold, no remove and no keep; until the pool closes, where it gives back those on their way
+    /// back that no hold or keep is on. It sleeps on the pool's bell, which every change and a
+    /// keep's drop ring ([`Bell`]).
     fn serve(self: &Arc<Self>, source: &dyn BlockSource) {
         let mut st = self.state.lock();
         loop {
+            let seen = self.bell.rung();
             if st.closed {
                 let back = st.take_out_going();
                 drop(st);
@@ -1077,12 +1191,7 @@ impl Shared {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            match next {
-                Some(after) => {
-                    let _ = self.changed.wait_for(&mut st, after);
-                }
-                None => self.changed.wait(&mut st),
-            }
+            MutexGuard::unlocked(&mut st, || self.bell.wait(seen, next));
         }
     }
 
@@ -1107,7 +1216,7 @@ impl Shared {
             match block {
                 Ok(block) if !st.closed => {
                     st.ahead.push_back(block);
-                    self.changed.notify_all();
+                    self.wake();
                 }
                 Ok(block) => MutexGuard::unlocked(&mut st, || {
                     let _ = source.release_block(block.id);
@@ -1171,7 +1280,7 @@ impl Shared {
                 takes::spawn_zeroer(self);
             }
             // The take waiting on it, where it still does, looks where the piece went.
-            self.changed.notify_all();
+            self.wake();
             if let Some((at, contents)) = placed {
                 (self.host.add)(at, contents.as_ptr(), block.len);
             }
@@ -1232,6 +1341,7 @@ impl Shared {
                 mapped: Mapped::Adding,
                 empty_since: Some((self.now)()),
                 holds: 0,
+                kept: Arc::new(()),
                 carves: 0,
                 zeros: takes::Ranges::new(),
                 zero_pending: true,
@@ -1242,23 +1352,38 @@ impl Shared {
         Some((at, contents))
     }
 
-    /// [`Pool::close`]'s part, once the pool's thread has ended: waits for every hold on the
-    /// pieces left to go, then takes them all out of the pool and answers their blocks. The host
-    /// removed every piece before the release, so it is asked nothing.
+    /// [`Pool::close`]'s part, once the pool's thread has ended: waits for every hold and keep on
+    /// the pieces left to go, asleep on the pool's bell, which their drops ring ([`Bell`]), then
+    /// takes them all out of the pool and answers their blocks. A keep goes once the platform freed
+    /// its import, which it does once no GPU work uses the bytes. The host removed every piece
+    /// before the release, so it is asked nothing.
     fn take_all_out(&self) -> Vec<BlockId> {
+        const WARN_AFTER: Duration = Duration::from_secs(1);
         let mut st = self.state.lock();
         let mut warned = false;
         let started = (self.now)();
-        while let Some(&at) = (st.pieces.iter()).find_map(|(at, p)| (p.holds > 0).then_some(at)) {
+        loop {
+            let seen = self.bell.rung();
+            let Some((&at, p)) = (st.pieces.iter()).find(|(_, p)| p.held()) else {
+                break;
+            };
             let waited = (self.now)().saturating_duration_since(started);
-            if !warned && waited > Duration::from_secs(1) {
+            if !warned && waited > WARN_AFTER {
                 warned = true;
+                let what = match p.holds > 0 {
+                    true => "a thread of the device's that holds",
+                    false => "the free of an import of the bytes of",
+                };
                 log::warn!(
-                    "pool: the release still waits after 1 s for a thread of the device's that \
-                     holds the piece at {at:#x}"
+                    "pool: the release still waits after 1 s for {what} the piece at {at:#x}"
                 );
             }
-            let _ = self.changed.wait_for(&mut st, Duration::from_millis(250));
+            // Until the hold's or the keep's drop rings the bell, or the warning is due.
+            let due = WARN_AFTER
+                .saturating_sub(waited)
+                .max(Duration::from_millis(1));
+            let most = (!warned).then_some(due);
+            MutexGuard::unlocked(&mut st, || self.bell.wait(seen, most));
         }
         st.by_block.clear();
         st.carves.clear();

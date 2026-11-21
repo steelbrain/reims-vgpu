@@ -1279,18 +1279,19 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     }
 
     /// [`heap::over_host_memory`]'s, with the descriptor's options: nil where Metal or rt refuses
-    /// it, counted.
+    /// it, counted. The recording names the bytes and the descriptor, not the deallocator.
     fn new_heap_over_host_memory(
         &self,
         bytes: HostRange<'_>,
         desc: &HeapDesc,
+        deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<HeapMade<RtPlatform>> {
         let recorded_call =
             crate::recorder::rec_call!("m2v.newBlockWithLength:storageMode:", self, bytes, desc);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<HeapMade<RtPlatform>> {
             let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
             Ok(HeapMade {
-                heap: heap::over_host_memory(self, bytes, desc, held),
+                heap: heap::over_host_memory(self, bytes, desc, held, deallocator),
                 descriptor_resource_options: held,
             })
         });

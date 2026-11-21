@@ -120,7 +120,9 @@ pub trait ApiPlatform: Platform {
     }
 
     /// What the platform holds of the guest's RAM while a graphics device made over `map` lives:
-    /// the views of the surfaces' pages made through the map hold it. Nothing by default.
+    /// the views of the surfaces' pages made through the map hold it, and so do the deallocators
+    /// of the platform's imports of the map's bytes, until the platform has run them. Nothing by
+    /// default.
     fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
         let _ = map;
         Box::new(())

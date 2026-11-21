@@ -1590,10 +1590,10 @@ fn by_pointer(
         Some(error) => Err(error),
         // SAFETY: the creators' `HostRange` contracts keep the bytes mapped and readable until
         // their deallocator runs, which runs only from the release, once rt freed the import, or
-        // as the object over a known block goes, which holds no import; with none, for the
-        // object's life, which holds the import. The pages they lie in, which the import covers,
-        // are mapped as they are. They are mapped writable too: the no-copy creators' bytes are
-        // memory the host maps readable and writable (the device's region, the host's own).
+        // as the object over a known block goes, which holds no import; with none, for the rest
+        // of the process. The pages they lie in, which the import covers, are mapped as they
+        // are. They are mapped writable too: the no-copy creators' bytes are memory the host maps
+        // readable and writable (the device's region, the host's own).
         None => unsafe { (device.rt()).import_host_memory(at, len, Some(release)) },
     };
     match imported {

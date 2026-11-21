@@ -148,7 +148,7 @@ use reims_vgpu_video::core::device_memory::{DeviceMemory, MemoryLife};
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::memory::map::MemoryMap;
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::device::{GpuDevice, NoCopyDeallocator};
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
 use reims_vgpu_vulkan::core::platform::resource::{
@@ -257,7 +257,7 @@ pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
 pub(crate) use surface_cache::{FillHook, FillWait};
 pub(crate) use surface_pages::Joined;
-use tables::{Context, Entry, GuestBytes, LaidUse, QueueCounts, View};
+use tables::{BytesKeep, Context, Entry, GuestBytes, LaidUse, QueueCounts, View};
 
 /// What follows a record handed to a [`CompletionSink`] or a [`SignalSink`], which the sink runs
 /// once the record is on the ring, or dropped, on the thread that posted it.
@@ -1475,7 +1475,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The guest's RAM, through which an IOSurface's own pages are mapped for its GPU view
     /// ([`surface_pages`]): with it, and a host page of the guest's size, the device carries out
     /// `SURFACE_PAGES` ([`Self::surface_pages_available`]).
-    /// `lease` is the platform's hold on the guest's RAM, which each view keeps.
+    /// `lease` is the platform's hold on the guest's RAM, which each view keeps, and each
+    /// import of its bytes until the platform has run its deallocator.
     pub(crate) fn set_guest_memory(
         &mut self,
         memory: Arc<MemoryMap<P>>,
@@ -4211,9 +4212,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // its memory is the `size_bytes` at `region_offset`, rounded up to Metal's 16 KiB
                 // page, so a resource the guest places in it lies in the guest's bytes at its
                 // offset, which the CPU and the GPU share, as Metal's heap does. A span in no
-                // block of the sender's is a guest protocol error. The region stays mapped while
-                // the decoder holds it, and the heap (in the object table) drops before the
-                // region (field order).
+                // block of the sender's is a guest protocol error. The heap's deallocator holds
+                // the region, so it stays mapped until the platform let go of its import of it.
                 let Some(length) = m.size_bytes.checked_next_multiple_of(HEAP_PAGE) else {
                     return Ok(Err(DecodeError::BadReference));
                 };
@@ -4221,13 +4221,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                     return Ok(Err(DecodeError::BadReference));
                 }
                 // SAFETY: the block lies inside the region (checked above), which stays mapped
-                // while the decoder, and so the heap, lives.
+                // until its last reference goes; the deallocator holds one until the platform
+                // runs it.
                 let bytes = unsafe {
                     HostRange::new(
                         HostPtr::from_ptr(self.region.base().add(m.region_offset as usize)),
                         length,
                     )
                 };
+                let region = Arc::clone(&self.region);
                 let pin = (m.gpu_address != 0).then_some(m.gpu_address);
                 let desc = HeapDesc {
                     size: m.size_bytes,
@@ -4235,8 +4237,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
                     pinned_gpu_address: pin,
                 };
-                let made = unkept::Kind::Region
-                    .making(|| device.new_heap_over_host_memory(bytes, &desc))?;
+                let made = unkept::Kind::Region.making(|| {
+                    let deallocator: NoCopyDeallocator = Box::new(move || drop(region));
+                    device.new_heap_over_host_memory(bytes, &desc, Some(deallocator))
+                })?;
                 match made.heap {
                     Some(heap) => {
                         let live = self.made_as(unkept::Kind::Region, pin, heap.gpu_address());
@@ -4267,8 +4271,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // memory is the `size_bytes` at pool offset `region_offset`, rounded up to Metal's
                 // 16 KiB page. A span in no block of the context's is a guest protocol error. The
                 // heap is made and stored with the pool's lock held, so the block's `POOL_GIVE`
-                // finds it ([`PoolLedger::give`]); the pool's piece stays mapped while the decoder
-                // holds its ledger, and so the heap.
+                // finds it ([`PoolLedger::give`]); the heap's deallocator holds a keep of the
+                // pool's piece, so its block does not go back to the source, which may free it,
+                // until the platform let go of its import of it ([`PieceKeep`]).
                 let (Some(ledger), Some(context)) = (self.shared.pool.get(), self.context) else {
                     return Ok(Err(DecodeError::BadReference));
                 };
@@ -4287,13 +4292,19 @@ impl<P: Platform> GraphicsDecoder<P> {
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
                 };
-                let made = ledger.over_held(context, m.region_offset, length, |first| {
+                let made = ledger.over_held(context, m.region_offset, length, |first, keep| {
                     let at = HostPtr::from_ptr(first.as_ptr());
                     // SAFETY: the bytes lie in one block the context holds (checked under the
-                    // pool's lock), whose piece stays mapped while the decoder holds the ledger.
+                    // pool's lock), whose piece stays mapped until its block goes back to the
+                    // source, which `keep`, which the deallocator holds until the platform runs
+                    // it, holds off.
                     let bytes = unsafe { HostRange::new(at, length) };
-                    let made = unkept::Kind::Pool
-                        .making(|| device.new_heap_over_host_memory(bytes, &desc))?;
+                    let kept: BytesKeep = Arc::new(keep);
+                    let held = Arc::clone(&kept);
+                    let made = unkept::Kind::Pool.making(|| {
+                        let deallocator: NoCopyDeallocator = Box::new(move || drop(held));
+                        device.new_heap_over_host_memory(bytes, &desc, Some(deallocator))
+                    })?;
                     Ok(made.heap.map(|heap| {
                         let pin = desc.pinned_gpu_address;
                         let live = self.made_as(unkept::Kind::Pool, pin, heap.gpu_address());
@@ -4301,6 +4312,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                             .over(Some((span, length)))
                             .counted(live);
                         entry.ram = Some((at, length));
+                        entry.ram_kept = Some(kept);
                         self.store(m.obj_id, entry);
                     }))
                 });
@@ -5043,6 +5055,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// (`HEAP_OVER_PAGES`): its first byte and length.
     fn ram_of(&self, obj_id: u64) -> Option<(HostPtr, u64)> {
         self.entry(obj_id).and_then(|e| e.ram)
+    }
+
+    /// What keeps the host bytes of the heap `obj_id` names mapped ([`Entry::ram_kept`]), where
+    /// the current context may name it and it lies over some.
+    fn ram_kept_of(&self, obj_id: u64) -> Option<BytesKeep> {
+        self.entry(obj_id).and_then(|e| e.ram_kept.clone())
     }
 
     /// Where the contents of the buffer over the guest's memory `obj_id` names lie, where the
@@ -12594,7 +12612,6 @@ lacks {part}"
         use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
         use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 
-        use super::surface_pages::Lease;
         use super::surface_pages::costs::{RAM, guest_ram};
 
         const STEPS: usize = 4;
@@ -12607,7 +12624,8 @@ lacks {part}"
         let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
         let device = platform.metal_device(None).unwrap();
         crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
-        // The guest's RAM, where the surface lies in place, outlives the decoder and its views.
+        // The guest's RAM, where the surface lies in place: mapped until it and the last lease on
+        // it, which the decoder, its views and the platform's imports hold, have gone.
         let mut ram = None;
         let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::clone(&region));
         let (tx, completed) = mpsc::channel();
@@ -12639,7 +12657,7 @@ lacks {part}"
             SharedPath::Copy => unsafe { region.base().add(block_at(0) as usize) },
             SharedPath::InPlace => {
                 let r = ram.insert(guest_ram(16 * page, true));
-                let lease: Lease = Arc::from(platform.guest_memory(&r.map));
+                let lease = r.lease(platform.guest_memory(&r.map));
                 let core = CoreMemoryMap::new(Arc::clone(&platform), &r.map.to_core())
                     .expect("a memory map");
                 dec.set_guest_memory(core, lease);
