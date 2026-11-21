@@ -7,7 +7,9 @@
 //! 1920 × 1080 without a window, sized to the display's scanout room on a device of several
 //! displays: `reims-vgpu-graphics`' `display::offered_in_room`), placed and clipped as in a
 //! drawable of that size. Where the
-//! guest has no scanout and presents no surface the display shows black, and so does the read.
+//! guest has no scanout and presents no surface the display shows black, and so does the read,
+//! as it does where the platform refuses the display's view of a presented surface (`sink`'s
+//! module doc, "The display's view").
 //! While the display's panel is off (the guest's display asleep) the draw clears the texture to
 //! black, and the read is black whatever the guest shows.
 //! The texture is BGRA8, shared, a render target, and is read
@@ -183,7 +185,7 @@ impl<P: ApiPlatform> DisplayRead<P> {
             })
             .ok_or(Error::Metal)?;
         let Some(status) = drawn else {
-            // No scanout, no surface: the display shows black.
+            // No scanout, no surface, or a surface the display's view of was refused: black.
             for pixel in dst.as_chunks_mut::<4>().0 {
                 pixel.copy_from_slice(&BLACK);
             }

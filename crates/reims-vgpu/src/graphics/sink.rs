@@ -20,6 +20,20 @@
 //! sample the surface in its own format (WindowServer's display surfaces are 10-bit,
 //! `BGR10A2Unorm`) and write the drawable's. The first surface of each format is logged.
 //!
+//! **The display's view.** The passes that sample a presented surface (the present shaders'
+//! and the colour's) read its texture through the display's own view of it
+//! ([`super::ShownView`]): the whole texture in its own pixel format, at one of the platform's
+//! own indices, not the texture's own index, which is the guest's. The guest's indices are its
+//! processes': as one ends (a logout, a window server's restart) its indices go back to the
+//! guest's kext, and the next process's texture made at one takes its element at once, while the
+//! display may still show, and draw again at each refresh, the texture that held it. The view is
+//! made at the texture's first such draw, and kept while the decoder holds the texture and while
+//! the display shows it, so a present of a texture shown before costs nothing more; the copy
+//! reads the texture's image, through no index, and makes none. Where the platform refuses the
+//! view, the draw is `None` ([`ScanoutDraw::encode_shown`]), counted (`display-view-refused`):
+//! the window keeps the frame it shows, and the host's read of the display answers black, as
+//! where the display shows nothing; the next draw asks for the view again.
+//!
 //! **Clears.** A draw clears the drawable to black first only where what it draws does not cover
 //! all of it: a pass whose draw covers the drawable writes each of its pixels, so it loads none
 //! of the drawable's old ones ([`pass_load`]), and its pixels are those it would draw after a
@@ -140,6 +154,11 @@ use reims_vgpu_vulkan::core::platform::resource::Library as _;
 use reims_vgpu_vulkan::core::platform::values::RenderPipelineDesc;
 
 mod cursor;
+
+/// The code of a draw of a presented surface that sampled nothing, the platform having refused
+/// the display's view of the surface's texture (the module doc, "The display's view"), counted
+/// per draw.
+pub(crate) const VIEW_REFUSED_CODE: &str = "display-view-refused";
 
 /// `MTLLoadActionDontCare`.
 const LOAD_ACTION_DONT_CARE: u64 = 0;
@@ -786,7 +805,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     /// finished; all of `texture` cleared to black while the display's panel is off (the module
     /// doc, "The panel"), and on a display after display 0 the guest shows nothing on ("A display
     /// the guest does not drive"). `None`, with nothing encoded, where the guest has no scanout on
-    /// display 0 or the queue gives no command buffer. It answers no present, so the host's reads of the display
+    /// display 0 or the queue gives no command buffer, and where the platform refuses the
+    /// display's view of the presented surface a pass would sample (the module doc, "The
+    /// display's view"). It answers no present, so the host's reads of the display
     /// (`graphics::read`) draw with it.
     pub(crate) fn encode_shown(
         &self,
@@ -802,15 +823,31 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         }
         let (changes, color) = self.presented.color();
         let color = (!color.is_identity()).then_some((changes, color));
-        if let Some((surface, hold)) = self.presented.shown() {
+        if let Some((surface, view, hold)) = self.presented.shown() {
             let (from, to) = (surface.pixel_format(), texture.pixel_format());
             self.presented.seen_format(from, to);
-            let drawn = if let Some((changes, color)) = &color {
-                self.encode_colored(*changes, color, &surface, texture, region)
-            } else if BGRA8_FORMATS.contains(&from) && BGRA8_FORMATS.contains(&to) {
+            let copied = BGRA8_FORMATS.contains(&from) && BGRA8_FORMATS.contains(&to);
+            let drawn = if color.is_none() && copied {
                 self.encode_surface(&surface, texture, region)
             } else {
-                self.encode_converted(&surface, texture, region)
+                // A pass samples the surface through the display's view of it (the module doc,
+                // "The display's view").
+                let Some(read) = view.of(&surface) else {
+                    reims_vgpu_vulkan::answer::count_kind(VIEW_REFUSED_CODE);
+                    log::warn!(
+                        target: "reims_vgpu::graphics", kind:% = VIEW_REFUSED_CODE;
+                        "the platform refused the display's view of the presented IOSurface's \
+                         texture (pixel format {from}): the window keeps the frame it shows \
+                         ({VIEW_REFUSED_CODE})"
+                    );
+                    return None;
+                };
+                match &color {
+                    Some((changes, color)) => {
+                        self.encode_colored(*changes, color, read, texture, region)
+                    }
+                    None => self.encode_converted(read, texture, region),
+                }
             };
             if let Some(drawn) = drawn {
                 return Some((drawn, Some(hold)));
@@ -1580,7 +1617,7 @@ mod tests {
     use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform};
 
     use super::super::color::Table;
-    use super::super::{DisplayHold, ShownTexture};
+    use super::super::{DisplayHold, ShownTexture, ShownView};
     use super::*;
 
     const FRAGMENT_BUFFER: &str = "setFragmentBuffer:offset:atIndex:";
@@ -1590,6 +1627,7 @@ mod tests {
                            destinationOrigin:";
     const NEW_BUFFER: &str = "newBufferWithLength:options:";
     const NEW_TEXTURE: &str = "newTextureWithDescriptor:";
+    const NEW_VIEW: &str = "newTextureViewWithPixelFormat:";
     const NEW_PIPELINE: &str = "newRenderPipelineStateWithDescriptor:error:";
     const NAMED: &str = "newFunctionWithName:";
     const FRAGMENT_TEXTURE: &str = "setFragmentTexture:atIndex:";
@@ -1642,6 +1680,7 @@ mod tests {
         let weak = Arc::downgrade(&hold);
         *presented.texture.lock() = Some(ShownTexture {
             texture: surface.clone_ref(),
+            view: Arc::default(),
             hold,
         });
         weak
@@ -1735,6 +1774,7 @@ mod tests {
         let surface = texture(&draw, 80);
         *presented.texture.lock() = Some(ShownTexture {
             texture: surface.clone_ref(),
+            view: Arc::default(),
             hold: Arc::new(DisplayHold {
                 span: None,
                 answers: Mutex::default(),
@@ -2161,6 +2201,7 @@ mod tests {
         let surface = texture(&draw, 94);
         *presented.texture.lock() = Some(ShownTexture {
             texture: surface.clone_ref(),
+            view: Arc::default(),
             hold: Arc::new(DisplayHold {
                 span: None,
                 answers: Mutex::default(),
@@ -2368,16 +2409,19 @@ mod tests {
     }
 
     /// A presented surface is drawn through the colour (a stage on) by the surface's colour
-    /// function, in place of the copy a BGRA8 surface takes, sampled straight from the surface.
-    /// The colour's pass, with no table (`a_surface_takes_the_table_at_its_own_size_in_unorm`)
+    /// function, in place of the copy a BGRA8 surface takes, sampled through the display's view
+    /// of the surface (the module doc, "The display's view"). The colour's pass, with no table
+    /// (`a_surface_takes_the_table_at_its_own_size_in_unorm`)
     #[test]
     fn a_color_draws_a_presented_surface_through_its_tables() {
         let (platform, draw, presented, drawable) = rig();
         draw.without_tables();
         let log = platform.call_log();
         let surface = texture(&draw, 80);
+        let view = Arc::<ShownView<FakePlatform>>::default();
         *presented.texture.lock() = Some(ShownTexture {
             texture: surface.clone_ref(),
+            view: Arc::clone(&view),
             hold: Arc::new(DisplayHold {
                 span: None,
                 answers: Mutex::default(),
@@ -2405,7 +2449,9 @@ mod tests {
             .filter(|c| c.sel == "setFragmentTexture:atIndex:")
             .map(|c| c.args[0].as_obj())
             .collect();
-        assert_eq!(sampled, [Some(surface.id())]);
+        let made = view.made().expect("the display's view");
+        assert_eq!(sampled, [Some(made.id())]);
+        assert_ne!(made.id(), surface.id());
         let bound = fragment_buffers(&platform, mark);
         assert_eq!(
             bound.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
@@ -2546,7 +2592,8 @@ mod tests {
     /// and it is drawn at its own size: the table, of 256 or 1024 entries, is drawn from a ramp
     /// of the surface's format (made once for each format, its width the table's, pixel k value
     /// k in every channel) by the surface's colour function, then the surface through the table
-    /// at texture 1. A surface drawn at another size, or of an sRGB format, takes the pass
+    /// at texture 1, sampled through the display's view of it, made at the first draw alone. A
+    /// surface drawn at another size, or of an sRGB format, takes the pass
     #[test]
     fn a_surface_takes_the_table_at_its_own_size_in_unorm() {
         let (platform, draw, presented, drawable) = rig();
@@ -2560,20 +2607,26 @@ mod tests {
         let post: Table = Arc::from(vec![[0.0, 0.0, 0.0, 0.0], [0.5, 0.25, 1.0, 0.0]]);
         set_color(&presented, 1, [None, None, None, Some(post)]);
         let show = |surface: &<FakePlatform as Platform>::Texture| {
+            let view = Arc::<ShownView<FakePlatform>>::default();
             *presented.texture.lock() = Some(ShownTexture {
                 texture: surface.clone_ref(),
+                view: Arc::clone(&view),
                 hold: Arc::new(DisplayHold {
                     span: None,
                     answers: Mutex::default(),
                 }),
             });
+            view
         };
         for (format, values) in [(80, 256), (70, 256), (94, 1024), (90, 1024)] {
             let surface = texture(&draw, format);
-            show(&surface);
+            let view = show(&surface);
             let mark = log.mark();
             let _ = draw.encode(&drawable, region, None).unwrap();
             assert_eq!(count_since(&platform, mark, DRAW), 2, "{format}");
+            assert_eq!(count_since(&platform, mark, NEW_VIEW), 1, "{format}");
+            let viewed = view.made().expect("the display's view").clone_ref();
+            assert_eq!(viewed.pixel_format(), format);
             assert_eq!(
                 count_since(&platform, mark, NEW_TEXTURE),
                 2,
@@ -2597,13 +2650,19 @@ mod tests {
             );
             assert_eq!(
                 fragment_textures(&platform, mark),
-                [(ramp.id(), 0), (table.id(), 1), (surface.id(), 0)],
+                [(ramp.id(), 0), (table.id(), 1), (viewed.id(), 0)],
                 "{format}"
             );
-            // Again: the ramp is kept.
+            // Again: the ramp and the view are kept.
             let mark = log.mark();
             let _ = draw.encode(&drawable, region, None).unwrap();
             assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 0, "{format}");
+            assert_eq!(count_since(&platform, mark, NEW_VIEW), 0, "{format}");
+            assert_eq!(
+                fragment_textures(&platform, mark),
+                [(ramp.id(), 0), (table.id(), 1), (viewed.id(), 0)],
+                "{format}"
+            );
         }
         let (_, pixel) = table_values(94).unwrap();
         assert_eq!(
@@ -2624,12 +2683,223 @@ mod tests {
         };
         let srgb = texture(&draw, 81);
         for (shown, at) in [(&surface, quarter), (&srgb, region)] {
-            show(shown);
+            let view = show(shown);
             let mark = log.mark();
             let _ = draw.encode(&drawable, at, None).unwrap();
             assert_eq!(count_since(&platform, mark, DRAW), 1);
-            assert_eq!(fragment_textures(&platform, mark), [(shown.id(), 0)]);
+            let viewed = view.made().expect("the display's view");
+            assert_eq!(fragment_textures(&platform, mark), [(viewed.id(), 0)]);
         }
+    }
+
+    /// A presented surface a pass draws, one the guest placed at its index 7, is sampled through
+    /// the display's view of it, a texture at an index of the platform's own, made at the pass's
+    /// first draw and kept: once the guest has let go of the surface and placed a new texture at
+    /// 7, the next draw makes no view and binds the same one, neither texture at 7
+    #[test]
+    fn a_pass_samples_a_presented_surface_through_a_view_at_an_index_of_its_own() {
+        let (platform, draw, presented, drawable) = rig();
+        let log = platform.call_log();
+        let placed = || {
+            let descriptor = draw.platform.texture_descriptor(&TextureDesc {
+                pixel_format: 70,
+                width: 64,
+                height: 32,
+                resource_index: Some((7, true)),
+                ..TextureDesc::default()
+            });
+            (draw.device.new_texture(OnFault::Die, &descriptor))
+                .unwrap()
+                .unwrap()
+        };
+        let surface = placed();
+        assert_eq!(surface.resource_index(), 7);
+        let view = Arc::<ShownView<FakePlatform>>::default();
+        *presented.texture.lock() = Some(ShownTexture {
+            texture: surface.clone_ref(),
+            view: Arc::clone(&view),
+            hold: Arc::new(DisplayHold {
+                span: None,
+                answers: Mutex::default(),
+            }),
+        });
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, WHOLE, None).expect("a draw");
+        assert_eq!(count_since(&platform, mark, NEW_VIEW), 1);
+        let viewed = view.made().expect("the display's view").clone_ref();
+        assert_ne!(viewed.resource_index(), 7);
+        assert_eq!(viewed.pixel_format(), 70);
+        assert_eq!(fragment_textures(&platform, mark), [(viewed.id(), 0)]);
+
+        // The guest lets go of the surface, which the display still shows, and places a new
+        // texture at its index.
+        drop(surface);
+        let next = placed();
+        assert_eq!(next.resource_index(), 7);
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, WHOLE, None).expect("a draw");
+        assert_eq!(count_since(&platform, mark, NEW_VIEW), 0);
+        assert_eq!(fragment_textures(&platform, mark), [(viewed.id(), 0)]);
+    }
+
+    /// Where the platform refuses the display's view of a presented surface a pass would sample,
+    /// the draw answers nothing, the refusal counted: nothing is encoded or committed, and the
+    /// scanout is not drawn in its place. The next draw makes the view and draws through it
+    #[test]
+    fn a_refused_view_of_a_presented_surface_draws_nothing_and_is_counted() {
+        use reims_vgpu_vulkan::core::testkit::Step;
+        let (platform, draw, presented, drawable) = rig();
+        let log = platform.call_log();
+        let surface = texture(&draw, 70);
+        let view = Arc::<ShownView<FakePlatform>>::default();
+        *presented.texture.lock() = Some(ShownTexture {
+            texture: surface.clone_ref(),
+            view: Arc::clone(&view),
+            hold: Arc::new(DisplayHold {
+                span: None,
+                answers: Mutex::default(),
+            }),
+        });
+        let refused = || {
+            (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+                .find(|(code, _)| code == VIEW_REFUSED_CODE)
+                .map_or(0, |(_, n)| n)
+        };
+        let before = refused();
+        platform.script().push(NEW_VIEW, Step::Nil);
+        let mark = log.mark();
+        assert!(draw.encode(&drawable, WHOLE, None).is_none());
+        assert_eq!(refused(), before + 1);
+        assert!(view.made().is_none());
+        let sels = log.sels_since(mark);
+        assert_eq!(sels, [NEW_VIEW], "{sels:?}");
+
+        let mark = log.mark();
+        let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None).expect("a draw");
+        presents.after(&command_buffer);
+        command_buffer.commit(OnFault::Die).unwrap();
+        assert_eq!(refused(), before + 1);
+        let viewed = view.made().expect("the display's view");
+        assert_eq!(fragment_textures(&platform, mark), [(viewed.id(), 0)]);
+        assert!(log.sels_since(mark).contains(&"commit"));
+    }
+
+    /// While the display shows a presented surface the guest placed at its index, the guest lets
+    /// go of it and places a new texture of other pixels at that index: the display's next read
+    /// still reads the shown surface's pixels, through the display's view of it, and the new
+    /// texture's once the display shows it
+    #[test]
+    fn on_vulkan_a_shown_surface_reads_its_own_pixels_after_its_index_is_placed_again() {
+        let platform = crate::rt_test_end::platform();
+        crate::entry::run(|_| shown_surface_reads_its_own_pixels(&platform));
+    }
+
+    /// [`on_vulkan_a_shown_surface_reads_its_own_pixels_after_its_index_is_placed_again`]'s body,
+    /// inside the library's entry.
+    fn shown_surface_reads_its_own_pixels<P: ApiPlatform>(platform: &Arc<P>) {
+        const W: u32 = 64;
+        const H: u32 = 32;
+        /// The guest's index the surfaces are placed at.
+        const PLACED: u64 = 4321;
+        let device = platform.metal_device(None).unwrap();
+        device.reserve_resource_indices(0, &[PLACED]).unwrap();
+        let region = Arc::new(crate::platform::test_region(
+            &**platform,
+            reims_vgpu_graphics::REGION_SIZE as usize,
+        ));
+        let shown = Arc::new(Shown::default());
+        let presented = Arc::new(Presented::<P>::default());
+        let draw = ScanoutDraw::new(Arc::clone(platform), &region, &shown, &presented).unwrap();
+        let whole = PixelRect {
+            x: 0,
+            y: 0,
+            width: u64::from(W),
+            height: u64::from(H),
+        };
+        // An RGBA8 texture of one colour at the placed index: the display converts it.
+        let placed = |rgba: [u8; 4]| {
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                pixel_format: 70,
+                width: u64::from(W),
+                height: u64::from(H),
+                usage: 0x1,
+                resource_options: Some(0),
+                resource_index: Some((PLACED, true)),
+                ..TextureDesc::default()
+            });
+            let texture = (device.new_texture(OnFault::Die, &descriptor))
+                .unwrap()
+                .unwrap();
+            assert_eq!(texture.resource_index(), PLACED);
+            let bytes: Vec<u8> = rgba.repeat((W * H) as usize);
+            let length = bytes.len() as u64;
+            // SAFETY: the bytes live across the call, which copies them out.
+            let range =
+                unsafe { HostRange::new(HostPtr::from_ptr(bytes.as_ptr().cast_mut()), length) };
+            texture
+                .replace_region(
+                    MtlRegion {
+                        origin: MtlOrigin::new(0, 0, 0),
+                        size: MtlSize::new(u64::from(W), u64::from(H), 1),
+                    },
+                    0,
+                    0,
+                    range,
+                    u64::from(W) * 4,
+                    length,
+                )
+                .unwrap();
+            texture
+        };
+        let show = |texture: &P::Texture| {
+            *presented.texture.lock() = Some(ShownTexture {
+                texture: texture.clone_ref(),
+                view: Arc::default(),
+                hold: Arc::new(DisplayHold {
+                    span: None,
+                    answers: Mutex::default(),
+                }),
+            });
+        };
+        // The display's read, into a BGRA8 texture.
+        let read = || -> Vec<u8> {
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                pixel_format: 80,
+                width: u64::from(W),
+                height: u64::from(H),
+                usage: 0x1 | 0x4,
+                resource_options: Some(0),
+                ..TextureDesc::default()
+            });
+            let target = (device.new_texture(OnFault::Die, &descriptor))
+                .unwrap()
+                .unwrap();
+            let (command_buffer, hold) = draw.encode_shown(&target, whole).expect("a draw");
+            command_buffer.commit(OnFault::Die).unwrap();
+            command_buffer.wait_until_completed(OnFault::Die).unwrap();
+            drop(hold);
+            let mut bytes = vec![0; (W * H * 4) as usize];
+            platform.read_pixels(&target, &mut bytes, (W * 4) as usize);
+            bytes
+        };
+        let first = [0x10, 0x80, 0xf0, 0xff];
+        let second = [0xe0, 0x30, 0x50, 0xff];
+        let bgra = |[r, g, b, a]: [u8; 4]| [b, g, r, a].repeat((W * H) as usize);
+
+        let surface = placed(first);
+        show(&surface);
+        assert_eq!(read(), bgra(first), "the shown surface");
+        // The guest lets go of the surface, which the display still shows, and places a new
+        // texture at its index.
+        drop(surface);
+        let next = placed(second);
+        assert_eq!(
+            read(),
+            bgra(first),
+            "the shown surface, its index placed again"
+        );
+        show(&next);
+        assert_eq!(read(), bgra(second), "the new texture, shown");
     }
 
     /// The colour's table draws the drawable's bytes the colour's pass draws: the scanout, and a
@@ -2799,6 +3069,7 @@ mod tests {
                     .unwrap();
                 ShownTexture {
                     texture,
+                    view: Arc::default(),
                     hold: Arc::new(DisplayHold {
                         span: None,
                         answers: Mutex::default(),
@@ -2990,6 +3261,7 @@ mod tests {
                 ] {
                     *presented.texture.lock() = (source == "the surface").then(|| ShownTexture {
                         texture: Handle::clone_ref(&surface),
+                        view: Arc::default(),
                         hold: Arc::new(DisplayHold {
                             span: None,
                             answers: Mutex::default(),

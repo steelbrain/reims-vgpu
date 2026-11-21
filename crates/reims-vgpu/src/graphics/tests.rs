@@ -9375,7 +9375,7 @@ fn a_presented_surface_s_block_waits_for_the_display() {
     // With no window, the present is answered as it is shown.
     let status = answered(&device, &mut guest, present_surface(0x77));
     assert_eq!(status, RGFX_STATUS_OK);
-    let (drawable, _) = device.control.presented[0]
+    let (drawable, _, _) = device.control.presented[0]
         .shown()
         .expect("the surface shown");
     let rect = reims_vgpu_window::PixelRect {

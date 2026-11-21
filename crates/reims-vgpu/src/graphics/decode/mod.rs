@@ -812,6 +812,9 @@ pub(crate) struct SurfacePresent<P: Platform> {
     /// The latest texture a guest process made over the surface's plane 0 with
     /// `TEXTURE_FROM_IOSURFACE` and has not destroyed.
     pub(crate) texture: P::Texture,
+    /// The display's view of it, which its entry keeps ([`Entry::shown_view`]), taken with the
+    /// texture from the one entry.
+    pub(crate) view: Arc<crate::graphics::ShownView<P>>,
     /// The region block it lies in (its buffer's): its offset and size.
     pub(crate) span: Option<(u64, u64)>,
     /// The command buffers committed that write the texture's copy, which the present waits for:
@@ -3595,10 +3598,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             let obj_id = *names.by_surface.get(&iosurface_id)?.last()?;
             (obj_id, names.writers.get(&obj_id).copied())
         };
-        let (texture, span) = self
+        let (texture, view, span) = self
             .context_state(context_of(obj_id))?
             .with_live(obj_id, |e| match &e.handle {
-                ObjHandle::Texture(texture) => Some((texture.clone_ref(), e.span)),
+                ObjHandle::Texture(texture) => {
+                    let view = e.shown_view.clone().unwrap_or_default();
+                    Some((texture.clone_ref(), view, e.span))
+                }
                 _ => None,
             })
             .flatten()?;
@@ -3624,6 +3630,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         Some(SurfacePresent {
             texture,
+            view,
             span,
             writers,
             owner: context_of(obj_id),
@@ -4868,6 +4875,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                         entry.laid_use = laid_use;
                         entry.shape = shape;
                         entry.over_view = matches!(wide, Some((_, true)));
+                        // A present shows the texture over plane 0: the display's view of it
+                        // lives with its entry (`ShownView`).
+                        entry.shown_view = (m.plane == 0).then(Arc::default);
                         self.store(m.obj_id, entry);
                         if m.plane == 0 {
                             let mut names = self.shared.surfaces.lock();
@@ -5117,22 +5127,25 @@ impl<P: Platform> GraphicsDecoder<P> {
                 handle,
                 span,
                 over_view,
+                shown_view,
                 ..
             } = removed.into_entry();
             // Nothing else: a texture's drop gives back the resource id the guest picked, and a
             // buffer's over host memory the GPU address, which the guest's next create may take
-            // at once.
+            // at once. The display's view of a texture holds what the texture holds, and goes
+            // with it.
             if over_view {
                 // Behind its block's jobs, or its own where it has no block.
                 let key = span.map_or(obj_id, |(offset, _)| offset);
                 self.shared
                     .surface_worker
-                    .drop_later(key, obj_id, (managed, handle));
+                    .drop_later(key, obj_id, (managed, handle, shown_view));
             } else {
                 if let Some(copy) = managed {
                     drop_refused(obj_id, copy);
                 }
                 drop_refused(obj_id, handle);
+                drop_refused(obj_id, shown_view);
             }
         }
         if texture {
@@ -6793,9 +6806,13 @@ impl<P: Platform> Closed<P> {
         for r in objects {
             let id = r.id();
             let Entry {
-                managed, handle, ..
+                managed,
+                handle,
+                shown_view,
+                ..
             } = r.into_entry();
             drop_refused(id, handle);
+            drop_refused(id, shown_view);
             if let Some(copy) = managed {
                 copies.push((id, copy));
             }

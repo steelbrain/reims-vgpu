@@ -176,10 +176,14 @@ repeats the ones code cites.
     microseconds; `private-take-span` and `private-take-span-us`, those of
     them longer than the guest's 16 MiB block, an object's own span, and the
     source's time for them; `private-take-lane-us-most`, the longest a take
-    held the thread that carried it out), and `managed-at-copy-unkept`, the
+    held the thread that carried it out), `managed-at-copy-unkept`, the
     `Managed` buffers' creates at their CPU copies' addresses that the
     platform made at others, kept there (docs/graphics-kext/design.md,
-    "Managed buffers at their copies"); a boot's degradations are
+    "Managed buffers at their copies"), and the display's
+    (`display-view-refused`, a draw of the display that kept the window's
+    last frame, or a read of it that answered black, because the platform
+    refused the display's view of the texture it shows: `graphics/sink.rs`,
+    "The display's view"); a boot's degradations are
     read from its last such line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
     repeated since the last count: <n> more of <file>:<line>[ [<kind>]]
     (<target>: <the first line's message>); …` is how many lines of each

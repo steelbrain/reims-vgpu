@@ -217,6 +217,10 @@ pub(crate) struct Entry<P: Platform> {
     /// A heap over a copy of its pages on its process's escaped copies, which it leaves at its drop
     /// ([`super::escape::Listed`]); `None` for any other object.
     pub(crate) listed: Option<super::escape::Listed>,
+    /// A texture over an IOSurface's plane 0, which a present shows: the display's view of it
+    /// ([`crate::graphics::ShownView`]), kept while the entry lives and while the display shows
+    /// the texture; `None` for any other object.
+    pub(crate) shown_view: Option<Arc<crate::graphics::ShownView<P>>>,
     /// The table's clock at its make.
     made: u64,
     /// The first clock of a view that names it: its make's, or the making message's view's where
@@ -247,6 +251,7 @@ impl<P: Platform> Entry<P> {
             over_cache: false,
             escape: None,
             listed: None,
+            shown_view: None,
             made: 0,
             seen: 0,
             live: None,
