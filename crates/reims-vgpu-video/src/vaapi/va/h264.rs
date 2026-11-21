@@ -119,6 +119,13 @@ impl H264Decoder {
     pub fn profile(&self) -> Option<Profile> {
         self.inner.accelerator().session.as_ref().map(|s| s.profile)
     }
+
+    /// The VA context the decoder's session decodes on, once it has started a picture.
+    #[cfg(test)]
+    pub(super) fn context_id(&self) -> Option<ffi::VAContextID> {
+        let session = self.inner.accelerator().session.as_ref()?;
+        session.context.as_ref().map(|context| context.id)
+    }
 }
 
 // Decoders and frames move between threads, and frames are read back from

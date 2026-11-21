@@ -294,6 +294,45 @@ fn pictures(decoder: &mut H264Decoder, samples: &[Vec<u8>]) -> Vec<u64> {
 #[cfg(windows)]
 const HELD_CONTEXT_LOCAL: u64 = 34_905_201;
 
+/// A decoder's context taken back after it decoded a whole stream starts the next stream with
+/// none of the last one's references: beside a decoder that lives throughout (so that, on
+/// Windows, a context let go is kept: `super::display::Display::context_let_go`), a decoder
+/// decodes the whole stream, its DPB left holding the stream's last pictures, and is let go; the
+/// next decoder, on Windows on the same context, decodes the stream's first access units into
+/// surfaces of its own, and its pictures are the first decoder's of them, frame 0 among them.
+/// **Read from code** (Mesa 26.2.4, `d3d12_video_dec_h264.cpp`, `d3d12_video_dec_hevc.cpp` and
+/// `d3d12_video_dec_references_mgr.cpp`): before each picture the driver marks every DPB slot
+/// unused, marks those the picture's reference list names, and releases the rest, with their
+/// map from the frontend's buffers; an IDR names none.
+#[test]
+#[ignore = "needs a VA-API driver that decodes H.264 at 4K, on its GPU: run on a VA-API host"]
+fn a_context_taken_back_starts_the_next_stream_with_none_of_the_last_ones_references() {
+    let display = display();
+    let stream = Stream::new(&display);
+    let first = &stream.samples[..SHORT_SAMPLES.min(stream.samples.len())];
+    let mut living = stream.decoder(&display);
+    let reference = pictures(&mut living, first);
+    assert!(
+        reference.len() > 1,
+        "{} pictures of {} access units",
+        reference.len(),
+        first.len()
+    );
+    let mut whole = stream.decoder(&display);
+    let mut id = 0;
+    let read = decode(&mut whole, &stream.samples, &mut id);
+    assert!(read > first.len(), "{read} pictures of the whole stream");
+    let used = whole.context_id();
+    drop(whole);
+    let mut next = stream.decoder(&display);
+    assert_eq!(pictures(&mut next, first), reference, "the next decoder's pictures");
+    #[cfg(windows)]
+    assert_eq!(next.context_id(), used, "the next decoder's context");
+    #[cfg(unix)]
+    let _ = used;
+    drop(living);
+}
+
 /// Sets its flag when dropped: the long decoder's end, where the test passes or fails.
 struct Ends<'a>(&'a AtomicBool);
 
@@ -337,13 +376,29 @@ fn short_decoders_let_go_beside_a_long_one_decode_alike_and_hold_no_more() {
         );
         #[cfg(windows)]
         let mut readings = vec![Used::now()];
+        #[cfg(windows)]
+        let mut let_go = None;
+        // Each short decoder's pictures that are not the long one's, by their place: told after
+        // the memory, so that a run says both.
+        let mut wrong = Vec::new();
         for n in 0..SHORT {
             let mut decoder = stream.decoder(&display);
-            assert_eq!(
-                pictures(&mut decoder, short),
-                reference,
-                "short decoder {n}'s pictures"
-            );
+            let got = pictures(&mut decoder, short);
+            let differ: Vec<usize> = (0..reference.len().max(got.len()))
+                .filter(|&at| got.get(at) != reference.get(at))
+                .collect();
+            eprintln!("short decoder {n}: pictures not the long one's at {differ:?}");
+            if !differ.is_empty() {
+                wrong.push((n, differ));
+            }
+            #[cfg(windows)]
+            {
+                // Each takes back the context the one before it let go.
+                if n > 0 {
+                    assert_eq!(decoder.context_id(), let_go, "short decoder {n}'s context");
+                }
+                let_go = decoder.context_id();
+            }
             #[cfg(windows)]
             let live = Used::now();
             drop(decoder);
@@ -369,6 +424,10 @@ fn short_decoders_let_go_beside_a_long_one_decode_alike_and_hold_no_more() {
                  a held context's {HELD_CONTEXT_LOCAL}"
             );
         }
+        assert!(
+            wrong.is_empty(),
+            "the short decoders' pictures not the long one's, by decoder and place: {wrong:?}"
+        );
     });
 }
 
