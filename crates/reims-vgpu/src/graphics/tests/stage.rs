@@ -131,11 +131,21 @@ fn a_make_ahead_refused_for_its_stage_starts_the_fill_its_dispatch_joins() {
     let world = platform.world();
     world.stages().refuse_next_prepare(7);
     world.script.push(THREADS, Step::Stage(7));
+    // The make ahead runs on a compile thread and the walk on its own, and the walk waits for
+    // none of it: a walk that reached its dispatch first would start the fill itself. So the walk
+    // is held after its encoder's begin, ahead of its dispatch, until the make ahead started it.
+    let gate = WalkGate::in_place(&device);
     ring.send(&device, dispatching(100));
+    assert!(gate.reached(), "the walk did not start");
     assert!(
         eventually(|| world.prepared().len() == 1),
         "nothing was made ahead"
     );
+    assert!(
+        eventually(|| world.stages().started_at() == [(7, Site::MakeAhead)]),
+        "the make ahead started no fill"
+    );
+    gate.open();
     assert!(
         eventually(|| world.log.count(THREADS) == 1),
         "the walk never dispatched"
