@@ -39,12 +39,10 @@
 # path on every compile (vendor/qemu/meson.build's -iquote), so at another path ninja rebuilds it
 # all.
 #
-# A tree that does not hold the base's commit (another repository, as metal2vulkan's) takes all its
-# tracked files as changed: it reuses the dependencies' units only. seed does nothing where
-# MINIBASE=0, where target/ already holds files (an advanced workspace builds in place), where no
-# base is published, or where the base built through another compiler wrapper (kache) than this
-# job, and says so; it prints what it copied, dropped and rewrote, and writes it to
-# target/minibase.seeded. failed, which a job runs after its build or tests failed, prints where
+# seed does nothing where MINIBASE=0, where target/ already holds files (an advanced workspace
+# builds in place), where no base is published, where this tree does not hold the base's commit,
+# or where the base built through another compiler wrapper (kache) than this job, and says so; it
+# prints what it copied, dropped and rewrote, and writes it to target/minibase.seeded. failed, which a job runs after its build or tests failed, prints where
 # the workspace's target/ came from (nothing, where it was not seeded) and that MINIBASE=0 builds
 # it again without the seed, so a lane can tell a seed's fault from a compile error.
 set -u
@@ -103,6 +101,8 @@ seed() {
   [ "$me" != "$bname" ] || { say "this workspace is the base"; return 0; }
   [ "$(field wrapper "$cur")" = "$(wrapper)" ] ||
     { say "the base built through $(field wrapper "$cur"), this job through $(wrapper): a fresh build"; return 0; }
+  git cat-file -e "$bc^{commit}" 2>/dev/null ||
+    { say "this tree does not hold the base's commit ${bc:0:10}: a fresh build"; return 0; }
 
   copy "$base/target" target || { say "copying the base's target/ failed: a fresh build"; rm -rf target; return 0; }
   rm -f target/minibase.env target/minibase.seeded
@@ -122,17 +122,11 @@ seed() {
   local copy_s=$((SECONDS - start))
 
   # Sources' mtimes: unchanged old, changed now.
-  local mode=repo changed
-  if git cat-file -e "$bc^{commit}" 2>/dev/null; then
-    git ls-files -z | xargs -0 touch -c -m -t $old
-    find . \( -path ./.git -o -path ./target -o -path ./nv -o -path ./vendor/qemu \) -prune -o -type d -print0 |
-      xargs -0 touch -c -m -t $old
-    changed=$({ git diff --no-renames --name-only "$bc" HEAD; git diff --no-renames --name-only HEAD; } | sort -u)
-  else
-    mode=foreign
-    git ls-files -z | xargs -0 touch -c -m
-    changed=
-  fi
+  local changed
+  git ls-files -z | xargs -0 touch -c -m -t $old
+  find . \( -path ./.git -o -path ./target -o -path ./nv -o -path ./vendor/qemu \) -prune -o -type d -print0 |
+    xargs -0 touch -c -m -t $old
+  changed=$({ git diff --no-renames --name-only "$bc" HEAD; git diff --no-renames --name-only HEAD; } | sort -u)
   [ -n "$changed" ] && echo "$changed" | awk '{ print; while (sub(/\/[^\/]*$/, "")) print }' | sort -u |
     tr '\n' '\0' | xargs -0 touch -c -m
 
@@ -167,7 +161,7 @@ seed() {
 
   # QEMU, where nothing it is built from changed.
   local qemu=none
-  if [ $nv = 1 ] && [ $mode = repo ] && [ "${MINIBASE_QEMU:-1}" = 1 ] && [ -e "$base/nv/data/reims-ctl/qemu/current" ]; then
+  if [ $nv = 1 ] && [ "${MINIBASE_QEMU:-1}" = 1 ] && [ -e "$base/nv/data/reims-ctl/qemu/current" ]; then
     local paths=(vendor/qemu crates firmware xtask Cargo.toml Cargo.lock rust-toolchain.toml .cargo ':!crates/reims-ctl')
     if git diff --quiet "$bc" HEAD -- "${paths[@]}" && git diff --quiet HEAD -- "${paths[@]}"; then
       local qd id
@@ -186,7 +180,6 @@ seed() {
     echo "from=$bname"
     echo "commit=$bc"
     echo "depth=$depth"
-    echo "mode=$mode"
     echo "copied=$copied"
     echo "changed=$(echo -n "$changed" | grep -c .)"
     echo "dropped=$(for f in ${drop[@]+"${drop[@]}"}; do echo "${f#*/build/}"; done | sort -u | tr '\n' ' ')"
@@ -194,7 +187,7 @@ seed() {
     echo "qemu=$qemu"
     echo "seconds=$((SECONDS - start)) (copy $copy_s)"
   } > target/minibase.seeded
-  say "seeded from $bname at ${bc:0:10} ($mode): $(tr '\n' ';' < target/minibase.seeded)"
+  say "seeded from $bname at ${bc:0:10}: $(tr '\n' ';' < target/minibase.seeded)"
 }
 
 publish() {
