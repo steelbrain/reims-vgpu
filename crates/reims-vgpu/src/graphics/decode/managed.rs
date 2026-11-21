@@ -2746,10 +2746,12 @@ mod tests {
         drop(r);
         drop(shared_pool);
         let (ended, end) = mpsc::channel();
-        let release = std::thread::spawn(move || {
+        let release = std::thread::Builder::new().name("x-release".into());
+        let release = release.spawn(move || {
             drop(ledger);
             let _ = ended.send(());
         });
+        let release = release.expect("a thread");
         assert_eq!(
             end.recv_timeout(Duration::from_secs(10)),
             Ok(()),
