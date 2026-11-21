@@ -582,6 +582,20 @@ fn wide_os(s: &std::ffi::OsStr) -> Vec<u16> {
     s.encode_wide().chain([0]).collect()
 }
 
+/// How long a stop waits for QEMU to end after QMP's `quit` before it ends it (`ENDS`): about
+/// twice [`QEMU_EXIT_MEASURED`] ([`super::follows_the_measured_exit`]).
+pub const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The longest QEMU took to end on Windows, from the guest's shutdown to the process's end.
+/// **Measured** on an Intel UHD Graphics 630, Windows 11, 2026-11-20, three boots of a macOS
+/// 26.7.2 guest stopped after Safari ran a WebGL page: 2.4, 4.9 and 28.1 s. In the 28.1 s, QEMU
+/// called `ExitProcess` 1.4 s after the shutdown, and its process ended 26.7 s after that. A stop
+/// that gave QEMU 15 s after `quit` (10 s, then 5 s after `TerminateProcess`) ended in "did not
+/// exit", with QEMU gone 2 s later.
+pub const QEMU_EXIT_MEASURED: std::time::Duration = std::time::Duration::from_millis(28_100);
+
+const _: () = assert!(super::follows_the_measured_exit(QUIT_WAIT, QEMU_EXIT_MEASURED));
+
 /// The ways a stop ends a QEMU that QMP's `quit` did not: TerminateProcess. Windows has no
 /// signal that asks a process with no console to end.
 pub const ENDS: &[super::End] = &[(terminate, "killed (TerminateProcess)")];

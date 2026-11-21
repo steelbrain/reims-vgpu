@@ -23,6 +23,18 @@ pub struct SoundDevices {
 /// A way to end a process, by its pid, with what a stop says once it has ended (`ENDS`).
 pub type End = (fn(i32), &'static str);
 
+/// Whether `wait`, how long a stop waits for QEMU to end after QMP's `quit` before it ends it
+/// (`QUIT_WAIT`, then `ENDS`), follows `measured`, the longest QEMU was measured to take to end
+/// on the OS (`QEMU_EXIT_MEASURED`): about twice it, and 10 s at least.
+pub const fn follows_the_measured_exit(
+    wait: std::time::Duration,
+    measured: std::time::Duration,
+) -> bool {
+    let twice = 2 * measured.as_millis();
+    let want = if twice > 10_000 { twice } else { 10_000 };
+    wait.as_millis() >= want && wait.as_millis() <= want + 5_000
+}
+
 /// A local date and time, by the host's clock and time zone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalTime {

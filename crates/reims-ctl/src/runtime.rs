@@ -932,9 +932,11 @@ pub const NO_SHUTDOWN: &str = "the guest did not shut down in time (a question a
      document, or Setup Assistant, which macOS opens once on a new Mac, holds it up: answer it in \
      the VM's window): powering off";
 
+/// Powers the VM off: QMP's `quit`, then, where QEMU has not ended [`crate::os::QUIT_WAIT`] on,
+/// each of [`crate::os::ENDS`] in turn, 5 s apart.
 fn power_off(vm: &Vm, p: i32, progress: &mut impl FnMut(&str)) -> Result<()> {
     let _ = qmp::run(&vm.qmp_socket(), "quit", None);
-    if wait_gone(p, Duration::from_secs(10)) {
+    if wait_gone(p, crate::os::QUIT_WAIT) {
         progress("powered off");
         return Ok(());
     }
@@ -1107,6 +1109,22 @@ impl Drop for TestQemu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stop waits for QEMU to end after `quit` about twice the longest it was measured to take
+    /// on the host's OS, and 10 s at least, before it ends QEMU: 15 s on Windows, where QEMU took
+    /// 28.1 s, fails the rule, and 60 s follows it.
+    #[test]
+    fn the_wait_after_quit_follows_the_measured_exit_with_a_10_s_floor() {
+        use crate::os::{QEMU_EXIT_MEASURED, QUIT_WAIT, follows_the_measured_exit};
+        assert!(follows_the_measured_exit(QUIT_WAIT, QEMU_EXIT_MEASURED));
+        let windows = Duration::from_millis(28_100);
+        assert!(!follows_the_measured_exit(Duration::from_secs(15), windows));
+        assert!(follows_the_measured_exit(Duration::from_secs(60), windows));
+        assert!(!follows_the_measured_exit(Duration::from_secs(120), windows));
+        let linux = Duration::from_millis(440);
+        assert!(follows_the_measured_exit(Duration::from_secs(10), linux));
+        assert!(!follows_the_measured_exit(Duration::from_secs(5), linux));
+    }
 
     /// The limit at which an NVIDIA GPU takes a guest uncopied is a mapping per 4 KiB page of it
     /// past the library's 16,384 and 8,192, as the library's own line names it

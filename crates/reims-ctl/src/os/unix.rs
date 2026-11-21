@@ -251,6 +251,17 @@ pub fn spawn_detached(mut cmd: Command, log: std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
+/// How long a stop waits for QEMU to end after QMP's `quit` before it ends it (`ENDS`): the 10 s
+/// floor, which covers twice [`QEMU_EXIT_MEASURED`] ([`super::follows_the_measured_exit`]).
+pub const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest QEMU took to end on Linux, from the guest's shutdown to the process's end.
+/// **Measured** on a Radeon 780M, 2026-11-20: 0.44 s, a macOS 26.7.2 guest stopped after Safari
+/// ran a WebGL page. Not measured on macOS hosts.
+pub const QEMU_EXIT_MEASURED: std::time::Duration = std::time::Duration::from_millis(440);
+
+const _: () = assert!(super::follows_the_measured_exit(QUIT_WAIT, QEMU_EXIT_MEASURED));
+
 /// The ways a stop ends a QEMU that QMP's `quit` did not, in order, each with what the stop says
 /// once QEMU is gone: SIGTERM, then SIGKILL.
 pub const ENDS: &[super::End] = &[
