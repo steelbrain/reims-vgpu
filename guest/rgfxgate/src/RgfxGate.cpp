@@ -12,5 +12,8 @@ void graft_client_initialize() {
         return;
     if (!rgfxgate::installHooks())
         return;
+#if !defined(__arm64e__)
+    rgfxgate::installXstate();
+#endif
     rgfxgate::startInstaller();
 }

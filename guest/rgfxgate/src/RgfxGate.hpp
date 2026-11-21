@@ -44,6 +44,14 @@ bool cdhashIsOurs(void *fg, uint64_t offset);
 // Install all six kernel hooks atomically, or leave the gate disabled.
 bool installHooks();
 
+#if !defined(__arm64e__)
+// Where XNU took AVX-512 state from CPUID leaf 0xD while leaf 7 says the CPU
+// has none, promote every user thread to AVX-512 state at its first FP use,
+// and copy that state at CPUID's offsets where they are not Intel's
+// (RgfxGateXstate.cpp). Logs what it installed, or why nothing, to Graft's log.
+void installXstate();
+#endif
+
 // Run once at boot: wait for the Data volume, then install/replace the bundle
 // in kernel context if missing or different. No-op in x86-64's installer and
 // Recovery; in arm64's BaseSystem it installs into the temporary Data volume and

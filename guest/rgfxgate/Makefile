@@ -6,8 +6,11 @@
 #
 #   make BUNDLE_DIR=<signed reims-graphics.bundle dir>   build/RgfxGate.kext
 #   make test                                            native tests of the matching and preference logic,
-#                                                        the tree removal, the pass's decisions, and when
-#                                                        the payload is made again
+#                                                        the tree removal, the pass's decisions, the AVX-512
+#                                                        state copy, and when the payload is made again
+#   make sigproof                                        build/xstate_sigproof-x86_64, the guest's own proof
+#                                                        of what a thread keeps across signals and thread
+#                                                        state (tests/xstate_sigproof.c); run in a guest
 #   make clean
 #
 # BUNDLE_DIR is the signed bundle to embed; packaging reads its cdhash with
@@ -49,9 +52,10 @@ CXXFLAGS = $(FLAGS) -MMD -MP -std=c++17 -fapple-kext -fno-rtti -fno-exceptions \
 	-I$(GEN) -Isrc -I$(GRAFT)/sdk/include
 
 OBJS = $(BUILD)/obj/RgfxGate.o $(BUILD)/obj/RgfxGateHooks.o \
-	$(BUILD)/obj/RgfxGateInstall.o $(BUILD)/obj/RgfxGatePrefs.o $(BUILD)/obj/GraftStart.o
+	$(BUILD)/obj/RgfxGateInstall.o $(BUILD)/obj/RgfxGatePrefs.o $(BUILD)/obj/RgfxGateXstate.o \
+	$(BUILD)/obj/GraftStart.o
 
-.PHONY: all clean test FORCE
+.PHONY: all clean test sigproof FORCE
 all: $(PLIST)
 
 -include $(OBJS:.o=.d)
@@ -91,6 +95,10 @@ $(BUILD)/obj/RgfxGatePrefs.o: src/RgfxGatePrefs.cpp src/RgfxGatePrefs.hpp src/Rg
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
+$(BUILD)/obj/RgfxGateXstate.o: src/RgfxGateXstate.cpp src/RgfxGate.hpp src/rgfx_xstate.h
+	@mkdir -p $(BUILD)/obj
+	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
+
 $(BUILD)/obj/GraftStart.o: $(GRAFT)/sdk/Start.cpp
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
@@ -106,7 +114,14 @@ $(PLIST): $(BIN) Info.plist Makefile
 	@nm $(BIN) | grep ' _kmod_info$$' > /dev/null || { echo "no _kmod_info in $(BIN): OpenCore refuses it" >&2; exit 1; }
 	@echo "built $(KEXT)"
 
-test:
+sigproof: $(BUILD)/xstate_sigproof-x86_64
+
+$(BUILD)/xstate_sigproof-x86_64: tests/xstate_sigproof.c Makefile
+	@mkdir -p $(BUILD)
+	xcrun --sdk macosx clang -arch x86_64 -O2 -mmacosx-version-min=11.0 -Wall -Werror $< -o $@
+
+# The guest's proof is built here, not run: it runs in an x86-64 guest.
+test: sigproof
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/match_test.cpp -o $(BUILD)/obj/match_test
 	$(BUILD)/obj/match_test
@@ -118,7 +133,9 @@ test:
 	$(BUILD)/obj/tree_test
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/pass_test.cpp -o $(BUILD)/obj/pass_test
 	$(BUILD)/obj/pass_test
+	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/xstate_test.cpp -o $(BUILD)/obj/xstate_test
+	$(BUILD)/obj/xstate_test
 	bash tests/payload_test.sh $(BUILD)/payload-test
 
 clean:
-	rm -rf $(BUILD)/obj $(BUILD)/gen $(KEXT)
+	rm -rf $(BUILD)/obj $(BUILD)/gen $(KEXT) $(BUILD)/xstate_sigproof-x86_64
