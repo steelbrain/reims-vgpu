@@ -1671,7 +1671,10 @@ mod tests {
                  buffer fails from here on, and nothing makes the device again (rt-device-lost)\n"
             ]
         );
-        assert_eq!(said_lost(" on B GPU (1234:9abc) faulted: "), Vec::<String>::new());
+        assert_eq!(
+            said_lost(" on B GPU (1234:9abc) faulted: "),
+            Vec::<String>::new()
+        );
     }
 
     /// Each command buffer rt ends as in flight at its device's loss writes a line after the

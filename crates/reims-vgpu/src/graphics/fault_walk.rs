@@ -20,8 +20,9 @@ struct Tables(TableWalk<RtPlatform>);
 impl LiveObjects for Tables {
     fn walk(&self) -> Walked {
         let mut walked = Walked::default();
-        let (contexts, unwalked, busy) =
-            self.0.each(fault::BOUND, &mut |context, id, gone, object| match object {
+        let (contexts, unwalked, busy) = self.0.each(
+            fault::BOUND,
+            &mut |context, id, gone, object| match object {
                 TableObject::Buffer(buffer) => {
                     walked.add(fault::buffer_parts(context, id, gone, buffer), false);
                 }
@@ -34,7 +35,8 @@ impl LiveObjects for Tables {
                 TableObject::ManagedCopy(buffer) => {
                     walked.add(fault::managed_copy_parts(context, id, gone, buffer), false);
                 }
-            });
+            },
+        );
         walked.contexts = contexts;
         walked.unwalked = unwalked;
         walked.contexts_busy = busy;

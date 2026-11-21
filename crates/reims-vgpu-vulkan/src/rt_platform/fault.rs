@@ -207,7 +207,10 @@ impl<T> Nearest<'_, T> {
         };
         let above = match self.above {
             Some((range, gap)) => {
-                format!("{}, its first byte {gap:#x} bytes past the address", name(range))
+                format!(
+                    "{}, its first byte {gap:#x} bytes past the address",
+                    name(range)
+                )
             }
             None => "none".to_owned(),
         };
@@ -333,26 +336,31 @@ impl Placement<'_> {
     /// offset in it, or in none and the nearest below and above, then those the access's bytes
     /// reach beside; then the same of the mapped blocks.
     pub fn text(&self) -> String {
-        let mut objects = (self.objects.iter())
-            .map(|(object, offset)| format!("inside {} at offset {offset:#x}", object_text(object)))
-            .collect::<Vec<_>>();
+        let mut objects = Vec::new();
+        for (object, offset) in &self.objects {
+            let object = object_text(object);
+            objects.push(format!("inside {object} at offset {offset:#x}"));
+        }
         if let Some(nearest) = &self.nearest_objects {
             objects.push(format!("in no live object ({})", nearest.text(object_text)));
         }
-        objects.extend((self.near_objects.iter()).map(|object| {
-            format!("its bytes reach {} (not its address)", object_text(object))
-        }));
-        let mut blocks = (self.blocks.iter())
-            .map(|(block, offset)| {
-                format!("in mapped block {} at offset {offset:#x}", block_text(block))
-            })
-            .collect::<Vec<_>>();
-        if let Some(nearest) = &self.nearest_blocks {
-            blocks.push(format!("in no mapped block we know ({})", nearest.text(block_text)));
+        for object in &self.near_objects {
+            let object = object_text(object);
+            objects.push(format!("its bytes reach {object} (not its address)"));
         }
-        blocks.extend((self.near_blocks.iter()).map(|block| {
-            format!("its bytes reach mapped block {} (not its address)", block_text(block))
-        }));
+        let mut blocks = Vec::new();
+        for (block, offset) in &self.blocks {
+            let block = block_text(block);
+            blocks.push(format!("in mapped block {block} at offset {offset:#x}"));
+        }
+        if let Some(nearest) = &self.nearest_blocks {
+            let nearest = nearest.text(block_text);
+            blocks.push(format!("in no mapped block we know ({nearest})"));
+        }
+        for block in &self.near_blocks {
+            let block = format!("mapped block {}", block_text(block));
+            blocks.push(format!("its bytes reach {block} (not its address)"));
+        }
         format!("{}, {}", objects.join("; "), blocks.join("; "))
     }
 }
@@ -591,10 +599,12 @@ impl FaultWatch {
         let placed = |at: &rt::FaultAddress| {
             let placement = place(at.address, at.precision, &objects, &blocks);
             let (start, end) = placement.range;
-            format!("{at:?}, the bytes [{start:#x}, {end:#x}): {}", placement.text())
+            let text = placement.text();
+            format!("{at:?}, the bytes [{start:#x}, {end:#x}): {text}")
         };
         for at in &fault.instructions {
-            lines.push(format!("{head}instruction {}; {NO_CODE_SEEN}\n", placed(at)));
+            let at = placed(at);
+            lines.push(format!("{head}instruction {at}; {NO_CODE_SEEN}\n"));
         }
         for at in &fault.accesses {
             lines.push(format!("{head}access {}\n", placed(at)));
@@ -712,7 +722,7 @@ impl FaultWatch {
 mod tests {
     use super::*;
 
-    use ash::vk;
+    use ash::vk::DeviceFaultAddressTypeEXT as Kind;
 
     fn buffer(id: u64, gpu_address: u64, len: u64) -> LiveObject {
         LiveObject {
@@ -742,7 +752,10 @@ mod tests {
     /// it is in no live object and no mapped block we know.
     #[test]
     fn a_fault_s_access_is_placed_among_live_objects_and_mapped_blocks() {
-        assert_eq!(fault_range(0xdef63a3123, 0x1000), (0xdef63a3000, 0xdef63a4000));
+        assert_eq!(
+            fault_range(0xdef63a3123, 0x1000),
+            (0xdef63a3000, 0xdef63a4000)
+        );
         assert_eq!(fault_range(0x10, 0), (0x10, 0x11));
         let objects = [
             buffer(0x1_0000_0001, 0x10_0000, 0x400),
@@ -756,7 +769,12 @@ mod tests {
         ];
         let blocks = [
             block("rt's pool allocation 7", 0x10_0000, 0x100_0000, None),
-            block("known block 9 of allocation 12", 0x200_0000, 0x1_0000, Some("an import")),
+            block(
+                "known block 9 of allocation 12",
+                0x200_0000,
+                0x1_0000,
+                Some("an import"),
+            ),
         ];
         // Inside the buffer and the pool allocation.
         let inside = place(0x10_0123, 0x10, &objects, &blocks);
@@ -764,7 +782,10 @@ mod tests {
         assert_eq!(inside.objects, [(&objects[0], 0x123)]);
         assert!(inside.near_objects.is_empty() && inside.near_blocks.is_empty());
         assert_eq!(inside.blocks, [(&blocks[0], 0x123)]);
-        assert_eq!((inside.nearest_objects, inside.nearest_blocks), (None, None));
+        assert_eq!(
+            (inside.nearest_objects, inside.nearest_blocks),
+            (None, None)
+        );
         assert_eq!(
             place(0x10_0123, 0x10, &objects, &blocks).text(),
             "inside buffer 0x100000001 of context 3 (Private, length 0x400, at 0x100000) at offset \
@@ -830,8 +851,14 @@ mod tests {
         // Between the first two buffers, past the first allocation's end, below the second.
         let between = place(0x20_0400, 0x1000, &objects, &blocks);
         let objects_near = between.nearest_objects.as_ref().unwrap();
-        assert_eq!(objects_near.below, Some((&objects[0], 0x20_0400 - 0x10_0400)));
-        assert_eq!(objects_near.above, Some((&objects[1], 0x30_0000 - 0x20_0400)));
+        assert_eq!(
+            objects_near.below,
+            Some((&objects[0], 0x20_0400 - 0x10_0400))
+        );
+        assert_eq!(
+            objects_near.above,
+            Some((&objects[1], 0x30_0000 - 0x20_0400))
+        );
         let blocks_near = between.nearest_blocks.as_ref().unwrap();
         // The known block spans its whole allocation: of the two, the first.
         assert_eq!(blocks_near.below, Some((&blocks[0], 0x400)));
@@ -865,7 +892,10 @@ mod tests {
         // Below every range, and in an empty set.
         let low = place(0x1000, 0x1000, &objects, &[]);
         let near = low.nearest_objects.as_ref().unwrap();
-        assert_eq!((near.below, near.above), (None, Some((&objects[0], 0xf_f000))));
+        assert_eq!(
+            (near.below, near.above),
+            (None, Some((&objects[0], 0xf_f000)))
+        );
         assert_eq!(
             low.nearest_blocks,
             Some(Nearest {
@@ -873,9 +903,11 @@ mod tests {
                 above: None
             })
         );
-        assert!(low.text().ends_with(
-            ", in no mapped block we know (nearest below: none; nearest above: none)"
-        ));
+        assert!(
+            low.text().ends_with(
+                ", in no mapped block we know (nearest below: none; nearest above: none)"
+            )
+        );
     }
 
     /// A decoder's tables as a test makes them.
@@ -926,8 +958,9 @@ mod tests {
     #[test]
     fn a_lost_device_s_lines_name_the_driver_s_fault_and_place_it() {
         let allocations = Arc::new(Allocations::default());
-        allocations.0.lock().insert(7, (rt::MemoryClass::Private, 0x52_0000_0000, 0x100_0000));
-        allocations.0.lock().insert(8, (rt::MemoryClass::Shared, 0x53_0000_0000, 0x100_0000));
+        let private = (rt::MemoryClass::Private, 0x52_0000_0000, 0x100_0000);
+        let shared = (rt::MemoryClass::Shared, 0x53_0000_0000, 0x100_0000);
+        allocations.0.lock().extend([(7, private), (8, shared)]);
         let watch = FaultWatch::new(Arc::clone(&allocations), KnownBlocks::default());
         watch.watch(Arc::new(Tables {
             objects: vec![buffer(0x9, 0x1000, 0x1000)],
@@ -960,20 +993,18 @@ mod tests {
         let fault = rt::DeviceFault {
             description: "a fault".to_owned(),
             accesses: vec![
-                at(vk::DeviceFaultAddressTypeEXT::READ_INVALID, 0x52_0000_0810, 0x10),
-                at(vk::DeviceFaultAddressTypeEXT::WRITE_INVALID, 0x52_1af0_0000, 0x1000),
+                at(Kind::READ_INVALID, 0x52_0000_0810, 0x10),
+                at(Kind::WRITE_INVALID, 0x52_1af0_0000, 0x1000),
             ],
-            instructions: vec![at(
-                vk::DeviceFaultAddressTypeEXT::INSTRUCTION_POINTER_FAULT,
-                0xde_fe1f_bef0,
-                0x10,
-            )],
+            instructions: vec![at(Kind::INSTRUCTION_POINTER_FAULT, 0xde_fe1f_bef0, 0x10)],
             vendor: vec![("mmu".to_owned(), 0x1f, 0x2)],
         };
         let lines = watch.lines("GPU (10de:2204)", Some(&fault));
         let head = "reims-vgpu: the rt platform's device on GPU (10de:2204) faulted: ";
         assert_eq!(lines.len(), 5);
-        assert!(lines.iter().all(|line| line.starts_with(head) && line.ends_with('\n')));
+        for line in &lines {
+            assert!(line.starts_with(head) && line.ends_with('\n'), "{line}");
+        }
         assert_eq!(
             lines[0],
             format!(
@@ -1045,12 +1076,14 @@ mod tests {
     /// Where rt read no report of the fault, its one line says so.
     #[test]
     fn a_loss_with_no_fault_report_says_so() {
-        let watch = FaultWatch::default();
+        let lines = FaultWatch::default().lines("GPU (1002:744c)", None);
         assert_eq!(
-            watch.lines("GPU (1002:744c)", None),
-            ["reims-vgpu: the rt platform's device on GPU (1002:744c) faulted: rt read no report \
-              of the fault (the device has no VK_EXT_device_fault, the read failed, or a window's \
-              swapchain reported the loss)\n"]
+            lines,
+            [
+                "reims-vgpu: the rt platform's device on GPU (1002:744c) faulted: rt read no \
+                 report of the fault (the device has no VK_EXT_device_fault, the read failed, or \
+                 a window's swapchain reported the loss)\n"
+            ]
         );
     }
 }

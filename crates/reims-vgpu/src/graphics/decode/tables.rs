@@ -508,6 +508,11 @@ impl<P: Platform> Tables<P> {
     }
 }
 
+/// What [`Context::each_object`] calls with each entry of the table: its id, whether it was
+/// removed and is kept for an open view, its handle and its `Managed` CPU copy's buffer.
+pub(super) type EachEntry<'a, P> =
+    dyn FnMut(u64, bool, &ObjHandle<P>, Option<&<P as Platform>::Buffer>) + 'a;
+
 /// One context's state: its objects, and the drain its command buffers join.
 pub(crate) struct Context<P: Platform> {
     /// The context's id.
@@ -539,11 +544,7 @@ impl<P: Platform> Context<P> {
     /// open view, its handle and its `Managed` CPU copy's buffer, under a read of the table's lock
     /// had within `bound`; false where the lock was not had in it (a device's loss,
     /// `super::TableWalk`).
-    pub(super) fn each_object(
-        &self,
-        bound: std::time::Duration,
-        f: &mut dyn FnMut(u64, bool, &ObjHandle<P>, Option<&P::Buffer>),
-    ) -> bool {
+    pub(super) fn each_object(&self, bound: std::time::Duration, f: &mut EachEntry<'_, P>) -> bool {
         let Some(tables) = self.tables.try_read_for(bound) else {
             return false;
         };
@@ -551,10 +552,12 @@ impl<P: Platform> Context<P> {
             (entry.managed.as_ref()).and_then(|copy| copy.cpu.as_ref())
         }
         for (&id, owned) in &tables.live {
-            f(id, false, &owned.entry().handle, cpu(owned.entry()));
+            let entry = owned.entry();
+            f(id, false, &entry.handle, cpu(entry));
         }
         for (removed, _) in &tables.gone {
-            f(removed.id(), true, &removed.entry().handle, cpu(removed.entry()));
+            let entry = removed.entry();
+            f(removed.id(), true, &entry.handle, cpu(entry));
         }
         true
     }

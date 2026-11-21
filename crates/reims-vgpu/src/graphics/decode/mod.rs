@@ -841,6 +841,10 @@ pub(crate) enum TableObject<'a, P: Platform> {
     ManagedCopy(&'a P::Buffer),
 }
 
+/// What [`TableWalk::each`] calls with each object: its context, its id, whether it was removed
+/// and is kept for an open view, and the object.
+pub(crate) type EachTableObject<'a, P> = dyn for<'o> FnMut(u32, u64, bool, TableObject<'o, P>) + 'a;
+
 /// A decoder's tables, held weakly, for the walk at its device's loss (`super::fault_walk`).
 pub(crate) struct TableWalk<P: Platform>(Weak<Shared<P>>);
 
@@ -858,7 +862,7 @@ impl<P: Platform> TableWalk<P> {
     pub(crate) fn each(
         &self,
         bound: std::time::Duration,
-        f: &mut dyn FnMut(u32, u64, bool, TableObject<'_, P>),
+        f: &mut EachTableObject<'_, P>,
     ) -> (usize, Vec<u32>, bool) {
         let Some(shared) = self.0.upgrade() else {
             return (0, Vec::new(), false);
