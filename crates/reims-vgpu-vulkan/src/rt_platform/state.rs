@@ -389,7 +389,10 @@ mod tests {
             ..SamplerDesc::default()
         };
         assert!(sampler(&unknown).is_none());
-        assert_eq!((counted(metal), counted(ours)), (before.0 + 1, before.1 + 1));
+        assert_eq!(
+            (counted(metal), counted(ours)),
+            (before.0 + 1, before.1 + 1)
+        );
         let gap = Kind::Gap.code();
         let before = counted(gap);
         let cubic = SamplerDesc {
