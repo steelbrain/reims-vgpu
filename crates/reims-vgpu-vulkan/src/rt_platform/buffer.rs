@@ -3168,6 +3168,163 @@ mod tests {
         assert_eq!(buffer.contents(), contents);
     }
 
+    /// On the GPU the test holds, kept busy: a no-copy buffer of 17 MiB over memory of the host's
+    /// own, rt's import of its pages, released while command buffers are in flight, has its
+    /// deallocator run while that load still runs, once rt freed the import (the module's docs,
+    /// "Imports"), with no wait for the load's later work. Under each of two loads, the test
+    /// commits command buffers of buffer fills, the next as the oldest completes: 3 in flight of
+    /// a GiB of fills each, as
+    /// `texture::tests::released_textures_go_while_the_gpu_stays_busy_on_vulkan` keeps, and 8 in
+    /// flight of one 4-byte fill each, as the busy arm of metal2vulkan-runtime's
+    /// `every_device_times_a_host_memory_import_by_part` keeps beside its import of 17 MiB. It
+    /// releases the buffer, which no work uses, once the load is in flight, and keeps the load up
+    /// until the deallocator ran or `LOADED` passed. Where it did not run by then, the load stops,
+    /// and the test waits up to `AFTER` more to say which it saw: the deallocator run only once
+    /// the load stopped, or never.
+    #[test]
+    fn a_released_no_copy_buffer_is_deallocated_while_the_gpu_stays_busy_on_vulkan() {
+        use std::collections::VecDeque;
+
+        use crate::core::platform::os::{Clock as _, MonoTime};
+        use crate::core::platform::types::CommandBufferStatus;
+        use crate::rt_platform::RtCommandBuffer;
+        // The no-copy buffer's length.
+        const LEN: u64 = 17 << 20;
+        // How long the load runs past the release for the deallocator. The work committed before
+        // the release is at most 3 command buffers of a GiB of fills, about 0.24 s each on the
+        // UHD 630, the slowest GPU the tests run on (the texture test's 60 in 14.3 s,
+        // m3-max-63591): 10 s is some 14 times theirs, for a host loaded by other tests too.
+        const LOADED: Duration = Duration::from_secs(10);
+        // How long the test then waits for the deallocator with the GPU idle, looking every
+        // 10 ms: twice `LOADED`, so the test's waits stay near a minute for both loads.
+        const AFTER: Duration = Duration::from_secs(20);
+        // Each load: its name, command buffers in flight, the filled buffer's length and options,
+        // and each command buffer's fills and their bytes.
+        let loads = [
+            (
+                "3 in flight of a GiB of fills each",
+                3,
+                32 << 20,
+                0x20,
+                32,
+                32 << 20,
+            ),
+            ("8 in flight of a 4-byte fill each", 8, 4096, 0, 1, 4),
+        ];
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let queue = device.new_command_queue().expect("a command queue");
+        let on = OnFault::Return;
+        let clock = platform.clock();
+        let waited = |commands: &RtObj<RtCommandBuffer>| {
+            assert_eq!(commands.wait_until_completed(on), Ok(()));
+            assert_eq!(commands.status(), CommandBufferStatus::COMPLETED);
+        };
+        let mut seen = Vec::new();
+        let mut deallocated = true;
+        for (load, depth, length, options, fills, fill) in loads {
+            let filled = device.new_buffer_of_length(on, length, options);
+            let filled = filled.expect("never a raise").expect("a buffer");
+            let commit = || {
+                let commands = queue.command_buffer(on).expect("never a raise");
+                let commands = commands.expect("a command buffer");
+                let encoder = commands.blit_encoder(on).expect("never a raise");
+                let encoder = encoder.expect("a blit encoder");
+                for _ in 0..fills {
+                    let cmd = BlitCmd::FillBuffer {
+                        buffer: &filled,
+                        range: NsRange::new(0, fill),
+                        value: 0x5a,
+                    };
+                    assert_eq!(encoder.encode(on, cmd), Ok(()));
+                }
+                assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+                assert_eq!(commands.commit(on), Ok(()));
+                commands
+            };
+            // Every byte of the host's memory written, as rt's test writes its own.
+            let layout = Layout::from_size_align(LEN.to_usize(), 0x10000).expect("a layout");
+            // SAFETY: the layout's size is not 0.
+            let memory = unsafe { std::alloc::alloc(layout) };
+            assert!(!memory.is_null());
+            // SAFETY: the `LEN` bytes at `memory` are the allocation's.
+            unsafe { memory.write_bytes(0xa5, LEN.to_usize()) };
+            let ran: Arc<OnceLock<MonoTime>> = Arc::default();
+            let set = Arc::clone(&ran);
+            let deallocator: NoCopyDeallocator = Box::new(move || {
+                let _ = set.set(crate::os::OsClock::new().now_mono());
+            });
+            let pointers = counted(IMPORTS_POINTER);
+            // SAFETY: the memory stays allocated until the deallocator ran, and for good where it
+            // never does.
+            let bytes = unsafe { HostRange::new(HostPtr::from_ptr(memory), LEN) };
+            let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(deallocator));
+            let buffer = made.expect("never a raise").expect("a no-copy buffer");
+            let by = match counted(IMPORTS_POINTER) > pointers {
+                true => "imported by its pointer",
+                false => "not imported by its pointer",
+            };
+            let mut flight: VecDeque<_> = (0..depth).map(|_| commit()).collect();
+            let mut commits = depth;
+            let released = clock.now_mono();
+            drop(buffer);
+            while ran.get().is_none()
+                && clock.now_mono().saturating_duration_since(released) < LOADED
+            {
+                waited(&flight.pop_front().expect("the oldest in flight"));
+                flight.push_back(commit());
+                commits += 1;
+            }
+            let stopped = clock.now_mono();
+            for commands in &flight {
+                waited(commands);
+            }
+            let idle = clock.now_mono();
+            while ran.get().is_none() && clock.now_mono().saturating_duration_since(idle) < AFTER {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let ms = |from: MonoTime, to: MonoTime| to.saturating_duration_since(from).as_millis();
+            let what = format!("{load}, {commits} committed, {by}");
+            match ran.get().copied() {
+                Some(at) if at <= stopped => {
+                    let after = ms(released, at);
+                    seen.push(format!("{what}: deallocated {after} ms after the release"));
+                }
+                Some(at) => {
+                    deallocated = false;
+                    seen.push(format!(
+                        "{what}: released only after the load stopped (after {} ms; its last \
+                         command buffers completed {} ms after it stopped, {} ms after the \
+                         release)",
+                        ms(stopped, at),
+                        ms(stopped, idle),
+                        ms(released, at),
+                    ));
+                }
+                None => {
+                    deallocated = false;
+                    seen.push(format!(
+                        "{what}: never released (waited {} s after the load stopped)",
+                        clock
+                            .now_mono()
+                            .saturating_duration_since(stopped)
+                            .as_secs(),
+                    ));
+                }
+            }
+            if ran.get().is_some() {
+                // SAFETY: the deallocator ran: rt holds no import of the memory.
+                unsafe { std::alloc::dealloc(memory, layout) };
+            }
+        }
+        let seen = seen.join("; ");
+        eprintln!("{seen}");
+        assert!(
+            deallocated,
+            "a no-copy buffer of {LEN} bytes released under load: {seen}"
+        );
+    }
+
     /// Runs `cmds` in a blit encoder of a new command buffer of `queue`, and waits for it.
     fn blit_and_wait(
         queue: &<RtPlatform as crate::core::platform::Platform>::CommandQueue,
