@@ -1894,7 +1894,11 @@ mod tests {
         assert!(new.contains(&luma), "{new:?}");
         let counts = r.dec.caches().counts().shapes;
         assert_eq!(
-            (counts.surfaces, counts.surfaces_declined, counts.surfaces_refused),
+            (
+                counts.surfaces,
+                counts.surfaces_declined,
+                counts.surfaces_refused
+            ),
             (0, 1, 0)
         );
         assert_eq!((counts.planes_made, counts.planes_filled_at_make), (0, 0));
