@@ -2252,7 +2252,11 @@ mod tests {
         };
         for storage in [0, STORAGE_PRIVATE] {
             let texture = make(70, storage).expect("a texture buffer");
-            let answers = (texture.texture_type(), texture.width(), texture.storage_mode());
+            let answers = (
+                texture.texture_type(),
+                texture.width(),
+                texture.storage_mode(),
+            );
             assert_eq!(answers, (TYPE_TEXTURE_BUFFER, 1001, storage >> 4));
             let held = texture.held.get().expect("the buffer it lies over");
             assert_eq!(held.byte_length(), 4004_u64.next_multiple_of(alignment));
