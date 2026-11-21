@@ -249,10 +249,11 @@ mod tests {
                 "no surface, no presenter"
             );
             assert_eq!(window.0.load(Ordering::SeqCst), 1, "asked before the loss");
-            sink.draw.device.rt().report_loss(metal2vulkan_runtime::DeviceLoss {
+            let loss = metal2vulkan_runtime::DeviceLoss {
                 call: "vkQueueSubmit2",
                 result: vk::Result::ERROR_DEVICE_LOST,
-            });
+            };
+            sink.draw.device.rt().report_loss(loss);
             assert!(sink.presenter(&window).is_none());
             assert_eq!(window.0.load(Ordering::SeqCst), 1, "asked for none after");
         });

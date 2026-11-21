@@ -628,7 +628,7 @@ impl RtSwapchain {
         let scheduled = raw.wait_until_scheduled();
         began.end("window-scheduled");
         if scheduled.is_err() || raw.status() == rt::CommandBufferStatus::Error {
-            if self.device_lost() {
+            if self.device.is_lost() {
                 // rt's loss, set before the frame ended with it: nothing is presented or made
                 // again (the module doc, "A lost device").
                 return false;
@@ -643,7 +643,7 @@ impl RtSwapchain {
             self.stale = true;
             return false;
         }
-        if self.device_lost() {
+        if self.device.is_lost() {
             // Lost since the take: nothing is presented (the module doc, "A lost device").
             return false;
         }
