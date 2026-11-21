@@ -343,12 +343,15 @@ IOMemoryDescriptor *rgfxSurfaceCacheHostPages(void *cache, UInt64 offset);
 // A command queue's completion ring the accelerator watches for its client
 // (RgfxAcceleratorContexts.cpp): the ring's header, mapped into the kernel, and the producer
 // count last seen there.
+// A watched ring, and the producer the work loop's last look and the vector's filter's last look
+// saw (RgfxQueueWakes.hpp).
 struct RgfxWatchedRing {
 	RgfxAcceleratorUserClient *client;
 	UInt64 objId;
 	IOMemoryMap *map;
 	volatile UInt8 *header;
 	UInt64 lastProducer;
+	UInt64 filterProducer;
 };
 
 class RgfxAccelerator : public IOAccelerator {
@@ -638,7 +641,9 @@ public:
 	// The completion rings of the clients' queues: watchQueue maps queue `objId`'s ring header
 	// at region offset `completeOffset`, and from then on each interrupt of the device's vector
 	// that finds records the client has not taken there wakes the client's completion waiters
-	// (queueInterrupt, on the framebuffer's work loop). unwatchQueue and unwatchClient stop it.
+	// (queueFilter, at the vector's filter as the interrupt arrives, and queueInterrupt, on the
+	// framebuffer's work loop after it; RgfxQueueWakes.hpp). unwatchQueue and unwatchClient stop
+	// it.
 	IOReturn watchQueue(RgfxAcceleratorUserClient *client, UInt64 objId, UInt64 completeOffset);
 	void unwatchQueue(RgfxAcceleratorUserClient *client, UInt64 objId);
 	// A kernel mapping of the ring header at region offset `offset`, write-back as the bundle maps
@@ -648,6 +653,7 @@ public:
 	IOMemoryMap *mapRingHeader(UInt64 offset, volatile UInt8 **header);
 	void unwatchClient(RgfxAcceleratorUserClient *client);
 	void queueInterrupt();
+	void queueFilter();
 	// The seqno the device last completed on queue `objId` (RgfxRingHeader::completed_seqno, 0
 	// where it writes none), read from its watched completion ring; 0 where it is not watched.
 	UInt64 queueCompleted(UInt64 objId);

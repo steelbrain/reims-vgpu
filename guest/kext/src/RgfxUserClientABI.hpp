@@ -274,8 +274,9 @@ enum {
 	// Waits for the client's command buffers to complete: in the last count this returned (0
 	// at first); out: the count now. Returns once the count is not the one given, which it
 	// becomes when a completion ring of one of the client's queues holds records the client
-	// has not taken (the device's interrupt, RgfxAccelerator::queueInterrupt). kIOReturnAborted
-	// when the thread is interrupted, kIOReturnNotOpen once the client's context is released.
+	// has not taken (the device's interrupt: RgfxAccelerator::queueFilter, as it arrives, and
+	// queueInterrupt). kIOReturnAborted when the thread is interrupted, kIOReturnNotOpen once the
+	// client's context is released.
 	kRgfxAccelMethodWaitCompletions = 0x107,
 	// The scanout an IOAccel surface of the client's process is drawn into, for a texture over
 	// it: in the surface's id and its buffer (0, the one buffer); out its region offset, its

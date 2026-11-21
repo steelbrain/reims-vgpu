@@ -6032,11 +6032,20 @@ where a Mac's never do.
 
 **Who takes the completions.** Every queue raises the device's one vector,
 the control ring's. The accelerator kext maps each queue's completion-ring
-header into the kernel at its `QUEUE_CREATE`. The framebuffer's work loop
-services the vector, and then the accelerator scans the watched rings: a ring
-whose `producer` moved since the last scan, and still holds records its process
-has not taken, wakes that process. The scan takes only the watch table's lock,
-which no submit path takes. Each process has one completion thread in the bundle.
+header into the kernel at its `QUEUE_CREATE`. The vector's interrupt source is
+a filter source: its filter, at primary interrupt context as the interrupt
+arrives, has the accelerator scan the watched rings, and a ring whose `producer`
+moved since the last scan, and still holds records its process has not taken,
+wakes that process. Then the framebuffer's work loop services the vector as it
+did without the filter, and the accelerator scans the rings again, waking a
+process only for a `producer` the filter's scan has not looked at
+(`RgfxQueueWakes.hpp`). So a completion thread is woken as the interrupt
+arrives, not after the work loop's thread is scheduled and has taken the
+control ring. The filter's scan takes only the watch table's spin lock and each
+woken client's wake-count lock, spin locks every holder takes with interrupts
+disabled; the work loop's scan takes the watch table's lock, which no submit
+path takes. Tested by the kext's `queue_wakes_test`. Each process has one
+completion thread in the bundle.
 It sleeps in the kext (user-client selector `0x107`, an interruptible wait on a
 per-client wake count it passes back), and each pass it drains every queue's
 ring, arms it, fences and looks again. A completion posted while it works shows

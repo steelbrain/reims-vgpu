@@ -63,7 +63,7 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 	doorbellAddress = 0;
 	queueLock = IOLockAlloc();
 	listLock = IOLockAlloc();
-	completionLock = IOLockAlloc();
+	completionSpin = IOSimpleLockAlloc();
 	completionCount = 0;
 	completionsClosed = false;
 	windowLock = IOLockAlloc();
@@ -72,7 +72,7 @@ bool RgfxAcceleratorUserClient::initWithTask(task_t owningTask, void *securityID
 	windowBase = 0;
 	windowSize = 0;
 	grants = grantNs = revokes = revokeNs = 0;
-	return queueLock != nullptr && listLock != nullptr && completionLock != nullptr &&
+	return queueLock != nullptr && listLock != nullptr && completionSpin != nullptr &&
 	       windowLock != nullptr;
 }
 
@@ -101,9 +101,9 @@ void RgfxAcceleratorUserClient::free()
 	if (listLock)
 		IOLockFree(listLock);
 	listLock = nullptr;
-	if (completionLock)
-		IOLockFree(completionLock);
-	completionLock = nullptr;
+	if (completionSpin)
+		IOSimpleLockFree(completionSpin);
+	completionSpin = nullptr;
 	closeWindow();
 	if (windowLock)
 		IOLockFree(windowLock);

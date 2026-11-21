@@ -39,10 +39,13 @@
  *     the surface's device cache first, then marks the block cached in its SURFACE_PAGES, and a
  *     cached block's release copies the host's cache into the pages (its locks waiting for it).
  *   - The completion rings of the clients' queues, watched: the device raises its one vector
- *     for a queue's completion as for the control ring's, and the framebuffer's work loop then
- *     calls queueInterrupt, which wakes the client of each ring whose producer moved and
- *     holds records the client has not taken. Each ring's header is mapped into the kernel
- *     at its queue's create; the scan takes only the watch table's lock.
+ *     for a queue's completion as for the control ring's. The vector's filter calls
+ *     queueFilter as the interrupt arrives, and the framebuffer's work loop then calls
+ *     queueInterrupt; each wakes the client of each ring whose producer moved and holds
+ *     records the client has not taken, the second skipping what the first woke for
+ *     (RgfxQueueWakes.hpp). Each ring's header is mapped into the kernel at its queue's
+ *     create; the work loop's scan takes only the watch table's lock, and the filter's only
+ *     the table's spin lock.
  *   - The object lifecycle, on the framebuffer's control ring: creates and destroys, a
  *     QUEUE_CREATE answered once the host has the queue's ring pair (so the process writes it at
  *     once), and a CONTEXT_CLOSE answered once the host has dropped the context's objects.
@@ -65,6 +68,7 @@
 #include "RgfxIdChunks.hpp"
 #include "RgfxTrace.hpp"
 #include "RgfxReleaseTable.hpp"
+#include "RgfxQueueWakes.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
@@ -215,8 +219,12 @@ struct ContextState {
 	// resource ids, null where none does (RgfxIdChunks.hpp).
 	const void *idChunkOwners[RGFX_RESOURCE_ID_SMALL_CHUNKS];
 	// Under watchLock: the watched completion rings, and whether the framebuffer calls
-	// queueInterrupt yet.
+	// queueInterrupt yet. Each change to the table (an entry added or taken out, its count) also
+	// holds filterLock, a spin lock taken with interrupts disabled, which the vector's filter
+	// takes at primary interrupt context (queueFilter) and which guards each entry's
+	// filterProducer; the filter reads the table under it alone.
 	IOLock *watchLock;
+	IOSimpleLock *filterLock;
 	RgfxWatchedRing *watched;
 	UInt32 watchedCount;
 	bool hooked;
@@ -252,6 +260,7 @@ ContextState state = {nullptr,
                       {},
                       nullptr,
                       nullptr,
+                      nullptr,
                       0,
                       false,
                       nullptr,
@@ -274,6 +283,7 @@ UInt64 &blocksEnd = state.blockTable.end;
 thread_call_t &releaseCall = state.releaseCall;
 const void *(&idChunkOwners)[RGFX_RESOURCE_ID_SMALL_CHUNKS] = state.idChunkOwners;
 IOLock *&watchLock = state.watchLock;
+IOSimpleLock *&filterLock = state.filterLock;
 RgfxWatchedRing *&watched = state.watched;
 UInt32 &watchedCount = state.watchedCount;
 bool &hooked = state.hooked;
@@ -554,6 +564,12 @@ void queueInterruptHook(OSObject *target)
 {
 	if (RgfxAccelerator *accel = OSDynamicCast(RgfxAccelerator, target))
 		accel->queueInterrupt();
+}
+
+// At primary interrupt context: the target is the accelerator whose watchQueue set the hook.
+void queueFilterHook(OSObject *target)
+{
+	static_cast<RgfxAccelerator *>(target)->queueFilter();
 }
 
 bool reapDormant();
@@ -951,6 +967,7 @@ bool RgfxAccelerator::startContexts()
 	// The first opener makes the state; one that loses the race frees what it made.
 	IOLock *lock = IOLockAlloc();
 	IOLock *wlock = IOLockAlloc();
+	IOSimpleLock *flock = IOSimpleLockAlloc();
 	RgfxBlock *table = static_cast<RgfxBlock *>(IOMalloc(sizeof(RgfxBlock) * kMaxBlocks));
 	RgfxWatchedRing *rings =
 	    static_cast<RgfxWatchedRing *>(IOMalloc(sizeof(RgfxWatchedRing) * kMaxWatched));
@@ -980,13 +997,14 @@ bool RgfxAccelerator::startContexts()
 	                                    region->getLength())
 	        : nullptr;
 	RgfxBlock *expected = nullptr;
-	if (lock && wlock && table && rings && call && naming && rlock && releases && timer &&
+	if (lock && wlock && flock && table && rings && call && naming && rlock && releases && timer &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
 	                                __ATOMIC_ACQUIRE)) {
 		bzero(table, sizeof(RgfxBlock) * kMaxBlocks);
 		bzero(rings, sizeof(RgfxWatchedRing) * kMaxWatched);
 		bzero(releases, sizeof(RgfxReleaseEntry) * kMaxReleases);
 		watched = rings;
+		filterLock = flock;
 		watchLock = wlock;
 		releaseCall = call;
 		namingCall = naming;
@@ -1082,6 +1100,8 @@ bool RgfxAccelerator::startContexts()
 		IOLockFree(lock);
 	if (wlock)
 		IOLockFree(wlock);
+	if (flock)
+		IOSimpleLockFree(flock);
 	if (table)
 		IOFree(table, sizeof(RgfxBlock) * kMaxBlocks);
 	if (rings)
@@ -3838,20 +3858,23 @@ IOReturn RgfxAccelerator::watchQueue(RgfxAcceleratorUserClient *client, UInt64 o
 		IOLog("RgfxAccelerator: queue 0x%llx: every watched ring is taken\n", objId);
 		return kIOReturnNoResources;
 	}
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(filterLock);
 	RgfxWatchedRing &w = watched[watchedCount++];
 	w.client = client;
 	w.objId = objId;
 	w.map = map;
 	w.header = header;
 	w.lastProducer = loadHeader64(header, kRingProducer);
+	w.filterProducer = w.lastProducer;
+	IOSimpleLockUnlockEnableInterrupt(filterLock, is);
 	bool hook = !hooked;
 	hooked = true;
 	IOLockUnlock(watchLock);
-	// The first watched ring has the framebuffer call queueInterrupt from now on.
+	// The first watched ring has the framebuffer call queueFilter and queueInterrupt from now on.
 	if (hook) {
 		ReimsGraphics *fb = copyFramebuffer();
 		if (fb) {
-			fb->setQueueInterrupt(this, &queueInterruptHook);
+			fb->setQueueInterrupt(this, &queueInterruptHook, &queueFilterHook);
 			fb->release();
 		} else {
 			IOLockLock(watchLock);
@@ -3871,7 +3894,9 @@ void RgfxAccelerator::unwatchQueue(RgfxAcceleratorUserClient *client, UInt64 obj
 	for (UInt32 i = 0; i < watchedCount; i++) {
 		if (watched[i].client == client && watched[i].objId == objId) {
 			map = watched[i].map;
+			IOInterruptState is = IOSimpleLockLockDisableInterrupt(filterLock);
 			watched[i] = watched[--watchedCount];
+			IOSimpleLockUnlockEnableInterrupt(filterLock, is);
 			break;
 		}
 	}
@@ -3890,10 +3915,14 @@ void RgfxAccelerator::unwatchClient(RgfxAcceleratorUserClient *client)
 	IOLockLock(watchLock);
 	for (UInt32 i = 0; i < watchedCount;) {
 		if (watched[i].client == client) {
-			// Released under the lock: the scan never meets a ring whose map is gone.
+			// Released under the lock, out of the table first: neither scan meets a ring whose
+			// map is gone, nor the filter's a client let go.
 			forgetQueueWrites(watched[i].objId);
-			watched[i].map->release();
+			IOMemoryMap *map = watched[i].map;
+			IOInterruptState is = IOSimpleLockLockDisableInterrupt(filterLock);
 			watched[i] = watched[--watchedCount];
+			IOSimpleLockUnlockEnableInterrupt(filterLock, is);
+			map->release();
 		} else {
 			i++;
 		}
@@ -3903,7 +3932,8 @@ void RgfxAccelerator::unwatchClient(RgfxAcceleratorUserClient *client)
 
 // On the framebuffer's work loop, once per pass over the control ring: the device raised its
 // vector, for a completion on some queue's ring or the control ring's. A ring whose producer
-// moved since the last look and that holds records its client has not taken wakes the client.
+// moved since the last look and that holds records its client has not taken wakes the client,
+// unless the vector's filter has looked at that producer (RgfxQueueWakes.hpp).
 void RgfxAccelerator::queueInterrupt()
 {
 	if (!watchLock)
@@ -3911,16 +3941,35 @@ void RgfxAccelerator::queueInterrupt()
 	IOLockLock(watchLock);
 	for (UInt32 i = 0; i < watchedCount; i++) {
 		RgfxWatchedRing &w = watched[i];
-		UInt64 producer = loadHeader64(w.header, kRingProducer);
-		if (producer == w.lastProducer)
-			continue;
-		w.lastProducer = producer;
-		if (producer != loadHeader64(w.header, kRingConsumer))
+		const UInt64 producer = loadHeader64(w.header, kRingProducer);
+		if (rgfxLoopWakes(&w.lastProducer, &w.filterProducer, producer,
+		                  [&w] { return loadHeader64(w.header, kRingConsumer); }))
 			w.client->wakeCompletions();
 	}
 	IOLockUnlock(watchLock);
 	// A lock waiting for a surface drawn in place looks at the completions again.
 	rgfxSurfaceLocksWake();
+}
+
+// At primary interrupt context, from the vector's filter (ReimsGraphics::filterAction), with
+// interrupts disabled: the first look at each watched ring, which wakes its client as the
+// interrupt arrives, so the client's completion thread is not woken by the work loop's look,
+// after the work loop's thread is scheduled and has taken the control ring. It takes filterLock
+// and each woken client's completion lock, spin locks that every other holder takes with
+// interrupts disabled, and nothing else: no allocation, no release, no blocking lock. A ring's
+// header mapping and its client stay while its entry is in the table.
+void RgfxAccelerator::queueFilter()
+{
+	if (!filterLock)
+		return;
+	IOSimpleLockLock(filterLock);
+	for (UInt32 i = 0; i < watchedCount; i++) {
+		RgfxWatchedRing &w = watched[i];
+		if (rgfxFilterWakes(&w.filterProducer, loadHeader64(w.header, kRingProducer),
+		                    [&w] { return loadHeader64(w.header, kRingConsumer); }))
+			w.client->wakeCompletions();
+	}
+	IOSimpleLockUnlock(filterLock);
 }
 
 UInt64 RgfxAccelerator::queueCompleted(UInt64 objId)

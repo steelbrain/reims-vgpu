@@ -828,6 +828,22 @@ void ReimsGraphics::serviceAction(OSObject *owner, IOInterruptEventSource *, int
 	static_cast<ReimsGraphics *>(owner)->service();
 }
 
+// At primary interrupt context, as each interrupt of the vector arrives, with interrupts disabled:
+// the accelerator looks at its queues' completion rings and wakes their clients' completion
+// threads, which then run beside the work loop's pass instead of after it. Every interrupt still
+// goes on to that pass (true), which runs as it did without the filter.
+bool ReimsGraphics::filterAction(OSObject *owner, IOFilterInterruptEventSource *)
+{
+	ReimsGraphics *self = static_cast<ReimsGraphics *>(owner);
+	if (__atomic_load_n(&self->ready, __ATOMIC_ACQUIRE) && self->queueFilterLock) {
+		IOSimpleLockLock(self->queueFilterLock);
+		if (self->queueFilter)
+			self->queueFilter(self->queueFilterTarget);
+		IOSimpleLockUnlock(self->queueFilterLock);
+	}
+	return true;
+}
+
 // Drains the completion ring, then arms its interrupt and looks again, so an
 // event published meanwhile is never left without one. Then sends what
 // IOFramebuffer asked of vblank, and a display refresh a DISPLAY_CHANGED
@@ -1738,10 +1754,12 @@ bool ReimsGraphics::start(IOService *provider)
 	publishBootConsole();
 	submitLock = IOSimpleLockAlloc();
 	interruptLock = IOSimpleLockAlloc();
+	queueFilterLock = IOSimpleLockAlloc();
 	stateLock = IOLockAlloc();
 	presentsLock = IOLockAlloc();
 	cursorLock = IOLockAlloc();
-	if (!submitLock || !interruptLock || !stateLock || !presentsLock || !cursorLock)
+	if (!submitLock || !interruptLock || !queueFilterLock || !stateLock || !presentsLock ||
+	    !cursorLock)
 		return false;
 	// The answers kept by pipeline key, empty at each start. Without the table, none is kept and
 	// every create waits.
@@ -1888,9 +1906,12 @@ bool ReimsGraphics::start(IOService *provider)
 		IOLog("ReimsGraphics: no MSI-X interrupt\n");
 		goto fail;
 	}
+	// Its filter wakes the queues' completion waiters as an interrupt arrives (filterAction), and
+	// lets each through to the work loop.
 	workLoop = IOWorkLoop::workLoop();
 	if (workLoop) {
-		msix = IOInterruptEventSource::interruptEventSource(this, serviceAction, pci, msixIndex);
+		msix = IOFilterInterruptEventSource::filterInterruptEventSource(this, serviceAction,
+		                                                                filterAction, pci, msixIndex);
 		kick = IOInterruptEventSource::interruptEventSource(this, serviceAction);
 	}
 	if (!msix || !kick || workLoop->addEventSource(msix) != kIOReturnSuccess ||
@@ -2518,6 +2539,11 @@ void ReimsGraphics::free()
 		IOSimpleLockFree(submitLock);
 	if (interruptLock)
 		IOSimpleLockFree(interruptLock);
+	// No filter call is running: quiesce disabled the vector's source, which waits for one
+	// (IOInterruptController::disableInterrupt), and teardown let it go.
+	if (queueFilterLock)
+		IOSimpleLockFree(queueFilterLock);
+	queueFilterLock = nullptr;
 	if (stateLock)
 		IOLockFree(stateLock);
 	if (presentsLock)
@@ -3380,12 +3406,21 @@ void ReimsGraphics::removePipe(OSObject *client)
 	kickWorkLoop();
 }
 
-void ReimsGraphics::setQueueInterrupt(OSObject *target, QueueInterruptHook hook)
+void ReimsGraphics::setQueueInterrupt(OSObject *target, QueueInterruptHook hook,
+                                      QueueInterruptHook filter)
 {
 	if (!hook)
 		target = nullptr;
 	if (target)
 		target->retain();
+	// The filter holds no reference of its own: it lets go of the old target before the
+	// reference below goes.
+	if (queueFilterLock) {
+		IOInterruptState is = IOSimpleLockLockDisableInterrupt(queueFilterLock);
+		queueFilterTarget = target;
+		queueFilter = target ? filter : nullptr;
+		IOSimpleLockUnlockEnableInterrupt(queueFilterLock, is);
+	}
 	IOSimpleLockLock(interruptLock);
 	OSObject *old = queueTarget;
 	queueTarget = target;

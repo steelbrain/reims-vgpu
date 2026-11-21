@@ -162,7 +162,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/legacy_swap_info_test $(BUILD)/tests/mobile_color_test $(BUILD)/tests/mobile_icc_test \
 	$(BUILD)/tests/mobile_cursor_test $(BUILD)/tests/display_power_test \
 	$(BUILD)/tests/control_ring_test $(BUILD)/tests/control_ring_arm64_test \
-	$(BUILD)/tests/completion_arm_test $(BUILD)/tests/kept_service_test \
+	$(BUILD)/tests/completion_arm_test $(BUILD)/tests/queue_wakes_test $(BUILD)/tests/kept_service_test \
 	$(BUILD)/tests/queue_publish_test $(BUILD)/tests/doorbell_pages_test $(BUILD)/tests/top_down_test \
 	$(BUILD)/tests/display_table_test $(BUILD)/tests/agdc_displays_test \
 	$(BUILD)/tests/pointer_over_test $(BUILD)/tests/display_bounds_test $(BUILD)/tests/display_places_test \

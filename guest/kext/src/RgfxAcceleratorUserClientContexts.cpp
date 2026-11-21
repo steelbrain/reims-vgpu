@@ -21,6 +21,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/task.h>
 #include <sys/proc.h>
 
@@ -1015,9 +1016,17 @@ IOReturn RgfxAcceleratorUserClient::waitCompletionsMethod(IOExternalMethodArgume
 	if (a->scalarInputCount != 1 || a->scalarOutputCount != 1)
 		return kIOReturnBadArgument;
 	IOReturn r = kIOReturnSuccess;
-	IOLockLock(completionLock);
+	// As IOWorkLoop's thread waits for its interrupt sources' signal: the wait is asserted under
+	// the spin lock the wakers take, then the thread blocks with the lock dropped, so a wake
+	// between the two ends the block at once, and none is lost.
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(completionSpin);
 	while (completionCount == a->scalarInput[0] && !completionsClosed) {
-		if (IOLockSleep(completionLock, &completionCount, THREAD_ABORTSAFE) != THREAD_AWAKENED) {
+		wait_result_t woke = assert_wait(&completionCount, THREAD_ABORTSAFE);
+		IOSimpleLockUnlockEnableInterrupt(completionSpin, is);
+		if (woke == THREAD_WAITING)
+			woke = thread_block(THREAD_CONTINUE_NULL);
+		is = IOSimpleLockLockDisableInterrupt(completionSpin);
+		if (woke != THREAD_AWAKENED) {
 			r = kIOReturnAborted;
 			break;
 		}
@@ -1025,16 +1034,16 @@ IOReturn RgfxAcceleratorUserClient::waitCompletionsMethod(IOExternalMethodArgume
 	if (completionsClosed)
 		r = kIOReturnNotOpen;
 	a->scalarOutput[0] = completionCount;
-	IOLockUnlock(completionLock);
+	IOSimpleLockUnlockEnableInterrupt(completionSpin, is);
 	return r;
 }
 
 void RgfxAcceleratorUserClient::wakeCompletions()
 {
-	IOLockLock(completionLock);
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(completionSpin);
 	completionCount++;
-	IOLockWakeup(completionLock, &completionCount, false);
-	IOLockUnlock(completionLock);
+	thread_wakeup(&completionCount);
+	IOSimpleLockUnlockEnableInterrupt(completionSpin, is);
 }
 
 bool RgfxAcceleratorUserClient::beginAsk(UInt32 *ctx)
@@ -1059,10 +1068,10 @@ void RgfxAcceleratorUserClient::releaseContext()
 	if (!queueLock)
 		return;
 	// The completion waiters return, and no ring of the client's wakes it any more.
-	IOLockLock(completionLock);
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(completionSpin);
 	completionsClosed = true;
-	IOLockWakeup(completionLock, &completionCount, false);
-	IOLockUnlock(completionLock);
+	thread_wakeup(&completionCount);
+	IOSimpleLockUnlockEnableInterrupt(completionSpin, is);
 	// The asks in flight end first, and none begins from here (RgfxAskGate.hpp): what each made
 	// is the context's, which the close lets go of below. Out of the queue lock, which a queue's
 	// create, one of them, takes.

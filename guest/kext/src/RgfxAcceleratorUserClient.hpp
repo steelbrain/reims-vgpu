@@ -44,8 +44,9 @@ public:
 	void free() override;
 
 	// Wakes the client's completion waiters (kRgfxAccelMethodWaitCompletions): a completion
-	// ring of one of its queues holds records it has not taken. Any thread, no lock of the
-	// client's held but its own.
+	// ring of one of its queues holds records it has not taken. Any thread, and the vector's
+	// filter at primary interrupt context (RgfxAccelerator::queueFilter): it takes only
+	// completionSpin, with interrupts disabled, and neither blocks nor allocates.
 	void wakeCompletions();
 
 	// Maps nothing: the region reaches the process only through the window.
@@ -221,9 +222,10 @@ private:
 	IOLock *queueLock;
 	IOLock *listLock;
 
-	// Under completionLock: the count wakeCompletions raises, which a waiter sleeps on, and
-	// whether the context is released (every waiter then returns).
-	IOLock *completionLock;
+	// Under completionSpin, a spin lock every holder takes with interrupts disabled, as
+	// wakeCompletions runs at primary interrupt context too: the count wakeCompletions raises,
+	// which a waiter sleeps on, and whether the context is released (every waiter then returns).
+	IOSimpleLock *completionSpin;
 	UInt64 completionCount;
 	bool completionsClosed;
 

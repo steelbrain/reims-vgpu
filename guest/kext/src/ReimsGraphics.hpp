@@ -38,6 +38,7 @@
 #define REIMS_GRAPHICS_HPP_
 
 #include <IOKit/IOCommandGate.h>
+#include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOWorkLoop.h>
@@ -347,10 +348,14 @@ public:
 
 	// The device's one MSI-X vector also carries the command queues' completion interrupts
 	// (each QUEUE_CREATE names it). setQueueInterrupt names the accelerator (retained) and its
-	// hook, which the work loop calls after each pass over the control ring, so the
-	// accelerator looks at its queues' completion rings once per interrupt. nullptr clears it.
+	// hooks: `hook`, which the work loop calls after each pass over the control ring, and
+	// `filter`, which the vector's filter calls as each interrupt arrives, at primary interrupt
+	// context with interrupts disabled and queueFilterLock held, so it takes only spin locks
+	// taken with interrupts disabled elsewhere, and neither blocks nor allocates. So the
+	// accelerator looks at its queues' completion rings twice per interrupt (RgfxQueueWakes.hpp).
+	// nullptr clears both; once it returns, no filter call holds the old target.
 	typedef void (*QueueInterruptHook)(OSObject *target);
-	void setQueueInterrupt(OSObject *target, QueueInterruptHook hook);
+	void setQueueInterrupt(OSObject *target, QueueInterruptHook hook, QueueInterruptHook filter);
 
 	// The accelerator's block releases, which no thread waits for. postReleases puts `count`
 	// BLOCK_RELEASEs on the control ring in order, as many at a time as fit, under one hold of
@@ -548,6 +553,9 @@ private:
 
 	// The work loop: the completion ring and what follows from it.
 	static void serviceAction(OSObject *owner, IOInterruptEventSource *sender, int count);
+	// The vector's filter, at primary interrupt context: the accelerator's look at its queues'
+	// completion rings (queueFilter), and then the work loop's pass, as for every interrupt.
+	static bool filterAction(OSObject *owner, IOFilterInterruptEventSource *sender);
 	void service();
 	// What service() sends for one display's framebuffer `fb`: the connect interrupt a change
 	// waited with, its SET_VBLANK and its SET_DISPLAY_POWER.
@@ -726,6 +734,12 @@ private:
 	// The accelerator (retained) and its queue-interrupt hook; and, the same, its release hook.
 	OSObject *queueTarget;
 	QueueInterruptHook queueHook;
+	// Under queueFilterLock, which the vector's filter takes at primary interrupt context and
+	// every other holder with interrupts disabled: the accelerator queueTarget holds, for the
+	// filter, and its filter hook. Display 0's framebuffer's alone, which owns the vector.
+	IOSimpleLock *queueFilterLock;
+	OSObject *queueFilterTarget;
+	QueueInterruptHook queueFilter;
 	OSObject *releaseTarget;
 	ReleaseAnswerHook releaseHook;
 
