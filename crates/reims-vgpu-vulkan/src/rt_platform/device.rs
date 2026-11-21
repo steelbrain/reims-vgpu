@@ -153,7 +153,8 @@ fn follow(counters: rt::Counters) {
 /// ([`over_copy_counts`]), then the command buffers held for room ([`HELD_FOR_ROOM_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
-    std::array::from_fn(|i| over.get(i).copied().unwrap_or((HELD_FOR_ROOM_CODE, m.held_for_room)))
+    let held = (HELD_FOR_ROOM_CODE, m.held_for_room);
+    std::array::from_fn(|i| over.get(i).copied().unwrap_or(held))
 }
 
 /// The over-copy metrics of `m`, each with its code (the module's docs): the over-copies and
