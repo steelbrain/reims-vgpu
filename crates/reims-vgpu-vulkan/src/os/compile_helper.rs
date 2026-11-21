@@ -5,9 +5,12 @@
 //! compile is not in its store yet, and its refusal carries an opaque request. The library then
 //! starts the helper, a process that opens a runtime device of its own on the same card and
 //! compiles the stage, and hands the compile's cache back to rt in the VM's process, which keeps it
-//! in its store for the VM's later creates. The helper's memory and time are capped ([`Limits`]).
-//! Past either it is killed, and the caller records the breach with rt, so later creates refuse
-//! without starting a helper again.
+//! in its store for the VM's later creates. The helper's memory and time are capped ([`Limits`]),
+//! its memory at most at the ceiling, [`Limits::memory`], and lower where the host's room at its
+//! seat is less ([`seat_cap`]). Past the ceiling or its time cap it is killed, and the caller
+//! records the breach with rt, so later creates refuse without starting a helper again. Past a
+//! cap the room set below the ceiling it is killed too, [`HelperEnd::OverRoom`], and nothing is
+//! recorded: the same stage fits on a host with room.
 //!
 //! **Side by side, as the host's memory allows.** The host's helpers share its seats ([`Seats`]),
 //! one lock file per logical CPU of the host ([`host_cpus`]) that all its processes share
@@ -15,9 +18,10 @@
 //! holds a seat from before its process starts until the process has ended. It takes one beside
 //! running helpers only where their memory caps and its own fit in what the host has free beside
 //! the guest's RAM ([`admits`]), so no helper's growth leaves another, or the guest, short of
-//! memory; with no helper running it always takes one, so one helper always runs. A helper counts
-//! the seats held and takes one under one more lock file, the seats' guard, so no two processes
-//! count the same room at once.
+//! memory; with no helper running it always takes one, so one helper always runs, at a cap no
+//! larger than the room read then ([`seat_cap`]), and nothing waits on the room for it. A helper
+//! counts the seats held and takes one under one more lock file, the seats' guard, so no two
+//! processes count the same room at once.
 //!
 //! **In request order.** A process's helpers take seats in the order they were started
 //! ([`Helper::start`]), which is the order of the stages' requests: only the first of its helpers
@@ -39,7 +43,7 @@
 //!   charge has taken (`GlobalMemoryStatusEx`): the guest's pagefile-backed section is charged in
 //!   full at its creation, so nothing of the guest's is taken off again.
 //!
-//! Where the OS does not say, there is no room: one helper runs at a time.
+//! Where the OS does not say, there is no room: one helper runs at a time, at the ceiling.
 //!
 //! **No caller's thread waits.** [`Helper::start`] returns at once. The helper's own thread,
 //! `reims-vgpu.compile-helper`, waits for its seat, starts the process and watches it. Once the
@@ -55,8 +59,12 @@
 //! macOS the talk's thread blocks `SIGPIPE`, so a write to a helper that has ended fails with
 //! `EPIPE` rather than signalling the host's process.
 //!
-//! **The memory cap** has one form on every OS: every [`POLL`] the helper's thread reads the
-//! process's footprint, and kills it once that is past [`Limits::memory`]:
+//! **The memory cap** is the helper's own, set at its seat ([`seat_cap`]): the ceiling,
+//! [`Limits::memory`], for a helper beside others, which [`admits`] fit in the room, and where the
+//! OS says no room; for a helper alone, the smaller of the ceiling and the room read at its seat,
+//! and no less than [`MEMORY_FLOOR`] (nor more than the ceiling) where the room reads less. It has
+//! one form on every OS: every [`POLL`] the helper's thread reads the process's footprint, and
+//! kills it once that is past its cap:
 //! - Linux: resident and swapped memory (`VmRSS` and `VmSwap` of `/proc/<pid>/status`), so swap,
 //!   zram's among it, does not hide what the helper holds. An address-space limit (`RLIMIT_AS`)
 //!   would count the virtual ranges a GPU driver reserves at device creation, which no memory
@@ -65,10 +73,11 @@
 //!   system's memory pressure acts on. macOS enforces neither `RLIMIT_AS` nor `RLIMIT_DATA`.
 //! - Windows: its private commit (`PrivateUsage` of `GetProcessMemoryInfo`).
 //!
-//! The footprint read that crossed the cap is in the end, [`HelperEnd::OverMemory`], so a run
-//! can tell how far past the cap a helper got within one poll. Every end comes with what the
-//! reads saw ([`Footprints`]): the largest footprint, and the largest growth from one read to the
-//! next, which bounds how far past the cap a helper can get before its kill.
+//! The footprint read that crossed the cap is in the end, [`HelperEnd::OverMemory`] where the cap
+//! was the ceiling and [`HelperEnd::OverRoom`] where the room set it lower, so a run can tell how
+//! far past the cap a helper got within one poll. Every end comes with what the reads saw
+//! ([`Footprints`]): the helper's cap, the largest footprint, and the largest growth from one read
+//! to the next, which bounds how far past the cap a helper can get before its kill.
 //!
 //! **The time cap** is wall time from the process's start, [`Limits::time`], on every OS.
 //!
@@ -121,6 +130,14 @@ use crate::os::OsClock;
 /// The most memory a helper may hold on any host: 8 GiB.
 const MEMORY_MOST: u64 = 8 << 30;
 
+/// The least memory cap a helper alone runs at where the host's room reads less, the ceiling
+/// allowing: 1 GiB. A helper holds a runtime device of its own before it compiles, so a cap far
+/// under the lightest fills' peaks would kill every helper before its compile ends. Measured on
+/// 2026-11-21, the helpers' peak footprints of one guest app's eight fills ran from 582 MiB on a
+/// Radeon 780M (RADV) and 709 MiB on an RTX 3090 (NVIDIA) up: at this floor the lightest still fill
+/// where the room reads nothing.
+pub(crate) const MEMORY_FLOOR: u64 = 1 << 30;
+
 /// The longest a helper may run: 10 minutes.
 const TIME_MOST: Duration = Duration::from_secs(10 * 60);
 
@@ -135,7 +152,9 @@ const ROOM_POLL: Duration = Duration::from_secs(1);
 /// A helper's caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Limits {
-    /// The most its footprint may reach, in bytes (the module's doc says what each OS counts).
+    /// The most its footprint may reach, in bytes, the ceiling (the module's doc says what each OS
+    /// counts): a helper alone on the host's seats is held lower where the room at its seat is less
+    /// ([`seat_cap`]).
     pub(crate) memory: u64,
     /// The longest it may run, in wall time from its start.
     pub(crate) time: Duration,
@@ -241,13 +260,26 @@ fn host_cpus() -> Option<u64> {
 /// Whether a helper whose memory cap is `cap` may take a seat beside `held` helpers running on
 /// the host, where the host has `room` bytes free beside the guest's RAM ([`room_of_host`]) and
 /// this process's running helpers hold `ours` bytes now: always where none runs, so one helper
-/// always can; otherwise where the caps of `held + 1` helpers fit in the room and what this
-/// process's helpers hold, which their caps count again. No room said is none.
+/// always can, at a cap no larger than the room ([`seat_cap`]); otherwise where the caps of
+/// `held + 1` helpers fit in the room and what this process's helpers hold, which their caps count
+/// again. No room said is none.
 fn admits(held: usize, cap: u64, room: Option<u64>, ours: u64) -> bool {
     held == 0
         || room.is_some_and(|room| {
             cap.saturating_mul(held.to_u64().saturating_add(1)) <= room.saturating_add(ours)
         })
+}
+
+/// The memory cap of a helper whose ceiling is `ceiling` ([`Limits::memory`]), seated as `beside`
+/// says: alone, the smaller of the ceiling and the room read at its seat, and no less than
+/// [`MEMORY_FLOOR`] nor more than the ceiling where the room reads less; the ceiling beside others,
+/// which [`admits`] fit in the room, and where the OS says no room, as nothing then says the host
+/// is short.
+fn seat_cap(ceiling: u64, beside: Beside) -> u64 {
+    match (beside.held, beside.room) {
+        (0, Some(room)) => ceiling.min(room.max(MEMORY_FLOOR)),
+        _ => ceiling,
+    }
 }
 
 /// The host ranges of a hold's guest RAM, each its host address and length.
@@ -392,10 +424,19 @@ impl Drop for Place {
 pub(crate) enum HelperEnd {
     /// It ran to its end, with this status.
     Ended(ExitStatus),
-    /// It was killed when its footprint, `bytes` at that read, was past its memory cap.
+    /// It was killed when its footprint, `bytes` at that read, was past its memory cap at the
+    /// ceiling ([`Limits::memory`]).
     OverMemory {
         /// The footprint read that crossed the cap, in bytes.
         bytes: u64,
+    },
+    /// It was killed when its footprint, `bytes` at that read, was past its memory cap `cap`,
+    /// which the host's room at its seat set below the ceiling ([`seat_cap`]).
+    OverRoom {
+        /// The footprint read that crossed the cap, in bytes.
+        bytes: u64,
+        /// The cap, in bytes.
+        cap: u64,
     },
     /// It was killed at its time cap.
     OverTime,
@@ -410,9 +451,11 @@ pub(crate) enum HelperEnd {
 }
 
 /// What the helper's thread read of a process's footprint, every [`POLL`] from its start to its
-/// end (the module's doc says what each OS counts).
+/// end (the module's doc says what each OS counts), and the cap they were held to.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Footprints {
+    /// The process's memory cap, in bytes ([`seat_cap`]); 0 where it never started.
+    pub(crate) cap: u64,
     /// The largest footprint read, in bytes: the one past the cap, for a process killed at it.
     pub(crate) peak: u64,
     /// The largest growth from one read to the next, in bytes.
@@ -539,8 +582,8 @@ fn watch<T: Send + 'static>(
     shared: &Shared,
 ) -> (HelperEnd, Footprints, Option<T>) {
     let clock = OsClock::new();
-    let seat = match take_seat(&run, &place, shared, &clock) {
-        Ok(Some(seat)) => seat,
+    let (seat, cap) = match take_seat(&run, &place, shared, &clock) {
+        Ok(Some(seated)) => seated,
         Ok(None) => return (HelperEnd::Cancelled, Footprints::default(), None),
         Err(e) => {
             let guard = run.seats.guard.display();
@@ -548,7 +591,7 @@ fn watch<T: Send + 'static>(
             return (end, Footprints::default(), None);
         }
     };
-    let ended = run_watched(run, talk, &place, shared, &clock);
+    let ended = run_watched(run, cap, talk, &place, shared, &clock);
     drop(seat);
     drop(place);
     ended
@@ -577,14 +620,14 @@ enum Tried {
 
 /// Takes a seat of `run`'s for the helper at `place`: once it is the first of this process's
 /// helpers that wait, a seat is free and [`admits`] lets it start beside the running helpers,
-/// tried every [`POLL`], the room read at most every [`ROOM_POLL`]; `None` where it was cancelled
-/// first.
+/// tried every [`POLL`], the room read at most every [`ROOM_POLL`] beside them; with the helper's
+/// memory cap ([`seat_cap`]); `None` where it was cancelled first.
 fn take_seat(
     run: &HelperRun,
     place: &Place,
     shared: &Shared,
     clock: &OsClock,
-) -> io::Result<Option<File>> {
+) -> io::Result<Option<(File, u64)>> {
     let seats = &run.seats;
     if let Some(dir) = seats.guard.parent() {
         std::fs::create_dir_all(dir)?;
@@ -604,13 +647,15 @@ fn take_seat(
             let now = clock.now_mono();
             let may_read =
                 room_read.is_none_or(|at| now.saturating_duration_since(at) >= ROOM_POLL);
-            let cap = run.limits.memory;
+            let ceiling = run.limits.memory;
             let tried = MutexGuard::unlocked(&mut state, || {
-                try_seat(seats, cap, place, &guard, &files, may_read)
+                try_seat(seats, ceiling, place, &guard, &files, may_read)
             })?;
             match tried {
                 Tried::Seated(n, beside) => {
-                    let level = if beside.held == 0 {
+                    let cap = seat_cap(ceiling, beside);
+                    // Alone at the ceiling at debug; beside others, or below the ceiling, at info.
+                    let level = if beside.held == 0 && cap == ceiling {
                         log::Level::Debug
                     } else {
                         log::Level::Info
@@ -623,7 +668,7 @@ fn take_seat(
                         seats.count,
                         room_line(beside, cap)
                     );
-                    return Ok(Some(files.swap_remove(n)));
+                    return Ok(Some((files.swap_remove(n), cap)));
                 }
                 Tried::NoRoom(Some(beside)) => {
                     room_read = Some(now);
@@ -640,7 +685,7 @@ fn take_seat(
                         run.label,
                         beside.held,
                         seats.count,
-                        room_line(beside, cap)
+                        room_line(beside, ceiling)
                     );
                 }
                 Tried::NoRoom(None) | Tried::Full => {}
@@ -653,14 +698,12 @@ fn take_seat(
     }
 }
 
-/// The room a helper whose cap is `cap` was admitted or kept waiting by, for its line: with no
-/// seat held, no room is read, as one helper always runs.
+/// The room a helper whose cap is `cap` was admitted or kept waiting by, for its line.
 fn room_line(beside: Beside, cap: u64) -> String {
     let mib = |bytes: u64| bytes >> 20;
-    let room = match (beside.held, beside.room) {
-        (0, _) => "not read".to_owned(),
-        (_, None) => "none said".to_owned(),
-        (_, Some(room)) => format!("{} MiB", mib(room)),
+    let room = match beside.room {
+        None => "none said".to_owned(),
+        Some(room) => format!("{} MiB", mib(room)),
     };
     format!(
         "the host's room beside the guest's RAM {room}, this process's helpers holding {} MiB, \
@@ -682,7 +725,8 @@ fn open_lock(path: &Path) -> io::Result<File> {
 
 /// One try for a seat of `seats`, whose lock files are `files`, under their guard, `guard`: the
 /// seats held counted, and one taken where one is free and [`admits`] lets a helper whose cap is
-/// `cap` start beside them, the room read only where `may_read` says so.
+/// `cap` start beside them, the room read beside them only where `may_read` says so, and always
+/// where none is held, for the cap of a helper alone ([`seat_cap`]).
 fn try_seat(
     seats: &Seats,
     cap: u64,
@@ -726,9 +770,10 @@ fn count_and_take(
         return Ok(Tried::Full);
     };
     let beside = match held {
+        // No seat is held, so none of this process's helpers runs.
         0 => Beside {
             held,
-            room: None,
+            room: (seats.room)(),
             ours: 0,
         },
         _ if !may_read => {
@@ -759,10 +804,11 @@ fn unlock(files: &[File], taken: &[usize]) {
     }
 }
 
-/// Starts the process and watches it, starts its talk, and polls the process until it ends or is
-/// killed; then waits for the talk's end.
+/// Starts the process and watches it, starts its talk, and polls the process, whose memory cap is
+/// `cap`, until it ends or is killed; then waits for the talk's end.
 fn run_watched<T: Send + 'static>(
     run: HelperRun,
+    cap: u64,
     talk: impl FnOnce(ChildStdin, ChildStdout) -> T + Send + 'static,
     place: &Place,
     shared: &Shared,
@@ -802,9 +848,12 @@ fn run_watched<T: Send + 'static>(
         }
     };
     let deadline = Deadline::Mono(started.saturating_add(run.limits.time));
-    let (end, footprints) = poll(
-        &mut child, &watched, run.limits, deadline, place, shared, clock,
-    );
+    let caps = Caps {
+        memory: cap,
+        ceiling: run.limits.memory,
+        deadline,
+    };
+    let (end, footprints) = poll(&mut child, &watched, caps, place, shared, clock);
     // The talk ends once the process has: its pipes read their end, and its writes fail.
     let said = talking.join().ok();
     // `watched` goes before `child`, whose process handle it reads on Windows.
@@ -827,19 +876,47 @@ fn start_talk<T: Send + 'static>(
         })
 }
 
+/// A running helper's caps.
+#[derive(Debug, Clone, Copy)]
+struct Caps {
+    /// Its memory cap, in bytes ([`seat_cap`]).
+    memory: u64,
+    /// The ceiling, [`Limits::memory`]: a cap below it is the room's.
+    ceiling: u64,
+    /// Its time cap.
+    deadline: Deadline,
+}
+
+impl Caps {
+    /// The end of a helper whose footprint read `bytes` past its memory cap: at the ceiling, over
+    /// memory; below it, over the room.
+    fn past_memory(&self, bytes: u64) -> HelperEnd {
+        if self.memory < self.ceiling {
+            HelperEnd::OverRoom {
+                bytes,
+                cap: self.memory,
+            }
+        } else {
+            HelperEnd::OverMemory { bytes }
+        }
+    }
+}
+
 /// Polls the process every [`POLL`] until it ends, or kills it at a cancel, past its memory cap,
 /// at its time cap, or where its footprint cannot be read; with what its footprint's reads saw,
 /// each read also kept at its `place` for the room of the helpers that wait.
 fn poll(
     child: &mut Child,
     watched: &host::Watched,
-    limits: Limits,
-    deadline: Deadline,
+    caps: Caps,
     place: &Place,
     shared: &Shared,
     clock: &OsClock,
 ) -> (HelperEnd, Footprints) {
-    let mut footprints = Footprints::default();
+    let mut footprints = Footprints {
+        cap: caps.memory,
+        ..Footprints::default()
+    };
     let end = loop {
         if let Some(end) = ended(child) {
             break end;
@@ -852,8 +929,8 @@ fn poll(
                 place.read(bytes);
             });
             match read {
-                Ok(bytes) if bytes > limits.memory => Some(HelperEnd::OverMemory { bytes }),
-                Ok(_) => deadline.reached(clock).then_some(HelperEnd::OverTime),
+                Ok(bytes) if bytes > caps.memory => Some(caps.past_memory(bytes)),
+                Ok(_) => caps.deadline.reached(clock).then_some(HelperEnd::OverTime),
                 // A process that ended since the look above has no footprint to read.
                 Err(e) => match ended(child) {
                     Some(end) => break end,

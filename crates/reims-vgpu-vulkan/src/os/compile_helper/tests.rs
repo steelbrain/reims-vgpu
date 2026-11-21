@@ -9,8 +9,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::{
-    Footprints, GUEST_RAM, Helper, HelperEnd, HelperRun, Limits, MEMORY_MOST, Seats, TIME_MOST,
-    admits, end_with_parent, hold_guest_ram, host,
+    Beside, Footprints, GUEST_RAM, Helper, HelperEnd, HelperRun, Limits, MEMORY_FLOOR, MEMORY_MOST,
+    Seats, TIME_MOST, admits, end_with_parent, hold_guest_ram, host, seat_cap,
 };
 use crate::core::platform::os::Clock;
 use crate::os::OsClock;
@@ -190,8 +190,9 @@ fn a_helper_talks_over_its_pipes_and_ends_with_its_code() {
     seats.remove_files();
 }
 
-/// A helper whose footprint passes its cap is killed, and the end says the footprint read that
-/// crossed it, which is the peak of the footprints its reads saw.
+/// A helper whose footprint passes its cap at the ceiling, with no room said, is killed over
+/// memory, and the end says the footprint read that crossed it, which is the peak of the
+/// footprints its reads saw.
 #[test]
 fn a_helper_past_its_memory_cap_is_killed_over_memory() {
     let test = "a_helper_past_its_memory_cap_is_killed_over_memory";
@@ -209,6 +210,7 @@ fn a_helper_past_its_memory_cap_is_killed_over_memory() {
     match helper.wait() {
         HelperEnd::OverMemory { bytes } => {
             assert!(bytes > limits.memory, "{bytes}");
+            assert_eq!(seen.cap, limits.memory, "{seen:?}");
             assert_eq!(seen.peak, bytes, "{seen:?}");
             assert!(seen.reads > 1 && seen.most_growth > 0, "{seen:?}");
             eprintln!(
@@ -222,6 +224,49 @@ fn a_helper_past_its_memory_cap_is_killed_over_memory() {
     }
     assert!(!host::alive(pid));
     seats.remove_files();
+}
+
+/// A helper alone is capped by the room read at its seat where that is below the ceiling, and
+/// killed past it over the room, not over memory; with the room above the ceiling, the ceiling
+/// holds it, and its kill is over memory.
+#[test]
+fn a_helper_alone_is_capped_by_the_room_at_its_seat() {
+    let test = "a_helper_alone_is_capped_by_the_room_at_its_seat";
+    stand_in(test);
+    // The stand-in grows to 2 GiB, past the room's cap and short of the ceiling.
+    let limits = Limits {
+        memory: 4 << 30,
+        time: Duration::from_secs(60),
+    };
+    let room = MEMORY_FLOOR + (64 << 20);
+    let seats = seats_of("roomcap", 1, move || Some(room));
+    let (ends, ended) = mpsc::channel();
+    let on_end = move |_: &HelperEnd, seen, _| ends.send(seen).unwrap();
+    let helper = Helper::start(run_of(test, "grow", limits, &seats), drain, on_end).unwrap();
+    let pid = pid_of(&helper);
+    let seen: Footprints = ended.recv_timeout(Duration::from_secs(30)).unwrap();
+    match helper.wait() {
+        HelperEnd::OverRoom { bytes, cap } => {
+            assert_eq!(cap, room);
+            assert!(bytes > cap && bytes < limits.memory, "{bytes}");
+            assert_eq!((seen.cap, seen.peak), (cap, bytes), "{seen:?}");
+        }
+        end => panic!("{end:?}"),
+    }
+    assert!(!host::alive(pid));
+    seats.remove_files();
+    let small = Limits {
+        memory: 256 << 20,
+        time: Duration::from_secs(60),
+    };
+    let roomy = seats_of("roomcap-ceiling", 2, || Some(1 << 40));
+    let helper = Helper::start(run_of(test, "grow", small, &roomy), drain, |_, _, _| {}).unwrap();
+    let end = helper.wait();
+    assert!(
+        matches!(end, HelperEnd::OverMemory { bytes } if bytes > small.memory),
+        "{end:?}"
+    );
+    roomy.remove_files();
 }
 
 /// A helper still running at its time cap is killed there.
@@ -396,14 +441,12 @@ fn helpers_take_seats_in_the_order_they_were_started() {
 }
 
 /// A helper takes a seat beside others only where the caps of all, its own among them, fit in the
-/// room and what this process's running helpers hold now, which the room no longer counts; alone,
-/// it always takes one; with no room said, never beside another.
+/// room and what this process's running helpers hold now, which the room no longer counts; with
+/// no room said, never beside another.
 #[test]
 fn a_helper_takes_a_seat_beside_others_only_where_all_their_caps_fit() {
     const GIB: u64 = 1 << 30;
     let cap = 8 * GIB;
-    assert!(admits(0, cap, None, 0));
-    assert!(admits(0, cap, Some(0), 0));
     assert!(!admits(1, cap, None, 4 * GIB));
     assert!(admits(1, cap, Some(16 * GIB), 0));
     assert!(!admits(1, cap, Some(16 * GIB - 1), 0));
@@ -411,6 +454,37 @@ fn a_helper_takes_a_seat_beside_others_only_where_all_their_caps_fit() {
     assert!(!admits(2, cap, Some(20 * GIB), 3 * GIB));
     assert!(admits(2, cap, Some(21 * GIB), 3 * GIB));
     assert!(super::room_of_host().is_some(), "the host says no room");
+}
+
+/// Alone, a helper always takes a seat, at a cap no larger than the room read at its seat: the
+/// smaller of the ceiling and the room, and no less than the floor (nor more than the ceiling)
+/// where the room reads less; at the ceiling where no room is said, and beside others.
+#[test]
+fn a_helper_alone_always_runs_at_a_cap_no_larger_than_the_room() {
+    const GIB: u64 = 1 << 30;
+    let ceiling = 8 * GIB;
+    assert!(admits(0, ceiling, None, 0));
+    assert!(admits(0, ceiling, Some(0), 0));
+    let alone = |room| Beside {
+        held: 0,
+        room,
+        ours: 0,
+    };
+    assert_eq!(seat_cap(ceiling, alone(Some(16 * GIB))), ceiling);
+    assert_eq!(seat_cap(ceiling, alone(Some(ceiling))), ceiling);
+    assert_eq!(seat_cap(ceiling, alone(Some(5 * GIB))), 5 * GIB);
+    assert_eq!(seat_cap(ceiling, alone(Some(GIB + 1))), GIB + 1);
+    assert_eq!(MEMORY_FLOOR, GIB);
+    assert_eq!(seat_cap(ceiling, alone(Some(GIB / 2))), MEMORY_FLOOR);
+    assert_eq!(seat_cap(ceiling, alone(Some(0))), MEMORY_FLOOR);
+    assert_eq!(seat_cap(GIB / 2, alone(Some(0))), GIB / 2);
+    assert_eq!(seat_cap(ceiling, alone(None)), ceiling);
+    let beside = Beside {
+        held: 1,
+        room: Some(20 * GIB),
+        ours: GIB,
+    };
+    assert_eq!(seat_cap(ceiling, beside), ceiling);
 }
 
 /// The guest's RAM is named to the room while its hold lives, and no longer once it drops.

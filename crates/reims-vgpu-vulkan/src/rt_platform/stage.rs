@@ -11,11 +11,15 @@
 //!   talk's wall time and the module's weight (`StageRequest::weight`).
 //! - **The fill's end** ([`fill_end`]) is the talk's answer first: data kept fills the stage, and
 //!   a compile the driver failed is a breach rt kept. Otherwise it is how the helper ended: killed
-//!   at its memory or time cap, a breach recorded with rt (`Device::record_stage_breach`), so the
-//!   pipeline's makes refuse it (`Gap::StageSize`) with no helper asked again; cancelled; or
-//!   failed, with nothing recorded (no helper, one of another build's wire, one that found no
-//!   device of the request's or enabled other features, a cache directory that took no entry,
-//!   a helper that ended before its reply).
+//!   at its memory cap at the ceiling (`Limits::memory`) or at its time cap, a breach recorded
+//!   with rt (`Device::record_stage_breach`), so the pipeline's makes refuse it (`Gap::StageSize`)
+//!   with no helper asked again; cancelled; or failed, with nothing recorded (no helper, one of
+//!   another build's wire, one that found no device of the request's or enabled other features, a
+//!   cache directory that took no entry, a helper that ended before its reply, and a helper killed
+//!   at a memory cap the host's room set below the ceiling, as the same stage fits on a host with
+//!   room). A failed fill's end is kept for the process's run, as every end is: the guest's
+//!   create of the pipeline fails, and its dispatches are skipped, until the VM's next start asks a
+//!   helper again.
 //! - A cancel of the fill kills the helper.
 //!
 //! Where there is no helper to run, no fill starts, and the stage's fill ends
@@ -29,8 +33,8 @@
 //! the VM's did.
 //!
 //! **Each helper's footprint** is logged as it ends, with its fill's key ([`footprints_line`]):
-//! the largest its reads saw, the largest growth from one read to the next, and how far past the
-//! cap it got, which a run reads the cap's margin from.
+//! the largest its reads saw, the largest growth from one read to the next, its own cap, and how
+//! far past that cap it got, which a run reads the cap's margin from.
 //!
 //! Each fill's start is logged with the site that asked for it ([`Site`]), and rt's refusals are
 //! counted by their site, each under a code of its own, apart from the refusals the calls end
@@ -131,7 +135,7 @@ pub(crate) fn unfilled_at_dispatch(error: &rt::Error) -> Option<StageKey> {
 
 /// The fills of `device`, whose physical device's `deviceUUID` is `uuid`: each runs the helper
 /// ([`helper_run`]), hands its pipes to rt's `fill_stage`, and records the breach of a helper
-/// killed at a cap (the module's docs).
+/// killed at the ceiling or its time cap (the module's docs).
 pub(crate) fn fills(device: rt::Device, uuid: [u8; 16]) -> StageFills<StageKey> {
     let talks = device.clone();
     StageFills::new(stage_start(
@@ -304,9 +308,14 @@ fn fill_end<S>(
         (_, HelperEnd::OverMemory { .. }) => (FillEnd::Breached, Some(rt::StageBreach::Memory)),
         (_, HelperEnd::OverTime) => (FillEnd::Breached, Some(rt::StageBreach::Time)),
         (_, HelperEnd::Cancelled) => (FillEnd::Cancelled, None),
-        (_, HelperEnd::Ended(_) | HelperEnd::NotStarted(_) | HelperEnd::Unwatched(_)) => {
-            (FillEnd::Failed, None)
-        }
+        // A cap the host's room set is no breach: the stage fits on a host with room.
+        (
+            _,
+            HelperEnd::OverRoom { .. }
+            | HelperEnd::Ended(_)
+            | HelperEnd::NotStarted(_)
+            | HelperEnd::Unwatched(_),
+        ) => (FillEnd::Failed, None),
     }
 }
 
@@ -343,13 +352,12 @@ where
         run.label = format!("stage {key:?}");
         let (talk, on_end) = (Arc::clone(&talk), Arc::clone(&on_end));
         let (talks, ends) = (key.clone(), key.clone());
-        let cap = run.limits.memory;
         let started = Helper::start(
             run,
             move |to_helper, from_helper| talk(&talks, to_helper, from_helper),
             move |end, seen, said| {
                 if seen.reads > 0 {
-                    footprints_line(&ends, end, seen, cap);
+                    footprints_line(&ends, end, seen);
                 }
                 done.end(on_end(&ends, end, said));
             },
@@ -371,9 +379,10 @@ where
 }
 
 /// Writes the footprint of the helper of `key`'s fill that ended as `end`, as its reads `seen`
-/// it, beside its memory cap `cap` (`os::compile_helper`'s docs, "The memory cap").
-fn footprints_line<K: fmt::Debug>(key: &K, end: &HelperEnd, seen: Footprints, cap: u64) {
+/// it, beside its memory cap (`os::compile_helper`'s docs, "The memory cap").
+fn footprints_line<K: fmt::Debug>(key: &K, end: &HelperEnd, seen: Footprints) {
     let mib = |bytes: u64| bytes >> 20;
+    let cap = seen.cap;
     log::info!(
         target: super::TARGET,
         "stage {key:?}: its helper ended {end:?}: its peak footprint {} MiB, its most growth \
@@ -396,7 +405,7 @@ mod tests {
 
     use super::*;
     use crate::core::platform::stage::StageFills;
-    use crate::os::compile_helper::{Limits, end_with_parent};
+    use crate::os::compile_helper::{Limits, MEMORY_FLOOR, end_with_parent};
 
     /// A refusal of a stage is counted under its site's code, and one of no stage is not
     #[test]
@@ -441,6 +450,7 @@ mod tests {
     /// Where this process is a stand-in, does what [`STAND_IN`] names, and never returns; otherwise
     /// returns at once. A stand-in arms its end with its parent first, as the helper's main does.
     /// - `echo`: writes back what its stdin carries, then exits with 0.
+    /// - `grow`: dirties 32 MiB more every 10 ms, up to 2 GiB, then sleeps for a minute.
     /// - `sleep`: sleeps for a minute, past every test's wait.
     fn stand_in() {
         let Some(mode) = std::env::var_os(STAND_IN) else {
@@ -453,6 +463,18 @@ mod tests {
             let mut stdout = io::stdout();
             stdout.write_all(&request).unwrap();
             stdout.flush().unwrap();
+        } else if mode == "grow" {
+            let mut held = Vec::new();
+            for _ in 0..64 {
+                let mut chunk = vec![0_u8; 32 << 20];
+                for page in chunk.chunks_mut(4096) {
+                    page[0] = 1;
+                }
+                held.push(chunk);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_secs(60));
+            drop(held);
         } else {
             std::thread::sleep(Duration::from_secs(60));
         }
@@ -482,7 +504,8 @@ mod tests {
         }
     }
 
-    /// The seats of this test process's `test`: one, so its helpers run one at a time.
+    /// The seats of this test process's `test`: one, so its helpers run one at a time, beside no
+    /// room said.
     fn seats_of(test: &str) -> Seats {
         let pid = std::process::id();
         Seats {
@@ -490,6 +513,23 @@ mod tests {
             count: 1,
             room: Arc::new(|| None),
         }
+    }
+
+    /// A run of `test`'s `grow` stand-in at the ceiling `ceiling`, on its seats beside the room
+    /// `room`.
+    fn grow_run(test: &str, ceiling: u64, room: u64) -> HelperRun {
+        let mut run = run_of(test, "grow");
+        run.limits.memory = ceiling;
+        run.seats.room = Arc::new(move || Some(room));
+        run
+    }
+
+    /// A talk that says nothing, reads the helper's stdout to its end, and answers that the helper
+    /// ended before its reply.
+    fn no_reply(_: &u32, stdin: ChildStdin, mut stdout: ChildStdout) -> Result<(), rt::StageFill> {
+        drop(stdin);
+        io::copy(&mut stdout, &mut io::sink()).unwrap_or(0);
+        Err(rt::StageFill::Ended)
     }
 
     /// An exit status of `code`.
@@ -588,8 +628,9 @@ mod tests {
     }
 
     /// The talk's answer decides first: data kept fills the stage, and a failed compile is a
-    /// breach rt kept. Otherwise a cap's kill is a breach to record, a cancel is a cancel, and
-    /// every other end fails the fill with nothing recorded.
+    /// breach rt kept. Otherwise a kill at the ceiling or the time cap is a breach to record, a
+    /// cancel is a cancel, and every other end, a kill at a cap the room set among them, fails the
+    /// fill with nothing recorded.
     #[test]
     fn a_fill_ends_by_its_talk_first_then_by_its_helper() {
         use rt::{StageBreach, StageFill};
@@ -623,6 +664,60 @@ mod tests {
         assert_eq!(fill_end::<()>(&not_started, None), failed);
         let unwatched = HelperEnd::Unwatched("its status".to_owned());
         assert_eq!(fill_end(&unwatched, Some(&ended)), failed);
+        let over_room = HelperEnd::OverRoom {
+            bytes: 5 << 30,
+            cap: 4 << 30,
+        };
+        assert_eq!(fill_end(&over_room, Some(&ended)), failed);
+        assert_eq!(fill_end::<()>(&over_room, None), failed);
+        assert_eq!(fill_end(&over_room, Some(&ok)), (FillEnd::Filled, None));
+    }
+
+    /// A helper killed at a cap the host's room set below the ceiling fails its fill with no
+    /// breach recorded, as the stage fits on a host with room, and the end is kept: no helper is
+    /// asked again in the process's run.
+    #[test]
+    fn a_helper_past_a_cap_the_room_set_fails_its_fill_with_nothing_recorded() {
+        let test = "a_helper_past_a_cap_the_room_set_fails_its_fill_with_nothing_recorded";
+        stand_in();
+        let (records, recorded) = mpsc::channel();
+        let (talks, talked) = mpsc::channel();
+        // The stand-in grows to 2 GiB, past the room's cap and short of the ceiling.
+        let room = MEMORY_FLOOR + (64 << 20);
+        let fills = StageFills::new(stage_start(
+            move || Ok(grow_run(test, 4 << 30, room)),
+            move |key: &u32, stdin, stdout| {
+                talks.send(*key).unwrap();
+                no_reply(key, stdin, stdout)
+            },
+            move |key, breach| records.send((*key, breach)).unwrap(),
+        ));
+        assert_eq!(fills.fill(6, Site::Dispatch).wait(), FillEnd::Failed);
+        assert_eq!(talked.recv_timeout(WAIT).unwrap(), 6);
+        assert_eq!(fills.fill(6, Site::Dispatch).end(), Some(FillEnd::Failed));
+        assert!(talked.try_recv().is_err());
+        assert!(recorded.try_recv().is_err());
+        seats_of(test).remove_files();
+    }
+
+    /// A helper killed at its memory cap at the ceiling, which the room at its seat did not lower,
+    /// breaches its stage: the memory breach is recorded, and the fill ends breached.
+    #[test]
+    fn a_helper_past_the_ceiling_records_a_memory_breach() {
+        let test = "a_helper_past_the_ceiling_records_a_memory_breach";
+        stand_in();
+        let (records, recorded) = mpsc::channel();
+        let fills = StageFills::new(stage_start(
+            move || Ok(grow_run(test, 256 << 20, 1 << 40)),
+            no_reply,
+            move |key, breach| records.send((*key, breach)).unwrap(),
+        ));
+        assert_eq!(fills.fill(7, Site::Dispatch).wait(), FillEnd::Breached);
+        assert_eq!(
+            recorded.recv_timeout(WAIT).unwrap(),
+            (7, rt::StageBreach::Memory)
+        );
+        seats_of(test).remove_files();
     }
 
     /// A helper of another build's wire, which rt's fill answers `StageFill::Version`, fails the
@@ -662,11 +757,7 @@ mod tests {
                 run.limits.time = Duration::from_millis(300);
                 Ok(run)
             },
-            |_: &u32, stdin, mut stdout| {
-                drop(stdin);
-                io::copy(&mut stdout, &mut io::sink()).unwrap_or(0);
-                Err::<(), _>(rt::StageFill::Ended)
-            },
+            no_reply,
             move |key, breach| records.send((*key, breach)).unwrap(),
         ));
         assert_eq!(fills.fill(3, Site::Dispatch).wait(), FillEnd::Breached);

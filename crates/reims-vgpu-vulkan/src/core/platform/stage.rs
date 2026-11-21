@@ -52,8 +52,9 @@ pub enum FillEnd {
     /// The compile passed its memory or time cap, or failed, and the platform recorded the breach:
     /// a make of the stage refuses.
     Breached,
-    /// The fill ended with nothing recorded (what runs it did not start, ended early, or could not
-    /// open its device): a make of the stage refuses as before the fill.
+    /// The fill ended with nothing recorded (what runs it did not start, ended early, could not
+    /// open its device, or passed a memory cap the host's room set): a make of the stage refuses
+    /// as before the fill.
     Failed,
     /// The fill was cancelled (a device's reset, the process's exit). Nothing is kept for its key.
     Cancelled,
