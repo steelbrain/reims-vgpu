@@ -119,6 +119,9 @@ pub struct Ctx {
     pub sound: crate::os::SoundDevices,
     /// Whether the host's KVM offers VMX to guests ([`crate::host::kvm_nested_vmx`]).
     pub nested_vmx: bool,
+    /// Whether the guest's CPU lists the AVX-512 state components in CPUID leaf 0xD, QEMU's
+    /// `x-avx512-xstate` ([`avx512_xstate`]).
+    pub avx512_xstate: bool,
     /// Whether QEMU's own window can open ([`crate::host::has_screen`]).
     pub screen: bool,
     /// The option ROM of reims-vgpu's own device, which its `romfile` names
@@ -126,6 +129,34 @@ pub struct Ctx {
     pub graphics_rom: PathBuf,
     /// What an arm64 VM boots on; None for an x86-64 VM.
     pub arm64: Option<Arm64Boot>,
+}
+
+/// Where Intel's CPUs put the AVX-512 state components 5, 6 and 7 in the standard XSAVE layout,
+/// the offsets macOS copies a thread's AVX-512 state at.
+pub const INTEL_AVX512_OFFSETS: [u32; 3] = [1088, 1152, 1664];
+
+/// Whether an x86-64 guest's CPU lists the AVX-512 state components in CPUID leaf 0xD while leaf
+/// 7 keeps AVX-512F clear, QEMU's `x-avx512-xstate`. macOS then keeps AVX-512 state, and the
+/// guest's RgfxGate turns it on in each user thread at the thread's first FP use
+/// (guest/rgfxgate/src/RgfxGateXstate.cpp): a Zen 4 core leaves its op cache unused while a
+/// thread's XCR0 lacks the AVX-512 components. The guest still sees no AVX-512 in leaf 7. Given
+/// where each holds, asked in this order:
+/// - `kvm`: QEMU runs on KVM, which gives the guest leaf 0xD's components from the host's;
+/// - `host_offsets`: the host's OS keeps the components, at other offsets than Intel's
+///   ([`crate::host::avx512_xstate_offsets`]). On a host with Intel's the command stays as it
+///   was: no gain was measured on one;
+/// - `kexts_held`: the VM is on reims-vgpu's own device and its OpenCore image holds the guest's
+///   kexts this reims-ctl carries ([`crate::opencore::holds_guest_kexts`]), whose RgfxGate copies
+///   the state at the CPU's offsets. macOS alone copies it at Intel's, and a thread that runs
+///   AVX-512 instructions loses its AVX-512 registers over a signal;
+/// - `qemu_knows`: the QEMU it runs has the property ([`crate::install::cpu_has_property`]).
+pub fn avx512_xstate(
+    kvm: bool,
+    host_offsets: Option<[u32; 3]>,
+    kexts_held: impl FnOnce() -> bool,
+    qemu_knows: impl FnOnce() -> bool,
+) -> bool {
+    kvm && host_offsets.is_some_and(|o| o != INTEL_AVX512_OFFSETS) && kexts_held() && qemu_knows()
 }
 
 /// What an arm64 VM boots on: Ambrosia's image ([`crate::ambrosia::image`]) and the
@@ -259,6 +290,11 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     // order, and `+` and `-` ones after them, so a `+vmx` here would outlive a `vmx=off`.
     if ctx.nested_vmx {
         cpu.push_str(",vmx=on");
+    }
+    // `name=value` as well, so a VM's `x-avx512-xstate=off` in `cpu_flags`, which follows it,
+    // takes it away.
+    if ctx.avx512_xstate {
+        cpu.push_str(",x-avx512-xstate=on");
     }
     if !q.cpu_flags.trim().is_empty() {
         cpu.push(',');
@@ -683,6 +719,7 @@ mod tests {
                 input: true,
             },
             nested_vmx: false,
+            avx512_xstate: false,
             screen: true,
             graphics_rom: "/d/firmware/ReimsGraphics-0123456789abcdef.rom".into(),
             arm64: None,
@@ -1157,6 +1194,85 @@ mod tests {
             )
         );
         assert!(!cpu(false).contains("vmx"));
+    }
+
+    /// QEMU's `x-avx512-xstate` only where each fact holds, asked in their order: KVM, the host's
+    /// AVX-512 state at other offsets than Intel's, the guest's kexts in the image, then a QEMU
+    /// that knows the property; neither the image nor QEMU is read where a fact before fails.
+    #[test]
+    fn avx512_xstate_only_where_each_fact_holds() {
+        const ZEN4: Option<[u32; 3]> = Some([832, 896, 1408]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let decide = |kvm, offsets, kexts: bool, knows: bool| {
+            asked.borrow_mut().clear();
+            avx512_xstate(
+                kvm,
+                offsets,
+                || {
+                    asked.borrow_mut().push("kexts");
+                    kexts
+                },
+                || {
+                    asked.borrow_mut().push("qemu");
+                    knows
+                },
+            )
+        };
+        assert!(decide(true, ZEN4, true, true));
+        assert_eq!(*asked.borrow(), ["kexts", "qemu"]);
+        // On WHPX, on a host whose OS keeps no AVX-512 state, and on Intel's layout.
+        for (kvm, offsets) in [
+            (false, ZEN4),
+            (true, None),
+            (true, Some(INTEL_AVX512_OFFSETS)),
+        ] {
+            assert!(!decide(kvm, offsets, true, true), "{kvm} {offsets:?}");
+            assert!(asked.borrow().is_empty());
+        }
+        // An image without the guest's kexts, and an older QEMU.
+        assert!(!decide(true, ZEN4, false, true));
+        assert_eq!(*asked.borrow(), ["kexts"]);
+        assert!(!decide(true, ZEN4, true, false));
+    }
+
+    /// `x-avx512-xstate=on` comes after `vmx=on` and before the VM's `cpu_flags`, so a VM's
+    /// `x-avx512-xstate=off` there takes it away: QEMU applies `name=value` flags in order, the
+    /// last one winning. Without it, the line is the one reims-ctl gave before it had the
+    /// property, byte for byte, as on Intel's layout, WHPX or an older QEMU.
+    #[test]
+    fn avx512_xstate_comes_before_the_vms_cpu_flags() {
+        let cpu = |vm: &Vm, nested_vmx, avx512_xstate| {
+            let c = Ctx {
+                nested_vmx,
+                avx512_xstate,
+                ..ctx(linux())
+            };
+            let inv = invocation(vm, &c).unwrap();
+            let i = inv.args.iter().position(|x| x == "-cpu").unwrap();
+            inv.args[i + 1].clone()
+        };
+        let head = format!(
+            "{},kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on",
+            default_cpu_model()
+        );
+        let flags = default_cpu_flags();
+        let vm = q35_vm();
+        assert_eq!(
+            cpu(&vm, true, true),
+            format!("{head},vmx=on,x-avx512-xstate=on,{flags}")
+        );
+        assert_eq!(
+            cpu(&vm, false, true),
+            format!("{head},x-avx512-xstate=on,{flags}")
+        );
+        assert_eq!(cpu(&vm, true, false), format!("{head},vmx=on,{flags}"));
+        assert_eq!(cpu(&vm, false, false), format!("{head},{flags}"));
+        let mut off = q35_vm();
+        off.config.q35.as_mut().unwrap().cpu_flags = format!("{flags},x-avx512-xstate=off");
+        assert_eq!(
+            cpu(&off, false, true),
+            format!("{head},x-avx512-xstate=on,{flags},x-avx512-xstate=off")
+        );
     }
 
     #[test]

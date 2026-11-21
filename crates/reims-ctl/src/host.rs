@@ -84,6 +84,30 @@ pub fn kvm_nested_vmx() -> bool {
         .is_ok_and(|s| matches!(s.trim(), "Y" | "1"))
 }
 
+/// Where this CPU's standard XSAVE layout puts the AVX-512 state components 5, 6 and 7 (the
+/// opmask, ZMM_Hi256 and Hi16_ZMM), as CPUID leaf 0xD's sub-leaves report them, where the host's OS
+/// keeps them (XCR0 bits 5-7, which KVM offers its guests only where they are set); None where it
+/// does not, and on a host other than x86-64 Linux. Intel's CPUs put them at 1088, 1152 and 1664,
+/// AMD's Zen 4 at 832, 896 and 1408.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn avx512_xstate_offsets() -> Option<[u32; 3]> {
+    use std::arch::x86_64::{__cpuid_count, _xgetbv};
+    // CPUID.1:ECX.OSXSAVE: the OS turned XSAVE on, so XGETBV reads XCR0.
+    if __cpuid_count(1, 0).ecx & (1 << 27) == 0 {
+        return None;
+    }
+    // SAFETY: OSXSAVE is set, so the CPU has XGETBV and XCR0 is readable.
+    let xcr0 = unsafe { _xgetbv(0) };
+    (xcr0 & 0xe0 == 0xe0).then(|| [5, 6, 7].map(|c| __cpuid_count(0xd, c).ebx))
+}
+
+/// Where this CPU's standard XSAVE layout puts the AVX-512 state components; None on a host other
+/// than x86-64 Linux.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub fn avx512_xstate_offsets() -> Option<[u32; 3]> {
+    None
+}
+
 /// Whether a window can open for a QEMU run with `env` over this process's environment: it names
 /// a Wayland compositor or an X server. Without one, QEMU's GTK window ends QEMU as it starts,
 /// where the library's runs headless.

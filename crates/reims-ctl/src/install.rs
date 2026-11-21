@@ -188,6 +188,40 @@ pub fn has_device(qemu: &Path, name: &'static str) -> Option<bool> {
     has
 }
 
+/// What `qemu -device qemu64-x86_64-cpu,help` listed, by binary and property.
+type CpuProbes = HashMap<(PathBuf, &'static str), Option<bool>>;
+
+/// Whether `qemu`'s x86-64 CPUs have the property `name`, which `-device qemu64-x86_64-cpu,help`
+/// lists (every x86-64 CPU model has the same properties), cached per binary; None where QEMU does
+/// not run. A QEMU ends at its start on a `-cpu` property it does not know.
+pub fn cpu_has_property(qemu: &Path, name: &'static str) -> Option<bool> {
+    static CACHE: OnceLock<Mutex<CpuProbes>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (qemu.to_path_buf(), name);
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return *v;
+    }
+    let has = std::process::Command::new(qemu)
+        .args(["-device", "qemu64-x86_64-cpu,help"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| lists_property(&String::from_utf8_lossy(&o.stdout), name));
+    cache.lock().unwrap().insert(key, has);
+    has
+}
+
+/// Whether `-device TYPE,help`'s output lists the property `name`, on a line `  name=<type>`.
+fn lists_property(out: &str, name: &str) -> bool {
+    out.lines().any(|l| {
+        l.trim_start()
+            .strip_prefix(name)
+            .is_some_and(|r| r.starts_with("=<"))
+    })
+}
+
 /// The audio backend to use where the VM names none: the host's native one, among those built
 /// (DirectSound's on Windows).
 pub fn default_audio_backend(available: &[String]) -> String {
@@ -232,6 +266,23 @@ mod tests {
         if std::env::var_os("REIMS_CTL_TEST_IDLE").is_some() {
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
+    }
+
+    /// A CPU property is found by its whole name in `-device qemu64-x86_64-cpu,help`'s lines, as
+    /// QEMU's object_property_help writes them, and not by a name it starts or ends.
+    #[test]
+    fn a_cpu_property_is_listed_by_its_whole_name() {
+        let out = "qemu64-x86_64-cpu options:\n  \
+                   avx512f=<bool>\n  \
+                   x-avx512-xstate=<bool>  - on/off (default: false)\n  \
+                   xsave=<bool>\n";
+        assert!(lists_property(out, "x-avx512-xstate"));
+        assert!(lists_property(out, "avx512f"));
+        assert!(!lists_property(out, "avx512"));
+        assert!(!lists_property(out, "avx512-xstate"));
+        assert!(!lists_property(out, "x-avx512"));
+        let none = "There are no options for qemu64-x86_64-cpu.\n";
+        assert!(!lists_property(none, "x-avx512-xstate"));
     }
 
     /// The installer's prune keeps a build older than the newest three while a QEMU runs from

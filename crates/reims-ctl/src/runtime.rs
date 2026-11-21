@@ -429,16 +429,30 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
         }),
         Profile::Q35X86_64 => None,
     };
+    let avx512_xstate = avx512_xstate(vm, host, &qemu);
     Ok(Ctx {
         host,
         qemu,
         audio_backend,
         sound: crate::os::sound_devices(),
         nested_vmx: crate::host::kvm_nested_vmx(),
+        avx512_xstate,
         screen,
         graphics_rom: graphics_rom(vm)?,
         arm64,
     })
+}
+
+/// Whether an x86-64 VM's CPU lists the AVX-512 state components in CPUID leaf 0xD
+/// ([`qemu::avx512_xstate`]), from this host's facts, the VM's OpenCore image and `qemu`.
+fn avx512_xstate(vm: &Vm, host: Host, qemu: &Path) -> bool {
+    vm.config.profile == Profile::Q35X86_64
+        && qemu::avx512_xstate(
+            vm.config.profile.accel(host) == "kvm",
+            crate::host::avx512_xstate_offsets(),
+            || crate::opencore::holds_guest_kexts(vm),
+            || crate::install::cpu_has_property(qemu, "x-avx512-xstate") == Some(true),
+        )
 }
 
 /// The option ROM of reims-vgpu's own device, written into the data directory for an x86-64 VM
@@ -492,12 +506,14 @@ pub fn trim_aux(vm: &Vm) -> Result<()> {
 pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
     let ctx = context(vm, host).unwrap_or_else(|_| {
         let qemu = crate::install::qemu_binary_or_default(vm.config.profile);
+        let avx512_xstate = avx512_xstate(vm, host, &qemu);
         Ctx {
             host,
             qemu,
             audio_backend: crate::install::default_audio_backend(&[]),
             sound: crate::os::sound_devices(),
             nested_vmx: crate::host::kvm_nested_vmx(),
+            avx512_xstate,
             screen: crate::host::has_screen(&vm.config.extra_env),
             graphics_rom: graphics_rom(vm).unwrap_or_else(|_| crate::prebuilt::graphics_rom_path()),
             arm64: (vm.config.profile == Profile::VmappleArm64).then(|| qemu::Arm64Boot {

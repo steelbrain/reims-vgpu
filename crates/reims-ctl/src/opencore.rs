@@ -233,6 +233,13 @@ pub fn missing_guest_kexts(vm: &Vm) -> Option<String> {
     }
 }
 
+/// Whether a VM on reims-vgpu's own device has an OpenCore image that holds the guest's kexts this
+/// reims-ctl carries, each in the set's order and of its build.
+pub fn holds_guest_kexts(vm: &Vm) -> bool {
+    vm.config.graphics() == Graphics::ReimsVgpu
+        && matches!(image_guest_kexts(vm), Some(Ok(GuestKexts::Held)))
+}
+
 /// Whether a VM on reims-vgpu's own GPU device has an OpenCore image that loads each of the
 /// guest's kexts, but other builds of some than this reims-ctl carries, or out of the set's
 /// order: an image an older reims-ctl made, which a start makes again ([`crate::runtime::prepare`])
