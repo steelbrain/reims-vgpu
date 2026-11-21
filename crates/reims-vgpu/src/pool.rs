@@ -58,7 +58,11 @@
 //! At the device's release the host has removed every piece it added (QEMU does so as it tears
 //! the device down, before the release): from then on ([`Pool::close`]) the pool waits only for
 //! the holds and the keeps and asks the host nothing, and it gives every block back before it lets
-//! go of the source.
+//! go of the source. It waits for them at most the release's 5 s ([`crate::LET_GO_BOUND`]): past
+//! them, where a hold or a keep is left (an import whose GPU work never completes, on a GPU that
+//! hung), it gives back only the blocks no hold or keep is on and forgets the source, so a block
+//! still imported never goes back, by the pool or by the source's drop, and the source, with the
+//! device it holds, stays to the process's exit.
 //!
 //! # The block source
 //!
@@ -1079,8 +1083,10 @@ impl Pool {
     /// (a take in flight is answered never) and its zeroer, and waits until their threads let go
     /// of the pool ([`Threads`]); gives back the blocks taken and not placed, with no word to the
     /// host; then, where no ledger lives, waits for every hold on the pieces left, gives each
-    /// one's block back and lets go of the source. Where a ledger lives (the decoder's, whose
-    /// heaps over the contexts' blocks may outlive the device), the last one's drop does that.
+    /// one's block back and lets go of the source, or past the release's bound gives back the
+    /// free ones' alone and forgets the source ([`Shared::give_all_back`]). Where a ledger lives
+    /// (the decoder's, whose heaps over the contexts' blocks may outlive the device), the last
+    /// one's drop does that.
     pub(crate) fn close(&mut self) {
         let mut st = self.shared.state.lock();
         st.closed = true;
@@ -1353,12 +1359,14 @@ impl Shared {
     }
 
     /// [`Pool::close`]'s part, once the pool's thread has ended: waits for every hold and keep on
-    /// the pieces left to go, asleep on the pool's bell, which their drops ring ([`Bell`]), then
-    /// takes them all out of the pool and answers their blocks. A keep goes once the platform freed
-    /// its import, which it does once no GPU work uses the bytes. The host removed every piece
-    /// before the release, so it is asked nothing.
-    fn take_all_out(&self) -> Vec<BlockId> {
+    /// the pieces left to go, asleep on the pool's bell, which their drops ring ([`Bell`]), at most
+    /// the release's bound ([`crate::LET_GO_BOUND`]), then takes them all out of the pool and
+    /// answers the blocks no hold or keep is on, and whether that is every block. A keep goes once
+    /// the platform freed its import, which it does once no GPU work uses the bytes. The host
+    /// removed every piece before the release, so it is asked nothing.
+    fn take_all_out(&self) -> (Vec<BlockId>, bool) {
         const WARN_AFTER: Duration = Duration::from_secs(1);
+        let bound = crate::LET_GO_BOUND;
         let mut st = self.state.lock();
         let mut warned = false;
         let started = (self.now)();
@@ -1368,6 +1376,9 @@ impl Shared {
                 break;
             };
             let waited = (self.now)().saturating_duration_since(started);
+            if waited >= bound {
+                break;
+            }
             if !warned && waited > WARN_AFTER {
                 warned = true;
                 let what = match p.holds > 0 {
@@ -1378,30 +1389,57 @@ impl Shared {
                     "pool: the release still waits after 1 s for {what} the piece at {at:#x}"
                 );
             }
-            // Until the hold's or the keep's drop rings the bell, or the warning is due.
-            let due = WARN_AFTER
-                .saturating_sub(waited)
-                .max(Duration::from_millis(1));
-            let most = (!warned).then_some(due);
-            MutexGuard::unlocked(&mut st, || self.bell.wait(seen, most));
+            // Until the hold's or the keep's drop rings the bell, or the warning or the bound is
+            // due.
+            let due = if warned { bound } else { WARN_AFTER };
+            let most = due.saturating_sub(waited).max(Duration::from_millis(1));
+            MutexGuard::unlocked(&mut st, || self.bell.wait(seen, Some(most)));
         }
         st.by_block.clear();
         st.carves.clear();
         st.takers.clear();
         let pieces = std::mem::take(&mut st.pieces);
         drop(st);
-        pieces.into_values().map(|p| p.block.id).collect()
+        // Its holds are no longer counted down once it is out of the pool: a piece held here, past
+        // the bound, stays held.
+        let (held, free): (Vec<_>, Vec<_>) = pieces.into_iter().partition(|(_, p)| p.held());
+        if !held.is_empty() {
+            let named: Vec<String> = (held.iter())
+                .map(|(at, p)| match p.holds > 0 {
+                    true => format!("{at:#x} (held by a thread of the device's)"),
+                    false => format!("{at:#x} (an import of its bytes not freed)"),
+                })
+                .collect();
+            log::warn!(
+                "pool: the release waited {bound:?}, its bound, for the pieces at {}: their blocks \
+                 stay out, and the block source and its device are kept to the exit",
+                named.join(", ")
+            );
+        }
+        let blocks = (free.into_iter()).map(|(_, p)| p.block.id).collect();
+        (blocks, held.is_empty())
     }
 
-    /// The device's release's end, once no ledger lives: every block goes back to `source`
-    /// ([`Self::take_all_out`]), which is then let go of.
+    /// The device's release's end, once no ledger lives: the blocks no hold or keep is on go back
+    /// to `source` ([`Self::take_all_out`]), which is then let go of where they were all of them.
+    /// Where a hold or a keep outlasted the release's bound, the source is forgotten instead, so
+    /// neither the pool nor the source's drop gives back a block still held or imported (the
+    /// runtime's source gives back every block it holds as it drops, `rt_blocks`), and the source
+    /// stays to the process's exit. Nothing reaches it after: the pool keeps it nowhere else
+    /// ([`Pool::close`] took it out of the state before), and a hold's or a keep's drop finds its
+    /// piece gone.
     fn give_all_back(&self, source: Arc<dyn BlockSource>) {
-        for block in self.take_all_out() {
+        let (blocks, all) = self.take_all_out();
+        for block in blocks {
             if let Err(e) = source.release_block(block) {
                 log::warn!(kind:? = e; "pool: the source refused a block back: {e:?}");
             }
         }
-        drop(source);
+        if all {
+            drop(source);
+        } else {
+            std::mem::forget(source);
+        }
     }
 }
 

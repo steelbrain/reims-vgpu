@@ -23,7 +23,9 @@
 //! quiesces the device and tears it down on its own thread. A plain handle of rt's would be out
 //! of that count: the let-go would quiesce the device under the source, and the source's drop,
 //! on another thread, would run rt's teardown (`vkDestroyDevice` and the instance's last drop)
-//! beside the process's exit.
+//! beside the process's exit. A source the pool forgot, at a release whose holds or imports
+//! outlasted its bound (`pool`, "Release"), never goes: the let-go then keeps the device to the
+//! exit, and the source's drop never gives back a block still imported.
 //!
 //! A block's bytes are undefined, new or taken again: rt zeroes nothing ahead of need, and
 //! nothing here zeroes them. rt maps and unmaps whole allocations through the `BlockMappings`

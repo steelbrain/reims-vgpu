@@ -1240,7 +1240,8 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
         });
         // The host removed every piece of the pool before the release: the pool's thread ends,
         // each block goes back to the source once no thread of the device's holds it and the
-        // platform freed every import of its bytes (`pool`'s keeps), and the source frees them.
+        // platform freed every import of its bytes (`pool`'s keeps), and the source frees them;
+        // past the release's 5 s, one still held stays out, and the source is kept to the exit.
         drop(self.pool.take());
         // The contexts' Private takes in flight end unanswered, and their workers go, each
         // giving back the block it was taking: none calls the source past the release.

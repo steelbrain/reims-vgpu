@@ -1634,6 +1634,44 @@ fn the_release_gives_a_kept_piece_back_only_once_its_keep_goes() {
     assert_eq!(blocks.counts(), (0, 2));
 }
 
+/// A keep that never goes, as an import's whose GPU work never completes on a GPU that hung,
+/// holds the release's end no longer than the release's bound: up to it the release waits, and
+/// past it every block no keep is on goes back, the kept one stays out, and the source is
+/// forgotten, so not even its drop gives that block back; the keep's later drop gives back nothing
+#[test]
+fn the_release_waits_for_a_keep_at_most_its_bound_then_forgets_the_source() {
+    let (host, hand) = (Arc::new(Host::default()), Hand::default());
+    let (pool, blocks) = pool_at(range(64), &host, LONG, hand.clock());
+    pool.grow(BLOCK_LEN);
+    host.wait_for(1);
+    pool.added(BASE).unwrap();
+    let ledger = pool.ledger();
+    answer(&take(&ledger, 1, TAKE_ALIGN)).unwrap();
+    let keep = ledger.over_held(1, 0, TAKE_ALIGN, |_, keep| keep);
+    let keep = keep.expect("a keep of the block");
+    host.wait_for(KEPT_CALLS + 1);
+    let bell = Arc::clone(&pool.shared.bell);
+    drop(pool);
+    let slept = bell.slept();
+    let release = std::thread::spawn(move || drop(ledger));
+    spin_until("the release's end sleeps on the keep", || {
+        bell.slept() > slept
+    });
+    hand.on(crate::LET_GO_BOUND - Duration::from_millis(1));
+    let slept = bell.slept();
+    bell.ring();
+    spin_until("the release's end sleeps again", || bell.slept() > slept);
+    assert!(!release.is_finished(), "the release waits up to its bound");
+    hand.on(Duration::from_millis(1));
+    bell.ring();
+    release.join().unwrap();
+    assert_eq!(blocks.counts().0, 1, "the kept block stays out");
+    assert_eq!(Arc::strong_count(&blocks), 2, "the pool's hold of the source is kept");
+    let counts = blocks.counts();
+    drop(keep);
+    assert_eq!(blocks.counts(), counts, "the keep's drop gives back nothing");
+}
+
 /// A piece whose block a keep holds, as an import of its bytes does until the platform frees the
 /// import, late: on its way back past the delay and out of the guest, it stays the pool's, its
 /// block out of the source and its address taken, until the keep's drop, after which the pool's
