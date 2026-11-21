@@ -1449,7 +1449,11 @@ mod tests {
 
         let sels = r.p.call_log().sels();
         let made = sels.iter().filter(|sel| **sel == "didModifyRange:").count();
-        assert_eq!(made, 2 + 1 + 2 + 1, "the platform's calls, those it raised at among them");
+        assert_eq!(
+            made,
+            2 + 1 + 2 + 1,
+            "the platform's calls, those it raised at among them"
+        );
         assert_eq!(
             managed::take(),
             Period {
@@ -1460,7 +1464,11 @@ mod tests {
                 chunk_bytes: 0x110 + 0x1000,
             }
         );
-        assert_eq!(managed::take(), Period::default(), "counted from none again");
+        assert_eq!(
+            managed::take(),
+            Period::default(),
+            "counted from none again"
+        );
     }
 
     /// On a platform that keeps a pin only inside a block it knows, each buffer and heap a guest's
