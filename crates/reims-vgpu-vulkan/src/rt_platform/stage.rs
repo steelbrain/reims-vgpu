@@ -13,7 +13,10 @@
 //!   a compile the driver failed is a breach rt kept. Otherwise it is how the helper ended: killed
 //!   at its memory cap at the ceiling (`Limits::memory`) or at its time cap, a breach recorded
 //!   with rt (`Device::record_stage_breach`), so the pipeline's makes refuse it (`Gap::StageSize`)
-//!   with no helper asked again; cancelled; or failed, with nothing recorded (no helper, one of
+//!   with no helper asked again. rt keeps a memory breach with the ceiling the device was opened
+//!   with (`DeviceOptions::stage_memory_ceiling`, `super::device::shared_options`), and on a device
+//!   given a higher ceiling, a host with more memory, the breach is a miss and a helper is asked
+//!   again; cancelled; or failed, with nothing recorded (no helper, one of
 //!   another build's wire, one that found no device of the request's or enabled other features, a
 //!   cache directory that took no entry, a helper that ended before its reply, and a helper killed
 //!   at a memory cap the host's room set below the ceiling, as the same stage fits on a host with

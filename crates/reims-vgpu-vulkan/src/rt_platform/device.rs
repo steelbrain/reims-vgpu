@@ -645,13 +645,16 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
 /// process ([`open`]) and in a stage's helper (`super::stage::helper_main`), where rt takes the
 /// helper's compile only from a device that enabled what the VM's did (its `StageFill::Enables`
 /// otherwise): the extension of present fences, with the feature it takes, where the device lists
-/// it and its instance extensions are on (the module's docs, "Its window system"). With that
-/// extension's name, where it is asked for.
+/// it and its instance extensions are on (the module's docs, "Its window system"); and the
+/// helper's memory ceiling on this host (`Limits::of_host`), which rt keeps with a memory breach,
+/// so a breach kept under a lower ceiling is a miss on this device and the helper is asked again.
+/// With that extension's name, where it is asked for.
 pub(crate) fn shared_options(
     instance: &rt::Instance,
     physical: &rt::PhysicalDevice,
 ) -> (rt::DeviceOptions, Option<&'static std::ffi::CStr>) {
     let mut options = rt::DeviceOptions::default();
+    options.stage_memory_ceiling = crate::os::compile_helper::Limits::of_host().memory;
     let (_, raw) = instance.raw();
     // SAFETY: the instance listed the device and is alive.
     let names =
@@ -1649,6 +1652,20 @@ mod tests {
     use super::*;
     use crate::core::platform::device::relaying_gaps;
     use crate::core::platform::values::{OptionSet, TextureDesc};
+
+    /// The options a device is opened with carry the helper's memory ceiling on this host, the
+    /// one a memory breach is kept under.
+    #[test]
+    fn the_shared_options_carry_the_helpers_ceiling_on_vulkan() {
+        let instance = crate::os::rt_instance(&crate::os::rt_instance_extensions())
+            .expect("rt's instance");
+        let listed = instance.physical_devices().expect("rt's devices");
+        let physical = listed.first().expect("a device on the GPU the test holds");
+        let (options, _) = shared_options(&instance, physical);
+        let ceiling = crate::os::compile_helper::Limits::of_host().memory;
+        assert_ne!(ceiling, 0);
+        assert_eq!(options.stage_memory_ceiling, ceiling);
+    }
 
     /// Only Vulkan's `INTEGRATED_GPU` is an integrated GPU: a discrete, virtual, CPU or other
     /// device is not
