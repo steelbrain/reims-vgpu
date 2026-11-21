@@ -174,7 +174,9 @@ enum BytesHold<P: Platform> {
     /// what keeps them mapped: its block of the region, its heap, or a pages block's view. Shared
     /// with the create, which takes it back where the platform refuses the buffer
     /// ([`CopyBufferHold`]).
-    Buffer(Arc<Mutex<Option<CopyBufferHold<P>>>>),
+    Buffer {
+        _hold: Arc<Mutex<Option<CopyBufferHold<P>>>>,
+    },
     /// What keeps the bytes of the heap they lie in mapped, where it lies over any but the
     /// region's ([`Entry::ram_kept`], `BUFFER_MANAGED_AT_OFFSET`).
     Kept {
@@ -548,7 +550,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             buffer: Some(cpu),
             worker: Arc::clone(&self.shared.surface_worker),
         })));
-        let keep = BytesHold::Buffer(Arc::clone(&hold));
+        let keep = BytesHold::Buffer {
+            _hold: Arc::clone(&hold),
+        };
         let made = kind.making(|| {
             self.buffer_over_bytes(device, bytes, m.length, options, pin, keep, zero_from)
         });
