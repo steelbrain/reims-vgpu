@@ -474,6 +474,40 @@ pub(crate) struct ShapeCounts {
     pub(crate) video_fill_wait_max_us: u64,
 }
 
+/// What an entry's shapes hold now, for the host's summary (`crate::graphics::summary::kept`),
+/// summed over the entries with [`ShapesLive::add`]: the shapes and their images' bytes; those a
+/// live guest texture references, and the references; those none does, and their bytes; of those,
+/// the ones past the bound, an entry's unreferenced shapes but its [`UNREFERENCED_KEPT`] most
+/// recently used, which only the entry's next sweep drops ([`ShapeTable::sweep`], at a new shape
+/// of the entry's); and the plane shapes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ShapesLive {
+    pub(crate) shapes: u64,
+    pub(crate) bytes: u64,
+    pub(crate) referenced: u64,
+    pub(crate) references: u64,
+    pub(crate) unreferenced: u64,
+    pub(crate) unreferenced_bytes: u64,
+    pub(crate) past_bound: u64,
+    pub(crate) past_bound_bytes: u64,
+    pub(crate) planes: u64,
+}
+
+impl ShapesLive {
+    /// Adds `other`'s counts to these.
+    pub(crate) fn add(&mut self, other: &ShapesLive) {
+        self.shapes += other.shapes;
+        self.bytes += other.bytes;
+        self.referenced += other.referenced;
+        self.references += other.references;
+        self.unreferenced += other.unreferenced;
+        self.unreferenced_bytes += other.unreferenced_bytes;
+        self.past_bound += other.past_bound;
+        self.past_bound_bytes += other.past_bound_bytes;
+        self.planes += other.planes;
+    }
+}
+
 /// One shape's image and its state.
 pub(crate) struct Shape<T> {
     pub(crate) key: ShapeKey,
@@ -642,6 +676,36 @@ impl<T> ShapeTable<T> {
     /// Whether a live guest texture references one of the shapes.
     pub(crate) fn any_referenced(&self) -> bool {
         self.shapes.iter().any(Shape::referenced)
+    }
+
+    /// What the shapes hold now ([`ShapesLive`]).
+    pub(crate) fn live(&self) -> ShapesLive {
+        let mut live = ShapesLive::default();
+        let mut unreferenced: Vec<(u64, u64)> = Vec::new();
+        for shape in &self.shapes {
+            live.shapes += 1;
+            live.bytes += shape.bytes;
+            live.planes += u64::from(shape.plane);
+            match shape.references() {
+                0 => {
+                    live.unreferenced += 1;
+                    live.unreferenced_bytes += shape.bytes;
+                    unreferenced.push((shape.used, shape.bytes));
+                }
+                n => {
+                    live.referenced += 1;
+                    live.references += n as u64;
+                }
+            }
+        }
+        // Past the bound: the unreferenced ones but the [`UNREFERENCED_KEPT`] most recently used,
+        // which the next sweep looks at ([`Self::sweep`]).
+        unreferenced.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for &(_, bytes) in unreferenced.iter().skip(UNREFERENCED_KEPT) {
+            live.past_bound += 1;
+            live.past_bound_bytes += bytes;
+        }
+        live
     }
 
     /// The entry's surface was used now (`now`, the caches' clock): named by a command buffer,
@@ -1109,6 +1173,37 @@ mod tests {
         let (_, again) = table.insert(key(50, 4), 50, true, 21);
         assert!(!again);
         drop(held);
+    }
+
+    /// What the shapes hold counts the referenced ones and their references, the unreferenced
+    /// ones, and of those the ones past the bound, the least recently used, until a sweep drops
+    /// them.
+    #[test]
+    fn the_live_counts_tell_the_unreferenced_past_the_bound() {
+        let mut table = ShapeTable::<u64>::default();
+        let first = table.insert(key(10, 4), 0, false, 0).0;
+        let again = first.clone_ref();
+        for w in 1..7 {
+            drop(table.insert(key(10 + w, 4), w, false, w));
+        }
+        let live = table.live();
+        assert_eq!(live.shapes, 7);
+        assert_eq!((live.referenced, live.references), (1, 2));
+        assert_eq!(live.unreferenced, 6);
+        assert_eq!(live.unreferenced_bytes, (11..17).map(|w| key(w, 4).bytes()).sum());
+        assert_eq!(live.past_bound, 2, "the two least recently used of six");
+        assert_eq!(live.past_bound_bytes, key(11, 4).bytes() + key(12, 4).bytes());
+        assert_eq!(live.bytes, table.bytes());
+        drop(table.sweep(&mut ShapeCounts::default()));
+        let live = table.live();
+        assert_eq!((live.shapes, live.unreferenced, live.past_bound), (5, 4, 0));
+        drop((first, again));
+        assert_eq!((table.live().referenced, table.live().unreferenced), (0, 5));
+        assert_eq!(table.live().past_bound, 1, "its last texture gone, a fifth unreferenced");
+        let mut sum = ShapesLive::default();
+        sum.add(&table.live());
+        sum.add(&table.live());
+        assert_eq!((sum.shapes, sum.past_bound), (10, 2));
     }
 
     /// A storage shape serves every texture of its extent, and is found first; a plain shape

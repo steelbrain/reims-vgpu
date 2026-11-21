@@ -257,8 +257,10 @@ use pipeline_key::PipelineKey;
 use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
-pub(crate) use surface_cache::{FillHook, FillWait};
+pub(crate) use surface_cache::shapes::ShapesLive;
+pub(crate) use surface_cache::{CachesLive, FillHook, FillWait};
 pub(crate) use surface_pages::Joined;
+pub(crate) use tables::TableCounts;
 use tables::{BytesKeep, Context, Entry, GuestBytes, LaidUse, QueueCounts, View};
 
 /// What follows a record handed to a [`CompletionSink`] or a [`SignalSink`], which the sink runs
@@ -1075,6 +1077,34 @@ pub(crate) struct Shared<P: Platform> {
     region: Arc<Region>,
 }
 
+impl<P: Platform> super::summary::kept::Source for Shared<P> {
+    /// The contexts' tables, each had within [`super::summary::kept::BOUND`] (one not had is
+    /// counted and left out), under the map of contexts' lock had within it too, held through
+    /// them so no context is let go of here, as [`TableWalk::each`] holds it; then the caches and
+    /// the pages' views, each under its own lock, one after another.
+    fn kept(&self) -> super::summary::kept::Kept {
+        let bound = super::summary::kept::BOUND;
+        let mut kept = super::summary::kept::Kept::default();
+        match self.contexts.try_lock_for(bound) {
+            Some(contexts) => {
+                for context in contexts.values() {
+                    match context.counts(bound) {
+                        Some(counts) => {
+                            kept.contexts += 1;
+                            kept.tables.sum(&counts);
+                        }
+                        None => kept.unread += 1,
+                    }
+                }
+            }
+            None => kept.unread += 1,
+        }
+        kept.caches = self.surface_caches.lock().live();
+        kept.views = self.surface_views.lock().live();
+        kept
+    }
+}
+
 impl<P: Platform> Shared<P> {
     /// The device's one listener, which the notifications of the values command buffers signal
     /// their shared events to run on, one after another (`cmdbuf.rs`, `Signals`), made at the
@@ -1466,6 +1496,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             pace_waits: std::sync::atomic::AtomicU64::new(0),
             region,
         });
+        // What the decoder holds, in the host's summary where it is on (`summary::kept`).
+        let source: Arc<dyn super::summary::kept::Source> = Arc::clone(&shared) as _;
+        super::summary::kept::watch(Arc::downgrade(&source));
         GraphicsDecoder::on(shared, None, Sinks::default())
     }
 

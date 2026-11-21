@@ -1736,6 +1736,31 @@ impl FillWait {
     }
 }
 
+/// What the caches hold now, for the host's summary of each ten seconds
+/// (`crate::graphics::summary::kept`; [`SurfaceCaches::live`]), so a boot's reader can tell
+/// which of the platform's buffers and textures no guest id names are the caches'. A diagnostic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CachesLive {
+    /// The caches, a block's each (`by_block`), and the bytes the caches' budget counts them
+    /// holding, their buffers' and their shapes' (`cache_bytes`).
+    pub(crate) caches: u64,
+    pub(crate) cache_bytes: u64,
+    /// Their buffers' bytes ([`SurfaceCache::bytes`]), and the caches made for the host's video.
+    pub(crate) buffer_bytes: u64,
+    pub(crate) video: u64,
+    /// Their other buffers: the Shared buffers over their pages' views, and their wide homes.
+    pub(crate) view_buffers: u64,
+    pub(crate) wide: u64,
+    /// Their shapes' images, summed ([`shapes::ShapesLive`]).
+    pub(crate) shapes: shapes::ShapesLive,
+    /// The caches that hold shapes none of which a live guest texture references, and the bytes
+    /// they hold, their buffers' and their shapes'.
+    pub(crate) unreferenced: u64,
+    pub(crate) unreferenced_bytes: u64,
+    /// The caches holding unreferenced shapes past the bound ([`shapes::ShapesLive`]).
+    pub(crate) past_bound: u64,
+}
+
 /// What the caches did, for the log ([`SurfaceCaches::counts`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CacheCounts {
@@ -2395,6 +2420,29 @@ impl<P: Platform> SurfaceCaches<P> {
         (self.refilled().into_iter())
             .map(|(block, _)| (block, Way::In))
             .collect()
+    }
+
+    /// What the caches hold now ([`CachesLive`]).
+    pub(crate) fn live(&self) -> CachesLive {
+        let mut live = CachesLive {
+            caches: self.by_block.len() as u64,
+            cache_bytes: self.cache_bytes,
+            ..CachesLive::default()
+        };
+        for cache in self.by_block.values() {
+            live.buffer_bytes += cache.bytes;
+            live.video += u64::from(cache.life.is_some());
+            live.view_buffers += u64::from(matches!(cache.pages, Some(CachePages::View(_))));
+            live.wide += u64::from(cache.wide.is_some());
+            let shapes = cache.shapes.live();
+            if shapes.shapes != 0 && shapes.referenced == 0 {
+                live.unreferenced += 1;
+                live.unreferenced_bytes += cache.held();
+            }
+            live.past_bound += u64::from(shapes.past_bound != 0);
+            live.shapes.add(&shapes);
+        }
+        live
     }
 
     /// What the caches did so far.

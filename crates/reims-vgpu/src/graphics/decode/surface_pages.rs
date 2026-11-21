@@ -1339,6 +1339,18 @@ impl<P: Platform> SurfaceViews<P> {
         self.counts
     }
 
+    /// The views held now, for the host's summary (`crate::graphics::summary::kept`): the
+    /// surfaces' blocks' views, the pages blocks', and the views the cache keeps, each with the
+    /// platform's import of its pages where it made one.
+    pub(crate) fn live(&self) -> (u64, u64, u64) {
+        let count = |n: usize| n as u64;
+        (
+            count(self.by_block.len()),
+            count(self.private.len()),
+            count(self.cache.len()),
+        )
+    }
+
     /// The read-only pages blocks that are not unchanging made so far, by their guest's why
     /// ([`whys`]).
     pub(crate) fn read_only_whys(&self) -> [whys::WhyCounts; whys::WHYS] {

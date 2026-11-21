@@ -305,6 +305,72 @@ impl<P: Platform> Entry<P> {
     }
 }
 
+/// A table's objects by kind as they are now, for the host's summary of each ten seconds
+/// (`crate::graphics::summary::kept`; [`Context::counts`]), so a boot's reader can tell the
+/// platform's buffers and textures a guest id names from those it holds for no id. Each count is
+/// of the live entries; those removed and kept for an open view or a command buffer posted before
+/// the removal are counted apart (`*_gone`). A diagnostic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TableCounts {
+    /// Textures and views of textures; of the live ones, the views of a device cache's shape's
+    /// image ([`Entry::shape`]), and those the display made its own view of
+    /// ([`Entry::shown_view`]).
+    pub(crate) textures: u64,
+    pub(crate) textures_gone: u64,
+    pub(crate) shape_views: u64,
+    pub(crate) shown_views: u64,
+    /// Buffers; of the live ones, those over a device cache's buffer itself
+    /// ([`Entry::over_cache`]), which are the cache's buffer, and those over a block's surface view
+    /// ([`Entry::over_view`]).
+    pub(crate) buffers: u64,
+    pub(crate) buffers_gone: u64,
+    pub(crate) over_cache: u64,
+    pub(crate) over_view: u64,
+    /// Heaps, live and gone.
+    pub(crate) heaps: u64,
+    /// The buffers over two-copy `Managed` objects' CPU copies.
+    pub(crate) managed_copies: u64,
+}
+
+impl TableCounts {
+    /// Counts `entry`, removed and kept where `gone`.
+    fn add<P: Platform>(&mut self, entry: &Entry<P>, gone: bool) {
+        let cpu = (entry.managed.as_ref()).is_some_and(|copy| copy.cpu.is_some());
+        self.managed_copies += u64::from(cpu);
+        match (&entry.handle, gone) {
+            (ObjHandle::Texture(_), true) => self.textures_gone += 1,
+            (ObjHandle::Texture(_), false) => {
+                self.textures += 1;
+                self.shape_views += u64::from(entry.shape.is_some());
+                let shown = (entry.shown_view.as_ref()).is_some_and(|view| view.is_made());
+                self.shown_views += u64::from(shown);
+            }
+            (ObjHandle::Buffer(_), true) => self.buffers_gone += 1,
+            (ObjHandle::Buffer(_), false) => {
+                self.buffers += 1;
+                self.over_cache += u64::from(entry.over_cache);
+                self.over_view += u64::from(entry.over_view);
+            }
+            (ObjHandle::Heap(_), _) => self.heaps += 1,
+            _ => {}
+        }
+    }
+
+    /// Adds `other`'s counts to these.
+    pub(crate) fn sum(&mut self, other: &TableCounts) {
+        self.textures += other.textures;
+        self.textures_gone += other.textures_gone;
+        self.shape_views += other.shape_views;
+        self.shown_views += other.shown_views;
+        self.buffers += other.buffers;
+        self.buffers_gone += other.buffers_gone;
+        self.over_cache += other.over_cache;
+        self.over_view += other.over_view;
+        self.heaps += other.heaps;
+        self.managed_copies += other.managed_copies;
+    }
+}
+
 /// A texture over a plane of a surface whose device cache lays its planes out at the GPU's pitch
 /// ([`Repitched`]), as a command buffer's walk notes each use of it
 /// ([`super::surface_cache::Caches::reconcile`]): the block, whether the texture lies in the
@@ -680,6 +746,19 @@ impl<P: Platform> Context<P> {
             f(g.removed.id(), true, &entry.handle, cpu(entry));
         }
         true
+    }
+
+    /// The table's objects by kind as they are now ([`TableCounts`]), under a read of the table's
+    /// lock had within `bound`; `None` where the lock was not had in it.
+    pub(crate) fn counts(&self, bound: std::time::Duration) -> Option<TableCounts> {
+        let tables = self.tables.try_read_for(bound)?;
+        let mut counts = TableCounts::default();
+        let live = tables.live.values().map(|owned| (owned.entry(), false));
+        let gone = tables.gone.iter().map(|g| (g.removed.entry(), true));
+        for (entry, gone) in live.chain(gone) {
+            counts.add(entry, gone);
+        }
+        Some(counts)
     }
 
     /// A context with no objects.
@@ -1130,6 +1209,49 @@ mod tests {
         let late = View::take(Arc::clone(&ctx));
         assert!(late.get(1).is_none());
         assert!(late.get(2).is_some());
+    }
+
+    /// The table's counts tell its textures and buffers by kind, live apart from those removed and
+    /// kept for an open view, and leave out every other kind of object.
+    #[test]
+    fn the_counts_tell_live_textures_and_buffers_apart_from_the_kept() {
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+        let p = FakePlatform::new();
+        let device = p.device();
+        let buffer = || {
+            let made = device.new_buffer_of_length(OnFault::Die, 64, 0);
+            ObjHandle::Buffer(made.unwrap().unwrap())
+        };
+        let desc = p.texture_descriptor(&TextureDesc {
+            width: 4,
+            height: 4,
+            ..TextureDesc::default()
+        });
+        let texture = || {
+            let made = device.new_texture(OnFault::Die, &desc);
+            ObjHandle::Texture(made.unwrap().unwrap())
+        };
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        drop(ctx.insert(1, Entry::of(texture()), None));
+        drop(ctx.insert(2, Entry::of(texture()), None));
+        drop(ctx.insert(3, Entry::of(buffer()).over_cache(true), None));
+        drop(ctx.insert(4, Entry::of(buffer()).over_view(), None));
+        drop(ctx.insert(5, Entry::of(fence(&p)), None));
+        let view = View::take(Arc::clone(&ctx));
+        assert!(view.get(2).is_some());
+        assert!(ctx.remove(2).is_some_and(|(_, now)| now.is_none()), "kept for the view");
+        let counts = ctx.counts(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!((counts.textures, counts.textures_gone), (1, 1));
+        assert_eq!((counts.buffers, counts.buffers_gone), (2, 0));
+        assert_eq!((counts.over_cache, counts.over_view), (1, 1));
+        assert_eq!((counts.shape_views, counts.shown_views, counts.heaps), (0, 0, 0));
+        drop(view);
+        let mut sum = ctx.counts(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(sum.textures_gone, 0, "let go of with the view");
+        sum.sum(&counts);
+        assert_eq!((sum.textures, sum.buffers), (2, 4));
     }
 
     /// Holds the first view step of `want` a thread comes to, there, until the test lets it go:

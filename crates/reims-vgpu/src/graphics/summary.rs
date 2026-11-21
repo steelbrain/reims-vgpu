@@ -1,5 +1,5 @@
 //! The host's summary of each ten seconds in its log, for the walks that time a guest's frames.
-//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes five lines of
+//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes six lines of
 //! what the period held. Each line starts with its stamp: the host's wall time (`CLOCK_REALTIME`,
 //! seconds since the Unix epoch to the millisecond) and the trace's clock in nanoseconds
 //! (`reims_vgpu_vulkan::core::trace::now`, rt's host clock, which `cbdone` and the trace's other
@@ -21,6 +21,9 @@
 //!   streams name, their bytes and those buffers ([`managed`], whose doc says what each counts).
 //! - **Waits**: our waits of 5 ms or more, by name, each with its count, its time in all and the
 //!   longest (`reims_vgpu_vulkan::core::long_waits`, whose doc names them).
+//! - **Kept**: what the decoders hold for the guest now, by holder, and the platform's textures
+//!   and buffers no guest id names ([`kept`], whose doc says what each counts), where a decoder
+//!   lives.
 //!
 //! - **Asked for by name**: [`start`] turns the summary on, and the long waits', the window's
 //!   times' and the `Managed` ranges' counting, only where `REIMS_VGPU_LOG` names the target
@@ -40,8 +43,9 @@ use reims_vgpu_vulkan::core::long_waits::{self, Waits};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline, MonoTime, WallTime};
 use reims_vgpu_vulkan::core::sync::Mutex;
-use reims_vgpu_vulkan::rt_platform::window_times;
+use reims_vgpu_vulkan::rt_platform::{self, window_times};
 
+pub(crate) mod kept;
 pub(crate) mod managed;
 
 /// The log target of the lines, at debug, which the filter names to start them ([`start`]).
@@ -106,6 +110,7 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
                         rt.take(),
                         Some(managed::line(&managed::take())),
                         Some(waits_part(&long_waits::take())),
+                        kept::take(rt_platform::summary::live_textures_and_buffers()),
                     ];
                     for part in parts.into_iter().flatten() {
                         log::debug!(

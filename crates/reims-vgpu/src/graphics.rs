@@ -1544,6 +1544,11 @@ impl<P: Platform> ShownView<P> {
     pub(crate) fn made(&self) -> Option<&P::Texture> {
         self.0.get()
     }
+
+    /// Whether the view was made (the host's summary, `summary::kept`).
+    pub(crate) fn is_made(&self) -> bool {
+        self.0.get().is_some()
+    }
 }
 
 /// What a present shows: a surface's texture (`None`: the scanout), by the surface's id, or what the

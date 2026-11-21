@@ -58,6 +58,14 @@ impl Part {
     }
 }
 
+/// The live textures (each image and each view) and buffers of the process's latest device, as
+/// rt's gauges count them now, for the summary's line of what the host keeps (reims-vgpu's
+/// `graphics::summary::kept`); `None` before a device is made.
+pub fn live_textures_and_buffers() -> Option<(u64, u64)> {
+    let gauges = super::device::gauges()?;
+    Some((gauges.textures, gauges.buffers))
+}
+
 /// The part of what rose from `before` to `now`, with `gauges` as they are (the module doc).
 pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges) -> String {
     // What a count rose by; where it fell, a new device's, what it is.
