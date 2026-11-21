@@ -111,11 +111,32 @@ pub(crate) struct Marks {
     /// The highest seqno signalled whose command buffer has finished.
     done: AtomicU64,
     /// How far the queue's buffers have been committed, which a buffer of another queue that
-    /// holds `COMMIT_ORDER` waits for ([`super::commit_order`]).
+    /// holds `COMMIT_ORDER` waits for ([`super::commit_order`]), and an entry removed from its
+    /// context's table before they were committed ([`super::tables::Pending`]).
     pub(crate) commit: commit_order::CommitMark,
+    /// How many waits of entries removed from its context's table are for its buffers' commits
+    /// ([`super::tables::Pending`]): a buffer's end looks at its table only where any is.
+    parked: AtomicUsize,
 }
 
 impl Marks {
+    /// An entry removed from the queue's context's table waits for one of its buffers' commits.
+    pub(crate) fn park(&self) {
+        self.parked.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A wait [`Self::park`] counted is over.
+    pub(crate) fn unpark(&self) {
+        self.parked.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Whether an entry removed from the queue's context's table waits for one of its buffers'
+    /// commits: read after the commit mark is raised, as the removal reads the mark after it
+    /// counts its wait, so one of the two sees the other.
+    pub(crate) fn has_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst) > 0
+    }
+
     /// Notes the queue's buffer at `seqno` taken; whether it need signal nothing, for it holds no
     /// op: no buffer of another queue waits past what the queue signalled. Where not, the buffer
     /// signals under the order's lock ([`SurfaceOrder::signal`]).
@@ -450,6 +471,11 @@ struct Queue<P: Platform> {
     /// What its ring has published, as the host gave it; `None` where it gave nothing (the
     /// decoder's own tests).
     published: Option<Published>,
+    /// What its ring has published of command buffers alone, as the host gave it; `None` where
+    /// it gave nothing (the decoder's own tests).
+    buffers: Option<Published>,
+    /// The decoder made it ([`SurfaceOrder::made`]), so its buffers raise its marks.
+    held: bool,
     /// Its surface timeline, made with the queue ([`SurfaceOrder::made`]), or at the first buffer
     /// that signals or waits on it where it was not.
     event: Option<P::SharedEvent>,
@@ -462,6 +488,8 @@ impl<P: Platform> Queue<P> {
         Queue {
             marks: Arc::default(),
             published: None,
+            buffers: None,
+            held: false,
             event: None,
             ended: false,
         }
@@ -521,6 +549,7 @@ impl<P: Platform> SurfaceOrder<P> {
         timeline: Option<P::SharedEvent>,
     ) -> (Arc<Marks>, Option<P::SharedEvent>) {
         let q = self.queues.entry(queue).or_insert_with(Queue::new);
+        q.held = true;
         let spare = match q.event {
             None => {
                 q.event = timeline;
@@ -536,6 +565,32 @@ impl<P: Platform> SurfaceOrder<P> {
     pub(crate) fn queue_made(&mut self, queue: u64, published: Published) {
         let q = self.queues.entry(queue).or_insert_with(Queue::new);
         q.published = Some(published);
+    }
+
+    /// Queue `queue` was made, the seqnos of the command buffers its ring published read through
+    /// `buffers`: what a removal from its context's table waits for of it
+    /// ([`Self::uncommitted`]).
+    pub(crate) fn buffers_made(&mut self, queue: u64, buffers: Published) {
+        let q = self.queues.entry(queue).or_insert_with(Queue::new);
+        q.buffers = Some(buffers);
+    }
+
+    /// What a removal from context `context`'s table waits for before its entry is let go of
+    /// ([`super::tables`], "After the buffers posted before it"): each queue of the context the
+    /// decoder made and that has not ended, whose ring published a command buffer its commit mark
+    /// has not reached, with that buffer's seqno, the highest so published. A queue whose ring's
+    /// seqnos the host gave nothing to read of (the decoder's own tests) is waited for in nothing.
+    pub(crate) fn uncommitted(&self, context: u32) -> Vec<(Arc<Marks>, u64)> {
+        (self.queues.iter())
+            .filter(|&(&id, q)| {
+                id >> RGFX_CONTEXT_OBJ_ID_SHIFT == u64::from(context) && q.held && !q.ended
+            })
+            .filter_map(|(_, q)| {
+                let seqno = (q.buffers.as_ref()?)()?;
+                let reached = (q.marks.commit).reached(seqno, commit_order::Until::Committed);
+                (!reached).then(|| (Arc::clone(&q.marks), seqno))
+            })
+            .collect()
     }
 
     /// The queues of context `context` the host holds, not yet ended.
@@ -837,6 +892,7 @@ impl<P: Platform> SurfaceOrder<P> {
         if let Some(q) = self.queues.get_mut(&queue) {
             q.ended = true;
             q.published = None;
+            q.buffers = None;
             let marks = Arc::clone(&q.marks);
             // Nothing waits for its commits any more ([`super::commit_order`]).
             marks.commit.end();

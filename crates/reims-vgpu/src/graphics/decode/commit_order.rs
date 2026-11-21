@@ -110,6 +110,12 @@ impl CommitMark {
         self.wake();
     }
 
+    /// Whether the queue's buffers through `seqno` were committed, stood in for or failed, the
+    /// queue's end aside.
+    pub(crate) fn committed_through(&self, seqno: u64) -> bool {
+        self.through.load(Ordering::SeqCst) >= seqno
+    }
+
     /// Whether a wait for the queue's buffer at `seqno` is over: it got as far as `until`, or the
     /// queue ended. A buffer committed was begun.
     pub(crate) fn reached(&self, seqno: u64, until: Until) -> bool {

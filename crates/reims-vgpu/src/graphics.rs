@@ -1854,8 +1854,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
         self.presents.queue_made(queue, poster.clone());
         let ring = poster.clone();
-        self.decoder()
-            .surface_order_queue_made(queue, Arc::new(move || ring.published_seqno()));
+        let decoder = self.decoder();
+        decoder.surface_order_queue_made(queue, Arc::new(move || ring.published_seqno()));
+        let ring = poster.clone();
+        decoder.queue_buffers_made(queue, Arc::new(move || ring.published_buffer_seqno()));
     }
 
     /// Takes every object of context `context` (its process closed the device or died) out of

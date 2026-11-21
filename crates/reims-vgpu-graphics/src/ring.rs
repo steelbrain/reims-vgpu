@@ -318,6 +318,15 @@ impl Consumer {
     /// read where they lie, pads skipped, nothing taken; `None` where there are none. A message
     /// the protocol refuses ends the walk there, as [`Self::peek`] would find the ring broken.
     pub(crate) fn highest_published_seqno(&self, region: &Region) -> Option<u64> {
+        self.highest_published_seqno_of(region, |_| true)
+    }
+
+    /// [`Self::highest_published_seqno`], of the messages whose `type` `kept` answers true for.
+    pub(crate) fn highest_published_seqno_of(
+        &self,
+        region: &Region,
+        kept: impl Fn(u32) -> bool,
+    ) -> Option<u64> {
         let ahead = self.published(region).ok()?;
         let mut highest = None;
         let mut walked = 0u64;
@@ -337,7 +346,7 @@ impl Consumer {
             if size > ahead - walked {
                 break;
             }
-            if r#type != RGFX_MSG_PAD {
+            if r#type != RGFX_MSG_PAD && kept(r#type) {
                 let seqno = region.read_array::<8>(self.at.data_at(at) + 8)?;
                 let seqno = u64::from_le_bytes(seqno);
                 highest = highest.max(Some(seqno));
@@ -805,6 +814,39 @@ mod tests {
         assert_eq!(
             consumer.walk_published(&region, wrapped, usize::MAX, |_, _, _| {}),
             Walked::Broken(wrapped)
+        );
+    }
+
+    /// The highest seqno published and not yet taken is read of the messages of the types asked
+    /// for alone, past the end's pad, taking nothing; none where none of them is published.
+    #[test]
+    fn the_highest_published_seqno_is_read_of_the_types_asked_for() {
+        let region = Region::new(4096).unwrap();
+        let mut consumer = Consumer::new(AT);
+        consumer.reset(&region);
+        let mut guest = Guest { count: 0 };
+        guest.write(&region, &message(0x201, 1, 200));
+        guest.write(&region, &message(0x202, 2, 16));
+        guest.write(&region, &message(0x201, 3, 16));
+        consumer.next(&region).unwrap().unwrap();
+        // Past the end: a pad, then the message at the ring's start.
+        guest.write(&region, &message(0x202, 4, 48));
+        assert_eq!(consumer.highest_published_seqno(&region), Some(4));
+        assert_eq!(
+            consumer.highest_published_seqno_of(&region, |t| t == 0x201),
+            Some(3),
+            "the taken one not counted, the other type's past it skipped"
+        );
+        assert_eq!(
+            consumer.highest_published_seqno_of(&region, |t| t == 0x203),
+            None
+        );
+        assert_eq!(consumer.next(&region).unwrap().unwrap().header.seqno, 2);
+        assert_eq!(consumer.next(&region).unwrap().unwrap().header.seqno, 3);
+        assert_eq!(
+            consumer.highest_published_seqno_of(&region, |t| t == 0x201),
+            None,
+            "all of its type taken"
         );
     }
 

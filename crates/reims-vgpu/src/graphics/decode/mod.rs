@@ -1557,9 +1557,17 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The message's command buffer was committed, stood in for or failed: its queue's commit
     /// mark rises to its seqno ([`commit_order`]). Called as the message ends, in its turn.
     fn note_committed(&self) {
-        if let Some((marks, seqno)) = self.committed.borrow_mut().take() {
-            marks.commit.begin(seqno);
-            marks.commit.raise(seqno);
+        let Some((marks, seqno)) = self.committed.borrow_mut().take() else {
+            return;
+        };
+        marks.commit.begin(seqno);
+        marks.commit.raise(seqno);
+        // An entry its process removed before the buffer was committed may wait for nothing more
+        // ([`tables`], "After the buffers posted before it").
+        if marks.has_parked()
+            && let Some(state) = self.context.and_then(|c| self.context_state(c))
+        {
+            state.settle();
         }
     }
 
@@ -3056,6 +3064,32 @@ impl<P: Platform> GraphicsDecoder<P> {
             .queue_made(queue, published);
     }
 
+    /// Queue `queue` was made, the seqnos of the command buffers its ring published read through
+    /// `buffers`: a removal from its context's table waits for the commits of those published
+    /// before it ([`tables`], "After the buffers posted before it").
+    pub(crate) fn queue_buffers_made(&self, queue: u64, buffers: surface_order::Published) {
+        (self.shared.surface_order.lock()).buffers_made(queue, buffers);
+    }
+
+    /// What a removal from context `context`'s table waits for: the command buffers its queues'
+    /// rings published before now and not yet committed ([`tables`], "After the buffers posted
+    /// before it").
+    fn uncommitted(&self, context: u32) -> Vec<tables::Pending> {
+        let uncommitted = self.shared.surface_order.lock().uncommitted(context);
+        (uncommitted.into_iter())
+            .map(|(marks, seqno)| tables::Pending::new(marks, seqno))
+            .collect()
+    }
+
+    /// [`Self::uncommitted`], for a make over `obj_id` in `context`'s table: nothing where the
+    /// id names no live entry, which the make then replaces with none.
+    fn uncommitted_over(&self, context: &Context<P>, obj_id: u64) -> Vec<tables::Pending> {
+        match context.with_live(obj_id, |_| ()) {
+            Some(()) => self.uncommitted(context.id),
+            None => Vec::new(),
+        }
+    }
+
     /// Queue `queue_obj_id`, whose handle is `queue` where the host still holds it, is gone (its
     /// destroy, or its context's close): its end event goes where none of its buffers signalled it
     /// ([`Caches::queue_ended`]), and its surface timeline signals what other queues' buffers
@@ -3064,6 +3098,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     fn queue_ended(&self, queue_obj_id: u64, queue: Option<&P::CommandQueue>) {
         self.surface_caches.queue_ended(queue_obj_id);
         let release = self.shared.surface_order.lock().ended(queue_obj_id);
+        // What its context's table waits for of it is the views open now ([`tables`], "After the
+        // buffers posted before it").
+        if let Some(state) = self.context_state(context_of(queue_obj_id)) {
+            state.settle();
+        }
         if let Some(release) = release
             && let Err(raise) = refusing(|| release.signal(queue, &self.shared.commit_cancel))
         {
@@ -4992,7 +5031,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// is let go of where no view needs it; the message sees it from now on.
     fn put(&self, obj_id: u64, entry: Entry<P>) {
         let context = self.context_made(context_of(obj_id));
-        let (at, replaced) = context.insert(obj_id, entry, self.view_at(&context));
+        let pending = self.uncommitted_over(&context, obj_id);
+        let (at, replaced) = context.insert_after(obj_id, entry, self.view_at(&context), pending);
         self.saw(&context, obj_id, Some(at));
         // As a store over a live id let go of what it named.
         drop(replaced.map(tables::Removed::into_entry));
@@ -5005,8 +5045,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(context) = self.context_made_if(context_of(obj_id), &live) else {
             return;
         };
+        let pending = self.uncommitted_over(&context, obj_id);
         if let Some((at, replaced)) =
-            context.insert_if(obj_id, entry, self.view_at(&context), &live)
+            context.insert_if(obj_id, entry, self.view_at(&context), pending, &live)
         {
             self.saw(&context, obj_id, Some(at));
             drop(replaced.map(tables::Removed::into_entry));
@@ -5024,7 +5065,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             return;
         };
         self.forget_library(obj_id);
-        let (at, replaced) = context.insert(obj_id, entry, self.view_at(&context));
+        let pending = self.uncommitted_over(&context, obj_id);
+        let (at, replaced) = context.insert_after(obj_id, entry, self.view_at(&context), pending);
         self.saw(&context, obj_id, Some(at));
         drop(replaced.map(tables::Removed::into_entry));
     }
@@ -5054,7 +5096,9 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Removes what `obj_id` names (an `OBJECT_DESTROY`): its CPU copy and then its object are let
     /// go of, each in a refusal scope ([`drop_refused`]), at once, or where an open view names
-    /// it, once the last such view closes ([`tables`]); a texture's surface names are forgotten. A
+    /// it or a command buffer its process posted before the destroy is not yet committed, once
+    /// the last such view closes and the last such buffer is committed ([`tables`]); a texture's
+    /// surface names are forgotten. A
     /// buffer over a block's surface view is let go of on the surface worker, where it may be the
     /// last hold of the view's mapping ([`surface_pages`]), and a video session on the video worker
     /// ([`video::SessionHold`]).
@@ -5063,7 +5107,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             return;
         };
         self.saw(&context, obj_id, None);
-        let Some((texture, removed)) = context.remove(obj_id) else {
+        let pending = self.uncommitted(context.id);
+        let Some((texture, removed)) = context.remove_after(obj_id, pending) else {
             return;
         };
         if let Some(removed) = removed {

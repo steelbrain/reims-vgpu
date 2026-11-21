@@ -10269,6 +10269,182 @@ mod tests {
         assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
     }
 
+    /// Queue 1's ring as a removal from its context's table reads it: the highest seqno of a
+    /// command buffer published on it, taken or not, which the test sets.
+    fn buffers_published(dec: &GraphicsDecoder<FakePlatform>) -> Arc<std::sync::atomic::AtomicU64> {
+        let published = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let read = Arc::clone(&published);
+        dec.queue_buffers_made(1, Arc::new(move || Some(read.load(Ordering::SeqCst))));
+        published
+    }
+
+    /// The platform's buffer `obj_id` names in `dec`'s tables, its view of them let go of.
+    fn platform_buffer(dec: &mut GraphicsDecoder<FakePlatform>, obj_id: u64) -> ObjId {
+        let id = match dec.object(obj_id) {
+            Some(ObjHandle::Buffer(b)) => b.id(),
+            _ => panic!("no buffer {obj_id}"),
+        };
+        dec.end_message();
+        id
+    }
+
+    /// Whether the platform still holds buffer `id`.
+    fn holds(p: &FakePlatform, id: ObjId) -> bool {
+        p.world().live("MTLBuffer").contains(&id)
+    }
+
+    /// A destroy ring 0 carries out while a command buffer its process posted before it on a
+    /// queue's ring is not yet committed (here, not yet taken) keeps the object for it, though the
+    /// buffer's view, taken after the destroy, does not name it (its work reaches objects through
+    /// argument buffers and heaps it names no entry of): the platform lets go of the object once
+    /// that buffer is committed, before the buffer completes. The destroy holds up nothing.
+    #[test]
+    fn a_destroy_waits_for_the_commit_of_a_buffer_posted_before_it() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let published = buffers_published(&dec);
+        let buffer = platform_buffer(&mut dec, 3);
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut queue = dec.sender(Some(0), super::super::Sinks::default());
+        drop(dec);
+        // Buffer 7 is on queue 1's ring as ring 0 takes the destroy.
+        published.store(7, Ordering::SeqCst);
+        assert_eq!(ring0.decode(&device, &destroy(3)).unwrap(), Ok(()));
+        ring0.end_message();
+        assert_eq!(kept(&ring0), 1, "kept for the buffer posted before it");
+        assert!(
+            holds(&p, buffer),
+            "let go of before the buffer posted first"
+        );
+        // Its view, taken now, does not name it; its commit lets it go.
+        let message = command_buffer_message(100, 7, &[]);
+        assert_eq!(queue.decode(&device, &message).unwrap(), Ok(()));
+        queue.end_message();
+        assert_eq!(kept(&ring0), 0);
+        assert!(!holds(&p, buffer), "kept past the buffer's commit");
+        p.world().complete_all(CompleteOn::Caller);
+        // A destroy with every buffer published committed waits for nothing.
+        let other = platform_buffer(&mut ring0, 2);
+        assert_eq!(ring0.decode(&device, &destroy(2)).unwrap(), Ok(()));
+        assert_eq!(kept(&ring0), 0);
+        assert!(!holds(&p, other));
+    }
+
+    /// A make behind a destroy that waits for a buffer's commit is carried out at once, as is one
+    /// over a live id, whose old object then waits for the same buffer: neither is held, and both
+    /// old objects go at the buffer's commit.
+    #[test]
+    fn a_make_behind_a_waiting_destroy_is_not_held() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let published = buffers_published(&dec);
+        let destroyed = platform_buffer(&mut dec, 3);
+        let replaced = platform_buffer(&mut dec, 2);
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut queue = dec.sender(Some(0), super::super::Sinks::default());
+        drop(dec);
+        published.store(7, Ordering::SeqCst);
+        assert_eq!(ring0.decode(&device, &destroy(3)).unwrap(), Ok(()));
+        let objects = ring0.object_count();
+        assert_eq!(ring0.decode(&device, &buffer_create(6)).unwrap(), Ok(()));
+        assert_eq!(ring0.object_count(), objects + 1, "made at once");
+        assert!(ring0.object(6).is_some());
+        ring0.end_message();
+        // Made again over a live id: the new one at once, the old one kept for the buffer.
+        assert_eq!(ring0.decode(&device, &buffer_create(2)).unwrap(), Ok(()));
+        ring0.end_message();
+        assert_ne!(platform_buffer(&mut ring0, 2), replaced, "the new one");
+        assert_eq!(kept(&ring0), 2);
+        assert!(holds(&p, destroyed) && holds(&p, replaced));
+        let message = command_buffer_message(100, 7, &[]);
+        assert_eq!(queue.decode(&device, &message).unwrap(), Ok(()));
+        queue.end_message();
+        assert_eq!(kept(&ring0), 0);
+        assert!(!holds(&p, destroyed) && !holds(&p, replaced));
+    }
+
+    /// A command buffer that fails, as one refused at its decode does, still raises its queue's
+    /// commit mark as its message ends: a destroy that waits for it waits no more, rather than until
+    /// its queue ends.
+    #[test]
+    fn a_destroy_waits_no_more_for_a_buffer_that_failed() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let published = buffers_published(&dec);
+        let buffer = platform_buffer(&mut dec, 3);
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut queue = dec.sender(Some(0), super::super::Sinks::default());
+        drop(dec);
+        published.store(7, Ordering::SeqCst);
+        assert_eq!(ring0.decode(&device, &destroy(3)).unwrap(), Ok(()));
+        assert!(holds(&p, buffer));
+        // It names buffer 9, which its process never made.
+        let message = command_buffer_message(100, 7, &draw_ops(9, 0, 0));
+        assert!(!matches!(queue.decode(&device, &message), Ok(Ok(()))));
+        queue.end_message();
+        assert_eq!(kept(&ring0), 0);
+        assert!(!holds(&p, buffer), "kept past the failed buffer's end");
+    }
+
+    /// A destroy that waits for a buffer of a queue that then ends (its destroy) waits no more:
+    /// the queue commits nothing more, and no view is open.
+    #[test]
+    fn a_destroy_waits_no_more_for_the_buffers_of_a_queue_that_ended() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let published = buffers_published(&dec);
+        let buffer = platform_buffer(&mut dec, 3);
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        drop(dec);
+        published.store(7, Ordering::SeqCst);
+        assert_eq!(ring0.decode(&device, &destroy(3)).unwrap(), Ok(()));
+        assert!(holds(&p, buffer));
+        assert_eq!(ring0.decode(&device, &destroy(1)).unwrap(), Ok(()));
+        assert_eq!(kept(&ring0), 0);
+        assert!(!holds(&p, buffer), "kept past its queue's end");
+    }
+
+    /// A context's close with a command buffer begun and one published behind it, never begun:
+    /// the objects go once the begun buffer is done with them (its view closes after its commit),
+    /// one its process destroyed before the close among them, which waited for the buffer behind;
+    /// none is kept for the buffer that never comes.
+    #[test]
+    fn a_close_keeps_the_objects_for_the_buffers_in_flight() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let published = buffers_published(&dec);
+        let destroyed = platform_buffer(&mut dec, 2);
+        let named = platform_buffer(&mut dec, 3);
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut queue = dec.sender(Some(0), super::super::Sinks::default());
+        drop(dec);
+        let message = command_buffer_message(100, 8, &[]);
+        let begun = queue
+            .begin_taken(&device, &message, Some(1), false)
+            .unwrap()
+            .unwrap();
+        published.store(9, Ordering::SeqCst);
+        assert_eq!(ring0.decode(&device, &destroy(2)).unwrap(), Ok(()));
+        ring0.end_message();
+        let (_, closed) = ring0.close_tables(&device, 0);
+        closed.let_go();
+        assert!(
+            holds(&p, destroyed) && holds(&p, named),
+            "let go of under the begun buffer"
+        );
+        assert_eq!(
+            queue
+                .finish_command_buffer(&device, &message, begun)
+                .unwrap(),
+            Ok(())
+        );
+        queue.end_message();
+        assert!(
+            !holds(&p, destroyed) && !holds(&p, named),
+            "kept past the begun buffer"
+        );
+    }
+
     /// The ids [`each_named`] reads off an op stream: its compute ops' in stream order, each run's
     /// records each, nil ids, ops that name nothing and ops of other groups left out.
     #[test]

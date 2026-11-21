@@ -1452,6 +1452,9 @@ pub(crate) struct QueueShared {
     submit: Mutex<Submit>,
     /// The highest `seqno` of a message taken off the submission ring, 0 before one is.
     taken_seqno: AtomicU64,
+    /// The highest `seqno` of a command buffer (`COMMAND_BUFFER` or `COMMAND_BUFFER_IN_REGION`)
+    /// taken off the submission ring, 0 before one is.
+    taken_buffer_seqno: AtomicU64,
     /// Held by whoever takes the submission ring's messages or offers them to the host: the
     /// service thread, from its take of a message to its hand-over, or to the host's begin of a
     /// command buffer where the host lets it go there ([`QueueClaim`]), or a doorbell's thread,
@@ -1572,9 +1575,12 @@ impl QueueShared {
         self.room.wake();
     }
 
-    /// A message of `seqno` was taken off its submission ring.
-    fn took(&self, seqno: u64) {
+    /// A message of `seqno` and `type` was taken off its submission ring.
+    fn took(&self, seqno: u64, r#type: u32) {
         self.taken_seqno.fetch_max(seqno, Ordering::AcqRel);
+        if is_command_buffer(r#type) {
+            self.taken_buffer_seqno.fetch_max(seqno, Ordering::AcqRel);
+        }
     }
 
     /// The highest `seqno` the guest has published on its submission ring: of a message the host
@@ -1588,6 +1594,22 @@ impl QueueShared {
         let waiting = submit.consumer.highest_published_seqno(region);
         Some(
             self.taken_seqno
+                .load(Ordering::Acquire)
+                .max(waiting.unwrap_or(0)),
+        )
+    }
+
+    /// [`Self::published_seqno`], of a command buffer alone (`COMMAND_BUFFER` or
+    /// `COMMAND_BUFFER_IN_REGION`): no command buffer of a greater seqno is on the ring, taken or
+    /// not; 0 where none was published.
+    fn published_buffer_seqno(&self, region: &Region) -> Option<u64> {
+        let submit = self.submit.lock();
+        if self.ended() {
+            return None;
+        }
+        let waiting = (submit.consumer).highest_published_seqno_of(region, is_command_buffer);
+        Some(
+            self.taken_buffer_seqno
                 .load(Ordering::Acquire)
                 .max(waiting.unwrap_or(0)),
         )
@@ -2259,6 +2281,17 @@ impl CompletionPoster {
         queue.upgrade()?.published_seqno(&shared.region)
     }
 
+    /// [`Self::published_seqno`], of a command buffer alone (`COMMAND_BUFFER` or
+    /// `COMMAND_BUFFER_IN_REGION`): no command buffer of a greater seqno is on the ring, taken or
+    /// not, so one the host is still to take or carry out is at most this; 0 where the guest
+    /// published none. What a destroy of the queue's process waits for of the queue before its
+    /// object is let go of (`reims-vgpu`'s decoder, `tables`).
+    pub fn published_buffer_seqno(&self) -> Option<u64> {
+        let shared = self.shared.upgrade()?;
+        let (queue, _) = self.queue.as_ref()?;
+        queue.upgrade()?.published_buffer_seqno(&shared.region)
+    }
+
     /// Whether the device was reset since the work this posts for began (or has ended): what it
     /// would post is dropped, and the host carries out nothing more of that work
     /// ([`Host::device_reset`]).
@@ -2356,6 +2389,12 @@ impl CompletionPoster {
             }
         }
     }
+}
+
+/// Whether a message of `type` on a queue's submission ring is a command buffer, which the host
+/// carries out: a `COMMAND_BUFFER`, or a `COMMAND_BUFFER_IN_REGION`.
+fn is_command_buffer(r#type: u32) -> bool {
+    r#type == RGFX_CMD_COMMAND_BUFFER || r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION
 }
 
 /// When a record handed over behind others starts to wait for room: now where `queue`'s ring is in
@@ -3989,6 +4028,7 @@ impl Shared {
                 asleep: false,
             }),
             taken_seqno: AtomicU64::new(0),
+            taken_buffer_seqno: AtomicU64::new(0),
             consuming: Mutex::new(None),
             complete: Mutex::new(producer),
             room: Room::default(),
@@ -4288,7 +4328,7 @@ impl Shared {
                 // the last, where the ring is empty.
                 let room = next.is_ok() && self.room_wanted(&submit.consumer);
                 if let Ok(Some(message)) = &next {
-                    queue.took(message.header.seqno);
+                    queue.took(message.header.seqno, message.header.r#type);
                 }
                 if let Err(broken) = &next {
                     log::error!(
@@ -4309,12 +4349,7 @@ impl Shared {
                 self.post_queue_waiting(queue, &submit_room(), queue.epoch);
             }
             let message = match next {
-                Ok(Some(message))
-                    if message.header.r#type == RGFX_CMD_COMMAND_BUFFER
-                        || message.header.r#type == RGFX_CMD_COMMAND_BUFFER_IN_REGION =>
-                {
-                    message
-                }
+                Ok(Some(message)) if is_command_buffer(message.header.r#type) => message,
                 // A thread waits for a buffer of the queue handed over before it to be
                 // scheduled: handed to the host at once, with the queue's claim held, as the
                 // buffer it names is begun.

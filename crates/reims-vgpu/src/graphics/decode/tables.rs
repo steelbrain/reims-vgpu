@@ -30,6 +30,25 @@
 //! make saw nothing of: an older view open meanwhile (a message that waits) keeps only what it
 //! names, so the list holds no more than the open views name. Each release is made in a refusal
 //! scope ([`super::drop_refused`]).
+//!
+//! **After the buffers posted before it.** A destroy or a make over a live id is carried out on
+//! ring 0's lane as ring 0's order reaches it, while a command buffer its process posted before it,
+//! on any of its queues' rings, may not have taken its view yet (the queue's thread takes it
+//! later, or its begin has not come to its view): that buffer would see the entry gone, and its
+//! work, which reaches objects through argument buffers and heaps it names no entry of, would run
+//! after the platform let go of the object. So the removal reads, for each of the context's queues,
+//! the highest seqno of a command buffer its ring has published, taken or not, and where the
+//! queue's commit mark has not reached it, the entry waits on the gone list for that buffer's
+//! commit too ([`Pending`]): it is let go of once every such buffer is committed, stood in for or
+//! failed (its queue's commit mark, [`super::commit_order`]), and no open view names it, never at
+//! the buffers' completion, which the platform's release waits for itself. Ring 0 waits for
+//! nothing meanwhile: the entry is only moved, and a make of any id goes into the table at once.
+//! Whoever lets go of a waiting entry is the thread that sweeps then: a buffer's end past its
+//! commit ([`Context::settle`]), a view's close, or a queue's end. A queue that ends (its destroy,
+//! or its context's close) commits nothing more, so a wait for its buffers turns into a wait for
+//! the views open then, a buffer begun after the removal among them, each closed only after its
+//! commit. A close itself waits for no buffer: one its process posted before the close and not yet
+//! begun finds its context closed or its queue gone, and runs nothing.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -48,6 +67,7 @@ use super::lane::Lane;
 use super::managed::ManagedCopy;
 use super::surface_cache::Repitched;
 use super::surface_cache::shapes::ShapeUse;
+use super::surface_order::Marks;
 use super::video::PlanePlace;
 use super::{Drain, ObjHandle, TableObject, drop_refused};
 
@@ -358,6 +378,73 @@ impl<P: Platform> Removed<P> {
     }
 }
 
+/// A command buffer an entry removed from its table waits for before it is let go of (the module
+/// doc, "After the buffers posted before it"): its queue's marks, and its seqno. Counted among the
+/// marks' waiting entries while it waits ([`Marks::park`]), so a buffer's end looks at its table
+/// only where an entry waits for its queue.
+pub(crate) struct Pending {
+    marks: Arc<Marks>,
+    seqno: u64,
+}
+
+impl Pending {
+    /// A wait for the buffer at `seqno` of the queue whose marks are `marks`: counted among them
+    /// before the removal looks at the queue's commit mark under the table's lock, so a buffer's
+    /// end that raises the mark and then finds no entry waiting is seen by that look.
+    pub(crate) fn new(marks: Arc<Marks>, seqno: u64) -> Self {
+        marks.park();
+        Pending { marks, seqno }
+    }
+
+    /// The buffer was committed, stood in for or failed.
+    fn committed(&self) -> bool {
+        self.marks.commit.committed_through(self.seqno)
+    }
+
+    /// Its queue ended: nothing of it is committed any more.
+    fn ended(&self) -> bool {
+        self.marks.commit.has_ended()
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.marks.unpark();
+    }
+}
+
+/// An entry removed from the table while a view or a command buffer may still reach it (the module
+/// doc).
+struct Gone<P: Platform> {
+    removed: Removed<P>,
+    /// The table's clock at its removal.
+    at: u64,
+    /// The command buffers posted before its removal whose commits it waits for.
+    pending: Vec<Pending>,
+    /// Kept while a view taken before this clock is open: a queue whose buffers it waited for
+    /// ended; 0 for none.
+    open_before: u64,
+}
+
+impl<P: Platform> Gone<P> {
+    /// Whether the entry is still to be kept, with the views `open` open and the table's clock at
+    /// `clock`: a buffer it waits for is not yet committed, or an open view names it. A wait for a
+    /// buffer of a queue that ended turns into a wait for every view open now.
+    fn kept(&mut self, open: &BTreeMap<u64, usize>, clock: u64) -> bool {
+        self.pending.retain(|p| !p.committed());
+        if self.pending.iter().any(Pending::ended) {
+            self.pending.retain(|p| !p.ended());
+            self.open_before = self.open_before.max(clock + 1);
+        }
+        !self.pending.is_empty()
+            || open
+                .range(self.removed.owned.entry().seen..self.at)
+                .next()
+                .is_some()
+            || open.range(..self.open_before).next().is_some()
+    }
+}
+
 /// Lets go of `removed`, in order: each one's CPU copy and then its object, each in a refusal scope
 /// of its own.
 pub(crate) fn let_go<P: Platform>(removed: Vec<Removed<P>>) {
@@ -384,9 +471,9 @@ struct Tables<P: Platform> {
     /// The objects, by id: hashed by core's fixed integer hasher, so the order a context's objects
     /// drop in at its close is the same in every run.
     live: HashMap<u64, Owned<P>, KeyBuild>,
-    /// The entries removed while a view taken before the removal was open, in the order removed,
-    /// each with the clock at its removal.
-    gone: Vec<(Removed<P>, u64)>,
+    /// The entries removed while a view taken before the removal was open, or while a command
+    /// buffer posted before it was not yet committed, in the order removed ([`Gone`]).
+    gone: Vec<Gone<P>>,
     /// Moves at each make and removal.
     clock: u64,
     /// The region spans the live entries lie over ([`Entry::span`]), each with how many lie over
@@ -430,54 +517,58 @@ impl<P: Platform> Tables<P> {
         if let Some(owned) = self.live.get(&id).filter(|o| o.entry().made <= at) {
             return Some(owned.0);
         }
-        self.gone.iter().rev().find_map(|(r, removed_at)| {
-            (r.id == id && r.owned.entry().made <= at && at < *removed_at).then_some(r.owned.0)
+        self.gone.iter().rev().find_map(|g| {
+            let r = &g.removed;
+            (r.id == id && r.owned.entry().made <= at && at < g.at).then_some(r.owned.0)
         })
     }
 
     /// Removes `owned`, `id`'s entry: onto the gone list where an open view of `views` names it
-    /// (each open view was taken before this), else handed back to let go of.
-    fn retire(&mut self, id: u64, owned: Owned<P>, views: &mut Views) -> Option<Removed<P>> {
+    /// (each open view was taken before this) or a command buffer of `pending` is not yet
+    /// committed, else handed back to let go of.
+    fn retire(
+        &mut self,
+        id: u64,
+        owned: Owned<P>,
+        views: &mut Views,
+        pending: Vec<Pending>,
+    ) -> Option<Removed<P>> {
         self.clock += 1;
         self.uncount_span(owned.entry().span);
-        let removed = Removed { id, owned };
-        if (views.open)
-            .range(removed.owned.entry().seen..)
-            .next()
-            .is_none()
-        {
-            return Some(removed);
+        let mut gone = Gone {
+            removed: Removed { id, owned },
+            at: self.clock,
+            pending,
+            open_before: 0,
+        };
+        if !gone.kept(&views.open, self.clock) {
+            return Some(gone.removed);
         }
-        self.gone.push((removed, self.clock));
+        self.gone.push(gone);
         views.gone = true;
         None
     }
 
-    /// The gone entries no open view of `views` names any more, in the order removed: a view
-    /// names one where it was taken from the entry's `seen` up to its removal.
+    /// The gone entries no open view of `views` names any more and that wait for no command
+    /// buffer's commit, in the order removed: a view names one where it was taken from the entry's
+    /// `seen` up to its removal ([`Gone::kept`]).
     fn sweep(&mut self, views: &mut Views) -> Vec<Removed<P>> {
         if self.gone.is_empty() {
             return Vec::new();
         }
-        if views.open.is_empty() {
-            views.gone = false;
-            return std::mem::take(&mut self.gone)
-                .into_iter()
-                .map(|(r, _)| r)
-                .collect();
+        let clock = self.clock;
+        let mut out = Vec::new();
+        let mut keep = Vec::new();
+        for mut g in std::mem::take(&mut self.gone) {
+            if g.kept(&views.open, clock) {
+                keep.push(g);
+            } else {
+                out.push(g.removed);
+            }
         }
-        let open = &views.open;
-        let (keep, out): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.gone)
-                .into_iter()
-                .partition(|(r, removed_at)| {
-                    open.range(r.owned.entry().seen..*removed_at)
-                        .next()
-                        .is_some()
-                });
         self.gone = keep;
         views.gone = !self.gone.is_empty();
-        out.into_iter().map(|(r, _)| r).collect()
+        out
     }
 }
 
@@ -502,9 +593,14 @@ struct Views {
 
 impl<P: Platform> Tables<P> {
     /// Removes `id`'s live entry, where it has one, as [`Self::retire`] does.
-    fn retire_live(&mut self, id: u64, views: &mut Views) -> Option<Option<Removed<P>>> {
+    fn retire_live(
+        &mut self,
+        id: u64,
+        views: &mut Views,
+        pending: Vec<Pending>,
+    ) -> Option<Option<Removed<P>>> {
         let owned = self.live.remove(&id)?;
-        Some(self.retire(id, owned, views))
+        Some(self.retire(id, owned, views, pending))
     }
 }
 
@@ -574,9 +670,9 @@ impl<P: Platform> Context<P> {
             let entry = owned.entry();
             f(id, false, &entry.handle, cpu(entry));
         }
-        for (removed, _) in &tables.gone {
-            let entry = removed.entry();
-            f(removed.id(), true, &entry.handle, cpu(entry));
+        for g in &tables.gone {
+            let entry = g.removed.entry();
+            f(g.removed.id(), true, &entry.handle, cpu(entry));
         }
         true
     }
@@ -607,7 +703,20 @@ impl<P: Platform> Context<P> {
     /// message's view of this table, where it has one ([`View::at`]), which names the entry
     /// though taken before its make ([`View::made`]). The entry's object is told `id` for its
     /// device's loss ([`name_for_loss`]).
-    pub(crate) fn insert(&self, id: u64, mut entry: Entry<P>, seen_from: Option<u64>) -> Made<P> {
+    #[cfg(test)]
+    pub(crate) fn insert(&self, id: u64, entry: Entry<P>, seen_from: Option<u64>) -> Made<P> {
+        self.insert_after(id, entry, seen_from, Vec::new())
+    }
+
+    /// [`Self::insert`], what the id named waiting for the command buffers of `pending` before it
+    /// is let go of (the module doc, "After the buffers posted before it").
+    pub(crate) fn insert_after(
+        &self,
+        id: u64,
+        mut entry: Entry<P>,
+        seen_from: Option<u64>,
+        pending: Vec<Pending>,
+    ) -> Made<P> {
         let mut t = self.tables.write();
         name_for_loss(id, &entry);
         t.clock += 1;
@@ -616,18 +725,19 @@ impl<P: Platform> Context<P> {
         t.count_span(entry.span);
         let owned = Owned::new(entry);
         let at = owned.0;
-        let replaced =
-            (t.live.insert(id, owned)).and_then(|old| t.retire(id, old, &mut self.views.lock()));
+        let replaced = (t.live.insert(id, owned))
+            .and_then(|old| t.retire(id, old, &mut self.views.lock(), pending));
         (at, replaced)
     }
 
-    /// [`Self::insert`], where `live` answers, under the table's lock, that the entry is still to
-    /// be stored; `None` where it is not.
+    /// [`Self::insert_after`], where `live` answers, under the table's lock, that the entry is
+    /// still to be stored; `None` where it is not.
     pub(crate) fn insert_if(
         &self,
         id: u64,
         mut entry: Entry<P>,
         seen_from: Option<u64>,
+        pending: Vec<Pending>,
         live: impl FnOnce() -> bool,
     ) -> Option<Made<P>> {
         let mut t = self.tables.write();
@@ -641,22 +751,35 @@ impl<P: Platform> Context<P> {
         t.count_span(entry.span);
         let owned = Owned::new(entry);
         let at = owned.0;
-        let replaced =
-            (t.live.insert(id, owned)).and_then(|old| t.retire(id, old, &mut self.views.lock()));
+        let replaced = (t.live.insert(id, owned))
+            .and_then(|old| t.retire(id, old, &mut self.views.lock(), pending));
         Some((at, replaced))
     }
 
     /// Removes `id`'s entry, where it has one: whether it was a texture, and it, to let go of,
     /// where no view needs it.
+    #[cfg(test)]
     pub(crate) fn remove(&self, id: u64) -> Option<(bool, Option<Removed<P>>)> {
+        self.remove_after(id, Vec::new())
+    }
+
+    /// [`Self::remove`], the entry waiting for the command buffers of `pending` before it is let
+    /// go of (the module doc, "After the buffers posted before it").
+    pub(crate) fn remove_after(
+        &self,
+        id: u64,
+        pending: Vec<Pending>,
+    ) -> Option<(bool, Option<Removed<P>>)> {
         let mut t = self.tables.write();
         let texture = matches!(t.live.get(&id)?.entry().handle, ObjHandle::Texture(_));
-        let removed = t.retire_live(id, &mut self.views.lock())?;
+        let removed = t.retire_live(id, &mut self.views.lock(), pending)?;
         Some((texture, removed))
     }
 
     /// Removes every entry, in the table's order: those to let go of now, where no view needs
-    /// them, and how many there were.
+    /// them, and how many there were. They wait for no command buffer's commit: a buffer posted
+    /// before the close that has not taken its view finds its context closed or its queue gone,
+    /// and runs nothing (the module doc).
     pub(crate) fn remove_all(&self) -> (Vec<Removed<P>>, usize) {
         let mut t = self.tables.write();
         let mut views = self.views.lock();
@@ -664,11 +787,26 @@ impl<P: Platform> Context<P> {
         let count = ids.len();
         let mut out = Vec::new();
         for id in ids {
-            if let Some(Some(removed)) = t.retire_live(id, &mut views) {
+            if let Some(Some(removed)) = t.retire_live(id, &mut views, Vec::new()) {
                 out.push(removed);
             }
         }
         (out, count)
+    }
+
+    /// Lets go of the removed entries no open view names and no command buffer's commit holds any
+    /// more: at a buffer's end past its commit, where an entry waits for its queue
+    /// ([`Marks::has_parked`]), and at a queue's end (the module doc, "After the buffers posted
+    /// before it").
+    pub(crate) fn settle(&self) {
+        if !self.views.lock().gone {
+            return;
+        }
+        let out = {
+            let mut t = self.tables.write();
+            t.sweep(&mut self.views.lock())
+        };
+        let_go(out);
     }
 
     /// Whether any entry in the table lies in the `size` bytes at region offset `offset`: a span
@@ -748,7 +886,7 @@ impl<P: Platform> Drop for Context<P> {
             .drain()
             .map(|(id, owned)| Removed { id, owned })
             .collect();
-        out.extend(std::mem::take(&mut t.gone).into_iter().map(|(r, _)| r));
+        out.extend(std::mem::take(&mut t.gone).into_iter().map(|g| g.removed));
         let_go(out);
     }
 }
