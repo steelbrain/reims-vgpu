@@ -104,7 +104,8 @@ fn at(family: i64) -> usize {
 /// A feature that the rows of Apple's Metal Feature Set Tables require of an Apple GPU family.
 /// [`WIRED`] lists those the lane's wire, decoder and bundle carry; the bundle answers each other
 /// one's members as Metal answers a device without the feature, and marks them
-/// `RGFX_UNSUPPORTED`.
+/// `RGFX_UNSUPPORTED`. A shader's piece ([`Piece::UlongAtomicMinMax`]) has no members: the
+/// platform translates it, and it is in [`WIRED`] once the platform makes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Piece {
     /// `MTLArgumentEncoder`, from the device, a function and an encoder (argument buffers tier 1).
@@ -157,6 +158,13 @@ enum Piece {
     Metal4,
     /// Placement sparse buffers and textures.
     PlacementSparse,
+    /// 64-bit atomic minimum and maximum using `ulong`, on both buffers and textures, which the
+    /// tables give Apple8 on macOS alone (the note to their "64-bit atomics" row, an Apple9 one).
+    /// A shader's piece, which no wire message carries: the platform translates the shader. rt
+    /// refuses the texture form (`atomic_min` and `atomic_max` of a `ulong` texture) on every
+    /// device, so the piece is not in [`WIRED`]: it joins it when rt makes that form, and until
+    /// then it holds Apple8 and the families after it back.
+    UlongAtomicMinMax,
     /// Mesh draws in an indirect command buffer.
     IndirectMeshDraws,
     /// Memory barriers in a render indirect command buffer.
@@ -216,7 +224,7 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
                 P::Metal4,
             ],
         ),
-        (1008, &[P::PlacementSparse]),
+        (1008, &[P::PlacementSparse, P::UlongAtomicMinMax]),
         (1009, &[P::IndirectMeshDraws, P::RenderIndirectBarriers]),
         (1010, &[P::DepthBounds]),
         (1011, &[]),
@@ -242,7 +250,8 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// compute pass's table bindings) are carried in compute pipelines alone, so their piece stays out
 /// of this list until a render pipeline's are carried too, and so are dynamic libraries
 /// (`DYNAMIC_LIBRARY_CREATE`, and the run of libraries that ends a compute create).
-/// A piece joins this list when its wire messages, its decoding and its bundle members land, and
+/// A piece joins this list when its wire messages, its decoding and its bundle members land (a
+/// shader's piece, when the platform makes it), and
 /// the Apple families it holds back rise with it once every piece up to Apple7's is here
 /// ([`cap_apple_families`]).
 const WIRED: &[Piece] = &[
@@ -922,6 +931,26 @@ mod tests {
             assert_eq!(answer(&apple7, family), Some(true), "family {family}");
         }
         assert_eq!(answer(&apple7, 1008), Some(false));
+    }
+
+    /// Apple8's 64-bit atomic minimum and maximum, whose texture form rt refuses, is not the
+    /// lane's: with every other piece, Apple1 to Apple7 stand and Apple8 and Apple9 do not
+    #[test]
+    fn ulong_atomic_min_max_holds_apple8_back() {
+        assert!(!WIRED.contains(&Piece::UlongAtomicMinMax));
+        let p = Arc::new(FakePlatform::new());
+        let mut identity = p.device().identity_caps();
+        let every_other: Vec<Piece> = (APPLE_PIECES.iter())
+            .flat_map(|(_, pieces)| pieces.iter().copied())
+            .filter(|&piece| piece != Piece::UlongAtomicMinMax)
+            .collect();
+        cap_apple_families(&mut identity, &every_other);
+        for family in 1001..=1007 {
+            assert_eq!(identity.families[at(family)], Some(true), "family {family}");
+        }
+        for family in [1008, 1009] {
+            assert_eq!(identity.families[at(family)], Some(false), "family {family}");
+        }
     }
 
     /// The identity is the platform's, a name longer than v1's 32 bytes whole and the memory as
