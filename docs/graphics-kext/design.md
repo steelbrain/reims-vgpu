@@ -1811,7 +1811,12 @@ Stages:
       monochrome pictures (a HEIC image's 4:4:4 thumbnail, or its alpha
       item) is then refused at the session's start, not at each tile or
       frame, and every tile a session takes lands in the 4:2:0 format its
-      `TDrs` names. Measured on an M3 Max
+      `TDrs` names. On arm64 macOS 26.6.2 under TCG on a 780M host
+      (2026-11-21), sips's decodes of a 356x356 4:4:4 thumbnail and of a
+      512x512 picture's monochrome alpha item each start a tile session
+      that is refused so; VideoToolbox decodes them in software, within
+      2/255 of the M3's own decode of each file, where a tile session that
+      took them left sips no picture. Measured on an M3 Max
       on macOS 27.0.1 (oracle job m3-max-39549): CMPhoto decodes Mac Blue,
       6016x6016, as 36 tiles of 1024x1024, each whole into a 1024x1024
       `420f` buffer of its own, asynchronous, and Apple's hardware decoder
