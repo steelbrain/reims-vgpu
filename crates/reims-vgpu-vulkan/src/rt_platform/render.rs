@@ -34,24 +34,31 @@
 //!   options (rt renders one sample, and the one option is custom sample positions); the object,
 //!   mesh and tile functions' buffers, textures, samplers and threadgroup memory, and the tile
 //!   threadgroup memory length (rt makes no state with such functions); and, each at Metal's
-//!   default, a resolve texture of nil, a visibility result mode of `Disabled`, a line width of 1,
-//!   primitive restart enabled, the viewport transform enabled, one vertex amplification view and
-//!   a tessellation factor scale of 1.
+//!   default, a resolve texture of nil, a line width of 1, primitive restart enabled, the viewport
+//!   transform enabled, one vertex amplification view and a tessellation factor scale of 1.
+//! - **The visibility result mode** is rt's: `Disabled`, at any offset, records nothing, and
+//!   `Boolean` and `Counting` are rt's gap (`Gap::Draw` of `VisibilityResults`), encoding nothing,
+//!   counted (`rt-refused-gap`), so the encoder's later draws write no result.
+//! - **The alpha test's reference** (`setAlphaTestReferenceValue:`) is rt's, which a state of
+//!   rt's private alpha test reads at its draws. No state of the platform's has that test
+//!   (`super::render_pipeline`'s private state has none), so no draw reads the reference.
 //! - **Unbuilt** ([`Unbuilt::RenderCommand`]), each encoding nothing, counted: indexed patch
 //!   draws, direct and indirect (rt has none, and refuses every state of a control point index
-//!   type), mesh draws, tile dispatches, a resolve texture, a visibility result mode but
-//!   `Disabled`, and the private settings of other than Metal's default rt has none of
-//!   (the alpha test's reference, a line width, a point size, the provoking vertex, primitive
-//!   restart disabled, the viewport transform disabled, vertex amplification, and an attachment
-//!   marked cleared). `tileWidth` and `tileHeight` answer 0, counted under
+//!   type), mesh draws, tile dispatches, a resolve texture, and the private settings of other than
+//!   Metal's default rt has none of (a point size, the provoking vertex, primitive restart
+//!   disabled, the viewport transform disabled, vertex amplification, and an attachment marked
+//!   cleared). So is a line width other than 1, which is set nowhere, so the encoder's later lines
+//!   draw 1 pixel wide: rt keeps such a width but refuses each draw of lines under it
+//!   (`Gap::Draw` of `LineWidth`), which would draw them not at all. `tileWidth` and `tileHeight`
+//!   answer 0, counted under
 //!   [`Unbuilt::RenderPass`]: rt's pass has no tiles. A tessellation factor scale other than 1
 //!   is counted under [`Unbuilt::TessellationFactorScale`]: rt has no call of it, and the
 //!   encoder's later patch draws read their factors unscaled.
 //! - **Metal's refusals**, each encoding nothing, counted (`rt-refused-metal`): a draw with no
 //!   pipeline state set, or with nil set since; a value no Metal enumeration has (a primitive,
-//!   index or fill type, a cull mode, a winding, a depth clip mode, a store action, a resource
-//!   usage); an index, a count or a base past rt's 32 bits; a list of another length than its
-//!   range; and a command after `endEncoding`.
+//!   index or fill type, a cull mode, a winding, a depth clip mode, a store action, a visibility
+//!   result mode, a resource usage); an index, a count or a base past rt's 32 bits; a list of
+//!   another length than its range; and a command after `endEncoding`.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
 //! before the refused one are bound.
@@ -79,9 +86,6 @@ use super::{RtBuffer, RtObj, RtPlatform};
 
 /// A count, a base or an index past rt's 32 bits.
 const WIDE: Stop = Stop::Metal("a count, a base or an index past 32 bits");
-
-/// `MTLVisibilityResultModeDisabled`.
-const VISIBILITY_DISABLED: u64 = 0;
 
 /// `id<MTLRenderCommandEncoder>` on metal2vulkan-runtime.
 pub struct RtRenderEncoder {
@@ -322,7 +326,6 @@ impl RtRenderEncoder {
             | RenderCmd::DispatchThreadsPerTile { .. }
             | RenderCmd::DispatchThreadsPerTileInRegion { .. }
             | RenderCmd::DispatchThreadsPerTileInRegionIndex { .. }
-            | RenderCmd::SetAlphaTestReferenceValue { .. }
             | RenderCmd::SetPointSize { .. }
             | RenderCmd::SetProvokingVertexMode { .. }
             | RenderCmd::SetVertexAmplificationMode { .. }
@@ -333,8 +336,11 @@ impl RtRenderEncoder {
             | RenderCmd::SetStencilResolveTexture { texture, .. } => {
                 unbuilt_unless(texture.is_none())?;
             }
-            RenderCmd::SetVisibilityResultMode { mode, .. } => {
-                unbuilt_unless(mode == VISIBILITY_DISABLED)?;
+            RenderCmd::SetVisibilityResultMode { mode, offset } => {
+                e.set_visibility_result_mode(visibility_mode(mode)?, offset)?;
+            }
+            RenderCmd::SetAlphaTestReferenceValue { reference_value } => {
+                e.set_alpha_test_reference_value(reference_value);
             }
             RenderCmd::SetLineWidth { line_width } => unbuilt_unless(line_width == 1.0)?,
             RenderCmd::SetTessellationFactorScale { scale } if scale != 1.0 => {
@@ -664,6 +670,16 @@ impl std::fmt::Display for DrawDetail {
 /// `MTLPrimitiveType` of `raw`.
 fn primitive(raw: u64) -> Result<PrimitiveType, Stop> {
     named(raw, "a primitive type Metal has none of")
+}
+
+/// rt's visibility result mode of `MTLVisibilityResultMode` `raw`.
+fn visibility_mode(raw: u64) -> Result<rt::VisibilityResultMode, Stop> {
+    match raw {
+        0 => Ok(rt::VisibilityResultMode::Disabled),
+        1 => Ok(rt::VisibilityResultMode::Boolean),
+        2 => Ok(rt::VisibilityResultMode::Counting),
+        _ => Err(Stop::Metal("a visibility result mode Metal has none of")),
+    }
 }
 
 /// rt's store action of `MTLStoreAction` `raw`.
@@ -1200,6 +1216,8 @@ mod tests {
             (counted(metal), counted(unbuilt), counted(pass_unbuilt));
         let scale = Unbuilt::TessellationFactorScale.code();
         let scale_before = counted(scale);
+        let gap = RtRefusal::Gap.code();
+        let gap_before = counted(gap);
         let commands = made();
         let encoder = commands.render_encoder(on, &pass(&target, 2));
         let encoder = encoder.expect("never a raise").expect("a render encoder");
@@ -1278,7 +1296,8 @@ mod tests {
             assert_eq!(encoder.encode(on, cmd), Ok(()));
         }
         assert_eq!(counted(metal), before + 8);
-        assert_eq!(counted(unbuilt), unbuilt_before + 3);
+        assert_eq!(counted(unbuilt), unbuilt_before + 1);
+        assert_eq!(counted(gap), gap_before + 1);
         assert_eq!(counted(pass_unbuilt), pass_before + 2);
         assert_eq!(counted(scale), scale_before + 1);
         assert_eq!(commands.commit(on), Ok(()));

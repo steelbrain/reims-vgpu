@@ -69,8 +69,8 @@ pub enum Unbuilt {
     /// answers nil.
     FunctionTable,
     /// Render commands rt has no form of: indexed patch draws, mesh draws, tile dispatches,
-    /// resolve textures, visibility results, and the private settings of other than Metal's
-    /// default rt has none of (`super::render`). Each encodes nothing.
+    /// resolve textures, the private settings of other than Metal's default rt has none of, and a
+    /// line width other than 1, at which rt draws no line (`super::render`). Each encodes nothing.
     RenderCommand,
     /// Compute commands rt has no form of: an indirect `dispatchThreads` and an indirect stage-in
     /// region. Each encodes nothing.

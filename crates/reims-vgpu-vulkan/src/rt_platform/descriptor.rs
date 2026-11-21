@@ -16,7 +16,7 @@
 //!   storing and resolving each (rt's docs); and the visibility result buffer, held as Metal's
 //!   descriptor retains it. rt's command buffer keeps that buffer until it retires, and its bytes
 //!   stay as they were: rt's pass writes no result, and a visibility result mode but `Disabled` is
-//!   unbuilt at the encoder (`super::render`). A render encoder's creation turns them into rt's
+//!   rt's gap at the encoder (`super::render`). A render encoder's creation turns them into rt's
 //!   descriptor ([`PassFields::rt_pass`]): an action or resolve filter Metal has none of, or a
 //!   level, slice or plane past 32 bits, is Metal's refusal there, as Metal asserts at the
 //!   encoder's creation; a width or height past 32 bits renders the attachments' area, as Metal's
