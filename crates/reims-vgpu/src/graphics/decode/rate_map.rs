@@ -70,13 +70,16 @@ fn write_samples(at: *mut u32, bits: &[u32]) {
 }
 
 impl<P: Platform> GraphicsDecoder<P> {
-    /// The platform's descriptor of the map `m` describes, with its layers set; `None` where the
-    /// message does not hold them, or the platform makes no layer of a layer's sample counts.
+    /// The platform's descriptor of the map `m` describes, with its layers set; else the status
+    /// its create or reset answers: [`RGFX_STATUS_INVALID_ARGUMENT`] where the message does not
+    /// hold a layer's record or samples, which every layer is read for before the platform makes
+    /// any, and [`RGFX_STATUS_REFUSED`] where the platform makes no layer of a layer's sample
+    /// counts, or makes one of other counts.
     fn rate_map_descriptor(
         &self,
         message: &[u8],
         m: &RgfxRateMapCreate,
-    ) -> RaiseResult<Option<P::RateMapDescriptor>> {
+    ) -> RaiseResult<Result<P::RateMapDescriptor, u32>> {
         let desc = self.platform.rate_map_descriptor(&RateMapDesc {
             screen_size: MtlSize::new(m.screen_width, m.screen_height, m.screen_depth),
             mutability: (m.flags & RGFX_RATE_MAP_MUTABILITY_SET != 0)
@@ -84,50 +87,49 @@ impl<P: Platform> GraphicsDecoder<P> {
             min_factor: None,
         });
         let stride = size_of::<RgfxRateMapLayer>() as u64;
+        let mut layers = Vec::new();
         for index in 0..u64::from(m.layer_count) {
             let Some(layer) = u32::try_from(u64::from(m.layers_offset) + index * stride)
                 .ok()
                 .and_then(|at| read_at::<RgfxRateMapLayer>(message, at))
             else {
-                return Ok(None);
+                return Ok(Err(RGFX_STATUS_INVALID_ARGUMENT));
             };
-            let (h, v) = (
-                layer.horizontal_count as usize,
-                layer.vertical_count as usize,
-            );
+            let h = layer.horizontal_count as usize;
             let Some(bits) = h
-                .checked_add(v)
+                .checked_add(layer.vertical_count as usize)
                 .and_then(|n| samples(message, layer.samples_offset as usize, n))
             else {
-                return Ok(None);
+                return Ok(Err(RGFX_STATUS_INVALID_ARGUMENT));
             };
-            let Some(made) = self.platform.new_rate_map_layer(
-                ON,
-                MtlSize::new(
-                    layer.horizontal_count.into(),
-                    layer.vertical_count.into(),
-                    0,
-                ),
-            )?
+            layers.push((layer, bits));
+        }
+        for (index, (layer, bits)) in (0..).zip(layers) {
+            let (h, v) = (layer.horizontal_count, layer.vertical_count);
+            let Some(made) = self
+                .platform
+                .new_rate_map_layer(ON, MtlSize::new(h.into(), v.into(), 0))?
             else {
-                return Ok(None);
+                return Ok(Err(RGFX_STATUS_REFUSED));
             };
             let counts = made.sample_count();
-            if counts.width != h as u64 || counts.height != v as u64 {
-                return Ok(None);
+            if counts.width != u64::from(h) || counts.height != u64::from(v) {
+                return Ok(Err(RGFX_STATUS_REFUSED));
             }
-            write_samples(made.horizontal_sample_storage().as_ptr(), &bits[..h]);
-            write_samples(made.vertical_sample_storage().as_ptr(), &bits[h..]);
+            let (horizontal, vertical) = bits.split_at(h as usize);
+            write_samples(made.horizontal_sample_storage().as_ptr(), horizontal);
+            write_samples(made.vertical_sample_storage().as_ptr(), vertical);
             desc.set_layer(ON, &made, index)?;
         }
-        Ok(Some(desc))
+        Ok(Ok(desc))
     }
 
     /// `RATE_MAP_CREATE` or `RATE_MAP_RESET` (`reset`): the map made under the message's id, or
     /// the map it names compiled again, and its state, the answer; `None` for a message too short
     /// to carry its seqno. A create's id must be the sender's; a malformed message is answered
     /// invalid, a reset of a map the sender does not hold not found, and a map the platform does
-    /// not make, or a layer it makes none of, refused, with nothing made.
+    /// not make, or a layer it makes none of or one of other sample counts, refused, with nothing
+    /// made.
     pub(crate) fn rate_map_state(
         &self,
         device: &P::Device,
@@ -160,8 +162,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         } else {
             None
         };
-        let Some(desc) = self.rate_map_descriptor(message, &m)? else {
-            return Ok(Some(answer(RGFX_STATUS_INVALID_ARGUMENT)));
+        let desc = match self.rate_map_descriptor(message, &m)? {
+            Ok(desc) => desc,
+            Err(status) => return Ok(Some(answer(status))),
         };
         let state = |map: &P::RateMap| {
             let screen = map.screen_size();
@@ -427,18 +430,61 @@ mod tests {
     }
 
     /// A create whose layer records or samples run past the message is answered invalid, and
-    /// makes nothing.
+    /// makes nothing: every layer is read before the platform makes any, so the first layer,
+    /// which the message holds, is not made either.
     #[test]
     fn a_rate_map_create_past_its_message_is_invalid_and_makes_nothing() {
         let (p, dec) = decoder();
-        let mut message = create(RGFX_CMD_RATE_MAP_CREATE, 8, 8, None, &[(&[1.0], &[1.0])]);
+        let mut message = create(
+            RGFX_CMD_RATE_MAP_CREATE,
+            8,
+            8,
+            None,
+            &[(&[1.0], &[1.0]), (&[1.0], &[1.0])],
+        );
         message.truncate(message.len() - 8);
+        let m = p.call_log().mark();
         let state = dec
             .rate_map_state(&p.device(), &message, false)
             .unwrap()
             .unwrap();
         assert_eq!(state.status, RGFX_STATUS_INVALID_ARGUMENT);
         assert!(dec.named(MAP).is_none());
+        let sels = p.call_log().sels_since(m);
+        assert!(!sels.contains(&"initWithSampleCount:"), "{sels:?}");
+    }
+
+    /// A create or a reset of a layer the platform makes none of is refused, not invalid: the
+    /// message is well formed. The create makes nothing, and the reset leaves the map it names
+    /// as it was.
+    #[test]
+    fn a_rate_map_of_a_layer_the_platform_makes_none_of_is_refused() {
+        use reims_vgpu_vulkan::core::testkit::Step;
+        let (p, dec) = decoder();
+        let made = create(RGFX_CMD_RATE_MAP_CREATE, 8, 8, None, &[(&[1.0], &[1.0])]);
+        p.script().push("initWithSampleCount:", Step::Nil);
+        let state = dec
+            .rate_map_state(&p.device(), &made, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, RGFX_STATUS_REFUSED);
+        assert!(dec.named(MAP).is_none());
+
+        let state = dec
+            .rate_map_state(&p.device(), &made, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, RGFX_STATUS_OK);
+        let reset = create(RGFX_CMD_RATE_MAP_RESET, 16, 16, None, &[(&[1.0], &[1.0])]);
+        p.script().push("initWithSampleCount:", Step::Nil);
+        let m = p.call_log().mark();
+        let state = dec
+            .rate_map_state(&p.device(), &reset, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.status, RGFX_STATUS_REFUSED);
+        let sels = p.call_log().sels_since(m);
+        assert!(!sels.iter().any(|s| s.starts_with("reset")), "{sels:?}");
     }
 
     /// A reset of a map the sender does not hold is not found; of one it holds, it is the
@@ -559,10 +605,10 @@ mod tests {
 
     /// On the rt platform a map of one layer whose rates vary makes nothing through the decoder,
     /// as rt builds no rasterization rate map: the map's descriptor and its layer are each
-    /// refused, counted under rt's code (`rt-unbuilt-rate-map`), and the create answers invalid,
+    /// refused, counted under rt's code (`rt-unbuilt-rate-map`), and the create answers refused,
     /// as [`GraphicsDecoder::rate_map_descriptor`] makes no descriptor where the platform makes
-    /// no layer, with no size, granularity, layer or parameters; a query of it is not found, as
-    /// the sender holds no map.
+    /// no layer of a well-formed message's, with no size, granularity, layer or parameters; a
+    /// query of it is not found, as the sender holds no map.
     #[test]
     fn on_vulkan_rt_refuses_a_rate_map_through_the_decoder() {
         use crate::platform::ApiPlatform as _;
@@ -582,7 +628,7 @@ mod tests {
         let refused = crate::platform::counted("rt-unbuilt-rate-map");
         let state = dec.rate_map_state(&device, &made, false).unwrap().unwrap();
         assert_eq!(crate::platform::counted("rt-unbuilt-rate-map") - refused, 2);
-        assert_eq!(state.status, RGFX_STATUS_INVALID_ARGUMENT);
+        assert_eq!(state.status, RGFX_STATUS_REFUSED);
         assert_eq!(
             (state.screen_width, state.layer_count, state.parameter_size),
             (0, 0, 0)
