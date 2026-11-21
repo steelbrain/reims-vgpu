@@ -4012,6 +4012,10 @@ impl<P: Platform> SurfaceCaches<P> {
         let counts = &mut self.counts.shapes;
         let mut gone =
             (self.by_block.get_mut(&block)).map_or_else(Vec::new, |c| c.shapes.sweep(counts));
+        let swept: u64 = gone.iter().map(|shape| shape.bytes).sum();
+        self.cache_bytes = self.cache_bytes.saturating_sub(swept);
+        // Each shape the budget trims gives its bytes back at once, so the trims stop as soon as
+        // the caches fit.
         while let Some(budget) = self.cache_budget
             && self.cache_bytes > budget
         {
@@ -4021,10 +4025,14 @@ impl<P: Platform> SurfaceCaches<P> {
             let Some(((_, id), at)) = oldest else {
                 break;
             };
-            gone.extend((self.by_block.get_mut(&at)).and_then(|c| c.shapes.take_id(id)));
+            let Some(shape) = (self.by_block.get_mut(&at)).and_then(|c| c.shapes.take_id(id))
+            else {
+                break;
+            };
+            self.cache_bytes = self.cache_bytes.saturating_sub(shape.bytes);
+            gone.push(shape);
         }
         for shape in &gone {
-            self.cache_bytes = self.cache_bytes.saturating_sub(shape.bytes);
             self.counts.shapes.dropped += 1;
             self.counts.shapes.dropped_bytes += shape.bytes;
         }

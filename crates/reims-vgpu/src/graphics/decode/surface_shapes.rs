@@ -1056,6 +1056,32 @@ mod tests {
         assert!(r.dec.entry(20).unwrap().shape.is_some());
     }
 
+    /// Past the caches' budget the shapes no texture references are trimmed least recently used
+    /// first, each giving its bytes back as it goes, so the trims stop once the caches fit: of
+    /// three unreferenced shapes, the two oldest go, and the newest stays, found by its next
+    /// texture
+    #[test]
+    fn the_budget_trims_shapes_only_until_the_caches_fit() {
+        let mut r = shaped();
+        for (n, width) in [4, 5, 6].into_iter().enumerate() {
+            let obj_id = 21 + n as u64;
+            texture(&mut r, obj_id, 80, (width, 8));
+            destroy(&mut r, obj_id);
+        }
+        // 8 rows of 4-byte texels each; the buffer holds no memory.
+        let row = 8 * 4;
+        assert_eq!(r.dec.caches().live().cache_bytes, (4 + 5 + 6) * row);
+        r.dec.set_cache_budget(500);
+        texture(&mut r, 30, 80, (7, 8));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(counts.dropped, 2, "the two oldest");
+        assert_eq!(counts.dropped_bytes, (4 + 5) * row);
+        assert_eq!(r.dec.caches().live().cache_bytes, (6 + 7) * row);
+        texture(&mut r, 31, 80, (6, 8));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.found, counts.again), (1, 0), "the newest kept");
+    }
+
     /// A shape a command buffer writes is dirty from its finish: a download copies it into the
     /// cache's buffer, at its place there, before it copies the buffer into the pages (rule 3),
     /// and once: the next download, nothing written since, writes nothing back. The surface reads
