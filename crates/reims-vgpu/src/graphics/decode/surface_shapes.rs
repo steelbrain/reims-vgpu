@@ -1165,6 +1165,77 @@ mod tests {
         assert_eq!(r.p.call_log().count(MAKE_MEMORY), 1, "made once");
     }
 
+    /// The caches' budget counts a shaped cache's buffer from its memory's make, not from the
+    /// cache's: a cache whose buffer holds no memory counts its shapes alone, and the first fill,
+    /// which makes it, adds its bytes, the most the caches held among them. The counts of what the
+    /// caches hold tell the buffers' made bytes beside all of theirs, the cache's own among the
+    /// caches holding the most, and, of the made bytes, those of buffers copied through once since,
+    /// by what made them: the fill's, until a newer generation's fill goes through it again
+    #[test]
+    fn the_caches_budget_counts_a_buffer_from_its_memorys_make() {
+        let mut r = shaped();
+        let page = r.page;
+        let shape = 32 * 8 * 4;
+        texture_image(&mut r, 21, 80, (32, 8));
+        let live = r.dec.caches().live();
+        assert_eq!((live.buffer_bytes, live.buffer_made_bytes), (2 * page, 0));
+        assert_eq!(live.cache_bytes, shape, "the shape alone");
+        assert_eq!(live.largest[0].held, shape);
+
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 2, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let live = r.dec.caches().live();
+        assert_eq!(live.buffer_made_bytes, 2 * page, "the fill made it");
+        assert_eq!(live.cache_bytes, 2 * page + shape);
+        let largest = live.largest[0];
+        assert_eq!((largest.held, largest.buffer_made_bytes), (2 * page + shape, 2 * page));
+        let once = (live.once_fill_bytes, live.once_download_bytes, live.once_other_bytes);
+        assert_eq!(once, (2 * page, 0, 0), "copied through once, made by its fill");
+        assert_eq!(r.dec.caches().counts().held_most, 2 * page + shape);
+
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 3, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let live = r.dec.caches().live();
+        assert_eq!(live.buffer_made_bytes, 2 * page);
+        assert_eq!(live.once_fill_bytes, 0, "copied through twice");
+    }
+
+    /// A buffer whose memory a download made counts, once copied through, as the download's; one
+    /// a command of the guest's made, which names the buffer itself, counts made with no copy of
+    /// the caches' own through it, and is not among those copied through once
+    #[test]
+    fn the_buffers_copied_through_once_are_told_by_what_made_them() {
+        use reims_vgpu_graphics::wire::{RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED};
+        let (mut r, _) = placing_deferred();
+        let page = r.page;
+        compute_pipeline(&mut r, 31);
+        writable_image(&mut r, 25);
+        computes(&mut r, 0x100, &[bind_pipeline(31), bind_texture(25, 0)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(r.dec.caches().live().buffer_made_bytes, 0, "zeros taken");
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_ATTACH;
+        let attached = r.pages_flagged(BLOCK, 7, &[(1, 2)], 2 * page, flags);
+        assert_eq!(attached, RGFX_STATUS_OK);
+        let mark = r.p.call_log().mark();
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        assert_eq!(written_back(&r.p.call_log().since(mark)).len(), 1, "its write");
+        let live = r.dec.caches().live();
+        assert_eq!(live.buffer_made_bytes, 2 * page);
+        let once = (live.once_fill_bytes, live.once_download_bytes, live.once_other_bytes);
+        assert_eq!(once, (0, 2 * page, 0), "the download's");
+
+        let mut r = shaped();
+        texture_image(&mut r, 21, 80, (32, 8));
+        write(&mut r, 0x100, 21, (32, 8));
+        r.p.world().complete_all(CompleteOn::Caller);
+        let live = r.dec.caches().live();
+        assert_eq!(live.buffer_made_bytes, 2 * r.page);
+        let once = (live.once_fill_bytes, live.once_download_bytes, live.once_other_bytes);
+        assert_eq!(once, (0, 0, 0), "named by the guest's blit");
+    }
+
     /// Where the platform refuses a shaped cache's buffer its memory, nothing is copied through
     /// the buffer, and the command buffer whose begin's fill or whose op found it refused fails
     /// with Metal's `MTLCommandBufferErrorOutOfMemory`, once, the op that names the buffer

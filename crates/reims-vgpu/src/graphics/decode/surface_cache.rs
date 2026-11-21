@@ -282,6 +282,10 @@
 //!   caches' budget trims the shapes no texture references instead, least recently used first,
 //!   never a dirty or plane one ([`shapes`], "The bound"), and a texture that takes a trimmed
 //!   shape again has it made again, filled from its cache's buffer as any new shape is (rule 2).
+//!   There the caches' budget counts a cache's buffer from the moment its memory is made
+//!   ("Deferred memory"; `SurfaceCaches::count_made`), and its shapes' images; the deferred
+//!   blocks' budget, which the device answers deferrals by, counts each deferred block's cache
+//!   whole, its memory made or not.
 //!
 //! - **By runs or by a view.** A cache's copies go between it and the pages' runs in the guest's
 //!   RAM where the platform copies by them ([`GpuDevice::copies_guest_ram`]; the block takes no
@@ -650,6 +654,91 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// Where the cache was made for the host's video, the surface its planes may take
     /// ([`exported`]).
     surface: exported::CacheSurface<P>,
+    /// Whether the caches' budget counts the buffer's bytes, its memory made, and what made it
+    /// and copied through it since ([`BufferMemory`]).
+    memory: BufferMemory,
+}
+
+/// A cache's buffer's memory as the caches' budget counts it ([`SurfaceCache::held`]): a buffer
+/// made deferred holds none until a copy through it, or a command or a texture of the guest's
+/// over it, makes it (the module doc, "Deferred memory"), and its bytes count from then. A
+/// diagnostic beside the budget: what made it, and how many of the caches' copies went through
+/// it since ([`CachesLive::once_fill_bytes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BufferMemory {
+    /// The budget counts the buffer's bytes: its memory was seen made
+    /// ([`SurfaceCaches::count_made`]).
+    counted: bool,
+    /// What made the memory, once seen made; `None` before.
+    by: Option<MadeBy>,
+    /// The use a make of the caches', with their lock let go of ([`Caches::make_memory`]), asked
+    /// the memory for while it was not made ([`SurfaceCaches::deferred_buffer`]): what made it,
+    /// where it is seen made next.
+    asked: Option<MemoryFor>,
+    /// The caches' copies through the buffer since its memory was made: fills, fills of its
+    /// shapes, copies out, early copies and writes' copies into other shapes of their plane.
+    through: u64,
+    /// A command of the guest's named the buffer itself (an object over it,
+    /// [`SurfaceCaches::over_written`]).
+    commanded: bool,
+}
+
+/// What made a cache's buffer's memory ([`BufferMemory::by`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MadeBy {
+    /// The cache's make: a buffer not made deferred.
+    Make,
+    /// A copy of the caches' own through it, for this use.
+    Copy(MemoryFor),
+    /// A use the caches did not ask it for: a command of the guest's that names the buffer
+    /// (`super::GraphicsDecoder::require_buffer`), or a texture made over it.
+    Other,
+}
+
+impl BufferMemory {
+    /// The memory of a new cache's buffer, `made` at its make or not.
+    fn new(made: bool) -> Self {
+        BufferMemory {
+            counted: made,
+            by: made.then_some(MadeBy::Make),
+            ..BufferMemory::default()
+        }
+    }
+
+    /// The memory seen made: what made it, where nothing was seen to yet, the make the caches
+    /// asked, else a use they did not ask it for.
+    fn seen(&mut self) {
+        if self.by.is_none() {
+            self.by = Some(self.asked.take().map_or(MadeBy::Other, MadeBy::Copy));
+        }
+        self.asked = None;
+    }
+
+    /// A copy through the buffer, which made its memory for `made_for` where `made_now`.
+    fn copied_through(&mut self, made_now: bool, made_for: MemoryFor) {
+        if made_now {
+            self.by = Some(MadeBy::Copy(made_for));
+            self.asked = None;
+        } else {
+            self.seen();
+        }
+        self.through += 1;
+    }
+
+    /// The bytes of `bytes` the buffer holds that a fill, a download or anything else made, where
+    /// it is made deferred and copied through exactly once since, with no command of the guest's
+    /// naming it: (fill, download, other); none for any other buffer.
+    fn once(&self, bytes: u64) -> (u64, u64, u64) {
+        if !self.counted || self.through != 1 || self.commanded {
+            return (0, 0, 0);
+        }
+        match self.by {
+            Some(MadeBy::Copy(MemoryFor::Fill | MemoryFor::FillShapes)) => (bytes, 0, 0),
+            Some(MadeBy::Copy(MemoryFor::Download)) => (0, bytes, 0),
+            Some(MadeBy::Make) | None => (0, 0, 0),
+            Some(_) => (0, 0, bytes),
+        }
+    }
 }
 
 /// Where a cache's buffer may differ from its pages ([`SurfaceCache::changed`]), as bytes of the
@@ -717,10 +806,29 @@ struct WideHome<P: Platform> {
 }
 
 impl<P: Platform> SurfaceCache<P> {
-    /// The bytes the cache holds in the caches' budget: its buffer's, and its shapes' images'
-    /// ([`shapes`]).
+    /// The bytes the cache holds in the caches' budget: its buffer's, once its memory is counted
+    /// made ([`BufferMemory::counted`]), and its shapes' images' ([`shapes`]).
     fn held(&self) -> u64 {
-        self.bytes.saturating_add(self.shapes.bytes())
+        self.buffer_held().saturating_add(self.shapes.bytes())
+    }
+
+    /// The bytes of the cache's buffer the caches' budget counts: its own, once its memory is
+    /// counted made, else none.
+    fn buffer_held(&self) -> u64 {
+        if self.memory.counted { self.bytes } else { 0 }
+    }
+
+    /// A copy of the caches' own through the cache's buffer, for `made_for`: its memory made
+    /// first where it is not ([`memory_of`]), and the copy counted among those through it
+    /// ([`BufferMemory::through`]). Whether the buffer holds its memory; `false`, nothing
+    /// counted, where the platform refused it.
+    fn copy_through(&mut self, made_for: MemoryFor) -> bool {
+        let made_now = !self.device.memory_made();
+        if !memory_of::<P>(&self.device, made_for) {
+            return false;
+        }
+        self.memory.copied_through(made_now, made_for);
+        true
     }
 
     /// The bytes a copy `way` moves between the cache and its pages: a fill's, all of the
@@ -1749,12 +1857,23 @@ impl FillWait {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CachesLive {
     /// The caches, a block's each (`by_block`), and the bytes the caches' budget counts them
-    /// holding, their buffers' and their shapes' (`cache_bytes`).
+    /// holding, their buffers' whose memory is made and their shapes' (`cache_bytes`).
     pub(crate) caches: u64,
     pub(crate) cache_bytes: u64,
-    /// Their buffers' bytes ([`SurfaceCache::bytes`]), and the caches made for the host's video.
+    /// Their buffers' bytes ([`SurfaceCache::bytes`]), made or not, and of those the bytes of the
+    /// buffers whose memory is made (the module doc, "Deferred memory"); the caches made for the
+    /// host's video.
     pub(crate) buffer_bytes: u64,
+    pub(crate) buffer_made_bytes: u64,
     pub(crate) video: u64,
+    /// Of the bytes of the buffers made deferred whose memory is made, those of the buffers the
+    /// caches copied through exactly once since, none of the guest's commands naming them, by what
+    /// made them ([`BufferMemory::once`]): a fill (of the buffer from its pages, or of its shapes
+    /// from it), a download, or anything else (an early copy, a release, a copy out, a write's
+    /// copy into another shape of its plane, a command or a texture of the guest's).
+    pub(crate) once_fill_bytes: u64,
+    pub(crate) once_download_bytes: u64,
+    pub(crate) once_other_bytes: u64,
     /// Their other buffers: the Shared buffers over their pages' views, and their wide homes.
     pub(crate) view_buffers: u64,
     pub(crate) wide: u64,
@@ -1777,11 +1896,13 @@ pub(crate) const LARGEST: usize = 6;
 /// One cache's counts, for the caches holding the most ([`CachesLive::largest`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CacheLive {
-    /// The block whose cache it is, the bytes it holds in the budget, its buffer's bytes, and
-    /// whether it was made for the host's video.
+    /// The block whose cache it is, the bytes it holds in the budget, its buffer's bytes and those
+    /// of them the budget counts (none where its memory is not made), and whether it was made for
+    /// the host's video.
     pub(crate) block: u64,
     pub(crate) held: u64,
     pub(crate) buffer_bytes: u64,
+    pub(crate) buffer_made_bytes: u64,
     pub(crate) video: bool,
     pub(crate) shapes: shapes::ShapesLive,
 }
@@ -2354,14 +2475,23 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// Another reference to the buffer of the block's cache where `copies` holds of it and the
     /// caches take the per-shape form, whose buffers' memory is made at their first copy (the
-    /// module doc, "Deferred memory"): for [`Caches::make_memory`], with the lock let go of.
+    /// module doc, "Deferred memory"): for [`Caches::make_memory`], with the lock let go of, for
+    /// `made_for`, which the cache keeps as what made its memory where it is not made yet
+    /// ([`BufferMemory::asked`]).
     fn deferred_buffer(
-        &self,
+        &mut self,
         block: u64,
+        made_for: MemoryFor,
         copies: impl FnOnce(&SurfaceCache<P>) -> bool,
     ) -> Option<P::Buffer> {
-        let cache = self.by_block.get(&block).filter(|_| self.shaped)?;
-        copies(cache).then(|| cache.device.clone_ref())
+        let cache = self.by_block.get_mut(&block).filter(|_| self.shaped)?;
+        if !copies(cache) {
+            return None;
+        }
+        if !cache.device.memory_made() {
+            cache.memory.asked = Some(made_for);
+        }
+        Some(cache.device.clone_ref())
     }
 
     /// Where the device recovered since the caches last looked ([`GpuDevice::recoveries`]): the
@@ -2465,8 +2595,10 @@ impl<P: Platform> SurfaceCaches<P> {
             .collect()
     }
 
-    /// What the caches hold now ([`CachesLive`]).
-    pub(crate) fn live(&self) -> CachesLive {
+    /// What the caches hold now ([`CachesLive`]), the buffers' memory made since the budget last
+    /// looked counted first ([`Self::count_made`]).
+    pub(crate) fn live(&mut self) -> CachesLive {
+        self.count_made();
         let mut live = CachesLive {
             caches: self.by_block.len() as u64,
             cache_bytes: self.cache_bytes,
@@ -2474,6 +2606,11 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         for (&block, cache) in &self.by_block {
             live.buffer_bytes += cache.bytes;
+            live.buffer_made_bytes += cache.buffer_held();
+            let (fill, download, other) = cache.memory.once(cache.bytes);
+            live.once_fill_bytes += fill;
+            live.once_download_bytes += download;
+            live.once_other_bytes += other;
             live.video += u64::from(cache.life.is_some());
             live.view_buffers += u64::from(matches!(cache.pages, Some(CachePages::View(_))));
             live.wide += u64::from(cache.wide.is_some());
@@ -2489,6 +2626,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 block,
                 held,
                 buffer_bytes: cache.bytes,
+                buffer_made_bytes: cache.buffer_held(),
                 video: cache.life.is_some(),
                 shapes,
             });
@@ -2496,8 +2634,10 @@ impl<P: Platform> SurfaceCaches<P> {
         live
     }
 
-    /// What the caches did so far.
-    pub(crate) fn counts(&self) -> CacheCounts {
+    /// What the caches did so far, the buffers' memory made since the budget last looked counted
+    /// first ([`Self::count_made`]).
+    pub(crate) fn counts(&mut self) -> CacheCounts {
+        self.count_made();
         CacheCounts {
             fill_gpu_ns: self.copy_gpu.fills.load(Ordering::Relaxed),
             out_gpu_ns: self.copy_gpu.out.load(Ordering::Relaxed),
@@ -2579,9 +2719,12 @@ impl<P: Platform> SurfaceCaches<P> {
         let Some((cache, life, repitched)) = cache.take(&mut self.counts) else {
             return Ok(false);
         };
+        // The budget counts the buffers' memory made: a deferred buffer's none yet.
+        self.count_made();
+        let made_bytes = if cache.memory_made() { length } else { 0 };
         if self.shaped
             && let Some(budget) = self.cache_budget
-            && self.cache_bytes.saturating_add(length) > budget
+            && self.cache_bytes.saturating_add(made_bytes) > budget
         {
             self.counts.shapes.past_budget += 1;
         }
@@ -2596,6 +2739,7 @@ impl<P: Platform> SurfaceCaches<P> {
         if matches!(pages, CachePages::Runs { .. }) {
             self.counts.by_runs += 1;
         }
+        let memory = BufferMemory::new(cache.memory_made());
         self.by_block.insert(
             block,
             SurfaceCache {
@@ -2630,6 +2774,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 wide: None,
                 shapes: ShapeTable::default(),
                 shadow: ShapeTable::default(),
+                memory,
             },
         );
         let pages = Pages {
@@ -2638,7 +2783,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         self.watched.0.lock().insert(block, pages);
         self.owed.insert(block);
-        self.hold_bytes(bytes);
+        self.hold_bytes(if memory.counted { bytes } else { 0 });
         self.counts.made += 1;
         Ok(true)
     }
@@ -2858,6 +3003,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(false);
         };
         let carries = carried.is_some();
+        let memory = BufferMemory::new(cache.memory_made());
         self.by_block.insert(
             block,
             SurfaceCache {
@@ -2894,6 +3040,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 wide: None,
                 shapes: ShapeTable::default(),
                 shadow: ShapeTable::default(),
+                memory,
             },
         );
         if carries {
@@ -2906,7 +3053,7 @@ impl<P: Platform> SurfaceCaches<P> {
             self.counts.carried += 1;
         }
         self.deferred_bytes += bytes;
-        self.hold_bytes(bytes);
+        self.hold_bytes(if memory.counted { bytes } else { 0 });
         self.counts.made += 1;
         self.counts.deferred += 1;
         Ok(true)
@@ -3115,10 +3262,38 @@ impl<P: Platform> SurfaceCaches<P> {
         budget.saturating_sub(self.cache_bytes.saturating_sub(going))
     }
 
-    /// A cache of `bytes` taken: the bytes every cache holds, and the most they held, split at
-    /// each new most by what holds them ([`CacheCounts::held_referenced`]).
+    /// `bytes` taken by a cache, its buffer's made or a shape's image: the bytes every cache
+    /// holds, the buffers' memory made since counted first ([`Self::count_made`]), and the most
+    /// they held, split at each new most by what holds them ([`CacheCounts::held_referenced`]).
     fn hold_bytes(&mut self, bytes: u64) {
+        self.count_made();
         self.cache_bytes += bytes;
+        self.note_most();
+    }
+
+    /// The caches' buffers whose memory was made since the budget last looked, by a copy through
+    /// each or by a command or a texture of the guest's over it (the module doc, "Deferred
+    /// memory"): their bytes counted from now ([`BufferMemory::counted`]), and the most the caches
+    /// held noted.
+    fn count_made(&mut self) {
+        let mut counted = 0;
+        for cache in self.by_block.values_mut() {
+            if cache.memory.counted || !cache.device.memory_made() {
+                continue;
+            }
+            cache.memory.counted = true;
+            cache.memory.seen();
+            counted += cache.bytes;
+        }
+        if counted != 0 {
+            self.cache_bytes += counted;
+            self.note_most();
+        }
+    }
+
+    /// The bytes every cache holds noted where more than the most they held, split by what holds
+    /// them ([`CacheCounts::held_referenced`]).
+    fn note_most(&mut self) {
         if self.cache_bytes <= self.cache_bytes_most {
             return;
         }
@@ -3578,9 +3753,13 @@ impl<P: Platform> SurfaceCaches<P> {
     /// record of its written bytes is whole from now, or, where the buffer was counted after a
     /// deferred copy of the cache was asked, once that copy is made ([`Since`]). A block it named
     /// no use of takes the same, as nothing says what its work did there; one it named only
-    /// reads of keeps its record.
+    /// reads of keeps its record. Each such cache is marked named by a command of the guest's
+    /// ([`BufferMemory::commanded`]), read or written.
     fn over_written(&mut self, counts: &[Count], over: &[u64]) {
         for block in over {
+            if let Some(cache) = self.by_block.get_mut(block) {
+                cache.memory.commanded = true;
+            }
             let count = counts.iter().find(|c| c.block == *block);
             if count.is_some_and(|c| !c.writes) {
                 continue;
@@ -3704,7 +3883,7 @@ impl<P: Platform> SurfaceCaches<P> {
             // The source's overlap goes into the buffer on the way: within its extent. Where the
             // platform refuses the buffer's memory, no copy is made, and `refused` fails the
             // command buffer (the module doc, "Deferred memory").
-            if !into.is_empty() && !memory_of::<P>(&cache.device, MemoryFor::Reconcile) {
+            if !into.is_empty() && !cache.copy_through(MemoryFor::Reconcile) {
                 *refused = true;
             } else {
                 if !into.is_empty() {
@@ -4559,7 +4738,7 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             let block = c.block;
             let (Some(cache), Some((event, value))) =
-                (self.by_block.get(&block), self.ends.get(&signals))
+                (self.by_block.get_mut(&block), self.ends.get(&signals))
             else {
                 continue;
             };
@@ -4581,16 +4760,18 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             // Pages in a buffer, or by their runs: a deferred block's not named yet have none,
             // and copied pages ([`CachePages::Copied`]) take no early copy.
-            let view = match &cache.pages {
-                Some(CachePages::View(pages)) => Some(pages),
-                Some(CachePages::Runs { .. }) => None,
-                Some(CachePages::Copied(_)) | None => continue,
-            };
+            if matches!(cache.pages, Some(CachePages::Copied(_)) | None) {
+                continue;
+            }
             // The buffer's memory first, as for every copy through it ("Deferred memory").
             let Some(cb) = (copies_on.command_buffer(ON)?)
-                .filter(|_| memory_of::<P>(&cache.device, MemoryFor::EarlyCopy))
+                .filter(|_| cache.copy_through(MemoryFor::EarlyCopy))
             else {
                 continue;
+            };
+            let view = match &cache.pages {
+                Some(CachePages::View(pages)) => Some(pages),
+                _ => None,
             };
             if let Some((writer, end)) = after {
                 cb.encode_wait(Some(EventRef::Event(writer)), end)?;
@@ -4687,7 +4868,7 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         // The buffer's memory first, as for every copy through it ("Deferred memory").
         let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
-            let made = memory_of::<P>(&cache.device, MemoryFor::Fill);
+            let made = cache.copy_through(MemoryFor::Fill);
             self.memory_refused |= !made;
             made
         }) else {
@@ -4780,7 +4961,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         // The buffer's memory first, as for every copy through it ("Deferred memory").
         let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
-            let made = memory_of::<P>(&cache.device, MemoryFor::FillShapes);
+            let made = cache.copy_through(MemoryFor::FillShapes);
             self.memory_refused |= !made;
             made
         }) else {
@@ -5327,7 +5508,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         // The buffer's memory first, as for every copy through it ("Deferred memory").
         let Some(cb) = transfer.queue.command_buffer(ON)?.filter(|_| {
-            cache.pages.is_some() && memory_of::<P>(&cache.device, MemoryFor::WriteBack)
+            cache.pages.is_some() && cache.copy_through(MemoryFor::WriteBack)
         }) else {
             done();
             return Ok(());
@@ -6733,8 +6914,12 @@ impl<P: Platform> Caches<P> {
             let mut state = self.lock();
             // A write another shape takes goes through the cache's buffer.
             let buffers: Vec<P::Buffer> = (by_block.iter())
-                .filter(|(block, ids)| state.reconciles_through_buffer(*block, ids))
-                .filter_map(|(block, _)| state.deferred_buffer(*block, |_| true))
+                .filter_map(|(block, ids)| {
+                    if !state.reconciles_through_buffer(*block, ids) {
+                        return None;
+                    }
+                    state.deferred_buffer(*block, MemoryFor::Reconcile, |_| true)
+                })
                 .collect();
             if !buffers.is_empty() {
                 drop(state);
@@ -7179,7 +7364,10 @@ impl<P: Platform> Caches<P> {
             // An early copy goes through the cache's buffer: one whose CPU reads its writes back.
             let buffers = (uses.blocks.iter())
                 .filter(|c| c.writes)
-                .filter_map(|c| state.deferred_buffer(c.block, |cache| cache.read_back.on))
+                .filter_map(|c| {
+                    let early = MemoryFor::EarlyCopy;
+                    state.deferred_buffer(c.block, early, |cache| cache.read_back.on)
+                })
                 .collect();
             (state.after(device, queue, cb, &uses.blocks), buffers)
         };
@@ -7277,7 +7465,7 @@ impl<P: Platform> Caches<P> {
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
         // A written cache's copy goes through its buffer.
-        let buffer = self.lock().deferred_buffer(block, |c| c.written);
+        let buffer = self.lock().deferred_buffer(block, MemoryFor::Download, |c| c.written);
         self.make_memory(buffer.into_iter().collect(), MemoryFor::Download);
         let mut state = self.lock();
         // The pieces a staged copy of its cache, and a recovery's refills, would make for want of
@@ -7374,7 +7562,7 @@ impl<P: Platform> Caches<P> {
         let (done, failed, may_copy, reserve, buffer) = {
             let mut state = self.lock();
             let may_copy = state.release_may_copy(block, unheld);
-            let buffer = state.deferred_buffer(block, |_| may_copy);
+            let buffer = state.deferred_buffer(block, MemoryFor::Release, |_| may_copy);
             let lacking = may_copy.then(|| state.lacking(block, Way::Out)).flatten();
             let reserve = lacking.map(|(lens, first)| Reserve {
                 spares: Arc::clone(&state.spares),
@@ -15033,7 +15221,7 @@ pub(super) mod tests {
             deferral.join().unwrap()
         });
         assert_eq!(answer, RGFX_STATUS_OK, "the deferral's answer");
-        let caches = r.dec.caches();
+        let mut caches = r.dec.caches();
         assert!(caches.has(deferred), "its cache, taken once made");
         assert_eq!(caches.counts().deferred, 1);
     }
@@ -15074,7 +15262,7 @@ pub(super) mod tests {
             (held.join().unwrap(), second_answer)
         });
         assert_eq!(answers, (RGFX_STATUS_REFUSED, Ok(RGFX_STATUS_OK)));
-        let caches = r.dec.caches();
+        let mut caches = r.dec.caches();
         assert!(!caches.has(first), "no cache for the refused deferral");
         assert!(caches.has(second));
         let counts = caches.counts();

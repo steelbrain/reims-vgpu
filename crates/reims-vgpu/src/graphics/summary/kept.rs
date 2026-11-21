@@ -16,7 +16,11 @@
 //!   and how many contexts were read, and those whose table was not had within [`BOUND`]
 //!   (`contexts_unread`), whose objects are left out.
 //! - **The IOSurfaces' device caches'** ([`CachesLive`]): the caches, the bytes the budget counts
-//!   them holding, their buffers' bytes, those made for the host's video, their other buffers
+//!   them holding (their buffers' whose memory is made, and their shapes'), their buffers' bytes,
+//!   made or not, and of those the bytes of the buffers whose memory is made
+//!   (`cache_buffer_made_bytes`), and of those the bytes of the buffers made deferred that the
+//!   caches copied through exactly once since, by what made them (`cache_buffer_once_fill_bytes`,
+//!   `_download_bytes`, `_other_bytes`), those made for the host's video, their other buffers
 //!   (over their pages' views, and wide homes); their shapes' images and bytes, those a live
 //!   guest texture references and the references, those none does and their bytes, and of those
 //!   the ones past the bound, which only the cache's next new shape sweeps
@@ -24,8 +28,9 @@
 //!   the bytes they hold, and those holding shapes past the bound.
 //! - **The caches holding the most**, one by one, in a part of their own, `kept caches: block
 //!   BLOCK held BYTES, ...; ...` ([`largest_line`]): the six caches holding the most bytes,
-//!   the most first, each with its block, the bytes it holds, its buffer's, whether it was made
-//!   for the host's video, and its shapes' counts as above.
+//!   the most first, each with its block, the bytes it holds, its buffer's and those of them the
+//!   budget counts (`buffer_made_bytes`), whether it was made for the host's video, and its
+//!   shapes' counts as above.
 //! - **The pages' views**: the surfaces' blocks' views, the pages blocks' and the idle ones the
 //!   views' cache keeps (`decode::surface_pages`).
 //! - **What no id names**: the platform's textures less the guest's (live and gone),
@@ -77,6 +82,10 @@ impl Kept {
         a.caches += b.caches;
         a.cache_bytes += b.cache_bytes;
         a.buffer_bytes += b.buffer_bytes;
+        a.buffer_made_bytes += b.buffer_made_bytes;
+        a.once_fill_bytes += b.once_fill_bytes;
+        a.once_download_bytes += b.once_download_bytes;
+        a.once_other_bytes += b.once_other_bytes;
         a.video += b.video;
         a.view_buffers += b.view_buffers;
         a.wide += b.wide;
@@ -130,13 +139,14 @@ pub(crate) fn largest_line(kept: &Kept) -> Option<String> {
         .map(|one: &CacheLive| {
             let s = &one.shapes;
             format!(
-                "block {:#x} held {}, buffer_bytes {}, video {}, shapes {}, shape_bytes {}, \
-                 shapes_referenced {}, shape_references {}, shapes_unreferenced {}, \
-                 shapes_unreferenced_bytes {}, shapes_past_bound {}, shapes_past_bound_bytes {}, \
-                 plane_shapes {}",
+                "block {:#x} held {}, buffer_bytes {}, buffer_made_bytes {}, video {}, shapes {}, \
+                 shape_bytes {}, shapes_referenced {}, shape_references {}, shapes_unreferenced \
+                 {}, shapes_unreferenced_bytes {}, shapes_past_bound {}, \
+                 shapes_past_bound_bytes {}, plane_shapes {}",
                 one.block,
                 one.held,
                 one.buffer_bytes,
+                one.buffer_made_bytes,
                 u8::from(one.video),
                 s.shapes,
                 s.bytes,
@@ -185,6 +195,10 @@ pub(crate) fn line(kept: &Kept, rt: Option<(u64, u64)>) -> String {
         ("caches", c.caches),
         ("cache_bytes", c.cache_bytes),
         ("cache_buffer_bytes", c.buffer_bytes),
+        ("cache_buffer_made_bytes", c.buffer_made_bytes),
+        ("cache_buffer_once_fill_bytes", c.once_fill_bytes),
+        ("cache_buffer_once_download_bytes", c.once_download_bytes),
+        ("cache_buffer_once_other_bytes", c.once_other_bytes),
         ("video_caches", c.video),
         ("cache_view_buffers", c.view_buffers),
         ("wide_homes", c.wide),
@@ -226,6 +240,10 @@ mod tests {
         kept.tables.textures_gone = 2;
         kept.tables.shown_views = 3;
         kept.caches.caches = 40;
+        kept.caches.buffer_bytes = 9 << 20;
+        kept.caches.buffer_made_bytes = 5 << 20;
+        kept.caches.once_fill_bytes = 3 << 20;
+        kept.caches.once_download_bytes = 1 << 20;
         kept.caches.shapes.shapes = 1100;
         kept.caches.shapes.past_bound = 7;
         kept.views = (0, 5, 1);
@@ -233,6 +251,11 @@ mod tests {
         assert!(line.starts_with(
             "kept: rt_textures 1513, rt_buffers 675, host_textures 1120, \
              host_textures_other 17, guest_textures 391, guest_textures_gone 2, "
+        ));
+        assert!(line.contains(
+            ", cache_buffer_bytes 9437184, cache_buffer_made_bytes 5242880, \
+             cache_buffer_once_fill_bytes 3145728, cache_buffer_once_download_bytes 1048576, \
+             cache_buffer_once_other_bytes 0, "
         ));
         assert!(line.contains(", shapes 1100, "));
         assert!(line.contains(", shapes_past_bound 7, "));
@@ -275,7 +298,8 @@ mod tests {
         assert!(held[4..].iter().all(|&(_, held)| held == 5));
         let line = largest_line(&kept).unwrap();
         assert!(line.starts_with(
-            "kept caches: block 0x14 held 40, buffer_bytes 0, video 0, shapes 20, shape_bytes 0, "
+            "kept caches: block 0x14 held 40, buffer_bytes 0, buffer_made_bytes 0, video 0, \
+             shapes 20, shape_bytes 0, "
         ));
         assert!(line.contains("; block 0x2 held 30, "));
         assert_eq!(line.matches("; block ").count(), LARGEST - 1);
