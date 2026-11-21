@@ -179,9 +179,14 @@ const LET_GO_PICTURES: usize = 16;
 /// device made on the adapter (one a process, which `D3D12CreateDevice` answers while it lives)
 /// has no reference but ours, within 5 s of the display's drop (its `vaTerminate` may be made on
 /// its call thread). Run holding the GPU, on vaon12 on the default adapter.
+///
+/// **Measured** to fail on vaon12 of Mesa 26.2.7 over an Intel UHD Graphics 630, 2026-11-20: one
+/// reference beside ours, as the driver leaves one of every decode session (docs/video/bugs.md,
+/// U31).
 #[cfg(windows)]
 #[test]
-#[ignore = "needs vaon12 and RVG_VA_H264: run on the Windows host"]
+#[ignore = "vaon12 of Mesa 26.2.7 fails it (docs/video/bugs.md, U31); needs RVG_VA_H264: run on \
+            the Windows host"]
 fn a_display_let_go_after_its_decodes_leaves_no_reference_on_the_adapters_device() {
     use super::d3d12::{
         default_adapter_device_references, default_adapter_device_references_once_let_go,

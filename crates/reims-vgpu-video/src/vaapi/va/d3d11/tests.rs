@@ -530,8 +530,14 @@ const VIDEO_PICTURES: usize = 16;
 /// `D3D12CreateDevice` answers while it lives) has no reference but ours, within 5 s of the
 /// display's drop (its `vaTerminate` may be made on its call thread). Run holding the GPU, on
 /// vaon12 on the default adapter.
+///
+/// **Measured** to fail on vaon12 of Mesa 26.2.7 over an Intel UHD Graphics 630, 2026-11-20: one
+/// reference beside ours, as the driver leaves one of every decode session, where
+/// [`a_plane_draw_let_go_leaves_no_reference_on_the_adapters_device`] passes (docs/video/bugs.md,
+/// U31).
 #[test]
-#[ignore = "needs vaon12 and RVG_VA_H264: run on the Windows host"]
+#[ignore = "vaon12 of Mesa 26.2.7 fails it (docs/video/bugs.md, U31); needs RVG_VA_H264: run on \
+            the Windows host"]
 fn a_video_let_go_leaves_no_reference_on_the_adapters_device() {
     assert_eq!(
         default_adapter_device_references(),
