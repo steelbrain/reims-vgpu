@@ -90,9 +90,9 @@ pub enum Unbuilt {
     /// blit options (`MTLBlitOption`: a depth or stencil plane of a combined format, PVRTC rows).
     /// Each encodes nothing.
     Blit,
-    /// A render pass descriptor's properties rt's pass has no field of: layered rendering,
-    /// imageblock and threadgroup memory lengths, tile sizes and sample positions. A set of one
-    /// other than Metal's default keeps nothing, and the pass renders without it.
+    /// A render pass descriptor's properties rt's pass has no field of: imageblock and threadgroup
+    /// memory lengths, tile sizes and sample positions. A set of one other than Metal's default
+    /// keeps nothing, and the pass renders without it.
     RenderPass,
     /// Rasterization rate maps, their descriptors and layers: rt has none. A layer's creation
     /// answers nil, and a descriptor keeps no layer.
@@ -172,7 +172,7 @@ impl Unbuilt {
             Unbuilt::Protection => "a command buffer's protection options",
             Unbuilt::FillTexture => "a fill of a texture with bytes",
             Unbuilt::Blit => "a colour fill, a pattern fill or a copy with blit options",
-            Unbuilt::RenderPass => "a render pass's layers, tiles or samples",
+            Unbuilt::RenderPass => "a render pass's memory lengths, tiles or samples",
             Unbuilt::RateMap => "a rasterization rate map",
             Unbuilt::Icb => "an indirect command buffer",
             Unbuilt::DynamicLibrary => "a dynamic library",

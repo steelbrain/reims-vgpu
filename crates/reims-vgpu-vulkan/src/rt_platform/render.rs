@@ -1442,6 +1442,109 @@ mod tests {
         assert_eq!(counted(unbuilt), before.2);
     }
 
+    /// A pass of a render target array length of 2 from slice 0 of a 2D array texture of 2
+    /// slices clears and stores both slices, and a draw whose vertex function writes no
+    /// `[[render_target_array_index]]` renders into slice 0 alone. The length is counted nowhere.
+    /// A length of 2 from the texture's last slice, which leaves the pass no second slice, is
+    /// Metal's refusal: nil, counted.
+    #[test]
+    fn a_layered_pass_renders_each_slice_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let done = CommandBufferStatus::COMPLETED;
+        let (metal, unbuilt) = (RtRefusal::Refused.code(), Unbuilt::RenderPass.code());
+        let before = (counted(metal), counted(unbuilt));
+        // `MTLTextureType2DArray` of 2 slices, `RGBA8Unorm`, shader read and render target usage.
+        let target = device.new_texture(
+            on,
+            &platform.texture_descriptor(&TextureDesc {
+                texture_type: 3,
+                array_length: 2,
+                width: 4,
+                height: 4,
+                usage: 5,
+                ..TextureDesc::default()
+            }),
+        );
+        let target = target.expect("never a raise").expect("a render target");
+        let texels = |slice: u32| {
+            let mut texels = [0u8; 64];
+            let region = rt::Region {
+                origin: [0; 3],
+                size: [4, 4, 1],
+            };
+            let read = target.rt().get_bytes(&mut texels, 16, 64, region, 0, slice);
+            read.expect("the slice's texels");
+            texels
+        };
+        let every = |texel: [u8; 4]| -> [u8; 64] { std::array::from_fn(|i| texel[i % 4]) };
+        let (red, green, blue) = ([255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]);
+        // A pass of `slice` of the target as colour attachment 0, cleared to `clear` and stored,
+        // of render target array length `layers`.
+        let layered = |slice: u64, clear: ClearColor, layers: u64| {
+            let pass = RtObj::new(PassFields::default());
+            let set = ColorAttachmentSet {
+                texture: Some(Some(&target)),
+                slice: Some(slice),
+                load_action: Some(2),
+                store_action: Some(1),
+                clear_color: Some(clear),
+                ..ColorAttachmentSet::default()
+            };
+            assert_eq!(pass.set_color_attachment(on, 0, &set), Ok(()));
+            pass.set_pass(&PassSet {
+                render_target_array_length: Some(layers),
+                ..PassSet::default()
+            });
+            pass
+        };
+        let opaque = |red, green, blue| ClearColor {
+            red,
+            green,
+            blue,
+            alpha: 1.0,
+        };
+
+        // Slice 1 alone, cleared blue.
+        assert_eq!(run(&made(), &layered(1, opaque(0.0, 0.0, 1.0), 0), Vec::new()), done);
+        assert_eq!(texels(1), every(blue));
+
+        // Both slices from slice 0, cleared red, and a green triangle into slice 0.
+        let state = vdesc_state(&device, &function(&device, COLOR, "render_color"));
+        let buffer = triangle(&device);
+        let draw = vec![
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::SetVertexBuffer {
+                buffer: Some(&buffer),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: TRIANGLE,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+        ];
+        assert_eq!(run(&made(), &layered(0, opaque(1.0, 0.0, 0.0), 2), draw), done);
+        assert_eq!(texels(0), every(green));
+        assert_eq!(texels(1), every(red));
+        assert_eq!(counted(unbuilt), before.1);
+
+        // Two slices from slice 1, the last.
+        assert_eq!(counted(metal), before.0);
+        let refused = made().render_encoder(on, &layered(1, opaque(1.0, 0.0, 0.0), 2));
+        assert!(matches!(refused, Ok(None)));
+        assert_eq!(counted(metal), before.0 + 1);
+    }
+
     /// A pass whose colour attachment, a 4-sample texture, resolves into its resolve texture
     /// leaves the cleared colour there, as Metal's resolve does; one that resolves with no
     /// resolve texture is Metal's refusal, nil and counted.

@@ -11,14 +11,18 @@
 //!   which its reads answer, and its clear value; its resolve texture, held so too, its resolve
 //!   level, slice and depth plane, and a depth or stencil attachment's resolve filter as Metal's
 //!   raw value, by which rt's pass resolves where a store action resolves (rt's docs); the render
-//!   target's width and height; and the visibility result buffer, held as Metal's descriptor
-//!   retains it. rt's command buffer keeps that buffer until it retires, and its bytes stay as
-//!   they were: rt's pass writes no result, and a visibility result mode but `Disabled` is unbuilt
-//!   at the encoder (`super::render`). A render encoder's creation turns them into rt's
+//!   target's width and height; the render target array length, by which rt's pass renders, at 2
+//!   or more, that many slices of each attachment and resolve texture from its own slice, loading,
+//!   storing and resolving each (rt's docs); and the visibility result buffer, held as Metal's
+//!   descriptor retains it. rt's command buffer keeps that buffer until it retires, and its bytes
+//!   stay as they were: rt's pass writes no result, and a visibility result mode but `Disabled` is
+//!   unbuilt at the encoder (`super::render`). A render encoder's creation turns them into rt's
 //!   descriptor ([`PassFields::rt_pass`]): an action or resolve filter Metal has none of, or a
 //!   level, slice or plane past 32 bits, is Metal's refusal there, as Metal asserts at the
-//!   encoder's creation, and a width or height past 32 bits renders the attachments' area, as
-//!   Metal's does. A colour attachment past the eighth raises at its subscript, as Metal's does.
+//!   encoder's creation; a width or height past 32 bits renders the attachments' area, as Metal's
+//!   does; and an array length past 32 bits is past every device's layers, which rt refuses as it
+//!   refuses any other past them, as it refuses an attachment with fewer slices from its own than
+//!   the length. A colour attachment past the eighth raises at its subscript, as Metal's does.
 //!   - **Kept nowhere, changing nothing rt renders**: a depth plane (rt renders into no 3D
 //!     texture); store action options (rt builds none); `defaultRasterSampleCount` (rt renders no
 //!     pass without an attachment); `defaultColorSampleCount` (SPI); and `visibilityResultType`,
@@ -26,9 +30,9 @@
 //!     buffer's bytes as they were under either type where its encoder enables no mode (rt's
 //!     docs: an Apple M3 Max, macOS 27.0.1).
 //!   - **Unbuilt** ([`Unbuilt::RenderPass`]), counted at a set of other than Metal's default, and
-//!     kept nowhere, so the pass renders without them: a render target array length past 1, an
-//!     imageblock sample length, a threadgroup memory length, a tile width or height, and sample
-//!     positions. No rasterization rate map is ever made to set.
+//!     kept nowhere, so the pass renders without them: an imageblock sample length, a threadgroup
+//!     memory length, a tile width or height, and sample positions. No rasterization rate map is
+//!     ever made to set.
 //! - **The rate map descriptor** is unbuilt ([`Unbuilt::RateMap`]): rt has no rate maps.
 
 use crate::core::platform::descriptor::{RenderPassDescriptor, TextureDescriptor};
@@ -374,6 +378,7 @@ struct Pass {
     clear_stencil: u32,
     render_target_width: u64,
     render_target_height: u64,
+    render_target_array_length: u64,
     default_raster_sample_count: u64,
     visibility_result_buffer: Option<RtObj<RtBuffer>>,
 }
@@ -381,8 +386,8 @@ struct Pass {
 impl Default for Pass {
     /// Metal's: colour attachments of `DontCare` loads and `Store` stores, cleared to opaque
     /// black; depth and stencil of `Clear` loads and `DontCare` stores, cleared to 1 and 0; no
-    /// texture, level and slice 0; no render target size, a default raster sample count of 0 and
-    /// no visibility result buffer.
+    /// texture, level and slice 0; no render target size, a render target array length and a
+    /// default raster sample count of 0, and no visibility result buffer.
     fn default() -> Pass {
         let black = ClearColor {
             alpha: 1.0,
@@ -397,6 +402,7 @@ impl Default for Pass {
             clear_stencil: 0,
             render_target_width: 0,
             render_target_height: 0,
+            render_target_array_length: 0,
             default_raster_sample_count: 0,
             visibility_result_buffer: None,
         }
@@ -475,6 +481,9 @@ impl PassFields {
         // A size past 32 bits renders the area a size of the most 32 bits do: the attachments'.
         out.render_target_width = u32::try_from(pass.render_target_width).unwrap_or(u32::MAX);
         out.render_target_height = u32::try_from(pass.render_target_height).unwrap_or(u32::MAX);
+        // A length past 32 bits is past every device's layers, which rt refuses as any other.
+        let layers = pass.render_target_array_length;
+        out.render_target_array_length = u32::try_from(layers).unwrap_or(u32::MAX);
         // A count past 32 bits is no count Metal takes; rt refuses it as it refuses any other.
         let samples = pass.default_raster_sample_count;
         out.default_raster_sample_count = u32::try_from(samples).unwrap_or(u32::MAX);
@@ -569,16 +578,12 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         recorded_answer
     }
 
-    /// The render target's width and height, the default raster sample count and the visibility
-    /// result buffer; the rest as the module's docs say.
+    /// The render target's width, height and array length, the default raster sample count and
+    /// the visibility result buffer; the rest as the module's docs say.
     fn set_pass(&self, set: &PassSet<'_, RtPlatform>) {
         let recorded_call = crate::recorder::rec_call!("m2v.setPass", self, set);
         crate::recorder::run(|| {
             let unbuilt = [
-                (
-                    set.render_target_array_length.is_some_and(|n| n > 1),
-                    "setRenderTargetArrayLength:",
-                ),
                 (
                     set.imageblock_sample_length.is_some_and(|n| n != 0),
                     "setImageblockSampleLength:",
@@ -599,6 +604,9 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
             }
             if let Some(height) = set.render_target_height {
                 pass.render_target_height = height;
+            }
+            if let Some(layers) = set.render_target_array_length {
+                pass.render_target_array_length = layers;
             }
             if let Some(samples) = set.default_raster_sample_count {
                 pass.default_raster_sample_count = samples;
@@ -1208,7 +1216,8 @@ mod tests {
         let read = pass.color_attachment_state(u64::MAX).err();
         assert_eq!(read.map(|r| r.origin()), Some(Origin::Platform(SUBSCRIPT)));
 
-        // What rt has no field of: counted where it is other than Metal's default.
+        // What rt has no field of: counted where it is other than Metal's default. The render
+        // target array length is rt's, kept as set and counted nowhere.
         let code = Unbuilt::RenderPass.code();
         let before = counted(code);
         pass.set_pass(&PassSet {
@@ -1219,6 +1228,14 @@ mod tests {
         });
         assert_eq!(pass.set_sample_positions(&[]), Ok(()));
         assert_eq!(counted(code), before);
+        let layers = |p: &RtObj<PassFields>| p.rt_pass().map(|d| d.render_target_array_length);
+        let fresh = RtObj::new(PassFields::default());
+        assert_eq!(layers(&fresh), Ok(0));
+        fresh.set_pass(&PassSet {
+            render_target_array_length: Some(1 << 32),
+            ..PassSet::default()
+        });
+        assert_eq!(layers(&fresh), Ok(u32::MAX));
         pass.set_pass(&PassSet {
             render_target_array_length: Some(2),
             imageblock_sample_length: Some(32),
@@ -1229,6 +1246,6 @@ mod tests {
         });
         let positions = [MtlSamplePosition { x: 0.5, y: 0.5 }];
         assert_eq!(pass.set_sample_positions(&positions), Ok(()));
-        assert_eq!(counted(code), before + 6);
+        assert_eq!(counted(code), before + 5);
     }
 }

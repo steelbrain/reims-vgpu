@@ -60,7 +60,7 @@ many times. The pieces, by code:
 | `rt-unbuilt-protection` | protection options other than 0: the command buffer runs as one with none |
 | `rt-unbuilt-fill-texture` | `fillTexture:level:slice:region:bytes:length:`: nothing encoded |
 | `rt-unbuilt-blit` | a texture fill with a colour, a buffer fill with a 4-byte pattern of more than one byte value, and copies with blit options: nothing encoded |
-| `rt-unbuilt-render-pass` | layered rendering, imageblock and threadgroup memory lengths, tile sizes and sample positions of a render pass: the pass renders without them |
+| `rt-unbuilt-render-pass` | imageblock and threadgroup memory lengths, tile sizes and sample positions of a render pass: the pass renders without them |
 | `rt-unbuilt-rate-map` | rasterization rate maps: a layer's creation answers nil. The device answers no layer count on rt and offers no `RATE_MAPS` (`rt_platform::answers`, `device_info::makes_rate_maps`), so a guest's map is nil in the guest and reaches no create |
 | `rt-unbuilt-icb` | indirect command buffers, and the reservation of their resource indices: nil |
 | `rt-unbuilt-dynamic-library` | dynamic libraries (`newDynamicLibrary:error:`): nil |
