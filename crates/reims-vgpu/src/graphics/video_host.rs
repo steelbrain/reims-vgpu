@@ -15,8 +15,9 @@
 //! - **Landing.** The picture the decoder answers goes to the session's landing thread
 //!   (`reims-vgpu.graphics-video-land`). It lands the pictures in decode order, each in its own
 //!   decode's output, and signals each decode's value once its picture is there. A decode that
-//!   answers no picture (one the stream's random access skips) is signalled in its turn, and its
-//!   output keeps its bytes. Each plane of an output lies in one of two places:
+//!   answers no picture (one the stream's random access skips, or one of the stream's pictures
+//!   that does not decode: below) is signalled in its turn, and its output keeps its bytes. Each
+//!   plane of an output lies in one of two places:
 //!   - **The surface's pages**, the host bytes of the plane's buffer ([`OutputPlane::host`]).
 //!     The backend's hardware writes them, or the CPU does ([`Landing::copy_rows`]).
 //!   - **The surface's device cache** ([`VideoPlane::cached`]), the runtime's buffer in the GPU's
@@ -40,6 +41,19 @@
 //!   pictures unlanded than the decoder spares ([`HostDecoder::most_unlanded`]): a decode past
 //!   them waits, once its picture is decoded, for the oldest to land. The landing waits only
 //!   for the hardware, so the wait ends.
+//! - **A picture of the stream that does not decode** is answered with no picture
+//!   ([`picture_error`]), its command buffer completing as any other: one whose bytes do not
+//!   read as its standard reads them, one that predicts from a picture the decoder does not
+//!   hold (as a stream's first pictures do where it starts at a P picture), and one after a
+//!   picture that did not decode, before the decoding starts afresh at an I (H.264) or IRAP
+//!   (HEVC) picture: the codec crate's `is_picture_error`. The session goes on, and decodes
+//!   again from that picture. A Mac's hardware decoders answer such a picture alone and go on
+//!   (measured with VideoToolbox on a UHD 630, macOS 26.7.1): H.264's with no error, and for
+//!   most of them an image it conceals; HEVC's with `kVTVideoDecoderBadDataErr` or
+//!   `kVTVideoDecoderReferenceMissingErr` and no image. The output's earlier bytes, which the
+//!   guest's decoder hands on here, are the device's own, not Apple's concealment. What is no
+//!   picture's (a stream the decoder does not take, an `avcC` or `hvcC` record's error) and
+//!   the hardware's or the host API's errors fault the command buffer.
 //! - **The event** is a shared event, as the host signals it: the runtime holds a command
 //!   buffer's wait for it on the host until the value is reached.
 //! - **An end** ([`Drop`]) closes the landing thread's queue and waits up to [`TEARDOWN_WAIT`]
@@ -116,7 +130,9 @@ pub(crate) trait HostDecoder<P: Platform>: Send + 'static {
     /// Starts the decode of the access unit `au`, NAL units in Annex-B form, after the parameter
     /// sets the session handed it, and answers its picture, which the session lands in the
     /// decode's output; `None` for a picture the stream's random access skips (a RASL picture
-    /// after a CRA picture at the stream's start), whose output gets nothing.
+    /// after a CRA picture at the stream's start), and for one of the stream's pictures that does
+    /// not decode ([`picture_error`]), whose output gets nothing. An error faults the command
+    /// buffer.
     ///
     /// `au` lies in the guest's bitstream buffer, in place. Its bytes stay mapped and as they are
     /// until the picture answered has landed ([`HostPicture::land`] returned), or, where none is
@@ -785,6 +801,21 @@ fn access_unit<'a, P: Platform>(decode: &VideoDecode<'a, P>) -> RaiseResult<&'a 
 /// A command-buffer fault for a decode the session could not take.
 fn decode_fault(what: impl std::fmt::Display) -> Raise {
     op_fault(format_args!("a video decode: {what}"))
+}
+
+/// A backend's answer to a decode whose access unit is a picture of the stream that does not
+/// decode, `error` (the module docs, "A picture of the stream that does not decode"): no picture.
+/// The process's first of each kind of error is logged at `info` (`kind`), and the rest counted.
+pub(crate) fn picture_error<P: Platform>(
+    name: &str,
+    error: impl std::fmt::Display,
+) -> Option<Box<dyn HostPicture<P>>> {
+    log::info!(
+        kind:% = error;
+        "hardware video: {name}: a picture of the stream that does not decode lands nothing, its \
+         output keeping its bytes: {error}"
+    );
+    None
 }
 
 /// One decode's work for the landing thread: its picture, its output and its bitstream's buffer,

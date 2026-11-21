@@ -1010,6 +1010,59 @@ fn a_picture_the_hardware_failed_fails_each_after_it_until_an_irap_picture() -> 
     Ok(())
 }
 
+/// A stream that starts at a P picture, as a session started or a seek at one: each picture
+/// before an IRAP picture is refused with one picture's error ([`Error::is_picture_error`]), and
+/// the decoder decodes from the IRAP picture on, as a Mac's hardware decoder answers each such
+/// picture alone and decodes on.
+#[test]
+fn a_stream_started_at_a_p_picture_answers_picture_errors_until_an_irap_picture()
+-> Result<(), Error> {
+    let spec = SpsSpec {
+        sets: gop_sets(),
+        ..SpsSpec::default()
+    };
+    let p = |lsb| sample(&[picture(&spec, nal_type::TRAIL_R, 1, lsb, 0)]);
+    let mut d = decoder();
+    assert!(d.decode(&sample(&[sps(&spec), pps(&PpsSpec::default())]), 0)?.is_empty());
+    for (id, lsb) in [(1, 4), (2, 8), (3, 12)] {
+        let error = d.decode(&p(lsb), id).err().expect("a P picture with no reference is refused");
+        assert!(error.is_picture_error(), "{error:?}");
+    }
+    let mut units = vec![sps(&spec), pps(&PpsSpec::default())];
+    units.push(picture(&spec, nal_type::IDR_W_RADL, 2, 0, 0));
+    assert_eq!(d.decode(&sample(&units), 4)?.len(), 1);
+    assert_eq!(d.decode(&p(4), 5)?.len(), 1);
+    Ok(())
+}
+
+/// One picture's errors are a picture's of the stream: its data, its references, those after one
+/// that did not decode, and a leading picture the random access skips. What the decoder does not
+/// take and an `hvcC` record's errors are no picture's.
+#[test]
+fn what_is_one_picture_s_error() {
+    for error in [
+        Error::Truncated,
+        Error::OutOfRange("slice_type"),
+        Error::BadLengthPrefix,
+        Error::MissingPps(0),
+        Error::MissingReference,
+        Error::Unrecovered,
+        Error::SkippedLeadingPicture,
+        Error::SpsChangedAtNonIrap,
+        Error::BadReferenceList,
+    ] {
+        assert!(error.is_picture_error(), "{error:?}");
+    }
+    for error in [
+        Error::Unsupported("palette mode"),
+        Error::HvccTruncated,
+        Error::HvccVersion,
+        Error::HvccArrayPastEnd,
+    ] {
+        assert!(!error.is_picture_error(), "{error:?}");
+    }
+}
+
 #[test]
 fn a_cra_picture_that_ends_a_failure_the_hardware_reported_skips_its_rasl_pictures()
 -> Result<(), Error> {

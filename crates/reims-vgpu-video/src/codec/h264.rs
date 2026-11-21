@@ -128,4 +128,26 @@ impl std::fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// Whether the error is one picture's of the stream, after which the
+    /// decoder goes on: the picture's bytes do not decode as the standard
+    /// reads them, or it predicts from a frame the decoder does not hold
+    /// ([`Self::MissingReference`], [`Self::Unrecovered`]). The decoder
+    /// takes the next sample as it would any, decoding again from the next
+    /// I picture ([`Decoder::decode`]), as a Mac's hardware decoder answers
+    /// such a picture alone and decodes on. Not one picture's: what this
+    /// decoder does not take ([`Self::Unsupported`], [`Self::Interlaced`]),
+    /// and an `avcC` record's errors, which are no picture's.
+    pub fn is_picture_error(&self) -> bool {
+        !matches!(
+            self,
+            Self::Unsupported(_)
+                | Self::Interlaced
+                | Self::AvccTruncated
+                | Self::AvccVersion
+                | Self::AvccParameterSetPastEnd
+        )
+    }
+}
+
 impl std::error::Error for Error {}

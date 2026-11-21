@@ -94,7 +94,7 @@ use super::decode::{
 };
 use super::video_host::{
     BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostVideoSession,
-    Landing, OutputPlane, SourcePlane,
+    Landing, OutputPlane, SourcePlane, picture_error,
 };
 
 mod encode;
@@ -532,7 +532,11 @@ impl<P: Platform> HostDecoder<P> for NvdecDecoder<P> {
         au: &[u8],
         _output: &DecodeOutput<P>,
     ) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError> {
-        let picture = self.decoder.decode(au)?;
+        let picture = match self.decoder.decode(au) {
+            Ok(picture) => picture,
+            Err(error) if error.is_picture_error() => return Ok(picture_error(NAME, error)),
+            Err(error) => return Err(error.into()),
+        };
         Ok(picture.map(|picture| {
             Box::new(NvdecPicture {
                 picture,
@@ -941,7 +945,9 @@ fn copy_planes(
 fn video_error(error: reims_vgpu_video::nvidia::Error) -> VideoError {
     use reims_vgpu_video::nvidia::Error;
     match error {
-        Error::Bitstream(_) | Error::DecodeFailed(_) => VideoError::BadData(error.to_string()),
+        Error::Bitstream(_) | Error::Picture(_) | Error::DecodeFailed(_) => {
+            VideoError::BadData(error.to_string())
+        }
         Error::Unsupported(why) => VideoError::Unsupported(why),
         Error::SkippedLeadingPicture(why) => VideoError::SkippedLeadingPicture(why),
         error => VideoError::Malfunction(error.to_string()),

@@ -165,6 +165,26 @@ impl std::fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// Whether the error is one picture's of the stream, after which the
+    /// decoder goes on: the picture's bytes do not decode as the standard
+    /// reads them, it predicts from a picture the decoder does not hold
+    /// ([`Self::MissingReference`], [`Self::Unrecovered`]), or it is a
+    /// leading picture the stream's random access skips
+    /// ([`Self::SkippedLeadingPicture`]). The decoder takes the next sample
+    /// as it would any, decoding again from the next IRAP picture
+    /// ([`Decoder::decode`]), as a Mac's hardware decoder answers such a
+    /// picture alone and decodes on. Not one picture's: what this decoder
+    /// does not take ([`Self::Unsupported`]), and an `hvcC` record's
+    /// errors, which are no picture's.
+    pub fn is_picture_error(&self) -> bool {
+        !matches!(
+            self,
+            Self::Unsupported(_) | Self::HvccTruncated | Self::HvccVersion | Self::HvccArrayPastEnd
+        )
+    }
+}
+
 impl std::error::Error for Error {}
 
 /// The NAL framing H.264 and HEVC share refuses a sample so.

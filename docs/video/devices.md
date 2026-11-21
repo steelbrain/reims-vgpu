@@ -183,8 +183,22 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   as any, and the pictures after it decode from it, as a Mac's hardware decoder hands such a
   picture on with no error ([nvidia.md](nvidia.md), "An H.264 picture NVDEC failed lands as
   NVDEC left it").
-- **A picture the stream's random access skips** lands nothing, and its command buffer
-  completes as any other.
+- **A picture the stream's random access skips, or one of the stream's that does not decode,**
+  lands nothing, and its command buffer completes as any other, its output keeping its bytes.
+  One that does not decode is one whose bytes do not read as its standard reads them, one that
+  predicts from a picture the decoder does not hold (a stream's first pictures, where it starts
+  at a P picture), or one after a picture that did not decode, before the next I (H.264) or IRAP
+  (HEVC) picture, from which the session decodes again (reims-vgpu's `graphics/video_host.rs`,
+  "A picture of the stream that does not decode"). A Mac's hardware decoders answer such a
+  picture alone and decode on too, H.264's with no error and HEVC's with
+  `kVTVideoDecoderBadDataErr` or `kVTVideoDecoderReferenceMissingErr` and no image (**measured**
+  with VideoToolbox on a MacBook Pro of 2019, macOS 26.7.1, 2026-11-20). In the guest, AppleGVA
+  hands the device every H.264 picture, and the client gets each such one with no error and the
+  output's earlier bytes; it answers an HEVC stream started at a P picture itself, as a Mac
+  does, `kVTVideoDecoderBadDataErr` and no image for each picture until the IRAP picture, and
+  none of them reaches the device (**measured** in the guest on a Radeon 780M, 2026-11-20).
+  A stream the decoder does not take, an `avcC` or `hvcC` record's error, and the hardware's or
+  the host API's errors still fault the command buffer.
 
 ## An encode
 

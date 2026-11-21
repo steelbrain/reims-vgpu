@@ -135,7 +135,7 @@ use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
 
 use super::video_host::{
     BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
-    HostVideoSession, Landing, OutputPlane,
+    HostVideoSession, Landing, OutputPlane, picture_error,
 };
 
 mod encode;
@@ -1151,14 +1151,13 @@ impl<P: Platform> VaDecoder<P> {
         &mut self,
         au: &[u8],
         target_for: Option<TargetFor>,
-    ) -> Result<Vec<Frame>, BackendError> {
+    ) -> Result<Vec<Frame>, reims_vgpu_video::vaapi::Error> {
         let id = self.next_id;
         self.next_id += 1;
-        let frames = match &mut self.codec {
+        match &mut self.codec {
             Codec::H264(decoder) => decoder.decode_into(au, id, target_for),
             Codec::Hevc(decoder) => decoder.decode_into(au, id, target_for),
-        };
-        Ok(frames?)
+        }
     }
 }
 
@@ -1181,7 +1180,11 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
         };
         let target_for = (self.targets.as_ref())
             .and_then(|targets| targets.target_for(codec, output, &self.said, &self.roles));
-        let mut frames = self.frames(au, target_for)?;
+        let mut frames = match self.frames(au, target_for) {
+            Ok(frames) => frames,
+            Err(error) if error.is_picture_error() => return Ok(picture_error(NAME, error)),
+            Err(error) => return Err(error.into()),
+        };
         let frame = match (frames.pop(), frames.len()) {
             (None, _) => return Ok(None),
             (Some(frame), 0) => frame,

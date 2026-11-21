@@ -1305,3 +1305,52 @@ fn a_gap_the_sps_allows_is_not_concealed() -> Result<(), Error> {
     assert!(d.accelerator().concealed.is_empty());
     Ok(())
 }
+
+/// A stream that starts at a P picture, as a session started or a seek at one: each picture
+/// before an I picture is refused with one picture's error ([`Error::is_picture_error`]), and the
+/// decoder decodes from the I picture on, as a Mac's hardware decoder answers each such picture
+/// alone and decodes on.
+#[test]
+fn a_stream_started_at_a_p_picture_answers_picture_errors_until_an_i_picture() -> Result<(), Error>
+{
+    let spec = SpsSpec::default();
+    let mut d = decoder(OutputOrder::Decode);
+    assert!(d.decode(&sample(&[sps(&spec), pps(false)]), 0)?.is_empty());
+    for n in 1..4 {
+        let refused = d.decode(&sample(&[slice(&p(n, 2 * n), &spec)]), u64::from(n));
+        let error = refused.err().expect("a P picture with no reference is refused");
+        assert!(error.is_picture_error(), "{error:?}");
+    }
+    let units = [sps(&spec), pps(false), slice(&idr(), &spec)];
+    assert_eq!(d.decode(&sample(&units), 4)?.len(), 1);
+    assert_eq!(d.decode(&sample(&[slice(&p(1, 2), &spec)]), 5)?.len(), 1);
+    Ok(())
+}
+
+/// One picture's errors are a picture's of the stream: its data, its references, and those after
+/// one that did not decode. What the decoder does not take and an `avcC` record's errors are no
+/// picture's.
+#[test]
+fn what_is_one_picture_s_error() {
+    for error in [
+        Error::Truncated,
+        Error::OutOfRange("slice_type"),
+        Error::BadLengthPrefix,
+        Error::MissingPps(0),
+        Error::MissingReference,
+        Error::Unrecovered,
+        Error::TooManyReferences,
+        Error::ReferenceOutsideDpb,
+    ] {
+        assert!(error.is_picture_error(), "{error:?}");
+    }
+    for error in [
+        Error::Unsupported("data partitioning"),
+        Error::Interlaced,
+        Error::AvccTruncated,
+        Error::AvccVersion,
+        Error::AvccParameterSetPastEnd,
+    ] {
+        assert!(!error.is_picture_error(), "{error:?}");
+    }
+}

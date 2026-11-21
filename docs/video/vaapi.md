@@ -839,8 +839,11 @@ Redundant pictures are dropped.
 
 `H264Decoder::new` also checks the `avcC` record's first SPS, and the
 driver's profiles and sizes, so that a session the driver cannot serve
-fails when it is made. Through the graphics device, every refusal fails
-the decode's command buffer ([devices.md](devices.md), "A decode").
+fails when it is made. Through the graphics device, a refusal of one
+picture of the stream (`Error::is_picture_error`: its data, its references,
+and those after one that did not decode) lands nothing, its command buffer
+completing as any, and every other refusal fails the decode's command
+buffer ([devices.md](devices.md), "A decode").
 
 A P or B slice is refused with `MissingReference` when it has nothing to
 predict from: after starting or `reset()` at a non-I picture, or when its

@@ -489,6 +489,30 @@ fn values_are_signalled_in_decode_order_once_landed() {
     assert_eq!(s.counts.lock().landed, [2, 0, 0, 0, 0, 0]);
 }
 
+/// A picture of the stream that does not decode ([`picture_error`]) lands nothing: its value is
+/// signalled in its turn, its command buffer completes as any, and its output keeps its bytes.
+#[test]
+fn a_picture_of_the_stream_that_does_not_decode_lands_nothing_and_completes() {
+    assert!(picture_error::<P>("test", "a reference frame is missing").is_none());
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let s = session(&p, vec![Ok(None)], &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let (first, second) = (
+        buffer(&p, 16384, STORAGE_SHARED),
+        buffer(&p, 16384, STORAGE_SHARED),
+    );
+    let none = s.decode(&decode(&bitstream, &[], planes(&first, &first, 96))).unwrap();
+    assert_eq!(none.value, 1);
+    let next = s.decode(&decode(&bitstream, &[], planes(&second, &second, 96))).unwrap();
+    assert_eq!(next.value, 2);
+    assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
+    assert!(!none.landed.as_deref().is_some_and(Landed::failed));
+    assert!(bytes(&first).iter().all(|&x| x == UNTOUCHED));
+    assert!(holds(&bytes(&second), 0, 64, 96, 2));
+    assert_eq!(s.counts.lock().skipped, 1);
+}
+
 /// A decode that would have the session hold more pictures unlanded than its decoder spares
 /// waits, once decoded, for the oldest to land.
 #[test]

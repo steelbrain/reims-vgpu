@@ -193,6 +193,62 @@ fn access_units_decode_in_place_and_land_by_the_gpu_as_they_read_back() {
     }
 }
 
+/// An H.264 and an HEVC stream of NVENC's started at a P picture, as a session started or a seek
+/// at one: each picture before the stream's next IDR picture is refused with one picture's error
+/// ([`Error::is_picture_error`]), and the decoder decodes from the IDR picture on, each picture
+/// read back whole.
+#[test]
+#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+fn a_stream_started_at_a_p_picture_answers_picture_errors_until_its_idr_picture() {
+    let gpu = Arc::new(Gpu::open(&GpuSelector::First).expect("an NVIDIA GPU"));
+    let runtime: Arc<dyn Runtime> = Arc::new(GatedRuntime);
+    for (profile, codec) in [
+        (EncodeProfile::H264High, AnnexBCodec::H264),
+        (EncodeProfile::HevcMain, AnnexBCodec::Hevc),
+    ] {
+        let params = EncodeParams {
+            width: 1920,
+            height: 1080,
+            b_frames: 0,
+            ..params(profile)
+        };
+        let mut encoder = NvencEncoder::new(Arc::clone(&gpu), &params).expect("an NVENC session");
+        let mut units = Vec::new();
+        for n in 0..8 {
+            let (luma, chroma, row) = noise(&params, n);
+            let packets = encoder
+                .encode(&RawFrame {
+                    luma: (&luma, row),
+                    chroma: (&chroma, row),
+                    index: n,
+                    force_idr: n == 0 || n == 5,
+                })
+                .expect("a frame NVENC takes");
+            for packet in packets {
+                units.push(packet.expect("a packet").data);
+            }
+        }
+        assert_eq!(units.len(), 8, "{codec:?}");
+        let mut decoder = AnnexBDecoder::new(&gpu, codec, &runtime);
+        decoder
+            .parameter_sets(encoder.sequence_parameters())
+            .expect("the parameter sets");
+        for (n, unit) in units.iter().enumerate().skip(2) {
+            let decoded = decoder.decode(unit);
+            if n < 5 {
+                let error = decoded.err().expect("a P picture with no reference is refused");
+                assert!(error.is_picture_error(), "{codec:?} picture {n}: {error}");
+                continue;
+            }
+            let picture = decoded.expect("a decode").expect("a picture");
+            let read = picture
+                .read_back((1920, 1080))
+                .map(|read| read.planes()[0].rows);
+            assert_eq!(read.ok(), Some(1080), "{codec:?} picture {n}");
+        }
+    }
+}
+
 /// An H.264 P picture whose slice is cut to half, which NVDEC answers failed: read back as NVDEC
 /// left it, telling its status, with the pictures after it decoded, where the decoder copies
 /// failed H.264 pictures; failed, with the next picture refused until an I picture, where it does

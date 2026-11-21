@@ -710,6 +710,10 @@ fn nvidia_errors_reach_videotoolbox_as_their_kind() {
         VideoError::BadData("bad bitstream: a short slice".to_owned())
     );
     assert_eq!(
+        video_error(Error::Picture(said("a reference frame is missing"))),
+        VideoError::BadData("bad bitstream: a reference frame is missing".to_owned())
+    );
+    assert_eq!(
         video_error(Error::DecodeFailed(said("slice data"))),
         VideoError::BadData("slice data".to_owned())
     );

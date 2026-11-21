@@ -82,6 +82,19 @@ impl std::fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// Whether the error is one picture's of the stream, after which the decoder goes on (the
+    /// codec crate's `is_picture_error`, H.264's and HEVC's): the rest are the decoder's own or
+    /// the driver's.
+    pub fn is_picture_error(&self) -> bool {
+        match self {
+            Self::Bitstream(e) => e.is_picture_error(),
+            Self::HevcBitstream(e) => e.is_picture_error(),
+            _ => false,
+        }
+    }
+}
+
 impl std::error::Error for Error {}
 
 impl From<crate::codec::h264::Error> for Error {
@@ -550,6 +563,31 @@ mod tests {
 
     /// The child's role in [`an_open_once_the_exit_began_makes_no_call_of_libva`].
     const OPEN_CHILD: &str = "RVG_TEST_DISPLAY_OPEN_CHILD";
+
+    /// One picture's errors are the codec crate's of a picture, H.264's and HEVC's; what the
+    /// decoder does not take, a record's errors and the driver's are not.
+    #[test]
+    fn one_picture_s_errors_are_the_codec_s_of_a_picture() {
+        use crate::codec::{h264, hevc};
+        for error in [
+            Error::Bitstream(h264::Error::MissingReference),
+            Error::Bitstream(h264::Error::Unrecovered),
+            Error::HevcBitstream(hevc::Error::MissingReference),
+            Error::HevcBitstream(hevc::Error::SkippedLeadingPicture),
+        ] {
+            assert!(error.is_picture_error(), "{error}");
+        }
+        for error in [
+            Error::Bitstream(h264::Error::Unsupported("data partitioning")),
+            Error::Bitstream(h264::Error::AvccVersion),
+            Error::HevcBitstream(hevc::Error::HvccVersion),
+            Error::Unsupported("4:2:2".to_owned()),
+            Error::OutOfSurfaces,
+            Error::Stalled("a decode".to_owned()),
+        ] {
+            assert!(!error.is_picture_error(), "{error}");
+        }
+    }
 
     /// An open begun once the process's exit closed the host's gate makes no call of libva's:
     /// its thread parks before it loads libva, where it would otherwise fail at once, no node

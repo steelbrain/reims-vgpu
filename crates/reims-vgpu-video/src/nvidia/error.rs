@@ -39,6 +39,11 @@ pub enum Error {
     TooSmall(String),
     /// The stream is malformed, or uses what our parsers refuse.
     Bitstream(String),
+    /// One picture of the stream does not decode, and the decoder goes on:
+    /// the codec crate's errors that are one picture's
+    /// (`crate::codec::h264::Error::is_picture_error`), such as a picture
+    /// that predicts from one the decoder does not hold.
+    Picture(String),
     /// NVDEC reports a picture's decode failed (`cuvidGetDecodeStatus`):
     /// its slice data is damaged, past what our parsers read. The guest is
     /// told so as of a malformed stream, and an H.264 or HEVC session fails
@@ -75,13 +80,22 @@ impl fmt::Display for Error {
             Self::NoDevice(what) => write!(f, "no NVIDIA GPU {what}"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::TooSmall(what) => write!(f, "too small: {what}"),
-            Self::Bitstream(what) => write!(f, "bad bitstream: {what}"),
+            Self::Bitstream(what) | Self::Picture(what) => write!(f, "bad bitstream: {what}"),
             Self::DecodeFailed(what) => write!(f, "{what}"),
             Self::SkippedLeadingPicture(what) => write!(f, "{what}"),
             Self::OutOfSurfaces => write!(f, "every decode surface is held"),
             Self::Stalled(what) => write!(f, "the GPU did not finish {what}"),
             Self::PlaneTooSmall(plane) => write!(f, "the {plane} plane is too small"),
         }
+    }
+}
+
+impl Error {
+    /// Whether the error is one picture's of the stream, after which the
+    /// decoder goes on ([`Self::Picture`], and a leading picture skipped,
+    /// [`Self::SkippedLeadingPicture`]).
+    pub fn is_picture_error(&self) -> bool {
+        matches!(self, Self::Picture(_) | Self::SkippedLeadingPicture(_))
     }
 }
 
@@ -93,8 +107,8 @@ impl From<LoadError> for Error {
     }
 }
 
-/// A codec crate error: what our parsers refuse is unsupported, the rest a
-/// malformed stream.
+/// A codec crate error: what our parsers refuse is unsupported, one
+/// picture's error a picture's, the rest a malformed stream.
 macro_rules! from_codec {
     ($($codec:ident),*) => {$(
         impl From<crate::codec::$codec::Error> for Error {
@@ -103,6 +117,7 @@ macro_rules! from_codec {
                     crate::codec::$codec::Error::Unsupported(_) => {
                         Self::Unsupported(e.to_string())
                     }
+                    _ if e.is_picture_error() => Self::Picture(e.to_string()),
                     _ => Self::Bitstream(e.to_string()),
                 }
             }
@@ -120,7 +135,50 @@ impl From<crate::codec::hevc::Error> for Error {
         match e {
             Hevc::Unsupported(_) => Self::Unsupported(e.to_string()),
             Hevc::SkippedLeadingPicture => Self::SkippedLeadingPicture(e.to_string()),
+            _ if e.is_picture_error() => Self::Picture(e.to_string()),
             _ => Self::Bitstream(e.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{h264, hevc};
+
+    /// A codec error that is one picture's is a picture's, what the parsers refuse unsupported,
+    /// a RASL picture skipped one apart, and the rest a malformed stream's.
+    #[test]
+    fn codec_errors_are_a_picture_s_unsupported_or_the_stream_s() {
+        let picture = |e: &Error| matches!(e, Error::Picture(_));
+        assert!(picture(&h264::Error::MissingReference.into()));
+        assert!(picture(&h264::Error::Unrecovered.into()));
+        assert!(picture(&hevc::Error::MissingReference.into()));
+        assert!(picture(&hevc::Error::Unrecovered.into()));
+        let unsupported = Error::from(h264::Error::Unsupported("data partitioning"));
+        assert!(matches!(unsupported, Error::Unsupported(_)), "{unsupported}");
+        let skipped = Error::from(hevc::Error::SkippedLeadingPicture);
+        assert!(matches!(skipped, Error::SkippedLeadingPicture(_)), "{skipped}");
+        for error in [
+            Error::from(h264::Error::AvccVersion),
+            Error::from(hevc::Error::HvccVersion),
+        ] {
+            assert!(matches!(error, Error::Bitstream(_)), "{error}");
+        }
+        for error in [
+            Error::from(h264::Error::Truncated),
+            Error::from(hevc::Error::Unrecovered),
+            skipped,
+        ] {
+            assert!(error.is_picture_error(), "{error}");
+        }
+        for error in [
+            Error::from(h264::Error::AvccVersion),
+            unsupported,
+            Error::DecodeFailed("status 8".to_owned()),
+            Error::OutOfSurfaces,
+        ] {
+            assert!(!error.is_picture_error(), "{error}");
         }
     }
 }
