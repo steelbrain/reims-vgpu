@@ -64,6 +64,24 @@ was the driver's allocation. On a Radeon RX 550, an app waited 65 ms, 64.4 ms of
 We measured these before a change to how QEMU handles such a request, and we'll update them once
 we've measured again. The driver's part stays either way. We don't know of a workaround yet.
 
+## A macOS debug kernel may not start on an AMD host
+
+On a Linux host whose CPU has AVX-512 but doesn't lay out its saved registers the way Intel's do,
+such as a Zen 4 Ryzen, `reims-ctl` turns on AVX-512's registers for the threads of a macOS VM's
+apps. Apps still see no AVX-512, but the CPU runs their code faster: on a Ryzen 7 8745H, a CPU
+benchmark's scores went up about 10%. macOS's usual kernels work with this. A DEVELOPMENT or DEBUG
+kernel, from a Kernel Debug Kit, checks at startup that the saved registers take as much room as
+on Intel's CPUs. On these hosts they take less, so the check fails and the kernel stops. We found
+this in the kernel's source and haven't started one this way.
+
+To start such a kernel, turn this off for that VM. In its `vm.toml`
+(`~/.local/share/reims-ctl/vms/NAME/vm.toml` unless you made it elsewhere), add
+`,x-avx512-xstate=off` to the end of `cpu_flags`, under `[q35]`:
+
+```toml
+cpu_flags = "+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check,x-avx512-xstate=off"
+```
+
 ## On a Mac
 
 ### You need macOS 26 or later to run VMs

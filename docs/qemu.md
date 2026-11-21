@@ -1940,6 +1940,83 @@ whose `Cpuid1Data` is `0x00050654`:
 **Unknown**: a boot on Skylake-Client-noTSX-IBRS itself, and a boot behind
 an OpenCore that leaves leaf 1 as it is.
 
+**AVX-512 state on hosts whose layout is not Intel's.** A Zen 4 core runs
+a thread's code from its decoders, its op cache unused, while the thread's
+XCR0 leaves the AVX-512 state components (opmask, ZMM_Hi256 and Hi16_ZMM,
+bits 5 to 7) off. XNU runs every thread at XCR0 0x7 until the thread takes
+a #UD on an EVEX or VEX instruction, its on-demand promotion
+(`osfmk/i386/fpu.c`, read from code), and the model has no AVX-512, so
+all of a guest's code ran without the op cache. Two pieces turn the
+components on, with no AVX-512 for apps:
+- QEMU's `x-avx512-xstate` CPU property (vendor/qemu `c3e40185`) lists
+  components 5 to 7 in CPUID leaf 0xD whatever leaf 7 says. XNU then takes
+  AVX-512 state from leaf 0xD, and its capability bits still say no
+  AVX-512, since they need leaf 7's as well (`commpage.c`, read from code):
+  `hw.optional.avx512f` reads 0.
+- RgfxGate's xstate route (`guest/rgfxgate/src/RgfxGateXstate.cpp`)
+  promotes each user thread to AVX-512 state at its first FP use after a
+  switch (XNU's `fpnoextflt`), and, where leaf 0xD's offsets are not
+  Intel's, copies a thread's own AVX-512 state at the offsets leaf 0xD
+  gives ([lessons.md](lessons.md), "XNU copies AVX-512 state at Intel's
+  offsets"). Another thread's AVX-512 state is refused there with
+  `KERN_FAILURE`. Graft's log (`ioreg -l -w0 -d1 | grep -o 'xstate: [^"]*'`
+  in the guest) has one line for what was installed or why nothing was,
+  and counts promotions at 1, 10, 100 and so on.
+
+`reims-ctl` adds `x-avx512-xstate=on` to `-cpu`, after `vmx=on` and before
+the VM's `cpu_flags`, only where all of these hold (`qemu::avx512_xstate`):
+- the accelerator is KVM;
+- the host's XCR0 has bits 5 to 7, and the host's own leaf 0xD puts
+  components 5 to 7 at offsets other than Intel's 1088, 1152 and 1664
+  (`host::avx512_xstate_offsets`; a Zen 4 core's are 832, 896 and 1408);
+- the VM is on reims-vgpu graphics and its OpenCore image holds this
+  `reims-ctl`'s kexts, since without the route XNU's own promotion copies
+  the state at Intel's offsets;
+- the QEMU it runs lists the property (`-device qemu64-x86_64-cpu,help`),
+  since an install with `--skip-qemu` keeps an older QEMU, which would
+  refuse it.
+
+There is no vendor or model check. Everywhere else (Intel hosts, hosts
+without AVX-512 state, WHPX and the Mac) the command is the same byte for
+byte. `x-avx512-xstate=off` at the end of a VM's `cpu_flags` turns it off
+for that VM, since QEMU applies `name=value` flags in order. A guest on a
+DEVELOPMENT or DEBUG kernel (a KDK's) needs that: such a kernel asserts at
+boot that leaf 0xD's size is Intel's 2688 bytes, and with AMD's layout it
+is 2432 (`fpu.c`, read from code; release kernels compile the assert out
+and size the save area as Intel's, which holds AMD's).
+
+**Measured** on Zen 4 hosts, a Ryzen 7 8745H and a Ryzen 7 7840HS:
+- On the 8745H, the op cache's share of the uops of guest code that never
+  runs AVX-512, without the route and with it: `md5 -t` 0.1% and 99.6%, a
+  perl loop 0.0% and 100%, a static loop 1.7% and 99.5%. Linux on the
+  same host runs every thread with bits 5 to 7 on. On a Core i9-13900H the
+  same loop took 99.0% of its uops from the DSB at XCR0 0x3: Intel's does
+  not depend on XCR0.
+- With the route, on both hosts, on macOS 11.7.11, 12.7.6, 13.7.8, 14.8.9,
+  15.8.2 and 26.7.2 (2026-11-21): every user thread of a 60 s load ran at
+  XCR0 0xe7, `hw.optional.avx512f` read 0, and a thread that runs AVX-512
+  without checking the feature kept zmm0's upper half, zmm16 and k3 across
+  a signal handler, read them right in the signal frame and through
+  `thread_get_state` of itself, with no kernel error lines. Without the
+  copy (only the promotion), k3 was lost and all three read wrong.
+- Timed on the 8745H (2026-11-21), the 26.7.2 guest with 8 vCPUs, each run
+  in a fresh boot that held the whole host, the same build without the
+  property and with it:
+  - Geekbench 7.1.0's CPU benchmark, two runs each: single-core 1814 and
+    1856 without, 2047 and 2024 with (10.9% higher by the means);
+    multi-core 7876 and 7958 without, 8858 and 8491 with (9.6% higher).
+  - Its Metal compute benchmark on an RTX 3090 behind Thunderbolt, one run
+    each: 104,147 without and 103,562 with on the timed pass, 105,611 and
+    106,870 on the warm pass before it. The timed pass's wall time fell
+    6.4% (Particle Physics 20.92 to 14.94 s).
+  - A path-traced render on the CPU (the classroom scene, 64 samples), one
+    run each: 78.77 s without and 77.98 s with, cold; 78.03 s and 77.68 s
+    warm.
+
+**Unknown**: the gain on Zen 5 and on Intel hosts with AVX-512, where the
+property applies the same way (their layout decides, not their op cache);
+WHPX on a Zen 4 host, which builds leaf 0xD itself, and is left out.
+
 ### x86-64 macOS guests: VMX
 
 `reims-ctl` adds `vmx=on` to `-cpu` where the host's KVM offers VMX to guests:
