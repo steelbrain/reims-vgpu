@@ -21,12 +21,18 @@
 //            indexed draw into an indirect command buffer (or resets its command), which the
 //            scene pass executes; the commands inherit the pipeline, and the encoder's buffers
 //            unless -b, and sample only through the material's argument buffer (icb_fs).
+//            Off: none of the pass's objects is made: no pipeline with supportIndirectCommandBuffers,
+//            no encode kernel's pipeline, no ICB and no argument buffer.
 //   cicb     a GPU-driven compute pass: a kernel encodes CICB_COMMANDS concurrent dispatches into
 //            a compute indirect command buffer (every fifth reset), and a later compute encoder
 //            sets the pipeline and its buffers at non-zero offsets and executes it; the commands
 //            inherit the pipeline, and the encoder's buffers unless -b. The dispatches sum their
 //            input into a word, which the CPU checks against its own sum as the frame slot comes
 //            back: a wrong sum is counted, and the run exits 1 (see cicb_bad).
+//            Off: none of the pass's objects is made: no encode kernel's pipeline, no pipeline with
+//            supportIndirectCommandBuffers, no compute ICB, no argument buffer, input or sums.
+//            With icb and cicb both off, the run makes no indirect command buffer and no pipeline
+//            for one.
 //   draws    DRAWS CPU-encoded indexed draws in the scene pass (8 pipeline changes over 4
 //            function-constant variants, each draw its own object-buffer offset and material
 //            argument-buffer offset) and DRAWS/4 in a 2048 x 2048 Depth32Float shadow pass.
@@ -64,7 +70,8 @@
 //     -b        the ICBs inherit no buffers: their kernels set each drawn command's vertex and
 //               fragment buffers (icb_encode_bound) and each dispatch's kernel buffers
 //               (cicb_encode_bound); by default they inherit the encoder's.
-//     --off     the shapes to leave out (above); --private, the buffers to make Private (above).
+//     --off     the shapes to leave out (above; icb and cicb off also make none of their
+//               objects); --private, the buffers to make Private (above).
 //               Both may be given more than once.
 //     -q        no per-frame lines.
 //     -l        lists the devices and exits.
@@ -423,7 +430,7 @@ int main(int argc, char **argv)
 		const NSUInteger samples = on[S_TARGETS] ? 4 : 1;
 		const MTLPixelFormat depth_fmt = on[S_TARGETS] ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
 		id<MTLFunction> scene_vs = [lib newFunctionWithName:@"scene_vs"];
-		id<MTLRenderPipelineState> scene_pso[VARIANTS], icb_pso;
+		id<MTLRenderPipelineState> scene_pso[VARIANTS], icb_pso = nil;
 		id<MTLFunction> scene_fs0 = nil;
 		for (int v = 0; v < VARIANTS; v++) {
 			MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
@@ -443,7 +450,7 @@ int main(int argc, char **argv)
 			scene_pso[v] = [D newRenderPipelineStateWithDescriptor:p error:&err];
 			if (!scene_pso[v])
 				die("a scene pipeline", err);
-			if (v == 0) {
+			if (v == 0 && on[S_ICB]) {
 				p.supportIndirectCommandBuffers = YES;
 				p.fragmentFunction = [lib newFunctionWithName:@"icb_fs"];
 				icb_pso = [D newRenderPipelineStateWithDescriptor:p error:&err];
@@ -478,11 +485,12 @@ int main(int argc, char **argv)
 		id<MTLRenderPipelineState> composite_pso = [D newRenderPipelineStateWithDescriptor:cp error:&err];
 		if (!composite_pso)
 			die("the composite pipeline", err);
-		id<MTLComputePipelineState> cps[6];
+		// The ICB pass's encode kernel first (its pipeline made only with icb on), then post's.
+		id<MTLComputePipelineState> cps[6] = {nil};
 		const char *kernels[6] = {icb_bound ? "icb_encode_bound" : "icb_encode", "hist_clear", "luminance", "bloom_down",
 		                          "bloom_up", "tonemap"};
 		id<MTLFunction> icb_fn = nil;
-		for (int k = 0; k < 6; k++) {
+		for (int k = on[S_ICB] ? 0 : 1; k < 6; k++) {
 			id<MTLFunction> f = [lib newFunctionWithName:@(kernels[k])];
 			if (k == 0)
 				icb_fn = f;
@@ -495,18 +503,21 @@ int main(int argc, char **argv)
 		// The histogram's threadgroups: 16 x 16, or 8 x 8 where the kernel takes fewer (its 64 bins
 		// need 64 threads).
 		const NSUInteger lum_tg = luminance.maxTotalThreadsPerThreadgroup >= 256 ? 16 : 8;
-		// The compute ICB's encoder and the pipeline its dispatches inherit.
-		id<MTLFunction> cicb_fn = [lib newFunctionWithName:icb_bound ? @"cicb_encode_bound" : @"cicb_encode"];
-		id<MTLComputePipelineState> cicb_encode = cicb_fn ? [D newComputePipelineStateWithFunction:cicb_fn error:&err] : nil;
-		if (!cicb_encode)
-			die("the compute ICB's encode kernel", err);
-		MTLComputePipelineDescriptor *cwd = [MTLComputePipelineDescriptor new];
-		cwd.computeFunction = [lib newFunctionWithName:@"cicb_work"];
-		cwd.supportIndirectCommandBuffers = YES;
-		id<MTLComputePipelineState> cicb_work = [D newComputePipelineStateWithDescriptor:cwd options:0 reflection:nil
-		                                                                           error:&err];
-		if (!cicb_work)
-			die("the compute ICB's pipeline", err);
+		// The compute ICB's encoder and the pipeline its dispatches inherit, made only with cicb on.
+		id<MTLFunction> cicb_fn = nil;
+		id<MTLComputePipelineState> cicb_encode = nil, cicb_work = nil;
+		if (on[S_CICB]) {
+			cicb_fn = [lib newFunctionWithName:icb_bound ? @"cicb_encode_bound" : @"cicb_encode"];
+			cicb_encode = cicb_fn ? [D newComputePipelineStateWithFunction:cicb_fn error:&err] : nil;
+			if (!cicb_encode)
+				die("the compute ICB's encode kernel", err);
+			MTLComputePipelineDescriptor *cwd = [MTLComputePipelineDescriptor new];
+			cwd.computeFunction = [lib newFunctionWithName:@"cicb_work"];
+			cwd.supportIndirectCommandBuffers = YES;
+			cicb_work = [D newComputePipelineStateWithDescriptor:cwd options:0 reflection:nil error:&err];
+			if (!cicb_work)
+				die("the compute ICB's pipeline", err);
+		}
 
 		MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
 		dsd.depthCompareFunction = MTLCompareFunctionLess;
