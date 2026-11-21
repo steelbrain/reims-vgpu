@@ -590,9 +590,9 @@ Stages:
       (`guest/kext/src/RgfxAcceleratorLocks.cpp`, `rgfxLockGivesUp`). The
       device's stop and the locking thread's abort end the wait.
     - **The device cache:** every host that maps the surfaces' pages has
-      `RGFX_FEATURE_SURFACE_CACHE`, one whose GPU shares the CPU's memory
-      within a budget (*Device caches on a GPU that shares the CPU's memory*,
-      below), and a block the kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
+      `RGFX_FEATURE_SURFACE_CACHE`, within a budget on any GPU (*Device
+      caches on a GPU that shares the CPU's memory*, below), and a block the
+      kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
       the host: a Private buffer of the surface's bytes, which every buffer
       over the block is, so every texture over the surface, of any shape,
       plane or format, lies over the same bytes. The
@@ -895,19 +895,29 @@ Stages:
       pages on the Iris Xe run at 4.1 times). On the Iris, 96.5% of
       Launchpad's GPU writes land in three compositor surfaces the CPU never
       locks, which a cache keeps in the GPU's memory (lane tiledlock, jobs
-      m3-max-37869 and 37870). The caches are host RAM beside the guest's
-      pages there, so they fit one budget together, deferred or not: half of
-      the GPU's memory budget as the platform answers it at the device's
-      start, twice the deferred blocks' (a quarter held a WebGL page's
-      surfaces in place on a Radeon 780M with an 8 GiB guest, at 1385 MiB,
-      and its frames fell from 33.0 to 24.6 a second; unbounded, the caches
-      held 1762 MiB at most, jobs m3-max-38033 and 38034). A cached block
-      past it gets no cache and lies in place in its pages, its buffers over
-      its view, as where the platform makes no cache; a deferral past it is
-      refused, and
-      the kext names its pages (`reims-vgpu`'s `decode/surface_cache.rs`,
-      "Within a budget"). The device's summary of its caches counts the
-      blocks past the budget and the most bytes the caches held.
+      m3-max-37869 and 37870). The caches fit one budget together, deferred
+      or not, on any GPU, a share of the GPU's memory budget as the platform
+      answers it at the device's start. They are host RAM beside the guest's
+      pages here, and the budget is half of it, twice the deferred blocks'
+      (a quarter held a WebGL page's surfaces in place on a Radeon 780M with
+      an 8 GiB guest, at 1385 MiB, and its frames fell from 33.0 to 24.6 a
+      second; unbounded, the caches held 1762 MiB at most, jobs m3-max-38033
+      and 38034). On a GPU of its own memory they are that memory, beside
+      everything else the runtime places there for the guest, and the
+      budget is two thirds of it: unbounded on a 4 GiB Radeon RX 550, the
+      caches were the most of what QEMU asked of the card when it asked for
+      more than the card has (a browser's 3D page and a video), and two
+      thirds lies under what they hold that no budget can trim there (jobs
+      m3-max-63976 and 64138; `reims-vgpu`'s `graphics.rs`,
+      `cache_budget`). A cached block past it gets no cache and lies in
+      place in its pages, its buffers over its view, as where the platform
+      makes no cache; a deferral past it is refused, and the kext names its
+      pages. In the per-shape form, the Vulkan platform's, every block keeps
+      its cache past it, and the budget trims the shapes no texture
+      references instead, least recently used first (`reims-vgpu`'s
+      `decode/surface_cache.rs`, "Within a budget"). The device's summary of
+      its caches counts the blocks past the budget and the most bytes the
+      caches held.
 
       Before 2026-11-16 such a host offered the mode below instead, which
       the kext and the host still carry out and no host offers now:

@@ -358,15 +358,37 @@ fn deferred_budget(features: u64, own_memory: u64) -> u64 {
     own_memory / 4
 }
 
-/// The bytes every IOSurface device cache may hold together on a GPU that shares the CPU's memory
-/// (`SurfaceCaches::set_cache_budget`), of a GPU whose own memory's budget is `own_memory`
-/// ([`GpuDevice::own_memory_budget`], read once at the device's start, past the guest's RAM where
-/// QEMU preallocated it): half of it. A quarter, the deferred blocks' budget, held Safari's and a
-/// WebGL page's surfaces in place on a Radeon 780M with an 8 GiB guest (1385 MiB, 454 blocks
-/// past it), and its WebGL frames fell from 33.0 to 24.6 a second; with no bound, the caches held
-/// 1762 MiB at most (jobs m3-max-38033 and 38034).
-fn cache_budget(own_memory: u64) -> u64 {
-    own_memory / 2
+/// The bytes every IOSurface device cache may hold together (`SurfaceCaches::set_cache_budget`),
+/// of a GPU whose own memory's budget is `own_memory` ([`GpuDevice::own_memory_budget`], read
+/// once at the device's start, past the guest's RAM where QEMU preallocated it): half of it where
+/// the GPU shares the CPU's memory (`unified`), two thirds of it where the GPU has memory of its
+/// own.
+///
+/// Where the GPU shares the CPU's memory the caches are host RAM beside the guest's pages. A
+/// quarter, the deferred blocks' budget, held Safari's and a WebGL page's surfaces in place on a
+/// Radeon 780M with an 8 GiB guest (1385 MiB, 454 blocks past it), and its WebGL frames fell from
+/// 33.0 to 24.6 a second; with no bound, the caches held 1762 MiB at most (jobs m3-max-38033 and
+/// 38034).
+///
+/// Where the GPU has memory of its own the caches are that memory, beside everything else the
+/// platform places there for the guest. In the per-shape form the budget trims only the shapes no
+/// texture references (`decode::surface_cache`, "Within a budget"): the caches' buffers and their
+/// referenced shapes are a floor it does not go under. On a 4 GiB Radeon RX 550 (RADV) with no
+/// budget, QEMU asked the card for more than it has in a browser's 3D page (by 201-270 MiB) and in
+/// a video (by up to 1283 MiB, most of it the host's video decoder's); what the card did not take
+/// stayed in the host's memory after it had room, and where long-lived allocations stayed so, a
+/// later benchmark scene ran at 17.2-17.5 frames a second, against 29.4-32.6 where few did (jobs
+/// m3-max-63976 and 64138). At each such moment the caches' floor was 2912-3634 MiB, and their
+/// unreferenced shapes 353-670 MiB, more than the 3D page's over-ask. Two thirds of the card, about
+/// 2.7 GB, is under every such floor, so the budget trims every unreferenced shape it may there; in
+/// those walks it would have trimmed elsewhere only where QEMU asked within 415 MiB of the card's
+/// room, where half would have trimmed in a scroll that asked 2.2 GB of it too.
+fn cache_budget(own_memory: u64, unified: bool) -> u64 {
+    if unified {
+        own_memory / 2
+    } else {
+        own_memory / 3 * 2
+    }
 }
 
 /// The mode a display offers before its window has a size, and without a window: no screen
@@ -594,10 +616,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             }
             // Every host keeps IOSurfaces' device caches where the kext asks (`SURFACE_CACHE`), as
             // a Mac's GPU keeps its own copy of each surface it uses, synced with the pages at the
-            // CPU's locks; a GPU that shares the CPU's memory keeps them within a budget, past
-            // which a surface lies in place in its pages (`decode::surface_cache`). A GPU of its
-            // own memory places its `Managed` buffers' CPU copies in the guest's heaps. Every host
-            // answers a
+            // CPU's locks, within a budget of the GPU's memory (`decode::surface_cache`, "Within a
+            // budget"). A GPU of its own memory places its `Managed` buffers' CPU copies in the
+            // guest's heaps. Every host answers a
             // command buffer's ask for its submission, and a waiting thread's for its scheduling
             // (`SCHEDULED_ASK`), orders command buffers of different queues
             // over the IOSurfaces they share where the guest names the order, commits a process's
@@ -795,9 +816,6 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             if !P::SURFACE_VIEWS {
                 decoder.set_surfaces_unviewed();
             }
-            // A GPU that shares the CPU's memory holds every device cache in the host's RAM
-            // beside the guest's pages: they all fit one budget together, past which a surface
-            // lies in place, so the copies stay bounded on a small host.
             // A platform of the per-shape form has each texture over a device cache be a view of
             // its shape's image, the platform's (`ApiPlatform::shape_image`,
             // `decode::surface_shapes`).
@@ -821,16 +839,25 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             if P::STAGED_SURFACE_COPIES {
                 decoder.set_staged_surface_copies();
             }
-            if unified_memory {
-                let cache_budget = cache_budget(own_memory);
-                decoder.set_cache_budget(cache_budget);
-                if deferred_budget != 0 {
-                    log::info!(
-                        target: "reims_vgpu::graphics",
-                        "IOSurface device caches: {} MiB at most, the GPU sharing the CPU's memory",
-                        cache_budget >> 20
-                    );
-                }
+            // Every device cache fits one budget together, on any GPU (`decode::surface_cache`,
+            // "Within a budget"): where the GPU shares the CPU's memory they are host RAM beside
+            // the guest's pages, so the copies stay bounded on a small host; where it has memory
+            // of its own they are that memory, beside what the platform places there for the
+            // guest, so the caches leave it room.
+            let cache_budget = cache_budget(own_memory, unified_memory);
+            decoder.set_cache_budget(cache_budget);
+            if deferred_budget != 0 {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "IOSurface device caches: {} MiB at most, of the {} MiB of memory the GPU {}",
+                    cache_budget >> 20,
+                    own_memory >> 20,
+                    if unified_memory {
+                        "shares with the CPU"
+                    } else {
+                        "has of its own"
+                    }
+                );
             }
             if offerable & u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK) != 0 {
                 decoder.set_deferred_asks();

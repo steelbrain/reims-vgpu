@@ -264,19 +264,24 @@
 //!   for a block refused past the budget: the pages then decide, as on a device that defers
 //!   nothing.
 //!
-//! - **Within a budget.** On a GPU that shares the CPU's memory a cache is host RAM beside the
-//!   guest's pages, so the device bounds them all ([`SurfaceCaches::set_cache_budget`]): every
-//!   cache, deferred or not, fits one budget together, half of the GPU's memory's budget as the
-//!   platform answers it at the device's start ([`GpuDevice::own_memory_budget`]), twice the
-//!   deferred blocks' (a quarter, measured too tight: on a Radeon 780M it held a WebGL page's
-//!   surfaces in place, and its frames fell by a quarter). A cached block past it gets no cache,
-//!   counted, and lies in place in its pages, as where the platform makes none: it takes its view
-//!   where it was named by its runs, and its buffers lie over the view, its textures the
-//!   runtime's over the pages. A deferral past either budget is refused, and the kext names its
-//!   pages. So
-//!   the copies stay bounded on a small host, and only their speed is lost past the budget. A
-//!   GPU of its own memory sets none: its own memory bounds them, and a cache it does not make
-//!   lies in place alike.
+//! - **Within a budget.** The device bounds every cache, deferred or not, by one budget together
+//!   ([`SurfaceCaches::set_cache_budget`]), a share of the GPU's memory's budget as the platform
+//!   answers it at the device's start ([`GpuDevice::own_memory_budget`]), on any GPU (`graphics`'s
+//!   `cache_budget`). On a GPU that shares the CPU's memory a cache is host RAM beside the
+//!   guest's pages, and the budget is half of it, twice the deferred blocks' (a quarter, measured
+//!   too tight: on a Radeon 780M it held a WebGL page's surfaces in place, and its frames fell by
+//!   a quarter). On a GPU of its own memory a cache is that memory, beside everything else the
+//!   platform places there for the guest, and the budget is two thirds of it (measured on a 4 GiB
+//!   Radeon RX 550, where the caches were the most of what QEMU asked of the card when it asked
+//!   for more than it has). A cached block past it gets no cache, counted, and lies in place in
+//!   its pages, as where the platform makes none: it takes its view where it was named by its
+//!   runs, and its buffers lie over the view, its textures the runtime's over the pages. A
+//!   deferral past either budget is refused, and the kext names its pages. So the copies stay
+//!   bounded, and only their speed is lost past the budget. In the per-shape form every block
+//!   keeps its cache past the budget, and a deferral meets the deferred blocks' budget alone: the
+//!   caches' budget trims the shapes no texture references instead, least recently used first,
+//!   never a dirty or plane one ([`shapes`], "The bound"), and a texture that takes a trimmed
+//!   shape again has it made again, filled from its cache's buffer as any new shape is (rule 2).
 //!
 //! - **By runs or by a view.** A cache's copies go between it and the pages' runs in the guest's
 //!   RAM where the platform copies by them ([`GpuDevice::copies_guest_ram`]; the block takes no
@@ -2036,9 +2041,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// bytes they hold.
     deferred_budget: u64,
     deferred_bytes: u64,
-    /// The bytes every cache may hold at once, deferred or not, on a device whose GPU shares the
-    /// CPU's memory ([`Self::set_cache_budget`]; the module doc, "Within a budget"), `None` on any
-    /// other; the bytes every cache holds, and the most they held at once.
+    /// The bytes every cache may hold at once, deferred or not, which the device sets at its make
+    /// ([`Self::set_cache_budget`]; the module doc, "Within a budget"), `None` until it does; the
+    /// bytes every cache holds, and the most they held at once.
     cache_budget: Option<u64>,
     cache_bytes: u64,
     cache_bytes_most: u64,
@@ -3086,6 +3091,12 @@ impl<P: Platform> SurfaceCaches<P> {
     /// budget").
     pub(crate) fn set_cache_budget(&mut self, budget: u64) {
         self.cache_budget = Some(budget);
+    }
+
+    /// The bytes every cache may hold at once, as the device set them (for the tests).
+    #[cfg(test)]
+    pub(crate) fn cache_budget(&self) -> Option<u64> {
+        self.cache_budget
     }
 
     /// The room the caches' budget has for the block at `block`'s cache, the cache the block has
@@ -6812,8 +6823,8 @@ impl<P: Platform> Caches<P> {
         self.lock().set_deferred_budget(budget);
     }
 
-    /// Sets the bytes every cache may hold at once, deferred or not, on a device whose GPU shares
-    /// the CPU's memory (the module doc, "Within a budget"): set once, at the device's make.
+    /// Sets the bytes every cache may hold at once, deferred or not, on any GPU (the module doc,
+    /// "Within a budget"): set once, at the device's make.
     pub(crate) fn set_cache_budget(&self, budget: u64) {
         self.lock().set_cache_budget(budget);
     }

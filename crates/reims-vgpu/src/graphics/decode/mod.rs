@@ -1641,8 +1641,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Sets the bytes every device cache may hold at once, deferred or not ([`surface_cache`],
-    /// "Within a budget"), on a device whose GPU shares the CPU's memory: set once, at the
-    /// device's make; without it the caches hold what the platform makes.
+    /// "Within a budget"), on any GPU: set once, at the device's make; without it the caches hold
+    /// what the platform makes.
     pub(crate) fn set_cache_budget(&self, budget: u64) {
         self.surface_caches.set_cache_budget(budget);
     }

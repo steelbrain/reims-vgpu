@@ -10133,18 +10133,45 @@ fn the_deferred_budget_is_a_quarter_of_the_gpus_own_memory() {
     assert_eq!(super::deferred_budget(refused, 16 << 30), 0);
 }
 
-/// Every device cache on a GPU that shares the CPU's memory fits half of the GPU's own memory's
-/// budget, twice the deferred blocks' budget
+/// Every device cache fits half of the GPU's own memory's budget on a GPU that shares the CPU's
+/// memory, twice the deferred blocks' budget, and two thirds of it on a GPU of its own memory
 #[test]
-fn the_caches_budget_is_half_of_the_gpus_own_memory() {
-    assert_eq!(super::cache_budget(16 << 30), 8 << 30);
-    assert_eq!(super::cache_budget(0x1_5a80_0000), 0x1_5a80_0000 / 2);
-    assert_eq!(super::cache_budget(0), 0);
+fn the_caches_budget_is_half_of_shared_memory_and_two_thirds_of_a_gpus_own() {
+    assert_eq!(super::cache_budget(16 << 30, true), 8 << 30);
+    assert_eq!(super::cache_budget(0x1_5a80_0000, true), 0x1_5a80_0000 / 2);
+    assert_eq!(super::cache_budget(0, true), 0);
     let deferred = u64::from(RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_SURFACE_DEFERRED);
     assert_eq!(
-        super::cache_budget(16 << 30),
+        super::cache_budget(16 << 30, true),
         2 * super::deferred_budget(deferred, 16 << 30)
     );
+    assert_eq!(super::cache_budget(3 << 30, false), 2 << 30);
+    assert_eq!(super::cache_budget(4 << 30, false), 0xaaaa_aaaa);
+    assert_eq!(super::cache_budget(0, false), 0);
+    assert_eq!(super::cache_budget(u64::MAX, false), u64::MAX / 3 * 2);
+}
+
+/// A device bounds its IOSurface device caches on any GPU, set at its make: at half of the
+/// GPU's own memory's budget where the GPU shares the CPU's memory, and at two thirds of it where
+/// the GPU has memory of its own
+#[test]
+fn a_device_bounds_its_caches_on_a_gpu_of_its_own_memory_too() {
+    for unified in [true, false] {
+        let raised = Arc::new(AtomicU32::new(0));
+        let platform = Arc::new(FakePlatform::new());
+        platform.device().set_unified_memory(unified);
+        let (device, _platform) = headless_over(&raised, platform);
+        let expected = if unified {
+            FAKE_OWN_MEMORY / 2
+        } else {
+            FAKE_OWN_MEMORY / 3 * 2
+        };
+        assert_eq!(
+            device.control.decoder().caches().cache_budget(),
+            Some(expected),
+            "unified memory: {unified}"
+        );
+    }
 }
 
 /// What the poison-fill tests write over the guest's memory before the host answers into it: a
