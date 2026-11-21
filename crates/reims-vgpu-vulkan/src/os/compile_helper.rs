@@ -248,9 +248,12 @@ fn admits(held: usize, cap: u64, room: Option<u64>, ours: u64) -> bool {
         })
 }
 
-/// The host ranges of the guest's RAM this process maps, each its host address and length, by
-/// the hold that named them ([`hold_guest_ram`]).
-static GUEST_RAM: Mutex<Vec<(u64, Vec<(u64, u64)>)>> = Mutex::new(Vec::new());
+/// The host ranges of a hold's guest RAM, each its host address and length.
+type Ranges = Vec<(u64, u64)>;
+
+/// The host ranges of the guest's RAM this process maps, by the id of the hold that named them
+/// ([`hold_guest_ram`]).
+static GUEST_RAM: Mutex<Vec<(u64, Ranges)>> = Mutex::new(Vec::new());
 
 /// The next hold's id.
 static NEXT_HOLD: AtomicU64 = AtomicU64::new(0);
@@ -281,7 +284,7 @@ impl Drop for GuestRamHeld {
 /// not say.
 pub(crate) fn room_of_host() -> Option<u64> {
     let free = host::free_memory()?;
-    let mut ranges: Vec<(u64, u64)> = (GUEST_RAM.lock().iter())
+    let mut ranges: Ranges = (GUEST_RAM.lock().iter())
         .flat_map(|(_, ranges)| ranges.iter().copied())
         .collect();
     // Two devices over one guest's RAM name its ranges twice.
