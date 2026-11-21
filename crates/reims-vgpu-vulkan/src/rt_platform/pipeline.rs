@@ -66,7 +66,7 @@ use metal2vulkan_runtime as rt;
 
 use crate::core::platform::compute::Dispatch;
 use crate::core::platform::resource::ComputePipeline;
-use crate::core::platform::stage::StageFills;
+use crate::core::platform::stage::{Site, StageFills};
 use crate::core::platform::types::{MtlSize, NsErrorText};
 use crate::core::platform::values::{FullComputePipelineDesc, LinkedFunctionsDesc, StageInputDesc};
 use crate::core::platform::{Handle, Platform};
@@ -76,7 +76,7 @@ use crate::core::trace;
 
 use super::device::RtDevice;
 use super::library::RtFunction;
-use super::stage::{StageKey, stage_of};
+use super::stage::{StageKey, UNFILLED_AT_MAKE, counted, stage_of};
 use super::state::value;
 use super::texture::OwnIndices;
 use super::unbuilt::{
@@ -374,9 +374,10 @@ fn make(
     }
     if let Err(error) = &made {
         super::diag::keep_refused_compute(sel, error, descriptor);
-        // The kernel's compile for its helper starts now, for the state's next make.
-        if let Some(stage) = stage_of(error) {
-            let _fill = device.stage_fills().fill(stage);
+        // The kernel's compile for its helper starts now, for the state's next make; counted
+        // apart from the make's refusal (`super::stage`).
+        if let Some(stage) = counted(UNFILLED_AT_MAKE, stage_of(error)) {
+            let _fill = device.stage_fills().fill(stage, Site::Make);
         }
     }
     let (rt, lease) = taking.made(sel, made)?;
@@ -579,7 +580,7 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         if let Err(error) = prepared
             && let Some(stage) = stage_of(&error)
         {
-            let _fill = self.fills.fill(stage);
+            let _fill = self.fills.fill(stage, Site::MakeAhead);
         }
     }
 

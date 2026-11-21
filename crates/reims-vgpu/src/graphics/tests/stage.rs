@@ -6,7 +6,7 @@
 //! device's reset and the process's quiesce ahead of its exit wait for no fill: the fills a walk
 //! waits for end cancelled, and its dispatch is refused.
 
-use reims_vgpu_vulkan::core::platform::stage::FillEnd;
+use reims_vgpu_vulkan::core::platform::stage::{FillEnd, Site};
 use reims_vgpu_vulkan::core::testkit::Step;
 
 use super::prepass::{
@@ -49,7 +49,7 @@ fn a_dispatch_refused_for_its_stage_is_made_after_its_fill() {
     world.script.push(THREADS, Step::Stage(7));
     ring.send(&device, dispatching(100));
     assert!(
-        eventually(|| world.stages().started() == [7]),
+        eventually(|| world.stages().started_at() == [(7, Site::Dispatch)]),
         "no fill started"
     );
     assert!(
@@ -103,7 +103,7 @@ fn a_make_ahead_refused_for_its_stage_starts_the_fill_its_dispatch_joins() {
         none_completes(&platform, &mut ring),
         "the buffer completed while its dispatch waited for its stage's fill"
     );
-    assert_eq!(world.stages().started(), [7]);
+    assert_eq!(world.stages().started_at(), [(7, Site::MakeAhead)]);
     assert!(world.stages().end(7, FillEnd::Filled));
     assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
     assert!(world.stages().refused().is_empty());
@@ -199,7 +199,7 @@ fn a_reset_ends_the_fill_a_dispatch_waits_for() {
     assert!(cancelled, "the reset waited for the fill a dispatch waits for");
     assert_eq!(world.stages().refused(), [(THREADS, 7)]);
     assert!(
-        eventually(|| world.stages().fills().fill(7).end().is_none()),
+        eventually(|| world.stages().fills().fill(7, Site::Dispatch).end().is_none()),
         "the fills stayed suspended past the reset"
     );
     assert_eq!(world.stages().started(), [7, 7]);
@@ -225,7 +225,7 @@ fn a_quiesce_for_exit_ends_the_fill_a_dispatch_waits_for() {
     assert_eq!(world.stages().cancels(), 1);
     assert_eq!(world.stages().refused(), [(THREADS, 7)]);
     assert_eq!(
-        world.stages().fills().fill(8).end(),
+        world.stages().fills().fill(8, Site::Dispatch).end(),
         Some(FillEnd::Cancelled)
     );
     assert_eq!(world.stages().started(), [7]);

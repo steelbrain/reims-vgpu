@@ -20,6 +20,12 @@
 //!
 //! Where there is no helper to run, no fill starts, and the stage's fill ends
 //! [`FillEnd::Failed`] at once: nothing is recorded, and a make of the stage refuses as before.
+//!
+//! Each fill's start is logged with the site that asked for it ([`Site`]), and rt's refusals are
+//! counted by their site, each under a code of its own, apart from the refusals the calls end
+//! with: a state's make refused ([`UNFILLED_AT_MAKE`]), and a dispatch refused
+//! ([`UNFILLED_AT_DISPATCH`]) whether or not it is made after its fill. The make ahead's refusals
+//! are not counted: what the guest meets is its dispatch's.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -29,7 +35,7 @@ use std::sync::Arc;
 use metal2vulkan_runtime as rt;
 
 use crate::core::platform::os::Clock;
-use crate::core::platform::stage::{Cancel, FillDone, FillEnd, StageFills, Start};
+use crate::core::platform::stage::{Cancel, FillDone, FillEnd, Site, StageFills, Start};
 use crate::os::OsClock;
 use crate::os::compile_helper::{Helper, HelperEnd, HelperRun, Limits};
 
@@ -44,6 +50,14 @@ const LOCK: &str = "compile-helper.lock";
 /// `VkPipeline`, equal for every refusal of one pipeline.
 pub type StageKey = rt::StageRequest;
 
+/// The degradation code of a pipeline state's make that rt refused for a stage whose compile is
+/// not in its store (`Error::StageUnfilled`): the make fails, and the stage's fill starts.
+pub(crate) const UNFILLED_AT_MAKE: &str = "stage-unfilled-make";
+
+/// The degradation code of a dispatch that rt refused so: it waits for its stage's fill, and is
+/// made after a fill that filled the store, else refused.
+pub(crate) const UNFILLED_AT_DISPATCH: &str = "stage-unfilled-dispatch";
+
 /// The request whose fill rt's refusal `error` waits for, where it is such a refusal
 /// (`Error::StageUnfilled`).
 pub(crate) fn stage_of(error: &rt::Error) -> Option<StageKey> {
@@ -51,6 +65,21 @@ pub(crate) fn stage_of(error: &rt::Error) -> Option<StageKey> {
         rt::Error::StageUnfilled(request) => Some(request.clone()),
         _ => None,
     }
+}
+
+/// `stage`, the stage a refusal at the site counted under `code` names ([`stage_of`]), counted
+/// under `code` where there is one.
+pub(crate) fn counted<K>(code: &'static str, stage: Option<K>) -> Option<K> {
+    if stage.is_some() {
+        crate::answer::count_kind(code);
+    }
+    stage
+}
+
+/// The request whose fill a dispatch's refusal `error` waits for ([`stage_of`]), counted under
+/// [`UNFILLED_AT_DISPATCH`] where there is one.
+pub(crate) fn unfilled_at_dispatch(error: &rt::Error) -> Option<StageKey> {
+    counted(UNFILLED_AT_DISPATCH, stage_of(error))
 }
 
 /// The fills of `device`, whose physical device's `deviceUUID` is `uuid`: each runs the helper
@@ -170,18 +199,22 @@ where
 {
     let talk = Arc::new(talk);
     let on_end = Arc::new(on_end);
-    Box::new(move |key: &K, done: FillDone| -> Cancel {
+    Box::new(move |key: &K, site: Site, done: FillDone| -> Cancel {
         let run = match run() {
             Ok(run) => run,
             Err(why) => {
                 log::warn!(
                     target: super::TARGET,
-                    "stage {key:?}: no helper process compiles it: {why}"
+                    "stage {key:?}: no helper process compiles it for {site}: {why}"
                 );
                 done.end(FillEnd::Failed);
                 return Box::new(|| {});
             }
         };
+        log::info!(
+            target: super::TARGET,
+            "stage {key:?}: its helper's fill starts for {site}"
+        );
         let (talk, on_end) = (Arc::clone(&talk), Arc::clone(&on_end));
         let (talks, ends) = (key.clone(), key.clone());
         let started = Helper::start(
@@ -216,6 +249,21 @@ mod tests {
     use super::*;
     use crate::core::platform::stage::StageFills;
     use crate::os::compile_helper::{Limits, end_with_parent};
+
+    /// A refusal of a stage is counted under its site's code, and one of no stage is not
+    #[test]
+    fn a_stage_s_refusal_is_counted_under_its_site_s_code() {
+        let count = |code: &str| {
+            (crate::answer::counted_kinds().into_iter())
+                .find(|(kind, _)| *kind == code)
+                .map_or(0, |(_, n)| n)
+        };
+        assert_eq!(counted(UNFILLED_AT_DISPATCH, Some(1)), Some(1));
+        assert_eq!(counted::<u32>(UNFILLED_AT_MAKE, None), None);
+        assert_eq!(unfilled_at_dispatch(&rt::Error::Quiesced), None);
+        assert_eq!(count(UNFILLED_AT_DISPATCH), 1);
+        assert_eq!(count(UNFILLED_AT_MAKE), 0);
+    }
 
     /// The variable that makes this test binary a stand-in helper, and names what it does.
     const STAND_IN: &str = "RVG_STAGE_STAND_IN";
@@ -306,9 +354,9 @@ mod tests {
                 FillEnd::Breached
             },
         ));
-        let fill = fills.fill(1);
+        let fill = fills.fill(1, Site::Dispatch);
         assert_eq!(fill.end(), Some(FillEnd::Failed));
-        assert_eq!(fills.fill(1).end(), Some(FillEnd::Failed));
+        assert_eq!(fills.fill(1, Site::Dispatch).end(), Some(FillEnd::Failed));
         assert!(ended.try_recv().is_err());
     }
 
@@ -330,7 +378,7 @@ mod tests {
                 FillEnd::Failed
             },
         ));
-        let fill = fills.fill(4);
+        let fill = fills.fill(4, Site::Dispatch);
         assert_eq!(fill.wait(), FillEnd::Failed);
         let (key, end, said) = ended.recv_timeout(WAIT).unwrap();
         assert_eq!(key, 4);
@@ -354,7 +402,7 @@ mod tests {
                 FillEnd::Filled
             },
         ));
-        let fill = fills.fill(9);
+        let fill = fills.fill(9, Site::Dispatch);
         assert_eq!(fill.wait(), FillEnd::Filled);
         let (key, end, said) = ended.recv_timeout(WAIT).unwrap();
         assert_eq!(key, 9);
@@ -364,7 +412,7 @@ mod tests {
         );
         // The harness's own lines come first.
         assert!(said.unwrap().ends_with(b"stage 9"));
-        assert_eq!(fills.fill(9).end(), Some(FillEnd::Filled));
+        assert_eq!(fills.fill(9, Site::Dispatch).end(), Some(FillEnd::Filled));
         let _ = std::fs::remove_file(lock_file(test));
     }
 
@@ -422,9 +470,9 @@ mod tests {
             },
             move |key, breach| records.send((*key, breach)).unwrap(),
         ));
-        assert_eq!(fills.fill(5).wait(), FillEnd::Failed);
+        assert_eq!(fills.fill(5, Site::Dispatch).wait(), FillEnd::Failed);
         assert!(talked.recv_timeout(WAIT).unwrap().ends_with(b"stage 5"));
-        assert_eq!(fills.fill(5).end(), Some(FillEnd::Failed));
+        assert_eq!(fills.fill(5, Site::Dispatch).end(), Some(FillEnd::Failed));
         assert!(talked.try_recv().is_err());
         assert!(recorded.try_recv().is_err());
         let _ = std::fs::remove_file(lock_file(test));
@@ -450,7 +498,7 @@ mod tests {
             },
             move |key, breach| records.send((*key, breach)).unwrap(),
         ));
-        assert_eq!(fills.fill(3).wait(), FillEnd::Breached);
+        assert_eq!(fills.fill(3, Site::Dispatch).wait(), FillEnd::Breached);
         assert_eq!(
             recorded.recv_timeout(WAIT).unwrap(),
             (3, rt::StageBreach::Time)
@@ -490,7 +538,7 @@ mod tests {
                 FillEnd::Breached
             },
         ));
-        let fill = fills.fill(2);
+        let fill = fills.fill(2, Site::Dispatch);
         assert_eq!(fill.end(), None);
         fills.cancel_all();
         assert_eq!(fill.end(), Some(FillEnd::Cancelled));

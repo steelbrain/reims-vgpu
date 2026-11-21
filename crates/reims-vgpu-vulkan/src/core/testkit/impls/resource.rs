@@ -14,6 +14,7 @@ use crate::core::host::HostPtr;
 use crate::core::num::ToU64 as _;
 use crate::core::platform::compute::Dispatch;
 use crate::core::platform::resource::*;
+use crate::core::platform::stage::Site;
 use crate::core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
 use crate::core::platform::values::SurfacePlane;
 use crate::core::platform::{Handle as _, HostRange, Platform};
@@ -716,7 +717,7 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
         let world = self.world();
         world.note_prepared(prepared(self, dispatch, threads, lengths));
         if let Some(stage) = world.stages().prepare_refusal() {
-            let _ = world.stages().fills().fill(stage);
+            let _ = world.stages().fills().fill(stage, Site::MakeAhead);
         }
     }
 

@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::core::platform::stage::{Cancel, FillDone, FillEnd, StageFills};
+use crate::core::platform::stage::{Cancel, FillDone, FillEnd, Site, StageFills};
 use crate::core::sync::Mutex;
 
 /// The fake's stage fills, and what the test sees of them.
@@ -33,8 +33,9 @@ impl std::fmt::Debug for FakeStages {
 /// What the test sees of the fills.
 #[derive(Default)]
 struct Seen {
-    /// Each fill started, by stage, in order, with its end until the test ends it.
-    started: Mutex<Vec<(u64, Option<FillDone>)>>,
+    /// Each fill started, by stage, with the site it was started for, in order, with its end until
+    /// the test ends it.
+    started: Mutex<Vec<(u64, Site, Option<FillDone>)>>,
     /// How many fills a cancel ended.
     cancels: AtomicUsize,
     /// The calls answered as refused after their stage's fill: their selector and stage.
@@ -54,13 +55,14 @@ impl FakeStages {
     pub fn new() -> FakeStages {
         let seen = Arc::new(Seen::default());
         let theirs = Arc::clone(&seen);
-        let fills = StageFills::new(Box::new(move |&stage: &u64, done: FillDone| -> Cancel {
-            theirs.started.lock().push((stage, Some(done)));
+        let start = move |&stage: &u64, site: Site, done: FillDone| -> Cancel {
+            theirs.started.lock().push((stage, site, Some(done)));
             let seen = Arc::clone(&theirs);
             Box::new(move || {
                 seen.cancels.fetch_add(1, Ordering::SeqCst);
             })
-        }));
+        };
+        let fills = StageFills::new(Box::new(start));
         FakeStages { fills, seen }
     }
 
@@ -72,7 +74,16 @@ impl FakeStages {
     /// The stage of each fill started, in order.
     pub fn started(&self) -> Vec<u64> {
         let started = self.seen.started.lock();
-        started.iter().map(|&(stage, _)| stage).collect()
+        started.iter().map(|&(stage, _, _)| stage).collect()
+    }
+
+    /// The stage of each fill started and the site it was started for, in order.
+    pub fn started_at(&self) -> Vec<(u64, Site)> {
+        let started = self.seen.started.lock();
+        started
+            .iter()
+            .map(|&(stage, site, _)| (stage, site))
+            .collect()
     }
 
     /// Ends the first fill of `stage` the test has not ended with `end`, on this thread; false
@@ -82,8 +93,8 @@ impl FakeStages {
             let mut started = self.seen.started.lock();
             started
                 .iter_mut()
-                .find(|(of, done)| *of == stage && done.is_some())
-                .and_then(|(_, done)| done.take())
+                .find(|(of, _, done)| *of == stage && done.is_some())
+                .and_then(|(_, _, done)| done.take())
         };
         match done {
             Some(done) => {

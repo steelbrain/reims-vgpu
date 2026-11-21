@@ -52,16 +52,38 @@ pub enum FillEnd {
     Cancelled,
 }
 
+/// What asked for a fill: the call refused for the fill's stage, which a fill started for it
+/// names ([`Start`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Site {
+    /// A pipeline state's make: it fails, and a later make of the state finds the stage filled.
+    Make,
+    /// A dispatch's make ahead, in its command buffer's pre-pass: it waits for nothing.
+    MakeAhead,
+    /// A dispatch, in its walk: it waits for the fill ([`held`]).
+    Dispatch,
+}
+
+impl fmt::Display for Site {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Site::Make => "a state's make",
+            Site::MakeAhead => "a dispatch's make ahead",
+            Site::Dispatch => "a dispatch",
+        })
+    }
+}
+
 /// What a fill's end runs, on the thread that ends it.
 type OnEnd = Box<dyn FnOnce(FillEnd) + Send>;
 
 /// What cancels whatever runs a fill: it returns at once.
 pub type Cancel = Box<dyn FnOnce() + Send>;
 
-/// What starts a fill of a key: it starts whatever runs the fill, which ends it through
-/// [`FillDone::end`] once, and returns at once with its [`Cancel`]. Where nothing can start, it
-/// ends the fill [`FillEnd::Failed`] itself.
-pub type Start<K> = Box<dyn Fn(&K, FillDone) -> Cancel + Send + Sync>;
+/// What starts a fill of a key, asked for at a [`Site`]: it starts whatever runs the fill, which
+/// ends it through [`FillDone::end`] once, and returns at once with its [`Cancel`]. Where nothing
+/// can start, it ends the fill [`FillEnd::Failed`] itself.
+pub type Start<K> = Box<dyn Fn(&K, Site, FillDone) -> Cancel + Send + Sync>;
 
 /// A fill's state.
 #[derive(Default)]
@@ -270,9 +292,10 @@ impl<K: Eq + Hash + Clone + Send + 'static> StageFills<K> {
         }
     }
 
-    /// The fill of `key`: the one running, else one that has ended with the end its key's fill had
-    /// this run, else a fill started now. Returns at once.
-    pub fn fill(&self, key: K) -> Arc<Fill> {
+    /// The fill of `key`, asked for by a refusal at `site`: the one running, else one that has
+    /// ended with the end its key's fill had this run, else a fill started now, for `site`.
+    /// Returns at once.
+    pub fn fill(&self, key: K, site: Site) -> Arc<Fill> {
         let fill = {
             let mut state = self.shared.state.lock();
             if state.closed || state.suspended > 0 {
@@ -300,7 +323,7 @@ impl<K: Eq + Hash + Clone + Send + 'static> StageFills<K> {
                 }
             })),
         };
-        let cancel = (self.shared.start)(&key, done);
+        let cancel = (self.shared.start)(&key, site, done);
         fill.hold_cancel(cancel);
         fill
     }
@@ -376,7 +399,7 @@ where
     let Some(stage) = stage_of(&refused) else {
         return Err(refused);
     };
-    let fill = fills.fill(stage);
+    let fill = fills.fill(stage, Site::Dispatch);
     if fill.end().is_none() {
         hold(&mut || {
             fill.wait();
@@ -443,19 +466,22 @@ mod tests {
 
     use super::*;
 
-    /// A fake start: keeps each fill's end for the test, and counts starts and cancels.
+    /// A fake start: keeps each fill's end for the test, counts starts and cancels, and notes the
+    /// site each fill was started for.
     #[derive(Clone, Default)]
     struct Fake {
         dones: Arc<Mutex<Vec<FillDone>>>,
         starts: Arc<AtomicUsize>,
         cancels: Arc<AtomicUsize>,
+        sites: Arc<Mutex<Vec<(u32, Site)>>>,
     }
 
     impl Fake {
         fn fills(&self) -> StageFills<u32> {
             let fake = self.clone();
-            StageFills::new(Box::new(move |_key, done| {
+            StageFills::new(Box::new(move |&key, site, done| {
                 fake.starts.fetch_add(1, Ordering::SeqCst);
+                fake.sites.lock().push((key, site));
                 fake.dones.lock().push(done);
                 let cancels = Arc::clone(&fake.cancels);
                 Box::new(move || {
@@ -484,13 +510,27 @@ mod tests {
     fn refusals_of_one_stage_join_its_fill() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let first = fills.fill(1);
-        let second = fills.fill(1);
+        let first = fills.fill(1, Site::Dispatch);
+        let second = fills.fill(1, Site::Dispatch);
         assert!(Arc::ptr_eq(&first, &second));
-        let other = fills.fill(2);
+        let other = fills.fill(2, Site::Dispatch);
         assert!(!Arc::ptr_eq(&first, &other));
         assert_eq!(fake.starts(), 2);
         assert_eq!(first.end(), None);
+    }
+
+    /// A fill is started for the site whose refusal asked for it first; a later refusal of its
+    /// stage, at any site, joins it
+    #[test]
+    fn a_fill_starts_for_the_site_that_asked_for_it_first() {
+        let fake = Fake::default();
+        let fills = fake.fills();
+        let _ = fills.fill(1, Site::MakeAhead);
+        let _ = fills.fill(1, Site::Dispatch);
+        let _ = fills.fill(2, Site::Make);
+        let _ = fills.fill(2, Site::MakeAhead);
+        let started = fake.sites.lock().clone();
+        assert_eq!(started, [(1, Site::MakeAhead), (2, Site::Make)]);
     }
 
     /// A fill's end wakes its waiters and runs what was given to run at its end, once.
@@ -498,7 +538,7 @@ mod tests {
     fn a_fill_ends_its_waits_and_runs_its_callbacks() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let fill = fills.fill(1);
+        let fill = fills.fill(1, Site::Dispatch);
         let waiter = {
             let fill = Arc::clone(&fill);
             std::thread::Builder::new()
@@ -529,9 +569,9 @@ mod tests {
             (2, FillEnd::Breached),
             (3, FillEnd::Failed),
         ] {
-            let _ = fills.fill(key);
+            let _ = fills.fill(key, Site::Make);
             fake.end(end);
-            let again = fills.fill(key);
+            let again = fills.fill(key, Site::Dispatch);
             assert_eq!(again.end(), Some(end), "{key}");
         }
         assert_eq!(fake.starts(), 3);
@@ -544,7 +584,7 @@ mod tests {
     fn a_cancelled_fill_ends_at_once_and_keeps_nothing() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let fill = fills.fill(1);
+        let fill = fills.fill(1, Site::Dispatch);
         let waiter = {
             let fill = Arc::clone(&fill);
             std::thread::Builder::new()
@@ -557,7 +597,7 @@ mod tests {
         // What ran it ends late, breached: nothing is kept.
         fake.end(FillEnd::Breached);
         assert_eq!(fill.end(), Some(FillEnd::Cancelled));
-        let again = fills.fill(1);
+        let again = fills.fill(1, Site::Dispatch);
         assert_eq!(again.end(), None);
         assert_eq!(fake.starts(), 2);
     }
@@ -567,11 +607,11 @@ mod tests {
     fn closed_fills_start_none() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let running = fills.fill(1);
+        let running = fills.fill(1, Site::Dispatch);
         fills.close();
         assert_eq!(running.end(), Some(FillEnd::Cancelled));
-        assert_eq!(fills.fill(2).end(), Some(FillEnd::Cancelled));
-        assert_eq!(fills.fill(1).end(), Some(FillEnd::Cancelled));
+        assert_eq!(fills.fill(2, Site::Make).end(), Some(FillEnd::Cancelled));
+        assert_eq!(fills.fill(1, Site::Make).end(), Some(FillEnd::Cancelled));
         assert_eq!((fake.starts(), fake.cancels()), (1, 1));
     }
 
@@ -582,18 +622,18 @@ mod tests {
     fn suspended_fills_start_none_until_resumed() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let running = fills.fill(1);
+        let running = fills.fill(1, Site::Dispatch);
         fills.suspend();
         assert_eq!(running.end(), Some(FillEnd::Cancelled));
-        assert_eq!(fills.fill(1).end(), Some(FillEnd::Cancelled));
-        assert_eq!(fills.fill(2).end(), Some(FillEnd::Cancelled));
+        assert_eq!(fills.fill(1, Site::Make).end(), Some(FillEnd::Cancelled));
+        assert_eq!(fills.fill(2, Site::Make).end(), Some(FillEnd::Cancelled));
         fills.suspend();
         fills.resume();
-        assert_eq!(fills.fill(2).end(), Some(FillEnd::Cancelled));
+        assert_eq!(fills.fill(2, Site::Make).end(), Some(FillEnd::Cancelled));
         assert_eq!((fake.starts(), fake.cancels()), (1, 1));
         fills.resume();
-        assert_eq!(fills.fill(1).end(), None);
-        assert_eq!(fills.fill(2).end(), None);
+        assert_eq!(fills.fill(1, Site::Dispatch).end(), None);
+        assert_eq!(fills.fill(2, Site::Dispatch).end(), None);
         assert_eq!((fake.starts(), fake.cancels()), (3, 1));
     }
 
@@ -602,7 +642,7 @@ mod tests {
     fn dropped_fills_cancel_their_fills() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let fill = fills.fill(1);
+        let fill = fills.fill(1, Site::Dispatch);
         drop(fills);
         assert_eq!(fill.wait(), FillEnd::Cancelled);
         assert_eq!(fake.cancels(), 1);
@@ -617,15 +657,15 @@ mod tests {
     fn a_fill_that_cannot_start_ends_at_once() {
         let cancels = Arc::new(AtomicUsize::new(0));
         let theirs = Arc::clone(&cancels);
-        let fills: StageFills<u32> = StageFills::new(Box::new(move |_key, done| {
+        let fills: StageFills<u32> = StageFills::new(Box::new(move |_key, _site, done| {
             done.end(FillEnd::Failed);
             let cancels = Arc::clone(&theirs);
             Box::new(move || {
                 cancels.fetch_add(1, Ordering::SeqCst);
             })
         }));
-        assert_eq!(fills.fill(1).end(), Some(FillEnd::Failed));
-        assert_eq!(fills.fill(1).end(), Some(FillEnd::Failed));
+        assert_eq!(fills.fill(1, Site::Dispatch).end(), Some(FillEnd::Failed));
+        assert_eq!(fills.fill(1, Site::Dispatch).end(), Some(FillEnd::Failed));
         fills.cancel_all();
         assert_eq!(cancels.load(Ordering::SeqCst), 0);
     }
@@ -635,10 +675,10 @@ mod tests {
     fn a_lost_end_fails_its_fill() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let fill = fills.fill(1);
+        let fill = fills.fill(1, Site::Dispatch);
         drop(fake.dones.lock().remove(0));
         assert_eq!(fill.end(), Some(FillEnd::Failed));
-        assert_eq!(fills.fill(1).end(), Some(FillEnd::Failed));
+        assert_eq!(fills.fill(1, Site::Dispatch).end(), Some(FillEnd::Failed));
         assert_eq!((fake.starts(), fake.cancels()), (1, 0));
     }
 
@@ -690,7 +730,7 @@ mod tests {
     fn a_held_call_answers_its_refusal_after_a_breach() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let _ = fills.fill(3);
+        let _ = fills.fill(3, Site::Dispatch);
         fake.end(FillEnd::Breached);
         let mut made = 0;
         let answer: Result<(), Option<u32>> = held(
@@ -756,7 +796,7 @@ mod tests {
     fn a_fill_waits_until_it_ends() {
         let fake = Fake::default();
         let fills = fake.fills();
-        let fill = fills.fill(1);
+        let fill = fills.fill(1, Site::Dispatch);
         let (sent, got) = std::sync::mpsc::channel();
         let theirs = Arc::clone(&fill);
         let waiter = std::thread::Builder::new()
