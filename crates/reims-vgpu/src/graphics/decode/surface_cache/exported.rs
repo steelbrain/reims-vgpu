@@ -38,10 +38,11 @@
 //! `video-surface-copy-form-declined`), and the cache's shapes are made as any other's, so the
 //! host's video writes the cache's buffer and the shapes take a fill a picture written. Kept,
 //! such a surface's planes are copied in for every command buffer that samples them, written or
-//! not. **Measured** (2026-11-21, m3-max-63386, an RX 550, whose driver holds no dma-buf surface
-//! in place, before the decline): a macOS guest's walk made 17,917 such copies of
-//! 107.16 GB, 2 a present on a scrolling desktop, of 12.44 MB each, a 3840 by 2160 10-bit
-//! picture's two planes' sizes.
+//! not. **Measured** (2026-11-21, an RX 550, whose driver holds no dma-buf surface in place):
+//! before the decline, a macOS guest's walk (m3-max-63386) had rt copy such planes 15,602
+//! times, 107.15 GB (rt's over-copies of cause `dedicated`), 2 a present on a scrolling desktop,
+//! of 12.44 MB each, a 3840 by 2160 10-bit picture's two planes' sizes; with it (m3-max-63574),
+//! the walk declined 137 surfaces and rt made no such copy.
 //!
 //! On Windows the surface's planes lie over two Direct3D 11 textures that the host's video draws
 //! its pictures into (`graphics::drawn`), made at the ask and imported by the platform
