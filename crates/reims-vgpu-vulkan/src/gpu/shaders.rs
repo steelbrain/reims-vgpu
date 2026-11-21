@@ -11,10 +11,15 @@ mod tests {
     /// The metallibs the repository holds for a build without Apple's tools (`metallibs/`,
     /// `build.rs`) are this tree's: their record is the one `build.rs` writes of this tree's
     /// commands and sources, and the directory holds every metallib it names and no other. So a
-    /// source changed on a Mac without `cargo xtask metallibs` fails here, not on Linux.
+    /// source changed on a Mac without `cargo xtask metallibs` fails here, not on Linux. The
+    /// directory is the crate's, which cargo and nextest give the test process: read at run time,
+    /// so the test is the same binary in every worktree (docs/development.md, "Building through
+    /// kache").
     #[test]
     fn the_committed_metallibs_are_this_trees() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("metallibs");
+        let crate_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is unset: run the tests with cargo or nextest");
+        let dir = std::path::Path::new(&crate_dir).join("metallibs");
         let mend = "run `cargo xtask metallibs` on a Mac and commit what it writes";
         let tree = include_str!(concat!(env!("OUT_DIR"), "/metallibs.toml"));
         let committed = std::fs::read_to_string(dir.join("metallibs.toml"))

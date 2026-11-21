@@ -655,10 +655,14 @@ fn trace_of(script: fn(&mut FakeGuest)) -> String {
 }
 
 /// `trace` against the recorded file `name` beside this one; with `RVG_PEER_RECORD=1`, writes
-/// it there instead.
+/// it there instead, under the crate's directory, which cargo and nextest give the test process:
+/// read at run time, so the test is the same binary in every worktree (docs/development.md,
+/// "Building through kache").
 fn check_recorded(name: &str, recorded: &str, trace: &str) {
     if std::env::var_os("RVG_PEER_RECORD").is_some_and(|v| v == "1") {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let crate_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is unset: run the tests with cargo or nextest");
+        let path = std::path::Path::new(&crate_dir)
             .join("src/device/tests")
             .join(name);
         std::fs::write(&path, trace).unwrap();
