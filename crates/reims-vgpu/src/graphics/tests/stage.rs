@@ -196,10 +196,11 @@ fn a_reset_ends_the_fill_a_dispatch_waits_for() {
     let cancelled = eventually(|| world.stages().cancels() == 1);
     // Where the reset waits for the fill, the fill's end lets it go on.
     let _ = world.stages().end(7, FillEnd::Filled);
-    assert!(cancelled, "the reset waited for the fill a dispatch waits for");
+    assert!(cancelled, "the reset waited for its dispatch's fill");
     assert_eq!(world.stages().refused(), [(THREADS, 7)]);
+    let fills = world.stages().fills();
     assert!(
-        eventually(|| world.stages().fills().fill(7, Site::Dispatch).end().is_none()),
+        eventually(|| fills.fill(7, Site::Dispatch).end().is_none()),
         "the fills stayed suspended past the reset"
     );
     assert_eq!(world.stages().started(), [7, 7]);
