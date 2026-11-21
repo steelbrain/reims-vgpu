@@ -27,6 +27,9 @@
 //! - **The completed handlers' line.** Each look also writes the line of the completed handlers
 //!   that held rt's completion thread (`super::handler_times`), where it changed since the line
 //!   before, whether or not a device is made.
+//! - **The gauges at their highest.** Each look with a device also gives its gauges to the
+//!   counts line's highest (`super::device::note_gauges`), so that while the thread runs those
+//!   are the highest at a 5 s look as well as at the counts' folds.
 
 use std::sync::Once;
 use std::time::Duration;
@@ -129,6 +132,7 @@ pub(super) fn start() {
                     let Some(gauges) = super::device::gauges() else {
                         continue;
                     };
+                    super::device::note_gauges(&gauges);
                     if let Some(line) = lines.next(&gauges) {
                         log::debug!(target: TARGET, "{line}");
                     }

@@ -59,6 +59,15 @@
 //! dropped writes, [`CACHE_WRITES_DROPPED_CODE`], and the bytes written to the directory, its
 //! pipeline cache blob's among them, [`CACHE_BYTES_WRITTEN_CODE`] (`Metrics::cache_bytes_written`),
 //! as amounts: rt counts the writes it kept by their bytes alone.
+//!
+//! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
+//! its places and blocks: the preprocess regions executions of indirect command buffers hold
+//! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
+//! the texture blocks held whole (`texture_block_held_bytes`), and the Private blocks taken and
+//! not given back (`private_take_bytes`). A gauge rises and falls, so the counts line carries the
+//! highest each reached at a look, `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to
+//! it ([`note_gauges`]). The counts' fold looks ([`fold_metrics`]), and so does the gauges' thread
+//! where it runs (`super::gauge_log`, every 5 s).
 
 use std::sync::{Arc, OnceLock};
 
@@ -128,6 +137,30 @@ pub const CACHE_WRITES_DROPPED_CODE: &str = "rt-cache-writes-dropped";
 /// amount on the counts line ([`fold_metrics`]).
 pub const CACHE_BYTES_WRITTEN_CODE: &str = "rt-cache-bytes-written";
 
+/// The code of the most bytes of preprocess regions that executions of indirect command buffers
+/// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
+pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
+
+/// The code of the most bytes of preprocess regions kept idle for the next executions at a look
+/// (`Gauges::preprocess_idle_bytes`, [`note_gauges`]).
+pub const PREPROCESS_IDLE_MOST_CODE: &str = "rt-preprocess-idle-bytes-most";
+
+/// The code of the most bytes of texture blocks held, each whole, at a look
+/// (`Gauges::texture_block_held_bytes`, [`note_gauges`]).
+pub const TEXTURE_BLOCK_HELD_MOST_CODE: &str = "rt-texture-block-held-bytes-most";
+
+/// The code of the most bytes of Private blocks taken and not given back at a look
+/// (`Gauges::private_take_bytes`, [`note_gauges`]).
+pub const PRIVATE_TAKE_MOST_CODE: &str = "rt-private-take-bytes-most";
+
+/// The gauges the counts line carries at their highest ([`highest_gauges`]).
+const HIGHEST_GAUGES: usize = 4;
+
+/// The highest of each of [`highest_gauges`]'s gauges a look saw, in its order, over the
+/// process's devices.
+static GAUGES_HIGHEST: crate::core::sync::Mutex<[u64; HIGHEST_GAUGES]> =
+    crate::core::sync::Mutex::new([0; HIGHEST_GAUGES]);
+
 /// The over-copy metrics the counts line and the trace's `rtcounts` carry ([`over_copy_counts`]):
 /// the over-copies and their bytes, those over an imported block, and the 12 causes' pairs.
 pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
@@ -145,21 +178,60 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
 /// device, its command buffers held for room and its cache writes rose by since the last fold
-/// ([`folded_counts`]), so the counts line carries their totals (the module's docs). Nothing
-/// before the device is made.
+/// ([`folded_counts`]), so the counts line carries their totals, then looks at its gauges
+/// ([`note_gauges`]) (the module's docs). Nothing before the device is made.
 pub fn fold_metrics() {
-    if let Some((counters, folded)) = COUNTERS.lock().as_mut() {
+    let gauges = {
+        let mut latest = COUNTERS.lock();
+        let Some((counters, folded)) = latest.as_mut() else {
+            return;
+        };
         fold(folded, folded_counts(&counters.metrics()));
+        counters.gauges()
+    };
+    note_gauges(&gauges);
+}
+
+/// Looks at `g`, the gauges of the process's device now: counts each of [`highest_gauges`]'s by
+/// its rise over the highest a look saw before, so that the counts line carries the highest (the
+/// module's docs).
+pub(super) fn note_gauges(g: &rt::Gauges) {
+    raise_to(&mut GAUGES_HIGHEST.lock(), highest_gauges(g));
+}
+
+/// The gauges of `g` the counts line carries at their highest, each with its code: the
+/// preprocess regions used ([`PREPROCESS_USED_MOST_CODE`]) and idle
+/// ([`PREPROCESS_IDLE_MOST_CODE`]), the texture blocks held ([`TEXTURE_BLOCK_HELD_MOST_CODE`])
+/// and the Private blocks taken ([`PRIVATE_TAKE_MOST_CODE`]).
+fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
+    [
+        (PREPROCESS_USED_MOST_CODE, g.preprocess_used_bytes),
+        (PREPROCESS_IDLE_MOST_CODE, g.preprocess_idle_bytes),
+        (TEXTURE_BLOCK_HELD_MOST_CODE, g.texture_block_held_bytes),
+        (PRIVATE_TAKE_MOST_CODE, g.private_take_bytes),
+    ]
+}
+
+/// Counts the rise of each gauge of `now` over its highest in `highest` under its code, where it
+/// is higher, and keeps it as the highest.
+fn raise_to(highest: &mut [u64; HIGHEST_GAUGES], now: [(&'static str, u64); HIGHEST_GAUGES]) {
+    for ((code, now), most) in now.into_iter().zip(highest.iter_mut()) {
+        if now > *most {
+            crate::answer::count_kind_by(code, now - *most);
+            *most = now;
+        }
     }
 }
 
 /// Makes `counters`, those of a device just made, the ones [`fold_metrics`] reads. What the
-/// device before it rose by since the last fold is folded first, so that the counts line keeps
-/// its totals after a let-go (`RtPlatform::let_go_of_device`) and adds the new device's.
+/// device before it rose by since the last fold is folded first, and its gauges looked at
+/// ([`note_gauges`]), so that the counts line keeps its totals after a let-go
+/// (`RtPlatform::let_go_of_device`) and adds the new device's.
 fn follow(counters: rt::Counters) {
     let mut latest = COUNTERS.lock();
     if let Some((before, folded)) = latest.as_mut() {
         fold(folded, folded_counts(&before.metrics()));
+        note_gauges(&before.gauges());
     }
     *latest = Some((counters, [0; FOLDED_METRICS]));
 }
@@ -1651,6 +1723,39 @@ mod tests {
             named.iter().all(|code| code.starts_with("rt-over-cop")),
             "{named:?}"
         );
+    }
+
+    /// Four of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by its
+    /// rise over the highest a look saw, so that one that falls leaves its count as it was and
+    /// one that rises past it raises it.
+    #[test]
+    fn four_gauges_count_at_their_highest() {
+        let codes = [
+            PREPROCESS_USED_MOST_CODE,
+            PREPROCESS_IDLE_MOST_CODE,
+            TEXTURE_BLOCK_HELD_MOST_CODE,
+            PRIVATE_TAKE_MOST_CODE,
+        ];
+        let counts = || {
+            let all = crate::answer::degradation_counts();
+            codes.map(|code| (all.iter()).find(|(c, _)| c == code).map_or(0, |&(_, n)| n))
+        };
+        let before = counts();
+        let mut g = rt::Gauges::default();
+        g.preprocess_used_bytes = 4 << 20;
+        g.preprocess_idle_bytes = 64 << 20;
+        g.texture_block_held_bytes = 48 << 20;
+        g.private_take_bytes = 16 << 20;
+        let mut highest = [0; HIGHEST_GAUGES];
+        raise_to(&mut highest, highest_gauges(&g));
+        g.preprocess_used_bytes = 12 << 20;
+        g.preprocess_idle_bytes = 0;
+        g.texture_block_held_bytes = 32 << 20;
+        raise_to(&mut highest, highest_gauges(&g));
+        assert_eq!(highest, [12 << 20, 64 << 20, 48 << 20, 16 << 20]);
+        let after = counts();
+        let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
+        assert_eq!(rose, highest);
     }
 
     /// The counts read the device the process made last ([`follow`]), on the GPU the test holds:
