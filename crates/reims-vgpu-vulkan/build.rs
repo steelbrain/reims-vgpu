@@ -1,9 +1,7 @@
 //! Compiles the library's own shaders, `src/gpu/shaders.metal`, into
 //! `$OUT_DIR/shaders.metallib` with Apple's tools, which `src/gpu/shaders.rs` includes, and the
-//! command predication's step kernel, `src/gpu/predication.metal`, into
-//! `$OUT_DIR/predication.metallib`, which `src/gpu/predication.rs` includes, the vertex function
-//! of the pipeline that ends a pass over a mutable rate map, `src/gpu/no_draw.metal`, into
-//! `$OUT_DIR/no_draw.metallib`, which `src/gpu/rate_map.rs` includes, and the tests' kernel
+//! vertex function of the pipeline that ends a pass over a mutable rate map,
+//! `src/gpu/no_draw.metal`, into `$OUT_DIR/no_draw.metallib`, and the tests' kernel
 //! that encodes indirect commands, `src/gpu/icb_encode.metal`, into `$OUT_DIR/icb_encode.metallib`,
 //! the tests' render functions that read barycentric weights, `src/gpu/barycentric.metal`, into
 //! `$OUT_DIR/barycentric.metallib`, those that read the vertex ID, `src/gpu/vertex_ids.metal`, into
@@ -48,6 +46,12 @@
 //! records the compiler's version and its AIR version and target (`air64_v29-apple-macosx27.2.0`
 //! there, `air64_v28-apple-macosx26.0.0` from Metal 32023.921), so a Mac with another Xcode
 //! writes each file again with the same sources.
+//!
+//! No Rust test loads `no_draw`, `icb_encode`, `barycentric`, `vertex_ids`, `rounding_safe`,
+//! `refused`, `simd_stages`, `depth_denormals`, `slice_write_repro`, `unrasterized`, `icb_color1`,
+//! `spin`, `rgbx`, `argument_probe`, `ci_kernel` or `mesh`: with the rest of `metallibs/`, they are
+//! the corpus of the guest's AIR reader test, `guest/bundle/tests/air_arguments_test.cpp`, which
+//! reads every metallib the directory holds (`RGFX_COMMITTED_METALLIBS`, `make -C guest test`).
 //!
 //! Any other host (Linux) takes the metallibs a Mac compiled instead: those committed in
 //! `metallibs/` beside this file ([`COMMITTED`]), or those in the directory `RVG_METALLIB_DIR`
@@ -98,8 +102,7 @@ const STITCH_TOOL: [&str; 6] = [
 ];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
-const TEST_LIBRARIES: [&str; 24] = [
-    "predication",
+const TEST_LIBRARIES: [&str; 23] = [
     "no_draw",
     "icb_encode",
     "barycentric",
@@ -144,8 +147,7 @@ struct Step {
     sources: Vec<PathBuf>,
     /// Whether its files are the same bytes wherever they are built, so that a build elsewhere
     /// can take them. The import step's ([`imports`]) are not: their install names are paths in
-    /// the building `OUT_DIR`. Only the macOS tests read them (`states::tests::metal_tests`), so a
-    /// build elsewhere goes without them.
+    /// the building `OUT_DIR`. No test reads them, and a build elsewhere goes without them.
     portable: bool,
 }
 
@@ -270,8 +272,7 @@ fn compile(manifest: &Path, out: &Path) -> Result<(), String> {
         xcrun(&COMPILE, &source, &air)?;
         xcrun(&["metallib"], &air, &metallib)?;
     }
-    // The same functions with fast math off, for the tests that compare a draw's blend in both
-    // math modes.
+    // The same functions with fast math off.
     let source = manifest.join("src/gpu/rounding.metal");
     let (air, metallib) = (
         out.join("rounding_safe.air"),
@@ -391,7 +392,7 @@ fn write_record(steps: &[Step], path: &Path) -> Result<(), String> {
 /// exports it, at its own file; `refused_import_other.metallib` against one whose install name's
 /// file, `refused_other.metallib`, exports `other` instead; `refused_import_absent.metallib`
 /// against one whose install name has no file. Metal loads an install name's library as it makes
-/// a pipeline, and so does the runtime (`states::tests`).
+/// a pipeline.
 fn imports(dir: &Path, out: &Path) -> Result<(), String> {
     let source = |name: &str| {
         let path = dir.join(format!("{name}.metal"));
