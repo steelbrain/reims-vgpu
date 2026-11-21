@@ -32,7 +32,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::core::platform::values::{PagesInPlace, PagesPlane};
+use crate::core::platform::values::{BufferDeallocator, PagesInPlace, PagesPlane};
 use crate::core::sync::{Condvar, Mutex, MutexGuard};
 
 use super::calllog::{Arg, CallLog, Event, ReleaseContext};
@@ -653,6 +653,50 @@ fn run_deallocator(deallocator: NoCopyDeallocator) {
     deallocator();
 }
 
+/// A watch on a deallocator handed to a no-copy make, for a test of what a refused make lets go
+/// of (core's `NoCopyDeallocator`): whether the deallocator ran, and on which thread what it
+/// holds was dropped.
+#[derive(Debug, Default)]
+pub struct DeallocatorWatch {
+    ran: AtomicBool,
+    dropped_on: Mutex<Option<std::thread::ThreadId>>,
+}
+
+/// What a watched deallocator holds: it notes the thread it is dropped on.
+struct Watched(Arc<DeallocatorWatch>);
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        *self.0.dropped_on.lock() = Some(std::thread::current().id());
+    }
+}
+
+impl DeallocatorWatch {
+    /// A watch of no deallocator yet.
+    pub fn new() -> Arc<DeallocatorWatch> {
+        Arc::default()
+    }
+
+    /// A deallocator the watch watches: it holds the watch's capture, and notes its run.
+    pub fn deallocator(self: &Arc<Self>) -> NoCopyDeallocator {
+        let watched = Watched(Arc::clone(self));
+        Box::new(move || watched.0.ran.store(true, Ordering::SeqCst))
+    }
+
+    /// [`Self::deallocator`] as a buffer descriptor's, which takes the bytes and the length.
+    pub fn buffer_deallocator(self: &Arc<Self>) -> BufferDeallocator {
+        let watched = Watched(Arc::clone(self));
+        Box::new(move |_, _| watched.0.ran.store(true, Ordering::SeqCst))
+    }
+
+    /// Whether the deallocator was dropped unrun, and on this thread: it never ran, and what it
+    /// holds went here.
+    pub fn dropped_unrun_here(&self) -> bool {
+        let here = Some(std::thread::current().id());
+        !self.ran.load(Ordering::SeqCst) && *self.dropped_on.lock() == here
+    }
+}
+
 /// A counted, type-erased reference to a fake object (what models hold).
 pub struct AnyHandle(Arc<FakeObj>);
 
@@ -929,10 +973,6 @@ pub struct World {
     /// ([`World::run_deallocators_late`]), in the order the objects died; `None` while they run at
     /// the death.
     late_deallocators: Mutex<Option<Vec<NoCopyDeallocator>>>,
-    /// The deallocators of the no-copy buffers the devices refused, kept unrun, in the order
-    /// refused, once a test asks for it ([`World::keep_refused_deallocators`]); `None` while they
-    /// are dropped at the refusal.
-    refused_deallocators: Mutex<Option<Vec<Box<dyn Send>>>>,
     /// The handles let go of while a deallocator ran, each its class and object, in the order
     /// they went ([`World::handles_dropped_in_deallocators`]).
     dropped_in_deallocators: Mutex<Vec<(&'static str, ObjId)>>,
@@ -1078,7 +1118,6 @@ impl World {
             release_dies: Mutex::new(Vec::new()),
             release_holds: Mutex::new(Vec::new()),
             late_deallocators: Mutex::new(None),
-            refused_deallocators: Mutex::new(None),
             dropped_in_deallocators: Mutex::new(Vec::new()),
             held_submissions: Mutex::new(None),
             release_at_commit: AtomicBool::new(false),
@@ -1439,44 +1478,6 @@ impl World {
             run_deallocator(deallocator);
         }
         ran
-    }
-
-    /// From here, keeps the deallocator of each no-copy buffer a device refuses unrun, with all it
-    /// holds, for the world's life, as the Vulkan platform keeps them, since Metal runs no
-    /// deallocator for a buffer it does not make (`rt_platform::buffer`'s `keep_unrun`):
-    /// `newBufferWithBytesNoCopy:length:options:deallocator:`'s, and a no-copy
-    /// `newBufferWithDescriptor:`'s. Until a test asks, each is dropped unrun at the refusal,
-    /// what it holds let go of with it, as a test of the decoder's has it: a deferred block's
-    /// pages view goes with the deallocator of the buffer refused over it
-    /// (`a_deferred_blocks_pages_with_no_view_are_copied`). A heap's over host memory, refused,
-    /// is dropped either way, as the Vulkan platform drops it.
-    pub fn keep_refused_deallocators(&self) {
-        let mut kept = self.refused_deallocators.lock();
-        if kept.is_none() {
-            *kept = Some(Vec::new());
-        }
-    }
-
-    /// How many deallocators of refused no-copy buffers the world keeps unrun
-    /// ([`World::keep_refused_deallocators`]): 0 until a test asks it to keep them.
-    pub fn refused_deallocators(&self) -> usize {
-        self.refused_deallocators
-            .lock()
-            .as_ref()
-            .map_or(0, Vec::len)
-    }
-
-    /// The deallocator of a no-copy buffer a device refused: kept unrun where the world keeps
-    /// them ([`World::keep_refused_deallocators`]), else dropped unrun here, with no lock of the
-    /// world's held.
-    pub(crate) fn refused(&self, deallocator: Box<dyn Send>) {
-        let mut kept = self.refused_deallocators.lock();
-        if let Some(list) = kept.as_mut() {
-            list.push(deallocator);
-            return;
-        }
-        drop(kept);
-        drop(deallocator);
     }
 
     /// The handles let go of while a deallocator ran, on its thread, each its class and object,

@@ -504,6 +504,7 @@ mod tests {
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::resource::{Buffer as _, GpuResource as _, Texture as _};
     use crate::core::platform::values::{OptionSet, TextureDesc};
+    use crate::core::testkit::DeallocatorWatch;
     use crate::rt_platform::RtRefusal;
     use crate::rt_platform::buffer::{IMPORTS_CODE, UNPINNED_CODE};
     use crate::rt_platform::unbuilt::HEAP_TEXTURE_PLACE;
@@ -530,6 +531,26 @@ mod tests {
         (crate::answer::degradation_counts().into_iter())
             .find(|(c, _)| c == code)
             .map_or(0, |(_, n)| n)
+    }
+
+    /// A heap over host memory Metal or rt refuses on the GPU the test holds drops its deallocator
+    /// unrun before the make returns, on the caller's thread ([`over_host_memory`]): a Private
+    /// one, and one over fewer bytes than its size.
+    #[test]
+    fn a_refused_heap_over_host_memory_drops_its_deallocator_unrun_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let memory = vec![0_u8; 0x4000];
+        let bytes = HostRange::of_slice(&memory);
+        for (what, desc) in [
+            ("Private", placement(0x4000, 0x20, None)),
+            ("fewer bytes", placement(0x8000, 0, None)),
+        ] {
+            let watch = DeallocatorWatch::new();
+            let made = device.new_heap_over_host_memory(bytes, &desc, Some(watch.deallocator()));
+            assert!(made.expect("never a raise").heap.is_none(), "{what}");
+            assert!(watch.dropped_unrun_here(), "{what}");
+        }
     }
 
     /// Heaps on the GPU the test holds: a Private one of its own, its buffers at their offsets

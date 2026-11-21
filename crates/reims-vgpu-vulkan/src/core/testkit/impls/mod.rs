@@ -270,17 +270,20 @@ pub fn new_state<C: Kind>(w: &Arc<World>, index: Option<(Space, Option<u64>)>) -
 
 #[cfg(test)]
 mod tests {
-    use super::super::objects::{CompleteOn, GPU_VA_BASE};
+    use super::super::objects::{CompleteOn, DeallocatorWatch, GPU_VA_BASE};
     use super::super::platform::FakePlatform;
     use super::super::script::Step;
     use super::*;
+    use crate::core::platform::HostRange;
     use crate::core::platform::Platform;
     use crate::core::platform::command::{CommandBuffer, CommandQueue};
     use crate::core::platform::device::GpuDevice;
     use crate::core::platform::event::SharedEvent;
     use crate::core::platform::resource::{Buffer, GpuResource, Texture};
     use crate::core::platform::types::{CommandBufferStatus, MtlSize};
-    use crate::core::platform::values::{IcbDesc, RateMapDesc, TextureDesc};
+    use crate::core::platform::values::{
+        BufferDesc, HeapDesc, IcbDesc, OptionSet, RateMapDesc, TextureDesc,
+    };
     use crate::core::raise::OnFault;
 
     /// Buffers get a GPU VA, contents unless private, and refuse past the fake's limit
@@ -481,5 +484,94 @@ mod tests {
         let e = p.device().new_shared_event().unwrap();
         e.set_signaled_value(5).unwrap();
         assert!(e.wait_until_signaled_value(5, 0));
+    }
+
+    /// A no-copy buffer the device refuses, by either maker, nil or raised, drops its deallocator
+    /// unrun before the make returns, on the caller's thread, as the Vulkan platform does (core's
+    /// `NoCopyDeallocator`).
+    #[test]
+    fn a_refused_no_copy_buffer_drops_its_deallocator_unrun() {
+        let p = FakePlatform::new();
+        let d = p.device();
+        let memory = vec![0_u8; 64];
+        let bytes = HostRange::of_slice(&memory);
+        let raise = Step::Raise {
+            name: "NSInvalidArgumentException".to_owned(),
+            reason: "a scripted raise".to_owned(),
+        };
+        for step in [Step::Nil, raise] {
+            let watch = DeallocatorWatch::new();
+            let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
+            p.script().push(sel, step.clone());
+            let made =
+                d.new_buffer_over_host_memory(OnFault::Return, bytes, 0, Some(watch.deallocator()));
+            let refused = made.is_ok_and(|b| b.is_none());
+            assert_eq!(refused, matches!(step, Step::Nil), "{step:?}");
+            assert!(watch.dropped_unrun_here(), "{step:?}");
+
+            let watch = DeallocatorWatch::new();
+            p.script().push("newBufferWithDescriptor:", step.clone());
+            let made = d.new_buffer(BufferDesc {
+                length: 64,
+                options: vec![OptionSet::ResourceOptions(0)],
+                pinned_gpu_address: None,
+                contents: Some(bytes),
+                no_copy: true,
+                deallocator: Some(watch.buffer_deallocator()),
+                zero_from: None,
+            });
+            let refused = made.is_ok_and(|b| b.is_none());
+            assert_eq!(refused, matches!(step, Step::Nil), "{step:?}");
+            assert!(watch.dropped_unrun_here(), "{step:?}");
+        }
+    }
+
+    /// A heap over host memory the device refuses drops its deallocator unrun before the make
+    /// returns, on the caller's thread, as the Vulkan platform does.
+    #[test]
+    fn a_refused_heap_over_host_memory_drops_its_deallocator_unrun() {
+        let p = FakePlatform::new();
+        let d = p.device();
+        let memory = vec![0_u8; 0x4000];
+        let desc = HeapDesc {
+            size: 0x4000,
+            heap_type: 1,
+            options: vec![OptionSet::ResourceOptions(0)],
+            pinned_gpu_address: None,
+        };
+        let watch = DeallocatorWatch::new();
+        p.script().push("newHeapWithDescriptor:", Step::Nil);
+        let bytes = HostRange::of_slice(&memory);
+        let made = d.new_heap_over_host_memory(bytes, &desc, Some(watch.deallocator()));
+        assert!(made.unwrap().heap.is_none());
+        assert!(watch.dropped_unrun_here());
+    }
+
+    /// A rebind the buffer refuses, scripted or of bytes of another length, drops the new bytes'
+    /// deallocator unrun before it returns, on the caller's thread, as the Vulkan platform's
+    /// refusal does, the buffer over its old bytes.
+    #[test]
+    fn a_refused_rebind_drops_its_deallocator_unrun() {
+        let p = FakePlatform::new();
+        let d = p.device();
+        let (old, new) = (vec![0_u8; 64], vec![0_u8; 64]);
+        let made = d.new_buffer_over_host_memory(OnFault::Die, HostRange::of_slice(&old), 0, None);
+        let buffer = made.unwrap().expect("a no-copy buffer");
+        let raise = Step::Raise {
+            name: "NSInvalidArgumentException".to_owned(),
+            reason: "a scripted refusal".to_owned(),
+        };
+        p.script().push("rebindNoCopy", raise);
+        for bytes in [&new[..], &new[..32]] {
+            let watch = DeallocatorWatch::new();
+            let rebound =
+                buffer.rebind_no_copy(HostRange::of_slice(bytes), Some(watch.deallocator()));
+            assert!(rebound.is_err(), "{} bytes", bytes.len());
+            assert!(watch.dropped_unrun_here(), "{} bytes", bytes.len());
+            assert_eq!(
+                buffer.contents(),
+                HostPtr::from_ptr(old.as_ptr().cast_mut())
+            );
+        }
     }
 }

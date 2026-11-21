@@ -242,9 +242,10 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
     }
 
     /// Logged with the new bytes' pointer and length (`rebindNoCopy`); a scripted raise refuses
-    /// it, as does a buffer of no contents or of another length. Otherwise `contents` answers the
-    /// new pointer, the buffer's deallocator runs at once, as the fake holds no import of the old
-    /// bytes, and `deallocator` takes its place.
+    /// it, as does a buffer of no contents or of another length, and a refusal drops `deallocator`
+    /// unrun as it returns, with no lock held. Otherwise `contents` answers the new pointer, the
+    /// buffer's deallocator runs at once, as the fake holds no import of the old bytes, and
+    /// `deallocator` takes its place.
     fn rebind_no_copy(
         &self,
         bytes: HostRange<'_>,

@@ -237,11 +237,9 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                 Some(b)
             },
         );
-        // Refused: kept unrun where the world keeps them, as the Vulkan platform does, else
-        // dropped unrun (`World::keep_refused_deallocators`).
-        if let Some(deallocator) = deallocator {
-            self.world().refused(Box::new(deallocator));
-        }
+        // Refused: dropped unrun here, with no lock of the world's held, as the Vulkan platform
+        // drops it (core's `NoCopyDeallocator`).
+        drop(deallocator);
         made
     }
 
@@ -737,11 +735,9 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             }
             Some(b)
         });
-        // Refused: kept unrun where the world keeps them, as the Vulkan platform does, else
-        // dropped unrun (`World::keep_refused_deallocators`).
-        if let Some(deallocator) = deallocator {
-            self.world().refused(Box::new(deallocator));
-        }
+        // Refused: dropped unrun here, with no lock of the world's held, as the Vulkan platform
+        // drops it (core's `NoCopyDeallocator`).
+        drop(deallocator);
         made
     }
 

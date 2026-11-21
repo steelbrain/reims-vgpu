@@ -2691,6 +2691,7 @@ mod tests {
     use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::values::{OptionSet, TextureDesc};
+    use crate::core::testkit::DeallocatorWatch;
     use crate::rt_platform::RtRefusal;
 
     /// A buffer's options: Shared, Private and Managed, Metal's default hazard tracking answered
@@ -3021,6 +3022,86 @@ mod tests {
             .new_texture(on, &descriptor, 0, 256)
             .expect("never a raise");
         assert!(texture.is_some());
+    }
+
+    /// A buffer descriptor of `length` bytes and `options`, over `contents` where given,
+    /// `no_copy` as given, with no deallocator.
+    fn described(
+        contents: Option<HostRange<'_>>,
+        length: u64,
+        no_copy: bool,
+        options: u64,
+    ) -> BufferDesc<'_> {
+        BufferDesc {
+            length,
+            options: vec![OptionSet::ResourceOptions(options)],
+            pinned_gpu_address: None,
+            contents,
+            no_copy,
+            deallocator: None,
+            zero_from: None,
+        }
+    }
+
+    /// A no-copy buffer Metal or rt refuses on the GPU the test holds drops its deallocator unrun
+    /// before the make returns, on the caller's thread ([`let_go_unrun`]): over host memory, a
+    /// Private one and one of no bytes; through a descriptor, one of fewer contents than its
+    /// length, one of none, one with a deallocator that is not no-copy, and a Private one.
+    #[test]
+    fn a_refused_no_copy_buffer_drops_its_deallocator_unrun_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let memory = vec![0_u8; 0x1000];
+        for (bytes, options) in [(&memory[..], 0x20), (&memory[..0], 0)] {
+            let watch = DeallocatorWatch::new();
+            let bytes = HostRange::of_slice(bytes);
+            let made =
+                device.new_buffer_over_host_memory(on, bytes, options, Some(watch.deallocator()));
+            let what = format!("{options:#x}, {} bytes", bytes.len());
+            assert!(made.expect("never a raise").is_none(), "{what}");
+            assert!(watch.dropped_unrun_here(), "{what}");
+        }
+        let bytes = Some(HostRange::of_slice(&memory));
+        for (what, desc) in [
+            ("fewer contents", described(bytes, 0x2000, true, 0)),
+            ("no contents", described(None, 64, true, 0)),
+            ("not no-copy", described(bytes, 64, false, 0)),
+            ("Private", described(bytes, 64, true, 0x20)),
+        ] {
+            let watch = DeallocatorWatch::new();
+            let desc = BufferDesc {
+                deallocator: Some(watch.buffer_deallocator()),
+                ..desc
+            };
+            assert!(
+                device.new_buffer(desc).expect("never a raise").is_none(),
+                "{what}"
+            );
+            assert!(watch.dropped_unrun_here(), "{what}");
+        }
+    }
+
+    /// A rebind on the GPU the test holds, which the platform refuses (core's default), drops the
+    /// new bytes' deallocator unrun before it returns, on the caller's thread, the buffer over its
+    /// old bytes.
+    #[test]
+    fn a_refused_rebind_drops_its_deallocator_unrun_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let made = device.new_buffer_of_length(OnFault::Return, 64, 0);
+        let buffer = made.expect("never a raise").expect("a buffer");
+        let contents = buffer.contents();
+        let memory = vec![0_u8; 64];
+        let watch = DeallocatorWatch::new();
+        let bytes = HostRange::of_slice(&memory);
+        assert!(
+            buffer
+                .rebind_no_copy(bytes, Some(watch.deallocator()))
+                .is_err()
+        );
+        assert!(watch.dropped_unrun_here());
+        assert_eq!(buffer.contents(), contents);
     }
 
     /// Runs `cmds` in a blit encoder of a new command buffer of `queue`, and waits for it.
