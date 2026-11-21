@@ -940,7 +940,8 @@ mod tests {
         let library = device.new_library(bytes).expect("never a raise");
         let library = library.expect("a metallib").expect("a library");
         let made = library.new_function(OnFault::Return, name);
-        made.expect("never a raise").expect("a function of the table")
+        made.expect("never a raise")
+            .expect("a function of the table")
     }
 
     /// The state of `render_vdesc` and `fragment` on `device`, into one `RGBA8Unorm` colour
