@@ -109,10 +109,18 @@ Stages:
      readbacks) reaches VRAM by the host's own GPU copies.
    - The guest maps memory only where Metal gives the app a pointer:
      `contents` of Shared and Managed buffers, and IOSurfaces the CPU locks.
-     That memory is plain anonymous host memory, zeroed with stores, imported
-     into Vulkan by pointer and mapped into the BAR. KVM maps it like guest
-     RAM on any kernel, and the host GPU reads it in place. The staging rings
-     live there too.
+     That memory is the runtime's Shared blocks: host-cached system memory
+     the host's driver allocates, which QEMU maps into the device's pool
+     range a block at a time (`crates/reims-vgpu/src/pool.rs`), and which the
+     host GPU reads in place. The staging rings live there too.
+   - Under KVM that needs Linux 6.13 or later. Before 6.13, KVM maps a page
+     of a driver's mapping only where it can take a reference on the page,
+     and the drivers on TTM (amdgpu among them) allocate higher-order pages
+     whose tail pages have none, so the guest's first write to them stops
+     its vCPU ("kvm run failed Bad address"; read from Linux 6.12's
+     `hva_to_pfn_remapped` and `ttm_pool_alloc_page`). reims-ctl refuses a
+     start on an older kernel (`MIN_KVM_KERNEL` in
+     `crates/reims-ctl/src/runtime.rs`).
    - Real discrete Macs keep Shared in system memory, so this is Metal's
      discrete model.
    - IOSurfaces are the one place the host reaches guest RAM: where the

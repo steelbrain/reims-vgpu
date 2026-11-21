@@ -1637,6 +1637,17 @@ fn doctor(host: Host) -> Result<i32> {
     // KVM and the library's needs, for the x86-64 VMs Linux runs; KVM alone for the arm64 VMs
     // arm64 Linux runs.
     let vms = registered_vms();
+    if host.os == crate::host::Os::Linux
+        && profile.accel(host) == "kvm"
+        && let Some(v) = runtime::host_kernel()
+    {
+        let problem = runtime::kernel_problem(v);
+        line(
+            problem.is_none(),
+            "kernel",
+            problem.unwrap_or_else(|| format!("Linux {}.{}", v.0, v.1)),
+        );
+    }
     match host.os {
         crate::host::Os::Linux if profile.accel(host) == "kvm" && profile != Profile::Q35X86_64 => {
             let (ok, detail) = kvm_check(host, &vms);

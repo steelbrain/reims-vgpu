@@ -31,6 +31,10 @@ x86-64 macOS needs an x86-64 Linux host or an x86-64 Windows PC. Our drivers loa
 and later for now; we've tested macOS 26 on an RTX 5080 laptop GPU and a Radeon 780M on Linux, and
 on an Intel UHD 630 on Windows 11.
 
+On Linux, a VM on our virtual GPU needs Linux 6.13 or later. An older kernel's KVM can't map the
+GPU's memory into the guest, so the VM hangs at boot. `reims-ctl` won't start one on an older
+kernel, and `reims-ctl doctor` shows the kernel it found.
+
 arm64 macOS 14 to 27 runs on QEMU too, with Ambrosia, our own arm64 firmware, and the same virtual
 GPU. On an Apple silicon Mac it runs under HVF, macOS's hypervisor, and on arm64 Linux under KVM.
 An x86-64 Linux host runs arm64 VMs as well, with QEMU emulating the CPU (TCG), which is much
@@ -230,7 +234,7 @@ it needs itself; working on the code needs the following.
 ### Requirements
 
 - A Linux host for the library and for VMs (on x86-64, x86-64 VMs under KVM and arm64 VMs under
-  TCG; on arm64, arm64 VMs under KVM), and an Apple silicon Mac for the metallibs and the guest's
+  TCG; on arm64, arm64 VMs under KVM; KVM's VMs need Linux 6.13 or later), and an Apple silicon Mac for the metallibs and the guest's
   kexts, where arm64 VMs run under HVF. Every Rust binary built on the Mac is arm64
   (`aarch64-apple-darwin`): rustc's arm64e target has no pointer authentication, and its binaries
   crash before `main` (`rust-toolchain.toml`).
