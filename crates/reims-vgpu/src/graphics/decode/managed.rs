@@ -102,6 +102,7 @@ use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlRegion, MtlSize, Ns
 use reims_vgpu_vulkan::core::platform::values::{BufferDesc, OptionSet};
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::surface_pages::TEARDOWN;
 use super::tables::{Entry, GuestBytes};
@@ -170,8 +171,10 @@ pub(crate) struct ManagedCopy<P: Platform> {
 /// deallocator, so the bytes stay mapped until then ([`GraphicsDecoder::buffer_over_bytes`]).
 enum BytesHold<P: Platform> {
     /// The `Shared` buffer whose contents the bytes are (`MANAGED_BUFFER_CREATE`), which holds
-    /// what keeps them mapped: its block of the region, its heap, or a pages block's view.
-    Buffer(CopyBufferHold<P>),
+    /// what keeps them mapped: its block of the region, its heap, or a pages block's view. Shared
+    /// with the create, which takes it back where the platform refuses the buffer
+    /// ([`CopyBufferHold`]).
+    Buffer(Arc<Mutex<Option<CopyBufferHold<P>>>>),
     /// What keeps the bytes of the heap they lie in mapped, where it lies over any but the
     /// region's ([`Entry::ram_kept`], `BUFFER_MANAGED_AT_OFFSET`).
     Kept {
@@ -197,6 +200,14 @@ enum BytesHold<P: Platform> {
 /// platform's handle of it and rt's own, and rt tears a device down only once every handle of it
 /// and of every object made from it is gone, so a hold still in a release keeps its device from
 /// teardown until the release has run and the worker has let go of the buffer.
+///
+/// Where the platform refuses the no-copy buffer, it may keep the deallocator unrun for good,
+/// with all it holds: the Vulkan platform does, as Metal runs no deallocator for a buffer it does
+/// not make (`rt_platform::buffer`'s `keep_unrun`). A buffer kept so would hold its device for
+/// good, past the platform's let-go of it. So the create takes the hold back from the slot it
+/// shares with the deallocator once the platform's call has returned, outside every callback of
+/// rt's, and lets go of it as any hold goes, the buffer on the surface worker; the deallocator
+/// keeps an emptied slot. The guest sees nothing of it: its CPU copy's object holds the buffer.
 struct CopyBufferHold<P: Platform> {
     /// The CPU copy's guest object, which names it where its release is refused.
     obj_id: u64,
@@ -532,15 +543,23 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cpu = cpu.clone_ref();
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
         let kind = super::unkept::Kind::managed(self.unified());
-        let keep = BytesHold::Buffer(CopyBufferHold {
+        let hold = Arc::new(Mutex::new(Some(CopyBufferHold {
             obj_id: m.cpu_buffer_obj_id,
             buffer: Some(cpu),
             worker: Arc::clone(&self.shared.surface_worker),
-        });
-        let Some(buffer) = kind.making(|| {
+        })));
+        let keep = BytesHold::Buffer(Arc::clone(&hold));
+        let made = kind.making(|| {
             self.buffer_over_bytes(device, bytes, m.length, options, pin, keep, zero_from)
-        })?
-        else {
+        });
+        // Refused: the hold is taken back from a deallocator the platform may keep unrun
+        // ([`CopyBufferHold`]).
+        if !matches!(made, Ok(Some(_))) {
+            let taken = hold.lock().take();
+            drop(taken);
+        }
+        drop(hold);
+        let Some(buffer) = made? else {
             return Ok(Err(DecodeError::Refused));
         };
         let made = buffer.gpu_address();
@@ -2615,6 +2634,48 @@ mod tests {
             );
             assert!(r.dec.named(obj_id).is_none());
         }
+    }
+
+    /// Where the platform refuses a `MANAGED_BUFFER_CREATE`'s buffer and keeps its deallocator
+    /// unrun, as the Vulkan platform does (the testkit's, `World::refused_deallocators`), the
+    /// create lets go of the CPU copy's buffer it handed the deallocator, wherever the copy lies,
+    /// so no handle of the platform's is kept for good; what else the deallocator holds is kept
+    /// with it, the region among it, and no deallocator runs.
+    #[test]
+    fn a_refused_managed_buffer_lets_go_of_its_cpu_copy_s_buffer_and_runs_no_deallocator() {
+        let (mut r, ram, page) = pages_rig();
+        let copies = shared_copies(&mut r, &ram, page);
+        let refused = r.p.world().refused_deallocators();
+        for (i, (cpu, _)) in copies.into_iter().enumerate() {
+            let obj_id = 60 + i as u64;
+            let buffer = match r.dec.named(cpu) {
+                Some(ObjHandle::Buffer(b)) => Arc::clone(b.obj()),
+                _ => panic!("no buffer {cpu:#x}"),
+            };
+            r.dec.surface_worker().flush();
+            let (handles, regions) = (buffer.handle_count(), Arc::strong_count(&r.region));
+            r.p.script().push("newBufferWithDescriptor:", Step::Nil);
+            assert_eq!(
+                r.send(&managed_over(obj_id, cpu, 0x300, MANAGED)),
+                Err(DecodeError::Refused),
+                "copy {cpu}"
+            );
+            r.dec.surface_worker().flush();
+            assert_eq!(buffer.handle_count(), handles, "copy {cpu}: let go of");
+            assert_eq!(
+                r.p.world().refused_deallocators(),
+                refused + i + 1,
+                "copy {cpu}: its deallocator kept unrun"
+            );
+            assert_eq!(
+                Arc::strong_count(&r.region),
+                regions + 1,
+                "copy {cpu}: the region kept with it"
+            );
+            assert!(r.dec.named(cpu).is_some(), "copy {cpu}: its object kept");
+        }
+        let dropped = r.p.world().handles_dropped_in_deallocators();
+        assert!(dropped.is_empty(), "{dropped:?}");
     }
 
     /// A `MANAGED_BUFFER_CREATE` names a `Shared` buffer over the guest's memory the sender

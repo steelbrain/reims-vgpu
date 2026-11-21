@@ -219,7 +219,8 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
         let (pointer, length) = (bytes.ptr(), bytes.len());
-        self.make(
+        let mut deallocator = deallocator;
+        let made = self.make(
             Policy::On(on),
             "newBufferWithBytesNoCopy:length:options:deallocator:",
             vec![
@@ -231,11 +232,16 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             |w| {
                 let b = new_buffer(w, length, options, Backing::At(pointer), None)?;
                 if let Model::Buffer(m) = &mut b.state().model {
-                    m.deallocator = deallocator;
+                    m.deallocator = deallocator.take();
                 }
                 Some(b)
             },
-        )
+        );
+        // Refused: kept unrun, as the Vulkan platform keeps it (`World::refused_deallocators`).
+        if let Some(deallocator) = deallocator {
+            self.world().refused(Box::new(deallocator));
+        }
+        made
     }
 
     fn new_buffer_of_length(
@@ -719,17 +725,22 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             length,
             pinned_gpu_address,
             contents,
-            deallocator,
+            mut deallocator,
             ..
         } = desc;
-        self.make(Policy::Caught, "newBufferWithDescriptor:", vec![arg], |w| {
+        let made = self.make(Policy::Caught, "newBufferWithDescriptor:", vec![arg], |w| {
             let backing = contents.map_or(Backing::Fresh, |c| Backing::At(c.ptr()));
             let b = new_buffer(w, length, opts, backing, w.kept_pin(pinned_gpu_address))?;
             if let Model::Buffer(m) = &mut b.state().model {
-                m.desc_deallocator = deallocator.map(DescDeallocator);
+                m.desc_deallocator = deallocator.take().map(DescDeallocator);
             }
             Some(b)
-        })
+        });
+        // Refused: kept unrun, as the Vulkan platform keeps it (`World::refused_deallocators`).
+        if let Some(deallocator) = deallocator {
+            self.world().refused(Box::new(deallocator));
+        }
+        made
     }
 
     /// A heap of the value's size, with its options folded as Metal's heap descriptor folds

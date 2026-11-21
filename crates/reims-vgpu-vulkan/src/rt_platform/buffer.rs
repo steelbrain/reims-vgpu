@@ -1316,7 +1316,10 @@ fn run(slot: &Slot) {
 }
 
 /// The deallocator in `slot`, never to run: taken out, and its captures kept for good, as Metal
-/// runs none for a buffer it does not make.
+/// runs none for a buffer it does not make. A caller lets go itself of what it handed one that is
+/// not to be kept so, a handle of the platform's among it, once the make answered nil (the
+/// reims-graphics decoder's `MANAGED_BUFFER_CREATE`): rt holds nothing of ours after an `Err`,
+/// and its call has returned by then.
 fn keep_unrun(slot: &Slot) {
     if let Some(deallocator) = slot.lock().take() {
         std::mem::forget(deallocator);

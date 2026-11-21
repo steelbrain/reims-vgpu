@@ -929,6 +929,9 @@ pub struct World {
     /// ([`World::run_deallocators_late`]), in the order the objects died; `None` while they run at
     /// the death.
     late_deallocators: Mutex<Option<Vec<NoCopyDeallocator>>>,
+    /// The deallocators of the no-copy buffers the devices refused, kept unrun, in the order
+    /// refused ([`World::refused_deallocators`]).
+    refused_deallocators: Mutex<Vec<Box<dyn Send>>>,
     /// The handles let go of while a deallocator ran, each its class and object, in the order
     /// they went ([`World::handles_dropped_in_deallocators`]).
     dropped_in_deallocators: Mutex<Vec<(&'static str, ObjId)>>,
@@ -1074,6 +1077,7 @@ impl World {
             release_dies: Mutex::new(Vec::new()),
             release_holds: Mutex::new(Vec::new()),
             late_deallocators: Mutex::new(None),
+            refused_deallocators: Mutex::new(Vec::new()),
             dropped_in_deallocators: Mutex::new(Vec::new()),
             held_submissions: Mutex::new(None),
             release_at_commit: AtomicBool::new(false),
@@ -1434,6 +1438,22 @@ impl World {
             run_deallocator(deallocator);
         }
         ran
+    }
+
+    /// How many no-copy buffers the devices refused, their deallocators kept unrun with all they
+    /// hold for the world's life, as the Vulkan platform keeps them, since Metal runs no
+    /// deallocator for a buffer it does not make (`rt_platform::buffer`'s `keep_unrun`):
+    /// `newBufferWithBytesNoCopy:length:options:deallocator:`'s, and a no-copy
+    /// `newBufferWithDescriptor:`'s. A heap's over host memory, refused, is dropped, as the
+    /// Vulkan platform drops it.
+    pub fn refused_deallocators(&self) -> usize {
+        self.refused_deallocators.lock().len()
+    }
+
+    /// Keeps the deallocator of a no-copy buffer a device refused, unrun
+    /// ([`World::refused_deallocators`]).
+    pub(crate) fn refused(&self, deallocator: Box<dyn Send>) {
+        self.refused_deallocators.lock().push(deallocator);
     }
 
     /// The handles let go of while a deallocator ran, on its thread, each its class and object,
