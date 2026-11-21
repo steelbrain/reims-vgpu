@@ -2341,4 +2341,112 @@ mod tests {
         let words = unsafe { std::slice::from_raw_parts(sampled.contents().as_ptr::<u32>(), 4) };
         assert_eq!(words.to_vec(), vec![0u32; 4], "zero through a sample");
     }
+
+    /// On the GPU the test holds, kept busy: a texture released while command buffers are in
+    /// flight goes once the work committed before its release completes, while later work still
+    /// runs. The test keeps `DEPTH` command buffers of buffer fills in flight, each completing,
+    /// committing the next once the oldest completes, and releases `PER` textures no work reads
+    /// after each commit, so the GPU never idles. At the load's end, rt keeps at most the
+    /// textures released for the command buffers in flight and those of 12 command buffers more,
+    /// for its threads' lag, far fewer than the load released; and once the work is done, its
+    /// textures and releases waiting come back to where they started.
+    #[test]
+    fn released_textures_go_while_the_gpu_stays_busy_on_vulkan() {
+        use std::time::Duration;
+
+        use crate::core::num::ToU64 as _;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::types::CommandBufferStatus;
+        use crate::core::raise::OnFault;
+        use crate::rt_platform::RtCommandBuffer;
+        // Command buffers in flight, textures released after each commit, and commits.
+        const DEPTH: usize = 3;
+        const PER: usize = 50;
+        const ROUNDS: usize = 60;
+        // Each command buffer fills a Private buffer of `FILL` bytes `FILLS` times: a GiB.
+        const FILL: u64 = 32 << 20;
+        const FILLS: usize = 32;
+        let on = OnFault::Return;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let queue = device.new_command_queue().expect("a command queue");
+        // rt's textures and releases waiting now.
+        let gauges = || {
+            let gauges = device.rt().counters().gauges();
+            (gauges.textures, gauges.releases_waiting)
+        };
+        let filled = device.new_buffer_of_length(on, FILL, STORAGE_PRIVATE);
+        let filled = filled.expect("never a raise").expect("a buffer");
+        let desc = platform.texture_descriptor(&TextureDesc {
+            width: 64,
+            height: 64,
+            resource_options: Some(STORAGE_PRIVATE),
+            ..TextureDesc::default()
+        });
+        let start = gauges();
+        let made = |_| {
+            let made = device.new_texture(on, &desc).expect("never a raise");
+            made.expect("a texture")
+        };
+        let mut textures: Vec<RtObj<RtTexture>> = (0..ROUNDS * PER).map(made).collect();
+        // rt's textures a texture of ours makes.
+        let each = (gauges().0 - start.0) / (ROUNDS * PER).to_u64();
+        assert!(each >= 1, "rt counts the textures made");
+        let waited = |commands: &RtObj<RtCommandBuffer>| {
+            assert_eq!(commands.wait_until_completed(on), Ok(()));
+            assert_eq!(commands.status(), CommandBufferStatus::COMPLETED);
+        };
+        let mut flight = VecDeque::new();
+        // The most textures rt kept after the test released them, at a commit.
+        let mut most = 0;
+        for _ in 0..ROUNDS {
+            let commands = queue.command_buffer(on).expect("never a raise");
+            let commands = commands.expect("a command buffer");
+            let encoder = commands.blit_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a blit encoder");
+            for _ in 0..FILLS {
+                let fill = BlitCmd::FillBuffer {
+                    buffer: &filled,
+                    range: NsRange::new(0, FILL),
+                    value: 0x5a,
+                };
+                assert_eq!(encoder.encode(on, fill), Ok(()));
+            }
+            assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+            assert_eq!(commands.commit(on), Ok(()));
+            flight.push_back(commands);
+            textures.truncate(textures.len() - PER);
+            if flight.len() == DEPTH {
+                waited(&flight.pop_front().expect("the oldest in flight"));
+            }
+            let held = start.0 + each * textures.len().to_u64();
+            let kept = gauges().0.saturating_sub(held);
+            most = most.max(kept);
+        }
+        let end = gauges();
+        let kept = end.0.saturating_sub(start.0);
+        for commands in &flight {
+            waited(commands);
+        }
+        // Every 10 ms, up to 1000 times (about 10 s).
+        for _ in 0..1000 {
+            if gauges() == start {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after = gauges();
+        let bound = each * ((DEPTH + 12) * PER).to_u64();
+        assert!(
+            kept <= bound,
+            "rt kept {kept} of the {} textures released under the load, at most {bound} for the \
+             work in flight: {} releases waiting, at most {most} kept at a commit; from {start:?} \
+             (textures, releases waiting), {after:?} once the work was done",
+            each * (ROUNDS * PER).to_u64(),
+            end.1,
+        );
+        assert_eq!(after, start, "rt's gauges once the work was done");
+    }
 }
