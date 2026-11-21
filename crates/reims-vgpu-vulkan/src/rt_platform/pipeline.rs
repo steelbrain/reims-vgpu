@@ -17,11 +17,11 @@
 //!   platform's own (`super::texture`'s `OwnIndices`, the sampler states' own, which never takes
 //!   an index the guest reserved). rt places a constexpr sampler's device samplers at its index;
 //!   the read and write samplers take nothing there. A state gives its indices back as it goes,
-//!   after rt's state: an index whose last holder goes is the platform's again. Every command
-//!   buffer that set the state keeps it until it completes (`super::command`'s `Kept`), so none
-//!   that reads an index through it is unfinished as the index goes back, which gives back no
-//!   reads (`super::texture`'s `IndexUse`). Where none is free, the creation is refused
-//!   (`rt-refused-limit`).
+//!   after rt's state: an index whose last holder goes is the platform's again, taken once every
+//!   command buffer committed before then has completed, as any of its own
+//!   (`super::texture`'s `OwnIndices::give_back`). Every command buffer that set the state keeps
+//!   it until it completes (`super::command`'s `Kept`). Where none is free, the creation is
+//!   refused (`rt-refused-limit`).
 //! - **Its answers.** `maxTotalThreadsPerThreadgroup`, `staticThreadgroupMemoryLength`,
 //!   `threadExecutionWidth` (32, the SIMD-group width rt runs every kernel's SIMD groups at),
 //!   `supportIndirectCommandBuffers` (NO: rt refuses a compute state for indirect command
@@ -102,10 +102,6 @@ const STRIDE_DYNAMIC: u64 = u64::MAX;
 /// The next `uniqueIdentifier` a state takes.
 static NEXT_IDENTIFIER: AtomicU64 = AtomicU64::new(1);
 
-/// What takes a sampler index of the platform's own for a state's sampler, as the boot
-/// diagnostics name the take (`super::texture`'s `OwnIndices::take`).
-const CONSTEXPR_SAMPLER: &str = "a pipeline state's sampler";
-
 /// The sampler indices the live pipeline states' samplers hold (the module's docs): each sampler
 /// a live state numbers, with its index and how many of the live states' samplers hold it.
 #[derive(Default)]
@@ -143,7 +139,7 @@ impl Numbering {
                 indices.push(h.index);
                 continue;
             }
-            let taken = own.take(device, CONSTEXPR_SAMPLER);
+            let taken = own.take(device);
             let Ok(Some(index)) = taken else {
                 give_back(&mut held, own, samplers.get(..at).unwrap_or_default());
                 return taken.map(|_| None);
@@ -172,7 +168,7 @@ fn give_back(
         };
         h.holders = h.holders.saturating_sub(1);
         if h.holders == 0 {
-            own.give_back(h.index, None);
+            own.give_back(h.index);
             held.remove(sampler);
         }
     }

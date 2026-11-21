@@ -7955,9 +7955,10 @@ mod tests {
     /// shared event its name keeps past the process's close. The close's worker lets go of the
     /// two while the buffer waits, giving their indices back. With each class's range three
     /// indices from there, and a spare of each given back after the close, its last owner read by
-    /// no buffer, the takes get the last fresh index and the spare's, then none: the closed
-    /// process's are passed over. Once the unname sets the event past every value and the close's
-    /// drain is answered, the buffer done, a take gets each of them.
+    /// no buffer, the takes get the last fresh index, then none: the closed process's and the
+    /// spare's wait, each given back after the buffer was committed. Once the unname sets the event
+    /// past every value and the close's drain is answered, the buffer done, a take gets each of
+    /// them, in the order they were given back.
     #[test]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn on_vulkan_rt_s_own_indices_wait_for_a_closed_process_s_running_buffer() {
@@ -8012,14 +8013,13 @@ mod tests {
             let made = (texture(), sampler());
             (made.0.expect("a texture"), made.1.expect("a sampler state"))
         };
-        // Each class's takes counted while their last owner's reads were unfinished, takes of
-        // indices given back and give-backs, since the test's start.
-        let counts = |own: &OwnIndices| [own.reused(), own.taken_again(), own.given_back()];
+        // Each class's takes of indices given back and give-backs, since the test's start.
+        let counts = |own: &OwnIndices| [own.taken_again(), own.given_back()];
         let classes = || [counts(device.indices()), counts(device.sampler_indices())];
         let base = classes();
         let since = || {
             let now = classes();
-            [0usize, 1].map(|c| [0usize, 1, 2].map(|k| now[c][k] - base[c][k]))
+            [0usize, 1].map(|c| [0usize, 1].map(|k| now[c][k] - base[c][k]))
         };
 
         // Process 1: its queue, its shared event, named, and the two the buffer binds.
@@ -8091,7 +8091,7 @@ mod tests {
         let buffer = command_buffer_on(obj(1), obj(20), &ops);
         assert_eq!(dec.decode(&device, &buffer).unwrap(), Ok(()));
         dec.set_context(None);
-        assert_eq!(since(), [[0, 0, 0]; 2]);
+        assert_eq!(since(), [[0, 0]; 2]);
 
         // Its close, as a `CONTEXT_CLOSE` makes it, the buffer waiting: the close worker lets go
         // of the two, giving their indices back, and the drain answers once the buffer is done.
@@ -8102,26 +8102,21 @@ mod tests {
         let drain = dec.drain_context(1, true, answer);
         dec.let_go_later(closed, drain);
         dec.closes_let_go();
-        assert_eq!(since(), [[0, 0, 1]; 2]);
-        // The spare of each is given back after them: the takes get the last fresh index and the
-        // spare's, then none.
+        assert_eq!(since(), [[0, 1]; 2]);
+        // The spare of each is given back after them, the buffer committed before it too: the
+        // takes get the last fresh index, then none.
         drop(spare);
         let fresh = made();
-        let again = made();
-        assert_eq!(
-            (again.0.resource_index(), again.1.resource_index()),
-            spare_at
-        );
         let (t, s) = (texture(), sampler());
         assert!(
             t.is_none() && s.is_none(),
-            "an index taken that the closed process's buffer reads"
+            "an index taken while a buffer committed before its give-back runs"
         );
         assert!(
             !drained.load(Ordering::Acquire),
             "drained before the buffer ran"
         );
-        assert_eq!(since(), [[0, 1, 2]; 2]);
+        assert_eq!(since(), [[0, 2]; 2]);
 
         // The unname sets the event past every value: the buffer runs and completes, and its
         // indices are taken again.
@@ -8144,7 +8139,12 @@ mod tests {
         }
         let last = made();
         assert_eq!((last.0.resource_index(), last.1.resource_index()), read_at);
-        assert_eq!(since(), [[0, 2, 2]; 2]);
+        let again = made();
+        assert_eq!(
+            (again.0.resource_index(), again.1.resource_index()),
+            spare_at
+        );
+        assert_eq!(since(), [[2, 2]; 2]);
         drop((fresh, again, last));
     }
 

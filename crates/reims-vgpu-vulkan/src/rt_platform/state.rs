@@ -8,17 +8,15 @@
 //!   takes the guest's index, from the guest's reservation (`reserveResourceIndicesForResourceType:`
 //!   of type 1); one it does not place takes one of the platform's own (`super::texture`'s
 //!   `OwnIndices`, of the sampler class), as a texture does: the highest index no reservation holds
-//!   and no state of the platform's took yet, then the one given back longest ago, a take while a
-//!   command buffer whose encoders bound the index's last owner is unfinished counted for the boot
-//!   diagnostics (`super::texture`'s `IndexUse`). Its `gpuResourceID` is rt's, the index and the
+//!   and no state of the platform's took yet, then the one given back longest ago once every
+//!   command buffer committed before its give-back has completed (`super::texture`'s
+//!   `OwnIndices::give_back`). Its `gpuResourceID` is rt's, the index and the
 //!   translator's word of its descriptor, and its `resourceIndex` the index.
 //!   `supportArgumentBuffers` changes nothing: every state has an index. rt refuses a cubic filter
 //!   (`rt-refused-gap`), and a state past the device's samplers (`rt-refused-limit`): nil, counted.
 //! - **A depth-stencil state** is rt's, which holds no Vulkan object: a draw under it sets its
 //!   tests as dynamic state. Its `gpuResourceID` is 0 and its `resourceIndex` raises, as the
 //!   host's stubs answer below Apple10 (measured on the M3 Max).
-
-use std::sync::Arc;
 
 use metal2vulkan_runtime as rt;
 
@@ -29,7 +27,7 @@ use crate::core::raise::{Raise, RaiseResult};
 
 use super::RtObj;
 use super::device::RtDevice;
-use super::texture::{IndexUse, refused_metal};
+use super::texture::refused_metal;
 use super::unbuilt::{RtRefusal, refused_as, rt_refused_create};
 
 /// `newSamplerStateWithDescriptor:`.
@@ -46,17 +44,12 @@ pub struct RtSampler {
     device: RtObj<RtDevice>,
     /// Its index where it is one of the platform's own, which its drop gives back.
     own: Option<u32>,
-    /// What reads it through that index (`super::texture::IndexUse`), which goes back with it;
-    /// `None` where it has none of the platform's own.
-    read: Option<Arc<IndexUse>>,
 }
 
 impl Drop for RtSampler {
     fn drop(&mut self) {
         if let Some(index) = self.own {
-            self.device
-                .sampler_indices()
-                .give_back(index, self.read.take());
+            self.device.sampler_indices().give_back(index);
         }
     }
 }
@@ -65,12 +58,6 @@ impl RtSampler {
     /// rt's state.
     pub fn rt(&self) -> &rt::SamplerState {
         &self.rt
-    }
-
-    /// What reads it through its index, where that is one of the platform's own
-    /// (`super::texture::IndexUse`), which a command buffer whose work reads it so notes.
-    pub(super) fn index_use(&self) -> Option<&Arc<IndexUse>> {
-        self.read.as_ref()
     }
 }
 
@@ -182,7 +169,7 @@ pub fn new_sampler_state(device: &RtObj<RtDevice>, desc: &SamplerDesc) -> Option
         Err(why) => return refused_metal(SAMPLER, &why),
     };
     let (index, own) = match desc.resource_index.unwrap_or(0) {
-        0 => match device.sampler_indices().take(device.rt(), SAMPLER) {
+        0 => match device.sampler_indices().take(device.rt()) {
             Ok(Some(index)) => (index, Some(index)),
             Ok(None) => {
                 crate::core::platform::device::note_relayed_gap();
@@ -207,12 +194,11 @@ pub fn new_sampler_state(device: &RtObj<RtDevice>, desc: &SamplerDesc) -> Option
                 rt: made,
                 device: device.clone_ref(),
                 own,
-                read: own.map(|_| IndexUse::new(super::diag::OwnMade::sampler(SAMPLER))),
             }))
         }
         Err(error) => {
             if let Some(index) = own {
-                device.sampler_indices().give_back(index, None);
+                device.sampler_indices().give_back(index);
             }
             rt_refused_create(SAMPLER, &error);
             None

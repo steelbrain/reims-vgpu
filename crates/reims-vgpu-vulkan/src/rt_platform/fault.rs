@@ -95,6 +95,11 @@
 //! id ([`Ids`]). An encoder's names join its command buffer's as it ends, or as it goes unended
 //! ([`Naming`]). A command buffer cut in parts is one entry for each part rt has.
 //!
+//! The list's numbers are its device's commit order, across all its queues, which the platform's
+//! own texture and sampler indices go back by (`super::texture`'s `OwnIndices`): the number of the
+//! last command buffer committed ([`Flights::last`]), and the highest number up to which every
+//! command buffer has left the list ([`Flights::done_through`]).
+//!
 //! At the loss, two lines follow the fault's ([`Flights::lines`]): the first [`FLIGHTS_LISTED`]
 //! command buffers committed and not complete, the oldest committed first, each with its context,
 //! its commit's time against the loss and its encoders' kinds in order (runs of one kind counted,
@@ -975,6 +980,21 @@ impl Flights {
         }
         let gone = self.0.lock().1.remove(&number);
         drop(gone);
+    }
+
+    /// The number of the last command buffer committed, 0 where none was: a wait for it is one
+    /// for every command buffer committed up to now ([`Flights::done_through`]).
+    pub fn last(&self) -> u64 {
+        self.0.lock().0
+    }
+
+    /// The highest number N such that every command buffer numbered N or less has left the list,
+    /// its first completed handler run or its commit refused, whatever the order they left in,
+    /// across all its device's queues: the oldest's in it less one, or [`Flights::last`] where it
+    /// is empty. A later command buffer that completed first moves it nowhere.
+    pub fn done_through(&self) -> u64 {
+        let flights = self.0.lock();
+        (flights.1.keys().next()).map_or(flights.0, |&oldest| oldest.saturating_sub(1))
     }
 
     /// How many command buffers are committed and not complete.

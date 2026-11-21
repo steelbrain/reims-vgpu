@@ -205,7 +205,6 @@ impl RtComputeEncoder {
                 let at = slots(range, &lengths)?;
                 let clamps = lod_min_clamps.iter().zip(lod_max_clamps);
                 for ((sampler, (&min, &max)), index) in samplers.iter().zip(clamps).zip(at) {
-                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                     let sampler = sampler.map(|s| s.rt());
                     e.set_sampler_state_with_lod_clamps(sampler, min, max, index)?;
                 }
@@ -214,7 +213,6 @@ impl RtComputeEncoder {
                 let at = slots(range, &[samplers.len()])?;
                 for (sampler, index) in samplers.iter().zip(at) {
                     e.set_sampler_state(sampler.map(|s| s.rt()), index)?;
-                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                 }
             }
             ComputeCmd::SetStageInRegion { region } => {
@@ -327,8 +325,7 @@ pub(super) fn resource_usage(usage: u64) -> Result<rt::ResourceUsage, Stop> {
 
 /// rt's resource of `resource`, which a compute or render encoder's `useResources:` declares to the
 /// command buffer that keeps `kept`: a texture's declaration is a use of it where it is tiled
-/// (`super::tiled`), and a read through its index where that is one of the platform's own
-/// (`Kept::reads`).
+/// (`super::tiled`).
 pub(super) fn declared<'r>(
     kept: &Kept,
     resource: &'r ResourceRef<'_, RtPlatform>,
@@ -337,7 +334,6 @@ pub(super) fn declared<'r>(
         ResourceRef::Buffer(b) => rt::Resource::Buffer(b.rt()),
         ResourceRef::Texture(t) => {
             kept.takes().used(t);
-            kept.reads().note(t.index_use());
             rt::Resource::Texture(t.rt())
         }
         ResourceRef::Icb(icb) => rt::Resource::IndirectCommandBuffer(icb.rt()),

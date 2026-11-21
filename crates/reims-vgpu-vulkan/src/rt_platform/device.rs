@@ -508,12 +508,14 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     );
     let known = KnownBlocks::default();
     let watch = super::fault::FaultWatch::new(allocations, known.clone());
+    let loss = Arc::new(DeviceLoss::watching(gpu, watch));
+    let order = || Arc::clone(loss.flights());
     Ok(RtObj::new(RtDevice {
         rt: device,
         facts,
         caps,
-        indices: OwnIndices::new(rt::IndexClass::Texture),
-        sampler_indices: OwnIndices::new(rt::IndexClass::Sampler),
+        indices: OwnIndices::new(rt::IndexClass::Texture, order()),
+        sampler_indices: OwnIndices::new(rt::IndexClass::Sampler, order()),
         numbering: Numbering::default(),
         shaders: OnceLock::new(),
         known,
@@ -521,7 +523,7 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         drm,
         present_fences,
         host_gpu,
-        loss: Arc::new(DeviceLoss::watching(gpu, watch)),
+        loss,
     }))
 }
 

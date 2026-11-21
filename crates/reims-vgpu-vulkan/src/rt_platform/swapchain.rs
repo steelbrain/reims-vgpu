@@ -1114,10 +1114,10 @@ impl RtSwapchain {
             let made =
                 unsafe { (self.device.rt()).new_drawable_texture(&descriptor, index, raw, info) };
             let texture = match made {
-                Ok(made) => texture::drawable(&self.device, NEXT_DRAWABLE, made, own),
+                Ok(made) => texture::drawable(&self.device, made, own),
                 Err(e) => {
                     if let Some(own) = own {
-                        self.device.indices().give_back(own, None);
+                        self.device.indices().give_back(own);
                     }
                     rt_refused(NEXT_DRAWABLE, &e);
                     return Err(undo(images, Refused(format!("new_drawable_texture: {e}"))));

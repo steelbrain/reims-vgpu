@@ -35,13 +35,13 @@
 //!   bind counts and the device's tokens (`super::icb::ExecutionDetail`).
 //! - **`useResources:`** in each form is rt's `use_resource` of each resource it names but nil, as
 //!   the compute encoder's is (`super::compute`): the command buffer keeps the resource until it
-//!   retires, and rt records nothing. A tiled texture it names is a use of it (`super::tiled`), and
-//!   a texture at one of the platform's own indices a read through it (`Kept::reads`). After a
-//!   usage that writes a texture made for shader writes with no storage element, each draw of the
-//!   encoder whose vertex or fragment function may reach a texture beyond its slots (an argument
-//!   buffer's `access::write` or `access::read_write` texture, a resource ID) is rt's refusal
-//!   (`Gap::StorageElement`), encoding nothing, counted (`rt-refused-gap`), as the compute
-//!   encoder's dispatch is: Metal writes such a texture there, and Vulkan would drop the writes.
+//!   retires, and rt records nothing. A tiled texture it names is a use of it (`super::tiled`).
+//!   After a usage that writes a texture made for shader writes with no storage element, each
+//!   draw of the encoder whose vertex or fragment function may reach a texture beyond its slots
+//!   (an argument buffer's `access::write` or `access::read_write` texture, a resource ID) is rt's
+//!   refusal (`Gap::StorageElement`), encoding nothing, counted (`rt-refused-gap`), as the
+//!   compute encoder's dispatch is: Metal writes such a texture there, and Vulkan would drop the
+//!   writes.
 //! - **Nothing to record**: `useHeaps:` in each form (rt's pass orders every earlier command before
 //!   it and itself before every later one, and every resource is resident); the store action
 //!   options (rt renders one sample, and the one option is custom sample positions); the object,
@@ -585,14 +585,12 @@ impl RtRenderEncoder {
                 let at = slots(range, &[samplers.len()])?;
                 for (sampler, index) in samplers.iter().zip(at) {
                     e.set_vertex_sampler_state(sampler.map(|s| s.rt()), index)?;
-                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                 }
             }
             RenderCmd::SetFragmentSamplerStates { samplers, range } => {
                 let at = slots(range, &[samplers.len()])?;
                 for (sampler, index) in samplers.iter().zip(at) {
                     e.set_fragment_sampler_state(sampler.map(|s| s.rt()), index)?;
-                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                 }
             }
             RenderCmd::SetVertexSamplerStatesLodClamps {
@@ -605,7 +603,6 @@ impl RtRenderEncoder {
                 let at = slots(range, &lengths)?;
                 let clamps = lod_min_clamps.iter().zip(lod_max_clamps);
                 for ((sampler, (&min, &max)), index) in samplers.iter().zip(clamps).zip(at) {
-                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                     let sampler = sampler.map(|s| s.rt());
                     e.set_vertex_sampler_state_with_lod_clamps(sampler, min, max, index)?;
                 }
@@ -620,7 +617,6 @@ impl RtRenderEncoder {
                 let at = slots(range, &lengths)?;
                 let clamps = lod_min_clamps.iter().zip(lod_max_clamps);
                 for ((sampler, (&min, &max)), index) in samplers.iter().zip(clamps).zip(at) {
-                    self.kept.reads().note(sampler.and_then(|s| s.index_use()));
                     let sampler = sampler.map(|s| s.rt());
                     e.set_fragment_sampler_state_with_lod_clamps(sampler, min, max, index)?;
                 }
