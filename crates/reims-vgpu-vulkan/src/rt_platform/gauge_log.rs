@@ -18,8 +18,9 @@
 //!   the long allocations held again, the textures' places in texture blocks, which are Private
 //!   blocks, and outside the pools, the textures' allocations of their own, the spills, the
 //!   imports and the surface imports; then the live `VkDeviceMemory` allocations, the imports,
-//!   surface imports and exports among them, and the live buffers and textures. A look at which
-//!   none changed writes no line ([`Lines`]).
+//!   surface imports and exports among them, the live buffers and textures, and the releases
+//!   that wait for the command buffers committed before them. A look at which none changed writes
+//!   no line ([`Lines`]).
 
 use std::sync::Once;
 use std::time::Duration;
@@ -66,6 +67,7 @@ pub(crate) fn line(gauges: &rt::Gauges) -> String {
         exports,
         buffers,
         textures,
+        releases_waiting,
     );
     let pairs: Vec<String> = (named.iter())
         .map(|(name, value)| format!("{name} {value}"))
@@ -146,6 +148,7 @@ mod tests {
         gauges.imports = 3;
         gauges.buffers = 4;
         gauges.textures = 5;
+        gauges.releases_waiting = 2;
         let expected = "rt gauges: private_allocation_bytes 33554432, private_idle_bytes 16777216, \
                         private_reserve_bytes 16777216, private_placed_bytes 8388608, \
                         private_buffer_bytes 1048576, texture_block_bytes 4194304, \
@@ -154,7 +157,8 @@ mod tests {
                         shared_buffer_bytes 65536, shared_long_reused_bytes 0, \
                         texture_own_bytes 2097152, spilled_bytes 0, managed_spilled_bytes 0, \
                         import_bytes 3145728, surface_import_bytes 0, blocks 6, imports 3, \
-                        surface_imports 0, exports 0, buffers 4, textures 5";
+                        surface_imports 0, exports 0, buffers 4, textures 5, \
+                        releases_waiting 2";
         assert_eq!(line(&gauges), expected);
 
         let mut lines = Lines::default();
@@ -162,7 +166,10 @@ mod tests {
         assert_eq!(lines.next(&gauges), None, "nothing changed");
         gauges.textures = 6;
         let changed = lines.next(&gauges).expect("a gauge changed");
-        assert!(changed.ends_with("buffers 4, textures 6"), "{changed}");
+        assert!(
+            changed.ends_with("buffers 4, textures 6, releases_waiting 2"),
+            "{changed}"
+        );
         let zeros = line(&rt::Gauges::default());
         assert_eq!(
             lines.next(&rt::Gauges::default()),
