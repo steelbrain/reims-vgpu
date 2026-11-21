@@ -15,21 +15,19 @@
 //!   or more, that many slices of each attachment and resolve texture from its own slice, loading,
 //!   storing and resolving each (rt's docs); the default raster sample count, at which rt's pass
 //!   with no attachment renders, refused at 0, Metal's default, as Metal refuses it (rt's docs);
-//!   and the visibility result buffer, held as Metal's descriptor retains it. rt's command buffer
-//!   keeps that buffer until it retires, and its bytes stay as they were: rt's pass writes no
-//!   result, and a visibility result mode but `Disabled` is rt's gap at the encoder
-//!   (`super::render`). A render encoder's creation turns them into rt's
-//!   descriptor ([`PassFields::rt_pass`]): an action or resolve filter Metal has none of, or a
-//!   level, slice or plane past 32 bits, is Metal's refusal there, as Metal asserts at the
-//!   encoder's creation; a width or height past 32 bits renders the attachments' area, as Metal's
+//!   the visibility result buffer, held as Metal's descriptor retains it; and the
+//!   `visibilityResultType`. rt's command buffer keeps that buffer until it retires, and rt's pass
+//!   writes the result of each `Boolean` or `Counting` mode its encoder sets at the mode's offset,
+//!   every other byte staying as it was; in a pass of `Accumulate` such a mode is rt's gap at the
+//!   encoder (`super::render`). A render encoder's creation turns them into rt's
+//!   descriptor ([`PassFields::rt_pass`]): an action, resolve filter or visibility result type
+//!   Metal has none of, or a level, slice or plane past 32 bits, is Metal's refusal there, as
+//!   Metal asserts at the encoder's creation; a width or height past 32 bits renders the attachments' area, as Metal's
 //!   does; and an array length past 32 bits is past every device's layers, which rt refuses as it
 //!   refuses any other past them, as it refuses an attachment with fewer slices from its own than
 //!   the length. A colour attachment past the eighth raises at its subscript, as Metal's does.
 //!   - **Kept nowhere, changing nothing rt renders**: a depth plane (rt renders into no 3D
-//!     texture); store action options (rt builds none); `defaultColorSampleCount` (SPI); and
-//!     `visibilityResultType`, which decides only what an enabled visibility result mode writes:
-//!     Metal's pass leaves the buffer's bytes as they were under either type where its encoder
-//!     enables no mode (rt's docs: an Apple M3 Max, macOS 27.0.1).
+//!     texture); store action options (rt builds none); and `defaultColorSampleCount` (SPI).
 //!   - **Unbuilt** ([`Unbuilt::RenderPass`]), counted at a set of other than Metal's default, and
 //!     kept nowhere, so the pass renders without them: an imageblock sample length, a threadgroup
 //!     memory length, a tile width or height, and sample positions. No rasterization rate map is
@@ -369,6 +367,11 @@ struct RtAttachment {
     resolve_depth_plane: u32,
 }
 
+/// `MTLVisibilityResultTypeReset`, Metal's default.
+const VISIBILITY_RESET: u64 = 0;
+/// `MTLVisibilityResultTypeAccumulate`.
+const VISIBILITY_ACCUMULATE: u64 = 1;
+
 /// What a render pass descriptor keeps.
 struct Pass {
     colors: [Attachment; rt::MAX_COLOR_ATTACHMENTS],
@@ -382,13 +385,16 @@ struct Pass {
     render_target_array_length: u64,
     default_raster_sample_count: u64,
     visibility_result_buffer: Option<RtObj<RtBuffer>>,
+    /// `MTLVisibilityResultType`, Metal's raw value.
+    visibility_result_type: u64,
 }
 
 impl Default for Pass {
     /// Metal's: colour attachments of `DontCare` loads and `Store` stores, cleared to opaque
     /// black; depth and stencil of `Clear` loads and `DontCare` stores, cleared to 1 and 0; no
     /// texture, level and slice 0; no render target size, a render target array length and a
-    /// default raster sample count of 0, and no visibility result buffer.
+    /// default raster sample count of 0, no visibility result buffer, and a visibility result type
+    /// of `Reset`.
     fn default() -> Pass {
         let black = ClearColor {
             alpha: 1.0,
@@ -406,6 +412,7 @@ impl Default for Pass {
             render_target_array_length: 0,
             default_raster_sample_count: 0,
             visibility_result_buffer: None,
+            visibility_result_type: VISIBILITY_RESET,
         }
     }
 }
@@ -417,8 +424,8 @@ impl PassFields {
     }
 
     /// rt's descriptor of what is set (the module's docs). `Err` names the first value Metal
-    /// takes no pass of: an action or resolve filter Metal has none of, or a level, slice or plane
-    /// past 32 bits.
+    /// takes no pass of: an action, resolve filter or visibility result type Metal has none of, or
+    /// a level, slice or plane past 32 bits.
     pub fn rt_pass(&self) -> Result<rt::RenderPassDescriptor, String> {
         let pass = self.lock();
         let mut out = rt::RenderPassDescriptor::default();
@@ -490,6 +497,11 @@ impl PassFields {
         out.default_raster_sample_count = u32::try_from(samples).unwrap_or(u32::MAX);
         let kept = pass.visibility_result_buffer.as_ref();
         out.visibility_result_buffer = kept.map(|b| b.rt().clone());
+        out.visibility_result_type = match pass.visibility_result_type {
+            VISIBILITY_RESET => rt::VisibilityResultType::Reset,
+            VISIBILITY_ACCUMULATE => rt::VisibilityResultType::Accumulate,
+            raw => return Err(format!("the visibility result type {raw}")),
+        };
         Ok(out)
     }
 
@@ -572,8 +584,8 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         recorded_answer
     }
 
-    /// The render target's width, height and array length, the default raster sample count and
-    /// the visibility result buffer; the rest as the module's docs say.
+    /// The render target's width, height and array length, the default raster sample count, the
+    /// visibility result buffer and its type; the rest as the module's docs say.
     fn set_pass(&self, set: &PassSet<'_, RtPlatform>) {
         let recorded_call = crate::recorder::rec_call!("m2v.setPass", self, set);
         crate::recorder::run(|| {
@@ -607,6 +619,9 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
             }
             if let Some(buffer) = set.visibility_result_buffer {
                 pass.visibility_result_buffer = buffer.map(Handle::clone_ref);
+            }
+            if let Some(kind) = set.visibility_result_type {
+                pass.visibility_result_type = kind;
             }
         });
         crate::recorder::rec_done!(recorded_call, ());

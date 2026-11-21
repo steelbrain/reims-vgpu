@@ -52,9 +52,16 @@
 //!   functions); and, each at Metal's default, a resolve texture of nil, a line width of 1,
 //!   primitive restart enabled, the viewport transform enabled, one vertex amplification view and
 //!   a tessellation factor scale of 1.
-//! - **The visibility result mode** is rt's: `Disabled`, at any offset, records nothing, and
-//!   `Boolean` and `Counting` are rt's gap (`Gap::Draw` of `VisibilityResults`), encoding nothing,
-//!   counted (`rt-refused-gap`), so the encoder's later draws write no result.
+//! - **The visibility result mode** is rt's: `Boolean` and `Counting` count the encoder's later
+//!   draws, to the next mode set, and rt's pass writes the count at the mode's offset of its
+//!   visibility result buffer as it ends; `Disabled`, at any offset, ends the count. Metal's
+//!   refusals, each encoding nothing, counted (`rt-refused-metal`): such a mode in a pass without
+//!   a visibility result buffer, at an offset that is not a multiple of 8 or whose 8 bytes run
+//!   past the buffer, or at an offset the encoder took before. rt's gaps, counted
+//!   (`rt-refused-gap`), each encoding nothing: such a mode in a pass whose `visibilityResultType`
+//!   is `Accumulate` (`Gap::Draw` of `AccumulatedVisibilityResults`), and, while a count runs, a
+//!   command that would end the pass's rendering (`Gap::Draw` of `VisibilityResultInterrupt`),
+//!   which rt's docs list.
 //! - **The alpha test's reference** (`setAlphaTestReferenceValue:`) is rt's, which a state of
 //!   rt's private alpha test reads at its draws. No state of the platform's has that test
 //!   (`super::render_pipeline`'s private state has none), so no draw reads the reference.
@@ -1198,10 +1205,10 @@ mod tests {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 
-    /// Render encoders clear, load and store their pass's attachment, and draw through a
-    /// pipeline state and a vertex buffer bound to them; what rt has no form of is counted as
-    /// its piece, what Metal's validation stops as Metal's refusal, and the command buffer still
-    /// completes.
+    /// Render encoders clear, load and store their pass's attachment, draw through a pipeline
+    /// state and a vertex buffer bound to them, and write their draws' visibility results; what
+    /// rt has no form of is counted as its piece, what Metal's validation stops as Metal's
+    /// refusal, and the command buffer still completes.
     #[test]
     fn render_encoders_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1298,6 +1305,67 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u8>(), 16) };
         assert_eq!(bytes, [0xa5; 16]);
 
+        // `Counting` at offset 0 and `Boolean` at offset 8, each over a draw of the whole target,
+        // 16 samples: the pass writes 16 at 0 and a value other than 0 at 8.
+        let result = |at: usize| {
+            // SAFETY: as above; the command buffer has completed.
+            let bytes = unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u8>(), 16) };
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+        };
+        let triangle_draw = || RenderCmd::DrawPrimitives {
+            primitive_type: TRIANGLE,
+            vertex_start: 0,
+            vertex_count: 3,
+        };
+        let draws = || {
+            vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&state),
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&buffer),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetVisibilityResultMode { mode: 2, offset: 0 },
+                triangle_draw(),
+                RenderCmd::SetVisibilityResultMode { mode: 1, offset: 8 },
+                triangle_draw(),
+            ]
+        };
+        assert_eq!(run(&made(), &kept, draws()), done);
+        assert_eq!(texels(), every(green));
+        assert_eq!(result(0), 16);
+        assert_ne!(result(8), 0);
+
+        // In a pass of `Accumulate`, a mode is rt's gap and encodes nothing, counted, and the
+        // buffer keeps its bytes; the draws still draw.
+        // SAFETY: as above; no command buffer is in flight.
+        unsafe { results.contents().as_ptr::<u8>().write_bytes(0xa5, 16) };
+        let accumulated = pass(&target, 2);
+        accumulated.set_pass(&PassSet {
+            visibility_result_buffer: Some(Some(&results)),
+            visibility_result_type: Some(1),
+            ..PassSet::default()
+        });
+        let gaps = counted(RtRefusal::Gap.code());
+        assert_eq!(run(&made(), &accumulated, draws()), done);
+        assert_eq!(counted(RtRefusal::Gap.code()), gaps + 2);
+        assert_eq!(texels(), every(green));
+        let kept_bytes = u64::from_le_bytes([0xa5; 8]);
+        assert_eq!((result(0), result(8)), (kept_bytes, kept_bytes));
+
+        // A visibility result type Metal has none of: Metal's refusal at the encoder's creation,
+        // nil, counted.
+        let unknown = pass(&target, 2);
+        unknown.set_pass(&PassSet {
+            visibility_result_type: Some(2),
+            ..PassSet::default()
+        });
+        let before = counted(metal);
+        assert!(matches!(made().render_encoder(on, &unknown), Ok(None)));
+        assert_eq!(counted(metal), before + 1);
+
         // Passes Metal refuses: an unknown load action, and a pass of no attachment at its
         // default size and sample count of 0. Nil, counted.
         let before = counted(metal);
@@ -1366,6 +1434,7 @@ mod tests {
                 offsets: &[],
                 range: NsRange::new(0, 1),
             },
+            // In a pass without a visibility result buffer: Metal's refusal.
             RenderCmd::SetVisibilityResultMode { mode: 1, offset: 0 },
             RenderCmd::SetLineWidth { line_width: 2.0 },
             RenderCmd::SetAlphaTestReferenceValue {
@@ -1407,9 +1476,9 @@ mod tests {
         for cmd in cmds {
             assert_eq!(encoder.encode(on, cmd), Ok(()));
         }
-        assert_eq!(counted(metal), before + 8);
+        assert_eq!(counted(metal), before + 9);
         assert_eq!(counted(unbuilt), unbuilt_before + 1);
-        assert_eq!(counted(gap), gap_before + 1);
+        assert_eq!(counted(gap), gap_before);
         assert_eq!(counted(pass_unbuilt), pass_before + 2);
         assert_eq!(counted(scale), scale_before + 1);
         assert_eq!(commands.commit(on), Ok(()));
