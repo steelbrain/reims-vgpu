@@ -25,7 +25,7 @@ use crate::core::sync::{Mutex, MutexGuard};
 use super::caps::{Config, Context, Entrypoint, Profile};
 #[cfg(windows)]
 use super::d3d12::{CopyError, SharedTexture};
-use super::display::{Display, Error, check};
+use super::display::{Display, Error, Teardown, check};
 use super::export::{self, SurfaceExport};
 use super::ffi;
 use super::image::{self, Image};
@@ -160,7 +160,7 @@ impl Drop for PoolInner {
             // SAFETY: every surface was made by vaCreateSurfaces on this
             // display, and none is lent, since each lent Surface holds the
             // pool; destroyed once, here, behind every call on them.
-            self.display.release_teardown(false, move |raw| unsafe {
+            self.display.release_teardown(Teardown::Surfaces, move |raw| unsafe {
                 ffi::vaDestroySurfaces(raw, all.as_mut_ptr(), count);
                 #[cfg(windows)]
                 drop(textures);

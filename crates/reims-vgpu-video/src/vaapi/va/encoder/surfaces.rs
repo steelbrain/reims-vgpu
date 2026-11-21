@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::core::sync::Mutex;
 
-use super::super::display::{Display, Error, check};
+use super::super::display::{Display, Error, Teardown, check};
 use super::super::ffi::{self, encode as enc};
 use super::super::image::Image;
 use crate::codec::encode::{InputFormat, InputFrame};
@@ -91,7 +91,7 @@ impl Drop for Pool {
         // SAFETY: made by vaCreateSurfaces on this display, destroyed once,
         // here. The session destroys its context first; a Lent outliving
         // the pool only pushes its ID onto the free list.
-        self.display.release_teardown(false, move |raw| unsafe {
+        self.display.release_teardown(Teardown::Surfaces, move |raw| unsafe {
             ffi::vaDestroySurfaces(raw, ids.as_mut_ptr(), count);
         });
     }

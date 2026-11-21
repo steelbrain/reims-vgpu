@@ -19,6 +19,8 @@ use crate::core::sync::Mutex;
 use super::calls::{Calls, Late};
 use super::caps::Answers;
 use super::ffi;
+#[cfg(windows)]
+use super::held::{Asked, Held};
 use super::import_check::{ImportWrite, ImportWrites};
 use super::surface::SurfaceFormat;
 use super::wait;
@@ -176,16 +178,18 @@ struct DisplayInner {
     /// On Windows, the display's live contexts and the teardowns held while one lives
     /// ([`Display::release_teardown`]).
     #[cfg(windows)]
-    teardowns: Mutex<Teardowns>,
+    teardowns: Mutex<Held<Box<dyn FnOnce(ffi::VADisplay) + Send>>>,
 }
 
-/// On Windows, a display's contexts made and not yet let go, and the teardowns asked for while
-/// one lived, in the order asked ([`Display::release_teardown`]).
-#[cfg(windows)]
-#[derive(Default)]
-struct Teardowns {
-    live: usize,
-    held: Vec<Box<dyn FnOnce(ffi::VADisplay) + Send>>,
+/// What a teardown ends ([`Display::release_teardown`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Teardown {
+    /// A context (`vaDestroyContext`).
+    Context,
+    /// A config (`vaDestroyConfig`).
+    Config,
+    /// A pool's surfaces (`vaDestroySurfaces`), and on Windows the textures they are.
+    Surfaces,
 }
 
 /// Whether a teardown was held yet in this process, which the log says once.
@@ -351,7 +355,7 @@ impl Display {
                 #[cfg(windows)]
                 d3d12: OnceLock::new(),
                 #[cfg(windows)]
-                teardowns: Mutex::default(),
+                teardowns: Mutex::new(Held::new()),
             }),
         };
         display.prime();
@@ -487,12 +491,11 @@ impl Display {
     pub(crate) fn context_made(&self) {
         #[cfg(windows)]
         {
-            self.inner.teardowns.lock().live += 1;
+            self.inner.teardowns.lock().context_made();
         }
     }
 
-    /// `release`, the teardown of a context (`ends_context`), of a config or of a pool's
-    /// surfaces, made as [`Display::release`] makes a release.
+    /// `release`, the teardown `kind`, made as [`Display::release`] makes a release.
     ///
     /// On Windows it is held while another context lives on the display, and made, behind the
     /// teardowns held before it, once the teardown of the display's last live context is asked
@@ -507,38 +510,36 @@ impl Display {
     /// contexts' last pictures were done. With teardowns held until no context lived, and with
     /// the decoders kept until both threads ended, every run passed, as one thread making and
     /// letting go decoders one after another did. A teardown held keeps its surfaces' memory
-    /// meanwhile.
+    /// meanwhile. `super::held` counts the live contexts and keeps the teardowns held.
     pub(crate) fn release_teardown(
         &self,
-        ends_context: bool,
+        kind: Teardown,
         release: impl FnOnce(ffi::VADisplay) + Send + 'static,
     ) {
         #[cfg(windows)]
         {
-            let held = {
-                let mut teardowns = self.inner.teardowns.lock();
-                if ends_context {
-                    teardowns.live = teardowns.live.saturating_sub(1);
-                }
-                if teardowns.live > 0 {
+            let asked = self.inner.teardowns.lock().ask(kind, Box::new(release));
+            match asked {
+                Asked::Held => {
                     if !HELD_LOGGED.swap(true, Ordering::Relaxed) {
                         log::info!(
                             "hardware video: VA-API: a session's teardown is held while another \
                              session lives on the display, and made once none does"
                         );
                     }
-                    teardowns.held.push(Box::new(release));
-                    return;
                 }
-                std::mem::take(&mut teardowns.held)
-            };
-            for teardown in held {
-                self.release(teardown);
+                Asked::Now(now) => {
+                    for teardown in now {
+                        self.release(teardown);
+                    }
+                }
             }
         }
         #[cfg(unix)]
-        let _ = ends_context;
-        self.release(release);
+        {
+            let _ = kind;
+            self.release(release);
+        }
     }
 }
 
