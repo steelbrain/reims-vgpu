@@ -95,7 +95,9 @@
 //            the stream slots, the vertex buffer and the bloom chain) in the measured frames, in
 //            ms: their count, p50, p90, the worst and their time a frame; then the same of their
 //            releases where -r times them, and of those how many another reference outlived
-//            (shared: CFGetRetainCount above 1 as it was released).
+//            (shared: CFGetRetainCount above 1 as it was released); then, heap and post on, the
+//            device's heapTextureSizeAndAlignWithDescriptor: alone, which an Automatic heap's
+//            make asks first, timed after the window as many times as the bloom chain's makes.
 //   "GAMELOAD summary ..."          per-frame p50/p90/mean of each number, fps, the work a frame
 //            holds (draws, dispatches, passes, heap objects made), command-buffer errors, and
 //            the compute ICB's sums checked (cicb_checks) and wrong (cicb_bad).
@@ -1405,6 +1407,17 @@ int main(int argc, char **argv)
 		window_end = epoch_s();
 		printf("GAMELOAD window end %.6f\n", window_end);
 		fflush(stdout);
+		// After the window, the device's size query alone, which an Automatic heap's make asks
+		// first: as many as the measured frames' bloom makes, each timed.
+		const size_t size_cap = on[S_HEAP] && on[S_POST] ? (size_t)frames * (2 * BLOOM - 1) : 0;
+		double *size_ms = calloc(size_cap ? size_cap : 1, sizeof(double));
+		for (size_t i = 0; i < size_cap; i++) {
+			const double tq = now_ms();
+			const MTLSizeAndAlign sa = [D heapTextureSizeAndAlignWithDescriptor:bloom_desc[i % (2 * BLOOM - 1)]];
+			size_ms[i] = now_ms() - tq;
+			if (!sa.size)
+				die("a bloom texture's heap size", nil);
+		}
 
 		// --- the numbers ------------------------------------------------------------------------
 		for (int f = 0; f < total; f++) {
@@ -1425,10 +1438,14 @@ int main(int argc, char **argv)
 		double k50, k90, km, r50, r90, rm;
 		stats(make_ms, (int)makes, &k50, &k90, &km);
 		stats(release_ms, (int)releases, &r50, &r90, &rm);
+		double q50, q90, qm;
+		stats(size_ms, (int)size_cap, &q50, &q90, &qm);
 		printf("GAMELOAD calls makes %zu ms p50 %.4f p90 %.4f worst %.4f per_frame %.4f"
-		       " releases_timed %d releases %zu ms p50 %.4f p90 %.4f worst %.4f per_frame %.4f shared %zu\n",
+		       " releases_timed %d releases %zu ms p50 %.4f p90 %.4f worst %.4f per_frame %.4f shared %zu"
+		       " size_queries %zu ms p50 %.4f p90 %.4f worst %.4f\n",
 		       makes, k50, k90, worst(make_ms, makes), km * makes / frames, time_releases, releases, r50, r90,
-		       worst(release_ms, releases), rm * releases / frames, releases_shared);
+		       worst(release_ms, releases), rm * releases / frames, releases_shared, size_cap, q50, q90,
+		       worst(size_ms, size_cap));
 		double c50, c90, cm, w50, w90, wm, l50, l90, lm, g50, g90, gm, a50, a90, am, b50, b90, bm;
 		stats(m_cpu, frames, &c50, &c90, &cm);
 		stats(m_wait, frames, &w50, &w90, &wm);
