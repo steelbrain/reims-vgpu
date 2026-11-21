@@ -23,7 +23,7 @@
 //!   ([`ShapesLive`]); the caches none of whose shapes a live texture references, with
 //!   the bytes they hold, and those holding shapes past the bound.
 //! - **The caches holding the most**, one by one, in a part of their own, `kept caches: block
-//!   BLOCK held BYTES, ...; ...` ([`largest_line`]): the [`LARGEST`] caches holding the most bytes,
+//!   BLOCK held BYTES, ...; ...` ([`largest_line`]): the six caches holding the most bytes,
 //!   the most first, each with its block, the bytes it holds, its buffer's, whether it was made
 //!   for the host's video, and its shapes' counts as above.
 //! - **The pages' views**: the surfaces' blocks' views, the pages blocks' and the idle ones the
@@ -43,7 +43,6 @@ use std::time::Duration;
 
 use reims_vgpu_vulkan::core::sync::Mutex;
 
-use crate::graphics::decode::surface_cache_largest as LARGEST;
 use crate::graphics::decode::{CacheLive, CachesLive, ShapesLive, TableCounts};
 
 /// How long a read waits for each lock it tries (the map of contexts' and each table's).
@@ -215,6 +214,7 @@ pub(crate) fn line(kept: &Kept, rt: Option<(u64, u64)>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graphics::decode::surface_cache_largest as LARGEST;
 
     /// The part names each count, and tells the platform's textures no guest id names, and what
     /// neither a shape's image nor a display's view explains of them; with no platform's counts
@@ -291,8 +291,10 @@ mod tests {
                 self.0
             }
         }
-        let mut one = Kept::default();
-        one.contexts = 2;
+        let mut one = Kept {
+            contexts: 2,
+            ..Kept::default()
+        };
         one.tables.textures = 10;
         one.caches.shapes.shapes = 4;
         one.views = (1, 2, 3);
