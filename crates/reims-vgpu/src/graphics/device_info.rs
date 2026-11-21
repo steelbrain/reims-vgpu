@@ -949,7 +949,11 @@ mod tests {
             assert_eq!(identity.families[at(family)], Some(true), "family {family}");
         }
         for family in [1008, 1009] {
-            assert_eq!(identity.families[at(family)], Some(false), "family {family}");
+            assert_eq!(
+                identity.families[at(family)],
+                Some(false),
+                "family {family}"
+            );
         }
     }
 
