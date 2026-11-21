@@ -248,7 +248,12 @@ fn a_reset_ends_the_fill_a_dispatch_waits_for() {
     // Where the reset waits for the fill, the fill's end lets it go on.
     let _ = world.stages().end(7, FillEnd::Filled);
     assert!(cancelled, "the reset waited for its dispatch's fill");
-    assert_eq!(world.stages().refused(), [(THREADS, 7)]);
+    // The cancel wakes the held dispatch, which is answered refused on its walk's thread.
+    assert!(
+        eventually(|| world.stages().refused() == [(THREADS, 7)]),
+        "the held dispatch was not refused: {:?}",
+        world.stages().refused()
+    );
     let fills = world.stages().fills();
     assert!(
         eventually(|| fills.fill(7, Site::Dispatch).end().is_none()),
