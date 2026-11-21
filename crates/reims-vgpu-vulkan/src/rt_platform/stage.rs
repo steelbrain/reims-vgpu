@@ -383,8 +383,14 @@ mod tests {
         let not_started = HelperEnd::NotStarted("no lock".to_owned());
         assert_eq!(fill_end(&exited(), Some(&ok)), (FillEnd::Filled, None));
         assert_eq!(fill_end(&over_memory, Some(&ok)), (FillEnd::Filled, None));
-        assert_eq!(fill_end(&exited(), Some(&compile)), (FillEnd::Breached, None));
-        assert_eq!(fill_end(&HelperEnd::OverTime, Some(&compile)), (FillEnd::Breached, None));
+        assert_eq!(
+            fill_end(&exited(), Some(&compile)),
+            (FillEnd::Breached, None)
+        );
+        assert_eq!(
+            fill_end(&HelperEnd::OverTime, Some(&compile)),
+            (FillEnd::Breached, None)
+        );
         let memory = (FillEnd::Breached, Some(StageBreach::Memory));
         assert_eq!(fill_end(&over_memory, Some(&ended)), memory);
         assert_eq!(fill_end::<()>(&over_memory, None), memory);
@@ -445,7 +451,10 @@ mod tests {
             move |key, breach| records.send((*key, breach)).unwrap(),
         ));
         assert_eq!(fills.fill(3).wait(), FillEnd::Breached);
-        assert_eq!(recorded.recv_timeout(WAIT).unwrap(), (3, rt::StageBreach::Time));
+        assert_eq!(
+            recorded.recv_timeout(WAIT).unwrap(),
+            (3, rt::StageBreach::Time)
+        );
         let _ = std::fs::remove_file(lock_file(test));
     }
 

@@ -167,16 +167,8 @@ struct State {
     /// Whether it was cancelled.
     cancelled: bool,
     /// Its process's id, once the process has started.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the tests' `Helper::pid` alone")
-    )]
     pid: Option<u32>,
     /// How it ended, once it has. The library takes it in its `on_end`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the tests' `Helper::wait` alone")
-    )]
     end: Option<HelperEnd>,
 }
 
@@ -430,7 +422,10 @@ fn end_process(child: &mut Child) {
 /// helper's part, on macOS (the module's doc). The helper's main calls it first.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "its caller, the helper's main, lands with the helper's binary")
+    expect(
+        dead_code,
+        reason = "its caller, the helper's main, lands with the helper's binary"
+    )
 )]
 pub(crate) fn end_with_parent() -> io::Result<()> {
     host::watch_parent()
