@@ -845,7 +845,9 @@ impl Failed {
 
     /// Fails the command buffer with `code`, unless it was failed already.
     fn fail(&self, code: i64) {
-        let _ = self.0.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self
+            .0
+            .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
