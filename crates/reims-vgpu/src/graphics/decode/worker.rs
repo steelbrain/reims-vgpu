@@ -434,7 +434,7 @@ impl Drop for Worker {
 
 impl Shared {
     /// Starts the worker's thread `index`, whose name the caller took ([`State::named`]). Err
-    /// where the OS refuses it, or, in the tests, where they refuse it ([`Worker::refuse_threads`]).
+    /// where the OS refuses it, or, in the tests, where they refuse it (`Worker::refuse_threads`).
     fn start(self: &Arc<Self>, index: usize) -> std::io::Result<()> {
         #[cfg(test)]
         if self.refuse.load(Ordering::Relaxed) {
