@@ -1522,7 +1522,7 @@ mod tests {
         use vk::PhysicalDeviceType as T;
         assert!(integrated(T::INTEGRATED_GPU));
         for other in [T::OTHER, T::DISCRETE_GPU, T::VIRTUAL_GPU, T::CPU] {
-            assert!(!integrated(other), "{other:?}");
+            assert!(!integrated(other), "device type {}", other.as_raw());
         }
     }
 
