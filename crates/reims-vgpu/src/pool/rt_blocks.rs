@@ -28,9 +28,11 @@
 //! exit, and the source's drop never gives back a block still imported.
 //!
 //! A block's bytes are undefined, new or taken again: rt zeroes nothing ahead of need, and
-//! nothing here zeroes them. rt maps and unmaps whole allocations through the `BlockMappings`
-//! hook its device was made with (`DeviceOptions::block_mappings`), not through the pool: `map`
-//! before any block of an allocation goes out, `unmap` before the allocation is freed.
+//! nothing here zeroes them. No device takes rt's `BlockMappings` hook (the platform's device
+//! leaves `DeviceOptions::block_mappings` at `None`): rt keeps each Shared allocation's host
+//! mapping for the allocation's life ([`BlockInfo`]'s `contents`), and the pool maps each block
+//! it places into the guest's range itself, a piece a block, through the host
+//! (`PoolHost::add`, the pool's module doc).
 
 use std::collections::HashMap;
 
