@@ -17,6 +17,12 @@
  *
  * Streams are serialised in the process, so it holds at most one window at a time.
  *
+ * A block is written again only once the host has copied its chunk out, which it does once the
+ * context's lane takes the chunk, behind what the context posted before it, a pipeline's compile
+ * among it: so the stream waits for each ack with no deadline, as the kext waits for the last
+ * chunk's answer (RgfxAnswerWait.hpp), sleeping between looks (rgfxStreamIdleSleep). The wait
+ * ends at the ack, or with the process.
+ *
  * No window is kept for the next stream: what a window costs is small beside the stream
  * (measured on the RTX 5080 host, 42 apps and 7 WebGL and WebGPU pages open, 75 processes with a
  * context: 52 streams in 10 processes, at most 12 in one; a window's take from the kext 69 us at
@@ -63,19 +69,28 @@ RgfxStagingShape rgfxStagingShape(uint64_t length, uint64_t chunkMax);
 /// next; false after the last.
 bool rgfxStagingSmaller(uint64_t *chunkMax);
 
-/// How long a stream waits for the host to copy a block's chunk out, at most: ten seconds.
-constexpr uint64_t kRgfxStagingAwaitUs = 10ull * 1000 * 1000;
+/// What a stream does between looks for a block's ack (above): `looks` is how many looks found
+/// no ack yet, from 1, for this block's chunk.
+using RgfxStreamIdle = void (*)(void *context, uint64_t looks);
+
+/// The microseconds rgfxStreamIdleSleep sleeps after look `looks`: 200 for the first 50 looks
+/// (10 ms, most acks), then 1000 for 200 more, then 5000, however long the host's compile takes.
+uint64_t rgfxStreamIdleUs(uint64_t looks);
+
+/// The default idle: sleeps rgfxStreamIdleUs(looks) microseconds.
+void rgfxStreamIdleSleep(void *context, uint64_t looks);
 
 /// Streams the `length` bytes at `bytes` to the host as one library, through a window of
 /// `region` made for it: each chunk copied into the next block once the host has copied out what
 /// it last held, then posted, carrying the content key where `key` (32 bytes) is not null. The
-/// last chunk's answer is `*outStatus`, and the library's id `*outObjId`. The window goes back
-/// once every chunk posted is copied out, which the host's acks say; one whose acks do not come
-/// within `awaitUs` is kept, so nothing the host may still read is given out again. False where
-/// the region has room for no window, where the host did not take a chunk, or where it did not
-/// copy one out within `awaitUs`.
+/// last chunk's answer is `*outStatus`, and the library's id `*outObjId`. Each wait for an ack has
+/// no deadline, `idle(idleContext, looks)` called between its looks. The window goes back once
+/// every chunk posted is copied out, which the host's acks say, so nothing the host may still
+/// read is given out again. False where the region has room for no window, or where the host did
+/// not take a chunk.
 bool rgfxStreamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes,
                        uint64_t length, const uint8_t *key, RgfxObjId *outObjId,
-                       uint32_t *outStatus, uint64_t awaitUs = kRgfxStagingAwaitUs);
+                       uint32_t *outStatus, RgfxStreamIdle idle = rgfxStreamIdleSleep,
+                       void *idleContext = nullptr);
 
 #endif // RGFX_LIBRARY_STREAM_HPP_

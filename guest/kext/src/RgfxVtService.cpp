@@ -17,7 +17,9 @@
 #include <libkern/version.h>
 
 namespace {
-// How long a send waits for its VT_STATUS: the host answers once its side took the message.
+// How long a send waits for its VT_STATUS: the host answers once its side took the message,
+// which its video runtime does behind no pipeline's compile, so the deadline is kept where the
+// device's waits behind a compile have none (RgfxAnswerWait.hpp).
 constexpr UInt32 kRgfxVtAnswerMs = 10000;
 // The status the framework's guest side answers a message it cannot send, kVTParameterErr.
 constexpr int32_t kRgfxVtParameterErr = -12902;

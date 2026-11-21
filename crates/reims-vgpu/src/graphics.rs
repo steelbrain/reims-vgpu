@@ -2363,9 +2363,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     .icb_slots_in_pages_pipelines(&self.device, message)
             }),
             // The destroy of an indirect command buffer still being made (the kext destroys
-            // behind a create it stopped waiting for, after a minute, or one made for a context
-            // that had closed) waits for its create, so it and everything after it keep their
-            // places in ring order.
+            // behind a create whose submitting thread was aborted before the answer, or one made
+            // for a context that had closed) waits for its create, so it and everything after it
+            // keep their places in ring order.
             RGFX_CMD_OBJECT_DESTROY => self.icbs.wait(message_identity(message).2),
             _ => {}
         }

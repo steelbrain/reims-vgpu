@@ -576,7 +576,13 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 	IOLockLock(lock);
 	if (begun == id)
 		begun = 0;
-	// Room for one more outstanding transaction, waiting up to five seconds.
+	// Room for one more outstanding transaction, waiting up to five seconds. The pipe's waits keep
+	// their deadlines, where the device's waits behind a compile have none (RgfxAnswerWait.hpp):
+	// they are WindowServer's, whose display goes on when one process's surface is late (its
+	// present waits on the host for that process's GPU work, behind its compile, say), a
+	// transaction not sent being WindowServer's to send again with its next frame; and the
+	// ring's room frees as the host's reader takes messages off it, behind no compile. A wait for
+	// a transaction (sWait) is to the caller's own deadline.
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
 	while (!transactions.hasRoom()) {

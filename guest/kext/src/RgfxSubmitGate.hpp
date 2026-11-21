@@ -17,8 +17,9 @@
 // type that touches kext-tracked state, its entry here (and submit_gate_test) is where it is
 // caught.
 //
-// Submit takes no lock across its post (a pipeline create waits up to a minute for its answer),
-// so a thread in a submit may post its create after another thread's close of the client posted
+// Submit takes no lock across its post (a pipeline create waits for its answer as long as the
+// host's compile takes), so a thread in a submit may post its create after another thread's close
+// of the client posted
 // the context's CONTEXT_CLOSE, which the device answers having dropped every object of the
 // context then. rgfxSubmitDestroysBehind says when the submit follows its create with a destroy.
 //
@@ -154,15 +155,16 @@ inline bool rgfxSubmitMakes(uint32_t type)
 
 // Whether a submitted message of `type`, `posted` on the control ring, must be followed by an
 // OBJECT_DESTROY of its obj_id, so the device keeps nothing of it: where it makes an object
-// (rgfxSubmitMakes) and either its answer did not come in time (`timedOut`: the client takes the
-// create as failed and may make it again under a new id), or the client's context closed between
-// the submit's check and now (`closedSince`): a create posted after its context's CONTEXT_CLOSE
-// is one the device's close never dropped. The destroy follows the create on the ring, which the
-// device carries out in order, and context ids are never reused, so it drops that object alone;
-// where the create came before the close after all, it finds nothing, which is no error.
-inline bool rgfxSubmitDestroysBehind(uint32_t type, bool posted, bool timedOut, bool closedSince)
+// (rgfxSubmitMakes) and either the wait for its answer ended without it (`unanswered`: the
+// submitting thread was aborted, its process ending, and the client takes the create as failed),
+// or the client's context closed between the submit's check and now (`closedSince`): a create
+// posted after its context's CONTEXT_CLOSE is one the device's close never dropped. The destroy
+// follows the create on the ring, which the device carries out in order, and context ids are
+// never reused, so it drops that object alone, cancelling a compile still under way; where the
+// create came before the close after all, it finds nothing, which is no error.
+inline bool rgfxSubmitDestroysBehind(uint32_t type, bool posted, bool unanswered, bool closedSince)
 {
-	return posted && rgfxSubmitMakes(type) && (timedOut || closedSince);
+	return posted && rgfxSubmitMakes(type) && (unanswered || closedSince);
 }
 
 #endif // RGFX_SUBMIT_GATE_HPP_

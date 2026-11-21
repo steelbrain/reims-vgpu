@@ -728,8 +728,9 @@ fn surface_pages_answer_took(took: u64) {
 const VIEWS_LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a `SURFACE_PAGES` waits for a copy of a device cache into its pages still in flight
-/// ([`GraphicsDecoder::wait_copies_into`]): as long as the kext's new block over a surface's
-/// pages waits for the release of the surface's last block (its `kRgfxWriteBackWaitMs`).
+/// ([`GraphicsDecoder::wait_copies_into`]). The kext's new block over a surface's pages waits for
+/// the release of the surface's last block with no deadline, so a copy is still in flight here
+/// only where that wait ended first, at the asking thread's abort or the device's stop.
 const PAGES_COPY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long after it was asked a `SURFACE_DOWNLOAD` or a `BLOCK_RELEASE` of a cached block is
@@ -1701,10 +1702,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Waits, before the `SURFACE_PAGES` of the block at `block` over `runs` is begun, for every
     /// copy of a device cache into those pages asked and not yet landed
     /// ([`surface_cache::Caches::wait_copies_into`]), [`PAGES_COPY_WAIT`] at most: a released
-    /// block's, which the kext's new block over a surface's pages waits for only so long (its
-    /// `kRgfxWriteBackWaitMs`) before it makes the block all the same. The new block's buffers lie
-    /// over the pages, so the copy would land over what they write. One still in flight past the
-    /// wait is logged, and the block goes on.
+    /// block's, which the kext's new block over a surface's pages waits for, ending first only at
+    /// the asking thread's abort or the device's stop, where it makes the block all the same. The
+    /// new block's buffers lie over the pages, so the copy would land over what they write. One
+    /// still in flight past the wait is logged, and the block goes on.
     pub(crate) fn wait_copies_into(&self, block: u64, runs: &[RgfxPageRun]) {
         if runs.is_empty() {
             return;

@@ -124,8 +124,8 @@ IOReturn RgfxSharedEventUserClient::exportMethod(IOExternalMethodArguments *a)
 	IOLockLock(lock);
 	port.endExport(named ? name : 0);
 	IOLockUnlock(lock);
-	// A name posted and not taken in time may still be taken: let go of it behind the post, so
-	// the device holds nothing of it.
+	// A name posted and not answered, its thread aborted, may still be taken: let go of it behind
+	// the post, so the device holds nothing of it.
 	if (posted && !named)
 		accelerator->unnameSharedEvent(name);
 	a->scalarOutput[0] = status;

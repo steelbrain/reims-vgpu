@@ -25,9 +25,12 @@
 #include <sys/proc.h>
 
 namespace {
-// How long a pipeline create waits for its reflection: the host compiles it first, which may
-// take seconds cold, behind whatever was posted before it.
-constexpr UInt32 kReflectionMs = 60000;
+// How a create, a query and a take of a context's answers wait for the device: until the host
+// answers (ReimsGraphics::kLifecycleUntilAnswered, RgfxAnswerWait.hpp), as Metal's own calls wait
+// for the GPU's driver. The host compiles a pipeline first, which takes seconds cold and longer
+// on a slow host, behind whatever was posted before it. The wait ends unanswered only at the
+// device's stop or at the thread's abort, its process ending.
+constexpr UInt32 kAnswerWait = ReimsGraphics::kLifecycleUntilAnswered;
 // A lifecycle message's obj_id follows its header.
 constexpr UInt32 kObjIdOffset = sizeof(RgfxMsgHeader);
 } // namespace
@@ -410,10 +413,10 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 // MARK: - Shared events' ports
 
 namespace {
-// How long a shared event's name or import waits for the device: the host carries it out on the
-// caller's context's lane, behind what the context posted before it, a pipeline's compile among
-// them.
-constexpr UInt32 kShareMs = 60000;
+// How a shared event's name or import waits for the device: until the host answers
+// (ReimsGraphics::kLifecycleUntilAnswered), which it does on the caller's context's lane, behind
+// what the context posted before it, a pipeline's compile among them.
+constexpr UInt32 kShareWait = ReimsGraphics::kLifecycleUntilAnswered;
 } // namespace
 
 IOReturn RgfxAcceleratorUserClient::connectClient(IOUserClient *client)
@@ -448,8 +451,9 @@ IOReturn RgfxAcceleratorUserClient::exportSharedEvent(UInt64 ctx, UInt64 eventId
 	UInt32 length = 0;
 	UInt64 seqno = 0;
 	IOReturn r = owner->postLifecycle(RGFX_CMD_SHARED_EVENT_NAME, &m, sizeof(m), RGFX_EVT_COMPLETE,
-	                                  reply, sizeof(reply), &length, &seqno, kShareMs);
-	*posted = r == kIOReturnSuccess || r == kIOReturnTimeout;
+	                                  reply, sizeof(reply), &length, &seqno, kShareWait);
+	// Posted, answered or not: unanswered where the wait ended at the thread's abort.
+	*posted = r == kIOReturnSuccess || r == kIOReturnAborted;
 	if (r != kIOReturnSuccess)
 		return r;
 	RgfxComplete complete = {};
@@ -474,10 +478,10 @@ IOReturn RgfxAcceleratorUserClient::importSharedEvent(UInt64 ctx, UInt64 eventId
 	UInt64 seqno = 0;
 	IOReturn r = owner->postLifecycle(RGFX_CMD_SHARED_EVENT_IMPORT, &m, sizeof(m),
 	                                  RGFX_EVT_SHARED_EVENT_VALUE, reply, sizeof(reply), &length,
-	                                  &seqno, kShareMs);
-	if (r == kIOReturnTimeout) {
-		// Not answered in time: the process takes the import as failed, and the device keeps
-		// nothing of it, the destroy following the import on the ring.
+	                                  &seqno, kShareWait);
+	if (r == kIOReturnAborted) {
+		// Posted and not answered, its thread aborted: the process takes the import as failed,
+		// and the device keeps nothing of it, the destroy following the import on the ring.
 		RgfxObjectDestroy destroy = {};
 		destroy.header.type = RGFX_CMD_OBJECT_DESTROY;
 		destroy.obj_id = eventId;
@@ -649,23 +653,25 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	}
 	if (checked && !deferred && r == kIOReturnSuccess) {
 		r = owner->postLifecycle(type, message, static_cast<UInt32>(size), replyType, reply,
-		                         sizeof(reply), &replyLength, &seqno, kReflectionMs);
+		                         sizeof(reply), &replyLength, &seqno, kAnswerWait);
 		if (r == kIOReturnSuccess && pipeline)
 			owner->learnSharedPipeline(reply, replyLength);
 	}
 	IOFree(message, size);
-	// Posted where postLifecycle answered or timed out waiting for the answer. Whether the context
-	// closed since the check: its CONTEXT_CLOSE may then have gone before this create, which the
-	// device's close then never dropped.
-	const bool posted = checked && (r == kIOReturnSuccess || r == kIOReturnTimeout);
+	// Posted where postLifecycle answered, or where its wait for the answer ended at the thread's
+	// abort (kIOReturnAborted: its process is ending). Whether the context closed since the check:
+	// its CONTEXT_CLOSE may then have gone before this create, which the device's close then never
+	// dropped.
+	const bool unanswered = r == kIOReturnAborted;
+	const bool posted = checked && (r == kIOReturnSuccess || unanswered);
 	IOLockLock(listLock);
 	const bool closedSince = !hasContext || context != ctx;
 	IOLockUnlock(listLock);
-	if (rgfxSubmitDestroysBehind(type, posted, r == kIOReturnTimeout, closedSince)) {
-		// Not answered in time (the client takes the create as failed, and may make it again
-		// under a new id), or made for a context that has closed: destroy it, so the device keeps
-		// nothing of it. The destroy follows the create on the ring, and cancels it where it is
-		// still being made. A query or a write into an object makes nothing, so nothing follows.
+	if (rgfxSubmitDestroysBehind(type, posted, unanswered, closedSince)) {
+		// Not answered, its thread aborted (the client takes the create as failed), or made for a
+		// context that has closed: destroy it, so the device keeps nothing of it. The destroy
+		// follows the create on the ring, and cancels it where it is still being made. A query or
+		// a write into an object makes nothing, so nothing follows.
 		RgfxObjectDestroy destroy = {};
 		destroy.header.type = RGFX_CMD_OBJECT_DESTROY;
 		destroy.obj_id = objId;
@@ -807,8 +813,9 @@ IOReturn RgfxAcceleratorUserClient::submitBatchMethod(IOExternalMethodArguments 
 }
 
 // kRgfxAccelMethodTakeAnswers (RgfxAccelerator.hpp): the answers to the client's deferred
-// pipeline creates the device has given, after waiting for the one asked for. Always succeeds with
-// what it took, the answers' count out, so none is lost on a wait that timed out: the caller finds
+// pipeline creates the device has given, after waiting for the one asked for, until it is
+// answered (kAnswerWait). Always succeeds with what it took, the answers' count out, so none is
+// lost on a wait that ended first, at the device's stop or the thread's abort: the caller finds
 // whether the one it waited for is among them.
 IOReturn RgfxAcceleratorUserClient::takeAnswersMethod(IOExternalMethodArguments *a)
 {
@@ -819,7 +826,7 @@ IOReturn RgfxAcceleratorUserClient::takeAnswersMethod(IOExternalMethodArguments 
 	if (!open || a->scalarInputCount != 1 || a->scalarOutputCount != 1 || !a->structureOutput)
 		return kIOReturnBadArgument;
 	UInt32 length = 0, count = 0;
-	owner->takeDeferred(ctx, a->scalarInput[0], kReflectionMs,
+	owner->takeDeferred(ctx, a->scalarInput[0], kAnswerWait,
 	                    static_cast<UInt8 *>(a->structureOutput), a->structureOutputSize, &length,
 	                    &count);
 	a->scalarOutput[0] = count;

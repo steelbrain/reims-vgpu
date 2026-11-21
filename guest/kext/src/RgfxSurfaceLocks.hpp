@@ -197,6 +197,49 @@ inline bool rgfxLockWaits(const RgfxLockTable &t, uint64_t key)
 	return false;
 }
 
+// Whether the device has completed the command buffer of every pending write of surface `key`
+// (by its queues' marks): what is left is the bundle's retire, once the buffers' completions are
+// delivered and their copies written back. True where none is pending.
+inline bool rgfxLockDeviceDone(const RgfxLockTable &t, uint64_t key)
+{
+	for (uint32_t i = 0; i < t.useCount; i++) {
+		const RgfxLockUse &u = t.uses[i];
+		if (u.key != key)
+			continue;
+		const RgfxLockQueue *q = nullptr;
+		for (uint32_t j = 0; j < t.queueCount && q == nullptr; j++) {
+			if (t.queues[j].queue == u.queue)
+				q = &t.queues[j];
+		}
+		if (q == nullptr || u.lastWrite > q->completed)
+			return false;
+	}
+	return true;
+}
+
+// A CPU lock's wait for surface `key`'s pending writes, at `now`, waiting for the bundle's retire
+// at most `retireBound` once the device completed their buffers (both in one clock's units).
+// The lock waits for the device with no deadline: a buffer that waits behind a pipeline's compile
+// on the host, or behind other work on its GPU, holds the lock as long, as Metal's lock waits for
+// the GPU's writes, and a lock that went on before them would read whatever bytes the pages held.
+// The device's stop ends the wait (the caller's), and a GPU fault on the host completes the
+// buffers. What is left once the device has completed them is the process's: its completion
+// handler's delivery and its write-back. That wait keeps its bound, so a process that locks a
+// surface its own later buffer writes, on the thread that would retire it, holds no lock for
+// good. `*deviceDoneAt` is the time the device was first seen done (0: not yet), the caller's
+// across the wait. Whether the lock goes on unretired.
+inline bool rgfxLockGivesUp(const RgfxLockTable &t, uint64_t key, uint64_t now,
+                            uint64_t retireBound, uint64_t *deviceDoneAt)
+{
+	if (!rgfxLockDeviceDone(t, key)) {
+		*deviceDoneAt = 0;
+		return false;
+	}
+	if (*deviceDoneAt == 0)
+		*deviceDoneAt = now ? now : 1;
+	return now - *deviceDoneAt >= retireBound;
+}
+
 // The queues whose writes of surface `key` are pending, up to `capacity` of them in `queues`, of
 // those drawn in place only where `inPlace` (the ones the device's completion can retire): how
 // many. `*surfaceId` is the surface's IOSurfaceID where any is pending.

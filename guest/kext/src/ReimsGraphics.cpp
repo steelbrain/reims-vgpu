@@ -82,7 +82,14 @@ constexpr UInt32 kRingGuestClockBound = __builtin_offsetof(RgfxRingHeader, guest
 constexpr UInt32 kStrideAlign = 256;
 constexpr UInt32 kMaxDimension = kRgfxDisplayMaxDimension;
 
-// How long a command waits for ring space, and then for its answer.
+// How long a command waits for ring space, and then for its answer. Both keep a deadline, as
+// neither waits for the host's work: the ring's room frees as the host's reader takes messages
+// off it into the contexts' lanes, which it does behind no compile, so a ring full for 5 s is a
+// host that stopped reading; and the asks answered within kAnswerTimeoutMs are the display's
+// commands, which the host's display answers on no context's lane, and the kept pipeline
+// answers at the start (seedSharedPipelines), which the host reads from its store before any
+// process runs, a short seed costing only a cold compile later. A wait behind a compile has no
+// deadline (RgfxAnswerWait.hpp).
 constexpr UInt32 kPostTimeoutMs = 5000;
 constexpr UInt32 kAnswerTimeoutMs = 5000;
 // How often the control ring's room line is logged at most, while posts sleep for room: a summary,
@@ -398,7 +405,7 @@ IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 	// ring; a free one frees up with the shared array as its event.
 	ControlWaiter *w = nullptr;
 	IOLockLock(stateLock);
-	while (!w) {
+	while (!w && ready) {
 		for (UInt32 i = 0; i < kControlWaiters && !w; i++) {
 			if (!controlWaiters[i].waiting)
 				w = &controlWaiters[i];
@@ -408,7 +415,10 @@ IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 			break;
 	}
 	if (!w) {
+		const bool up = ready;
 		IOLockUnlock(stateLock);
+		if (!up)
+			return kIOReturnNotReady;
 		IOLog("ReimsGraphics: command %u: every control waiter is taken\n", type);
 		return kIOReturnBusy;
 	}
@@ -422,8 +432,11 @@ IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 	IOReturn r = post(type, message, size, &s, &w->seqno);
 	IOLockLock(stateLock);
 	while (r == kIOReturnSuccess && !w->done) {
-		if (IOLockSleepDeadline(stateLock, &w->done, deadline, THREAD_UNINT) ==
-		    THREAD_TIMED_OUT && !w->done)
+		if (!ready)
+			r = kIOReturnNotReady;
+		else if (IOLockSleepDeadline(stateLock, &w->done, deadline, THREAD_UNINT) ==
+		             THREAD_TIMED_OUT &&
+		         !w->done)
 			r = kIOReturnTimeout;
 	}
 	UInt32 status = w->status;
@@ -467,28 +480,46 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 		return kIOReturnUnsupported;
 	}
 
-	// Take a waiter, so the answer finds this thread once the message is on the ring.
+	// Take a waiter of the ask's kind, so the answer finds this thread once the message is on the
+	// ring. Both waits, for the waiter and for the answer, are in `timeoutMs`'s mode
+	// (RgfxAnswerWait.hpp), and end where the device stops: quiesce wakes them.
 	uint64_t deadline = 0;
-	if (timeoutMs != kLifecycleNoDeadline)
+	if (rgfxWaitHasDeadline(timeoutMs))
 		clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
+	const UInt32 interruptible =
+	    rgfxWaitInterruptible(timeoutMs) ? THREAD_INTERRUPTIBLE : THREAD_UNINT;
 	// Sleeps on `event` under stateLock until woken, or past the deadline where there is one.
-	auto sleepOn = [this, deadline](void *event) {
-		return deadline ? IOLockSleepDeadline(stateLock, event, deadline, THREAD_UNINT)
-		                : IOLockSleep(stateLock, event, THREAD_UNINT);
+	auto sleepOn = [this, deadline, interruptible](void *event) {
+		const wait_result_t r =
+		    deadline ? IOLockSleepDeadline(stateLock, event, deadline, interruptible)
+		             : IOLockSleep(stateLock, event, interruptible);
+		return r == THREAD_TIMED_OUT     ? kRgfxSleepTimedOut
+		       : r == THREAD_INTERRUPTED ? kRgfxSleepInterrupted
+		                                 : kRgfxSleepWoken;
 	};
+	auto upNow = [this] { return answers(); };
+	const RgfxWaiterKind kind = rgfxWaiterKind(type);
 	LifecycleWaiter *w = nullptr;
 	IOLockLock(stateLock);
-	while (!w) {
-		for (UInt32 i = 0; i < kLifecycleWaiters && !w; i++) {
-			if (lifecycleWaiters[i].replyType == 0)
-				w = &lifecycleWaiters[i];
-		}
-		if (!w && sleepOn(lifecycleWaiters) == THREAD_TIMED_OUT)
-			break;
-	}
-	if (!w) {
+	const RgfxWaitEnd took = rgfxAwait(
+	    [this, kind, &w] {
+		    const int32_t at = rgfxFreeWaiter(
+		        kind, [this](uint32_t i) { return lifecycleWaiters[i].replyType == 0; });
+		    w = at >= 0 ? &lifecycleWaiters[at] : nullptr;
+		    return w != nullptr;
+	    },
+	    upNow, [&sleepOn, this] { return sleepOn(lifecycleWaiters); });
+	// No waiter, the message not posted: kIOReturnBusy where the wait for one ended at its
+	// deadline or at the thread's abort, so the caller never takes it for a message posted and
+	// unanswered (kIOReturnTimeout, kIOReturnAborted below).
+	if (took != kRgfxWaitAnswered) {
 		IOLockUnlock(stateLock);
-		IOLog("ReimsGraphics: lifecycle %u: every waiter is taken\n", type);
+		if (took == kRgfxWaitStopped)
+			return kIOReturnNotReady;
+		static char untaken;
+		if (rgfxFirstCalls(&untaken, (static_cast<UInt64>(type) << 32) | took, 1))
+			IOLog("ReimsGraphics: lifecycle %u: every waiter of its kind is taken, %s\n", type,
+			      took == kRgfxWaitTimedOut ? "past its deadline" : "and its thread aborted");
 		return kIOReturnBusy;
 	}
 	w->seqno = 0;
@@ -508,10 +539,9 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	// Each waiter sleeps on its own `done`, so an answer wakes only the thread it is for, not
 	// every waiter (which, with many in flight, would herd on stateLock and starve the work loop
 	// that delivers the answers). The free event below stays the shared array, a slot's seekers'.
-	while (r == kIOReturnSuccess && !w->done) {
-		if (sleepOn(&w->done) == THREAD_TIMED_OUT && !w->done)
-			r = kIOReturnTimeout;
-	}
+	if (r == kIOReturnSuccess)
+		r = rgfxWaitReturn(rgfxAwait([w] { return w->done; }, upNow,
+		                             [&sleepOn, w] { return sleepOn(&w->done); }));
 	if (r == kIOReturnSuccess) {
 		UInt32 n = w->length < replyCapacity ? w->length : replyCapacity;
 		memcpy(reply, w->reply, n);
@@ -523,9 +553,15 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	w->seed = false;
 	IOLockWakeup(stateLock, lifecycleWaiters, false);
 	IOLockUnlock(stateLock);
+	// Once per command type and end a boot (docs/conventions.md).
 	static char unanswered;
-	if (r == kIOReturnTimeout && rgfxFirstCalls(&unanswered, type, 1))
-		IOLog("ReimsGraphics: lifecycle %u (seqno %llu): no answer\n", type, s);
+	if ((r == kIOReturnTimeout || r == kIOReturnAborted || r == kIOReturnNotReady) &&
+	    rgfxFirstCalls(&unanswered, (static_cast<UInt64>(type) << 32) | static_cast<UInt32>(r),
+	                   1))
+		IOLog("ReimsGraphics: lifecycle %u (seqno %llu): no answer: %s\n", type, s,
+		      r == kIOReturnTimeout   ? "its deadline passed"
+		      : r == kIOReturnAborted ? "its thread was aborted"
+		                              : "the device stopped");
 	if (seqno)
 		*seqno = s;
 	return r;
@@ -556,23 +592,37 @@ IOReturn ReimsGraphics::takeDeferred(UInt32 context, UInt64 waitFor, UInt32 time
                                      UInt32 capacity, UInt32 *length, UInt32 *count)
 {
 	uint64_t deadline = 0;
-	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
-	IOReturn r = kIOReturnSuccess;
+	if (rgfxWaitHasDeadline(timeoutMs))
+		clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
+	const UInt32 interruptible =
+	    rgfxWaitInterruptible(timeoutMs) ? THREAD_INTERRUPTIBLE : THREAD_UNINT;
 	IOLockLock(stateLock);
-	while (waitFor != 0 &&
-	       deferredAnswers.state(context, waitFor) == DeferredAnswers::kWaiting) {
-		if (IOLockSleepDeadline(stateLock, &deferredAnswers, deadline, THREAD_UNINT) ==
-		        THREAD_TIMED_OUT &&
-		    deferredAnswers.state(context, waitFor) == DeferredAnswers::kWaiting) {
-			r = kIOReturnTimeout;
-			break;
-		}
-	}
+	const RgfxWaitEnd end = rgfxAwait(
+	    [this, context, waitFor] {
+		    return waitFor == 0 ||
+		           deferredAnswers.state(context, waitFor) != DeferredAnswers::kWaiting;
+	    },
+	    [this] { return answers(); },
+	    [this, deadline, interruptible] {
+		    const wait_result_t r =
+		        deadline
+		            ? IOLockSleepDeadline(stateLock, &deferredAnswers, deadline, interruptible)
+		            : IOLockSleep(stateLock, &deferredAnswers, interruptible);
+		    return r == THREAD_TIMED_OUT     ? kRgfxSleepTimedOut
+		           : r == THREAD_INTERRUPTED ? kRgfxSleepInterrupted
+		                                     : kRgfxSleepWoken;
+	    });
 	*length = deferredAnswers.take(context, out, capacity, count);
 	IOLockUnlock(stateLock);
-	if (r == kIOReturnTimeout)
-		IOLog("ReimsGraphics: context %u: no answer to its deferred create (seqno %llu)\n",
-		      context, waitFor);
+	const IOReturn r = rgfxWaitReturn(end);
+	// Once per end a boot (docs/conventions.md).
+	static char unanswered;
+	if (r != kIOReturnSuccess && rgfxFirstCalls(&unanswered, static_cast<UInt32>(r), 1))
+		IOLog("ReimsGraphics: context %u: no answer to its deferred create (seqno %llu): %s\n",
+		      context, waitFor,
+		      r == kIOReturnTimeout   ? "its deadline passed"
+		      : r == kIOReturnAborted ? "its thread was aborted"
+		                              : "the device stopped");
 	return r;
 }
 
@@ -2053,10 +2103,28 @@ void ReimsGraphics::stop(IOService *provider)
 }
 
 // No more commands, and no work loop action left running: removing an event
-// source waits for its action.
+// source waits for its action. Every thread waiting for the device's answer, or for a waiter or
+// the ring's room to ask with, is woken under stateLock and finds the device stopped (ready
+// false), so a wait with no deadline (RgfxAnswerWait.hpp) ends with the device; and so are the
+// surfaces' CPU locks waiting for the device (rgfxSurfaceLocksStopped).
 void ReimsGraphics::quiesce()
 {
-	ready = false;
+	if (stateLock) {
+		IOLockLock(stateLock);
+		__atomic_store_n(&ready, false, __ATOMIC_RELEASE);
+		for (ControlWaiter &w : controlWaiters)
+			IOLockWakeup(stateLock, &w.done, false);
+		for (LifecycleWaiter &w : lifecycleWaiters)
+			IOLockWakeup(stateLock, &w.done, false);
+		IOLockWakeup(stateLock, controlWaiters, false);
+		IOLockWakeup(stateLock, lifecycleWaiters, false);
+		IOLockWakeup(stateLock, &deferredAnswers, false);
+		IOLockWakeup(stateLock, &room, false);
+		IOLockUnlock(stateLock);
+		rgfxSurfaceLocksStopped();
+	} else {
+		ready = false;
+	}
 	if (!workLoop)
 		return;
 	if (msix) {

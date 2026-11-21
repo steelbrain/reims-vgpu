@@ -158,14 +158,14 @@ int main()
 		      "the render, mesh render and compute pipeline creates are the pipeline creates");
 	check(rgfxSubmitAdmitted(RGFX_CMD_MESH_RENDER_PIPELINE_CREATE), "a mesh pipeline create is accepted");
 
-	// A destroy follows a create only where it was posted and made something, and either timed
-	// out or its context closed since the submit's check.
+	// A destroy follows a create only where it was posted and made something, and either its wait
+	// ended unanswered (its thread aborted) or its context closed since the submit's check.
 	check(rgfxSubmitDestroysBehind(RGFX_CMD_TEXTURE_CREATE, true, false, true),
 	      "a span-less create posted across its context's close is destroyed behind");
 	check(rgfxSubmitDestroysBehind(RGFX_CMD_RENDER_PIPELINE_CREATE, true, false, true),
 	      "a pipeline create across the close too");
 	check(rgfxSubmitDestroysBehind(RGFX_CMD_SAMPLER_CREATE, true, true, false),
-	      "a create not answered in time is destroyed behind");
+	      "a create whose thread was aborted before its answer is destroyed behind");
 	check(!rgfxSubmitDestroysBehind(RGFX_CMD_TEXTURE_CREATE, true, false, false),
 	      "an answered create of an open context is kept");
 	check(!rgfxSubmitDestroysBehind(RGFX_CMD_TEXTURE_CREATE, false, false, true),
@@ -178,15 +178,17 @@ int main()
 	      "nor a write into an object");
 	check(!rgfxSubmitDestroysBehind(RGFX_CMD_ICB_WRITE, true, true, true),
 	      "nor an indirect command buffer's commands");
-	// The timeout path is as before for every type that waits for an answer.
+	// The abort: a pipeline create's thread aborted while its compile runs (its process ending)
+	// posts the destroy behind the create, which cancels the compile, for every type that waits
+	// for an answer; a size query makes nothing to destroy.
 	const uint32_t answered[] = {RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
 	                             RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_ICB_CREATE, RGFX_CMD_LIBRARY_CREATE,
 	                             RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_LIBRARY_FROM_REGION};
 	for (uint32_t t : answered)
 		check(rgfxSubmitDestroysBehind(t, true, true, false),
-		      "an answered create that times out is destroyed behind, as before");
+		      "an answered create whose thread was aborted is destroyed behind");
 	check(!rgfxSubmitDestroysBehind(RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, true, true, false),
-	      "a size query that times out is not, as before");
+	      "a size query whose thread was aborted is not");
 
 	std::printf("submit_gate_test: OK (%d checks)\n", checks);
 	return 0;

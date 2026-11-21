@@ -20,15 +20,21 @@
  * write in place when the device raises its vector or a process retires writes (the bundle
  * retires a buffer that writes only surfaces in place as it takes the buffer's completion), and
  * at most every kBackstopMs where nothing wakes it. A wake that comes while it looks has it look
- * again, so it sleeps through none. A lock still waiting after kWaitMs goes on, with an
- * "RGFX: WARN" line naming the surface and the task: a write that never retires (a host that
- * never completes the buffer, or a process that locks a surface its own later buffer writes from
- * the thread that would retire it) holds no lock for good. A lock waiting for the host's answers
- * about a cached surface's pages (a download's, its own or another lock's, an attach's, a
- * deferral's, or its block's release's) waits as long as a new block of the surface waits for the
- * release (kRgfxCacheAnswerWaitMs, RgfxSurfaceCaches.hpp), and its warning gives how long it
- * waited in all. A download it stopped waiting for stays the host's: the host answers a download
- * or a release asked after it once its copy lands.
+ * again, so it sleeps through none. A lock waits for the device's completion of the writes'
+ * buffers with no deadline, as Metal's lock waits for the GPU's writes: a buffer behind a
+ * pipeline's compile on the host holds the lock as long as the compile takes, and a lock that
+ * went on before its buffer would read whatever bytes the pages held. Once the device has
+ * completed every pending write's buffer, what is left is the bundle's retire, the process's own,
+ * and a lock still waiting kRetireWaitMs after that goes on, with an "RGFX: WARN" line naming the
+ * surface and the task: a process that locks a surface its own later buffer writes from the
+ * thread that would retire it holds no lock for good (rgfxLockGivesUp, RgfxSurfaceLocks.hpp). A
+ * lock waiting for the host's answers about a cached surface's pages (a download's, its own or
+ * another lock's, an attach's, a deferral's, or its block's release's) waits with no deadline too
+ * (RgfxSurfaceCaches.hpp). Every such wait ends at the device's stop, which wakes the locks
+ * (rgfxSurfaceLocksStopped), and at the locking thread's abort (its process ending: the sleeps
+ * are THREAD_INTERRUPTIBLE, which no caught signal breaks), the lock then going on with its
+ * warning; a GPU fault on the host completes the buffers. A download it stopped waiting for stays
+ * the host's: the host answers a download or a release asked after it once its copy lands.
  *
  * A surface whose block has a device cache on the host (RgfxSurfaceCaches.hpp) has its cache made
  * with the block, and the control function does more at op 2, once no write is pending: where
@@ -77,6 +83,7 @@
 
 #include "RgfxAccelerator.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
+#include "RgfxAnswerWait.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxSurfaceLocks.hpp"
@@ -96,16 +103,17 @@ namespace {
 // The most pending writes kept at once (a surface's per queue), and the most queues with any.
 constexpr UInt32 kMaxUses = 4096;
 constexpr UInt32 kMaxQueues = kRgfxMaxWatchedQueues;
-// How long a lock waits before it goes on, and how long it sleeps at most between looks at the
+// How long a lock waits for the bundle's retire once the device completed the writes' buffers
+// before it goes on (rgfxLockGivesUp), and how long it sleeps at most between looks at the
 // device's completions where no wake comes.
-constexpr UInt32 kWaitMs = 2000;
+constexpr UInt32 kRetireWaitMs = 2000;
 constexpr UInt32 kBackstopMs = 20;
 // The most queues one surface's lock looks at the completions of.
 constexpr UInt32 kMaxLookedAt = 16;
 // The most cached surfaces at once (kRgfxCachedMaxSurfaces: every shared block in place may be
 // one, held, dormant or released and not yet answered). A lock waits for a download's answer
-// as long as for the host's other answers (rgfxCacheDownloadWaitMs): the host copies once the
-// buffers that used the cache before have finished.
+// with no deadline, as for the host's other answers: the host copies once the buffers that used
+// the cache before have finished.
 constexpr UInt32 kMaxCached = kRgfxCachedMaxSurfaces;
 // How many device caches made are logged, with what IOSurface answered, and how many writes
 // named of surfaces the kext cannot follow.
@@ -132,7 +140,7 @@ struct LockState {
 	uint32_t cachesMade;
 	// Writes the table had no room for, logged at the first.
 	uint32_t dropped;
-	uint32_t waitMs;
+	uint32_t retireWaitMs;
 	// Writes named of surfaces the kext cannot follow, logged up to kSkipsLogged.
 	uint32_t skipsLogged;
 	// Under `lock`: the surfaces whose blocks have a device cache on the host. The waiting locks
@@ -155,7 +163,7 @@ struct LockState {
 	uint64_t grown;
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0, {}, false, 0};
+                   kRetireWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0, {}, false, 0};
 
 // Under state.lock: where the table of cached surfaces grows and is full, it doubles
 // (rgfxCacheGrow). Where the memory is not there, it stays as it is, and the add finds no room,
@@ -361,10 +369,35 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key, bool logged)
 	return ok;
 }
 
+// How a sleep for the host's answer ended (sleepForHost).
+enum class Slept { kWoken, kStopped, kAborted };
+
+// Sleeps on the table for the host's next answer, under state.lock, with no deadline: a wake
+// ends it, and so do the device's stop, which wakes the table (rgfxSurfaceLocksStopped), and the
+// thread's abort, its process ending (THREAD_INTERRUPTIBLE: a caught signal does not break it).
+// Whether the device still answers is looked at first, out of state.lock (the lock order, above),
+// and a wake that came meanwhile has it return at once, so it sleeps through none.
+Slept sleepForHost(RgfxAccelerator *accel)
+{
+	const uint64_t woken = state.wakes;
+	IOLockUnlock(state.lock);
+	const bool up = accel->deviceAnswers();
+	IOLockLock(state.lock);
+	if (!up)
+		return Slept::kStopped;
+	if (state.wakes != woken)
+		return Slept::kWoken;
+	return IOLockSleep(state.lock, &state.table, THREAD_INTERRUPTIBLE) == THREAD_INTERRUPTED
+	           ? Slept::kAborted
+	           : Slept::kWoken;
+}
+
 // Sleeps, out of state.lock, until the next naming of a deferred block's pages after `tries`
 // not taken (rgfxAttachRetryMs), or `deadline` where sooner; false, sleeping not, where
 // `deadline` has passed. Under state.lock. No wake ends the sleep early: the next naming backs
-// off whatever moves meanwhile, and what moves is read again at the wake.
+// off whatever moves meanwhile, and what moves is read again at the wake. The sleeps are bounded
+// by `deadline`, kRgfxAttachRetryWaitMs from the first refusal: a wait on the host's refusals,
+// not on its work, each naming's answer itself waited for in full.
 bool attachBackoff(uint32_t tries, uint64_t deadline)
 {
 	if (mach_absolute_time() >= deadline)
@@ -456,45 +489,59 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 	if (op != 2)
 		return;
 	const uint64_t start = mach_absolute_time();
-	const uint64_t deadline = deadlineAfter(start, state.waitMs);
+	// The bound on the bundle's retire, from the device's completion of the writes' buffers
+	// (rgfxLockGivesUp), in mach_absolute_time's units.
+	uint64_t retireBound = 0, deviceDoneAt = 0;
+	nanoseconds_to_absolutetime(state.retireWaitMs * 1000000ull, &retireBound);
 	uint32_t surfaceId = 0;
 	bool gaveUp = false;
+	const char *waitedFor = nullptr;
 	IOLockLock(state.lock);
 	while (rgfxLockWaits(state.table, key)) {
 		// The wakes so far: one that comes while the completions are read, out of the lock, has
 		// the lock look again rather than sleep through it.
 		const uint64_t woken = state.wakes;
-		// The device's completions of the queues writing the surface in place.
+		// The device's completions of the queues writing the surface: they retire the writes in
+		// place, and once they pass every write, the bundle's retire is all that is left.
 		uint64_t queues[kMaxLookedAt];
-		uint32_t n = rgfxLockPendingQueues(state.table, key, true, queues, kMaxLookedAt,
+		uint32_t n = rgfxLockPendingQueues(state.table, key, false, queues, kMaxLookedAt,
 		                                   &surfaceId);
-		if (n) {
-			IOLockUnlock(state.lock);
-			uint64_t done[kMaxLookedAt];
-			for (uint32_t i = 0; i < n; i++)
-				done[i] = accel->queueCompleted(queues[i]);
-			IOLockLock(state.lock);
-			for (uint32_t i = 0; i < n; i++)
-				rgfxLockCompleted(state.table, queues[i], done[i]);
-			if (!rgfxLockWaits(state.table, key))
-				break;
-		}
-		uint64_t now = mach_absolute_time();
-		if (now >= deadline) {
+		IOLockUnlock(state.lock);
+		uint64_t done[kMaxLookedAt];
+		for (uint32_t i = 0; i < n; i++)
+			done[i] = accel->queueCompleted(queues[i]);
+		const bool up = accel->deviceAnswers();
+		IOLockLock(state.lock);
+		for (uint32_t i = 0; i < n; i++)
+			rgfxLockCompleted(state.table, queues[i], done[i]);
+		if (!rgfxLockWaits(state.table, key))
+			break;
+		if (!up) {
 			gaveUp = true;
+			waitedFor = "the GPU's writes to it pending, the device stopped";
+			break;
+		}
+		if (rgfxLockGivesUp(state.table, key, mach_absolute_time(), retireBound,
+		                    &deviceDoneAt)) {
+			gaveUp = true;
+			waitedFor = "the GPU's writes to it done on the device, and not retired";
 			break;
 		}
 		if (state.wakes != woken)
 			continue;
 		uint64_t backstop = 0;
 		clock_interval_to_deadline(kBackstopMs, kMillisecondScale, &backstop);
-		IOLockSleepDeadline(state.lock, &state.table, backstop < deadline ? backstop : deadline,
-		                    THREAD_UNINT);
+		if (IOLockSleepDeadline(state.lock, &state.table, backstop, THREAD_INTERRUPTIBLE) ==
+		    THREAD_INTERRUPTED) {
+			gaveUp = true;
+			waitedFor = "the GPU's writes to it pending, its thread aborted";
+			break;
+		}
 	}
 	// A cached surface: the pages take what the GPU wrote, one lock asking at a time, and a
 	// read-write lock moves its CPU generation.
-	const char *waitedFor = gaveUp ? "the GPU's writes to it pending" : nullptr;
 	uint32_t attachTries = 0;
+	uint64_t attachUntil = 0;
 	if (const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
 		if (!surfaceId)
 			surfaceId = c->surfaceId;
@@ -506,15 +553,18 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 			break;
 		if (step == kRgfxCacheAttach) {
 			// A deferred block's pages, named first: then a download, where the GPU wrote it. A
-			// naming not taken is made again until the deadline: the lock never goes on over
-			// pages that hold neither the GPU's writes nor a place for the CPU's but there.
-			// One asked and not answered (kRgfxCacheAttachLate) goes on as for pages named.
+			// naming not taken is made again for kRgfxAttachRetryWaitMs from the first refusal:
+			// the lock never goes on over pages that hold neither the GPU's writes nor a place
+			// for the CPU's but there. One asked and not answered (kRgfxCacheAttachLate: the
+			// device stopped, or the thread aborted) goes on as for pages named.
 			if (attachLocked(accel, key, attachTries == 0))
 				continue;
 			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
 			if (c == nullptr || c->deferral != kRgfxCacheDeferred)
 				continue;
-			if (!attachBackoff(++attachTries, deadline)) {
+			if (!attachUntil)
+				attachUntil = deadlineAfter(mach_absolute_time(), kRgfxAttachRetryWaitMs);
+			if (!attachBackoff(++attachTries, attachUntil)) {
 				gaveUp = true;
 				waitedFor = "its deferred block's pages not named";
 				break;
@@ -522,39 +572,41 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 			continue;
 		}
 		if (step == kRgfxCacheDownload) {
-			// Its answer, as long as the lock waits for the host's answers from its start: the
-			// pages hold the GPU's writes only once the host's copy lands.
-			const uint64_t left = rgfxCacheDownloadWaitMs(msSince(start), state.waitMs);
+			// Its answer, with no deadline: the pages hold the GPU's writes only once the host's
+			// copy lands, behind the buffers that used the cache.
 			IOLockUnlock(state.lock);
-			const IOReturn r =
-			    left ? accel->downloadSurfaceCache(offset, static_cast<UInt32>(left))
-			         : kIOReturnTimeout;
+			const IOReturn r = accel->downloadSurfaceCache(offset, kRgfxWaitUntilAnswered);
 			IOLockLock(state.lock);
 			const bool ok = r == kIOReturnSuccess;
 			rgfxCacheDownloaded(state.caches, key, mark, ok);
 			wakeLocked();
 			if (!ok) {
-				waitedFor = r == kIOReturnTimeout
-				                ? "its device cache's copy into its pages unanswered"
-				                : "its device cache's copy into its pages refused";
+				waitedFor = r == kIOReturnAborted
+				                ? "its device cache's copy into its pages unanswered, its thread "
+				                  "aborted"
+				            : r == kIOReturnUnsupported
+				                ? "its device cache's copy into its pages refused"
+				                : "its device cache's copy into its pages unanswered, the device "
+				                  "stopped";
 				break;
 			}
 			continue;
 		}
-		// Another lock's download, attach or deferral, or the block's release, as long as the
-		// lock waits for the host's answers.
-		const uint64_t waitMs = rgfxCacheLockWaitMs(state.caches, key, state.waitMs);
-		const uint64_t until = waitMs == state.waitMs ? deadline : deadlineAfter(start, waitMs);
-		if (mach_absolute_time() >= until) {
+		// Another lock's download, attach or deferral, or the block's release, with no deadline.
+		const Slept slept = sleepForHost(accel);
+		if (slept != Slept::kWoken) {
 			gaveUp = true;
 			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
-			waitedFor = c != nullptr && c->releasing
-			                ? "its block's release unanswered"
-			                : "another lock's copy of its device cache, or its pages' naming, "
-			                  "unanswered";
+			const bool releasing = c != nullptr && c->releasing;
+			waitedFor = slept == Slept::kAborted
+			                ? (releasing ? "its block's release unanswered, its thread aborted"
+			                             : "another lock's copy of its device cache, or its "
+			                               "pages' naming, unanswered, its thread aborted")
+			                : (releasing ? "its block's release unanswered, the device stopped"
+			                             : "another lock's copy of its device cache, or its "
+			                               "pages' naming, unanswered, the device stopped");
 			break;
 		}
-		IOLockSleepDeadline(state.lock, &state.table, until, THREAD_UNINT);
 	}
 	if (a == 0) {
 		if (RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
@@ -936,15 +988,13 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 	// The surface's memory, retained, not wired: its pages are named only where a lock needs them.
 	memory->retain();
 	const uint64_t key = reinterpret_cast<uintptr_t>(cache);
-	uint64_t deadline = 0;
-	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
 	IOLockLock(state.lock);
 	// As rgfxSurfaceCacheAdd: the surface's previous block's attach in flight is answered first,
-	// and its release unanswered was the ask's to wait for.
+	// with no deadline, and its release unanswered was the ask's to wait for.
 	for (const RgfxCachedSurface *previous;
 	     (previous = rgfxCacheFind(state.caches, key)) != nullptr && !previous->releasing &&
-	     mach_absolute_time() < deadline;)
-		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
+	     sleepForHost(accel) == Slept::kWoken;)
+		;
 	const bool previous = rgfxCacheFind(state.caches, key) != nullptr;
 	if (!previous)
 		growCaches();
@@ -1102,10 +1152,10 @@ RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 o
 		IOLockUnlock(state.lock);
 		return did;
 	}
-	// A naming not taken is made again, as a lock's is, until the locks' wait ends: past it the
-	// release goes with the pages unnamed, what the GPU wrote not copied into them.
-	uint64_t deadline = 0;
-	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
+	// A naming not taken is made again, as a lock's is, for kRgfxAttachRetryWaitMs from the first
+	// refusal: past it the release goes with the pages unnamed, what the GPU wrote not copied into
+	// them. Each naming waits for its answer with no deadline, on the naming worker.
+	uint64_t retryUntil = 0;
 	uint32_t tries = 0;
 	IOLockLock(state.lock);
 	for (;;) {
@@ -1117,7 +1167,9 @@ RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 o
 			// Named, or asked and not answered (kRgfxCacheAttachLate): the host may map them.
 			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
 			const bool hostPages = c != nullptr && rgfxCacheHostPages(*c);
-			if (!named && !hostPages && c != nullptr && attachBackoff(++tries, deadline))
+			if (!named && !hostPages && c != nullptr && !retryUntil)
+				retryUntil = deadlineAfter(mach_absolute_time(), kRgfxAttachRetryWaitMs);
+			if (!named && !hostPages && c != nullptr && attachBackoff(++tries, retryUntil))
 				continue;
 			did = hostPages ? kRgfxReleaseAttached : kRgfxReleaseUnattached;
 			static char unnamed;
@@ -1125,12 +1177,13 @@ RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 o
 				IOLog("RGFX: WARN: the release of IOSurface %u's deferred block 0x%llx goes on "
 				      "after %u ms with its pages not named: what the GPU wrote is not copied "
 				      "into them\n",
-				      c != nullptr ? c->surfaceId : 0, offset, state.waitMs);
+				      c != nullptr ? c->surfaceId : 0, offset, kRgfxAttachRetryWaitMs);
 			break;
 		}
-		// A lock's attach in flight ends within its SURFACE_PAGES's answer time, and none
-		// starts once the block is releasing (rgfxCacheNext): the release goes after it, never
-		// over it, under no lock but this one, which the sleep lets go.
+		// A lock's attach in flight ends at its SURFACE_PAGES's answer, or at the device's stop
+		// or its thread's abort, and none starts once the block is releasing (rgfxCacheNext): the
+		// release goes after it, never over it, under no lock but this one, which the sleep lets
+		// go.
 		if (step == kRgfxCacheReleaseWait) {
 			IOLockSleep(state.lock, &state.table, THREAD_UNINT);
 			continue;
@@ -1221,8 +1274,8 @@ bool rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool rele
 	return true;
 }
 
-bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,
-                         IOMemoryMap *header, UInt32 genOffset)
+bool rgfxSurfaceCacheAdd(RgfxAccelerator *accel, void *cache, void *surface, UInt64 offset,
+                         uint32_t surfaceId, IOMemoryMap *header, UInt32 genOffset)
 {
 	if (!cache || !surface || !header || !startLocks())
 		return false;
@@ -1243,17 +1296,16 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 	auto *genAt = reinterpret_cast<volatile uint64_t *>(header->getVirtualAddress() + genOffset);
 	__atomic_store_n(genAt, 0, __ATOMIC_RELEASE);
 	const uint64_t key = reinterpret_cast<uintptr_t>(cache);
-	uint64_t deadline = 0;
-	clock_interval_to_deadline(state.waitMs, kMillisecondScale, &deadline);
 	IOLockLock(state.lock);
 	// IOSurface gives a surface one device cache, so the surface's previous block may still be
 	// in the table: a let-go's attach of its pages in flight, whose answer lets it go, is waited
-	// for. One whose release is unanswered was the ask's to wait for, before it made this block
-	// (rgfxSurfaceCacheAwaitWriteBack): the release is late, and this block goes on uncached.
+	// for, with no deadline (sleepForHost). One whose release is unanswered was the ask's to wait
+	// for, before it made this block (rgfxSurfaceCacheAwaitWriteBack): the device stopped, or the
+	// asker's process is ending, and this block goes on uncached.
 	for (const RgfxCachedSurface *previous;
 	     (previous = rgfxCacheFind(state.caches, key)) != nullptr && !previous->releasing &&
-	     mach_absolute_time() < deadline;)
-		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
+	     sleepForHost(accel) == Slept::kWoken;)
+		;
 	const char *why = nullptr;
 	RgfxCachedSurface *c = nullptr;
 	bool logged = true;
@@ -1301,16 +1353,19 @@ bool rgfxSurfaceCacheWritingBack(OSObject *surface)
 	return writing;
 }
 
-void rgfxSurfaceCacheAwaitWriteBack(OSObject *surface, uint64_t deadline)
+bool rgfxSurfaceCacheAwaitWriteBack(RgfxAccelerator *accel, OSObject *surface)
 {
 	if (!surface || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
-		return;
+		return true;
 	// The release's answer takes the cached surface out and wakes the locks' sleepers
 	// (rgfxSurfaceCacheReleased).
 	IOLockLock(state.lock);
-	while (rgfxCacheWritingBack(state.caches, surface) && mach_absolute_time() < deadline)
-		IOLockSleepDeadline(state.lock, &state.table, deadline, THREAD_UNINT);
+	bool done;
+	while (!(done = !rgfxCacheWritingBack(state.caches, surface)) &&
+	       sleepForHost(accel) == Slept::kWoken)
+		;
 	IOLockUnlock(state.lock);
+	return done;
 }
 
 void rgfxSurfaceCacheNoteClients(UInt64 offset)
@@ -1505,6 +1560,15 @@ void rgfxSurfaceLocksWake()
 	IOLockLock(state.lock);
 	if (state.table.useCount)
 		wakeLocked();
+	IOLockUnlock(state.lock);
+}
+
+void rgfxSurfaceLocksStopped()
+{
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLockLock(state.lock);
+	wakeLocked();
 	IOLockUnlock(state.lock);
 }
 

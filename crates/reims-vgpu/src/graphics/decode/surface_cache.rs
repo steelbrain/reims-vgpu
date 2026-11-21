@@ -1075,9 +1075,9 @@ fn after_landings(mut landings: Vec<Arc<Landing>>, done: Answer) {
 }
 
 /// The longest a release waits for its turn ([`ReleasePace`]), from its ask: past it, its copy is
-/// made at once, beside any other. The kext waits 10 s for a release's answer, at a lock of its
-/// surface and at a new block over its pages, before it goes on over pages the copy may not have
-/// reached (`kRgfxWriteBackWaitMs`); the copy itself then still waits for the GPU.
+/// made at once, beside any other. The kext waits for a release's answer with no deadline, at a
+/// lock of its surface and at a new block over its pages, so a release's turn holds those up; the
+/// copy itself then still waits for the GPU.
 const RELEASE_TURN_MOST: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The name of the releases' pace's thread ([`ReleasePace`]).

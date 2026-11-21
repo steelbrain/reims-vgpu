@@ -6,7 +6,6 @@
 #include "RgfxLibraryStream.hpp"
 
 #include <atomic>
-#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <unistd.h>
@@ -33,6 +32,16 @@ bool rgfxStagingSmaller(uint64_t *chunkMax)
 	const uint64_t next = *chunkMax / 4;
 	*chunkMax = next < kRgfxStagingPage ? kRgfxStagingPage : next;
 	return true;
+}
+
+uint64_t rgfxStreamIdleUs(uint64_t looks)
+{
+	return looks <= 50 ? 200 : looks <= 250 ? 1000 : 5000;
+}
+
+void rgfxStreamIdleSleep(void *, uint64_t looks)
+{
+	usleep(static_cast<useconds_t>(rgfxStreamIdleUs(looks)));
 }
 
 namespace {
@@ -104,24 +113,19 @@ bool makeWindow(RgfxRegion &region, uint64_t length, Window *w)
 	return false;
 }
 
-// Waits, `awaitUs` at most, for the host to have copied block `i`'s last chunk out.
-bool awaitBlock(const Window &w, uint32_t i, uint64_t awaitUs)
+// Waits, with no deadline, for the host to have copied block `i`'s last chunk out (none posted:
+// no wait), `idle` between looks.
+void awaitBlock(const Window &w, uint32_t i, RgfxStreamIdle idle, void *idleContext)
 {
-	const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(awaitUs);
-	for (;;) {
-		if (__atomic_load_n(w.ack[i], __ATOMIC_ACQUIRE) == w.expected[i])
-			return true;
-		if (std::chrono::steady_clock::now() >= end)
-			return false;
-		usleep(200);
-	}
+	for (uint64_t looks = 0; __atomic_load_n(w.ack[i], __ATOMIC_ACQUIRE) != w.expected[i];)
+		idle(idleContext, ++looks);
 }
 
 } // namespace
 
 bool rgfxStreamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *bytes,
                        uint64_t length, const uint8_t *key, RgfxObjId *outObjId,
-                       uint32_t *outStatus, uint64_t awaitUs)
+                       uint32_t *outStatus, RgfxStreamIdle idle, void *idleContext)
 {
 	if (bytes == nullptr || length == 0)
 		return false;
@@ -131,14 +135,11 @@ bool rgfxStreamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *b
 		return false;
 	const uint64_t chunk = w.shape.chunk;
 	const RgfxObjId objId = ser.allocLibraryId();
-	bool streamed = true, copiedOut = true;
+	bool streamed = true;
 	uint32_t i = 0;
 	for (uint64_t at = 0; at < length; at += chunk, i = (i + 1) % w.shape.blocks) {
 		const uint64_t n = length - at < chunk ? length - at : chunk;
-		if (!awaitBlock(w, i, awaitUs)) {
-			streamed = copiedOut = false;
-			break;
-		}
+		awaitBlock(w, i, idle, idleContext);
 		std::memcpy(const_cast<uint8_t *>(w.block[i]), bytes + at, n);
 		const uint64_t token = g_nextToken++;
 		bool posted = false;
@@ -156,18 +157,9 @@ bool rgfxStreamLibrary(RgfxRegion &region, RgfxSerializer &ser, const uint8_t *b
 	}
 	// The window goes back once the host has copied out every chunk it took (the last chunk's
 	// answer comes once the library is made from them all, so this rarely waits).
-	for (uint32_t b = 0; copiedOut && b < w.shape.blocks; b++)
-		copiedOut = awaitBlock(w, b, awaitUs);
-	if (copiedOut) {
-		region.release(w.offset);
-	} else {
-		static std::atomic<bool> logged{false};
-		if (!logged.exchange(true))
-			os_log_error(rgfxLog(),
-			             "RGFX: the host did not copy a library's chunk out of its staging window "
-			             "in time: the window's %llu bytes are kept (logged once)",
-			             (unsigned long long)w.shape.bytes);
-	}
+	for (uint32_t b = 0; b < w.shape.blocks; b++)
+		awaitBlock(w, b, idle, idleContext);
+	region.release(w.offset);
 	if (!streamed)
 		return false;
 	*outObjId = objId;

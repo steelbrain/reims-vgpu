@@ -57,6 +57,7 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #endif
 #include <kern/thread_call.h>
 
+#include "RgfxAnswerWait.hpp"
 #include "RgfxBootConsole.hpp"
 #include "RgfxDeferredAnswers.hpp"
 #include "RgfxDisplayBounds.hpp"
@@ -70,6 +71,15 @@ typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxSharedPipelines.hpp"
 #include "RgfxVblankClock.hpp"
 #include "reims_graphics_wire.h"
+
+// The IOReturn of a wait for the host's answer that ended as `end` (RgfxAnswerWait.hpp).
+inline IOReturn rgfxWaitReturn(RgfxWaitEnd end)
+{
+	return end == kRgfxWaitAnswered  ? kIOReturnSuccess
+	       : end == kRgfxWaitTimedOut ? kIOReturnTimeout
+	       : end == kRgfxWaitAborted  ? kIOReturnAborted
+	                                  : kIOReturnNotReady;
+}
 
 class RgfxAccelerator;
 class RgfxPointerDevice;
@@ -278,6 +288,12 @@ public:
 	// The displays the device's framebuffers drive (rgfxDisplaysDriven): 1 where the framebuffer
 	// did not take MULTI_DISPLAY; 0 before display 0's start has read the device's displays.
 	UInt32 drivenDisplays() const { return (isHead() ? device : this)->displayCount; }
+	// Whether the device answers asks: started, and not stopped since (quiesce). A wait for the
+	// host's answer ends where it does not.
+	bool answers() const
+	{
+		return __atomic_load_n(&(isHead() ? device : this)->ready, __ATOMIC_ACQUIRE);
+	}
 	// The framebuffer that drives display `display` (0 is display 0's, the device's), retained for
 	// the caller, or nullptr where none does.
 	ReimsGraphics *copyDisplay(UInt32 display);
@@ -364,16 +380,21 @@ public:
 	// the control ring: `message` is the whole message in kernel memory, at most
 	// kLifecycleMessageMax bytes, whose header is stamped here with `type`, its size and the
 	// seqno (*seqno, when not null). With `replyType` 0 it returns once the message is on the
-	// ring; else it waits up to `timeoutMs` for the device's answer of that type to this
-	// seqno and copies it, header and all, into `reply` (*replyLength its bytes, at most
-	// `replyCapacity`), or, with kLifecycleNoDeadline, for as long as the answer takes. Thread
-	// context only, never on the work loop.
+	// ring; else it takes a waiter of the type's kind (rgfxWaiterKind) and waits for the device's
+	// answer of that type to this seqno, in `timeoutMs`'s mode (RgfxAnswerWait.hpp), and copies
+	// it, header and all, into `reply` (*replyLength its bytes, at most `replyCapacity`). Both
+	// waits, for a free waiter and for the answer, end unanswered at the device's stop
+	// (kIOReturnNotReady), at a deadline where the mode has one, and in kLifecycleUntilAnswered
+	// at the thread's abort. A wait for a waiter that ends so returns kIOReturnBusy, the message
+	// not posted; one for the answer kIOReturnTimeout or kIOReturnAborted, the message posted and
+	// the host's, answered or not. Thread context only, never on the work loop.
 	static constexpr UInt32 kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
 	static constexpr UInt32 kLifecycleReplyMax = 128;
-	// A `timeoutMs` with no deadline: the waits, for a free waiter and for the answer, last until
-	// they end, for an ask the host answers however long it takes (a pool block's,
-	// RgfxPoolBlocks.hpp).
-	static constexpr UInt32 kLifecycleNoDeadline = UINT32_MAX;
+	// The `timeoutMs` modes with no deadline (RgfxAnswerWait.hpp): THREAD_UNINT, for an ask
+	// whose context's close waits for it (a pool block's, RgfxPoolBlocks.hpp), and
+	// THREAD_INTERRUPTIBLE, for the processes' asks that wait behind the host's compiles.
+	static constexpr UInt32 kLifecycleNoDeadline = kRgfxWaitNoDeadline;
+	static constexpr UInt32 kLifecycleUntilAnswered = kRgfxWaitUntilAnswered;
 	// Where `seedOrder` is not null, the waiter is a seed's (LifecycleWaiter), its first
 	// PIPELINE_REFLECTION the *seedOrder th newest.
 	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,
@@ -392,7 +413,9 @@ public:
 	// Copies context `context`'s answers to its deferred creates into the `capacity` bytes at
 	// `out`, each whole, in their seqnos' order, while they fit, and frees their slots: the bytes
 	// in `*length`, the answers in `*count`. Where `waitFor` is the seqno of one of its creates
-	// still waiting, waits up to `timeoutMs` for its answer first. Thread context only.
+	// still waiting, waits for its answer first, in `timeoutMs`'s mode (postLifecycle): the
+	// answers taken all the same where that wait ends unanswered, its end returned
+	// (kIOReturnNotReady, kIOReturnTimeout or kIOReturnAborted). Thread context only.
 	IOReturn takeDeferred(UInt32 context, UInt64 waitFor, UInt32 timeoutMs, UInt8 *out,
 	                      UInt32 capacity, UInt32 *length, UInt32 *count);
 	// Frees context `context`'s deferred slots, at its close, and lets its waiters go.
@@ -475,7 +498,11 @@ private:
 	static constexpr UInt32 kControlWaiters = 8;
 
 	// A thread waiting for a lifecycle message's answer: free while replyType is 0; its seqno
-	// is 0 until the message is on the ring. A seed's (`seed`, seedSharedPipelines) takes the
+	// is 0 until the message is on the ring. Split by kind, each kind taking only its own
+	// (rgfxFreeWaiter, RgfxAnswerWait.hpp): 32 for the processes' creates and queries, which wait
+	// with no deadline behind the host's compiles, 16 for the surfaces' pages and copies, and 16
+	// for the device's own asks (a queue's create, a close, a pool's take), so the creates never
+	// take the waiters WindowServer's asks need. A seed's (`seed`, seedSharedPipelines) takes the
 	// PIPELINE_REFLECTIONs of its seqno before its answer into the shared pipelines, the next one
 	// the `order`th newest the device hands.
 	struct LifecycleWaiter {
@@ -487,7 +514,7 @@ private:
 		UInt32 order;
 		UInt8 reply[kLifecycleReplyMax];
 	};
-	static constexpr UInt32 kLifecycleWaiters = 32;
+	static constexpr UInt32 kLifecycleWaiters = kRgfxLifecycleWaiters;
 
 	// The deferred creates' answers (postDeferred): 256 slots, at most 64 a context.
 	static constexpr UInt32 kDeferredAnswers = 256;

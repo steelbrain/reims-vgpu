@@ -8,7 +8,9 @@
 // as the work loop would once woken; else it pauses the CPU and looks again. It never waits for
 // the gate: where another thread holds it, the work loop most likely, which takes the record
 // itself, the waiter pauses and looks again, so a holder that waits for something the waiter
-// holds is bounded by the waiter's deadline, as before. It looks only while its own call waits
+// holds waits at most kRgfxAnswerLookNs for the look, then the waiter sleeps as before; the asks
+// that wait with no deadline (RgfxAnswerWait.hpp) are posted holding no lock the work loop takes.
+// It looks only while its own call waits
 // for an answer, and only that long: an answer that comes later wakes it as before.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/answer_look_test.cpp)

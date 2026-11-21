@@ -193,6 +193,56 @@ int main()
 	          rgfxControlReleases(kRgfxControlDone),
 	      "op 3 alone releases");
 
+	// A lock behind a pending create: WindowServer locks a surface the app's buffer 5 writes, the
+	// buffer waiting on the host for a pipeline's compile, which takes a minute. The lock waits
+	// with no deadline until the device completes the buffer, then for the bundle's retire, that
+	// part bounded.
+	{
+		RgfxLockUse behindUses[2] = {};
+		RgfxLockQueue behindQueues[2] = {};
+		RgfxLockTable b = {behindUses, 0, 2, behindQueues, 0, 2};
+		constexpr uint64_t kMs = 1000000, kBound = 2000 * kMs;
+		uint64_t deviceDoneAt = 0;
+		check(rgfxLockNote(b, kSurface, kQueue, 5, kId, kCopy, kBlock) &&
+		          rgfxLockNote(b, kSurface, kQueue2, 3, kId, kInPlace, kBlock),
+		      "the app's buffers write the surface, a copy and in place");
+		check(!rgfxLockDeviceDone(b, kSurface), "the device has completed neither buffer");
+		bool gaveUp = false;
+		for (uint64_t now = kMs; now <= 60000 * kMs && !gaveUp; now += 20 * kMs)
+			gaveUp = rgfxLockGivesUp(b, kSurface, now, kBound, &deviceDoneAt);
+		check(!gaveUp && deviceDoneAt == 0,
+		      "a minute of the compile, past the old 2 s: the lock waits on, its bound not begun");
+		check(!rgfxLockCompleted(b, kQueue, 4) && !rgfxLockDeviceDone(b, kSurface),
+		      "the device completes the copy's queue's buffer 4: buffer 5 is pending still");
+		check(rgfxLockCompleted(b, kQueue2, 3) && !rgfxLockDeviceDone(b, kSurface),
+		      "the in-place buffer completes and retires: the copy's buffer holds the lock still");
+		check(!rgfxLockGivesUp(b, kSurface, 61000 * kMs, kBound, &deviceDoneAt) &&
+		          deviceDoneAt == 0,
+		      "so the lock waits on");
+		check(!rgfxLockCompleted(b, kQueue, 5) && rgfxLockWaits(b, kSurface) &&
+		          rgfxLockDeviceDone(b, kSurface),
+		      "the compile ends and the device completes buffer 5: the copy's retire is left");
+		check(!rgfxLockGivesUp(b, kSurface, 62000 * kMs, kBound, &deviceDoneAt) &&
+		          deviceDoneAt == 62000 * kMs,
+		      "the bound starts at the device's completion");
+		check(!rgfxLockGivesUp(b, kSurface, 62000 * kMs + kBound - 1, kBound, &deviceDoneAt),
+		      "and the lock waits for the bundle's retire within it");
+		check(rgfxLockRetire(b, kQueue, 5) && !rgfxLockWaits(b, kSurface),
+		      "the bundle retires buffer 5 after its write-back: the lock goes on, the pages "
+		      "holding the GPU's writes");
+		// The retire that never comes: the process locks the surface on the thread that would
+		// retire its own later buffer.
+		deviceDoneAt = 0;
+		check(rgfxLockNote(b, kSurface, kQueue, 6, kId, kCopy, kBlock) &&
+		          !rgfxLockGivesUp(b, kSurface, 70000 * kMs, kBound, &deviceDoneAt),
+		      "a later buffer's write: the lock waits for the device");
+		check(!rgfxLockCompleted(b, kQueue, 6) &&
+		          !rgfxLockGivesUp(b, kSurface, 71000 * kMs, kBound, &deviceDoneAt) &&
+		          rgfxLockGivesUp(b, kSurface, 71000 * kMs + kBound, kBound, &deviceDoneAt),
+		      "completed, never retired: the lock goes on once the bound is past");
+		check(rgfxLockDeviceDone(b, kOther), "a surface with nothing pending waits for nothing");
+	}
+
 	std::printf("surface_locks_test: OK (%d checks)\n", checks);
 	return 0;
 }

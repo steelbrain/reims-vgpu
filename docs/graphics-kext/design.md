@@ -581,8 +581,14 @@ Stages:
       write retires at the bundle's retire call after the buffer's completion
       and write-back, or, for a surface drawn in place, once the queue's
       completion ring's `completed_seqno` reaches the buffer, whichever comes
-      first. A lock still waiting after 2 s goes on with an "RGFX: WARN" line
-      (`guest/kext/src/RgfxAcceleratorLocks.cpp`).
+      first. A lock waits with no deadline until the device has completed
+      every pending write's buffer, however long the host takes, a compile
+      the buffer waits behind among it, as Metal's lock waits for the GPU's
+      writes; then it waits 2 s at most for the bundle's retire, so a
+      process that locks a surface on the thread that would retire its own
+      writes goes on, with an "RGFX: WARN" line
+      (`guest/kext/src/RgfxAcceleratorLocks.cpp`, `rgfxLockGivesUp`). The
+      device's stop and the locking thread's abort end the wait.
     - **The device cache:** every host that maps the surfaces' pages has
       `RGFX_FEATURE_SURFACE_CACHE`, one whose GPU shares the CPU's memory
       within a budget (*Device caches on a GPU that shares the CPU's memory*,
@@ -2675,9 +2681,10 @@ messages change, and only for messages published before it
   of those four kinds that names its block, and for each lane through its last
   `BLOCK_RELEASE` of a block described cached whose runs share a page with its
   own: the release copies that block's device cache into the pages, and the
-  kext makes a surface's new block over them once it has waited 10 s for the
-  release's answer, when a slow message on the release's lane may still hold
-  it; a `SURFACE_DOWNLOAD` waits for no other lane, as on the control thread
+  kext makes a surface's new block over them only once the release is
+  answered, however long a slow message on the release's lane holds it (the
+  device's stop and the asking thread's abort end that wait); a
+  `SURFACE_DOWNLOAD` waits for no other lane, as on the control thread
   before.
 
 `reims_vgpu_graphics`'s `device::lanes` lists every message that names a block or
@@ -3080,10 +3087,51 @@ sleeps: where the control completion ring holds a record the work loop has
 not taken, it takes the ring in the work loop's gate, as the work loop does,
 and else pauses the CPU. It never waits for the gate: where another thread
 holds it, the waiter pauses and looks again, so a holder that waits for a lock
-the waiter's caller holds is bounded by the waiter's deadline, as before. The
+the waiter's caller holds waits at most the look's 150 us, and the waiter then
+sleeps as before; the asks that wait with no deadline (below) are posted
+holding no lock the work loop takes. The
 rest of the work loop's service follows at the interrupt the record raised. Only a thread whose call waits for an answer
 looks, and only that long; a later answer wakes it as before. Tested by the
 kext's `answer_look_test`.
+
+**How a waiter waits.** The host answers a process's asks on the asking
+context's lane, behind what the context posted before them, a pipeline's
+compile among it, which takes seconds cold and longer on a slow host. So the
+kext waits for them with no deadline, as Metal's own calls wait for the GPU's
+driver (`RgfxAnswerWait.hpp`): a create or a query a process submits, a take of
+its deferred creates' answers, a shared event's name or import, a queue's
+create, a surface's `SURFACE_PAGES` and `SURFACE_DOWNLOAD`, a CPU lock's wait
+for its surface's writes and the host's copies, and a new block's wait for its
+surface's write-back. The bundle's library stream waits for each chunk's ack
+with no deadline too (`RgfxLibraryStream.hpp`). Such a wait sleeps
+`THREAD_INTERRUPTIBLE` and ends only at the answer, at the device's stop
+(`quiesce` wakes every waiter, each finding the device stopped), or at the
+thread's abort, a SIGKILL, a signal whose default action ends the process, or
+its exit; a caught signal never ends it. A create whose wait the abort ended
+has its destroy posted behind it, which cancels its compile on the host
+(`RgfxSubmitGate.hpp`). What the guest sees is that a call behind a slow
+compile waits for it: a lock or a present of a surface the compiling process
+draws, its queue's create, its next create. A pool or Private block's take
+waits with no deadline too, `THREAD_UNINT`, as its context's close waits for
+it. The asks that keep a deadline wait on no compile: the control ring's room
+(5 s: the host's reader takes messages off the ring behind no compile), the
+display's commands (5 s), the kept pipeline answers read at the start (5 s), a
+context's close (10 s, after which it is parked, not dropped), the display
+pipe's (5 s, WindowServer's, a transaction not sent being sent again with its
+next frame), an arm64 guest's video sends (10 s), and a new block's wait for
+the region's room (100 ms, after which the process makes a copy).
+
+The kext's 64 lifecycle waiters are split by kind, each kind taking only its
+own, so asks that wait with no deadline never take the waiters WindowServer's
+asks need: 32 for the creates and queries the processes submit and their
+shared events' names and imports; 16 for the surfaces' `SURFACE_PAGES` and
+`SURFACE_DOWNLOAD`, any process's, WindowServer's for its own surfaces and at
+its CPU locks among them; and 16 for the device's own asks, a queue's create,
+a context's close, a pool or Private take, the kept pipeline answers and an
+arm64 guest's video sends (`rgfxWaiterKind`). A thread that finds its kind's
+waiters taken waits for one in its ask's mode. The display's commands have 8
+waiters of their own. Tested by the kext's `answer_wait_test`, which takes
+every create waiter and finds the surface and device asks theirs.
 
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its
@@ -4942,16 +4990,17 @@ reads it once.
   one reuses a range another freed in it. The take happens on the thread
   whose buffer found no room, and only then: nothing is taken ahead.
 - **No deadline.** The kext waits for a take's answer with no deadline,
-  `THREAD_UNINT`, as it waits for its other asks of the host, whose
-  deadlines are 5 to 60 s. A take ends at its answer, its context's close or
-  the device's reset; the host gives back the block of a take whose context
-  closed first and sends no answer. Where the host stops answering (the
-  library stalled), each taking thread waits holding one of the kext's 32
-  waiters for answers, and a kill of its process completes only once the
-  host answers; the process's other threads, and other processes, go on,
-  their asks ending at their deadlines. A paused VM runs no guest thread. The
-  kext resets the device only at its start, before a process can open it,
-  and at its stop, once every process closed it.
+  `THREAD_UNINT`, where its other asks behind the host's work wait with none
+  interruptibly (*How a waiter waits*). A take ends at its answer, its
+  context's close or the device's reset; the host gives back the block of a
+  take whose context closed first and sends no answer. Where the host stops
+  answering (the library stalled), each taking thread waits holding one of
+  the kext's 16 waiters for the device's own asks, and a kill of its process
+  completes only once the host answers; the process's other threads, and
+  other processes, go on, their asks ending at their processes' kills. A
+  paused VM runs no guest thread. The kext resets the device only at its
+  start, before a process can open it, and at its stop, once every process
+  closed it.
 - **A heap.** The bundle makes each block one Shared Placement heap,
   `HEAP_OVER_POOL` (an `RgfxHeapOverHostMemory` whose `region_offset` is the
   block's offset in the pool) at the block's GPU address where the host gave
@@ -7243,12 +7292,12 @@ The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers
 Where the device offers no `POOL` (an arm64 guest on a Windows host), the kext sets no `Pool`
 bit, selector 16 answers `kIOReturnUnsupported`, and its processes keep the
 region's blocks and the kext's chunked pages. A take waits for the host's
-answer with no deadline, `THREAD_UNINT` like each of the kext's other asks of the host, whose
-deadlines run 5 to 60 s: the host answers each take of an open context, and the
-context's close waits for its takes in flight. Where the host stops answering,
-each taking thread waits until it answers, holding one of the kext's 32 waiters
-for answers, and a kill of its process completes only then; other threads and
-processes go on, their asks ending at their deadlines. A paused VM runs no guest thread. The device's reset ends a take
+answer with no deadline, `THREAD_UNINT`, where the kext's other asks behind the host's work
+wait with none interruptibly (*How a waiter waits*): the host answers each take of an open
+context, and the context's close waits for its takes in flight. Where the host stops answering,
+each taking thread waits until it answers, holding one of the kext's 16 waiters for the
+device's own asks, and a kill of its process completes only then; other threads and
+processes go on, their asks ending at their processes' kills. A paused VM runs no guest thread. The device's reset ends a take
 unanswered, but the kext resets the device only at its start and its stop,
 when no process holds it open, and a VM's reset restarts the guest.
 

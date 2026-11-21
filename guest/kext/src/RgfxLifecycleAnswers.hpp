@@ -2,9 +2,10 @@
 // which the event handler hands to their waiters (answerLifecycle), and the only answer types a
 // waiter may ask for.
 //
-// A waiter sleeps THREAD_UNINT, some with no deadline (a POOL_TAKE's), so an answer the handler
-// drops leaves its thread waiting for good, unkillable: postLifecycle refuses at once a reply type
-// this list does not hold, and the handler hands on every type it holds, from the one list.
+// Most waiters wait with no deadline (RgfxAnswerWait.hpp), a POOL_TAKE's THREAD_UNINT, so an
+// answer the handler drops leaves its thread waiting for good, unkillable for a take and ended
+// only by its process's kill for the others: postLifecycle refuses at once a reply type this list
+// does not hold, and the handler hands on every type it holds, from the one list.
 //
 // Header-only and free of the kernel's headers, so its native test
 // (tests/lifecycle_answers_test.cpp) builds it as the kext does.

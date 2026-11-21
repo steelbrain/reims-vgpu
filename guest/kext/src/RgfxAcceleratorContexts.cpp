@@ -90,9 +90,12 @@ constexpr UInt32 kMaxWatched = kRgfxMaxWatchedQueues;
 constexpr UInt32 kRingProducer = 0x00;
 constexpr UInt32 kRingCompletedSeqno = 0x08;
 constexpr UInt32 kRingConsumer = 0x40;
-// How long a QUEUE_CREATE and a CONTEXT_CLOSE wait for their answers: the host takes the
-// control ring in order, behind whatever pipeline compiles were posted before them.
-constexpr UInt32 kQueueAnswerMs = 30000;
+// How long a CONTEXT_CLOSE waits for its answer before it is late. It keeps a deadline, as no
+// answer of it is read wrong: a close not answered in time is parked (kCloseLate, parkClose),
+// what the context held staying the device's until the answer, so the process's exit, or its
+// client's close, goes on. A QUEUE_CREATE and a surface's SURFACE_PAGES wait for their answers
+// with no deadline (kLifecycleUntilAnswered): the host answers each on the context's lane,
+// behind whatever pipeline compiles were posted before them.
 constexpr UInt32 kCloseAnswerMs = 10000;
 // The most closes in flight, late ones included (RgfxCloseTable.hpp).
 constexpr UInt32 kMaxCloses = 32;
@@ -106,7 +109,8 @@ constexpr UInt64 kPage = 0x1000;
 constexpr UInt64 kDormantMemoryUnknown = 2ull << 30;
 // How often the dormant blocks' line is logged at most, a summary, once a minute
 // (docs/conventions.md), and how long a new block waits for dormant blocks' releases to give the
-// region room for it.
+// region room for it. That wait keeps its deadline: it is for room, not for an answer read, and a
+// block that finds none is refused (kRgfxCopyRefusedRoom), its process making a copy instead.
 constexpr UInt32 kDormantLogMs = 60000;
 constexpr UInt32 kDormantRoomMs = 100;
 // How many dormant blocks a new block that finds no room in the region lets go.
@@ -2509,6 +2513,9 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// When a new block began to wait for its surface's write-back, and whether it went on past
 	// its wait (rgfxCacheNewBlockStep).
 	uint64_t writeBackFrom = 0;
+	// Whether the wait for the previous block's write-back ended unanswered, and then whether the
+	// block goes on without it (rgfxCacheNewBlockStep).
+	bool writeBackGaveUp = false;
 	bool writeBackLate = false;
 	int32_t at = -1, slot = -1;
 	RgfxBlockPin pin = {};
@@ -2619,7 +2626,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			// not, found by its pages or not.
 			const RgfxNewBlockStep writeBack = rgfxCacheNewBlockStep(
 			    inPlace && !writeBackLate && rgfxSurfaceCacheWritingBack(asker.object),
-			    nanosSince(writeBackFrom, mach_absolute_time()) / 1000000);
+			    writeBackGaveUp);
 			if (writeBack == kRgfxNewBlockWait) {
 				if (!writeBackFrom) {
 					writeBackFrom = mach_absolute_time();
@@ -2629,10 +2636,8 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 				if (release)
 					thread_call_enter(releaseCall);
 				release = false;
-				uint64_t until = 0;
-				nanoseconds_to_absolutetime(kRgfxWriteBackWaitMs * 1000000ull, &until);
 				IOLockUnlock(contextLock);
-				rgfxSurfaceCacheAwaitWriteBack(asker.object, writeBackFrom + until);
+				writeBackGaveUp = !rgfxSurfaceCacheAwaitWriteBack(this, asker.object);
 				IOLockLock(contextLock);
 				continue;
 			}
@@ -2865,9 +2870,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	IOLockUnlock(contextLock);
 	if (writeBackLate)
 		IOLog("RGFX: WARN: IOSurface %u's new block 0x%llx goes on after %llu ms with its previous "
-		      "block's release unanswered: the host's copy of that block's cache into the pages "
-		      "may land over this block's\n",
-		      surfaceId, offset, kRgfxWriteBackWaitMs);
+		      "block's release unanswered, %s: the host's copy of that block's cache into the "
+		      "pages may land over this block's\n",
+		      surfaceId, offset, nanosSince(writeBackFrom, mach_absolute_time()) / 1000000,
+		      deviceAnswers() ? "its thread aborted" : "the device stopped");
 	// The device learns of the block before any process does; it is pinned until then, so no
 	// release overtakes the share. A block in place first hands the device its surface's pages,
 	// and goes as a share not posted goes where the device maps none of them: the process makes
@@ -3025,7 +3031,7 @@ bool RgfxAccelerator::cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t su
 	// The header's page, where the kext writes the surface's CPU generation for the processes.
 	IOMemoryMap *header = region->createMappingInTask(
 	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, offset, kPage);
-	if (!header || !rgfxSurfaceCacheAdd(cache, surface, offset, surfaceId, header,
+	if (!header || !rgfxSurfaceCacheAdd(this, cache, surface, offset, surfaceId, header,
 	                                    kRgfxSurfaceCpuGenOffset)) {
 		if (header)
 			header->release();
@@ -3377,7 +3383,8 @@ IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
 	RgfxPagesAnswer answer = {};
 	UInt32 answered = 0;
 	IOReturn r = postLifecycle(RGFX_CMD_SURFACE_PAGES, &message, bytes, RGFX_EVT_COMPLETE,
-	                           &answer, sizeof(answer), &answered, nullptr, kQueueAnswerMs);
+	                           &answer, sizeof(answer), &answered, nullptr,
+	                           ReimsGraphics::kLifecycleUntilAnswered);
 	UInt32 answeredStatus = 0;
 	UInt64 at = 0;
 	if (r == kIOReturnSuccess && !rgfxPagesAnswer(answer, answered, &answeredStatus, &at))
@@ -3947,6 +3954,14 @@ IOReturn RgfxAccelerator::postLifecycle(UInt32 type, const void *message, UInt32
 	return r;
 }
 
+bool RgfxAccelerator::deviceAnswers()
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	const bool up = fb && fb->answers();
+	OSSafeReleaseNULL(fb);
+	return up;
+}
+
 IOReturn RgfxAccelerator::postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
                                   UInt32 *posted)
 {
@@ -4034,7 +4049,8 @@ UInt32 RgfxAccelerator::openQueue(const RgfxQueueCreate &create, UInt32 flags)
 	RgfxComplete answer = {};
 	UInt32 length = 0;
 	IOReturn r = postLifecycle(RGFX_CMD_QUEUE_CREATE, &message, size, RGFX_EVT_COMPLETE, &answer,
-	                           sizeof(answer), &length, nullptr, kQueueAnswerMs);
+	                           sizeof(answer), &length, nullptr,
+	                           ReimsGraphics::kLifecycleUntilAnswered);
 	if (r != kIOReturnSuccess || length < sizeof(answer)) {
 		IOLog("RgfxAccelerator: queue 0x%llx: no answer to its create (0x%x)\n", create.obj_id, r);
 		return RGFX_STATUS_INVALID_ARGUMENT;

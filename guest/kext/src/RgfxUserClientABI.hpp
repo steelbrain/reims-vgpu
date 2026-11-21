@@ -116,7 +116,8 @@ enum {
 	// 6 is kept for WakeCompletions (kRgfxKextFeatureWakeCompletions).
 	// The answers to the client's deferred pipeline creates (Submit's kRgfxSubmitDeferred) the
 	// device has given (kRgfxKextFeatureDeferredAnswers): in the seqno of one to wait for first
-	// (0: none), up to a minute; struct out, the answers taken, each a whole
+	// (0: none), until it is answered, the device stops or the thread is aborted; struct out, the
+	// answers taken, each a whole
 	// RGFX_EVT_PIPELINE_REFLECTION, in their seqnos' order, as many as fit; out their count.
 	// Returns success whether or not the one waited for came: the answers that did are out all
 	// the same.

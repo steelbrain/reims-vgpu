@@ -152,18 +152,21 @@ bool rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool rele
 // write its CPU generation at `genOffset`, 0 from here, and its clients at
 // kRgfxSurfaceClientsOffset, its count now from here (rgfxCacheNoteClients). The surface's
 // memory is wired until then. Where the surface's previous block is cached still, a let-go's
-// attach of its pages in flight, waits for the answer first, as a lock does; a previous block's
-// release unanswered is the ask's to wait for (rgfxSurfaceCacheAwaitWriteBack), and goes on at
-// once. False, `header` the caller's and the table as it was, where it cannot be.
-bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,
-                         IOMemoryMap *header, UInt32 genOffset);
+// attach of its pages in flight, waits for the answer first, as a lock does, with no deadline,
+// ending at `accel`'s device's stop or the thread's abort; a previous block's release
+// unanswered is the ask's to wait for (rgfxSurfaceCacheAwaitWriteBack), and goes on at once.
+// False, `header` the caller's and the table as it was, where it cannot be.
+bool rgfxSurfaceCacheAdd(RgfxAccelerator *accel, void *cache, void *surface, UInt64 offset,
+                         uint32_t surfaceId, IOMemoryMap *header, UInt32 genOffset);
 // Whether the pages of IOSurface `surface` are still to take a write-back: a cached block of it
 // went, and the host copies its cache into them before it answers the block's release
 // (rgfxCacheWritingBack). Takes the locks' lock alone, which may be under the contexts' lock.
 bool rgfxSurfaceCacheWritingBack(OSObject *surface);
 // Waits, holding no lock of the kext's, until the pages of IOSurface `surface` took their
-// write-back, or until `deadline` (mach absolute time).
-void rgfxSurfaceCacheAwaitWriteBack(OSObject *surface, uint64_t deadline);
+// write-back, with no deadline: the host answers the release once the buffers that used the
+// cache have finished, behind its other work, a pipeline's compile among it. False where the
+// wait ended first, at `accel`'s device's stop or the thread's abort (its process ending).
+bool rgfxSurfaceCacheAwaitWriteBack(RgfxAccelerator *accel, OSObject *surface);
 // The cached block at `offset` was held again by a process, which holds its surface: the
 // surface's clients written into the block's header anew (rgfxCacheNoteClients). Takes the
 // locks' lock alone.
@@ -235,6 +238,9 @@ bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfac
 // The device raised its vector: the locks waiting for a surface look at the queues' completions
 // again.
 void rgfxSurfaceLocksWake();
+// The device stopped (ReimsGraphics::quiesce): every wait of the locks wakes, finds the device
+// answering no more (RgfxAccelerator::deviceAnswers), and ends.
+void rgfxSurfaceLocksStopped();
 // The IOSurface of ID `surfaceId` that `task` may see, retained, or null. Under no lock of the
 // kext's: it calls into IOSurface (the contexts' lock order, RgfxAcceleratorContexts.cpp).
 OSObject *rgfxSurfaceLocksLookup(RgfxAccelerator *accel, task_t task, uint32_t surfaceId);
@@ -571,10 +577,13 @@ public:
 	void retryRefusedBlocks();
 	// A CPU lock of the cached surface whose block is at `offset` follows a GPU write: the host
 	// copies its device cache into its pages (SURFACE_DOWNLOAD). kIOReturnSuccess once answered
-	// OK, waiting up to `timeoutMs`; kIOReturnTimeout where no answer came by then,
-	// kIOReturnUnsupported where the host answered otherwise, else what the post returned
-	// (RgfxAcceleratorContexts.cpp).
+	// OK, waiting in `timeoutMs`'s mode (RgfxAnswerWait.hpp); kIOReturnUnsupported where the host
+	// answered otherwise, else what postLifecycle returned (kIOReturnAborted, kIOReturnNotReady
+	// or kIOReturnTimeout where no answer came).
 	IOReturn downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs);
+	// Whether the device answers asks: its framebuffer is up and has not stopped
+	// (ReimsGraphics::answers). A wait for the host with no deadline ends where it does not.
+	bool deviceAnswers();
 	// Names the pages of the in-place block at `offset` made by context `context`: wires the
 	// first `length` bytes of the surface's memory `memory`, writes their runs past the `size`
 	// bytes its holders map, and posts its SURFACE_PAGES with `flags` (RGFX_SURFACE_PAGES_*): a

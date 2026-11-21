@@ -2,7 +2,8 @@
  * library_stream_tests: a library streamed through a staging window made for it
  * (RgfxLibraryStream.hpp), against a host of the test's own on the kext's forwarding route: the
  * window's shape for each library, its fallbacks where the region refuses it, the chunks' bytes
- * and order, and the window going back once every chunk is copied out, or kept where one is not.
+ * and order, and the window going back once every chunk is copied out, an ack that comes late,
+ * past any fixed bound, waited for.
  * Part of the serialiser check (serializer_tests.cpp calls rgfxLibraryStreamTests). No Metal.
  */
 
@@ -74,15 +75,41 @@ struct Blocks {
 };
 
 // The host: takes each LIBRARY_FROM_REGION off the forward, appends its chunk's bytes, and writes
-// its ack (unless `ackless` names the chunk's place, which it never acks), answering the last
-// chunk with `answer`.
+// its ack, answering the last chunk with `answer`. The chunk at `late` it acks late, as a host
+// whose lane takes the chunk behind a compile does: its ack is held until the stream has idled
+// past `lateUs` (idle), each chunk noting whether the late ack had come by its post.
 struct Host {
 	Blocks *blocks;
 	std::vector<uint8_t> library;
 	std::vector<RgfxLibraryFromRegion> chunks;
+	std::vector<bool> afterLate;
 	uint32_t answer = RGFX_STATUS_OK;
-	uint64_t ackless = ~0ull;
+	uint64_t late = ~0ull;
+	uint64_t lateUs = 0;
+	bool held = false, acked = false;
+	uint64_t heldAt = 0, heldValue = 0;
+	uint64_t idledUs = 0, idles = 0;
 	uint64_t nextSeqno = 1;
+
+	void ack(uint64_t at, uint64_t value)
+	{
+		std::memcpy(blocks->mem.data() + at, &value, sizeof(value));
+	}
+
+	// The stream's idle, which sleeps not: counts what rgfxStreamIdleSleep would have slept, and
+	// acks the late chunk once that passes `lateUs`.
+	static void idle(void *context, uint64_t looks)
+	{
+		Host *h = static_cast<Host *>(context);
+		CHECK(looks >= 1);
+		h->idles++;
+		h->idledUs += rgfxStreamIdleUs(looks);
+		if (h->held && h->idledUs > h->lateUs) {
+			h->ack(h->heldAt, h->heldValue);
+			h->held = false;
+			h->acked = true;
+		}
+	}
 
 	static bool forward(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
 	                    uint32_t *out_status)
@@ -97,11 +124,17 @@ struct Host {
 		CHECK(m.header.type == RGFX_CMD_LIBRARY_FROM_REGION);
 		CHECK(m.chunk_offset == h->library.size()); // in order
 		h->chunks.push_back(m);
+		h->afterLate.push_back(h->acked);
 		const uint8_t *base = h->blocks->mem.data();
 		h->library.insert(h->library.end(), base + m.region_offset,
 		                  base + m.region_offset + m.byte_length);
-		if (m.chunk_offset != h->ackless)
-			std::memcpy(h->blocks->mem.data() + m.ack_offset, &m.ack_value, sizeof(m.ack_value));
+		if (m.chunk_offset == h->late) {
+			h->held = true;
+			h->heldAt = m.ack_offset;
+			h->heldValue = m.ack_value;
+		} else {
+			h->ack(m.ack_offset, m.ack_value);
+		}
 		if (m.chunk_offset + m.byte_length >= m.total_length && out_status)
 			*out_status = h->answer;
 		return true;
@@ -126,8 +159,8 @@ struct Run {
 	size_t heldAfter;
 };
 
-Run stream(uint64_t length, uint64_t regionBytes, uint64_t largest, uint64_t ackless = ~0ull,
-           uint64_t awaitUs = kRgfxStagingAwaitUs)
+Run stream(uint64_t length, uint64_t regionBytes, uint64_t largest, uint64_t late = ~0ull,
+           uint64_t lateUs = 0)
 {
 	Blocks blocks(regionBytes);
 	blocks.largest = largest;
@@ -135,7 +168,8 @@ Run stream(uint64_t length, uint64_t regionBytes, uint64_t largest, uint64_t ack
 	region.setBlockSource(&Blocks::alloc, &Blocks::release, &blocks);
 	Run run = {};
 	run.host.blocks = &blocks;
-	run.host.ackless = ackless;
+	run.host.late = late;
+	run.host.lateUs = lateUs;
 	RgfxRingWriter writer(&Host::forward, &run.host, 4096);
 	RgfxIdSpace ids;
 	RgfxSerializer ser(writer, ids);
@@ -143,7 +177,7 @@ Run stream(uint64_t length, uint64_t regionBytes, uint64_t largest, uint64_t ack
 	RgfxObjId objId = 0;
 	run.status = kRgfxNoAnswer;
 	run.ok = rgfxStreamLibrary(region, ser, lib.data(), lib.size(), nullptr, &objId, &run.status,
-	                           awaitUs);
+	                           &Host::idle, &run.host);
 	if (run.ok) {
 		CHECK(objId != 0);
 		CHECK(run.host.library == lib); // every byte, in order
@@ -235,8 +269,9 @@ void test_window_falls_back()
 }
 
 // The device's refusal of the library is its answer; the window still goes back. A chunk the host
-// never acks keeps the window, so nothing it may still read is given out again.
-void test_refused_and_ackless()
+// acks late, behind a compile, past the ten seconds a stream once waited, is waited for with no
+// deadline: the stream goes on once it comes, and the window goes back only then.
+void test_refused_and_late()
 {
 	{
 		Blocks blocks(16 * kMiB);
@@ -254,19 +289,32 @@ void test_refused_and_ackless()
 		CHECK(rgfxStreamLibrary(region, ser, lib.data(), lib.size(), nullptr, &objId, &status));
 		CHECK(status == RGFX_STATUS_REFUSED && blocks.gives.size() == 1 && blocks.held.empty());
 	}
-	// Room for chunks of 512 KiB: six, the fifth (at 2 MiB) never acked. The stream is done, the
-	// device made the library, and the window is kept.
-	Run lastAckless = stream(3 * kMiB, 16 * kMiB, 2 * kMiB + kPage, /*ackless*/ 2 * kMiB,
-	                         /*awaitUs*/ 2000);
-	CHECK(lastAckless.ok && lastAckless.status == RGFX_STATUS_OK);
-	CHECK(lastAckless.host.chunks.size() == 6 && lastAckless.host.chunks[0].byte_length == 512 * 1024);
-	CHECK(lastAckless.gives.empty() && lastAckless.heldAfter == 1);
-	// The first chunk never acked: its block is never written again, so the stream stops at the
-	// third chunk, answers false and keeps the window.
-	Run firstAckless = stream(3 * kMiB, 16 * kMiB, 2 * kMiB + kPage, /*ackless*/ 0,
-	                          /*awaitUs*/ 2000);
-	CHECK(!firstAckless.ok && firstAckless.host.chunks.size() == 2);
-	CHECK(firstAckless.gives.empty() && firstAckless.heldAfter == 1);
+	constexpr uint64_t kPastTenSeconds = 10ull * 1000 * 1000 + 1;
+	// Room for chunks of 512 KiB: six, the fifth (at 2 MiB) acked late. The stream is done, the
+	// device made the library, and the window goes back once the late ack comes.
+	Run lastLate = stream(3 * kMiB, 16 * kMiB, 2 * kMiB + kPage, /*late*/ 2 * kMiB,
+	                      kPastTenSeconds);
+	CHECK(lastLate.ok && lastLate.status == RGFX_STATUS_OK);
+	CHECK(lastLate.host.chunks.size() == 6 && lastLate.host.chunks[0].byte_length == 512 * 1024);
+	CHECK(lastLate.host.acked && lastLate.host.idledUs > kPastTenSeconds);
+	CHECK(lastLate.gives.size() == 1 && lastLate.heldAfter == 0);
+	// The idle's sleeps back off: 200 us at first, 5 ms once the wait is long.
+	CHECK(rgfxStreamIdleUs(1) == 200 && rgfxStreamIdleUs(50) == 200 &&
+	      rgfxStreamIdleUs(51) == 1000 && rgfxStreamIdleUs(251) == 5000 &&
+	      rgfxStreamIdleUs(1ull << 40) == 5000);
+	CHECK(lastLate.host.idles < 2500); // ten seconds in a few thousand looks, not fifty thousand
+	// The first chunk acked late: its block is written again only once the ack comes, so the third
+	// chunk, the first block's next, is posted after it, and the stream goes on whole.
+	Run firstLate = stream(3 * kMiB, 16 * kMiB, 2 * kMiB + kPage, /*late*/ 0, kPastTenSeconds);
+	CHECK(firstLate.ok && firstLate.status == RGFX_STATUS_OK);
+	CHECK(firstLate.host.chunks.size() == 6 && firstLate.host.acked);
+	CHECK(!firstLate.host.afterLate[0] && !firstLate.host.afterLate[1] &&
+	      firstLate.host.afterLate[2]);
+	CHECK(firstLate.host.chunks[2].region_offset == firstLate.host.chunks[0].region_offset);
+	CHECK(firstLate.gives.size() == 1 && firstLate.heldAfter == 0);
+	// Every ack on time: the stream never idles past them.
+	Run onTime = stream(3 * kMiB, 16 * kMiB, 2 * kMiB + kPage);
+	CHECK(onTime.ok && onTime.host.idles == 0 && !onTime.host.acked);
 }
 
 } // namespace
@@ -276,5 +324,5 @@ void rgfxLibraryStreamTests()
 	test_staging_shapes();
 	test_window_made_and_given_back();
 	test_window_falls_back();
-	test_refused_and_ackless();
+	test_refused_and_late();
 }

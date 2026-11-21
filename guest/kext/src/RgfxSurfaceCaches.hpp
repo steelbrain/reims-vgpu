@@ -56,9 +56,13 @@
 //     attaches its pages first, so the release copies the cache into them
 //     (rgfxCacheReleaseNext), naming them again as a lock does; else nothing reads them.
 // A wait for the host's answers (a download's, another lock's download, attach or deferral, the
-// block's release) lasts as long as a new block's for the release (rgfxCacheLockWaitMs); one
-// that does not end then goes on, as a lock waiting for a write does after kWaitMs. A naming the
-// host refused is made again only within kWaitMs.
+// block's release) has no deadline, as a new block's for the release (rgfxCacheNewBlockStep): the
+// host answers each once its copy lands, after the buffers that used the cache, behind its other
+// work, a pipeline's compile among it, and a lock that went on before it would read, or write,
+// pages without the GPU's writes. The device's stop ends it, and so does the locking thread's
+// abort. A naming the host refused is made again for a while from the first refusal
+// (kRgfxAttachRetryWaitMs): each naming's answer is waited for in full, and the bound is on the
+// refusals.
 //
 // A surface is named by its key, the device cache the kext made on it, as in RgfxSurfaceLocks.
 // The caller holds one lock around every call. Header-only and free of the kernel's headers, so
@@ -510,11 +514,14 @@ inline void rgfxCacheDownloaded(RgfxCacheTable &t, uint64_t key, uint64_t mark, 
 // not answered OK (kRgfxPagesNotNamed: the surface's memory not wired, its runs not taken or not
 // written, or the host refusing them), `tries` namings made so far: from kRgfxAttachRetryFirstMs,
 // doubling to kRgfxAttachRetryMostMs. A naming that fails for a moment (the guest short of wired
-// memory, the host's views full) is made again within the lock's wait, and one that keeps failing
-// costs a dozen namings in its 2 s. The lock goes on over pages that do not hold the cache's bytes
-// only at its deadline, as each wait of a lock does.
+// memory, the host's views full) is made again within kRgfxAttachRetryWaitMs of the first
+// refusal, and one that keeps failing costs a dozen namings in its 2 s. Each naming's answer is
+// waited for in full (a SURFACE_PAGES waits with no deadline): the host answered these, and the
+// bound is on its refusals. The lock goes on over pages that do not hold the cache's bytes only
+// once that bound is past.
 constexpr uint32_t kRgfxAttachRetryFirstMs = 10;
 constexpr uint32_t kRgfxAttachRetryMostMs = 320;
+constexpr uint32_t kRgfxAttachRetryWaitMs = 2000;
 
 inline uint32_t rgfxAttachRetryMs(uint32_t tries)
 {
@@ -846,60 +853,29 @@ inline bool rgfxCacheWritingBack(RgfxCacheTable &t, const void *object)
 	return false;
 }
 
-// How long a new block of a surface whose pages are still to take a write-back
-// (rgfxCacheWritingBack) waits for it: as long as the kext waits for a BLOCK_RELEASE's answer
-// before it counts the release late (RgfxAcceleratorContexts.cpp's kReleaseAnswerMs). The host
-// answers once the buffers that used the cache have finished and its copy is done, which takes
-// seconds where those buffers wait behind other work on the host's GPU.
-constexpr uint64_t kRgfxWriteBackWaitMs = 10000;
-
-// What an ask that would make a new block in place of a surface does, `waitedMs` into its wait,
-// where the surface's pages are still to take a write-back (`writingBack`). Nothing of the new
-// block may come before that copy over the same pages: a cache filled from them before it reads
-// older bytes, and the GPU's writes to them in place, or a new cache's download, are overwritten
-// by it. So every such ask waits for it, cached, uncached or deferred.
+// What an ask that would make a new block in place of a surface does where the surface's pages
+// are still to take a write-back (`writingBack`). Nothing of the new block may come before that
+// copy over the same pages: a cache filled from them before it reads older bytes, and the GPU's
+// writes to them in place, or a new cache's download, are overwritten by it. So every such ask
+// waits for it, cached, uncached or deferred, with no deadline: the host answers the release once
+// the buffers that used the cache have finished and its copy is done, behind the host's other
+// work, a pipeline's compile among it, however long that takes. A wait that ended without the
+// answer (`gaveUp`: the device stopped, or the asking thread's process is ending) makes the
+// block all the same, logged.
 enum RgfxNewBlockStep : uint32_t {
 	// No write-back is pending: the block is made.
 	kRgfxNewBlockMake = 0,
 	// The ask waits for the release's answer.
 	kRgfxNewBlockWait,
-	// The release is late (kRgfxWriteBackWaitMs): the block is made all the same, logged, as a
-	// CPU lock goes on past its wait.
+	// The wait ended unanswered: the block is made all the same, logged.
 	kRgfxNewBlockLate,
 };
 
-inline RgfxNewBlockStep rgfxCacheNewBlockStep(bool writingBack, uint64_t waitedMs)
+inline RgfxNewBlockStep rgfxCacheNewBlockStep(bool writingBack, bool gaveUp)
 {
 	if (!writingBack)
 		return kRgfxNewBlockMake;
-	return waitedMs < kRgfxWriteBackWaitMs ? kRgfxNewBlockWait : kRgfxNewBlockLate;
-}
-
-// How long, from its start, a CPU lock of a cached surface waits for the host's answers that put
-// what the GPU wrote into the pages, where it waits `lockMs` for the GPU's writes: its own
-// download's (SURFACE_DOWNLOAD), and at a kRgfxCacheWait another lock's download, attach or
-// deferral, or its block's release: as long as a new block of the surface waits for the
-// release's write-back (kRgfxWriteBackWaitMs), so the lock reads, or writes, the pages only once
-// they hold what the GPU wrote. The host answers each once its copy lands, after the buffers that
-// used the cache, which takes seconds where those buffers wait behind other work on the host's
-// GPU (the car 13 gate's two downloads went unanswered past the 2 s a lock waited for them, and
-// the locks read pages without the GPU's writes). A lock still waiting then goes on, as Metal's
-// lock goes on once a GPU that never finishes is timed out. Never shorter than `lockMs`.
-constexpr uint64_t kRgfxCacheAnswerWaitMs = kRgfxWriteBackWaitMs;
-
-inline uint64_t rgfxCacheLockWaitMs(RgfxCacheTable &t, uint64_t key, uint64_t lockMs)
-{
-	const RgfxCachedSurface *c = rgfxCacheFind(t, key);
-	return c != nullptr && lockMs < kRgfxCacheAnswerWaitMs ? kRgfxCacheAnswerWaitMs : lockMs;
-}
-
-// How long a lock `waitedMs` into its wait, where it waits `lockMs` for the GPU's writes, waits
-// for its own download's answer (rgfxCacheLockWaitMs): what is left of its wait for the host's
-// answers; 0 where nothing is, and the lock goes on without asking.
-inline uint64_t rgfxCacheDownloadWaitMs(uint64_t waitedMs, uint64_t lockMs)
-{
-	const uint64_t all = lockMs < kRgfxCacheAnswerWaitMs ? kRgfxCacheAnswerWaitMs : lockMs;
-	return waitedMs < all ? all - waitedMs : 0;
+	return gaveUp ? kRgfxNewBlockLate : kRgfxNewBlockWait;
 }
 
 // The let-go of the block at `offset`, which named surface `key`'s device cache: as

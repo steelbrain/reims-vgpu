@@ -14,17 +14,17 @@
 // The list grows as the process takes blocks: the caller makes it a larger array where it is full
 // (rgfxPoolBlocksGrow), up to kRgfxPoolBlocksMax blocks.
 //
-// A take waits for the host's answer with no deadline, THREAD_UNINT like each of the kext's other
-// asks of the host (theirs end at 5 to 60 s): the host answers each take of an open context, after
-// it adds memory to the pool where none is free and zeroes the block, and the context's close
-// waits for the takes in flight, so no answer comes for a take the kext gave up on. Where the host
-// stops answering (the library stalled), each taking thread waits until it answers, holding one
-// of the kext's 32 waiters for answers (ReimsGraphics::kLifecycleWaiters), and a kill of its
-// process ends it only then; the process's other threads, and other processes, go on, and their
-// asks end at their deadlines. A paused VM runs no guest thread, and the answer is there
-// when it resumes. The device's reset ends a take unanswered, but the kext resets the device only
-// at its start, before a process can open it, and at its stop, once every process closed it; a
-// VM's reset restarts the guest.
+// A take waits for the host's answer with no deadline, THREAD_UNINT (kRgfxWaitNoDeadline,
+// RgfxAnswerWait.hpp), where a process's other asks of the host wait interruptibly: the host
+// answers each take of an open context, after it adds memory to the pool where none is free and
+// zeroes the block, and the context's close waits for the takes in flight, so no answer comes for
+// a take the kext gave up on. Where the host stops answering (the library stalled), each taking
+// thread waits until it answers, holding one of the kext's 16 waiters for the device's own asks
+// (rgfxWaiterKind), and a kill of its process ends it only then; the process's other threads, and
+// other processes, go on, and their asks end at a kill of their processes. A paused VM runs no
+// guest thread, and the answer is there when it resumes. The device's reset ends a take
+// unanswered, but the kext resets the device only at its start, before a process can open it, and
+// at its stop, once every process closed it; a VM's reset restarts the guest.
 //
 // The caller holds the client's list lock. Header-only and free of the kernel's headers, so its
 // native test (tests/pool_blocks_test.cpp) builds it as the kext does.

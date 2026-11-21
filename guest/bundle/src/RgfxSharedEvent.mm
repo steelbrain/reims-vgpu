@@ -286,7 +286,9 @@ bool rgfxSendRightOnly(mach_port_t port)
 // value moves on the host's EVENT_SIGNALLED and on the CPU's set, and the wait sleeps until one
 // moves it. Where the event is registered with a reader over a ring that no thread drives (a
 // unit test), the wait takes the ring meanwhile; the device's reader reads none, its signals
-// coming from the queues' readers, which the completion thread drives.
+// coming from the queues' readers, which the completion thread drives. Its deadline is the
+// caller's, Metal's own API, so it stays where the device's other waits for the host have none
+// (RgfxAnswerWait.hpp): NO past it is Metal's answer too.
 - (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds
 {
 	if (_original != nil)
