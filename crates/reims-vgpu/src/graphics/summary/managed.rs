@@ -1,4 +1,4 @@
-//! The summary's **Managed** part ([`line`]): the ranges of `Managed` buffers the host carried
+//! The summary's **Managed** part ([`line()`]): the ranges of `Managed` buffers the host carried
 //! out with the platform's `didModifyRange:` over each period, by who named them, the app's apart
 //! from the bundle's upload chunks of `set*Bytes:` data:
 //!
