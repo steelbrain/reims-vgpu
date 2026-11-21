@@ -1809,6 +1809,12 @@ enum RgfxStage : unsigned {
 	std::atomic<bool> _left;
 	// Its queue's group finish waits on (rgfxCommittedGroup), entered and left with `_done`.
 	dispatch_group_t _queueCommitted;
+	// Its serial among the process's command buffers in flight
+	// (RgfxSerializer::commandBufferCommitted), taken at its commit with a reader, 0 for none;
+	// `_flightLeft` says it was given back, at its completion or, where none came, at dealloc
+	// (rgfxLeaveFlight).
+	uint64_t _flightSerial;
+	std::atomic<bool> _flightLeft;
 	// Entered at commit with a reader, as `_done` is: `_submitted` is left once the buffer is
 	// submitted, `_scheduled` once its scheduled handlers have run, which is what
 	// commitAndWaitUntilSubmitted and waitUntilScheduled wait on. The buffer is submitted at its
@@ -1980,6 +1986,7 @@ enum RgfxStage : unsigned {
 	// what it kept go with it, out of flight.
 	_kept.land();
 	[self rgfxGiveSlotBack];
+	[self rgfxLeaveFlight];
 	// And the block its message lay in, as its completion would have: a buffer posted with a
 	// completion to come is kept until it comes (the reader holds it), so the host has read the
 	// message from any block given back here, or will never read it.
@@ -1988,6 +1995,15 @@ enum RgfxStage : unsigned {
 		_bodyPool = nullptr;
 	}
 	delete _encoder;
+}
+
+// Out of the process's command buffers in flight, once: the destroys' give-backs that waited
+// for it and no buffer still in flight go back (RgfxRetireGate).
+- (void)rgfxLeaveFlight
+{
+	RgfxSerializer *serializer = [self serializer];
+	if (_flightSerial != 0 && serializer != nullptr && !_flightLeft.exchange(true))
+		serializer->commandBufferDone(_flightSerial);
 }
 
 - (void)rgfxHoldSlot:(dispatch_semaphore_t)slots
@@ -2294,6 +2310,10 @@ enum RgfxStage : unsigned {
 	RgfxCommandQueue *queue = _queue;
 	_reader = queue.replyReader;
 	if (_reader != nullptr) {
+		// In flight from here to its completion: a destroy asked for from now waits for it
+		// before what its object lay over goes back (RgfxRetireGate).
+		if (RgfxSerializer *serializer = [self serializer])
+			_flightSerial = serializer->commandBufferCommitted();
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
 		dispatch_group_enter(_done);
@@ -2770,6 +2790,9 @@ static NSError *rgfxInvalidInputError()
 		_kept.land();
 	[self rgfxGiveSlotBack];
 	[self rgfxNoteGPUTimes:msg];
+	// The host is done with it, a failure included: what destroys asked for while it was in
+	// flight lay over may go to new objects.
+	[self rgfxLeaveFlight];
 }
 
 // On the queue's write-back queue, behind the buffers taken before it there: writes back the

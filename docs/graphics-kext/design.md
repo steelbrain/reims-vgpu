@@ -2982,7 +2982,17 @@ object before a buffer that names it runs. A buffer whose completion never comes
 holds back only what it names. Objects are released in the order they go. What an object lay over goes back only after its destroy: a Shared buffer's
 or heap's region block, an IOSurface plane's block, a queue's ring blocks (its
 completion ring read no more first), and a texture's resource id. The block's
-`BLOCK_RELEASE` then finds nothing of the object on the host. A resource placed
+`BLOCK_RELEASE` then finds nothing of the object on the host. What a destroy
+gives back (an object's resource id and GPU address, its heap's bytes, its
+region and pool blocks, its pages and its ICB slots) also waits until the host
+has completed every command buffer the process committed before the object was
+let go, a failed one included (`RgfxRetireGate`,
+`guest/bundle/src/RgfxSerializer.hpp`). The host keeps a destroyed object for
+the buffers committed before its destroy, but a new object made with its
+resource id or at its address takes them at once, so a buffer still running
+there would read the new object for the old one. A buffer committed after the
+object was let go holds nothing back, and the serialiser's end, the context's,
+runs whatever still waits. A resource placed
 in a heap keeps the heap alive (its `heap`), a command buffer keeps its queue,
 and a function keeps its library. So a pipeline made from a function whose
 library the app let go names a library the host still holds. The host makes the
@@ -3013,12 +3023,12 @@ The kext checks each as `Submit` checks one, all before it posts any, puts
 the runs on the ring under one hold of its lock with one doorbell at most,
 ends a queue's as `Submit` does, after the messages before it, and follows a
 buffer made for a context that closed since its check with its destroy, as
-`Submit` does. What an object lay over goes back as its destroy is held, as it
-went back once its destroy was posted: whatever takes it again, a create over
-the bytes or with the id, or a block's free, is posted after the destroy, so
-the host has dropped the object first, and every answer the guest reads (a
-heap's `usedSize`, a new object's GPU address and resource id) is the one it
-read before. A texture over an IOSurface goes at once, made and destroyed: a
+`Submit` does. What an object lay over goes to `RgfxRetireGate` as its
+destroy is held, as it did once its destroy was posted: whatever takes it
+again, a create over the bytes or with the id, or a block's free, is posted
+after the destroy, so the host has dropped the object first, and every answer
+the guest reads (a heap's `usedSize`, a new object's GPU address and resource
+id) is the one a posted destroy would give. A texture over an IOSurface goes at once, made and destroyed: a
 present of the surface, by any process, shows the newest live texture the
 host names it by, and waits for its create and its destroy. So do the creates
 that name a block (`BUFFER_OVER_PAGES`, `BUFFER_OVER_SURFACE_PAGES`), which the

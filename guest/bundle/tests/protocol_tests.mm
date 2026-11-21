@@ -3653,6 +3653,80 @@ void test_surface_texture_alloc_sizes()
 	CHECK(none == 0);
 }
 
+// A texture let go while a command buffer committed before is in flight keeps its resource id
+// until the host completes the buffer, a failed completion counting, so a texture made meanwhile
+// takes another; one let go with none in flight gives its id back at once (RgfxRetireGate).
+void test_a_release_waits_for_the_buffers_committed_before_it()
+{
+	QueueFixture fx;
+	// Drained while fx lives: what the test lets go posts its destroy through fx.
+	@autoreleasepool {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		auto make = [&]() -> RgfxTexture * {
+			RgfxTexture *t = nil;
+			@autoreleasepool {
+				t = [RgfxTexture textureWithDescriptor:td
+				                                  heap:RGFX_OBJ_NONE
+				                            heapOffset:0
+				                                device:nil
+				                            serializer:&fx.ser];
+			}
+			CHECK(t != nil);
+			return t;
+		};
+		auto let_go = [](RgfxTexture *__strong &t) {
+			@autoreleasepool {
+				t = nil;
+			}
+		};
+		// None in flight: the id goes back at once, and the next texture takes it.
+		RgfxTexture *t = make();
+		const uint64_t first = t.gpuResourceID._impl;
+		let_go(t);
+		t = make();
+		CHECK(t.gpuResourceID._impl == first);
+
+		// Let go after a commit: kept until the buffer completes.
+		id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+		[cb commit];
+		uint64_t seqno = 0;
+		(void)fx.nextOps(&seqno);
+		let_go(t);
+		CHECK(fx.ser.heldGiveBacks() == 1);
+		RgfxTexture *meanwhile = make();
+		CHECK(meanwhile.gpuResourceID._impl != first);
+		fx.complete(cb, seqno);
+		CHECK(fx.ser.heldGiveBacks() == 0);
+		t = make();
+		CHECK(t.gpuResourceID._impl == first);
+
+		// A buffer the host fails is done too.
+		id<MTLCommandBuffer> failing = [fx.queue commandBuffer];
+		[failing commit];
+		(void)fx.nextOps(&seqno);
+		let_go(t);
+		CHECK(fx.ser.heldGiveBacks() == 1);
+		RgfxCbComplete failed = {};
+		failed.header.type = RGFX_EVT_CB_COMPLETE;
+		failed.header.size = sizeof(failed);
+		failed.header.seqno = seqno;
+		failed.cb_obj_id = ((RgfxResource *)failing).rgfxObjId;
+		failed.status = RGFX_CB_INTERNAL;
+		failed.error_code = MTLCommandBufferErrorInternal;
+		CHECK(fx.completion.postFromHost(&failed, sizeof(failed)));
+		[failing waitUntilCompleted];
+		CHECK(failing.status == MTLCommandBufferStatusError);
+		CHECK(fx.ser.heldGiveBacks() == 0);
+		t = make();
+		CHECK(t.gpuResourceID._impl == first);
+	}
+}
+
 } // namespace
 
 void rgfxProtocolTests(const char *self)
@@ -3694,6 +3768,7 @@ void rgfxProtocolTests(const char *self)
 	test_heap_sizes();
 	test_surface_texture_alloc_sizes();
 	test_queue_barriers();
+	test_a_release_waits_for_the_buffers_committed_before_it();
 }
 
 // A case rgfxRunFairShare runs in a process of its own (shell_tests --protocol-fair-share NAME): 0

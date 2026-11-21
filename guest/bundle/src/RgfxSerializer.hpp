@@ -30,7 +30,9 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -296,11 +298,56 @@ struct RgfxPipelinePost {
 	RgfxPipelineReflection reflection = {};
 };
 
+/// The give-backs of the process's destroys (RgfxSerializer::destroy's `after`: an object's
+/// resource id and GPU address, its heap's bytes, its region and pool blocks, its pages and its
+/// ICB slots), each held until the host has completed every command buffer the process
+/// committed before the destroy was asked for, a failed one included. The host's runtime keeps a
+/// destroyed object for the buffers committed before it, but a new object made with its resource
+/// id or at its address takes that id or address at once, so a buffer still running there would
+/// read the new object for the old one: what an object lay over goes to a new one only once those
+/// buffers are done. A buffer committed after the destroy holds nothing back.
+class RgfxRetireGate {
+public:
+	RgfxRetireGate() = default;
+	RgfxRetireGate(const RgfxRetireGate &) = delete;
+	RgfxRetireGate &operator=(const RgfxRetireGate &) = delete;
+
+	/// A command buffer committed: its serial, from 1, in flight until completed() takes it.
+	uint64_t committed();
+	/// The buffer `serial` is done: the host completed it, failed it, or it went without its
+	/// completion. Runs, out of the lock and in the order of their stamps, the give-backs that
+	/// waited for no buffer still in flight.
+	void completed(uint64_t serial);
+	/// The serial of the last buffer committed, 0 where none was: a give-back stamped with it
+	/// waits for every buffer committed up to it.
+	uint64_t stamp() const;
+	/// Runs `after` once every buffer committed up to `stamp` is done: here, where none of them
+	/// is in flight or the gate is closed, else held for completed().
+	void release(uint64_t stamp, std::function<void()> after);
+	/// The context's end: runs every give-back held, and each one released later at once, and
+	/// logs once how many waited at most.
+	void close();
+	/// How many give-backs wait now, and how many waited at most at once.
+	size_t held() const;
+	size_t peak() const;
+
+private:
+	mutable std::mutex m_lock;
+	uint64_t m_last = 0;
+	std::set<uint64_t> m_inFlight;
+	std::multimap<uint64_t, std::function<void()>> m_held;
+	size_t m_peak = 0;
+	bool m_closed = false;
+};
+
 class RgfxSerializer {
 public:
 	/// Serialises onto `control`, picking ids from `ids`. Both outlive the
 	/// serialiser. `control` is the device's ring 0.
 	RgfxSerializer(RgfxRingWriter &control, RgfxIdSpace &ids);
+	/// Runs the give-backs of its destroys still held for command buffers in flight
+	/// (RgfxRetireGate::close): the process's context ends with it.
+	~RgfxSerializer();
 
 	// --- queues ---------------------------------------------------------------
 
@@ -815,12 +862,26 @@ public:
 	/// (RGFX_VIDEO_DECODE or RGFX_VIDEO_ENCODE), which video encoders name. Not answered.
 	RgfxCreated createVideoSession(uint32_t codec, uint32_t direction);
 
+	// --- command buffers in flight ----------------------------------------------
+
+	/// A command buffer of the process's committed, with a completion to come: its serial, which
+	/// commandBufferDone() takes back once (RgfxRetireGate::committed).
+	uint64_t commandBufferCommitted() { return m_retires.committed(); }
+	/// The buffer `serial` is done: completed by the host, failed, or gone without its
+	/// completion. Runs the destroys' give-backs that waited for it alone.
+	void commandBufferDone(uint64_t serial) { m_retires.completed(serial); }
+	/// The destroys' give-backs that wait for command buffers now, and the most that waited.
+	size_t heldGiveBacks() const { return m_retires.held(); }
+	size_t heldGiveBacksPeak() const { return m_retires.peak(); }
+
 	// --- destroy --------------------------------------------------------------
 
 	/// Drops the host handle for `obj_id` (an object of any kind, a queue
 	/// included: the host handle table knows the kind), after the waiting ICB records, which may
 	/// name it, then runs `after` (when set): what the host object lay over (its GPU address, its
-	/// resource id, its heap's bytes) goes back once the host is told to drop it. Where the
+	/// resource id, its heap's bytes) goes back once the host is told to drop it, and once the
+	/// host has completed every command buffer the process committed before this call
+	/// (RgfxRetireGate): at once where none is in flight, else at the last one's completion. Where the
 	/// destroy does not reach the ring (the kext refused it, as it does where its control ring
 	/// stays full), the host still holds the object: the destroy and its `after` wait, behind any
 	/// destroy waiting before them, and go out at the next destroy() or postWaitingDestroys(), so
@@ -828,16 +889,16 @@ public:
 	/// this destroy reached the ring now.
 	///
 	/// Where the route batches (RgfxRingWriter::batches), the destroy is held to go with others in
-	/// one call instead (RgfxRingWriter::postLater), unless `atOnce`, and `after` runs at once:
-	/// whatever reuses what it gives back, a create or a block's free, is posted after the held
-	/// destroys, so the host still drops the object first. A destroy the host orders other
+	/// one call instead (RgfxRingWriter::postLater), unless `atOnce`, and `after` goes to the gate
+	/// at once: whatever reuses what it gives back, a create or a block's free, is posted after
+	/// the held destroys, so the host still drops the object first. A destroy the host orders other
 	/// contexts' messages by goes `atOnce`: a texture over an IOSurface, which a present of the
 	/// surface waits for (docs/graphics-kext/design.md, "Destroys and heap-placed buffers go
 	/// together").
 	bool destroy(RgfxObjId obj_id, std::function<void()> after = {}, bool atOnce = false);
 
 	/// Posts the destroys waiting (destroy()), in the order they were made, each one's `after`
-	/// run once it is on the ring, until one is refused again. One load where none waits.
+	/// handed to the gate once it is on the ring, until one is refused again. One load where none waits.
 	/// Returns whether none waits now.
 	bool postWaitingDestroys();
 
@@ -932,6 +993,8 @@ private:
 	std::mutex m_destroyLock;
 	std::atomic<bool> m_destroysWaiting{false};
 	std::deque<WaitingDestroy> m_destroys;
+	// The destroys' give-backs, held for the command buffers committed before each destroy.
+	RgfxRetireGate m_retires;
 	// Posts OBJECT_DESTROY of `obj_id`: whether it reached the ring.
 	bool postDestroy(RgfxObjId obj_id);
 

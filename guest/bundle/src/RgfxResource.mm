@@ -253,7 +253,10 @@ bool RgfxIsResourceClassSlow(__unsafe_unretained id obj, uintptr_t cls)
 		return;
 	}
 	// Once the destroy is on the ring, which may be later where the kext refuses it now
-	// (RgfxSerializer::destroy): the host holds the object until then.
+	// (RgfxSerializer::destroy): the host holds the object until then. And once the host has
+	// completed the command buffers committed before now (RgfxRetireGate), which may still run
+	// with the object: a new object given its id, address or bytes before then would take them
+	// from it on the host.
 	serializer->destroy(
 	    _objId,
 	    [after = std::move(after), rangeHeap, rangeOffset, rangeSize] {

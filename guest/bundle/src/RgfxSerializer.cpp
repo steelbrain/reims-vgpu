@@ -4,6 +4,7 @@
  */
 
 #include "RgfxSerializer.hpp"
+#include "RgfxLog.hpp"
 #include "RgfxLogOnce.hpp"
 
 #include "RgfxIcbSlotTable.hpp"
@@ -32,9 +33,110 @@ uint64_t roundUp8(uint64_t n)
 
 } // namespace
 
+uint64_t RgfxRetireGate::committed()
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	const uint64_t serial = ++m_last;
+	m_inFlight.insert(serial);
+	return serial;
+}
+
+void RgfxRetireGate::completed(uint64_t serial)
+{
+	std::vector<std::function<void()>> run;
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		m_inFlight.erase(serial);
+		// Each give-back stamped below the oldest buffer still in flight waited for none of it.
+		const uint64_t oldest = m_inFlight.empty() ? UINT64_MAX : *m_inFlight.begin();
+		auto end = m_held.lower_bound(oldest);
+		for (auto it = m_held.begin(); it != end; ++it)
+			run.push_back(std::move(it->second));
+		m_held.erase(m_held.begin(), end);
+	}
+	// Out of the lock: what a give-back lets go of may destroy more objects, whose give-backs
+	// come here.
+	for (auto &after : run)
+		after();
+}
+
+uint64_t RgfxRetireGate::stamp() const
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	return m_last;
+}
+
+void RgfxRetireGate::release(uint64_t stamp, std::function<void()> after)
+{
+	bool waits = false;
+	size_t logPeak = 0;
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		waits = !m_closed && !m_inFlight.empty() && *m_inFlight.begin() <= stamp;
+		if (waits) {
+			m_held.emplace(stamp, std::move(after));
+			if (m_held.size() > m_peak) {
+				m_peak = m_held.size();
+				// The context ends only with its process: each power of two from 64 the peak
+				// reaches is logged then, as well as the peak at the end.
+				if (m_peak >= 64 && (m_peak & (m_peak - 1)) == 0)
+					logPeak = m_peak;
+			}
+		}
+	}
+	if (!waits) {
+		if (after)
+			after();
+		return;
+	}
+	if (logPeak != 0)
+		os_log(rgfxLog(),
+		       "RGFX: %zu destroys' give-backs wait at once for the command buffers committed "
+		       "before them",
+		       logPeak);
+}
+
+void RgfxRetireGate::close()
+{
+	std::multimap<uint64_t, std::function<void()>> run;
+	size_t peak = 0;
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		if (m_closed)
+			return;
+		m_closed = true;
+		run.swap(m_held);
+		peak = m_peak;
+	}
+	for (auto &held : run)
+		held.second();
+	if (peak != 0)
+		os_log(rgfxLog(),
+		       "RGFX: the context's end: at most %zu destroys' give-backs waited at once for the "
+		       "command buffers committed before them",
+		       peak);
+}
+
+size_t RgfxRetireGate::held() const
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	return m_held.size();
+}
+
+size_t RgfxRetireGate::peak() const
+{
+	std::lock_guard<std::mutex> hold(m_lock);
+	return m_peak;
+}
+
 RgfxSerializer::RgfxSerializer(RgfxRingWriter &control, RgfxIdSpace &ids)
     : m_control(control), m_ids(ids)
 {
+}
+
+RgfxSerializer::~RgfxSerializer()
+{
+	m_retires.close();
 }
 
 RgfxCreated RgfxSerializer::createQueue(uint64_t submit_offset, uint64_t complete_offset,
@@ -1729,6 +1831,14 @@ bool RgfxSerializer::postDestroy(RgfxObjId obj_id)
 
 bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after, bool atOnce)
 {
+	// What it gives back waits, once the destroy is on the ring or held to go, for the command
+	// buffers committed before now (RgfxRetireGate).
+	if (after) {
+		const uint64_t stamp = m_retires.stamp();
+		after = [this, stamp, after = std::move(after)]() mutable {
+			m_retires.release(stamp, std::move(after));
+		};
+	}
 	{
 		std::lock_guard<std::mutex> hold(m_libraryKeysLock);
 		m_libraryKeys.erase(obj_id);
@@ -1747,7 +1857,7 @@ bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after, bool
 			             static_cast<unsigned long long>(obj_id));
 	};
 	// Held to go with others, before anything the process posts after it: what it lay over goes
-	// back now, as anything that takes it again is posted after the destroy. Behind the destroys
+	// to the gate now, as anything that takes it again is posted after the destroy. Behind the destroys
 	// refused before, which go first; refused (they or the held before it were), it waits behind
 	// them.
 	if (m_control.batches()) {

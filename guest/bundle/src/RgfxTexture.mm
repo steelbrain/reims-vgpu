@@ -1504,8 +1504,9 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 - (void)dealloc
 {
 	// The host drops the texture as the app lets it go, after any command buffer that names it
-	// (each keeps it while it runs), then its id goes back to the process's chunks, so a
-	// texture made with the id later is created on ring 0 after this one's destroy.
+	// (each keeps it while it runs), then its id goes back to the process's chunks, once the
+	// command buffers committed before are done (RgfxRetireGate), so a texture made with the id
+	// later is created on ring 0 after this one's destroy and run by no buffer before it.
 	// A texture over a buffer keeps the buffer until then: the host's texture lies in it.
 	RgfxSerializer *serializer = _serializer;
 	uint64_t resourceId = _resourceId;

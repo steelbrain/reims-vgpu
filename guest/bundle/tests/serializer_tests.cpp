@@ -3310,6 +3310,94 @@ void test_held_destroys()
 	CHECK(counted);
 }
 
+// A destroy's give-back (its `after`) waits for the command buffers committed before the destroy
+// was asked for (RgfxRetireGate): at once where none is in flight; held while one is, whatever
+// the buffers committed after it do, and run in the order of their destroys once the last of
+// those is done; a give-back that destroys more, run there, has its own destroy wait for the
+// buffers committed by then. Where the destroy is held to go with others, its give-back waits
+// the same.
+void test_give_backs_wait_for_the_buffers_committed_before()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	std::vector<int> ran;
+	CHECK(ser.destroy(0x101, [&ran] { ran.push_back(1); }));
+	CHECK(ran == std::vector<int>({1}));
+	const uint64_t a = ser.commandBufferCommitted();
+	CHECK(ser.destroy(0x102, [&ser, &ran] {
+		ran.push_back(2);
+		// Run at a's completion, after c's commit: it waits for c.
+		CHECK(ser.destroy(0x104, [&ran] { ran.push_back(4); }));
+	}));
+	const uint64_t b = ser.commandBufferCommitted();
+	CHECK(ser.destroy(0x103, [&ran] { ran.push_back(3); }));
+	CHECK(ran.size() == 1 && ser.heldGiveBacks() == 2);
+	// The destroys themselves went at once.
+	for (RgfxObjId obj : {0x101ull, 0x102ull, 0x103ull})
+		CHECK(expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY).obj_id == obj);
+	// b done first: both still wait for a.
+	ser.commandBufferDone(b);
+	CHECK(ran.size() == 1 && ser.heldGiveBacks() == 2);
+	// A buffer committed after the destroys holds neither back.
+	const uint64_t c = ser.commandBufferCommitted();
+	ser.commandBufferDone(a);
+	CHECK(ran == std::vector<int>({1, 2, 3}) && ser.heldGiveBacks() == 1);
+	ser.commandBufferDone(c);
+	CHECK(ran == std::vector<int>({1, 2, 3, 4}) && ser.heldGiveBacks() == 0);
+	CHECK(ser.heldGiveBacksPeak() == 2);
+	// A buffer done twice changes nothing, and with none in flight a give-back runs at once.
+	ser.commandBufferDone(c);
+	CHECK(ser.destroy(0x105, [&ran] { ran.push_back(5); }));
+	CHECK(ran.back() == 5 && ser.heldGiveBacks() == 0);
+
+	KextLog log;
+	RgfxRingWriter batching(&kextSubmit, &log, 4096);
+	batching.setBatch(&kextSubmitBatch, 4096, 600ull * 1000000000);
+	RgfxIdSpace batchIds;
+	RgfxSerializer bser(batching, batchIds);
+	const uint64_t d = bser.commandBufferCommitted();
+	int held = 0;
+	CHECK(bser.destroy(0x201, [&held] { held++; }));
+	CHECK(held == 0 && bser.heldGiveBacks() == 1);
+	bser.commandBufferDone(d);
+	CHECK(held == 1 && bser.heldGiveBacks() == 0);
+}
+
+// The context's end, the serialiser's, runs every give-back still held for a buffer whose
+// completion never came; the gate then runs each one released at once, and a completion that
+// comes later runs nothing more.
+void test_the_context_s_end_runs_the_give_backs_held()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	int ran = 0;
+	{
+		RgfxSerializer ser(writer, ids);
+		(void)ser.commandBufferCommitted(); // its completion never comes
+		CHECK(ser.destroy(0x301, [&ran] { ran++; }));
+		CHECK(ran == 0 && ser.heldGiveBacks() == 1);
+	}
+	CHECK(ran == 1);
+
+	RgfxRetireGate gate;
+	const uint64_t serial = gate.committed();
+	gate.release(gate.stamp(), [&ran] { ran++; });
+	CHECK(ran == 1 && gate.held() == 1);
+	gate.close();
+	CHECK(ran == 2 && gate.held() == 0 && gate.peak() == 1);
+	gate.release(gate.stamp(), [&ran] { ran++; });
+	CHECK(ran == 3);
+	gate.completed(serial);
+	CHECK(ran == 3 && gate.held() == 0);
+}
+
 // Heap-placed buffers held to go together with the destroys around them
 // (RgfxSerializer::createBufferAtOffset): each answered as made and held, in their order with the
 // destroys, before anything posted after them; a commit's postHeldCreates() answers whether none
@@ -5493,6 +5581,8 @@ int main(int argc, char **argv)
 	test_render_pass_visibility();
 	test_forwarded_lifecycle();
 	test_held_destroys();
+	test_give_backs_wait_for_the_buffers_committed_before();
+	test_the_context_s_end_runs_the_give_backs_held();
 	test_held_buffers();
 	test_held_creates();
 	rgfxRunFairShare(argv[0], "--fair-share", "held-since-the-post-is-not-counted");
