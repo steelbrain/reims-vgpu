@@ -2294,6 +2294,51 @@ mod tests {
         }
     }
 
+    /// Where the OS refuses the surface worker a thread, a `Managed` buffer's deallocator run from
+    /// the platform's release still leaves its CPU copy's buffer to a thread the worker runs, which
+    /// lets go of it once its own job ends: never inside the deallocator.
+    #[test]
+    fn a_refused_surface_thread_leaves_the_cpu_copy_s_buffer_to_a_running_one() {
+        use super::super::worker::POOL_THREADS;
+        let (mut r, ram, page) = pages_rig();
+        let copies = shared_copies(&mut r, &ram, page);
+        r.p.world().run_deallocators_late();
+        let (cpu, _) = copies[0];
+        assert_eq!(r.send(&managed_over(60, cpu, 0x300, MANAGED)), Ok(()));
+        let gone = match r.dec.named(cpu) {
+            Some(ObjHandle::Buffer(b)) => Arc::downgrade(b.obj()),
+            _ => panic!("no buffer {cpu:#x}"),
+        };
+        for obj_id in [cpu, 60] {
+            let m = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(r.send(&m), Ok(()), "destroy {obj_id}");
+        }
+        let worker = r.dec.surface_worker();
+        worker.flush();
+        // Every thread the worker runs, one at least, held in a job of a key of the test's.
+        worker.hold();
+        let running = worker.threads().max(1);
+        assert!(running < POOL_THREADS, "{running} threads: one more may start");
+        for key in 0..running as u64 {
+            worker.submit(1 << 48 | key, Box::new(|| {}));
+        }
+        worker.refuse_threads(true);
+        assert_eq!(r.p.world().run_late_deallocators(), 1);
+        assert!(
+            gone.upgrade().is_some(),
+            "handed to the worker's threads, all busy"
+        );
+        worker.release();
+        worker.flush();
+        worker.refuse_threads(false);
+        assert!(gone.upgrade().is_none(), "let go of on a thread of the worker's");
+        let dropped = r.p.world().handles_dropped_in_deallocators();
+        assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
     /// Where the guest's driver took `MANAGED_AT_COPY`, a `MANAGED_BUFFER_CREATE` at its CPU
     /// copy's address is the buffer there where the platform keeps the pin. Where the platform
     /// makes the buffer at another address (a copy in no block it knows), the buffer is kept

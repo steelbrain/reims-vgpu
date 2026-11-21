@@ -21,7 +21,8 @@
 //! its pauses, and those only a burst ran wait longest and go (`reims_vgpu_graphics::keep`). A key
 //! whose job finds every thread busy waits for the next free one, behind the keys that were
 //! waiting before it, and is counted (a cap hit, logged at debug); a thread runs a job of each
-//! waiting key in turn. Where no thread can be started, the job runs where it is handed over.
+//! waiting key in turn. Where the OS refuses a thread, the key waits as where every thread is
+//! busy, for the threads running, and its job runs where it is handed over only where none runs.
 //! - The surface worker's (`reims-vgpu.graphics-surfaces-<i>`) key is a block's offset: a
 //!   `SURFACE_PAGES` and a `BUFFER_OVER_PAGES` handed over (a pages block's first, or one behind
 //!   its block's or its context's still being made) are their block's, as are a released block's
@@ -136,6 +137,9 @@ struct Shared {
     /// Holds the threads before each job while shut (tests only).
     #[cfg(test)]
     gate: Gate,
+    /// No thread is started while set, as where the OS refuses them (tests only).
+    #[cfg(test)]
+    refuse: AtomicBool,
 }
 
 /// A worker's keys and threads.
@@ -217,6 +221,8 @@ impl Worker {
                 done: Condvar::new(),
                 #[cfg(test)]
                 gate: Gate::default(),
+                #[cfg(test)]
+                refuse: AtomicBool::new(false),
             }),
         }
     }
@@ -255,20 +261,14 @@ impl Worker {
             state.made += 1;
         }
         drop(state);
-        let spawned = {
-            let shared = Arc::clone(shared);
-            std::thread::Builder::new()
-                .name(format!("{}-{index}", shared.name))
-                .spawn(move || work(&shared, index))
-        };
-        let Err(e) = spawned else {
+        let Err(e) = shared.start(index) else {
             return;
         };
         if !shared.refused.swap(true, Ordering::Relaxed) {
             log::warn!(
                 target: "reims_vgpu::graphics",
-                "{}-{index} could not be started ({e}): a job no thread takes runs where it is \
-                 handed over",
+                "{}-{index} could not be started ({e}): a job waits for the threads running, \
+                 and runs where it is handed over where none runs",
                 shared.name
             );
         }
@@ -277,6 +277,11 @@ impl Worker {
         #[cfg(test)]
         {
             state.made -= 1;
+        }
+        // A thread that runs takes the key's turn once its job ends, as where every thread is
+        // busy: every named thread looks at the waiting keys before it ends (`work`).
+        if state.named.iter().any(|&taken| taken) {
+            return;
         }
         // Unless a thread took it meanwhile.
         let Some(at) = state.ready.iter().position(|&k| k == key) else {
@@ -358,6 +363,13 @@ impl Worker {
         self.shared.gate.opened.notify_all();
     }
 
+    /// Has every later start of a thread refused, as where the OS refuses them, or no longer
+    /// (tests only).
+    #[cfg(test)]
+    pub(crate) fn refuse_threads(&self, refuse: bool) {
+        self.shared.refuse.store(refuse, Ordering::Relaxed);
+    }
+
     /// Waits until no job of any key waits or runs: the device's reset, for the closes' worker's
     /// jobs before it ([`super::GraphicsDecoder::closes_let_go`]).
     pub(crate) fn flush(&self) {
@@ -380,6 +392,22 @@ impl Drop for Worker {
         for idler in idle {
             idler.wake.notify_one();
         }
+    }
+}
+
+impl Shared {
+    /// Starts the worker's thread `index`, whose name the caller took ([`State::named`]). Err
+    /// where the OS refuses it, or, in the tests, where they refuse it ([`Worker::refuse_threads`]).
+    fn start(self: &Arc<Self>, index: usize) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.refuse.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("refused by the test"));
+        }
+        let shared = Arc::clone(self);
+        std::thread::Builder::new()
+            .name(format!("{}-{index}", self.name))
+            .spawn(move || work(&shared, index))
+            .map(drop)
     }
 }
 
@@ -664,6 +692,55 @@ mod tests {
         drop(goes.remove(2));
         assert_eq!(fifth_ran.recv_timeout(Duration::from_secs(5)), Ok(()));
         drop(goes);
+        worker.flush();
+    }
+
+    /// Where the OS refuses a thread, a key's job waits for the threads running, as where every
+    /// thread is busy, and runs on one once its job ends, not where it is handed over
+    #[test]
+    fn a_job_whose_thread_is_refused_waits_for_a_running_thread() {
+        let worker = Worker::new("reims-vgpu.test-worker");
+        let (started, begun) = mpsc::channel();
+        let (job, go) = blocking(&started, 1);
+        worker.submit(1, job);
+        assert_eq!(begun.recv_timeout(Duration::from_secs(5)), Ok(1));
+        worker.refuse_threads(true);
+        let (ran, wait) = mpsc::channel();
+        worker.submit(
+            2,
+            Box::new(move || {
+                let _ = ran.send(std::thread::current().name().map(str::to_owned));
+            }),
+        );
+        assert_eq!(
+            wait.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "not run where handed over"
+        );
+        assert_eq!(worker.threads(), 1, "no thread started");
+        drop(go);
+        assert_eq!(
+            wait.recv_timeout(Duration::from_secs(5)),
+            Ok(Some("reims-vgpu.test-worker-0".to_owned()))
+        );
+        worker.flush();
+    }
+
+    /// Where the OS refuses a thread and the worker runs none, a key's job runs where it is handed
+    /// over
+    #[test]
+    fn a_job_whose_thread_is_refused_runs_where_handed_over_where_none_runs() {
+        let worker = Worker::new("reims-vgpu.test-worker");
+        worker.refuse_threads(true);
+        let (ran, wait) = mpsc::channel();
+        worker.submit(
+            3,
+            Box::new(move || {
+                let _ = ran.send(std::thread::current().id());
+            }),
+        );
+        assert_eq!(wait.try_recv(), Ok(std::thread::current().id()));
+        assert_eq!(worker.threads(), 0);
         worker.flush();
     }
 
