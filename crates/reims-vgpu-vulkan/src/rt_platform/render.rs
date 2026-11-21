@@ -1591,7 +1591,12 @@ mod tests {
         let done = CommandBufferStatus::COMPLETED;
         let (metal, gap) = (RtRefusal::Refused.code(), RtRefusal::Gap.code());
         let (unbuilt, ours) = (Unbuilt::RenderCommand.code(), RtRefusal::Ours.code());
-        let before = (counted(metal), counted(gap), counted(unbuilt), counted(ours));
+        let before = (
+            counted(metal),
+            counted(gap),
+            counted(unbuilt),
+            counted(ours),
+        );
         let target = device.new_texture(
             on,
             &platform.texture_descriptor(&TextureDesc {

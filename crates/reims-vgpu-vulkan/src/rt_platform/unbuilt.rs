@@ -878,7 +878,11 @@ mod tests {
         use rt::RefusalBasis as Basis;
         let arms = [
             (Basis::Ours, RtRefusal::Ours, "rt-refused-ours"),
-            (Basis::MetalDocumented, RtRefusal::Refused, "rt-refused-metal"),
+            (
+                Basis::MetalDocumented,
+                RtRefusal::Refused,
+                "rt-refused-metal",
+            ),
             (Basis::MetalMeasured, RtRefusal::Refused, "rt-refused-metal"),
             (Basis::Device, RtRefusal::Refused, "rt-refused-metal"),
         ];
