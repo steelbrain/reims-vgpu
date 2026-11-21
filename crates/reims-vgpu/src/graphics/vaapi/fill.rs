@@ -69,8 +69,9 @@ const BINDING_ALIGNMENT: u64 = 256;
 const ARGUMENTS_APART: u64 = 256;
 
 /// What `videoEncodeFill` takes of a plane (`shaders.metal`'s `VideoFillPlane`): where the plane
-/// lies in its source buffer as bound, its rows and the bytes its margin repeats, and the input's
-/// words a row, its rows and its words from one row to the next.
+/// lies in its source buffer as bound, its rows and the bytes its margin repeats, the input's
+/// words a row, its rows and its words from one row to the next, and how the input lays its words
+/// out ([`TILING_LINEAR`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FillPlane {
     first: u32,
@@ -81,11 +82,15 @@ struct FillPlane {
     coded_words: u32,
     coded_rows: u32,
     pitch_words: u32,
+    tiling: u32,
 }
+
+/// `VideoFillPlane`'s `tiling` of a linear input.
+const TILING_LINEAR: u32 = 0;
 
 impl FillPlane {
     /// Its bytes, as the kernel reads them.
-    fn bytes(&self) -> [u8; 32] {
+    fn bytes(&self) -> [u8; 36] {
         let words = [
             self.first,
             self.source_pitch,
@@ -95,8 +100,9 @@ impl FillPlane {
             self.coded_words,
             self.coded_rows,
             self.pitch_words,
+            self.tiling,
         ];
-        let mut bytes = [0; 32];
+        let mut bytes = [0; 36];
         for (to, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
             *to = word.to_le_bytes();
         }
@@ -217,6 +223,7 @@ fn plane_fills(
                 coded_words: narrow(coded_bytes / 4, "a coded row's words")?,
                 coded_rows: narrow(coded_rows, "coded rows")?,
                 pitch_words: narrow(pitch_words, "a pitch's words")?,
+                tiling: TILING_LINEAR,
             },
         })
     };
@@ -555,7 +562,7 @@ fn encode_planes<P: Platform>(
     for (n, fill) in fills.iter().enumerate() {
         let bytes = fill.plane.bytes();
         // SAFETY: the buffer's host bytes, two planes' arguments apart at least, hold each plane's
-        // 32 at its multiple of 256; and no GPU work reads them: the fill before was waited for.
+        // 36 at its multiple of 256; and no GPU work reads them: the fill before was waited for.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),

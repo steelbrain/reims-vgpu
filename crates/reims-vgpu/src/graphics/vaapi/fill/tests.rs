@@ -86,6 +86,7 @@ fn a_frames_planes_fill_the_input_as_the_upload_does() {
             coded_words: 84,
             coded_rows,
             pitch_words: 128,
+            tiling: TILING_LINEAR,
         },
     };
     assert_eq!(
@@ -162,7 +163,7 @@ fn a_frame_the_input_or_its_planes_cannot_hold_is_declined() {
     assert!(why.contains(&format!("ends at byte {luma_end}")), "{why}");
 }
 
-/// A plane's arguments are `shaders.metal`'s `VideoFillPlane`, eight 32-bit words in its order,
+/// A plane's arguments are `shaders.metal`'s `VideoFillPlane`, nine 32-bit words in its order,
 /// and its dispatch a threadgroup of 64 threads a 64 words of a row, a row of threadgroups each
 /// coded row.
 #[test]
@@ -176,12 +177,13 @@ fn a_planes_arguments_are_the_kernels_and_its_grid_covers_its_words() {
         coded_words: 130,
         coded_rows: 7,
         pitch_words: 8,
+        tiling: 9,
     };
     let bytes = plane.bytes();
     let words: Vec<u32> = (bytes.as_chunks::<4>().0.iter())
         .map(|w| u32::from_le_bytes(*w))
         .collect();
-    assert_eq!(words, [1, 2, 3, 4, 5, 130, 7, 8]);
+    assert_eq!(words, [1, 2, 3, 4, 5, 130, 7, 8, 9]);
     assert_eq!(plane.threadgroups(), MtlSize::new(3, 7, 1));
 }
 

@@ -301,10 +301,11 @@ kernel void displayMirrorTileList(device const uint *now [[buffer(0)]],
 // ---- The host's video encoder's input ----
 
 // One plane of a frame that videoEncodeFill writes into a video encoder's input (reims-vgpu's
-// graphics/vaapi/fill.rs, `FillPlane`, 32 bytes): where the frame's plane lies in the source
+// graphics/vaapi/fill.rs, `FillPlane`, 36 bytes): where the frame's plane lies in the source
 // buffer as bound, its first byte and the bytes from one row to the next; the bytes of a row of the
 // frame's samples, its rows, and the bytes a row's margin repeats (a sample, or a Cb/Cr pair);
-// and the input's words a row, its rows and its words from one row to the next.
+// the input's words a row, its rows and its words from one row to the next; and how the input
+// lays its words out: 0 linear, 1 in Intel's Y tiles.
 struct VideoFillPlane {
     uint first;
     uint source_pitch;
@@ -314,7 +315,20 @@ struct VideoFillPlane {
     uint coded_words;
     uint coded_rows;
     uint pitch_words;
+    uint tiling;
 };
+
+// Where word `x` of row `y` of a plane of the input lies, in words from the plane's first: rows
+// `pitch_words` apart where linear; in Intel's Y tiles, 4 KiB tiles of 128 bytes by 32 rows,
+// `pitch_words / 32` of them to a row of tiles, each 8 columns of 16 bytes by 32 rows one after
+// another, a column's rows 16 bytes apart (the VA crate's `TargetTiling::byte_at`).
+static uint video_fill_word_at(uint x, uint y, uint pitch_words, uint tiling) {
+    if (tiling == 0) {
+        return y * pitch_words + x;
+    }
+    uint tile = (y >> 5) * (pitch_words >> 5) + (x >> 5);
+    return tile * 1024 + ((x & 31) >> 2) * 128 + (y & 31) * 4 + (x & 3);
+}
 
 // The source's byte `at`, of the words the buffer holds from its bound offset (little-endian).
 static uint video_fill_byte(device const uint *source, uint at) {
@@ -352,5 +366,5 @@ kernel void videoEncodeFill(device const uint *source [[buffer(0)]],
             word |= video_fill_byte(source, row + from) << (i * 8);
         }
     }
-    input[at.y * plane.pitch_words + at.x] = word;
+    input[video_fill_word_at(at.x, at.y, plane.pitch_words, plane.tiling)] = word;
 }
