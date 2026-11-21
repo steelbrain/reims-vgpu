@@ -58,12 +58,12 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use crate::codec::h264::{self, avcc};
 use crate::codec::h264::nal::LengthPrefixed;
 use crate::codec::h264::sps::Sps as H264Sps;
-use crate::codec::hevc::{self, hvcc};
+use crate::codec::h264::{self, avcc};
 use crate::codec::hevc::nal::nal_type;
 use crate::codec::hevc::sps::Sps as HevcSps;
+use crate::codec::hevc::{self, hvcc};
 use crate::core::fourcc::FourCc;
 use crate::core::runtime::Runtime;
 use crate::paravirt::WireError;

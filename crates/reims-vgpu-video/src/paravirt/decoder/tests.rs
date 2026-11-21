@@ -869,7 +869,10 @@ fn high_sps(profile_idc: u8, chroma_format_idc: u32, bit_depth_minus8: u32) -> V
         w.bit(false); // separate_colour_plane_flag
     }
     // The depths, then no transform bypass and no scaling matrix.
-    w.ue(bit_depth_minus8).ue(bit_depth_minus8).bit(false).bit(false);
+    w.ue(bit_depth_minus8)
+        .ue(bit_depth_minus8)
+        .bit(false)
+        .bit(false);
     // log2_max_frame_num_minus4, pic_order_cnt_type 0 and its lsb's size; one reference, no gaps.
     w.ue(0).ue(0).ue(0).ue(1).bit(false);
     // Four by three macroblocks, frames alone, direct 8x8 inference, no cropping, no VUI.
@@ -891,7 +894,8 @@ fn hvcc_of(sps: &[u8]) -> Vec<u8> {
 /// the decoder session `kVTVideoDecoderUnsupportedDataFormatErr` without `Dpba`, the tile
 /// session `kVTUnimplementedErr` without `TDrs`, and neither decodes after.
 fn starts_in(codec: Codec, record: &[u8], format: Option<&[u8; 4]>, what: &str) {
-    let named = format.map(|f| Value::Array(vec![Value::Integer(i64::from(u32::from_be_bytes(*f)))]));
+    let named =
+        format.map(|f| Value::Array(vec![Value::Integer(i64::from(u32::from_be_bytes(*f)))]));
     let guest = Guest::of(codec, Ok(Decoded::Landed), Some(TILES));
     guest.start(record);
     if let Some(named) = &named {
@@ -901,7 +905,11 @@ fn starts_in(codec: Codec, record: &[u8], format: Option<&[u8; 4]>, what: &str) 
     }
     let (_, reply) = guest.next_of(b"dsta");
     let refused = status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT;
-    assert_eq!(status_of(&reply), Some(if named.is_some() { 0 } else { refused }), "{what}");
+    assert_eq!(
+        status_of(&reply),
+        Some(if named.is_some() { 0 } else { refused }),
+        "{what}"
+    );
     if named.is_none() {
         guest.frame(0, 0, &one_sample(&SAMPLE, None, false));
         let (_, frame) = guest.next_of(b"dfrm");
@@ -918,10 +926,20 @@ fn starts_in(codec: Codec, record: &[u8], format: Option<&[u8; 4]>, what: &str) 
     }
     let (_, reply) = guest.next_of(b"dsts");
     let refused = status::UNIMPLEMENTED;
-    assert_eq!(status_of(&reply), Some(if named.is_some() { 0 } else { refused }), "{what}");
+    assert_eq!(
+        status_of(&reply),
+        Some(if named.is_some() { 0 } else { refused }),
+        "{what}"
+    );
     if named.is_none() {
         let buffer = GuestUuid([0xc1; 16]);
-        guest.tile(0, ((0, 0), (64, 48), (0, 0)), buffer, 31, &one_sample(&SAMPLE, None, false));
+        guest.tile(
+            0,
+            ((0, 0), (64, 48), (0, 0)),
+            buffer,
+            31,
+            &one_sample(&SAMPLE, None, false),
+        );
         guest.tile_emitted(0, NO_DECODER, buffer, 31);
         assert!(guest.calls.lock().is_empty(), "{what}");
     }
@@ -953,7 +971,8 @@ fn each_hevc_stream_lands_in_its_4_2_0_format_or_is_refused_at_its_start() {
         (2, 1, 4, false, None, None),
         (4, 1, 0, true, None, None),
     ] {
-        let sps = crate::codec::hevc::tests::sps_of(profile, chroma, deeper, range_extension, full_range);
+        let sps =
+            crate::codec::hevc::tests::sps_of(profile, chroma, deeper, range_extension, full_range);
         let what = format!("profile {profile}, chroma {chroma}, 8+{deeper} bits, {full_range:?}");
         starts_in(Codec::Hevc, &hvcc_of(&sps), format, &what);
     }
@@ -973,7 +992,12 @@ fn each_h264_stream_lands_in_its_4_2_0_format_or_is_refused_at_its_start() {
         (244, 3, 2, None),
     ] {
         let what = format!("profile {profile}, chroma {chroma}, 8+{deeper} bits");
-        starts_in(Codec::H264, &avcc(&high_sps(profile, chroma, deeper), 4), format, &what);
+        starts_in(
+            Codec::H264,
+            &avcc(&high_sps(profile, chroma, deeper), 4),
+            format,
+            &what,
+        );
     }
 }
 
