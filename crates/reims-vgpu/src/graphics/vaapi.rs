@@ -228,8 +228,8 @@ impl std::fmt::Display for DisplayAt<'_> {
 /// (`host_gpus::render_node_at`), as [`open`] opens it; `None`, logged, where its GPU has none.
 /// Its pictures land by the driver's video processing or the CPU's copy, as its GPU copies
 /// ([`fill::DeviceFills`]) make no copier; a reference picture is not decoded into its cache
-/// ([`CachedReferences::Apart`]); and no encoder is answered yet, though the GPU copies give an
-/// encode session a filler (`fill`).
+/// ([`CachedReferences::Apart`]); and the driver's encoders are answered, their sessions' frames
+/// written into the encoders' inputs by the GPU (`fill`), else uploaded by the CPU.
 #[cfg(unix)]
 pub(crate) fn open_on_rt(
     device: &RtDevice,
@@ -244,7 +244,7 @@ pub(crate) fn open_on_rt(
         .map(|dir| dir.join("device-checks").join("va-targets"));
     let rules = PlatformRules {
         references: CachedReferences::Apart,
-        encodes: false,
+        encodes: true,
     };
     let copies: Arc<dyn GpuCopies<reims_vgpu_vulkan::RtPlatform>> =
         Arc::new(fill::DeviceFills::new(device, &runtime));

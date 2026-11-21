@@ -293,28 +293,22 @@ fn caches_are_dma_bufs_where_either_of_the_drivers_checks_passed() {
     );
 }
 
-/// On the rt platform the VA-API arm answers what the driver decodes and no encoder (the platform
-/// releases no encoder's sources to the driver yet), and writes into the device's caches where the
-/// driver's check of decodes into targets passed a codec, or its import check a format: rt's
-/// exported blocks, as dma-bufs, take the pictures no later one predicts from, decoded there, or
-/// the pictures the driver's video processing writes there.
+/// On the rt platform the VA-API arm answers what the driver decodes and what it encodes, as the
+/// driver answers them, the encode sessions' frames written into their encoders' inputs by the
+/// GPU (`fill`); and it writes into the device's caches where the driver's check of decodes into
+/// targets passed a codec, or its import check a format: rt's exported blocks, as dma-bufs, take
+/// the pictures no later one predicts from, decoded there, or the pictures the driver's video
+/// processing writes there. The VA-API hosts' drivers encode.
 /// The rt device must be of a GPU the arm runs on (`video_choice::tested_gpu::check_rt`).
 #[test]
 #[ignore = "needs a VA-API GPU: run on the VA-API host"]
-fn the_rt_platforms_va_api_arm_decodes_alone() {
+fn the_rt_platforms_va_api_arm_answers_the_drivers_decoders_and_encoders() {
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
         crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::VaApi);
         let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
         let video = open_on_rt(&device, runtime).expect("VA-API on the rt device's GPU");
-        let caps = video.caps();
-        assert!(!caps.is_empty());
-        assert!(
-            caps.iter().all(|c| c.direction == RGFX_VIDEO_DECODE),
-            "{caps:?}"
-        );
-        assert!(video.guest_encoders().is_empty());
         assert!(video.guest_decodes());
         assert!(video.lands_in_device_caches());
         let gpu = device.host_gpu();
@@ -324,6 +318,21 @@ fn the_rt_platforms_va_api_arm_decodes_alone() {
             crate::video::runtime::PlatformRuntime::of(&platform),
         )
         .expect("a VA display");
+        let capabilities = display.capabilities().expect("the driver's capabilities");
+        let supports = encoder_support(&display);
+        assert!(!supports.is_empty(), "the VA-API host's driver encodes");
+        let mut answered = caps_of(&capabilities);
+        answered.extend(encode::encode_caps_of(&supports, &capabilities));
+        let caps = video.caps();
+        assert_eq!(caps, answered);
+        assert!(
+            caps.iter().any(|c| c.direction == RGFX_VIDEO_DECODE)
+                && caps.iter().any(|c| c.direction == RGFX_VIDEO_ENCODE),
+            "{caps:?}"
+        );
+        let encoders = video.guest_encoders();
+        assert!(!encoders.is_empty());
+        assert_eq!(encoders, encode::guest_encoders(&supports));
         let checks = TargetChecks::of(&display, None);
         let passed = [
             (TargetCodec::H264, TargetFormat::Nv12),
