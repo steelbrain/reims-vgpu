@@ -1531,7 +1531,10 @@ mod tests {
         };
 
         // Slice 1 alone, cleared blue.
-        assert_eq!(run(&made(), &layered(1, opaque(0.0, 0.0, 1.0), 0), Vec::new()), done);
+        assert_eq!(
+            run(&made(), &layered(1, opaque(0.0, 0.0, 1.0), 0), Vec::new()),
+            done
+        );
         assert_eq!(texels(1), every(blue));
 
         // Both slices from slice 0, cleared red, and a green triangle into slice 0.
@@ -1552,7 +1555,10 @@ mod tests {
                 vertex_count: 3,
             },
         ];
-        assert_eq!(run(&made(), &layered(0, opaque(1.0, 0.0, 0.0), 2), draw), done);
+        assert_eq!(
+            run(&made(), &layered(0, opaque(1.0, 0.0, 0.0), 2), draw),
+            done
+        );
         assert_eq!(texels(0), every(green));
         assert_eq!(texels(1), every(red));
         assert_eq!(counted(unbuilt), before.1);

@@ -514,7 +514,15 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             let lies = layout(source_offset, source_bytes_per_row, source_bytes_per_image);
             let (source, destination) = (source.rt(), destination);
             let size = size(source_size)?;
-            copy_bytes(e, sel, (source, lies), size, (destination, to), true, option)?;
+            copy_bytes(
+                e,
+                sel,
+                (source, lies),
+                size,
+                (destination, to),
+                true,
+                option,
+            )?;
         }
         BlitCmd::CopyBufferToBuffer {
             source_buffer,
@@ -551,7 +559,15 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             );
             let (source, destination) = (source_texture, destination_buffer.rt());
             let size = size(source_size)?;
-            copy_bytes(e, sel, (destination, lies), size, (source, from), false, NONE)?;
+            copy_bytes(
+                e,
+                sel,
+                (destination, lies),
+                size,
+                (source, from),
+                false,
+                NONE,
+            )?;
         }
         BlitCmd::CopyTextureToBufferOptions {
             source_texture,
@@ -577,7 +593,15 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             );
             let (source, destination) = (source, destination.rt());
             let size = size(source_size)?;
-            copy_bytes(e, sel, (destination, lies), size, (source, from), false, option)?;
+            copy_bytes(
+                e,
+                sel,
+                (destination, lies),
+                size,
+                (source, from),
+                false,
+                option,
+            )?;
         }
         BlitCmd::CopyTextureRegion {
             source_texture,
@@ -1003,7 +1027,10 @@ mod tests {
             }),
         );
         let both = both.expect("never a raise").expect("a texture");
-        let (depth, stencil) = ((16, DEPTH_FROM_DEPTH_STENCIL), (4, STENCIL_FROM_DEPTH_STENCIL));
+        let (depth, stencil) = (
+            (16, DEPTH_FROM_DEPTH_STENCIL),
+            (4, STENCIL_FROM_DEPTH_STENCIL),
+        );
 
         // A pass that clears and stores both planes.
         let pass = RtObj::new(PassFields::default());
@@ -1067,7 +1094,10 @@ mod tests {
         assert_eq!(blit(&queue, cmds), done);
         assert_eq!(read(&depth_out, 64), quarter);
         assert_eq!(read(&stencil_out, 16), written);
-        assert_eq!((counted(gap), counted(unbuilt)), (before.0 + 1, before.1 + 1));
+        assert_eq!(
+            (counted(gap), counted(unbuilt)),
+            (before.0 + 1, before.1 + 1)
+        );
     }
 
     /// Blits on the GPU the test holds: buffer fills, a pattern of one byte value among them,
