@@ -169,6 +169,11 @@ fn identity_of(object: *mut c_void) -> Result<usize, String> {
     Ok(unknown.raw() as usize)
 }
 
+/// The address of [`create_command_queue`], which a slot the module set holds.
+fn ours() -> usize {
+    create_command_queue as *const () as usize
+}
+
 impl Hold {
     /// A hold on `device`'s one video decode queue, setting its vtable's slot where no hold did.
     pub(super) fn new(device: &Com) -> Result<Hold, String> {
@@ -178,8 +183,8 @@ impl Hold {
         match state.vtables.iter_mut().find(|kept| kept.at == vtable) {
             Some(kept) if kept.holds > 0 => kept.holds += 1,
             Some(kept) => {
-                let was = set_slot(vtable, create_command_queue as usize)?;
-                if was != create_command_queue as usize {
+                let was = set_slot(vtable, ours())?;
+                if was != ours() {
                     // SAFETY: the slot held `CreateCommandQueue`'s method, of that signature.
                     kept.original =
                         unsafe { std::mem::transmute::<usize, CreateCommandQueue>(was) };
@@ -187,7 +192,7 @@ impl Hold {
                 kept.holds = 1;
             }
             None => {
-                let was = set_slot(vtable, create_command_queue as usize)?;
+                let was = set_slot(vtable, ours())?;
                 // SAFETY: as above; this vtable was not set before, so the slot held its own.
                 let original = unsafe { std::mem::transmute::<usize, CreateCommandQueue>(was) };
                 state.vtables.push(Vtable {
@@ -197,7 +202,11 @@ impl Hold {
                 });
             }
         }
-        match state.devices.iter_mut().find(|held| held.identity == identity) {
+        match state
+            .devices
+            .iter_mut()
+            .find(|held| held.identity == identity)
+        {
             Some(held) => held.holds += 1,
             None => state.devices.push(Held {
                 identity,
@@ -214,25 +223,26 @@ impl Drop for Hold {
         let released;
         {
             let mut state = STATE.lock();
-            let at = state
+            let identity = self.identity;
+            let Some(at) = state
                 .devices
                 .iter()
-                .position(|held| held.identity == self.identity)
-                .expect("a hold's device is held");
+                .position(|held| held.identity == identity)
+            else {
+                // Every hold's device is held while the hold lives.
+                return;
+            };
             let held = &mut state.devices[at];
             held.holds -= 1;
             released = (held.holds == 0).then(|| state.devices.swap_remove(at));
-            let kept = state
-                .vtables
-                .iter_mut()
-                .find(|kept| kept.at == self.vtable)
-                .expect("a hold's vtable is kept");
-            kept.holds -= 1;
-            let ours = slot_of(self.vtable).load(Ordering::SeqCst) == create_command_queue as usize;
-            if kept.holds == 0 && ours {
-                // Set back only where the slot still holds ours: something that set it after us
-                // calls ours, which passes through.
-                let _ = set_slot(self.vtable, kept.original as usize);
+            let vtable = self.vtable;
+            if let Some(kept) = state.vtables.iter_mut().find(|kept| kept.at == vtable) {
+                kept.holds -= 1;
+                if kept.holds == 0 && slot_of(vtable).load(Ordering::SeqCst) == ours() {
+                    // Set back only where the slot still holds ours: something that set it after
+                    // us calls ours, which passes through.
+                    let _ = set_slot(vtable, kept.original as usize);
+                }
             }
         }
         // The queues are released outside the lock: a release calls into the runtime.
@@ -278,7 +288,11 @@ unsafe extern "system" fn create_command_queue(
         // SAFETY: as above.
         return unsafe { original(device, desc, iid, out) };
     };
-    let Some(held) = state.devices.iter_mut().find(|held| held.identity == identity) else {
+    let Some(held) = state
+        .devices
+        .iter_mut()
+        .find(|held| held.identity == identity)
+    else {
         drop(state);
         // SAFETY: as above.
         return unsafe { original(device, desc, iid, out) };
@@ -336,7 +350,10 @@ fn a_held_devices_video_decode_queues_are_one_and_its_direct_queues_its_own() {
     let device = super::d3d12::Device::new(None).expect("a Direct3D 12 device");
     let (a, first) = queue_identity(&device.device, VIDEO_DECODE);
     let (b, second) = queue_identity(&device.device, VIDEO_DECODE);
-    assert_eq!(first, second, "two video decode queues on a held device are one");
+    assert_eq!(
+        first, second,
+        "two video decode queues on a held device are one"
+    );
     let (c, direct) = queue_identity(&device.device, DIRECT);
     let (d, other) = queue_identity(&device.device, DIRECT);
     assert_ne!(direct, other, "two direct queues are their own");
@@ -350,6 +367,9 @@ fn a_held_devices_video_decode_queues_are_one_and_its_direct_queues_its_own() {
     drop(device);
     let (e, first) = queue_identity(&unheld, VIDEO_DECODE);
     let (f, second) = queue_identity(&unheld, VIDEO_DECODE);
-    assert_ne!(first, second, "a device let go of answers a video decode queue each");
+    assert_ne!(
+        first, second,
+        "a device let go of answers a video decode queue each"
+    );
     drop((e, f));
 }
