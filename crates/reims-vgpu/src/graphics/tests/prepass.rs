@@ -1,8 +1,8 @@
 //! A command buffer's dispatch pre-pass (`decode::prepass`): each pipeline its dispatches run,
 //! by the platform's key of it, made ahead once for the device, on the compile threads, with the
-//! arguments of the first dispatch of it; a dispatch with no key made ahead never; the walk
-//! waiting for none of it; and nothing of it outliving the buffer's views of the table, nor its
-//! device.
+//! arguments of the first dispatch of it; a dispatch with no key, or of a key made, made ahead
+//! never; the walk waiting for none of it; and nothing of it outliving the buffer's views of the
+//! table, nor its device.
 
 use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
@@ -471,6 +471,60 @@ fn a_command_buffer_hands_its_first_shapes_up_to_the_most() {
     assert_eq!(widths(&platform), (1..=n).collect::<Vec<_>>());
     gate.open();
     assert_eq!(completed(&platform, &mut ring, 101), RGFX_CB_OK);
+}
+
+/// A dispatch whose key the platform answers made hands nothing: it takes no place of the
+/// buffer's [`MOST`] and gives the pool no compile, so the buffer's first [`MOST`] keys not made
+/// are each made ahead and none is counted past the most; a buffer of made keys alone gives the
+/// pool nothing; both complete as without the pre-pass
+#[test]
+fn a_made_key_takes_no_place_and_no_compile() {
+    let (device, platform, _guest, mut ring) = with_states(&[11]);
+    let world = platform.world();
+    // Each width its own key, the first four and those from 1000 made.
+    let made_keys = 4;
+    world.key_dispatches(|p| match p.dispatch {
+        PreparedGrid::Threads(w, _, _) => Some(w),
+        _ => None,
+    });
+    world.variants_made((1..=made_keys).chain(1000..1004));
+    let widths = |platform: &FakePlatform| -> Vec<u64> {
+        let mut widths: Vec<u64> = (made(platform).into_iter())
+            .map(|p| match p.dispatch {
+                PreparedGrid::Threads(w, _, _) => w,
+                grid => panic!("made ahead: {grid:?}"),
+            })
+            .collect();
+        widths.sort_unstable();
+        widths
+    };
+    let (handed, past_most) = (
+        counted("dispatch-prepass-handed"),
+        counted("dispatch-prepass-past-most"),
+    );
+    let n = MOST as u64 + made_keys;
+    let mut ops = vec![begin(), set_state(11)];
+    ops.extend((1..=n).map(|w| threads([w, 1, 1], [1, 1, 1])));
+    ops.push(end());
+    let gate = WalkGate::on(&device);
+    ring.send(&device, command_buffer_of(100, &ops));
+    assert!(gate.reached(), "the walk did not start");
+    assert!(eventually(|| made(&platform).len() >= MOST));
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(widths(&platform), (made_keys + 1..=n).collect::<Vec<_>>());
+    assert_eq!(counted("dispatch-prepass-handed") - handed, MOST as u64);
+    assert_eq!(counted("dispatch-prepass-past-most"), past_most);
+    gate.open();
+    assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+
+    let mut ops = vec![begin(), set_state(11)];
+    ops.extend((1000..1004).map(|w| threads([w, 1, 1], [1, 1, 1])));
+    ops.push(end());
+    ring.send(&device, command_buffer_of(101, &ops));
+    assert_eq!(completed(&platform, &mut ring, 101), RGFX_CB_OK);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(counted("dispatch-prepass-handed") - handed, MOST as u64);
+    assert_eq!(widths(&platform), (made_keys + 1..=n).collect::<Vec<_>>());
 }
 
 /// A command buffer whose makes ahead wait for a compile thread is walked and completes without

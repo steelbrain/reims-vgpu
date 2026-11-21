@@ -1050,6 +1050,8 @@ struct Variants {
     asked: std::collections::HashMap<Prepared, u64>,
     /// The test's keys, where it gave them.
     given: Option<KeyOf>,
+    /// The numbers of the keys answered as made ([`World::variants_made`]).
+    made: std::collections::HashSet<u64>,
 }
 
 /// One call of a compute state's
@@ -1166,14 +1168,25 @@ impl World {
         self.variants.lock().given = Some(Box::new(key_of));
     }
 
-    /// The key a compute state answers of its dispatch `prepared` ([`World::key_dispatches`]).
-    pub(crate) fn dispatch_variant(&self, prepared: Prepared) -> Option<FakeVariant> {
+    /// Has the compute states answer the keys numbered `keys` as made from now on, as a platform
+    /// answers a key whose pipeline it made ([`World::dispatch_variant`]). The fake's makes
+    /// ahead make nothing, so no key is made until then.
+    pub fn variants_made(&self, keys: impl IntoIterator<Item = u64>) {
+        self.variants.lock().made.extend(keys);
+    }
+
+    /// The key a compute state answers of its dispatch `prepared` ([`World::key_dispatches`]),
+    /// and whether it is made ([`World::variants_made`]).
+    pub(crate) fn dispatch_variant(&self, prepared: Prepared) -> Option<(FakeVariant, bool)> {
         let mut variants = self.variants.lock();
-        if let Some(key_of) = &variants.given {
-            return key_of(&prepared).map(FakeVariant);
-        }
-        let next = u64::try_from(variants.asked.len()).unwrap_or(u64::MAX);
-        Some(FakeVariant(*variants.asked.entry(prepared).or_insert(next)))
+        let key = match &variants.given {
+            Some(key_of) => key_of(&prepared)?,
+            None => {
+                let next = u64::try_from(variants.asked.len()).unwrap_or(u64::MAX);
+                *variants.asked.entry(prepared).or_insert(next)
+            }
+        };
+        Some((FakeVariant(key), variants.made.contains(&key)))
     }
 
     /// Has the devices keep no pin of a buffer or heap they make from now on, where `on`: each

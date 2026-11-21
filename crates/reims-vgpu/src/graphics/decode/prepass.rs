@@ -25,6 +25,9 @@
 //!   ([`Handed`]): a dispatch whose key is there hands nothing, so neither does another shape of a
 //!   pipeline handed (a grid of more whole threadgroups) nor another state's dispatch of it, and
 //!   once a run's pipelines are made its buffers hand nothing and the pool is given nothing. A
+//!   key the platform answers made (its pipeline made at its state's make, or by a make ahead
+//!   or a dispatch before) enters the memo as handed and hands nothing: it takes no place of
+//!   the buffer's [`MOST`] and gives the pool nothing. A key not made is handed as above. A
 //!   dispatch with no key, one the platform would make nothing for, hands nothing, counted
 //!   (`dispatch-prepass-no-variant`). A buffer hands [`MOST`] at the most; the rest are counted
 //!   (`dispatch-prepass-past-most`) and left to the walk.
@@ -418,10 +421,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             let ObjHandle::ComputePipeline(handle) = &entry.handle else {
                 continue;
             };
-            let Some(key) = handle.dispatch_variant(dispatch, threads, &lengths) else {
+            let Some((key, made)) = handle.dispatch_variant(dispatch, threads, &lengths) else {
                 no_variant += 1;
                 continue;
             };
+            if made {
+                // Made already: noted as handed, with no slot of the buffer's and no compile.
+                self.shared.handed.is_new(key, true);
+                continue;
+            }
             let room = items.len() < MOST;
             if !self.shared.handed.is_new(key, room) {
                 continue;

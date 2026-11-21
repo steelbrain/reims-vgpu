@@ -571,19 +571,21 @@ pub trait ComputePipeline<P: Platform>: Handle {
     }
     /// No Metal counterpart: the key of the pipeline a dispatch of the state runs
     /// ([`Platform::DispatchVariant`]), for the arguments [`prepare_dispatch`](Self::prepare_dispatch)
-    /// takes: dispatches of equal keys, of this state or another of the device's, run one
-    /// pipeline, so a caller that makes ahead once for each key it has not met makes each
-    /// pipeline once. `None` where [`prepare_dispatch`](Self::prepare_dispatch) makes nothing
-    /// (the dispatch would refuse its arguments or record nothing), whatever was made before.
+    /// takes, and whether that pipeline is made: dispatches of equal keys, of this state or
+    /// another of the device's, run one pipeline, so a caller that makes ahead once for each key
+    /// it has not met makes each pipeline once, and none whose pipeline is made. `None` where
+    /// [`prepare_dispatch`](Self::prepare_dispatch) makes nothing (the dispatch would refuse its
+    /// arguments or record nothing), whatever was made before.
     ///
-    /// It makes nothing, says nothing of whether the pipeline is made, and changes nothing the
+    /// The made flag is true only for a pipeline made: it may be false for one whose make ends
+    /// after the read, never true for one not made. It makes nothing, and changes nothing the
     /// guest or the dispatch observes. The default is `None`, as its make ahead makes nothing.
     fn dispatch_variant(
         &self,
         _dispatch: super::compute::Dispatch,
         _threads_per_threadgroup: MtlSize,
         _threadgroup_memory_lengths: &[(u64, u64)],
-    ) -> Option<P::DispatchVariant> {
+    ) -> Option<(P::DispatchVariant, bool)> {
         None
     }
 }

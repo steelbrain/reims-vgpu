@@ -717,13 +717,15 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
 
     /// The world's key of the dispatch
     /// ([`World::key_dispatches`](super::super::objects::World::key_dispatches)): by default one
-    /// of the state and the dispatch's own. Not logged, as its make ahead is not.
+    /// of the state and the dispatch's own, made where the test said so
+    /// ([`World::variants_made`](super::super::objects::World::variants_made)). Not logged, as
+    /// its make ahead is not.
     fn dispatch_variant(
         &self,
         dispatch: Dispatch,
         threads: MtlSize,
         lengths: &[(u64, u64)],
-    ) -> Option<FakeVariant> {
+    ) -> Option<(FakeVariant, bool)> {
         self.world()
             .dispatch_variant(prepared(self, dispatch, threads, lengths))
     }

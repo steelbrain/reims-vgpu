@@ -44,7 +44,12 @@
 //!   `graphics::decode::prepass`). It lowers nothing. A dispatch that needs what such a call is
 //!   making waits for that call alone, and gets every result and error of its own. The pre-pass
 //!   makes each pipeline once by rt's key of it (`dispatch_variant`), of the compiled content:
-//!   the states of one content share its `VkPipeline`s, and answer one key for one dispatch.
+//!   the states of one content share its `VkPipeline`s, and answer one key for one dispatch. rt
+//!   answers with the key whether its `VkPipeline` is made, so the pre-pass hands none made at
+//!   the state's make (rt makes a tiling kernel's tiles, an image-only kernel's square
+//!   workgroups, and an observing kernel's whole and ragged grids at its
+//!   `requiredThreadsPerThreadgroup`, or at `[N, 1, 1]` for the bound `N` of threads its state
+//!   declares) or by an earlier make.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -562,16 +567,17 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         }
     }
 
-    /// rt's key (`dispatch_variant`) of the `VkPipeline` the dispatch runs: of the compiled
-    /// content, so the states of one content answer one key for one dispatch. `None` where rt
-    /// would make nothing for it, and for a value past rt's 32 bits, as
+    /// rt's key (`dispatch_variant`) of the `VkPipeline` the dispatch runs, and whether rt made
+    /// it: of the compiled content, so the states of one content answer one key for one
+    /// dispatch. rt reads made from the kernel's variants, false for a make that ends after the
+    /// read. `None` where rt would make nothing for it, and for a value past rt's 32 bits, as
     /// [`prepare_dispatch`](Self::prepare_dispatch) makes nothing there.
     fn dispatch_variant(
         &self,
         dispatch: Dispatch,
         threads: MtlSize,
         lengths: &[(u64, u64)],
-    ) -> Option<rt::DispatchVariant> {
+    ) -> Option<(rt::DispatchVariant, bool)> {
         let args = RtDispatch::of(dispatch, threads, lengths)?;
         self.rt
             .dispatch_variant(args.dispatch, args.threads, &args.lengths)
@@ -894,7 +900,8 @@ mod tests {
     /// one kernel, and for grids that differ only in how many whole threadgroups they hold;
     /// another for another threadgroup size of a kernel that observes its threadgroups, or for
     /// another kernel; none where rt would make nothing (a threadgroup size past the state's
-    /// most, a grid of no threadgroups) and for a value past rt's 32 bits
+    /// most, a grid of no threadgroups) and for a value past rt's 32 bits. A key is made once
+    /// its pipeline is made ahead, for every state of its kernel, and not before
     #[test]
     fn dispatch_variants_on_vulkan() {
         let platform = RtPlatform::new();
@@ -910,11 +917,15 @@ mod tests {
             let made = device.new_compute_pipeline_state_for_function(Some(f));
             made.expect("a compute state").expect("a compute state")
         };
-        // The key of `state`'s dispatch of `groups` threadgroups of `threads` threads, with
-        // the threadgroup memory `lengths`.
+        // The key and the made flag of `state`'s dispatch of `groups` threadgroups of `threads`
+        // threads, with the threadgroup memory `lengths`.
+        let variant =
+            |state: &RtObj<RtComputePipeline>, groups, threads, lengths: &[(u64, u64)]| {
+                let grid = Dispatch::Threadgroups(MtlSize::new(groups, 1, 1));
+                state.dispatch_variant(grid, MtlSize::new(threads, 1, 1), lengths)
+            };
         let key = |state: &RtObj<RtComputePipeline>, groups, threads, lengths: &[(u64, u64)]| {
-            let grid = Dispatch::Threadgroups(MtlSize::new(groups, 1, 1));
-            state.dispatch_variant(grid, MtlSize::new(threads, 1, 1), lengths)
+            variant(state, groups, threads, lengths).map(|(key, _)| key)
         };
 
         let tgstatic = function(TGSTATIC, "tg_static");
@@ -925,6 +936,13 @@ mod tests {
             "no key of a dispatch rt makes a pipeline for"
         );
         assert_eq!(key(&second, 2, 32, &[]), made);
+        // `tg_static` declares no bound of threads: its state makes no `[32, 1, 1]` pipeline,
+        // and a make ahead of the dispatch makes the key's, for both states.
+        assert_eq!(variant(&first, 2, 32, &[]), made.map(|key| (key, false)));
+        let grid = Dispatch::Threadgroups(MtlSize::new(2, 1, 1));
+        first.prepare_dispatch(grid, MtlSize::new(32, 1, 1), &[]);
+        assert_eq!(variant(&first, 2, 32, &[]), made.map(|key| (key, true)));
+        assert_eq!(variant(&second, 4, 32, &[]), made.map(|key| (key, true)));
         assert_eq!(key(&first, 4, 32, &[]), made);
         let wider = key(&first, 2, 64, &[]);
         assert!(wider.is_some(), "no key of a wider threadgroup");
