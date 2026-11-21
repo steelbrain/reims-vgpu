@@ -2221,8 +2221,10 @@ mod tests {
     /// `MTLTextureTypeTextureBuffer`), which rt makes only over a buffer, lies over a buffer of the
     /// platform's own ([`make_texture_buffer`]) of the descriptor's storage mode, Shared and
     /// Private, its bytes the row rounded up to rt's texture-buffer alignment, which the texture
-    /// holds; none is rt's own refusal (`rt-refused-ours`). A format rt makes no texture buffer
-    /// of is nil, counted, and not under that code.
+    /// holds and lies over whole (one row, `bytesPerRow` long: on KosmicKrisp 1001 RGBA8 texels
+    /// lie over 4016 bytes, m3-max-64400; where rt answers 4, as on RADV, ANV and NVIDIA, 4004);
+    /// none is rt's own refusal (`rt-refused-ours`). A format rt makes no texture buffer of is
+    /// nil, counted, and not under that code.
     #[test]
     fn the_device_s_texture_buffer_lies_over_a_buffer_of_its_own_on_vulkan() {
         use crate::core::platform::device::GpuDevice as _;
@@ -2250,6 +2252,7 @@ mod tests {
             let made = device.new_texture(OnFault::Return, &platform.texture_descriptor(&desc));
             made.expect("never a raise")
         };
+        let row = 4004_u64.next_multiple_of(alignment);
         for storage in [0, STORAGE_PRIVATE] {
             let texture = make(70, storage).expect("a texture buffer");
             let answers = (
@@ -2259,11 +2262,11 @@ mod tests {
             );
             assert_eq!(answers, (TYPE_TEXTURE_BUFFER, 1001, storage >> 4));
             let held = texture.held.get().expect("the buffer it lies over");
-            assert_eq!(held.byte_length(), 4004_u64.next_multiple_of(alignment));
+            assert_eq!(held.byte_length(), row);
             assert_eq!(held.resource_options() & STORAGE_BITS, storage);
             let (over, bytes) = texture.over().expect("the bytes it lies over");
             assert!(std::ptr::eq(over.as_ptr(), &**held));
-            assert_eq!(bytes.end, 4004);
+            assert_eq!(*bytes, 0..row);
         }
         // BC1, compressed: rt makes no texture buffer of it, counted under its format's code.
         let bc1 = "rt-refused-texture-format-130";
