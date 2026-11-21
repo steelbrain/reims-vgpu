@@ -1696,11 +1696,10 @@ mod tests {
         video_shaped_made().0
     }
 
-    /// [`video_shaped`], and the images its decoder makes ([`take_shapes`]).
+    /// [`nv12_planes`] as a `SURFACE_PAGES` lays them out.
     #[cfg(unix)]
-    fn video_shaped_made() -> (Rig, Made) {
+    fn nv12_layout() -> reims_vgpu_graphics::wire::RgfxSurfacePagesLayout {
         use reims_vgpu_graphics::wire::{RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout};
-        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
         let mut layout = RgfxSurfacePagesLayout {
             plane_count: 2,
             ..Default::default()
@@ -1713,6 +1712,14 @@ mod tests {
                 rows: plane.rows,
             };
         }
+        layout
+    }
+
+    /// [`video_shaped`], and the images its decoder makes ([`take_shapes`]).
+    #[cfg(unix)]
+    fn video_shaped_made() -> (Rig, Made) {
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+        let layout = nv12_layout();
         let mut r = rig(16);
         let page = r.page;
         let made = take_shapes(&r);
@@ -1735,12 +1742,35 @@ mod tests {
         (r, made)
     }
 
-    /// Texture `obj_id` over buffer 10 that shows plane `plane` of [`nv12_planes`] whole, as a
-    /// decode's luma (`R8Unorm`) or chroma (`RG8Unorm`) texture: the image of its shape. The
-    /// rig's device describes every pixel format with the plane's texel bytes from then on,
-    /// where the fake's own answer is four.
+    /// Another cache made for the host's video on [`video_shaped`]'s rig, of the same layout in
+    /// pages 5 to 8, at `block`: buffer `buffer` is the cache.
+    #[cfg(unix)]
+    fn other_video_cache(r: &mut Rig, block: u64, buffer: u64) {
+        let page = r.page;
+        assert_eq!(
+            r.pages_asking(block, &[(5, 4)], 4 * page, Some(nv12_layout())),
+            RGFX_STATUS_CACHE
+        );
+        assert_eq!(
+            r.pages_cached(block, &[(5, 4)], 4 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.buffer(buffer, block, 4 * page), Ok(()));
+    }
+
+    /// Texture `obj_id` over buffer 10 that shows plane `plane` of [`nv12_planes`] whole
+    /// ([`plane_texture_over`]).
     #[cfg(unix)]
     fn plane_texture(r: &mut Rig, obj_id: u64, plane: u32) -> u64 {
+        plane_texture_over(r, obj_id, 10, plane)
+    }
+
+    /// Texture `obj_id` over buffer `buffer` that shows plane `plane` of [`nv12_planes`] whole,
+    /// as a decode's luma (`R8Unorm`) or chroma (`RG8Unorm`) texture: the image of its shape.
+    /// The rig's device describes every pixel format with the plane's texel bytes from then on,
+    /// where the fake's own answer is four.
+    #[cfg(unix)]
+    fn plane_texture_over(r: &mut Rig, obj_id: u64, buffer: u64, plane: u32) -> u64 {
         use reims_vgpu_graphics::wire::RgfxTextureFromIOSurface;
         use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
         use zerocopy::{FromBytes as _, IntoBytes as _};
@@ -1759,7 +1789,7 @@ mod tests {
         let width = laid.row_bytes / texel;
         let format = [10, 30][plane as usize];
         let size = (width as u32, laid.rows as u32);
-        let bytes = surface_texture_as(obj_id, 10, format, size, (1, 0));
+        let bytes = surface_texture_as(obj_id, buffer, format, size, (1, 0));
         let mut m = RgfxTextureFromIOSurface::read_from_bytes(&bytes).unwrap();
         m.offset = laid.offset;
         m.bytes_per_row = laid.bytes_per_row;
@@ -1917,6 +1947,51 @@ mod tests {
         assert_ne!(chroma, luma);
         assert_eq!(made.lock().len(), 2, "chroma's own image");
         assert_eq!(r.dec.caches().counts().shapes.surfaces_declined, 1);
+    }
+
+    /// A video cache whose surface would be made of a description the platform made in its copy
+    /// form before (`surface_cache::exported`) asks for none: declined unmade, counted, its
+    /// textures' shapes made as a declined cache's are, of the platform's own images, and a
+    /// decode into its planes given none
+    #[cfg(unix)]
+    #[test]
+    fn a_video_cache_asks_no_surface_of_a_description_made_in_the_copy_form() {
+        use reims_vgpu_vulkan::core::testkit::impls::device::EXPORTED_SURFACE_PLANE;
+        const OTHER: u64 = BLOCK + 0x4000;
+        let (mut r, made) = video_shaped_made();
+        r.p.world().copy_exported_surfaces(true);
+        let surface_planes = |calls: &[Call]| {
+            (calls.iter())
+                .filter(|c| c.sel == EXPORTED_SURFACE_PLANE)
+                .count()
+        };
+        let mark = r.p.call_log().mark();
+        plane_texture(&mut r, 21, 0);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(surface_planes(&calls), 2, "the first cache's surface was made");
+        other_video_cache(&mut r, OTHER, 11);
+
+        let mark = r.p.call_log().mark();
+        let luma = plane_texture_over(&mut r, 23, 11, 0);
+        let chroma = plane_texture_over(&mut r, 24, 11, 1);
+        assert_eq!(surface_planes(&r.p.call_log().since(mark)), 0, "none asked");
+        assert_ne!(chroma, luma);
+        assert_eq!(made.lock().len(), 3, "the shapes' own images");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (
+                counts.surfaces,
+                counts.surfaces_declined,
+                counts.surfaces_unasked,
+                counts.surfaces_refused
+            ),
+            (0, 1, 1, 0),
+            "asked once a cache"
+        );
+        assert!(
+            r.dec.surface_caches.surface_targets(OTHER).is_none(),
+            "a decode lands in the cache's buffer"
+        );
     }
 
     /// A picture smaller than its planes leaves the rest of them holding the cache's zeros, as a

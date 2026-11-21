@@ -2064,6 +2064,10 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// Whether laid-out caches of two planes are made with their memory a dma-buf, for the host's
     /// video to decode into ([`Caches::set_dma_buf`]).
     dma_buf: bool,
+    /// The descriptions of the video caches' surfaces the platform made in its copy form, which
+    /// no later cache asks for (`exported`).
+    #[cfg(unix)]
+    copy_forms: exported::CopyForms,
     /// The draws that write the host's video's pictures into Direct3D 11 textures, where laid-out
     /// caches of two planes take their planes over such textures ([`Caches::set_drawn`]).
     #[cfg(windows)]
@@ -2321,6 +2325,8 @@ impl<P: Platform> SurfaceCaches<P> {
             answering: HashSet::new(),
             copy_gpu: Arc::default(),
             dma_buf: false,
+            #[cfg(unix)]
+            copy_forms: exported::CopyForms::default(),
             #[cfg(windows)]
             drawn: None,
             recoveries: 0,

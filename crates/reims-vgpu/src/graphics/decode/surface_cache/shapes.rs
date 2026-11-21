@@ -432,10 +432,12 @@ pub(crate) struct ShapeCounts {
     /// (`ShapeTable::take_plane_fills`, on Windows).
     pub(crate) drawn_fills_taken: u64,
     /// Surfaces made for video caches' planes, those the platform made none of, those it made in
-    /// its copy form, declined, and the most caches that held one at once (`super::exported`).
+    /// its copy form, declined, those declined unmade as it made their description so before,
+    /// and the most caches that held one at once (`super::exported`).
     pub(crate) surfaces: u64,
     pub(crate) surfaces_refused: u64,
     pub(crate) surfaces_declined: u64,
+    pub(crate) surfaces_unasked: u64,
     pub(crate) surfaces_live_most: u64,
     /// Shapes made over a plane that held a shape of the other kind, plain or storage (the module
     /// doc, "A storage shape serves every texture of its extent"); and of rule 1's copies, those
