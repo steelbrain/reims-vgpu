@@ -1,6 +1,7 @@
 // The display's present shaders, compiled into the Vulkan platform's shaders.metallib (build.rs),
 // which gpu/shaders.rs loads once per device. Core's display/pipeline.rs and reims-vgpu's
-// graphics/sink.rs make their pipelines and bind their arguments.
+// graphics/sink.rs make their pipelines and bind their arguments; reims-vgpu's
+// graphics/vaapi/fill.rs makes the video encoder's input fill's.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -295,4 +296,61 @@ kernel void displayMirrorTileList(device const uint *now [[buffer(0)]],
     uint across = (frame.row_words + frame.tile_words - 1) / frame.tile_words;
     uint at = atomic_fetch_add_explicit(&list[0], 1u, memory_order_relaxed);
     atomic_store_explicit(&list[1 + at], tile.y * across + tile.x, memory_order_relaxed);
+}
+
+// ---- The host's video encoder's input ----
+
+// One plane of a frame that videoEncodeFill writes into a video encoder's input (reims-vgpu's
+// graphics/vaapi/fill.rs, `FillPlane`, 32 bytes): where the frame's plane lies in the source
+// buffer as bound, its first byte and the bytes from one row to the next; the bytes of a row of the
+// frame's samples, its rows, and the bytes a row's margin repeats (a sample, or a Cb/Cr pair);
+// and the input's words a row, its rows and its words from one row to the next.
+struct VideoFillPlane {
+    uint first;
+    uint source_pitch;
+    uint row_bytes;
+    uint rows;
+    uint unit;
+    uint coded_words;
+    uint coded_rows;
+    uint pitch_words;
+};
+
+// The source's byte `at`, of the words the buffer holds from its bound offset (little-endian).
+static uint video_fill_byte(device const uint *source, uint at) {
+    return (source[at >> 2] >> ((at & 3) * 8)) & 0xffu;
+}
+
+// Word `at.x` of row `at.y` of a plane of the encoder's input: the frame's row there (its last
+// for a row past them), and past the row's bytes its last `unit` bytes repeated, as the VA crate's
+// upload fills the margin to the coded size. 32-bit loads and stores alone; a word within the
+// row's bytes is one load where it starts on a word, two where it does not.
+kernel void videoEncodeFill(device const uint *source [[buffer(0)]],
+                            device uint *input [[buffer(1)]],
+                            constant VideoFillPlane &plane [[buffer(2)]],
+                            uint2 at [[thread_position_in_grid]]) {
+    if (at.x >= plane.coded_words || at.y >= plane.coded_rows) {
+        return;
+    }
+    uint row = plane.first + min(at.y, plane.rows - 1) * plane.source_pitch;
+    uint x = at.x * 4;
+    uint word;
+    if (x + 4 <= plane.row_bytes) {
+        uint from = row + x;
+        uint shift = (from & 3) * 8;
+        word = source[from >> 2];
+        if (shift != 0) {
+            word = (word >> shift) | (source[(from >> 2) + 1] << (32 - shift));
+        }
+    } else {
+        uint last = plane.row_bytes - plane.unit;
+        word = 0;
+        for (uint i = 0; i < 4; i++) {
+            uint byte_x = x + i;
+            uint from = byte_x < plane.row_bytes ? byte_x
+                                                 : last + (byte_x - plane.row_bytes) % plane.unit;
+            word |= video_fill_byte(source, row + from) << (i * 8);
+        }
+    }
+    input[at.y * plane.pitch_words + at.x] = word;
 }
