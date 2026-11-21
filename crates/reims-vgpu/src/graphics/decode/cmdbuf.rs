@@ -8742,23 +8742,21 @@ mod tests {
         [words[0], words[1], words[2], words[3]]
     }
 
-    /// rt builds `setVisibilityResultMode:offset:` of `Disabled` alone: the sub-encoders' counting
-    /// mode at 16 is rt's gap, counted once under rt's code (`rt-refused-gap`), their two
-    /// `Disabled` modes are built, and their draws write nothing into the results, every word
-    /// keeping its bytes. (Every Mac writes the square's 4096 samples at 16, and nothing at 0 and
-    /// 24 under `Disabled`, which [`render::visibility_offset`] keeps the M3 Max from writing 0
-    /// at.)
+    /// rt builds the sub-encoders' three `setVisibilityResultMode:offset:`: the counting mode at
+    /// 16 writes the square's 4096 samples there, as every Mac does, and the two `Disabled` modes
+    /// write nothing at 0 and 24, those words keeping their bytes ([`render::visibility_offset`]
+    /// keeps the M3 Max from writing 0 at either). Nothing is refused or left unbuilt.
     #[test]
-    fn on_vulkan_rt_s_sub_encoders_write_no_count_under_the_counting_mode_it_refuses() {
+    fn on_vulkan_rt_s_sub_encoders_write_the_count_every_mac_writes() {
         let fill = u64::from_ne_bytes([0xee; 8]);
         let codes = ["rt-refused-gap", "rt-unbuilt-render-command"];
         let before = codes.map(crate::platform::counted);
         assert_eq!(
             sub_encoders_after_a_count::<reims_vgpu_vulkan::RtPlatform>(),
-            [fill, fill, fill, fill]
+            [fill, fill, 4096, fill]
         );
         let after = codes.map(crate::platform::counted);
-        assert_eq!([after[0] - before[0], after[1] - before[1]], [1, 0]);
+        assert_eq!([after[0] - before[0], after[1] - before[1]], [0, 0]);
     }
 
     /// A `BUFFER_CREATE` of `length` bytes, id `obj_id`, at `gpu_address` (0: where the host
