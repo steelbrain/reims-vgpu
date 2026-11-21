@@ -113,10 +113,22 @@ typedef uint32_t (*RgfxForwardBatchPublish)(void *context, const void *messages,
 
 class RgfxRingWriter;
 
+/// What RgfxRingWriter::flushPublishing() did with what postLater() held.
+enum class RgfxHeldPublish {
+	/// The route posted every held message and published the queue's ring after them.
+	kPublished,
+	/// None was held, or the route posted every held message and published nothing, or it refused
+	/// only messages of the type the caller lets stay held: the queue's writer publishes.
+	kLeft,
+	/// The route refused a held message of another type, which stays held, first: the queue's ring
+	/// is not published.
+	kRefused,
+};
+
 /// A command buffer's post that hands its publish to the control ring's held messages, so a commit
 /// behind them makes one kext call (RgfxRingWriter::tryPost): the control ring's writer and the
-/// buffer's queue. `refused` is set where the post left the buffer off its ring because a held
-/// message other than a destroy was refused, which the buffer may name (as
+/// buffer's queue. `refused` is set where the post left the buffer off its ring because the route
+/// refused a held message other than a destroy, which the buffer may name (as
 /// RgfxSerializer::postHeldCreates fails it).
 struct RgfxPublishVia {
 	RgfxRingWriter *control = nullptr;
@@ -185,9 +197,11 @@ public:
 	/// moves, as the seqno is stamped. A forwarding writer writes no stamp.
 	/// With `via`, the publish goes to `via->control`'s held messages (flushPublishing), which
 	/// the kext posts first and then publishes this ring as this writer would; where none is held
-	/// or the kext did not publish, this writer publishes as it does without `via`, but where a
-	/// held message other than a destroy is still held then: the message is taken off the ring
-	/// again, unpublished, its seqno the next post's, `via->refused` set and false returned.
+	/// or the kext did not publish, this writer publishes as it does without `via`, but where the
+	/// kext refused a held message other than a destroy: the message is taken off the ring again,
+	/// unpublished, its seqno the next post's, `via->refused` set and false returned. A message
+	/// another thread holds once flushPublishing has looked is posted later and refuses nothing: the
+	/// buffer cannot name it, as it was made after the commit began.
 	bool tryPost(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno,
 	             uint32_t *out_status = nullptr,
 	             const std::function<void(uint64_t)> &beforePublish = {}, bool answered = false,
@@ -232,6 +246,11 @@ public:
 	/// where none is.
 	bool flushLater();
 
+	/// Posts what postLater() holds, as flushLater() does: whether the route refused a held message
+	/// and one of a type other than `type` stays held, both told in the post's own hold of the held
+	/// messages, so a message another thread holds once the post is made is not counted.
+	bool flushLeavesBut(uint32_t type);
+
 	/// Whether postLater() holds a message of a type other than `type`.
 	bool holdsBut(uint32_t type);
 
@@ -243,11 +262,13 @@ public:
 	/// Whether the route takes a queue's publish with the held messages (setBatchPublish).
 	bool publishesQueues() const;
 
-	/// Posts what postLater() holds, as flushLater() does, with `publish` in its last call: true
-	/// where the route posted every held message and published the queue's ring after them. False
-	/// where none was held (nothing posted), where the route refused a held message (the rest stay
-	/// held, first) or published nothing: the queue's writer then publishes, or not.
-	bool flushPublishing(const RgfxQueuePublish &publish);
+	/// Posts what postLater() holds, as flushLater() does, with `publish` in its last call:
+	/// kPublished where the route posted every held message and published the queue's ring after
+	/// them; kRefused where it refused a held message (the rest stay held, first) and one of a type
+	/// other than `but` stays held; else kLeft, the queue's writer then publishing. Told in the
+	/// post's own hold of the held messages, so a message another thread holds once the post is
+	/// made is not counted.
+	RgfxHeldPublish flushPublishing(const RgfxQueuePublish &publish, uint32_t but);
 
 	/// Whether the route keeps answers for later (setDeferred), so a known pipeline create need
 	/// not wait.

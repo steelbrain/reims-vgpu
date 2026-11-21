@@ -845,7 +845,8 @@ public:
 	/// buffer's commit does before the buffer goes on its ring, which the host reads after the
 	/// control ring's messages posted before it: whether nothing but destroys stays held, so no
 	/// create the buffer may name, nor a Managed buffer's range it may read. Destroys left held
-	/// wait for a later post, as refused ones do.
+	/// wait for a later post, as refused ones do. What another thread holds once the post is made
+	/// is not counted (RgfxRingWriter::flushLeavesBut): the buffer cannot name it.
 	bool postHeldCreates();
 
 	/// The control ring's writer, where a command buffer's commit may hand its publish to the held

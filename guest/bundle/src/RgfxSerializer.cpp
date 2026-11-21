@@ -1792,7 +1792,7 @@ bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after, bool
 
 bool RgfxSerializer::postHeldCreates()
 {
-	return m_control.flushLater() || !m_control.holdsBut(RGFX_CMD_OBJECT_DESTROY);
+	return !m_control.flushLeavesBut(RGFX_CMD_OBJECT_DESTROY);
 }
 
 bool RgfxSerializer::postWaitingDestroys()

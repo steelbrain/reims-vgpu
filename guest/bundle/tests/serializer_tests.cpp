@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -3108,6 +3109,9 @@ struct KextLog {
 	std::vector<Call> calls;
 	uint32_t batchTakes = UINT32_MAX;
 	uint64_t nextSeqno = 1;
+	// Run once, at the next batch call, before it takes anything: the writer's held messages are
+	// locked for the call then.
+	std::function<void()> once;
 
 	static RgfxObjId objOf(const uint8_t *m)
 	{
@@ -3144,6 +3148,8 @@ bool kextSubmit(void *context, const void *message, uint32_t size, uint64_t *out
 uint32_t kextSubmitBatch(void *context, const void *messages, uint32_t bytes)
 {
 	KextLog *log = static_cast<KextLog *>(context);
+	if (std::function<void()> once = std::exchange(log->once, nullptr))
+		once();
 	std::lock_guard<std::mutex> hold(log->lock);
 	const uint8_t *m = static_cast<const uint8_t *>(messages);
 	KextLog::Call call = {true, {}, {}};
@@ -3511,6 +3517,49 @@ void test_held_creates()
 	      !plain.calls[2].batch && !plain.calls[3].batch);
 	CHECK(plain.calls[3].types == std::vector<uint32_t>({RGFX_CMD_BUFFER_ESCAPED}));
 	CHECK(pser.postHeldCreates());
+}
+
+// A commit's postHeldCreates() counts only what the route refused of the held it posted: a
+// texture another thread makes while the route's call refuses a held destroy, its create held
+// once the call is done, leaves the answer true, as a buffer committed then cannot name it. The
+// create stays held behind the destroy, counts for the commits after it, and goes with the
+// destroy at the next post the route takes.
+void test_held_since_the_post_is_not_counted()
+{
+	constexpr uint64_t kNever = 600ull * 1000000000;
+	KextLog log;
+	RgfxRingWriter writer(&kextSubmit, &log, 4096);
+	writer.setBatch(&kextSubmitBatch, 4096, kNever);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxTextureDescriptor desc = {};
+	desc.texture_type = 2;
+	desc.pixel_format = 70;
+	desc.width = 4;
+	desc.height = 4;
+	desc.depth = 1;
+	desc.mipmap_level_count = 1;
+	desc.sample_count = 1;
+	desc.array_length = 1;
+
+	CHECK(ser.destroy(0x101));
+	log.batchTakes = 0;
+	RgfxCreated made = {};
+	std::thread other;
+	log.once = [&] {
+		// The other thread's create waits for the held messages, which the call has locked.
+		other = std::thread([&] { made = ser.createTexture(desc); });
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	};
+	CHECK(ser.postHeldCreates());
+	other.join();
+	CHECK(made.posted && made.obj_id != 0 && made.seqno == 0);
+	CHECK(log.calls.empty());
+	CHECK(writer.holdsBut(RGFX_CMD_OBJECT_DESTROY));
+	CHECK(!ser.postHeldCreates());
+	log.batchTakes = UINT32_MAX;
+	CHECK(ser.postHeldCreates());
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x101, made.obj_id}));
 }
 
 // A synthetic .metallib: its header (the bitcode section at 0x60, 16 bytes), a stand-in for the
@@ -5430,6 +5479,7 @@ int main()
 	test_held_destroys();
 	test_held_buffers();
 	test_held_creates();
+	test_held_since_the_post_is_not_counted();
 	test_library_key();
 	test_library_key_pieces();
 	test_library_key_of_file();

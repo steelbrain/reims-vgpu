@@ -14,8 +14,10 @@
 #import <objc/message.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -986,6 +988,12 @@ struct PublishingKext {
 	std::string calls;
 	uint64_t heldAtPublish = 0;
 	uint32_t word = 0;
+	// Posts every held message and publishes nothing, as the kext does for a queue whose ring
+	// header it keeps none of.
+	bool publishNothing = false;
+	// Run once, at the next batch call with a publish, before it posts: the bundle's held messages
+	// are locked for the call then.
+	std::function<void()> once;
 
 	static bool submitOne(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
 	                      uint32_t *out_status)
@@ -1037,6 +1045,8 @@ struct PublishingKext {
 	{
 		PublishingKext *kext = static_cast<PublishingKext *>(context);
 		kext->calls += 'P';
+		if (std::function<void()> once = std::exchange(kext->once, nullptr))
+			once();
 		uint32_t count = 0;
 		for (uint32_t at = 0; at < bytes; count++) {
 			RgfxMsgHeader header;
@@ -1045,7 +1055,7 @@ struct PublishingKext {
 		}
 		const uint32_t posted = kext->post(messages, bytes);
 		*out_published = false;
-		if (posted == count) {
+		if (posted == count && !kext->publishNothing) {
 			kext->heldAtPublish = kext->control->producer();
 			Header h{kext->submit};
 			const uint64_t flags = (publish.answered ? kRgfxPublishAnswered : 0) |
@@ -1235,6 +1245,113 @@ void test_commit_hands_its_publish_to_the_held()
 			CHECK(writer.flushLater());
 			CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_OBJECT_DESTROY);
 		}
+	}
+}
+
+// A create another thread makes while a commit's held messages are in the kext's call with the
+// buffer's publish (kRgfxKextFeatureQueuePublish) is none the buffer names, as it was made after
+// the commit began, and fails nothing: the buffer goes on its ring, published by the bundle where
+// the kext published nothing, and completes; the create, held once the call is done, goes before
+// the next post. The call is where a test can hold a create between the commit's post and its
+// answer; a commit with nothing held makes no call, and its answer is the same
+// (RgfxRingWriter::flushPublishing).
+void test_commit_counts_only_the_held_it_posted()
+{
+	TestRing control(0x8000);
+	RgfxRingWriter direct(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	TestRing submit(0x8000);
+	PublishingKext kext{&direct, &control, &submit, false, {}, 0, 0};
+	kext.publishNothing = true;
+	RgfxRingWriter writer(&PublishingKext::submitOne, &kext, 0x4000);
+	writer.setBatch(&PublishingKext::batch, 4096, 600ull * 1000000000);
+	writer.setBatchPublish(&PublishingKext::batchPublish);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, PublishingKext::kQueueRing,
+	                            &PublishingKext::doorbell, &kext);
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	control.setConsumerIdle(1);
+	submit.setConsumerIdle(RGFX_CONSUMER_ASLEEP);
+	RgfxTextureDescriptor desc = {};
+	desc.texture_type = 2;
+	desc.pixel_format = 70;
+	desc.width = 4;
+	desc.height = 4;
+	desc.depth = 1;
+	desc.mipmap_level_count = 1;
+	desc.sample_count = 1;
+	desc.array_length = 1;
+	@autoreleasepool {
+		RgfxCommandQueue *queue = nil;
+		@autoreleasepool {
+			queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+			                                 submitOffset:PublishingKext::kQueueRing
+			                               completeOffset:0
+			                             completeDataSize:0
+			                                          ids:&ids
+			                                     maxCount:0
+			                                       device:nil
+			                                   serializer:&ser];
+		}
+		CHECK(queue != nil);
+		queue.replyReader = &reader;
+		queue.region = &region;
+		(void)expectQueueCreate(control);
+		MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
+		hd.size = 0x100000;
+		hd.storageMode = MTLStorageModePrivate;
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&ser];
+		CHECK(heap != nil);
+		drainRing(control);
+
+		// A heap-placed buffer, held; while its commit's call posts it, another thread makes a
+		// texture, whose create waits for the held messages the call has locked.
+		id<MTLBuffer> buffer = [heap newBufferWithLength:256 options:MTLResourceStorageModePrivate];
+		CHECK(buffer != nil);
+		RgfxCreated made = {};
+		std::thread other;
+		kext.once = [&] {
+			other = std::thread([&] { made = ser.createTexture(desc); });
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		};
+		kext.calls.clear();
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit fillBuffer:buffer range:NSMakeRange(0, 256) value:0];
+		[blit endEncoding];
+		[cb commit];
+		other.join();
+		CHECK(made.posted && made.obj_id != 0 && made.seqno == 0);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(!control.next(&h, &bytes));
+		// The held in the kext's call, which published nothing, then the bundle's publish and
+		// doorbell.
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER && h.seqno == 1);
+		CHECK(kext.calls == "PD");
+		RgfxCbComplete done = {};
+		done.header.type = RGFX_EVT_CB_COMPLETE;
+		done.header.size = sizeof(done);
+		done.header.seqno = h.seqno;
+		done.cb_obj_id = ((RgfxResource *)cb).rgfxObjId;
+		done.status = RGFX_CB_OK;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		CHECK(cb.error == nil);
+
+		// The texture's create, held, goes before the next post.
+		CHECK(writer.holdsBut(RGFX_CMD_OBJECT_DESTROY));
+		CHECK(ser.postHeldCreates());
+		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_TEXTURE_CREATE);
+		uint64_t obj = 0;
+		std::memcpy(&obj, bytes.data() + sizeof(h), sizeof(obj));
+		CHECK(obj == made.obj_id);
 	}
 }
 
@@ -3541,6 +3658,7 @@ void rgfxProtocolTests()
 	test_inline_bytes_without_region();
 	test_commit_behind_an_untaken_buffer_fails();
 	test_commit_hands_its_publish_to_the_held();
+	test_commit_counts_only_the_held_it_posted();
 	test_doorbell_page_rings_at_its_first_byte();
 	test_render_barriers();
 	test_compute_dispatch_type();

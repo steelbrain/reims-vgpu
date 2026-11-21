@@ -109,7 +109,22 @@ struct RgfxRingLater {
 	// With `publish`, the last call carries it (publishPost), `*published` then whether the route
 	// published. With `lock` held.
 	bool flush(const RgfxQueuePublish *publish = nullptr, bool *published = nullptr);
+
+	// Whether a message of a type other than `type` is held. With `lock` held.
+	bool holdsBut(uint32_t type) const;
 };
+
+bool RgfxRingLater::holdsBut(uint32_t type) const
+{
+	for (size_t at = 0; at < held.size();) {
+		RgfxMsgHeader header;
+		std::memcpy(&header, held.data() + at, sizeof(header));
+		if (header.type != type)
+			return true;
+		at += header.size;
+	}
+	return false;
+}
 
 bool RgfxRingLater::flush(const RgfxQueuePublish *publish, bool *published)
 {
@@ -295,15 +310,26 @@ bool RgfxRingWriter::publishesQueues() const
 	return m_later != nullptr && m_later->publishPost != nullptr;
 }
 
-bool RgfxRingWriter::flushPublishing(const RgfxQueuePublish &publish)
+bool RgfxRingWriter::flushLeavesBut(uint32_t type)
+{
+	RgfxRingLater *later = m_later.get();
+	if (later == nullptr || !later->any.load(std::memory_order_acquire))
+		return false;
+	std::lock_guard<std::mutex> hold(later->lock);
+	return !later->flush() && later->holdsBut(type);
+}
+
+RgfxHeldPublish RgfxRingWriter::flushPublishing(const RgfxQueuePublish &publish, uint32_t but)
 {
 	RgfxRingLater *later = m_later.get();
 	if (later == nullptr || later->publishPost == nullptr ||
 	    !later->any.load(std::memory_order_acquire))
-		return false;
+		return RgfxHeldPublish::kLeft;
 	std::lock_guard<std::mutex> hold(later->lock);
 	bool published = false;
-	return later->flush(&publish, &published) && published;
+	if (later->flush(&publish, &published))
+		return published ? RgfxHeldPublish::kPublished : RgfxHeldPublish::kLeft;
+	return later->holdsBut(but) ? RgfxHeldPublish::kRefused : RgfxHeldPublish::kLeft;
 }
 
 bool RgfxRingWriter::holdsBut(uint32_t type)
@@ -312,14 +338,7 @@ bool RgfxRingWriter::holdsBut(uint32_t type)
 	if (later == nullptr || !later->any.load(std::memory_order_acquire))
 		return false;
 	std::lock_guard<std::mutex> hold(later->lock);
-	for (size_t at = 0; at < later->held.size();) {
-		RgfxMsgHeader header;
-		std::memcpy(&header, later->held.data() + at, sizeof(header));
-		if (header.type != type)
-			return true;
-		at += header.size;
-	}
-	return false;
+	return later->holdsBut(type);
 }
 
 bool RgfxRingWriter::tryPostKnown(uint32_t type, const void *message, uint32_t size,
@@ -530,18 +549,20 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 		// call where two were made (the held, then the doorbell).
 		const RgfxQueuePublish publish = {via->queue, m_produced, answered,
 		                                  answered && m_doorbellAsks};
-		if (via->control->flushPublishing(publish)) {
+		switch (via->control->flushPublishing(publish, RGFX_CMD_OBJECT_DESTROY)) {
+		case RgfxHeldPublish::kPublished:
 			if (out_seqno)
 				*out_seqno = seqno;
 			return true;
-		}
-		// A held message the buffer may name never went (RgfxSerializer::postHeldCreates): the
-		// buffer comes off the ring unseen, and fails.
-		if (via->control->holdsBut(RGFX_CMD_OBJECT_DESTROY)) {
+		case RgfxHeldPublish::kRefused:
+			// A held message the buffer may name never went (RgfxSerializer::postHeldCreates): the
+			// buffer comes off the ring unseen, and fails.
 			m_produced = producedBefore;
 			m_nextSeqno = seqno;
 			via->refused = true;
 			return false;
+		case RgfxHeldPublish::kLeft:
+			break;
 		}
 	}
 	store64(m_header + kProducer, m_produced);
