@@ -1241,12 +1241,18 @@ mod tests {
         drop(ctx.insert(5, Entry::of(fence(&p)), None));
         let view = View::take(Arc::clone(&ctx));
         assert!(view.get(2).is_some());
-        assert!(ctx.remove(2).is_some_and(|(_, now)| now.is_none()), "kept for the view");
+        assert!(
+            ctx.remove(2).is_some_and(|(_, now)| now.is_none()),
+            "kept for the view"
+        );
         let counts = ctx.counts(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!((counts.textures, counts.textures_gone), (1, 1));
         assert_eq!((counts.buffers, counts.buffers_gone), (2, 0));
         assert_eq!((counts.over_cache, counts.over_view), (1, 1));
-        assert_eq!((counts.shape_views, counts.shown_views, counts.heaps), (0, 0, 0));
+        assert_eq!(
+            (counts.shape_views, counts.shown_views, counts.heaps),
+            (0, 0, 0)
+        );
         drop(view);
         let mut sum = ctx.counts(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(sum.textures_gone, 0, "let go of with the view");

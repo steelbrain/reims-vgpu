@@ -1,7 +1,7 @@
 //! What the host holds for the guest now, in the host's summary of each ten seconds (`super`), so
 //! a boot's reader can tell the platform's textures and buffers a live guest id names from those
 //! the host holds for none, by their holder, as the guest makes and releases its objects. One
-//! part, `kept: NAME VALUE, ...` ([`line`]), each a count as it is now:
+//! part, `kept: NAME VALUE, ...` ([`line()`]), each a count as it is now:
 //!
 //! - **The platform's**: its live textures (each image and each view) and buffers, as the Vulkan
 //!   platform's runtime counts them (`rt_textures`, `rt_buffers`;
@@ -22,6 +22,10 @@
 //!   the ones past the bound, which only the cache's next new shape sweeps
 //!   ([`ShapesLive`]); the caches none of whose shapes a live texture references, with
 //!   the bytes they hold, and those holding shapes past the bound.
+//! - **The caches holding the most**, one by one, in a part of their own, `kept caches: block
+//!   BLOCK held BYTES, ...; ...` ([`largest_line`]): the [`LARGEST`] caches holding the most bytes,
+//!   the most first, each with its block, the bytes it holds, its buffer's, whether it was made
+//!   for the host's video, and its shapes' counts as above.
 //! - **The pages' views**: the surfaces' blocks' views, the pages blocks' and the idle ones the
 //!   views' cache keeps (`decode::surface_pages`).
 //! - **What no id names**: the platform's textures less the guest's (live and gone),
@@ -39,7 +43,8 @@ use std::time::Duration;
 
 use reims_vgpu_vulkan::core::sync::Mutex;
 
-use crate::graphics::decode::{CachesLive, ShapesLive, TableCounts};
+use crate::graphics::decode::surface_cache_largest as LARGEST;
+use crate::graphics::decode::{CacheLive, CachesLive, ShapesLive, TableCounts};
 
 /// How long a read waits for each lock it tries (the map of contexts' and each table's).
 pub(crate) const BOUND: Duration = Duration::from_millis(20);
@@ -80,6 +85,9 @@ impl Kept {
         a.unreferenced += b.unreferenced;
         a.unreferenced_bytes += b.unreferenced_bytes;
         a.past_bound += b.past_bound;
+        for one in b.largest.iter().filter(|one| one.held != 0) {
+            a.offer(*one);
+        }
         self.views.0 += other.views.0;
         self.views.1 += other.views.1;
         self.views.2 += other.views.2;
@@ -96,22 +104,54 @@ pub(crate) fn watch(source: Weak<dyn Source>) {
     }
 }
 
-/// The part of what the decoders watched hold now, with `rt`, the platform's live textures and
-/// buffers where it counts them; `None` where no decoder lives.
-pub(crate) fn take(rt: Option<(u64, u64)>) -> Option<String> {
+/// The parts of what the decoders watched hold now, with `rt`, the platform's live textures and
+/// buffers where it counts them: the counts ([`line()`]) and the caches holding the most
+/// ([`largest_line`]); `None` each where no decoder lives, and the second where no cache does.
+pub(crate) fn take(rt: Option<(u64, u64)>) -> [Option<String>; 2] {
     let sources: Vec<Arc<dyn Source>> = {
         let mut sources = SOURCES.lock();
         sources.retain(|source| source.strong_count() > 0);
         sources.iter().filter_map(Weak::upgrade).collect()
     };
     if sources.is_empty() {
-        return None;
+        return [None, None];
     }
     let mut kept = Kept::default();
     for source in &sources {
         kept.add(&source.kept());
     }
-    Some(line(&kept, rt))
+    [Some(line(&kept, rt)), largest_line(&kept)]
+}
+
+/// The part of the caches holding the most in `kept` (the module doc); `None` where no cache
+/// holds a byte.
+pub(crate) fn largest_line(kept: &Kept) -> Option<String> {
+    let caches: Vec<String> = (kept.caches.largest.iter())
+        .filter(|one| one.held != 0)
+        .map(|one: &CacheLive| {
+            let s = &one.shapes;
+            format!(
+                "block {:#x} held {}, buffer_bytes {}, video {}, shapes {}, shape_bytes {}, \
+                 shapes_referenced {}, shape_references {}, shapes_unreferenced {}, \
+                 shapes_unreferenced_bytes {}, shapes_past_bound {}, shapes_past_bound_bytes {}, \
+                 plane_shapes {}",
+                one.block,
+                one.held,
+                one.buffer_bytes,
+                u8::from(one.video),
+                s.shapes,
+                s.bytes,
+                s.referenced,
+                s.references,
+                s.unreferenced,
+                s.unreferenced_bytes,
+                s.past_bound,
+                s.past_bound_bytes,
+                s.planes,
+            )
+        })
+        .collect();
+    (!caches.is_empty()).then(|| format!("kept caches: {}", caches.join("; ")))
 }
 
 /// The part of `kept`, with `rt` (the module doc).
@@ -201,6 +241,44 @@ mod tests {
         assert!(fewer.contains("host_textures 1, host_textures_other 1,"));
         let off = super::line(&kept, None);
         assert!(off.starts_with("kept: guest_textures 391, "));
+    }
+
+    /// The caches holding the most are kept the most first, at most [`LARGEST`] of them, across
+    /// the decoders too, each named by its block; with none holding a byte the part is left out.
+    #[test]
+    fn the_largest_caches_part_names_each_cache_the_most_first() {
+        let one = |block: u64, held: u64| {
+            let mut one = CacheLive {
+                block,
+                held,
+                ..CacheLive::default()
+            };
+            one.shapes.shapes = block;
+            one
+        };
+        let mut kept = Kept::default();
+        assert_eq!(largest_line(&kept), None);
+        for (block, held) in [(1, 10), (2, 30), (3, 20)] {
+            kept.caches.offer(one(block, held));
+        }
+        let mut other = Kept::default();
+        for block in 4..(4 + LARGEST as u64) {
+            other.caches.offer(one(block, 5));
+        }
+        other.caches.offer(one(20, 40));
+        kept.add(&other);
+        let held: Vec<(u64, u64)> = (kept.caches.largest.iter())
+            .map(|one| (one.block, one.held))
+            .collect();
+        assert_eq!(&held[..4], &[(20, 40), (2, 30), (3, 20), (1, 10)]);
+        assert_eq!(held.len(), LARGEST);
+        assert!(held[4..].iter().all(|&(_, held)| held == 5));
+        let line = largest_line(&kept).unwrap();
+        assert!(line.starts_with(
+            "kept caches: block 0x14 held 40, buffer_bytes 0, video 0, shapes 20, shape_bytes 0, "
+        ));
+        assert!(line.contains("; block 0x2 held 30, "));
+        assert_eq!(line.matches("; block ").count(), LARGEST - 1);
     }
 
     /// The decoders' counts are summed; a decoder gone is no longer read, and with none the part

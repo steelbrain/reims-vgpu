@@ -1759,6 +1759,36 @@ pub(crate) struct CachesLive {
     pub(crate) unreferenced_bytes: u64,
     /// The caches holding unreferenced shapes past the bound ([`shapes::ShapesLive`]).
     pub(crate) past_bound: u64,
+    /// The [`LARGEST`] caches holding the most bytes, one by one, the most first; a slot holding
+    /// no bytes is empty.
+    pub(crate) largest: [CacheLive; LARGEST],
+}
+
+/// How many of the caches holding the most [`CachesLive::largest`] names one by one.
+pub(crate) const LARGEST: usize = 6;
+
+/// One cache's counts, for the caches holding the most ([`CachesLive::largest`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CacheLive {
+    /// The block whose cache it is, the bytes it holds in the budget, its buffer's bytes, and
+    /// whether it was made for the host's video.
+    pub(crate) block: u64,
+    pub(crate) held: u64,
+    pub(crate) buffer_bytes: u64,
+    pub(crate) video: bool,
+    pub(crate) shapes: shapes::ShapesLive,
+}
+
+impl CachesLive {
+    /// Keeps `one` among the caches holding the most ([`CachesLive::largest`]) where it holds more
+    /// than the least of them.
+    pub(crate) fn offer(&mut self, one: CacheLive) {
+        let last = LARGEST - 1;
+        if one.held > self.largest[last].held {
+            self.largest[last] = one;
+            self.largest.sort_by_key(|one| std::cmp::Reverse(one.held));
+        }
+    }
 }
 
 /// What the caches did, for the log ([`SurfaceCaches::counts`]).
@@ -2429,18 +2459,26 @@ impl<P: Platform> SurfaceCaches<P> {
             cache_bytes: self.cache_bytes,
             ..CachesLive::default()
         };
-        for cache in self.by_block.values() {
+        for (&block, cache) in &self.by_block {
             live.buffer_bytes += cache.bytes;
             live.video += u64::from(cache.life.is_some());
             live.view_buffers += u64::from(matches!(cache.pages, Some(CachePages::View(_))));
             live.wide += u64::from(cache.wide.is_some());
             let shapes = cache.shapes.live();
+            let held = cache.held();
             if shapes.shapes != 0 && shapes.referenced == 0 {
                 live.unreferenced += 1;
-                live.unreferenced_bytes += cache.held();
+                live.unreferenced_bytes += held;
             }
             live.past_bound += u64::from(shapes.past_bound != 0);
             live.shapes.add(&shapes);
+            live.offer(CacheLive {
+                block,
+                held,
+                buffer_bytes: cache.bytes,
+                video: cache.life.is_some(),
+                shapes,
+            });
         }
         live
     }

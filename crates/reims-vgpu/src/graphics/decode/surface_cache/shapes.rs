@@ -700,7 +700,7 @@ impl<T> ShapeTable<T> {
         }
         // Past the bound: the unreferenced ones but the [`UNREFERENCED_KEPT`] most recently used,
         // which the next sweep looks at ([`Self::sweep`]).
-        unreferenced.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        unreferenced.sort_unstable_by_key(|&(used, _)| std::cmp::Reverse(used));
         for &(_, bytes) in unreferenced.iter().skip(UNREFERENCED_KEPT) {
             live.past_bound += 1;
             live.past_bound_bytes += bytes;
@@ -1190,16 +1190,26 @@ mod tests {
         assert_eq!(live.shapes, 7);
         assert_eq!((live.referenced, live.references), (1, 2));
         assert_eq!(live.unreferenced, 6);
-        assert_eq!(live.unreferenced_bytes, (11..17).map(|w| key(w, 4).bytes()).sum());
+        assert_eq!(
+            live.unreferenced_bytes,
+            (11..17).map(|w| key(w, 4).bytes()).sum::<u64>()
+        );
         assert_eq!(live.past_bound, 2, "the two least recently used of six");
-        assert_eq!(live.past_bound_bytes, key(11, 4).bytes() + key(12, 4).bytes());
+        assert_eq!(
+            live.past_bound_bytes,
+            key(11, 4).bytes() + key(12, 4).bytes()
+        );
         assert_eq!(live.bytes, table.bytes());
         drop(table.sweep(&mut ShapeCounts::default()));
         let live = table.live();
         assert_eq!((live.shapes, live.unreferenced, live.past_bound), (5, 4, 0));
         drop((first, again));
         assert_eq!((table.live().referenced, table.live().unreferenced), (0, 5));
-        assert_eq!(table.live().past_bound, 1, "its last texture gone, a fifth unreferenced");
+        assert_eq!(
+            table.live().past_bound,
+            1,
+            "its last texture gone, a fifth unreferenced"
+        );
         let mut sum = ShapesLive::default();
         sum.add(&table.live());
         sum.add(&table.live());

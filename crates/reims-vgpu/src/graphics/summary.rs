@@ -1,10 +1,10 @@
 //! The host's summary of each ten seconds in its log, for the walks that time a guest's frames.
-//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes six lines of
-//! what the period held. Each line starts with its stamp: the host's wall time (`CLOCK_REALTIME`,
-//! seconds since the Unix epoch to the millisecond) and the trace's clock in nanoseconds
-//! (`reims_vgpu_vulkan::core::trace::now`, rt's host clock, which `cbdone` and the trace's other
-//! events count: `CLOCK_MONOTONIC` on Linux), so a reader joins the lines to its own steps by the
-//! wall time, and to a trace with no conversion on any host:
+//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes up to seven
+//! lines of what the period held. Each line starts with its stamp: the host's wall time
+//! (`CLOCK_REALTIME`, seconds since the Unix epoch to the millisecond) and the trace's clock in
+//! nanoseconds (`reims_vgpu_vulkan::core::trace::now`, rt's host clock, which `cbdone` and the
+//! trace's other events count: `CLOCK_MONOTONIC` on Linux), so a reader joins the lines to its own
+//! steps by the wall time, and to a trace with no conversion on any host:
 //!
 //! - **Presents**: the presents answered, and how many a second. Then the time from each one's
 //!   take to its show, from its show to its answer, and from its take to its answer, at the 50th,
@@ -22,8 +22,8 @@
 //! - **Waits**: our waits of 5 ms or more, by name, each with its count, its time in all and the
 //!   longest (`reims_vgpu_vulkan::core::long_waits`, whose doc names them).
 //! - **Kept**: what the decoders hold for the guest now, by holder, and the platform's textures
-//!   and buffers no guest id names ([`kept`], whose doc says what each counts), where a decoder
-//!   lives.
+//!   and buffers no guest id names; and the IOSurfaces' device caches holding the most, one by
+//!   one ([`kept`], whose doc says what each counts), where a decoder lives.
 //!
 //! - **Asked for by name**: [`start`] turns the summary on, and the long waits', the window's
 //!   times' and the `Managed` ranges' counting, only where `REIMS_VGPU_LOG` names the target
@@ -104,13 +104,16 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
                     since = now;
                     let stamp = stamp(clock.now_wall(), reims_vgpu_vulkan::core::trace::now());
                     let mut presents = std::mem::take(&mut *PRESENTS.lock());
+                    let rt_live = rt_platform::summary::live_textures_and_buffers();
+                    let [kept_part, largest_part] = kept::take(rt_live);
                     let parts = [
                         Some(presents_part(over, &mut presents)),
                         Some(window_times::line(&window_times::take())),
                         rt.take(),
                         Some(managed::line(&managed::take())),
                         Some(waits_part(&long_waits::take())),
-                        kept::take(rt_platform::summary::live_textures_and_buffers()),
+                        kept_part,
+                        largest_part,
                     ];
                     for part in parts.into_iter().flatten() {
                         log::debug!(
