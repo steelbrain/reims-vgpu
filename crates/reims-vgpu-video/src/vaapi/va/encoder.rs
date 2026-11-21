@@ -497,12 +497,14 @@ mod tests {
     }
 
     /// On the driver, for each profile it encodes, 6 frames of a moving 330x202 picture (a
-    /// margin of columns and rows to the coded size) at a constant QP, written by the CPU into an
-    /// input imported over host memory (`import_input`: a memfd made a dma-buf by udmabuf, rows
-    /// 256 bytes apart rounded up, the chroma plane right after the luma's rows), its margin
-    /// filled as an upload fills it, code as the same frames uploaded, byte for byte: two
-    /// encoders of the same settings code them, one from host bytes, one from the import
-    /// (`encode_target`), and every sample of the second is the first's.
+    /// margin of columns and rows to the coded size) at a constant QP with no B pictures, written
+    /// by the CPU into an input imported over host memory (`import_input`: a memfd made a dma-buf
+    /// by udmabuf, rows 256 bytes apart rounded up, the chroma plane right after the luma's rows),
+    /// its margin filled as an upload fills it, code as the same frames uploaded, byte for byte:
+    /// two encoders of the same settings code them, one from host bytes, one from the import
+    /// (`encode_target`), and every sample of the second is the first's. The one import holds
+    /// each frame in turn, so no frame may wait as a B picture past the next one's write
+    /// (`encode_target`'s docs).
     #[test]
     #[ignore = "needs a VA-API GPU: run on the VA-API host"]
     fn a_frame_in_an_imported_input_codes_as_its_upload_byte_for_byte() {
@@ -522,6 +524,7 @@ mod tests {
                 predicted: 28,
                 bidirectional: 30,
             };
+            settings.allow_frame_reordering = false;
             let mut by_upload = VideoEncoder::new(&display, settings.clone())
                 .unwrap_or_else(|e| panic!("{profile:?}: an encoder: {e}"));
             let mut by_import = VideoEncoder::new(&display, settings)
