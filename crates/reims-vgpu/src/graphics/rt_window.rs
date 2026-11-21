@@ -168,7 +168,7 @@ impl Presenter for RtPresenter {
             let frame = match self.swapchain.acquire(drawable) {
                 Acquired::Image(frame) => frame,
                 Acquired::Retry => return Drawn::Retry,
-                // rt parks no device: a take that ends answers Failed, or Lost.
+                // A take that ends answers Failed, or Lost where the device is lost.
                 Acquired::Failed => return Drawn::Ended,
                 Acquired::Lost => return Drawn::Lost,
             };

@@ -10,10 +10,7 @@
 //! while the window is shown, once SDL's window and the layout exist, through a presenter the sink
 //! makes over the window ([`FrameSink::presenter`](crate::FrameSink::presenter)), which makes the
 //! window's Vulkan surface ([`VulkanTarget`]), as `crate::present` says: made at the first draw,
-//! tried again after [`RETRY`] where no image came in time, made again where one ends. Where one
-//! is parked (`crate::present`, "A parked presenter"), the thread lets go of SDL's window, which
-//! the old swapchain holds for good, and asks the UI thread for a new one
-//! (`crate::sdl::shell::park`), over which the next presenter is made once it opens.
+//! tried again after [`RETRY`] where no image came in time, made again where one ends.
 //!
 //! Requests that come while it draws fold into one: it draws the latest frame once more. It
 //! copies the sink out of the window's lock before asking it, and holds no lock of the window's
@@ -181,16 +178,6 @@ impl Surface {
         });
     }
 
-    /// The presenter over SDL's window was parked (the module doc): nothing is drawn into that
-    /// window again, and nothing at all until the UI thread hands over a new one
-    /// ([`Surface::set_target`]), which is drawn at once.
-    fn park_target(&self) {
-        self.update(|s| {
-            s.target = None;
-            s.dirty = true;
-        });
-    }
-
     /// The guest presented a frame: it is drawn.
     pub(crate) fn request_draw(&self) {
         self.update(|s| s.dirty = true);
@@ -266,11 +253,6 @@ fn run(window: &Window) {
             cursor.as_ref(),
         ) {
             retry = Some(work);
-        }
-        if presenting.take_parked() {
-            surface.park_target();
-            let id = window.id();
-            super::ui::post(move || crate::sdl::shell::park(id));
         }
     }
     drop(presenting);
@@ -374,29 +356,6 @@ mod tests {
         assert!(surface.state.lock().take().is_some());
         surface.close();
         assert!(surface.next(None).is_none());
-    }
-
-    /// A window whose presenter was parked is drawn no more, nor is anything else, until the UI
-    /// thread hands over the new window, which is drawn at once
-    #[test]
-    fn a_parked_window_is_drawn_only_in_its_new_window() {
-        let surface = Surface::new();
-        surface.set_target(a_target());
-        surface.set_layout(a_layout());
-        surface.set_visible(true);
-        assert!(surface.state.lock().take().is_some());
-        surface.park_target();
-        assert!(surface.state.lock().take().is_none(), "the parked window");
-        surface.request_draw();
-        assert!(surface.state.lock().take().is_none(), "nor a new frame");
-        let new = Target(std::ptr::dangling_mut());
-        surface.set_target(new);
-        let work = surface
-            .state
-            .lock()
-            .take()
-            .expect("the new window is drawn");
-        assert_eq!(work.target.0, new.0);
     }
 
     /// A draw that had no image in time is not made again while the window is hidden: it is
