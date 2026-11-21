@@ -17,6 +17,13 @@
 //! submit a picture after its first: then it is destroyed, its close
 //! followed on the VCN by that picture. radeonsi's VCN hangs otherwise
 //! ([`super`]'s docs).
+//!
+//! A picture's input ([`Input`]) is a surface of the session's pool, which
+//! an upload wrote or another device wrote through its export, or a surface
+//! imported over the caller's memory ([`super::super::target::Target`]),
+//! which another device wrote: the picture is coded from it as from one of
+//! the pool's, though the context was not made with it. A stalled picture's
+//! imported input is kept with its session, as the GPU may read it still.
 
 use std::sync::Arc;
 
@@ -28,6 +35,7 @@ use super::super::caps::{Config, Context, Entrypoint, Profile};
 use super::super::display::{Display, Error, check};
 use super::super::export::{SurfaceExport, export_for_write};
 use super::super::ffi::{self, encode as enc};
+use super::super::target::Target;
 use super::super::wait::{self, Work};
 use super::params;
 use super::surfaces::{Lent, Pool, UploadMethod, Uploader};
@@ -93,6 +101,31 @@ impl Session {
     }
 }
 
+/// The surface a picture is coded from (module docs).
+pub(crate) enum Input {
+    /// A surface of the session's pool, uploaded into or lent ([`VaAccelerator::lend_input`]).
+    Lent(Lent),
+    /// A surface imported over the caller's memory, written by another device.
+    Imported(Target),
+}
+
+impl Input {
+    fn id(&self) -> ffi::VASurfaceID {
+        match self {
+            Input::Lent(lent) => lent.id(),
+            Input::Imported(target) => target.id(),
+        }
+    }
+
+    /// The imported surface, which a stalled picture's session keeps.
+    fn imported(&self) -> Option<Target> {
+        match self {
+            Input::Lent(_) => None,
+            Input::Imported(target) => Some(target.clone()),
+        }
+    }
+}
+
 /// VA-API's half of the encoder.
 pub(crate) struct VaAccelerator {
     display: Display,
@@ -134,10 +167,10 @@ impl VaAccelerator {
     }
 
     /// Stalls the encoder, the GPU not having finished `what` by its
-    /// deadline, and keeps the session, with the picture's reconstruction,
-    /// until the GPU is done with the picture's coded buffer and the
-    /// display's call thread with what it has.
-    fn stall(&mut self, what: &str, reconstructed: Option<Lent>) {
+    /// deadline, and keeps the session, with the picture's reconstruction and
+    /// its imported input, until the GPU is done with the picture's coded
+    /// buffer and the display's call thread with what it has.
+    fn stall(&mut self, what: &str, reconstructed: Option<Lent>, imported: Option<Target>) {
         self.stalled = Some(what.to_owned());
         if let Some(session) = self.session.take() {
             let works = vec![Work::Buffer(session.coded_buffer), Work::Calls];
@@ -145,9 +178,13 @@ impl VaAccelerator {
                 &self.display,
                 "a stalled encoder's session",
                 works,
-                (reconstructed, session),
+                (reconstructed, imported, session),
             );
         }
+    }
+
+    pub(crate) fn display(&self) -> &Display {
+        &self.display
     }
 
     pub(crate) fn profile(&self) -> Profile {
@@ -227,7 +264,7 @@ impl Drop for VaAccelerator {
 }
 
 impl Accelerator for VaAccelerator {
-    type Input = Lent;
+    type Input = Input;
     type Error = Error;
 
     fn configure(&mut self, stream: &StreamParams<'_>) -> Result<(), Error> {
@@ -315,24 +352,24 @@ impl Accelerator for VaAccelerator {
         Ok(())
     }
 
-    fn upload(&mut self, frame: &InputFrame<'_>) -> Result<Lent, Error> {
+    fn upload(&mut self, frame: &InputFrame<'_>) -> Result<Input, Error> {
         self.unstalled()?;
         let session = self.session.as_mut().ok_or_else(|| {
             Error::Unsupported("uploading before the stream is configured".into())
         })?;
         let surface = session.inputs.get()?;
         match session.uploader.upload(frame, &surface) {
-            Ok(()) => Ok(surface),
+            Ok(()) => Ok(Input::Lent(surface)),
             Err(Error::Stalled(what)) => {
                 drop(surface);
-                self.stall(&what, None);
+                self.stall(&what, None, None);
                 Err(Error::Stalled(what))
             }
             Err(error) => Err(error),
         }
     }
 
-    fn encode(&mut self, input: &Lent, p: &PictureParams<'_>) -> Result<Vec<u8>, Error> {
+    fn encode(&mut self, input: &Input, p: &PictureParams<'_>) -> Result<Vec<u8>, Error> {
         self.unstalled()?;
         let session = self
             .session
@@ -364,7 +401,7 @@ impl Accelerator for VaAccelerator {
                 Ok(coded)
             }
             Err(Error::Stalled(what)) => {
-                self.stall(&what, Some(reconstructed));
+                self.stall(&what, Some(reconstructed), input.imported());
                 Err(Error::Stalled(what))
             }
             Err(error) => Err(error),
@@ -392,7 +429,7 @@ fn code_picture(
     display: &Display,
     session: &Session,
     packed_headers: u32,
-    input: &Lent,
+    input: &Input,
     p: &PictureParams<'_>,
     reconstructed: &Lent,
 ) -> Result<Vec<u8>, Error> {

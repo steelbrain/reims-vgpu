@@ -1110,6 +1110,12 @@ picture: the first sample carries the record it belongs with, and
   surfaces on both nodes. On 1080p H.264 CQP, Derive ran 231.5 fps on Navi
   31 and 191.9 on Phoenix, against 188.4 and 188.8 for PutImage (single
   runs, 2026-10-24).
+- **An imported input** (Unix). Another device's dma-buf, imported on the
+  encoder's display as a linear NV12 or P010 surface of its coded size
+  (`import_input`, through DRM PRIME, as a decode's targets are), takes
+  a frame that device wrote, margin included, and `encode_target` codes
+  it without reading the frame's planes. An import of another shape is
+  refused, and a stalled frame's import is kept until its session ends.
 
 ### API
 
@@ -1130,6 +1136,8 @@ let rest: Vec<Coded<Error>> = encoder.flush();             // more frames may fo
 encoder.configuration();                                   // avcC or hvcC in use
 encoder.set_rate_control(..)?; encoder.set_frame_rate(..)?; encoder.set_key_frame_interval(..);
 encoder_support(&display);                                 // the profiles the driver encodes
+let input = encoder.import_input(fd, size, planes, keep)?; // Unix: a dma-buf of input_shape()
+encoder.encode_target(&input, &frame)?;                    // the frame another device wrote there
 ```
 
 `EncoderSettings` also takes the colour, the range, the sample aspect

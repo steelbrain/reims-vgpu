@@ -34,6 +34,9 @@
 //! - **What it keeps.** A target holds its memory's descriptor and what the caller gives it to
 //!   keep (`Target::import`), until the last of it and its pictures goes; the surface is then
 //!   destroyed (`Display::release`).
+//! - **An encoder's input** is imported the same way (`VideoEncoder::import_input`, of the
+//!   encoder's input shape): another device writes a frame into its memory, its margin to the
+//!   coded size filled, and the encoder codes the picture from it (`VideoEncoder::encode_target`).
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};

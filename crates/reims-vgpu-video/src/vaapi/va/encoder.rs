@@ -23,6 +23,8 @@ mod caps;
 mod params;
 mod surfaces;
 
+#[cfg(unix)]
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 pub use caps::{EncoderCapabilities, Feature, HevcBlockSizes, HevcFeatures};
@@ -32,12 +34,16 @@ use super::caps::{Entrypoint, Profile};
 use super::display::{Display, Error};
 use super::export::SurfaceExport;
 use super::ffi::{self, encode as enc};
+#[cfg(unix)]
+use super::target::TargetPlane;
+use super::target::{Target, TargetFormat, TargetShape};
 use super::wait::{self, Deadline};
 use crate::codec::encode::encoder::{DriverLimits, Encoder};
 use crate::codec::encode::{
-    self, Codec, Coded, EncoderSettings, FrameRate, InputFrame, RateControl, Unsupported, hevc,
+    self, Codec, Coded, EncoderSettings, FrameRate, InputFormat, InputFrame, RateControl,
+    Unsupported, hevc,
 };
-use accelerator::VaAccelerator;
+use accelerator::{Input, VaAccelerator};
 
 impl From<Unsupported> for Error {
     fn from(e: Unsupported) -> Self {
@@ -328,7 +334,66 @@ impl VideoEncoder {
         frame: &InputFrame<'_>,
     ) -> Result<Vec<Coded<Error>>, Error> {
         wait::by(&Deadline::default(), || {
-            self.inner.encode_input(surface.lent, frame)
+            self.inner.encode_input(Input::Lent(surface.lent), frame)
+        })
+    }
+
+    /// The shape of the encoder's input: its format, NV12 or P010, and its coded size, which an
+    /// imported input holds (`import_input`, on Unix).
+    pub fn input_shape(&self) -> TargetShape {
+        TargetShape {
+            format: match self.settings().input_format() {
+                InputFormat::Nv12 => TargetFormat::Nv12,
+                InputFormat::P010 => TargetFormat::P010,
+            },
+            coded: self.coded_size(),
+        }
+    }
+
+    /// `dma_buf`, of `size` bytes, imported on the encoder's display as a linear input of
+    /// [`Self::input_shape`] whose planes lie at `planes`, luma then chroma, keeping `keep` while
+    /// it lives ([`Target::import`]), for another device to write frames into and
+    /// [`Self::encode_target`] to code. `Err` where the driver refuses the import, or the planes do
+    /// not fit the dma-buf.
+    #[cfg(unix)]
+    pub fn import_input(
+        &self,
+        dma_buf: BorrowedFd<'_>,
+        size: u64,
+        planes: [TargetPlane; 2],
+        keep: Box<dyn Send + Sync>,
+    ) -> Result<Target, Error> {
+        let display = self.inner.accelerator().display();
+        Target::import(display, dma_buf, size, self.input_shape(), planes, keep)
+    }
+
+    /// [`Self::encode`] of the frame written into `input`, an import of the encoder's display of
+    /// [`Self::input_shape`] (`import_input`, on Unix), whose whole coded size holds it: the
+    /// picture's rows and columns, and the margin to the coded size filled as an upload fills it,
+    /// its last column and row repeated. `frame`'s times, key-frame demand and tag are taken, and
+    /// its planes are not read. The encoder reads `input` until the frame's samples come out:
+    /// with no B pictures, before this returns. `Err` is a frame not taken: an input of another
+    /// display or shape, or a time stamp that does not follow the last.
+    pub fn encode_target(
+        &mut self,
+        input: &Target,
+        frame: &InputFrame<'_>,
+    ) -> Result<Vec<Coded<Error>>, Error> {
+        let shape = self.input_shape();
+        if !input.is_on(self.inner.accelerator().display()) || input.shape() != shape {
+            return Err(Error::Unsupported(format!(
+                "an input of {:?} on {} for an encoder of {shape:?}",
+                input.shape(),
+                if input.is_on(self.inner.accelerator().display()) {
+                    "its display"
+                } else {
+                    "another display"
+                }
+            )));
+        }
+        let input = Input::Imported(input.clone());
+        wait::by(&Deadline::default(), || {
+            self.inner.encode_input(input, frame)
         })
     }
 }
@@ -405,5 +470,233 @@ mod tests {
                 .unwrap_or_else(|e| panic!("encoder {made} ({profile:?}): {e:?}"));
             assert_eq!(samples.len(), 4, "encoder {made} ({profile:?})");
         }
+    }
+
+    /// Writes `plane`, `rows` rows of `row` bytes, into `bytes` from `at`, rows `pitch` apart, out
+    /// to `coded_rows` rows of `coded_bytes`, as the upload fills its surface: each row past the
+    /// plane's its last row, each byte past a row's its last `unit` (a sample, or a Cb/Cr pair)
+    /// repeated.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_as_uploaded(
+        bytes: &mut [u8],
+        at: usize,
+        pitch: usize,
+        plane: &[u8],
+        (row, rows): (usize, usize),
+        (coded_bytes, coded_rows): (usize, usize),
+        unit: usize,
+    ) {
+        for r in 0..coded_rows {
+            let from = &plane[r.min(rows - 1) * row..][..row];
+            let to = &mut bytes[at + r * pitch..][..coded_bytes];
+            to[..row].copy_from_slice(from);
+            for x in row..coded_bytes {
+                to[x] = from[row - unit + (x - row) % unit];
+            }
+        }
+    }
+
+    /// On the driver, for each profile it encodes, 6 frames of a moving 330x202 picture (a
+    /// margin of columns and rows to the coded size) at a constant QP, written by the CPU into an
+    /// input imported over host memory (`import_input`: a memfd made a dma-buf by udmabuf, rows
+    /// 256 bytes apart rounded up, the chroma plane right after the luma's rows), its margin
+    /// filled as an upload fills it, code as the same frames uploaded, byte for byte: two
+    /// encoders of the same settings code them, one from host bytes, one from the import
+    /// (`encode_target`), and every sample of the second is the first's.
+    #[test]
+    #[ignore = "needs a VA-API GPU: run on the VA-API host"]
+    fn a_frame_in_an_imported_input_codes_as_its_upload_byte_for_byte() {
+        use super::super::host_memory::HostMemory;
+
+        let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        let display = Display::open(&node, Arc::new(GatedRuntime)).expect("a VA display");
+        let profiles: Vec<encode::Profile> = (encoder_support(&display).into_iter())
+            .map(|s| s.profile)
+            .collect();
+        assert!(!profiles.is_empty(), "the driver encodes nothing");
+        let (width, height) = (330u32, 202u32);
+        for profile in profiles {
+            let mut settings = EncoderSettings::new(profile, width, height);
+            settings.rate_control = RateControl::ConstantQp {
+                intra: 26,
+                predicted: 28,
+                bidirectional: 30,
+            };
+            let mut by_upload = VideoEncoder::new(&display, settings.clone())
+                .unwrap_or_else(|e| panic!("{profile:?}: an encoder: {e}"));
+            let mut by_import = VideoEncoder::new(&display, settings)
+                .unwrap_or_else(|e| panic!("{profile:?}: an encoder: {e}"));
+            let shape = by_import.input_shape();
+            let sample = profile.input_format().bytes_per_sample();
+            let (coded_width, coded_height) = (shape.coded.0 as usize, shape.coded.1 as usize);
+            assert!(
+                coded_width > width as usize && coded_height > height as usize,
+                "{profile:?}: a coded size of {:?} leaves no margin",
+                shape.coded
+            );
+            let pitch = (coded_width * sample).next_multiple_of(256);
+            let chroma_at = pitch * coded_height;
+            let mut memory = HostMemory::new(chroma_at + pitch * coded_height / 2)
+                .unwrap_or_else(|e| panic!("host memory: {e}"));
+            let planes = [
+                TargetPlane {
+                    offset: 0,
+                    bytes_per_row: pitch as u64,
+                },
+                TargetPlane {
+                    offset: chroma_at as u64,
+                    bytes_per_row: pitch as u64,
+                },
+            ];
+            let input = (by_import.import_input(
+                memory.dma_buf_fd(),
+                memory.len() as u64,
+                planes,
+                Box::new(()),
+            ))
+            .unwrap_or_else(|e| panic!("{profile:?}: the import: {e}"));
+            let (w, h) = (width as usize, height as usize);
+            let row = w * sample;
+            let (mut uploaded, mut imported) = (Vec::new(), Vec::new());
+            for id in 0..6u64 {
+                let value = |x: usize, y: usize, shift: usize| ((x + y + shift) % 220 + 16) as u16;
+                let mut luma = Vec::with_capacity(row * h);
+                let mut chroma = Vec::with_capacity(row * (h / 2));
+                for y in 0..h {
+                    for x in 0..w {
+                        let v = value(x, y, id as usize * 4);
+                        match sample {
+                            2 => luma.extend_from_slice(&(v << 6).to_le_bytes()),
+                            _ => luma.push(v as u8),
+                        }
+                    }
+                }
+                for y in 0..h / 2 {
+                    for x in 0..w {
+                        let v = 128 + value(x, y, id as usize) % 32;
+                        match sample {
+                            2 => chroma.extend_from_slice(&(v << 6).to_le_bytes()),
+                            _ => chroma.push(v as u8),
+                        }
+                    }
+                }
+                let bytes = memory.bytes_mut();
+                let coded_bytes = coded_width * sample;
+                fill_as_uploaded(
+                    bytes,
+                    0,
+                    pitch,
+                    &luma,
+                    (row, h),
+                    (coded_bytes, coded_height),
+                    sample,
+                );
+                fill_as_uploaded(
+                    bytes,
+                    chroma_at,
+                    pitch,
+                    &chroma,
+                    (row, h / 2),
+                    (coded_bytes, coded_height / 2),
+                    sample * 2,
+                );
+                let frame = InputFrame {
+                    planes: [
+                        Plane {
+                            data: &luma,
+                            bytes_per_row: row,
+                        },
+                        Plane {
+                            data: &chroma,
+                            bytes_per_row: row,
+                        },
+                    ],
+                    pts: 3000 * id as i64,
+                    duration: 3000,
+                    force_key_frame: false,
+                    id,
+                };
+                uploaded.extend(
+                    (by_upload.encode(&frame))
+                        .unwrap_or_else(|e| panic!("{profile:?} frame {id}: the upload: {e}")),
+                );
+                imported.extend(
+                    (by_import.encode_target(&input, &frame))
+                        .unwrap_or_else(|e| panic!("{profile:?} frame {id}: the import: {e}")),
+                );
+            }
+            uploaded.extend(by_upload.flush());
+            imported.extend(by_import.flush());
+            let data = |coded: Vec<Coded<Error>>| -> Vec<Vec<u8>> {
+                (coded.into_iter())
+                    .map(|c| {
+                        c.unwrap_or_else(|f| panic!("{profile:?}: {:?}", f.error))
+                            .data
+                    })
+                    .collect()
+            };
+            let (a, b) = (data(uploaded), data(imported));
+            assert_eq!(a.len(), 6, "{profile:?}: samples");
+            assert!(a == b, "{profile:?}: a sample of the import differs");
+            eprintln!("{profile:?}: 6 frames from an import coded as uploaded");
+        }
+    }
+
+    /// An input of another shape is not taken: a frame for an encoder of 330x202 is refused from
+    /// an import of 320x192's coded size.
+    #[test]
+    #[ignore = "needs a VA-API GPU: run on the VA-API host"]
+    fn an_input_of_another_shape_is_refused() {
+        use super::super::host_memory::HostMemory;
+
+        let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        let display = Display::open(&node, Arc::new(GatedRuntime)).expect("a VA display");
+        let support = (encoder_support(&display).into_iter())
+            .find(|s| s.profile.input_format() == InputFormat::Nv12)
+            .expect("an NV12 profile");
+        let small = VideoEncoder::new(&display, EncoderSettings::new(support.profile, 320, 192))
+            .expect("an encoder");
+        let mut large =
+            VideoEncoder::new(&display, EncoderSettings::new(support.profile, 330, 202))
+                .expect("an encoder");
+        let (coded_width, coded_height) = small.coded_size();
+        let pitch = u64::from(coded_width).next_multiple_of(256);
+        let chroma_at = pitch * u64::from(coded_height);
+        let memory = HostMemory::new((chroma_at + pitch * u64::from(coded_height) / 2) as usize)
+            .expect("host memory");
+        let planes = [
+            TargetPlane {
+                offset: 0,
+                bytes_per_row: pitch,
+            },
+            TargetPlane {
+                offset: chroma_at,
+                bytes_per_row: pitch,
+            },
+        ];
+        let input = (small.import_input(
+            memory.dma_buf_fd(),
+            memory.len() as u64,
+            planes,
+            Box::new(()),
+        ))
+        .expect("the import");
+        let none = Plane {
+            data: &[],
+            bytes_per_row: 0,
+        };
+        let frame = InputFrame {
+            planes: [none, none],
+            pts: 0,
+            duration: 3000,
+            force_key_frame: false,
+            id: 0,
+        };
+        let refused = large.encode_target(&input, &frame);
+        assert!(
+            matches!(refused, Err(Error::Unsupported(_))),
+            "{:?}",
+            refused.map(|c| c.len())
+        );
     }
 }
