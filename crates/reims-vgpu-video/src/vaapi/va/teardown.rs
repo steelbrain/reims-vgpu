@@ -325,7 +325,11 @@ fn a_context_taken_back_starts_the_next_stream_with_none_of_the_last_ones_refere
     let used = whole.context_id();
     drop(whole);
     let mut next = stream.decoder(&display);
-    assert_eq!(pictures(&mut next, first), reference, "the next decoder's pictures");
+    assert_eq!(
+        pictures(&mut next, first),
+        reference,
+        "the next decoder's pictures"
+    );
     #[cfg(windows)]
     assert_eq!(next.context_id(), used, "the next decoder's context");
     #[cfg(unix)]
