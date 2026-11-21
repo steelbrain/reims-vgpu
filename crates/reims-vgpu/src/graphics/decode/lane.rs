@@ -16,10 +16,11 @@
 //!   holds one thread a busy lane and the budget's at most.
 //! - **Walking and waiting.** At most [`LANE_THREADS`] of a lane's jobs walk at once. A job that
 //!   waits for what is committed before its command buffer (its turn, its tickets in the commit
-//!   order, the buffers its `COMMIT_ORDER` names, a split of its context) waits in
-//!   [`Lane::waiting`], and is not among those meanwhile: the lane starts its next job on another
-//!   thread, so a long walk starts as its buffer comes, not once the buffers before it commit, up
-//!   to [`LANE_MOST`] threads a lane. Counted while they waited, the four threads of Valley's GL
+//!   order, the buffers its `COMMIT_ORDER` names, a split of its context), or for its dispatch's
+//!   stage's fill (`reims_vgpu_vulkan::core::platform::stage`), waits in [`Lane::waiting`], and is
+//!   not among those meanwhile: the lane starts its next job on another thread, so a long walk
+//!   starts as its buffer comes, not once the buffers before it commit, up to [`LANE_MOST`]
+//!   threads a lane. Counted while they waited, the four threads of Valley's GL
 //!   queue each held a job 79% of the run, at 92% of its buffers' arrivals all four did and 23
 //!   buffers waited behind them (the median), 65.5% of its jobs ended within 1 ms of the job
 //!   before them, waiting for their turns, and a walk started 177 ms after the host took its
@@ -78,15 +79,18 @@
 //!   or past its first unfinished job, and the device's first unfinished one always runs: the
 //!   waits end. Threads only shared between queues could all be held by later jobs waiting for
 //!   an earlier one not yet started. A job held back by the walks' limit is later than every job
-//!   started, so it holds none of their waits.
+//!   started, so it holds none of their waits. A dispatch's wait for its stage's fill waits for
+//!   no buffer: the fill ends by itself, at its helper's time cap at the latest.
 
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use reims_vgpu_vulkan::core::platform::os::Threads;
+use reims_vgpu_vulkan::core::platform::stage::{Holder, Holding};
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 
 /// The most of a lane's jobs that walk at once, on its own thread and the budget's: those that
@@ -511,13 +515,18 @@ impl Lane {
     /// A lane thread: the walk hints, then the jobs, in the order they came, each once fewer
     /// than [`LANE_THREADS`] of the lane's threads walk, until the lane closes with none left or
     /// none comes for the lane's `idle_for`. It goes as one of the budget's where the lane has
-    /// any, else as the lane's own, so the lane's own thread is the last to go.
-    fn serve(&self) {
+    /// any, else as the lane's own, so the lane's own thread is the last to go. A job's dispatch
+    /// that waits for its stage's fill (`reims_vgpu_vulkan::core::platform::stage`) waits in
+    /// [`Self::waiting`], the thread's holder.
+    fn serve(self: &Arc<Self>) {
         if let Some(threads) = &self.budget.hints {
             threads.give_walk_hints();
         }
+        let held = Arc::clone(self);
+        let holder: Holder = Rc::new(move |wait: &mut dyn FnMut()| held.waiting(wait));
+        let _holding = Holding::install(holder);
         let me = Arc::new(Idler::default());
-        let lane = std::ptr::from_ref(self).addr();
+        let lane = Arc::as_ptr(self).addr();
         let mut state = self.state.lock();
         // Made for a job ([`Self::start`]).
         state.woken -= 1;
@@ -712,6 +721,9 @@ impl Drop for Walks<'_> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use reims_vgpu_vulkan::core::platform::stage::{FillEnd, held};
+    use reims_vgpu_vulkan::core::testkit::FakeStages;
 
     use super::*;
 
@@ -1124,6 +1136,65 @@ mod tests {
         assert!(until(|| seen.lock().len() == 5));
         assert_eq!(*seen.lock(), [1, 0, 0, 0, 1]);
         assert!(until(|| lane.walks_and_turn_waits() == (0, 0)));
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+    }
+
+    /// A job's dispatch held on its stage's fill (`stage::held`) waits in [`Lane::waiting`], the
+    /// lane thread's holder: while [`LANE_THREADS`] jobs wait for one fill, none of them walks, so
+    /// the lane's next job walks meanwhile; each held dispatch is made once more after the fill
+    #[test]
+    fn a_dispatch_held_on_its_stage_s_fill_steps_out_of_the_lane_s_walks() {
+        let lane = Lane::new(13, Budget::new(LANE_THREADS));
+        let stages = Arc::new(FakeStages::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..LANE_THREADS {
+            let (stages, started, answers) = (
+                Arc::clone(&stages),
+                Arc::clone(&started),
+                Arc::clone(&answers),
+            );
+            lane.run(Box::new(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let mut attempts = 0;
+                let answer = held(
+                    stages.fills(),
+                    || {
+                        attempts += 1;
+                        if attempts == 1 {
+                            Err(7_u64)
+                        } else {
+                            Ok(attempts)
+                        }
+                    },
+                    |&stage| Some(stage),
+                );
+                answers.lock().push(answer);
+            }));
+        }
+        let all_wait = || {
+            started.load(Ordering::SeqCst) == LANE_THREADS && lane.walks_and_turn_waits().0 == 0
+        };
+        assert!(
+            until(all_wait),
+            "{} jobs started, {} walking",
+            started.load(Ordering::SeqCst),
+            lane.walks_and_turn_waits().0
+        );
+        assert_eq!(stages.started(), [7]);
+        let next = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&next);
+        lane.run(Box::new(move || ran.store(true, Ordering::SeqCst)));
+        assert!(
+            until(|| next.load(Ordering::SeqCst)),
+            "the lane's next job waited behind the held dispatches"
+        );
+        assert!(answers.lock().is_empty(), "a held dispatch went on before its fill");
+        assert!(stages.end(7, FillEnd::Filled));
+        assert!(until(|| answers.lock().len() == LANE_THREADS));
+        assert!(answers.lock().iter().all(|answer| *answer == Ok(2)));
+        assert_eq!(stages.started(), [7]);
         lane.close();
         assert!(until(|| lane.threads() == 0));
     }

@@ -17,14 +17,20 @@
 //! - **Nothing waits but a hold.** [`StageFills::fill`] returns at once. A walk's dispatch waits
 //!   for its fill ([`Fill::wait`]); a make is made again at its fill's end ([`Fill::on_end`]); a
 //!   make ahead waits for nothing.
+//! - **A held wait goes through its thread's holder.** The thread that runs a walk may install a
+//!   holder ([`Holding`]), and a dispatch's wait for its fill ([`held`]) runs inside it: a lane's
+//!   thread steps out of the lane's walks while it waits, so the lane's other buffers walk on.
+//!   Where none is installed, the wait is the wait alone.
 //! - **Cancels.** [`StageFills::cancel_all`] ends every fill running as cancelled, and cancels what
 //!   runs it, at once: a device's reset waits for no fill. [`StageFills::close`] does too, and ends
 //!   every later fill as cancelled as it is asked for: a process's exit waits for none, and starts
 //!   none. Dropping the fills closes them.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::core::sync::{Condvar, Mutex};
@@ -348,9 +354,63 @@ where
     let Some(stage) = stage_of(&refused) else {
         return Err(refused);
     };
-    match fills.fill(stage).wait() {
+    let fill = fills.fill(stage);
+    if fill.end().is_none() {
+        hold(&mut || {
+            fill.wait();
+        });
+    }
+    // Ended already, unless the holder did not run the wait.
+    match fill.wait() {
         FillEnd::Filled => attempt(),
         FillEnd::Breached | FillEnd::Failed | FillEnd::Cancelled => Err(refused),
+    }
+}
+
+/// What runs a thread's waits for a fill ([`hold`]): it calls the wait it is given, once, and may
+/// do what it needs around it.
+pub type Holder = Rc<dyn Fn(&mut dyn FnMut())>;
+
+thread_local! {
+    /// The thread's holder, while a [`Holding`] has it installed.
+    static HOLDER: RefCell<Option<Holder>> = const { RefCell::new(None) };
+}
+
+/// Runs `wait`, a wait for a fill, inside the thread's holder where one is installed
+/// ([`Holding`]), else as it is.
+pub fn hold(wait: &mut dyn FnMut()) {
+    // Cloned out of the cell first: the holder may run what holds again on this thread.
+    match HOLDER.with(|holder| holder.borrow().clone()) {
+        Some(holder) => holder(wait),
+        None => wait(),
+    }
+}
+
+/// A holder installed on the thread that made it, until it drops, which installs the one it
+/// replaced again.
+#[must_use = "the holder is installed only until its holding drops"]
+pub struct Holding {
+    replaced: Option<Holder>,
+}
+
+impl Holding {
+    /// Installs `holder` on this thread, for this thread's waits for a fill ([`hold`]).
+    pub fn install(holder: Holder) -> Holding {
+        let replaced = HOLDER.with(|installed| installed.replace(Some(holder)));
+        Holding { replaced }
+    }
+}
+
+impl fmt::Debug for Holding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Holding").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        let replaced = self.replaced.take();
+        HOLDER.with(|installed| *installed.borrow_mut() = replaced);
     }
 }
 
@@ -605,6 +665,45 @@ mod tests {
             Ok(5)
         );
         assert_eq!(fake.starts(), 1);
+    }
+
+    /// A held call's wait for a running fill runs inside its thread's holder while one is
+    /// installed, the one it replaced again once its holding drops; a fill ended already is waited
+    /// for by none.
+    #[test]
+    fn a_held_wait_runs_inside_its_thread_s_holder() {
+        let fake = Fake::default();
+        let fills = fake.fills();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let holder = |name: &'static str| -> Holder {
+            let (seen, fake) = (Rc::clone(&seen), fake.clone());
+            Rc::new(move |wait: &mut dyn FnMut()| {
+                seen.borrow_mut().push(name);
+                // The fill ends inside the hold, before its wait.
+                fake.end(FillEnd::Filled);
+                wait();
+            })
+        };
+        let refusing = |stage: u32| {
+            let mut attempts = 0;
+            move || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(stage)
+                } else {
+                    Ok(attempts)
+                }
+            }
+        };
+        let outer = Holding::install(holder("outer"));
+        let inner = Holding::install(holder("inner"));
+        assert_eq!(held(&fills, refusing(1), |&stage| Some(stage)), Ok(2));
+        drop(inner);
+        assert_eq!(held(&fills, refusing(2), |&stage| Some(stage)), Ok(2));
+        assert_eq!(held(&fills, refusing(1), |&stage| Some(stage)), Ok(2));
+        drop(outer);
+        assert_eq!(*seen.borrow(), ["inner", "outer"]);
+        assert_eq!(fake.starts(), 2);
     }
 
     /// A wait on a fill that does not end goes on waiting: nothing ends a fill but its end or a
