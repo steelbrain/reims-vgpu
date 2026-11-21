@@ -13,10 +13,12 @@
 //!   raw value, by which rt's pass resolves where a store action resolves (rt's docs); the render
 //!   target's width and height; the render target array length, by which rt's pass renders, at 2
 //!   or more, that many slices of each attachment and resolve texture from its own slice, loading,
-//!   storing and resolving each (rt's docs); and the visibility result buffer, held as Metal's
-//!   descriptor retains it. rt's command buffer keeps that buffer until it retires, and its bytes
-//!   stay as they were: rt's pass writes no result, and a visibility result mode but `Disabled` is
-//!   rt's gap at the encoder (`super::render`). A render encoder's creation turns them into rt's
+//!   storing and resolving each (rt's docs); the default raster sample count, at which rt's pass
+//!   with no attachment renders, refused at 0, Metal's default, as Metal refuses it (rt's docs);
+//!   and the visibility result buffer, held as Metal's descriptor retains it. rt's command buffer
+//!   keeps that buffer until it retires, and its bytes stay as they were: rt's pass writes no
+//!   result, and a visibility result mode but `Disabled` is rt's gap at the encoder
+//!   (`super::render`). A render encoder's creation turns them into rt's
 //!   descriptor ([`PassFields::rt_pass`]): an action or resolve filter Metal has none of, or a
 //!   level, slice or plane past 32 bits, is Metal's refusal there, as Metal asserts at the
 //!   encoder's creation; a width or height past 32 bits renders the attachments' area, as Metal's
@@ -24,11 +26,10 @@
 //!   refuses any other past them, as it refuses an attachment with fewer slices from its own than
 //!   the length. A colour attachment past the eighth raises at its subscript, as Metal's does.
 //!   - **Kept nowhere, changing nothing rt renders**: a depth plane (rt renders into no 3D
-//!     texture); store action options (rt builds none); `defaultRasterSampleCount` (rt renders no
-//!     pass without an attachment); `defaultColorSampleCount` (SPI); and `visibilityResultType`,
-//!     which decides only what an enabled visibility result mode writes: Metal's pass leaves the
-//!     buffer's bytes as they were under either type where its encoder enables no mode (rt's
-//!     docs: an Apple M3 Max, macOS 27.0.1).
+//!     texture); store action options (rt builds none); `defaultColorSampleCount` (SPI); and
+//!     `visibilityResultType`, which decides only what an enabled visibility result mode writes:
+//!     Metal's pass leaves the buffer's bytes as they were under either type where its encoder
+//!     enables no mode (rt's docs: an Apple M3 Max, macOS 27.0.1).
 //!   - **Unbuilt** ([`Unbuilt::RenderPass`]), counted at a set of other than Metal's default, and
 //!     kept nowhere, so the pass renders without them: an imageblock sample length, a threadgroup
 //!     memory length, a tile width or height, and sample positions. No rasterization rate map is
@@ -555,8 +556,9 @@ fn color_index(index: u64) -> Result<usize, Raise> {
 }
 
 impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
-    /// Counted for any position ([`Unbuilt::RenderPass`]): rt renders one sample alone, at its
-    /// centre, and keeps none.
+    /// Counted for any position ([`Unbuilt::RenderPass`]): rt's pass keeps none, and renders its
+    /// samples at Vulkan's standard locations, which rt requires of the device: Metal's default
+    /// positions of 1, 2 and 4 samples.
     fn set_sample_positions(&self, positions: &[MtlSamplePosition]) -> RaiseResult<()> {
         let recorded_call =
             crate::recorder::rec_call!("setSamplePositions:count:", self, positions);

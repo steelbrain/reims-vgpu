@@ -46,11 +46,12 @@
 //!   writes.
 //! - **Nothing to record**: `useHeaps:` in each form (rt's pass orders every earlier command before
 //!   it and itself before every later one, and every resource is resident); the store action
-//!   options (rt renders one sample, and the one option is custom sample positions); the object,
-//!   mesh and tile functions' buffers, textures, samplers and threadgroup memory, and the tile
-//!   threadgroup memory length (rt makes no state with such functions); and, each at Metal's
-//!   default, a resolve texture of nil, a line width of 1, primitive restart enabled, the viewport
-//!   transform enabled, one vertex amplification view and a tessellation factor scale of 1.
+//!   options (the one option is custom sample positions, which rt's pass keeps none of:
+//!   `super::descriptor`); the object, mesh and tile functions' buffers, textures, samplers and
+//!   threadgroup memory, and the tile threadgroup memory length (rt makes no state with such
+//!   functions); and, each at Metal's default, a resolve texture of nil, a line width of 1,
+//!   primitive restart enabled, the viewport transform enabled, one vertex amplification view and
+//!   a tessellation factor scale of 1.
 //! - **The visibility result mode** is rt's: `Disabled`, at any offset, records nothing, and
 //!   `Boolean` and `Counting` are rt's gap (`Gap::Draw` of `VisibilityResults`), encoding nothing,
 //!   counted (`rt-refused-gap`), so the encoder's later draws write no result.
