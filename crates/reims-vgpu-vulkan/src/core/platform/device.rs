@@ -32,9 +32,11 @@ use crate::core::raise::{OnFault, RaiseResult};
 /// ([`GpuDevice::new_heap_over_host_memory`]): it runs once the platform no longer reads or
 /// writes the bytes, which may be well after the object went (the Vulkan platform runs it from
 /// rt's release of its import of them), so it holds what keeps them mapped. `None` is a nil block.
-/// Where a buffer's make answers nil, the platform may keep its deallocator unrun for good, with
-/// all it holds, as Metal runs none for a buffer it does not make (the Vulkan platform's does): a
-/// caller lets go itself of what it handed it that is not to be kept so, a platform handle.
+/// Where a buffer's or a heap's make answers nil, the platform drops its deallocator unrun before
+/// the make returns, on the caller's thread, as Metal runs none for an object it does not make:
+/// what it holds goes then, as had the make never been asked. Its captures are the host's holds
+/// (the guest's own deallocator never reaches the host), so a caller hands it none whose drop
+/// takes a lock the caller holds across the make.
 pub type NoCopyDeallocator = Box<dyn FnOnce() + Send>;
 
 thread_local! {

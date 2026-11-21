@@ -49,11 +49,12 @@
 //! Shared, or Managed over them, rt keeping the device copy where the GPU has memory of its own,
 //! whose bytes past `zero_from` start as zeros. Its deallocator runs once rt freed the import,
 //! after the buffer and every command buffer that used it are gone, as Metal runs it once the
-//! buffer is freed; one of a buffer never made never runs, and its captures are kept. Where the
-//! GPU keeps a device copy, a Managed one's bytes that its making names for that copy (all but
-//! those past `zero_from`) hold the import too, until the next commit of a command buffer with
-//! commands has copied them and its copy has completed (rt's `didModifyRange:` capture), so its
-//! deallocator runs no sooner, though the buffer went before. Each import
+//! buffer is freed; one of a buffer never made never runs, and is dropped unrun before the make
+//! returns, on its thread (`let_go_unrun`). Where the GPU keeps a device copy, a Managed one's
+//! bytes that its making names for that copy (all but those past `zero_from`) hold the import
+//! too, until the next commit of a command buffer with commands has copied them and its copy has
+//! completed (rt's `didModifyRange:` capture), so its deallocator runs no sooner, though the
+//! buffer went before. Each import
 //! is one Vulkan allocation; each is counted ([`IMPORTS_CODE`]), and the most live at once as that
 //! code's highest value ([`IMPORTS_LIVE_MOST_CODE`]); each again, with the most live at once,
 //! under the kind of the make that asked for it on its thread (`crate::answer::making_as`), or
@@ -1010,7 +1011,7 @@ pub fn deferred_of_length(
 /// `newBufferWithDescriptor:` of `desc` on `device`: a no-copy one as [`over_host_memory`]'s, its
 /// deallocator given the bytes' address and the length; another as [`of_length`]'s, at the
 /// pinned address where it lies in a known block, and holding a copy of the contents where given.
-/// Nil where Metal or rt refuses it, counted, the deallocator never run.
+/// Nil where Metal or rt refuses it, counted, the deallocator then dropped unrun.
 pub fn of_desc(device: &RtObj<RtDevice>, desc: BufferDesc<'_>) -> Option<RtObj<RtBuffer>> {
     const SEL: &str = "newBufferWithDescriptor:";
     let raw = descriptor_options(BUFFER_DESCRIPTOR_OPTIONS, &desc.options);
@@ -1028,18 +1029,18 @@ pub fn of_desc(device: &RtObj<RtDevice>, desc: BufferDesc<'_>) -> Option<RtObj<R
             let at = bytes.ptr();
             let release = deallocator.map(|d| with_bytes(d, at, length));
             if bytes.len() < length {
-                std::mem::forget(release);
+                drop(release);
                 let why = format!("contents of {} bytes for {length}", bytes.len());
                 return refused_metal(SEL, &why);
             }
             over_host_memory(device, SEL, bytes, length, raw, zero_from, pin, release)
         }
         (None, true, deallocator) => {
-            std::mem::forget(deallocator);
+            drop(deallocator);
             refused_metal(SEL, &"a no-copy buffer of no contents")
         }
         (_, false, Some(deallocator)) => {
-            std::mem::forget(deallocator);
+            drop(deallocator);
             refused_metal(SEL, &"a deallocator of a buffer that is not no-copy")
         }
         (contents, false, None) => {
@@ -1315,15 +1316,16 @@ fn run(slot: &Slot) {
     }
 }
 
-/// The deallocator in `slot`, never to run: taken out, and its captures kept for good, as Metal
-/// runs none for a buffer it does not make. A caller lets go itself of what it handed one that is
-/// not to be kept so, a handle of the platform's among it, once the make answered nil (the
-/// reims-graphics decoder's `MANAGED_BUFFER_CREATE`): rt holds nothing of ours after an `Err`,
-/// and its call has returned by then.
-fn keep_unrun(slot: &Slot) {
-    if let Some(deallocator) = slot.lock().take() {
-        std::mem::forget(deallocator);
-    }
+/// The deallocator in `slot` of a buffer not made, never to run, as Metal runs none for a buffer
+/// it does not make: taken out, then dropped unrun with the slot's lock let go, so what it holds
+/// goes as a heap's refused deallocator's does (`super::heap::over_host_memory`). Its captures
+/// are the host's own holds, the caller's to hand (core's `NoCopyDeallocator`); the guest's
+/// deallocator never reaches the host. Kept for good, they would keep what they hold to the
+/// process's end: a pool's piece its guest has emptied among it, which the pool's release then
+/// waits on.
+fn let_go_unrun(slot: &Slot) {
+    let deallocator = slot.lock().take();
+    drop(deallocator);
 }
 
 /// `newBufferWithBytesNoCopy:length:options:deallocator:` on `device`, for `sel`: a buffer of
@@ -1331,7 +1333,7 @@ fn keep_unrun(slot: &Slot) {
 /// the bytes are a known block's mapping there, else over rt's import of their pages at rt's
 /// address (the module's docs, "A pinned address", "Imports"); a Managed one's bytes from
 /// `zero_from` read as zeros by its device copy. Nil where Metal or rt refuses it, counted,
-/// `deallocator` then never run.
+/// `deallocator` then dropped unrun.
 #[expect(
     clippy::too_many_arguments,
     reason = "the descriptor's no-copy fields, which the creators share"
@@ -1350,7 +1352,7 @@ pub fn over_host_memory(
     let length = length.min(bytes.len());
     let made = no_copy(device, sel, bytes.ptr(), length, raw, zero_from, pin, &slot);
     if made.is_none() {
-        keep_unrun(&slot);
+        let_go_unrun(&slot);
     }
     made
 }
@@ -1418,9 +1420,9 @@ fn no_copy(
     // In place in a known block whose writes are not dropped.
     let in_place = o.read_only && !super::copied::drops(block.id);
     let (bytes, storage) = ((&block, offset), o.storage);
-    // The deallocator is kept unrun before the import goes, whose release would run it.
+    // The deallocator is let go of unrun before the import goes, whose release would run it.
     let Some(made) = range_of(device, sel, bytes, length, storage, zero_from, copy) else {
-        keep_unrun(slot);
+        let_go_unrun(slot);
         return None;
     };
     if in_place {

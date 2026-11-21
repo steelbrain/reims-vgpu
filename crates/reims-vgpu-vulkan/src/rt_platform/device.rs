@@ -703,8 +703,8 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     }
 
     /// A buffer over rt's import of the pages that hold `bytes` ([`buffer::over_host_memory`]);
-    /// nil where Metal or rt refuses it, counted, the deallocator then never run, as Metal runs
-    /// none for a buffer it does not make.
+    /// nil where Metal or rt refuses it, counted, the deallocator then dropped unrun, as Metal
+    /// runs none for a buffer it does not make.
     fn new_buffer_over_host_memory(
         &self,
         on: OnFault,
@@ -1229,7 +1229,7 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
     }
 
     /// [`buffer::of_desc`]'s: nil where Metal or rt refuses it, counted, the deallocator then
-    /// never run.
+    /// dropped unrun.
     fn new_buffer(
         &self,
         desc: BufferDesc<'_>,
