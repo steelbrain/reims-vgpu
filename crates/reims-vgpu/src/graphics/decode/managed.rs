@@ -2641,7 +2641,7 @@ mod tests {
     }
 
     /// Where the platform refuses a `MANAGED_BUFFER_CREATE`'s buffer and keeps its deallocator
-    /// unrun, as the Vulkan platform does (the testkit's, `World::refused_deallocators`), the
+    /// unrun, as the Vulkan platform does (the testkit's, `World::keep_refused_deallocators`), the
     /// create lets go of the CPU copy's buffer it handed the deallocator, wherever the copy lies,
     /// so no handle of the platform's is kept for good; what else the deallocator holds is kept
     /// with it, the region among it, and no deallocator runs.
@@ -2649,6 +2649,7 @@ mod tests {
     fn a_refused_managed_buffer_lets_go_of_its_cpu_copy_s_buffer_and_runs_no_deallocator() {
         let (mut r, ram, page) = pages_rig();
         let copies = shared_copies(&mut r, &ram, page);
+        r.p.world().keep_refused_deallocators();
         let refused = r.p.world().refused_deallocators();
         for (i, (cpu, _)) in copies.into_iter().enumerate() {
             let obj_id = 60 + i as u64;
