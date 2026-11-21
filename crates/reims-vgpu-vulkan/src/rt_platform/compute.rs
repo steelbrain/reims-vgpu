@@ -264,16 +264,7 @@ impl RtComputeEncoder {
                     ));
                 }
                 for resource in resources.iter().flatten() {
-                    let resource = match resource {
-                        ResourceRef::Buffer(b) => rt::Resource::Buffer(b.rt()),
-                        ResourceRef::Texture(t) => {
-                            self.kept.takes().used(t);
-                            self.kept.reads().note(t.index_use());
-                            rt::Resource::Texture(t.rt())
-                        }
-                        ResourceRef::Icb(icb) => icb.unreachable(),
-                    };
-                    e.use_resource(resource, usage)?;
+                    e.use_resource(declared(&self.kept, resource), usage)?;
                 }
             }
         }
@@ -311,8 +302,9 @@ pub(super) fn slots(range: NsRange, lengths: &[usize]) -> Result<Range<u32>, Sto
     Ok(small(range.location)?..small(end)?)
 }
 
-/// `MTLResourceUsage` as rt's: a value of read (1), write (2) and sample (4), at least one.
-fn resource_usage(usage: u64) -> Result<rt::ResourceUsage, Stop> {
+/// `MTLResourceUsage` as rt's: a value of read (1), write (2) and sample (4), at least one. The
+/// render encoder's `useResources:` takes it too (`super::render`).
+pub(super) fn resource_usage(usage: u64) -> Result<rt::ResourceUsage, Stop> {
     let bits = [
         (1, rt::ResourceUsage::READ),
         (2, rt::ResourceUsage::WRITE),
@@ -325,6 +317,25 @@ fn resource_usage(usage: u64) -> Result<rt::ResourceUsage, Stop> {
     match named {
         Some(named) if usage & !7 == 0 => Ok(named),
         _ => Err(Stop::Metal("a resource usage no Metal value is")),
+    }
+}
+
+/// rt's resource of `resource`, which a compute or render encoder's `useResources:` declares to the
+/// command buffer that keeps `kept`: a texture's declaration is a use of it where it is tiled
+/// (`super::tiled`), and a read through its index where that is one of the platform's own
+/// (`Kept::reads`).
+pub(super) fn declared<'r>(
+    kept: &Kept,
+    resource: &'r ResourceRef<'_, RtPlatform>,
+) -> rt::Resource<'r> {
+    match resource {
+        ResourceRef::Buffer(b) => rt::Resource::Buffer(b.rt()),
+        ResourceRef::Texture(t) => {
+            kept.takes().used(t);
+            kept.reads().note(t.index_use());
+            rt::Resource::Texture(t.rt())
+        }
+        ResourceRef::Icb(icb) => icb.unreachable(),
     }
 }
 

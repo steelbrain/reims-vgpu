@@ -12,16 +12,23 @@
 //!   `setVertexBuffers:offsets:attributeStrides:withRange:`) bind as the calls without them: only a
 //!   layout of `MTLBufferLayoutStrideDynamic` reads a stride, and rt refuses such a state as it is
 //!   made.
-//! - **Nothing to record**: `useResources:` and `useHeaps:` in each form (rt's pass orders every
-//!   earlier command before it and itself before every later one, and every resource is
-//!   resident), but that a tiled texture `useResources:` names is a use of it (`super::tiled`), and
-//!   a texture it names at one of the platform's own indices a read through it (`Kept::reads`); the
-//!   store action options (rt renders one sample, and the one option is custom
-//!   sample positions); the object, mesh and tile functions' buffers, textures, samplers and
-//!   threadgroup memory, and the tile threadgroup memory length (rt makes no state with such
-//!   functions); and, each at Metal's default, a resolve texture of nil, a visibility result mode
-//!   of `Disabled`, a line width of 1, primitive restart enabled, the viewport transform enabled,
-//!   one vertex amplification view and a tessellation factor scale of 1.
+//! - **`useResources:`** in each form is rt's `use_resource` of each resource it names but nil, as
+//!   the compute encoder's is (`super::compute`): the command buffer keeps the resource until it
+//!   retires, and rt records nothing. A tiled texture it names is a use of it (`super::tiled`), and
+//!   a texture at one of the platform's own indices a read through it (`Kept::reads`). After a
+//!   usage that writes a texture made for shader writes with no storage element, each draw of the
+//!   encoder whose vertex or fragment function may reach a texture beyond its slots (an argument
+//!   buffer's `access::write` or `access::read_write` texture, a resource ID) is rt's refusal
+//!   (`Gap::StorageElement`), encoding nothing, counted (`rt-refused-gap`), as the compute
+//!   encoder's dispatch is: Metal writes such a texture there, and Vulkan would drop the writes.
+//! - **Nothing to record**: `useHeaps:` in each form (rt's pass orders every earlier command before
+//!   it and itself before every later one, and every resource is resident); the store action
+//!   options (rt renders one sample, and the one option is custom sample positions); the object,
+//!   mesh and tile functions' buffers, textures, samplers and threadgroup memory, and the tile
+//!   threadgroup memory length (rt makes no state with such functions); and, each at Metal's
+//!   default, a resolve texture of nil, a visibility result mode of `Disabled`, a line width of 1,
+//!   primitive restart enabled, the viewport transform enabled, one vertex amplification view and
+//!   a tessellation factor scale of 1.
 //! - **Unbuilt** ([`Unbuilt::RenderCommand`]), each encoding nothing, counted: indirect draws,
 //!   indexed patch draws, mesh draws, tile dispatches, a resolve texture, a visibility result
 //!   mode but `Disabled`, and the private settings of other than Metal's default rt has none of
@@ -33,9 +40,9 @@
 //!   encoder's later patch draws read their factors unscaled.
 //! - **Metal's refusals**, each encoding nothing, counted (`rt-refused-metal`): a draw with no
 //!   pipeline state set, or with nil set since; a value no Metal enumeration has (a primitive,
-//!   index or fill type, a cull mode, a winding, a depth clip mode, a store action); an index, a
-//!   count or a base past rt's 32 bits; a list of another length than its range; and a command
-//!   after `endEncoding`.
+//!   index or fill type, a cull mode, a winding, a depth clip mode, a store action, a resource
+//!   usage); an index, a count or a base past rt's 32 bits; a list of another length than its
+//!   range; and a command after `endEncoding`.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
 //! before the refused one are bound.
@@ -45,7 +52,6 @@ use metal2vulkan::metal::{
 };
 use metal2vulkan_runtime as rt;
 
-use crate::core::platform::blit::ResourceRef;
 use crate::core::platform::render::{RenderCmd, RenderEncoder};
 use crate::core::platform::types::{MtlScissorRect, MtlViewport};
 use crate::core::platform::{Handle, ObjId};
@@ -54,7 +60,7 @@ use crate::core::sync::Mutex;
 
 use super::blit::{Stop, report};
 use super::command::{Kept, OpenMark};
-use super::compute::{slots, small};
+use super::compute::{declared, resource_usage, slots, small};
 use super::copied::Used;
 use super::diag::{self, Bound, Target, Use};
 use super::render_pipeline::{Raster, RtRenderPipeline};
@@ -298,13 +304,13 @@ impl RtRenderEncoder {
             RenderCmd::SetVertexAmplificationCount { view_mappings } => {
                 unbuilt_unless(view_mappings.len() <= 1)?;
             }
-            RenderCmd::UseResources { resources, .. }
-            | RenderCmd::UseResourcesStages { resources, .. } => {
+            RenderCmd::UseResources { resources, usage }
+            | RenderCmd::UseResourcesStages {
+                resources, usage, ..
+            } => {
+                let usage = resource_usage(usage)?;
                 for resource in resources.iter().flatten() {
-                    if let ResourceRef::Texture(texture) = resource {
-                        self.kept.takes().used(texture);
-                        self.kept.reads().note(texture.index_use());
-                    }
+                    e.use_resource(declared(&self.kept, resource), usage)?;
                 }
             }
             RenderCmd::EndEncoding
@@ -814,17 +820,19 @@ mod tests {
     use super::*;
     use crate::core::num::ToU64 as _;
     use crate::core::platform::Platform as _;
+    use crate::core::platform::blit::ResourceRef;
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
     use crate::core::platform::descriptor::RenderPassDescriptor as _;
     use crate::core::platform::device::GpuDevice as _;
-    use crate::core::platform::resource::{Buffer as _, Library as _};
-    use crate::core::platform::types::{ClearColor, CommandBufferStatus, NsRange};
+    use crate::core::platform::resource::{Buffer as _, Library as _, Texture as _};
+    use crate::core::platform::types::{ClearColor, CommandBufferStatus, MtlSize, NsRange};
     use crate::core::platform::values::{
         AttributeDesc, BufferLayoutDesc, ColorAttachmentDesc, ColorAttachmentSet,
         FullRenderPipelineDesc, PassSet, TextureDesc, VertexDesc,
     };
     use crate::rt_platform::unbuilt::RtRefusal;
-    use crate::rt_platform::{PassFields, RtCommandBuffer, RtTexture};
+    use crate::rt_platform::{PassFields, RtCommandBuffer, RtDevice, RtFunction, RtTexture};
 
     /// A vertex function fed through a vertex descriptor: attribute 0 a `float2` position, 1 a
     /// normalized `uchar4` colour.
@@ -832,6 +840,14 @@ mod tests {
 
     /// A fragment function that returns the interpolated colour.
     const COLOR: &[u8] = include_bytes!("../../../../tests/shaders/render_color.metallib");
+
+    /// A fragment function that reaches a texture beyond its slots: it writes `(1, 0, 1, 1)` to
+    /// texel `(0, 0)` of the texture whose resource ID the argument buffer at fragment buffer 0
+    /// holds, and returns opaque green.
+    const ARGWRITE: &[u8] = include_bytes!("../../../../tests/shaders/render_argwrite.metallib");
+
+    /// A kernel that writes each texel of texture 0 its grid reaches (`tex_write`).
+    const TEXWRITE: &[u8] = include_bytes!("../../../../tests/shaders/compute_texwrite.metallib");
 
     /// `MTLPrimitiveTypeTriangle`.
     const TRIANGLE: u64 = 3;
@@ -919,33 +935,23 @@ mod tests {
         made.status()
     }
 
-    /// Render encoders clear, load and store their pass's attachment, and draw through a
-    /// pipeline state and a vertex buffer bound to them; what rt has no form of is counted as
-    /// its piece, what Metal's validation stops as Metal's refusal, and the command buffer still
-    /// completes.
-    #[test]
-    fn render_encoders_on_vulkan() {
-        let platform = RtPlatform::new();
-        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
-        let on = OnFault::Return;
-        let queue = device.new_command_queue().expect("a command queue");
-        let made = || {
-            let made = queue.command_buffer(on).expect("never a raise");
-            made.expect("a command buffer")
-        };
-        let done = CommandBufferStatus::COMPLETED;
-        let metal = RtRefusal::Refused.code();
-        let function = |bytes: &[u8], name: &str| {
-            let library = device.new_library(bytes).expect("never a raise");
-            let library = library.expect("a metallib").expect("a library");
-            let made = library.new_function(on, name).expect("never a raise");
-            made.expect("a function of the table")
-        };
-        let (vdesc, color) = (
-            function(VDESC, "render_vdesc"),
-            function(COLOR, "render_color"),
-        );
-        let mut desc = FullRenderPipelineDesc::new(&vdesc, Some(&color));
+    /// The function `name` of the metallib `bytes`, made on `device`.
+    fn function(device: &RtObj<RtDevice>, bytes: &[u8], name: &str) -> RtObj<RtFunction> {
+        let library = device.new_library(bytes).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let made = library.new_function(OnFault::Return, name);
+        made.expect("never a raise").expect("a function of the table")
+    }
+
+    /// The state of `render_vdesc` and `fragment` on `device`, into one `RGBA8Unorm` colour
+    /// attachment: its vertex descriptor reads a `float2` position at byte 0 and a normalized
+    /// `uchar4` colour at byte 8 of each 12 bytes of buffer 0.
+    fn vdesc_state(
+        device: &RtObj<RtDevice>,
+        fragment: &RtObj<RtFunction>,
+    ) -> RtObj<RtRenderPipeline> {
+        let vdesc = function(device, VDESC, "render_vdesc");
+        let mut desc = FullRenderPipelineDesc::new(&vdesc, Some(fragment));
         desc.vertex_descriptor = Some(VertexDesc {
             layouts: vec![BufferLayoutDesc {
                 buffer_index: 0,
@@ -976,22 +982,46 @@ mod tests {
             },
         )];
         let state = device.new_render_pipeline_state_full(&desc);
-        let state = state.expect("a render state").expect("a render state");
+        state.expect("a render state").expect("a render state")
+    }
 
-        // One green triangle over the whole target: (-1, -1), (3, -1), (-1, 3).
+    /// One opaque green triangle over the whole of a target, (-1, -1), (3, -1), (-1, 3), in a
+    /// Shared buffer of `device` that [`vdesc_state`]'s vertex descriptor reads.
+    fn triangle(device: &RtObj<RtDevice>) -> RtObj<RtBuffer> {
         let mut vertices = Vec::new();
         for (x, y) in [(-1.0f32, -1.0f32), (3.0, -1.0), (-1.0, 3.0)] {
             vertices.extend_from_slice(&x.to_le_bytes());
             vertices.extend_from_slice(&y.to_le_bytes());
             vertices.extend_from_slice(&[0, 255, 0, 255]);
         }
-        let buffer = device.new_buffer_of_length(on, vertices.len().to_u64(), 0);
+        let buffer = device.new_buffer_of_length(OnFault::Return, vertices.len().to_u64(), 0);
         let buffer = buffer.expect("never a raise").expect("a buffer");
         // SAFETY: the Shared buffer's contents are mapped, `vertices` long.
         unsafe {
             let at = buffer.contents().as_ptr::<u8>();
             at.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
         }
+        buffer
+    }
+
+    /// Render encoders clear, load and store their pass's attachment, and draw through a
+    /// pipeline state and a vertex buffer bound to them; what rt has no form of is counted as
+    /// its piece, what Metal's validation stops as Metal's refusal, and the command buffer still
+    /// completes.
+    #[test]
+    fn render_encoders_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let done = CommandBufferStatus::COMPLETED;
+        let metal = RtRefusal::Refused.code();
+        let state = vdesc_state(&device, &function(&device, COLOR, "render_color"));
+        let buffer = triangle(&device);
         let target = device.new_texture(
             on,
             &platform.texture_descriptor(&TextureDesc {
@@ -1149,6 +1179,11 @@ mod tests {
                 resources: &[None],
                 usage: 1,
             },
+            RenderCmd::UseResourcesStages {
+                resources: &[Some(ResourceRef::Buffer(&buffer))],
+                usage: 8,
+                stages: 2,
+            },
             RenderCmd::SetTessellationFactorScale { scale: 2.0 },
             RenderCmd::SetTessellationFactorScale { scale: 1.0 },
             RenderCmd::SetRenderPipelineState {
@@ -1170,7 +1205,7 @@ mod tests {
         for cmd in cmds {
             assert_eq!(encoder.encode(on, cmd), Ok(()));
         }
-        assert_eq!(counted(metal), before + 7);
+        assert_eq!(counted(metal), before + 8);
         assert_eq!(counted(unbuilt), unbuilt_before + 4);
         assert_eq!(counted(pass_unbuilt), pass_before + 2);
         assert_eq!(counted(scale), scale_before + 1);
@@ -1248,5 +1283,247 @@ mod tests {
         let refused = made().render_encoder(on, &pass(resolve, None));
         assert!(matches!(refused, Ok(None)));
         assert_eq!(counted(metal), before + 1);
+    }
+
+    /// The draw commands of `state` over the triangle at vertex buffer 0, with `argument` at
+    /// fragment buffer 0.
+    fn drawn<'a>(
+        state: &'a RtObj<RtRenderPipeline>,
+        vertices: &'a RtObj<RtBuffer>,
+        argument: &'a RtObj<RtBuffer>,
+    ) -> [RenderCmd<'a, RtPlatform>; 4] {
+        [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(state),
+            },
+            RenderCmd::SetVertexBuffer {
+                buffer: Some(vertices),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::SetFragmentBuffer {
+                buffer: Some(argument),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: TRIANGLE,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+        ]
+    }
+
+    /// A render encoder's `useResources:` reaches rt: once it declares a write of a texture with
+    /// no storage element, a draw whose fragment function writes a texture beyond its slots
+    /// (through an argument buffer) is rt's refusal, which draws nothing and is counted under
+    /// `rt-refused-gap`, as the compute encoder's dispatch of a kernel that writes the same
+    /// texture at a slot is, and exactly where that dispatch is. The same draw before the
+    /// declaration, after a declaration for reading alone, and after a declared write of a
+    /// texture with a storage element draws, and so does a draw of a function that reaches no
+    /// texture beyond its slots after the declared write.
+    #[test]
+    fn a_draw_after_a_declared_write_of_a_texture_with_no_storage_element_is_refused_on_vulkan() {
+        // `MTLResourceUsageRead`, `MTLResourceUsageWrite` and `MTLRenderStageFragment`.
+        const READ: u64 = 1;
+        const WRITE: u64 = 2;
+        const FRAGMENT: u64 = 2;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let done = CommandBufferStatus::COMPLETED;
+        let gap = RtRefusal::Gap.code();
+        let texture = |desc: TextureDesc| {
+            let made = device.new_texture(on, &platform.texture_descriptor(&desc));
+            made.expect("never a raise").expect("a texture")
+        };
+        let writing = vdesc_state(&device, &function(&device, ARGWRITE, "render_argwrite"));
+        let plain = vdesc_state(&device, &function(&device, COLOR, "render_color"));
+        let tex_write = {
+            let kernel = function(&device, TEXWRITE, "tex_write");
+            let made = device.new_compute_pipeline_state_for_function(Some(&kernel));
+            made.expect("a compute state").expect("a compute state")
+        };
+        let vertices = triangle(&device);
+        let target = texture(TextureDesc {
+            width: 4,
+            height: 4,
+            usage: 5,
+            ..TextureDesc::default()
+        });
+        let drawn_into = || {
+            let mut texels = [0u8; 64];
+            target.read_pixels(&mut texels, 16);
+            texels
+        };
+        let every = |texel: [u8; 4]| -> [u8; 64] { std::array::from_fn(|i| texel[i % 4]) };
+        let (red, green) = (every([255, 0, 0, 255]), every([0, 255, 0, 255]));
+        // A new 1 x 1 Shared `RGBA8Unorm` texture of shader-read and shader-write usage, which
+        // reads zero, and a Shared argument buffer of its resource ID.
+        let fresh = || {
+            let written = texture(TextureDesc {
+                usage: 3,
+                resource_options: Some(0),
+                ..TextureDesc::default()
+            });
+            let argument = device.new_buffer_of_length(on, 8, 0);
+            let argument = argument.expect("never a raise").expect("a buffer");
+            let id = written.gpu_resource_id().to_le_bytes();
+            // SAFETY: the Shared buffer's contents are mapped, 8 bytes long.
+            unsafe {
+                let at = argument.contents().as_ptr::<u8>();
+                at.copy_from_nonoverlapping(id.as_ptr(), id.len());
+            }
+            (written, argument)
+        };
+        let texel = |written: &RtObj<RtTexture>| {
+            let mut texel = [0u8; 4];
+            written.read_pixels(&mut texel, 4);
+            texel
+        };
+        let magenta = [255, 0, 255, 255];
+        // Whether the compute encoder's dispatch of `tex_write` with `t` at texture 0 is rt's
+        // gap: a texture with no storage element.
+        let stores_none = |t: &RtObj<RtTexture>| {
+            let before = counted(gap);
+            let commands = made();
+            let encoder = commands.compute_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a compute encoder");
+            let cmds = [
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&tex_write),
+                },
+                ComputeCmd::SetTexture {
+                    texture: Some(t),
+                    index: 0,
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: MtlSize::new(4, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(4, 1, 1),
+                },
+                ComputeCmd::EndEncoding,
+            ];
+            for cmd in cmds {
+                assert_eq!(encoder.encode(on, cmd), Ok(()));
+            }
+            assert_eq!(commands.commit(on), Ok(()));
+            assert_eq!(commands.wait_until_completed(on), Ok(()));
+            assert_eq!(commands.status(), done);
+            match counted(gap) - before {
+                0 => false,
+                1 => true,
+                n => panic!("{n} gaps counted for one dispatch"),
+            }
+        };
+
+        // `RGBA8Unorm`, `RGBA8Unorm_sRGB`, `BGRA8Unorm_sRGB` and `A8Unorm`, 4 x 1, Private, of
+        // shader-read and shader-write usage.
+        let mut refused = Vec::new();
+        for format in [70, 71, 81, 1] {
+            let candidate = texture(TextureDesc {
+                pixel_format: format,
+                width: 4,
+                usage: 3,
+                resource_options: Some(0x20),
+                ..TextureDesc::default()
+            });
+            let unstored = stores_none(&candidate);
+            let declared = [Some(ResourceRef::Texture(&candidate))];
+
+            // A declared write, then the draw: rt's gap where the texture has no storage
+            // element, drawing nothing and writing nothing; drawn elsewhere.
+            let (written, argument) = fresh();
+            let declared_written = [Some(ResourceRef::Texture(&written))];
+            let before = counted(gap);
+            let mut cmds = vec![
+                RenderCmd::UseResources {
+                    resources: &declared_written,
+                    usage: WRITE,
+                },
+                RenderCmd::UseResourcesStages {
+                    resources: &declared,
+                    usage: WRITE,
+                    stages: FRAGMENT,
+                },
+            ];
+            cmds.extend(drawn(&writing, &vertices, &argument));
+            assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
+            assert_eq!(counted(gap), before + u64::from(unstored), "{format}");
+            let (drawn_texels, written_texel) = match unstored {
+                true => (red, [0; 4]),
+                false => (green, magenta),
+            };
+            assert_eq!(drawn_into(), drawn_texels, "{format}");
+            assert_eq!(texel(&written), written_texel, "{format}");
+
+            // Declared for reading alone, beside a buffer: the draw draws.
+            let (written, argument) = fresh();
+            let declared_written = [Some(ResourceRef::Texture(&written))];
+            let read = [
+                Some(ResourceRef::Buffer(&argument)),
+                Some(ResourceRef::Texture(&candidate)),
+            ];
+            let before = counted(gap);
+            let mut cmds = vec![
+                RenderCmd::UseResources {
+                    resources: &declared_written,
+                    usage: WRITE,
+                },
+                RenderCmd::UseResources {
+                    resources: &read,
+                    usage: READ,
+                },
+            ];
+            cmds.extend(drawn(&writing, &vertices, &argument));
+            assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
+            assert_eq!(counted(gap), before, "{format}");
+            assert_eq!(drawn_into(), green, "{format}");
+            assert_eq!(texel(&written), magenta, "{format}");
+
+            // The draw before a declared write draws; the same draw after it is rt's gap where
+            // the texture has no storage element.
+            let (written, argument) = fresh();
+            let declared_written = [Some(ResourceRef::Texture(&written))];
+            let before = counted(gap);
+            let mut cmds = vec![RenderCmd::UseResources {
+                resources: &declared_written,
+                usage: WRITE,
+            }];
+            cmds.extend(drawn(&writing, &vertices, &argument));
+            cmds.push(RenderCmd::UseResources {
+                resources: &declared,
+                usage: WRITE,
+            });
+            cmds.push(RenderCmd::DrawPrimitives {
+                primitive_type: TRIANGLE,
+                vertex_start: 0,
+                vertex_count: 3,
+            });
+            assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
+            assert_eq!(counted(gap), before + u64::from(unstored), "{format}");
+            assert_eq!(drawn_into(), green, "{format}");
+            assert_eq!(texel(&written), magenta, "{format}");
+
+            // After a declared write, a draw of a function that reaches no texture beyond its
+            // slots draws.
+            let before = counted(gap);
+            let mut cmds = vec![RenderCmd::UseResources {
+                resources: &declared,
+                usage: WRITE,
+            }];
+            cmds.extend(drawn(&plain, &vertices, &argument));
+            assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
+            assert_eq!(counted(gap), before, "{format}");
+            assert_eq!(drawn_into(), green, "{format}");
+            if unstored {
+                refused.push(format);
+            }
+        }
+        eprintln!("the pixel formats a declared write refused draws after: {refused:?}");
     }
 }
