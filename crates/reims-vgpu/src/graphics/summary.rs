@@ -1,5 +1,5 @@
 //! The host's summary of each ten seconds in its log, for the walks that time a guest's frames.
-//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes four lines of
+//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes five lines of
 //! what the period held. Each line starts with its stamp: the host's wall time (`CLOCK_REALTIME`,
 //! seconds since the Unix epoch to the millisecond) and the trace's clock in nanoseconds
 //! (`reims_vgpu_vulkan::core::trace::now`, rt's host clock, which `cbdone` and the trace's other
@@ -16,14 +16,18 @@
 //!   time, and the CPU time inside its `vkCreateSwapchainKHR` calls, each with its count, its time
 //!   in all and the longest (the waits with no count: one a present).
 //! - **rt**: rt's part (`reims_vgpu_vulkan::rt_platform::summary`), once its device is made.
+//! - **Managed**: the ranges of `Managed` buffers the host carried out, the app's range messages
+//!   and their bytes apart from the upload chunks of `set*Bytes:` data that command buffers' own
+//!   streams name, their bytes and those buffers ([`managed`], whose doc says what each counts).
 //! - **Waits**: our waits of 5 ms or more, by name, each with its count, its time in all and the
 //!   longest (`reims_vgpu_vulkan::core::long_waits`, whose doc names them).
 //!
-//! - **Asked for by name**: [`start`] turns the summary on, and the long waits' and the window's
-//!   times' counting, only where `REIMS_VGPU_LOG` names the target itself at debug as the first
-//!   decoder is made (`reims_vgpu_vulkan::core::logging::names`), as `decode::work` does, and
-//!   makes its thread then.
-//! - **Off**, a present's answer costs one relaxed load, and so do a wait and a window's call.
+//! - **Asked for by name**: [`start`] turns the summary on, and the long waits', the window's
+//!   times' and the `Managed` ranges' counting, only where `REIMS_VGPU_LOG` names the target
+//!   itself at debug as the first decoder is made (`reims_vgpu_vulkan::core::logging::names`), as
+//!   `decode::work` does, and makes its thread then.
+//! - **Off**, a present's answer costs one relaxed load, and so do a wait, a window's call and a
+//!   `Managed` range.
 //!
 //! A diagnostic: which lines the host writes is free under the contract.
 
@@ -37,6 +41,8 @@ use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline, MonoTime, WallTime};
 use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::rt_platform::window_times;
+
+pub(crate) mod managed;
 
 /// The log target of the lines, at debug, which the filter names to start them ([`start`]).
 pub(crate) const TARGET: &str = "reims_vgpu::summary";
@@ -98,6 +104,7 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
                         Some(presents_part(over, &mut presents)),
                         Some(window_times::line(&window_times::take())),
                         rt.take(),
+                        Some(managed::line(&managed::take())),
                         Some(waits_part(&long_waits::take())),
                     ];
                     for part in parts.into_iter().flatten() {
@@ -112,6 +119,7 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
         if made.is_ok() {
             long_waits::count();
             window_times::count();
+            managed::count();
             ON.store(true, Ordering::Relaxed);
         }
     });

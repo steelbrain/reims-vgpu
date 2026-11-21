@@ -660,8 +660,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `BUFFER_DID_MODIFY_RANGE`: the platform's `didModifyRange:` of the range, which brings it
     /// from the CPU copy to the GPU's where the buffer is two copies, after the context's buffers
     /// answered before it are committed ([`Self::after_submitted`], which `drain` is held
-    /// through). A bad reference for an object that is no `Managed` buffer; malformed for a range
-    /// past it: both found here.
+    /// through), counted among the app's ranges once carried out (`summary::managed`). A bad
+    /// reference for an object that is no `Managed` buffer; malformed for a range past it: both
+    /// found here.
     pub(super) fn did_modify_range(
         &self,
         message: &[u8],
@@ -689,7 +690,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let buffer = buffer.clone_ref();
         self.after_submitted("BUFFER_DID_MODIFY_RANGE", m.obj_id, drain, move || {
-            buffer.did_modify_range(OnFault::Return, NsRange::new(m.location, m.length))
+            buffer.did_modify_range(OnFault::Return, NsRange::new(m.location, m.length))?;
+            super::super::summary::managed::range_carried_out(m.length);
+            Ok(())
         });
         Ok(Ok(()))
     }
@@ -702,8 +705,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// buffer, or of bytes past one, is dropped (logged once), and so is one the platform raises
     /// at (logged), as a range message the host refuses or cannot carry out is, and the buffer
     /// runs, as it would behind such a message, the same whether or not it was answered at its
-    /// doorbell before its begin.
+    /// doorbell before its begin. The records carried out are counted as the buffer's upload
+    /// chunks (`summary::managed`).
     pub(super) fn uploads_written(&self, written: &[RgfxUploadWritten]) {
+        let (mut chunks, mut bytes) = (0, 0);
         for w in written {
             if let Some(ObjHandle::Refused(r)) = self.named(w.buffer_obj_id) {
                 r.used(w.buffer_obj_id);
@@ -724,14 +729,19 @@ impl<P: Platform> GraphicsDecoder<P> {
                 continue;
             }
             let (obj_id, range) = (w.buffer_obj_id, NsRange::new(0, w.length));
-            if let Err(raise) = refusing(|| buffer.did_modify_range(OnFault::Return, range)) {
-                log::warn!(
+            match refusing(|| buffer.did_modify_range(OnFault::Return, range)) {
+                Ok(()) => {
+                    chunks += 1;
+                    bytes += w.length;
+                }
+                Err(raise) => log::warn!(
                     target: "reims_vgpu::graphics", kind:% = raise;
                     "UPLOADS_WRITTEN of object {obj_id:#x} was not carried out: the platform \
                      raised ({raise:?})"
-                );
+                ),
             }
         }
+        super::super::summary::managed::uploads_carried_out(chunks, bytes);
     }
 
     /// Whether a `Managed` object `name` makes may take the CPU copy that lies over `span` (its
@@ -1389,6 +1399,68 @@ mod tests {
             assert!(r.dec.managed_copy(10).is_none() && r.dec.object_count() == 1);
             assert!(!r.dec.span_in_use(at, 0x100));
         }
+    }
+
+    /// The summary's `Managed` part counts what the platform's `didModifyRange:` carried out by
+    /// who named it: each app's range message with its bytes, apart from the chunks of a command
+    /// buffer's `UPLOADS_WRITTEN`, their bytes and the buffers that named at least one. A range or
+    /// record the host refuses, drops or skips, or whose call the platform raised at, counts in
+    /// neither, and a take counts from none again.
+    #[test]
+    fn the_summary_counts_the_app_s_ranges_apart_from_the_upload_chunks() {
+        use super::super::super::summary::managed::{self, Period};
+
+        managed::count();
+        let mut r = rig(false);
+        assert_eq!(r.buffer(10, BLOCKS, 0x1000, MANAGED), Ok(()));
+        assert_eq!(r.buffer(11, BLOCKS + 0x1000, 0x1000, MANAGED), Ok(()));
+        assert_eq!(r.buffer(12, BLOCKS + 0x2000, 0x1000, 0), Ok(()));
+        let raise = || Step::raise("NSInternalInconsistencyException", "scripted");
+
+        // The app's: two carried out; one past its buffer, a Shared buffer's and no object's
+        // refused; one the platform raises at.
+        assert_eq!(r.modified(10, 0x40, 0x10), Ok(()));
+        assert_eq!(r.modified(11, 0, 0x800), Ok(()));
+        assert_eq!(r.modified(10, 0xff8, 0x10), Err(DecodeError::Malformed));
+        assert_eq!(r.modified(12, 0, 0x10), Err(DecodeError::BadReference));
+        assert_eq!(r.modified(13, 0, 0x10), Err(DecodeError::BadReference));
+        r.p.script().push("didModifyRange:", raise());
+        assert_eq!(r.modified(10, 0, 0x20), Ok(()));
+
+        // A buffer's records: two carried out beside a Shared buffer's, one past its buffer and
+        // one of no bytes, all dropped or skipped.
+        let w = |buffer_obj_id, length| RgfxUploadWritten {
+            buffer_obj_id,
+            length,
+        };
+        r.dec.uploads_written(&[
+            w(10, 0x110),
+            w(12, 0x10),
+            w(11, 0x1000),
+            w(10, 0x1001),
+            w(11, 0),
+        ]);
+        // Buffers that carried out no chunk: none named, one whose record is no object's, and one
+        // whose one call the platform raises at.
+        r.dec.uploads_written(&[]);
+        r.dec.uploads_written(&[w(13, 0x10)]);
+        r.p.script().push("didModifyRange:", raise());
+        r.dec.uploads_written(&[w(10, 0x100)]);
+
+        let sels = r.p.call_log().sels();
+        let made = sels.iter().filter(|sel| **sel == "didModifyRange:").count();
+        assert_eq!(made, 2 + 1 + 2 + 1, "the platform's calls, those it raised at among them");
+        assert_eq!(
+            managed::take(),
+            Period {
+                app_ranges: 2,
+                app_range_bytes: 0x10 + 0x800,
+                upload_buffers: 1,
+                chunks: 2,
+                chunk_bytes: 0x110 + 0x1000,
+            }
+        );
+        assert_eq!(managed::take(), Period::default(), "counted from none again");
     }
 
     /// On a platform that keeps a pin only inside a block it knows, each buffer and heap a guest's
