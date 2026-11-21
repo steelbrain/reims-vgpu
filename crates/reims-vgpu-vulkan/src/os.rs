@@ -13,8 +13,12 @@
 //!
 //! A display's window presents through a swapchain over the window system's Vulkan extensions
 //! (`wsi.rs`), each OS naming its own surface extensions. The user's cache directory, where the
-//! library keeps what later processes reuse, is each OS's own too ([`user_cache_directory`]).
+//! library keeps what later processes reuse, is each OS's own too ([`user_cache_directory`]), and
+//! so is how a pipeline compile's helper process is capped and ended (`compile_helper.rs`).
 
+/// Pipeline compiles in a helper process, capped and ended with the library's process
+/// (`os/compile_helper.rs`).
+pub(crate) mod compile_helper;
 #[cfg(any(target_os = "linux", windows))]
 mod files;
 #[cfg(unix)]
