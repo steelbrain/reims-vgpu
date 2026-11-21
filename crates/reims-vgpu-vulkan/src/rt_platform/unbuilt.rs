@@ -86,9 +86,10 @@ pub enum Unbuilt {
     FillTexture,
     /// What of blits rt has no form of but [`Unbuilt::FillTexture`]: a fill of a texture's region
     /// with a colour (`fillTexture:level:slice:region:color:pixelFormat:`), a fill of a buffer with
-    /// a 4-byte pattern of more than one byte value (`fillBuffer:range:pattern4:`), and a copy with
-    /// blit options (`MTLBlitOption`: a depth or stencil plane of a combined format, PVRTC rows).
-    /// Each encodes nothing.
+    /// a 4-byte pattern of more than one byte value (`fillBuffer:range:pattern4:`), a copy between
+    /// textures with blit options, and a copy between a buffer and a texture with blit options
+    /// other than one plane of depth and stencil (`MTLBlitOption`: PVRTC rows, or more than one
+    /// option). Each encodes nothing.
     Blit,
     /// A render pass descriptor's properties rt's pass has no field of: imageblock and threadgroup
     /// memory lengths, tile sizes and sample positions. A set of one other than Metal's default

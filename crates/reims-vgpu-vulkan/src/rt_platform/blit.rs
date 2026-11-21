@@ -5,6 +5,12 @@
 //!   fills, mipmap generation, synchronizes of Managed resources and fences are rt's. A copy of
 //!   whole slices and levels (`copyFromTexture:sourceSlice:sourceLevel:toTexture:...sliceCount:
 //!   levelCount:`) is one rt copy of each level of each slice, the level's whole extent.
+//! - **A plane's copy**: a copy between a buffer and a texture of the blit option of one plane
+//!   (`MTLBlitOptionDepthFromDepthStencil`, `MTLBlitOptionStencilFromDepthStencil`) is rt's copy
+//!   of that aspect alone, 4 bytes a texel of `Depth32Float_Stencil8`'s depth and 1 of a stencil.
+//!   rt refuses a copy into a 32-bit float depth (`Gap::FloatDepthUpload`), and a plane option of
+//!   a format without its aspect, no option of a format of depth and stencil both and a plane
+//!   option of a multisample texture (`Gap::TextureBytes`), each counted (`rt-refused-gap`).
 //! - **`synchronizeTexture:slice:level:`** synchronizes the whole texture, rt's one form: the
 //!   other slices' and levels' bytes the host reads take the GPU's too, which for a Managed
 //!   texture whose host writes reached the GPU (`replaceRegion`, `didModifyRange`) are the
@@ -14,7 +20,9 @@
 //!   lossless compression whose contents an invalidate would drop).
 //! - **Unbuilt**: a fill of a texture with bytes ([`Unbuilt::FillTexture`]); a fill of a
 //!   texture with a colour, a fill of a buffer with a 4-byte pattern of more than one byte value,
-//!   and a copy with blit options ([`Unbuilt::Blit`]). Each encodes nothing, counted.
+//!   a copy between textures with blit options, and a copy between a buffer and a texture with
+//!   blit options other than one plane's (`MTLBlitOptionRowLinearPVRTC`, as rt makes no PVRTC
+//!   texture, or more than one option) ([`Unbuilt::Blit`]). Each encodes nothing, counted.
 //! - **The guest's RAM** is copied by no blit: the device copies none
 //!   (`GpuDevice::copies_guest_ram`), so each copy of it answers false.
 //!
@@ -219,10 +227,22 @@ fn layout(offset: u64, bytes_per_row: u64, bytes_per_image: u64) -> rt::BufferLa
     }
 }
 
-/// `Ok` for no blit options; [`Unbuilt::Blit`] for any.
-fn no_options(options: u64) -> Result<(), Stop> {
+/// `MTLBlitOptionNone`, the option of the copies between a buffer and a texture without one.
+const NONE: rt::BlitOption = rt::BlitOption::None;
+
+/// `MTLBlitOptionDepthFromDepthStencil`.
+const DEPTH_FROM_DEPTH_STENCIL: u64 = 1 << 0;
+
+/// `MTLBlitOptionStencilFromDepthStencil`.
+const STENCIL_FROM_DEPTH_STENCIL: u64 = 1 << 1;
+
+/// rt's option of a copy between a buffer and a texture of `MTLBlitOption` `options`: none, or
+/// one plane of depth and stencil; [`Unbuilt::Blit`] for any other.
+fn blit_option(options: u64) -> Result<rt::BlitOption, Stop> {
     match options {
-        0 => Ok(()),
+        0 => Ok(rt::BlitOption::None),
+        DEPTH_FROM_DEPTH_STENCIL => Ok(rt::BlitOption::DepthFromDepthStencil),
+        STENCIL_FROM_DEPTH_STENCIL => Ok(rt::BlitOption::StencilFromDepthStencil),
         _ => Err(Stop::Unbuilt(Unbuilt::Blit)),
     }
 }
@@ -286,10 +306,10 @@ fn copy_texture(
 }
 
 /// rt's copy of `size` texels between the buffer `buffer`, laid out as `lies`, and `texture` at
-/// `place`, for `sel`: from the buffer into the texture where `into` holds, else from the texture
-/// into the buffer. A copy rt refuses names its kind, the texture and its place and the buffer's
-/// layout in the process's first line of its kind ([`super::unbuilt::refusal_detail`]), and is
-/// counted with the command ([`report`]).
+/// `place`, of the aspect `option` names, for `sel`: from the buffer into the texture where
+/// `into` holds, else from the texture into the buffer. A copy rt refuses names its kind, the
+/// texture and its place and the buffer's layout in the process's first line of its kind
+/// ([`super::unbuilt::refusal_detail`]), and is counted with the command ([`report`]).
 fn copy_bytes(
     e: &mut rt::BlitCommandEncoder,
     sel: &'static str,
@@ -297,11 +317,12 @@ fn copy_bytes(
     size: [u32; 3],
     (texture, place): (&RtTexture, rt::TexturePlace),
     into: bool,
+    option: rt::BlitOption,
 ) -> Result<(), Stop> {
     let copied = if into {
-        e.copy_from_buffer(buffer, lies, size, texture.rt(), place)
+        e.copy_from_buffer_with_options(buffer, lies, size, texture.rt(), place, option)
     } else {
-        e.copy_from_texture_to_buffer(texture.rt(), place, size, buffer, lies)
+        e.copy_from_texture_to_buffer_with_options(texture.rt(), place, size, buffer, lies, option)
     };
     copied.map_err(|error| {
         let (texture, buffer) = (Copied::of(texture, place), Copied::Buffer(lies));
@@ -471,7 +492,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             let lies = layout(source_offset, source_bytes_per_row, source_bytes_per_image);
             let (source, destination) = (source_buffer.rt(), destination_texture);
             let size = size(source_size)?;
-            copy_bytes(e, sel, (source, lies), size, (destination, to), true)?;
+            copy_bytes(e, sel, (source, lies), size, (destination, to), true, NONE)?;
         }
         BlitCmd::CopyBufferToTextureOptions {
             source_buffer,
@@ -488,12 +509,12 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             let (Some(source), Some(destination)) = (source_buffer, destination_texture) else {
                 return Err(NIL);
             };
-            no_options(options)?;
+            let option = blit_option(options)?;
             let to = place(destination_slice, destination_level, destination_origin)?;
             let lies = layout(source_offset, source_bytes_per_row, source_bytes_per_image);
             let (source, destination) = (source.rt(), destination);
             let size = size(source_size)?;
-            copy_bytes(e, sel, (source, lies), size, (destination, to), true)?;
+            copy_bytes(e, sel, (source, lies), size, (destination, to), true, option)?;
         }
         BlitCmd::CopyBufferToBuffer {
             source_buffer,
@@ -530,7 +551,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             );
             let (source, destination) = (source_texture, destination_buffer.rt());
             let size = size(source_size)?;
-            copy_bytes(e, sel, (destination, lies), size, (source, from), false)?;
+            copy_bytes(e, sel, (destination, lies), size, (source, from), false, NONE)?;
         }
         BlitCmd::CopyTextureToBufferOptions {
             source_texture,
@@ -547,7 +568,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             let (Some(source), Some(destination)) = (source_texture, destination_buffer) else {
                 return Err(NIL);
             };
-            no_options(options)?;
+            let option = blit_option(options)?;
             let from = place(source_slice, source_level, source_origin)?;
             let lies = layout(
                 destination_offset,
@@ -556,7 +577,7 @@ fn encode(e: &mut rt::BlitCommandEncoder, cmd: BlitCmd<'_, RtPlatform>) -> Resul
             );
             let (source, destination) = (source, destination.rt());
             let size = size(source_size)?;
-            copy_bytes(e, sel, (destination, lies), size, (source, from), false)?;
+            copy_bytes(e, sel, (destination, lies), size, (source, from), false, option)?;
         }
         BlitCmd::CopyTextureRegion {
             source_texture,
@@ -903,6 +924,150 @@ mod tests {
                 destination_bytes_per_image: row * extent,
             }
         }
+    }
+
+    /// A copy of the 4 x 4 texels of level 0 and slice 0 of `texture`'s plane that `options` names
+    /// between it and `buffer`, rows `row` bytes apart: into the texture where `up`, else out of
+    /// it.
+    fn plane<'a>(
+        up: bool,
+        buffer: &'a RtObj<RtBuffer>,
+        texture: &'a RtObj<RtTexture>,
+        (row, options): (u64, u64),
+    ) -> BlitCmd<'a, RtPlatform> {
+        let (size, origin) = (MtlSize::new(4, 4, 1), MtlOrigin::default());
+        if up {
+            BlitCmd::CopyBufferToTextureOptions {
+                source_buffer: Some(buffer),
+                source_offset: 0,
+                source_bytes_per_row: row,
+                source_bytes_per_image: row * 4,
+                source_size: size,
+                destination_texture: Some(texture),
+                destination_slice: 0,
+                destination_level: 0,
+                destination_origin: origin,
+                options,
+            }
+        } else {
+            BlitCmd::CopyTextureToBufferOptions {
+                source_texture: Some(texture),
+                source_slice: 0,
+                source_level: 0,
+                source_origin: origin,
+                source_size: size,
+                destination_buffer: Some(buffer),
+                destination_offset: 0,
+                destination_bytes_per_row: row,
+                destination_bytes_per_image: row * 4,
+                options,
+            }
+        }
+    }
+
+    /// Copies between a buffer and a `Depth32Float_Stencil8` texture of one plane's blit option
+    /// move that plane alone: after a pass clears the depth to 0.25 and the stencil to 0x5a, the
+    /// depth reads back as 0.25, 4 bytes a texel, and the stencil as 0x5a, 1 byte a texel; a
+    /// stencil written from a buffer reads back as written, the depth unchanged. A copy into the
+    /// float depth is rt's gap, and one of `MTLBlitOptionRowLinearPVRTC` unbuilt, each counted and
+    /// copying nothing.
+    #[test]
+    fn plane_copies_on_vulkan() {
+        use crate::core::platform::descriptor::RenderPassDescriptor as _;
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+        use crate::rt_platform::PassFields;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let done = CommandBufferStatus::COMPLETED;
+        let (gap, unbuilt) = (RtRefusal::Gap.code(), Unbuilt::Blit.code());
+        let before = (counted(gap), counted(unbuilt));
+        let buffer = |bytes: &[u8]| {
+            let made = device.new_buffer_of_length(on, bytes.len().to_u64(), 0);
+            let made = made.expect("never a raise").expect("a buffer");
+            write(&made, bytes);
+            made
+        };
+        // `Depth32Float_Stencil8`, render target usage, Private.
+        let both = device.new_texture(
+            on,
+            &platform.texture_descriptor(&TextureDesc {
+                pixel_format: 260,
+                width: 4,
+                height: 4,
+                usage: 4,
+                resource_options: Some(0x20),
+                ..TextureDesc::default()
+            }),
+        );
+        let both = both.expect("never a raise").expect("a texture");
+        let (depth, stencil) = ((16, DEPTH_FROM_DEPTH_STENCIL), (4, STENCIL_FROM_DEPTH_STENCIL));
+
+        // A pass that clears and stores both planes.
+        let pass = RtObj::new(PassFields::default());
+        pass.set_depth_attachment(&DepthAttachmentSet {
+            texture: Some(Some(&both)),
+            load_action: Some(2),
+            store_action: Some(1),
+            clear_depth: Some(0.25),
+            ..DepthAttachmentSet::default()
+        });
+        pass.set_stencil_attachment(&StencilAttachmentSet {
+            texture: Some(Some(&both)),
+            load_action: Some(2),
+            store_action: Some(1),
+            clear_stencil: Some(0x5a),
+            ..StencilAttachmentSet::default()
+        });
+        let made = queue.command_buffer(on).expect("never a raise");
+        let made = made.expect("a command buffer");
+        let encoder = made.render_encoder(on, &pass).expect("never a raise");
+        let encoder = encoder.expect("a render encoder");
+        assert_eq!(encoder.encode(on, RenderCmd::EndEncoding), Ok(()));
+        assert_eq!(made.commit(on), Ok(()));
+        assert_eq!(made.wait_until_completed(on), Ok(()));
+        assert_eq!(made.status(), done);
+
+        // Each plane out, into bytes no copy writes but its own.
+        let quarter: Vec<u8> = (0..16).flat_map(|_| 0.25f32.to_le_bytes()).collect();
+        let (depth_out, stencil_out) = (buffer(&[0xee; 64]), buffer(&[0xee; 16]));
+        let cmds = vec![
+            plane(false, &depth_out, &both, depth),
+            plane(false, &stencil_out, &both, stencil),
+        ];
+        assert_eq!(blit(&queue, cmds), done);
+        assert_eq!(read(&depth_out, 64), quarter);
+        assert_eq!(read(&stencil_out, 16), [0x5a; 16]);
+
+        // A stencil in, then both planes out again.
+        let written: Vec<u8> = (0..16).map(|i| 0x10 + i * 0x0b).collect();
+        let stencil_in = buffer(&written);
+        let (depth_out, stencil_out) = (buffer(&[0xee; 64]), buffer(&[0xee; 16]));
+        let cmds = vec![
+            plane(true, &stencil_in, &both, stencil),
+            plane(false, &depth_out, &both, depth),
+            plane(false, &stencil_out, &both, stencil),
+        ];
+        assert_eq!(blit(&queue, cmds), done);
+        assert_eq!(read(&depth_out, 64), quarter);
+        assert_eq!(read(&stencil_out, 16), written);
+        assert_eq!((counted(gap), counted(unbuilt)), before);
+
+        // A depth in, and PVRTC rows: nothing copied, counted.
+        let depth_in = buffer(&[0; 64]);
+        let (depth_out, stencil_out) = (buffer(&[0xee; 64]), buffer(&[0xee; 16]));
+        let cmds = vec![
+            plane(true, &depth_in, &both, depth),
+            plane(true, &stencil_in, &both, (4, 1 << 2)),
+            plane(false, &depth_out, &both, depth),
+            plane(false, &stencil_out, &both, stencil),
+        ];
+        assert_eq!(blit(&queue, cmds), done);
+        assert_eq!(read(&depth_out, 64), quarter);
+        assert_eq!(read(&stencil_out, 16), written);
+        assert_eq!((counted(gap), counted(unbuilt)), (before.0 + 1, before.1 + 1));
     }
 
     /// Blits on the GPU the test holds: buffer fills, a pattern of one byte value among them,
