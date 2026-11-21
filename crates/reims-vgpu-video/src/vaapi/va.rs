@@ -62,8 +62,8 @@ pub use d3d11::{PlaneDraw, PlaneTargets};
 pub use d3d12::SharedTexture;
 pub use display::{Display, Error};
 pub use encoder::{
-    EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, InputSurface,
-    UploadMethod, VideoEncoder, encoder_support,
+    EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, InputLayout,
+    InputSurface, UploadMethod, VideoEncoder, encoder_support,
 };
 pub use export::{ExportedPlane, SurfaceExport};
 pub use frame::{Frame, FrameHold, GuestWrites, PlaneRows, ReadBack};
@@ -72,5 +72,5 @@ pub use hevc::HevcDecoder;
 pub use import_check::{ImportWrite, ImportWrites};
 pub use libva::LoadError;
 pub use readback::{ReadbackTimes, ReadbackWay, read_back_by};
-pub use target::{Target, TargetFor, TargetFormat, TargetPlane, TargetShape};
+pub use target::{Target, TargetFor, TargetFormat, TargetPlane, TargetShape, TargetTiling};
 pub use target_check::{ALIGNMENT as TARGET_ALIGNMENT, TargetChecks, TargetCodec};

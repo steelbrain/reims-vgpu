@@ -1111,11 +1111,24 @@ picture: the first sample carries the record it belongs with, and
   31 and 191.9 on Phoenix, against 188.4 and 188.8 for PutImage (single
   runs, 2026-10-24).
 - **An imported input** (Unix). Another device's dma-buf, imported on the
-  encoder's display as a linear NV12 or P010 surface of its coded size
+  encoder's display as an NV12 or P010 surface of its coded size
   (`import_input`, through DRM PRIME, as a decode's targets are), takes
   a frame that device wrote, margin included, and `encode_target` codes
   it without reading the frame's planes. An import of another shape is
   refused, and a stalled frame's import is kept until its session ends.
+  The input is laid out as `input_layout` says: as the driver lays out its
+  own inputs where it lays them out in Intel's Y tiles, and linear
+  otherwise, at rows of the coded row's bytes rounded up to 256, the
+  chroma plane right after the coded rows. iHD's own inputs are in Y
+  tiles, and it codes a linear import's frames otherwise than their
+  upload: on an Iris Xe (iHD 26.3.5), H.264's P pictures at 640x360 and
+  smaller and every HEVC Main 10 picture differed, while a Y-tiled
+  import laid out as iHD's own coded as the upload did, byte for byte, in
+  every profile at five sizes up to 1080p, wherever two uploads coded the
+  same bytes (HEVC Main at 640x360 and 1080p differs from one upload to
+  the next). radeonsi's own inputs are in AMD's 64 KiB swizzle, and a
+  linear import codes as the upload does there. The measurements are in
+  `src/vaapi/va/encoder.rs`'s docs, "Imported inputs".
 
 ### API
 
@@ -1136,7 +1149,8 @@ let rest: Vec<Coded<Error>> = encoder.flush();             // more frames may fo
 encoder.configuration();                                   // avcC or hvcC in use
 encoder.set_rate_control(..)?; encoder.set_frame_rate(..)?; encoder.set_key_frame_interval(..);
 encoder_support(&display);                                 // the profiles the driver encodes
-let input = encoder.import_input(fd, size, planes, keep)?; // Unix: a dma-buf of input_shape()
+let layout = encoder.input_layout();                     // Unix: Y tiles on iHD, else linear
+let input = encoder.import_input(fd, size, planes, layout.tiling, keep)?; // a dma-buf of input_shape()
 encoder.encode_target(&input, &frame)?;                    // the frame another device wrote there
 ```
 

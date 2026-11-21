@@ -37,6 +37,13 @@
 //! - **An encoder's input** is imported the same way (`VideoEncoder::import_input`, of the
 //!   encoder's input shape): another device writes a frame into its memory, its margin to the
 //!   coded size filled, and the encoder codes the picture from it (`VideoEncoder::encode_target`).
+//!   It may be laid out in Intel's Y tiles instead ([`Target::import_as`]).
+//! - **Intel's Y tiles** ([`TargetTiling::IntelY`]): both planes at one pitch, a multiple of 128
+//!   bytes, the luma plane from a tile's first byte and the chroma plane a whole number of rows
+//!   of tiles after it, the surface declared as tall as the luma plane's rows to the chroma
+//!   plane's, at least the coded height, and the chroma plane's half as many rows, rounded up to
+//!   a row of tiles, in the dma-buf: as iHD lays out a surface of its own (the encoder's input,
+//!   `VideoEncoder::input_layout`).
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
@@ -100,6 +107,53 @@ pub struct TargetShape {
     /// The coded picture's width and height in luma samples: every row the hardware writes.
     pub coded: (u32, u32),
 }
+
+/// How a target's planes lay their samples out in its dma-buf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetTiling {
+    /// Each plane's rows one after another, its pitch apart (`DRM_FORMAT_MOD_LINEAR`).
+    Linear,
+    /// Intel's Y tiles (`I915_FORMAT_MOD_Y_TILED`, module docs): each plane in tiles of 4 KiB,
+    /// 128 bytes by 32 rows, its pitch over 128 of them to a row of tiles; a tile holds 8 columns
+    /// of 16 bytes by 32 rows, one after another, each column's rows 16 bytes apart.
+    IntelY,
+}
+
+impl TargetTiling {
+    /// The tiling a DRM format modifier names, where it is one of these.
+    pub fn of_modifier(modifier: u64) -> Option<TargetTiling> {
+        match modifier {
+            ffi::DRM_FORMAT_MOD_LINEAR => Some(TargetTiling::Linear),
+            ffi::I915_FORMAT_MOD_Y_TILED => Some(TargetTiling::IntelY),
+            _ => None,
+        }
+    }
+
+    /// Where byte `x` of row `y` of a plane laid out so lies, from the plane's first byte, its
+    /// rows `pitch` bytes apart: a whole number of tiles in Intel's Y tiles.
+    pub fn byte_at(self, pitch: u64, x: u64, y: u64) -> u64 {
+        match self {
+            TargetTiling::Linear => y * pitch + x,
+            TargetTiling::IntelY => {
+                let tile = (y / Y_TILE_ROWS) * (pitch / Y_TILE_WIDTH) + x / Y_TILE_WIDTH;
+                let column = (x % Y_TILE_WIDTH) / Y_COLUMN_WIDTH;
+                tile * Y_TILE_BYTES
+                    + column * Y_COLUMN_WIDTH * Y_TILE_ROWS
+                    + (y % Y_TILE_ROWS) * Y_COLUMN_WIDTH
+                    + x % Y_COLUMN_WIDTH
+            }
+        }
+    }
+}
+
+/// A Y tile's width in bytes ([`TargetTiling::IntelY`]).
+pub(crate) const Y_TILE_WIDTH: u64 = 128;
+/// A Y tile's rows.
+pub(crate) const Y_TILE_ROWS: u64 = 32;
+/// A Y tile's bytes.
+const Y_TILE_BYTES: u64 = Y_TILE_WIDTH * Y_TILE_ROWS;
+/// The bytes of a column of a Y tile's rows.
+const Y_COLUMN_WIDTH: u64 = 16;
 
 /// A target for a decode's picture, made as the picture's storage is: asked once, with the
 /// picture's shape and whether a later picture may predict from it (its [`PictureRole`]), as the
@@ -229,73 +283,48 @@ impl Target {
                 shape.format
             )));
         };
-        let format = shape.format.surface();
-        let mut descriptor = ffi::VADRMPRIMESurfaceDescriptor {
-            fourcc: format.fourcc(),
-            width,
-            height: rows,
-            num_objects: 1,
-            num_layers: 1,
-            ..Default::default()
-        };
-        descriptor.objects[0] = ffi::VADRMPRIMESurfaceObject {
-            fd: dma_buf.as_raw_fd(),
-            size: object_size,
-            drm_format_modifier: ffi::DRM_FORMAT_MOD_LINEAR,
-        };
-        descriptor.layers[0] = ffi::VADRMPRIMESurfaceLayer {
-            drm_format: match format {
-                SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
-                SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
-            },
-            num_planes: 2,
-            object_index: [0, 0, 0, 0],
-            offset: [luma_at, chroma_at, 0, 0],
-            pitch: [luma_pitch, chroma_pitch, 0, 0],
-        };
-        let mut attributes = [
-            ffi::VASurfaceAttrib::zeroed(),
-            ffi::VASurfaceAttrib::zeroed(),
-        ];
-        attributes[0].type_ = ffi::VASurfaceAttribMemoryType;
-        attributes[0].flags = ffi::VA_SURFACE_ATTRIB_SETTABLE;
-        attributes[0].value.type_ = ffi::VAGenericValueTypeInteger;
-        attributes[0].value.value.i =
-            i32::from_ne_bytes(ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2.to_ne_bytes());
-        attributes[1].type_ = ffi::VASurfaceAttribExternalBufferDescriptor;
-        attributes[1].flags = ffi::VA_SURFACE_ATTRIB_SETTABLE;
-        attributes[1].value.type_ = ffi::VAGenericValueTypePointer;
-        attributes[1].value.value.p = (&raw mut descriptor).cast();
-        // The surface's own descriptor, which it holds while it lives.
-        let dma_buf = dma_buf
-            .try_clone_to_owned()
-            .map_err(|e| Error::Unsupported(format!("a target's dma-buf not duplicated: {e}")))?;
-        let mut id = ffi::VA_INVALID_SURFACE;
-        // SAFETY: one surface out; the attributes and the descriptor they point at live for the
-        // call, and the dma-buf for the surface's life (the target holds it).
-        let status = display.call(|raw| unsafe {
-            ffi::vaCreateSurfaces(
-                raw,
-                format.rt_format(),
-                width,
-                rows,
-                &raw mut id,
-                1,
-                attributes.as_mut_ptr(),
-                2,
-            )
-        })?;
-        check(
-            "vaCreateSurfaces (a target over the caller's memory)",
-            status,
-        )?;
-        Ok(Target(Arc::new(Imported {
-            display: display.clone_ref(),
-            id,
+        create(
+            display,
+            dma_buf,
             shape,
-            _dma_buf: dma_buf,
-            _keep: keep,
-        })))
+            Laid {
+                object_size,
+                offsets: [luma_at, chroma_at],
+                pitches: [luma_pitch, chroma_pitch],
+                rows,
+                modifier: ffi::DRM_FORMAT_MOD_LINEAR,
+            },
+            keep,
+        )
+    }
+
+    /// `dma_buf`, of `size` bytes, imported on `display` as a surface of `shape` whose planes lie
+    /// at `luma` and `chroma` as `tiling` lays them out, keeping `keep` while the surface lives:
+    /// [`Self::import`]'s, linear, or in Intel's Y tiles as that driver lays out a surface of its
+    /// own (module docs, "Intel's Y tiles"). `Err` where the driver refuses the import, or the
+    /// layout does not fit the dma-buf or the tiling.
+    #[cfg(unix)]
+    pub fn import_as(
+        display: &Display,
+        dma_buf: BorrowedFd<'_>,
+        size: u64,
+        shape: TargetShape,
+        [luma, chroma]: [TargetPlane; 2],
+        tiling: TargetTiling,
+        keep: Box<dyn Send + Sync>,
+    ) -> Result<Target, Error> {
+        if tiling == TargetTiling::Linear {
+            return Self::import(display, dma_buf, size, shape, [luma, chroma], keep);
+        }
+        let Some(laid) = y_tiled(size, shape, luma, chroma) else {
+            let (width, height) = shape.coded;
+            return Err(Error::Unsupported(format!(
+                "a target of {width}x{height} {:?} in Y tiles whose planes do not fit its {size} \
+                 bytes or the tiles: {luma:?}, {chroma:?}",
+                shape.format
+            )));
+        };
+        create(display, dma_buf, shape, laid, keep)
     }
 
     /// The shape it was imported as.
@@ -320,6 +349,135 @@ impl Target {
     }
 }
 
+/// How an import of `shape` in Intel's Y tiles over `size` bytes declares its planes at `luma`
+/// and `chroma` (module docs, "Intel's Y tiles"): the surface as tall as the luma plane's rows to
+/// the chroma plane's. `None` where the planes do not fit the tiles or the dma-buf: pitches that
+/// differ or are not a whole number of tiles wide, narrower than the coded row, a luma plane not
+/// at a tile's first byte, a chroma plane not a whole number of rows of tiles after it or fewer
+/// rows than the coded height, or a chroma plane whose rows of tiles end past `size`.
+#[cfg(unix)]
+fn y_tiled(size: u64, shape: TargetShape, luma: TargetPlane, chroma: TargetPlane) -> Option<Laid> {
+    let (width, height) = shape.coded;
+    let row = u64::from(width).checked_mul(shape.format.bytes_per_sample())?;
+    let pitch = luma.bytes_per_row;
+    let span = chroma.offset.checked_sub(luma.offset)?;
+    let fits = width != 0
+        && height != 0
+        && chroma.bytes_per_row == pitch
+        && pitch >= row
+        && pitch % Y_TILE_WIDTH == 0
+        && luma.offset % Y_TILE_BYTES == 0
+        && span % (pitch * Y_TILE_ROWS) == 0;
+    if !fits {
+        return None;
+    }
+    let rows = span / pitch;
+    let chroma_rows = (rows / 2).next_multiple_of(Y_TILE_ROWS);
+    let chroma_end = chroma.offset.checked_add(pitch.checked_mul(chroma_rows)?)?;
+    if rows < u64::from(height) || chroma_end > size {
+        return None;
+    }
+    Some(Laid {
+        object_size: u32::try_from(size).ok()?,
+        offsets: [u32::try_from(luma.offset).ok()?, u32::try_from(chroma.offset).ok()?],
+        pitches: [u32::try_from(pitch).ok()?; 2],
+        rows: u32::try_from(rows).ok()?,
+        modifier: ffi::I915_FORMAT_MOD_Y_TILED,
+    })
+}
+
+/// A target's planes as its import declares them: its dma-buf's bytes, each plane's first byte
+/// and pitch, the surface's height, and the dma-buf's DRM format modifier.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct Laid {
+    object_size: u32,
+    offsets: [u32; 2],
+    pitches: [u32; 2],
+    rows: u32,
+    modifier: u64,
+}
+
+/// The surface of `shape` over `dma_buf` laid out as `laid` says (`Target::import`), keeping
+/// `keep` while it lives; `Err` where the driver refuses it.
+#[cfg(unix)]
+fn create(
+    display: &Display,
+    dma_buf: BorrowedFd<'_>,
+    shape: TargetShape,
+    laid: Laid,
+    keep: Box<dyn Send + Sync>,
+) -> Result<Target, Error> {
+    let width = shape.coded.0;
+    let format = shape.format.surface();
+    let mut descriptor = ffi::VADRMPRIMESurfaceDescriptor {
+        fourcc: format.fourcc(),
+        width,
+        height: laid.rows,
+        num_objects: 1,
+        num_layers: 1,
+        ..Default::default()
+    };
+    descriptor.objects[0] = ffi::VADRMPRIMESurfaceObject {
+        fd: dma_buf.as_raw_fd(),
+        size: laid.object_size,
+        drm_format_modifier: laid.modifier,
+    };
+    descriptor.layers[0] = ffi::VADRMPRIMESurfaceLayer {
+        drm_format: match format {
+            SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
+            SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
+        },
+        num_planes: 2,
+        object_index: [0, 0, 0, 0],
+        offset: [laid.offsets[0], laid.offsets[1], 0, 0],
+        pitch: [laid.pitches[0], laid.pitches[1], 0, 0],
+    };
+    let mut attributes = [
+        ffi::VASurfaceAttrib::zeroed(),
+        ffi::VASurfaceAttrib::zeroed(),
+    ];
+    attributes[0].type_ = ffi::VASurfaceAttribMemoryType;
+    attributes[0].flags = ffi::VA_SURFACE_ATTRIB_SETTABLE;
+    attributes[0].value.type_ = ffi::VAGenericValueTypeInteger;
+    attributes[0].value.value.i =
+        i32::from_ne_bytes(ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2.to_ne_bytes());
+    attributes[1].type_ = ffi::VASurfaceAttribExternalBufferDescriptor;
+    attributes[1].flags = ffi::VA_SURFACE_ATTRIB_SETTABLE;
+    attributes[1].value.type_ = ffi::VAGenericValueTypePointer;
+    attributes[1].value.value.p = (&raw mut descriptor).cast();
+    // The surface's own descriptor, which it holds while it lives.
+    let dma_buf = dma_buf
+        .try_clone_to_owned()
+        .map_err(|e| Error::Unsupported(format!("a target's dma-buf not duplicated: {e}")))?;
+    let mut id = ffi::VA_INVALID_SURFACE;
+    // SAFETY: one surface out; the attributes and the descriptor they point at live for the
+    // call, and the dma-buf for the surface's life (the target holds it).
+    let status = display.call(|raw| unsafe {
+        ffi::vaCreateSurfaces(
+            raw,
+            format.rt_format(),
+            width,
+            laid.rows,
+            &raw mut id,
+            1,
+            attributes.as_mut_ptr(),
+            2,
+        )
+    })?;
+    check(
+        "vaCreateSurfaces (a target over the caller's memory)",
+        status,
+    )?;
+    Ok(Target(Arc::new(Imported {
+        display: display.clone_ref(),
+        id,
+        shape,
+        _dma_buf: dma_buf,
+        _keep: keep,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +487,114 @@ mod tests {
             offset,
             bytes_per_row,
         }
+    }
+
+    #[cfg(unix)]
+    fn shape(format: TargetFormat, width: u32, height: u32) -> TargetShape {
+        TargetShape {
+            format,
+            coded: (width, height),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_y_tiled_import_declares_ihds_own_input_layouts() {
+        // iHD's own encoder inputs (module docs): the pitch, the chroma plane's first byte and the
+        // object's bytes it exported, and the rows to the chroma plane; HEVC's coded height is not
+        // rounded up to 16 rows.
+        for (format, width, height, pitch, chroma_at, size, rows) in [
+            (TargetFormat::Nv12, 320, 192, 384, 73728, 122880, 192),
+            (TargetFormat::Nv12, 336, 208, 384, 86016, 135168, 224),
+            (TargetFormat::Nv12, 640, 368, 640, 245760, 368640, 384),
+            (TargetFormat::Nv12, 640, 360, 640, 245760, 368640, 384),
+            (TargetFormat::Nv12, 1280, 720, 1280, 942080, 1433600, 736),
+            (TargetFormat::Nv12, 1920, 1088, 1920, 2088960, 3194880, 1088),
+            (TargetFormat::P010, 320, 192, 640, 122880, 204800, 192),
+            (TargetFormat::P010, 336, 208, 768, 172032, 270336, 224),
+            (TargetFormat::P010, 1920, 1080, 3840, 4177920, 6389760, 1088),
+        ] {
+            let laid = y_tiled(
+                size,
+                shape(format, width, height),
+                plane(0, pitch),
+                plane(chroma_at, pitch),
+            );
+            assert_eq!(
+                laid,
+                Some(Laid {
+                    object_size: u32::try_from(size).unwrap(),
+                    offsets: [0, u32::try_from(chroma_at).unwrap()],
+                    pitches: [u32::try_from(pitch).unwrap(); 2],
+                    rows,
+                    modifier: ffi::I915_FORMAT_MOD_Y_TILED,
+                }),
+                "{format:?} {width}x{height}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_y_tiled_import_is_refused_where_its_planes_do_not_fit_the_tiles_or_the_dma_buf() {
+        let nv12 = shape(TargetFormat::Nv12, 320, 192);
+        let fits = |size, luma, chroma| y_tiled(size, nv12, luma, chroma).is_some();
+        // 384-byte rows, the chroma plane 192 rows on, its 96 rows of tiles in 110592 bytes.
+        assert!(fits(110592, plane(0, 384), plane(73728, 384)));
+        assert!(fits(4096 + 110592, plane(4096, 384), plane(4096 + 73728, 384)));
+        // Its rows of tiles end past the dma-buf.
+        assert!(!fits(110591, plane(0, 384), plane(73728, 384)));
+        // A pitch not a whole number of tiles wide, or narrower than the coded row.
+        assert!(!fits(1 << 20, plane(0, 320), plane(320 * 192, 320)));
+        assert!(!fits(1 << 20, plane(0, 256), plane(256 * 192, 256)));
+        // Pitches that differ.
+        assert!(!fits(1 << 20, plane(0, 384), plane(73728, 512)));
+        // A luma plane not at a tile's first byte.
+        assert!(!fits(1 << 20, plane(256, 384), plane(256 + 73728, 384)));
+        // A chroma plane not a whole number of rows of tiles on, or before the coded height.
+        assert!(!fits(1 << 20, plane(0, 384), plane(384 * 200, 384)));
+        assert!(!fits(1 << 20, plane(0, 384), plane(384 * 160, 384)));
+        assert!(!fits(1 << 20, plane(73728, 384), plane(0, 384)));
+        // A P010 row is twice the samples' bytes.
+        let p010 = shape(TargetFormat::P010, 320, 192);
+        assert!(y_tiled(1 << 20, p010, plane(0, 384), plane(73728, 384)).is_none());
+        assert!(y_tiled(1 << 20, p010, plane(0, 640), plane(122880, 640)).is_some());
+    }
+
+    #[test]
+    fn a_y_tile_holds_columns_of_16_bytes_by_32_rows_one_after_another() {
+        let y = TargetTiling::IntelY;
+        assert_eq!(y.byte_at(384, 0, 0), 0);
+        assert_eq!(y.byte_at(384, 15, 0), 15);
+        assert_eq!(y.byte_at(384, 0, 1), 16);
+        assert_eq!(y.byte_at(384, 0, 31), 31 * 16);
+        assert_eq!(y.byte_at(384, 16, 0), 512);
+        assert_eq!(y.byte_at(384, 127, 31), 4095);
+        assert_eq!(y.byte_at(384, 128, 0), 4096);
+        assert_eq!(y.byte_at(384, 0, 32), 3 * 4096);
+        assert_eq!(y.byte_at(384, 383, 63), 6 * 4096 - 1);
+        // Every byte of a plane of 3 by 2 tiles has a place of its own in its 24 KiB.
+        let mut seen = vec![false; 384 * 64];
+        for row in 0..64 {
+            for x in 0..384 {
+                let at = usize::try_from(y.byte_at(384, x, row)).unwrap();
+                assert!(!seen[at], "{x}, {row} at {at} twice");
+                seen[at] = true;
+            }
+        }
+        assert_eq!(TargetTiling::Linear.byte_at(384, 5, 2), 773);
+    }
+
+    #[test]
+    fn the_modifiers_name_their_tilings() {
+        assert_eq!(TargetTiling::of_modifier(0), Some(TargetTiling::Linear));
+        assert_eq!(
+            TargetTiling::of_modifier(0x0100_0000_0000_0002),
+            Some(TargetTiling::IntelY)
+        );
+        // AMD's 64 KiB swizzle, as radeonsi gives its own inputs, and Intel's Tile4.
+        assert_eq!(TargetTiling::of_modifier(0x0200_0000_1040_1b04), None);
+        assert_eq!(TargetTiling::of_modifier(0x0100_0000_0000_0009), None);
     }
 
     #[test]

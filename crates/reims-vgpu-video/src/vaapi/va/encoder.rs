@@ -17,6 +17,36 @@
 //! of Phoenix and one of Hawk Point, within 2 to 4 sessions; 40 sessions in
 //! a row each way without it on the Phoenix one.) iHD (Iris Xe) codes 90
 //! sessions in a row, each closed before the next.
+//!
+//! # Imported inputs
+//!
+//! An input imported for another device to write frames into
+//! (`VideoEncoder::import_input`) is laid out as the driver lays out its
+//! own input surfaces where those are in Intel's Y tiles, and linear
+//! otherwise (`VideoEncoder::input_layout`). iHD codes a frame from a linear
+//! import differently from the same frame uploaded into a surface of its
+//! own, and as the upload does from a Y-tiled import laid out as its own.
+//! (Measured with a libva program of our own on an Iris Xe of Raptor Lake-P,
+//! iHD 26.3.5: its own inputs are in Y tiles, `I915_FORMAT_MOD_Y_TILED`, in
+//! one object, the luma plane at its first byte, the pitch the coded row's
+//! bytes rounded up to 128, the chroma plane at the pitch times the coded
+//! height rounded up to 32 rows, as at 384 and 86016 for 336x208 NV12. At
+//! 320x192, 336x208, 640x360, 1280x720 and 1920x1080 in H.264 Constrained
+//! Baseline, Main and High and HEVC Main and Main 10, 6 frames from a Y-tiled
+//! import so laid out coded as their upload did, byte for byte, wherever the
+//! upload coded the same bytes twice: everywhere but HEVC Main at 640x360
+//! and 1920x1080, where two uploads differ too. Linear imports, at the row's
+//! bytes rounded up to 64, 128 or 256 and the chroma plane right after the
+//! coded rows, differed from the upload in H.264's P pictures at 640x360 and
+//! smaller, and in every HEVC Main 10 picture, intra ones too; at the
+//! driver's own pitch and offsets, in every H.264 picture at 1280x720 and
+//! smaller; at a pitch not a multiple of 64, even in intra pictures. P010
+//! samples are in the upper 10 bits: in the lower, the pictures came out
+//! near blank.) radeonsi's own inputs are in AMD's 64 KiB swizzle, which no
+//! import here declares; a linear import at rows 256 bytes apart codes as
+//! its upload does there (a Radeon 780M, Mesa 26.2.6). Intel's Tile4, which
+//! later Intel GPUs' drivers may give their own, is not measured, and an
+//! input there is linear.
 
 mod accelerator;
 mod caps;
@@ -36,7 +66,8 @@ use super::export::SurfaceExport;
 use super::ffi::{self, encode as enc};
 #[cfg(unix)]
 use super::target::TargetPlane;
-use super::target::{Target, TargetFormat, TargetShape};
+use super::target::{Target, TargetFormat, TargetShape, TargetTiling};
+use super::target_check::ALIGNMENT as TARGET_ALIGNMENT;
 use super::wait::{self, Deadline};
 use crate::codec::encode::encoder::{DriverLimits, Encoder};
 use crate::codec::encode::{
@@ -350,21 +381,36 @@ impl VideoEncoder {
         }
     }
 
-    /// `dma_buf`, of `size` bytes, imported on the encoder's display as a linear input of
-    /// [`Self::input_shape`] whose planes lie at `planes`, luma then chroma, keeping `keep` while
-    /// it lives ([`Target::import`]), for another device to write frames into and
-    /// [`Self::encode_target`] to code. `Err` where the driver refuses the import, or the planes do
-    /// not fit the dma-buf.
+    /// `dma_buf`, of `size` bytes, imported on the encoder's display as an input of
+    /// [`Self::input_shape`] whose planes lie at `planes`, luma then chroma, as `tiling` lays them
+    /// out, keeping `keep` while it lives ([`Target::import_as`]), for another device to write
+    /// frames into and [`Self::encode_target`] to code. `Err` where the driver refuses the import,
+    /// or the planes do not fit the dma-buf or the tiling. [`Self::input_layout`] says how to lay
+    /// it out.
     #[cfg(unix)]
     pub fn import_input(
         &self,
         dma_buf: BorrowedFd<'_>,
         size: u64,
         planes: [TargetPlane; 2],
+        tiling: TargetTiling,
         keep: Box<dyn Send + Sync>,
     ) -> Result<Target, Error> {
         let display = self.inner.accelerator().display();
-        Target::import(display, dma_buf, size, self.input_shape(), planes, keep)
+        Target::import_as(display, dma_buf, size, self.input_shape(), planes, tiling, keep)
+    }
+
+    /// How an input imported for the encoder ([`Self::import_input`]) lays out its planes (module
+    /// docs, "Imported inputs"): as the driver lays out its own input surfaces, where it lays them
+    /// out in Intel's Y tiles; linear otherwise, at a pitch of the coded row's bytes rounded up to
+    /// [`TARGET_ALIGNMENT`], the chroma plane right after the luma plane's coded rows. The driver's
+    /// is read from a surface made as the encoder's are, exported and let go.
+    #[cfg(unix)]
+    pub fn input_layout(&self) -> InputLayout {
+        let shape = self.input_shape();
+        let display = self.inner.accelerator().display();
+        driver_layout(display, self.settings().input_format(), shape)
+            .unwrap_or_else(|| InputLayout::linear(shape))
     }
 
     /// [`Self::encode`] of the frame written into `input`, an import of the encoder's display of
@@ -396,6 +442,73 @@ impl VideoEncoder {
             self.inner.encode_input(input, frame)
         })
     }
+}
+
+/// How an input imported for an encoder lays out its planes in its memory, from the luma plane's
+/// first byte ([`VideoEncoder::input_layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputLayout {
+    /// How the planes' samples lie.
+    pub tiling: TargetTiling,
+    /// The bytes from one row of either plane to the next.
+    pub pitch: u64,
+    /// The chroma plane's first byte, from the luma plane's.
+    pub chroma_at: u64,
+    /// The bytes the input's memory holds, from the luma plane's first byte: the planes' span,
+    /// or the driver's own surface's where its planes are laid out as it lays them out.
+    pub length: u64,
+}
+
+impl InputLayout {
+    /// The linear layout of an input of `shape` ([`VideoEncoder::input_layout`]).
+    pub fn linear(shape: TargetShape) -> InputLayout {
+        let pitch = (u64::from(shape.coded.0) * shape.format.bytes_per_sample())
+            .next_multiple_of(TARGET_ALIGNMENT);
+        let rows = u64::from(shape.coded.1);
+        InputLayout {
+            tiling: TargetTiling::Linear,
+            pitch,
+            chroma_at: pitch * rows,
+            length: pitch * rows + pitch * rows.div_ceil(2),
+        }
+    }
+}
+
+/// The layout the driver gives an input surface of `format` and `shape`'s coded size, made as
+/// the encoder's pool makes its own and exported, where it lays it out in Intel's Y tiles as an
+/// import in them is laid out (`Target::import_as`): both planes in one dma-buf at one pitch, the
+/// luma plane from its first byte, the chroma plane a whole number of rows of tiles after it, at
+/// least the coded height, and the dma-buf's bytes, taken as the layout's length, holding the
+/// chroma plane's rows of tiles. `None` otherwise, and where the driver makes or exports none.
+#[cfg(unix)]
+fn driver_layout(display: &Display, format: InputFormat, shape: TargetShape) -> Option<InputLayout> {
+    use super::target::{Y_TILE_ROWS, Y_TILE_WIDTH};
+    let (width, height) = shape.coded;
+    let pool = surfaces::Pool::new(display, format, width, height, 1).ok()?;
+    let id = *pool.ids().first()?;
+    let export = super::export::export_for_write(display, id, shape.coded).ok()?;
+    let (luma, chroma) = (export.plane(0), export.plane(1));
+    drop(export);
+    drop(pool);
+    let pitch = luma.pitch;
+    let rows = chroma.offset.checked_div(pitch)?;
+    let chroma_end = chroma.offset + pitch * (rows / 2).next_multiple_of(Y_TILE_ROWS);
+    let tiled = TargetTiling::of_modifier(luma.modifier) == Some(TargetTiling::IntelY)
+        && chroma.modifier == luma.modifier
+        && chroma.object == luma.object
+        && luma.offset == 0
+        && chroma.pitch == pitch
+        && pitch % Y_TILE_WIDTH == 0
+        && pitch >= u64::from(width) * shape.format.bytes_per_sample()
+        && chroma.offset % (pitch * Y_TILE_ROWS) == 0
+        && rows >= u64::from(height)
+        && luma.object_size >= chroma_end;
+    tiled.then_some(InputLayout {
+        tiling: TargetTiling::IntelY,
+        pitch,
+        chroma_at: chroma.offset,
+        length: luma.object_size,
+    })
 }
 
 /// An input surface of an encoder's, lent for another device to write a frame into
@@ -472,26 +585,34 @@ mod tests {
         }
     }
 
-    /// Writes `plane`, `rows` rows of `row` bytes, into `bytes` from `at`, rows `pitch` apart, out
-    /// to `coded_rows` rows of `coded_bytes`, as the upload fills its surface: each row past the
-    /// plane's its last row, each byte past a row's its last `unit` (a sample, or a Cb/Cr pair)
-    /// repeated.
+    /// Writes `plane`, `rows` rows of `row` bytes, into `bytes` from `at`, laid out as `layout`
+    /// says, out to `coded_rows` rows of `coded_bytes`, as the upload fills its surface: each row
+    /// past the plane's its last row, each byte past a row's its last `unit` (a sample, or a
+    /// Cb/Cr pair) repeated.
     #[allow(clippy::too_many_arguments)]
     fn fill_as_uploaded(
         bytes: &mut [u8],
         at: usize,
-        pitch: usize,
+        layout: InputLayout,
         plane: &[u8],
         (row, rows): (usize, usize),
         (coded_bytes, coded_rows): (usize, usize),
         unit: usize,
     ) {
+        let pitch = layout.pitch;
+        let mut put = |x: usize, y: usize, byte: u8| {
+            let to = layout.tiling.byte_at(pitch, x as u64, y as u64);
+            bytes[at + to as usize] = byte;
+        };
         for r in 0..coded_rows {
             let from = &plane[r.min(rows - 1) * row..][..row];
-            let to = &mut bytes[at + r * pitch..][..coded_bytes];
-            to[..row].copy_from_slice(from);
-            for x in row..coded_bytes {
-                to[x] = from[row - unit + (x - row) % unit];
+            for x in 0..coded_bytes {
+                let byte = if x < row {
+                    from[x]
+                } else {
+                    from[row - unit + (x - row) % unit]
+                };
+                put(x, r, byte);
             }
         }
     }
@@ -499,8 +620,8 @@ mod tests {
     /// On the driver, for each profile it encodes, 6 frames of a moving 330x202 picture (a
     /// margin of columns and rows to the coded size) at a constant QP with no B pictures, written
     /// by the CPU into an input imported over host memory (`import_input`: a memfd made a dma-buf
-    /// by udmabuf, rows 256 bytes apart rounded up, the chroma plane right after the luma's rows),
-    /// its margin filled as an upload fills it, code as the same frames uploaded, byte for byte:
+    /// by udmabuf, laid out as `input_layout` says: in iHD's Y tiles, linear on radeonsi), its
+    /// margin filled as an upload fills it, code as the same frames uploaded, byte for byte:
     /// two encoders of the same settings code them, one from host bytes, one from the import
     /// (`encode_target`), and every sample of the second is the first's. The one import holds
     /// each frame in turn, so no frame may wait as a B picture past the next one's write
@@ -537,24 +658,26 @@ mod tests {
                 "{profile:?}: a coded size of {:?} leaves no margin",
                 shape.coded
             );
-            let pitch = (coded_width * sample).next_multiple_of(256);
-            let chroma_at = pitch * coded_height;
-            let mut memory = HostMemory::new(chroma_at + pitch * coded_height / 2)
+            let layout = by_import.input_layout();
+            eprintln!("{profile:?}: the input laid out as {layout:?}");
+            let chroma_at = layout.chroma_at as usize;
+            let mut memory = HostMemory::new(layout.length as usize)
                 .unwrap_or_else(|e| panic!("host memory: {e}"));
             let planes = [
                 TargetPlane {
                     offset: 0,
-                    bytes_per_row: pitch as u64,
+                    bytes_per_row: layout.pitch,
                 },
                 TargetPlane {
-                    offset: chroma_at as u64,
-                    bytes_per_row: pitch as u64,
+                    offset: layout.chroma_at,
+                    bytes_per_row: layout.pitch,
                 },
             ];
             let input = (by_import.import_input(
                 memory.dma_buf_fd(),
                 memory.len() as u64,
                 planes,
+                layout.tiling,
                 Box::new(()),
             ))
             .unwrap_or_else(|e| panic!("{profile:?}: the import: {e}"));
@@ -588,7 +711,7 @@ mod tests {
                 fill_as_uploaded(
                     bytes,
                     0,
-                    pitch,
+                    layout,
                     &luma,
                     (row, h),
                     (coded_bytes, coded_height),
@@ -597,7 +720,7 @@ mod tests {
                 fill_as_uploaded(
                     bytes,
                     chroma_at,
-                    pitch,
+                    layout,
                     &chroma,
                     (row, h / 2),
                     (coded_bytes, coded_height / 2),
@@ -645,6 +768,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_linear_input_is_laid_out_at_rows_of_256_bytes_its_chroma_plane_after_the_coded_rows() {
+        let shape = |format, coded| TargetShape { format, coded };
+        assert_eq!(
+            InputLayout::linear(shape(TargetFormat::Nv12, (336, 208))),
+            InputLayout {
+                tiling: TargetTiling::Linear,
+                pitch: 512,
+                chroma_at: 512 * 208,
+                length: 512 * (208 + 104),
+            }
+        );
+        assert_eq!(
+            InputLayout::linear(shape(TargetFormat::P010, (1920, 1081))),
+            InputLayout {
+                tiling: TargetTiling::Linear,
+                pitch: 3840,
+                chroma_at: 3840 * 1081,
+                length: 3840 * (1081 + 541),
+            }
+        );
+    }
+
     /// An input of another shape is not taken: a frame for an encoder of 330x202 is refused from
     /// an import of 320x192's coded size.
     #[test]
@@ -681,6 +827,7 @@ mod tests {
             memory.dma_buf_fd(),
             memory.len() as u64,
             planes,
+            TargetTiling::Linear,
             Box::new(()),
         ))
         .expect("the import");

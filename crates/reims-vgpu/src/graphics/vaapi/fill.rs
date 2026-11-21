@@ -6,16 +6,21 @@
 //!
 //! - **The input** is a buffer in a dma-buf block of its own
 //!   (`new_dma_buf_buffer_of_length_padding_unobserved`), made on a session's first frame, its
-//!   memory exported once and imported on the encoder's display as a linear surface of the
-//!   encoder's input shape, its format and coded size (`VideoEncoder::import_input`): the luma
-//!   plane's coded rows from its first byte, then the chroma plane's, half as many, at one pitch,
-//!   the coded row's bytes rounded up to [`TARGET_ALIGNMENT`], as the arm's imports of device
-//!   caches lie (the VA crate's `target`). The import holds the buffer. The session keeps its
+//!   memory exported once and imported on the encoder's display as a surface of the encoder's
+//!   input shape, its format and coded size (`VideoEncoder::import_input`), laid out as the
+//!   encoder says (`VideoEncoder::input_layout`, asked once a shape): as the driver lays out its
+//!   own inputs where it lays them out in Intel's Y tiles, as iHD does, since iHD codes a linear
+//!   input's frames otherwise than it codes their upload (the VA crate's encoder docs, "Imported
+//!   inputs"); linear otherwise, the luma plane's coded rows from its first byte, then the chroma
+//!   plane's, half as many, at one pitch, the coded row's bytes rounded up to 256, as the arm's
+//!   imports of device caches lie (the VA crate's `target`). The import holds the buffer. The
+//!   session keeps its
 //!   input while the encoder's shape stays and the encoder no longer holds it, and makes another
 //!   otherwise: an encoder made for a new sequence of another shape, or a stalled picture's,
 //!   which the encoder keeps while the GPU may read it.
 //! - **A frame** is written by the platform library's `videoEncodeFill` kernel (`shaders.metal`),
-//!   on a queue of the filler's own: one dispatch a plane, a thread a 32-bit word of the input.
+//!   on a queue of the filler's own: one dispatch a plane, a thread a 32-bit word of the input,
+//!   stored where the input's layout puts it.
 //!   Each word holds the source's bytes, read where they lie, in the surface's pages or its device
 //!   caches, by 32-bit loads, the source bound from its plane's first byte rounded down to 256. The
 //!   kernel reads the rows the VA crate's upload reads: `height` luma rows and `height / 2`
@@ -40,7 +45,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reims_vgpu_video::core::runtime::Runtime;
-use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, Target, TargetPlane, TargetShape, VideoEncoder};
+use reims_vgpu_video::vaapi::{
+    InputLayout, TARGET_ALIGNMENT, Target, TargetPlane, TargetShape, TargetTiling, VideoEncoder,
+};
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -71,7 +78,7 @@ const ARGUMENTS_APART: u64 = 256;
 /// What `videoEncodeFill` takes of a plane (`shaders.metal`'s `VideoFillPlane`): where the plane
 /// lies in its source buffer as bound, its rows and the bytes its margin repeats, the input's
 /// words a row, its rows and its words from one row to the next, and how the input lays its words
-/// out ([`TILING_LINEAR`]).
+/// out ([`TILING_LINEAR`] or [`TILING_INTEL_Y`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FillPlane {
     first: u32,
@@ -87,6 +94,8 @@ struct FillPlane {
 
 /// `VideoFillPlane`'s `tiling` of a linear input.
 const TILING_LINEAR: u32 = 0;
+/// `VideoFillPlane`'s `tiling` of an input in Intel's Y tiles.
+const TILING_INTEL_Y: u32 = 1;
 
 impl FillPlane {
     /// Its bytes, as the kernel reads them.
@@ -148,26 +157,20 @@ struct PlaneFill {
     plane: FillPlane,
 }
 
-/// The pitch of an input of `shape` (module doc).
-fn pitch_of(shape: TargetShape) -> u64 {
-    (u64::from(shape.coded.0) * shape.format.bytes_per_sample()).next_multiple_of(TARGET_ALIGNMENT)
-}
-
-/// The bytes of an input of `shape` at `pitch`, and its chroma plane's first byte.
-fn input_bytes(shape: TargetShape, pitch: u64) -> (u64, u64) {
-    let rows = u64::from(shape.coded.1);
-    let chroma_at = pitch * rows;
-    (chroma_at + pitch * (rows / 2), chroma_at)
-}
+/// The rows of a Y tile: an input plane's rows in Intel's Y tiles take whole rows of tiles.
+const Y_TILE_ROWS: u64 = 32;
+/// The bytes of a Y tile's row: an input's pitch in Intel's Y tiles is a whole number of tiles.
+const Y_TILE_WIDTH: u64 = 128;
 
 /// The dispatches that write a frame of `size` (luma samples) from `sources`, its luma and chroma
-/// planes, into an input of `shape` (module doc): `Err` says why none can. The rows read are the
-/// upload's: `height` of luma and `height / 2` of chroma, each `width` samples' bytes, its margin
-/// repeating a sample, or a Cb/Cr pair.
+/// planes, into an input of `shape` laid out as `layout` (module doc): `Err` says why none can.
+/// The rows read are the upload's: `height` of luma and `height / 2` of chroma, each `width`
+/// samples' bytes, its margin repeating a sample, or a Cb/Cr pair.
 fn plane_fills(
     sources: [Source; 2],
     (width, height): (u32, u32),
     shape: TargetShape,
+    layout: InputLayout,
 ) -> Result<[PlaneFill; 2], String> {
     let (coded_width, coded_height) = shape.coded;
     if width < 2 || height < 2 || coded_width < width || coded_height < height {
@@ -178,17 +181,38 @@ fn plane_fills(
     let sample = shape.format.bytes_per_sample();
     let row_bytes = u64::from(width) * sample;
     let coded_bytes = u64::from(coded_width) * sample;
-    let pitch = pitch_of(shape);
+    let InputLayout {
+        tiling,
+        pitch,
+        chroma_at,
+        length,
+    } = layout;
     if coded_bytes % 4 != 0 {
         return Err(format!(
             "coded rows of {coded_bytes} bytes, not whole words"
         ));
     }
-    let (_, chroma_at) = input_bytes(shape, pitch);
+    // The kernel's word for the tiling, the rows a plane's rows are rounded up to and what its
+    // pitch is a multiple of.
+    let (tiling, rows_of, pitch_of) = match tiling {
+        TargetTiling::Linear => (TILING_LINEAR, 1, 4),
+        TargetTiling::IntelY => (TILING_INTEL_Y, Y_TILE_ROWS, Y_TILE_WIDTH),
+    };
+    if pitch < coded_bytes || pitch % pitch_of != 0 || chroma_at % BINDING_ALIGNMENT != 0 {
+        return Err(format!(
+            "an input of {coded_bytes} bytes a row at a pitch of {pitch}, its chroma at byte \
+             {chroma_at}, as {:?}",
+            layout.tiling
+        ));
+    }
     let narrow = |v: u64, what: &str| u32::try_from(v).map_err(|_| format!("{what} of {v}"));
     // A plane's dispatch: `rows` of the source's rows into the input's `coded_rows` from its byte
-    // `at`, its margin repeating `unit` bytes.
-    let plane = |source: Source, rows: u64, coded_rows: u64, unit: u64, at: u64, which: &str| {
+    // `at`, in `room` bytes, its margin repeating `unit` bytes.
+    let plane = |source: Source,
+                 (rows, coded_rows): (u64, u64),
+                 unit: u64,
+                 (at, room): (u64, u64),
+                 which: &str| {
         if source.row_bytes < row_bytes || source.bytes_per_row < row_bytes || source.height < rows
         {
             return Err(format!(
@@ -210,7 +234,14 @@ fn plane_fills(
         }
         let pitch_words = pitch / 4;
         narrow(reach, "a source plane's reach")?;
-        narrow(pitch_words * coded_rows, "an input plane's words")?;
+        // The input's bytes the plane's rows take, whole rows of tiles where it is in tiles.
+        let span = pitch * coded_rows.next_multiple_of(rows_of);
+        if span > room {
+            return Err(format!(
+                "a {which} plane of {span} bytes in {room} of the input's"
+            ));
+        }
+        narrow(span / 4, "an input plane's words")?;
         Ok(PlaneFill {
             bound,
             at,
@@ -223,19 +254,24 @@ fn plane_fills(
                 coded_words: narrow(coded_bytes / 4, "a coded row's words")?,
                 coded_rows: narrow(coded_rows, "coded rows")?,
                 pitch_words: narrow(pitch_words, "a pitch's words")?,
-                tiling: TILING_LINEAR,
+                tiling,
             },
         })
     };
     let (height, coded_height) = (u64::from(height), u64::from(coded_height));
     Ok([
-        plane(sources[0], height, coded_height, sample, 0, "luma")?,
+        plane(
+            sources[0],
+            (height, coded_height),
+            sample,
+            (0, chroma_at),
+            "luma",
+        )?,
         plane(
             sources[1],
-            height / 2,
-            coded_height / 2,
+            (height / 2, coded_height / 2),
             2 * sample,
-            chroma_at,
+            (chroma_at, length.saturating_sub(chroma_at)),
             "chroma",
         )?,
     ])
@@ -306,6 +342,7 @@ impl<P: Platform> GpuCopies<P> for DeviceFills<P> {
             pipeline: Arc::clone(&self.pipeline),
             queue: None,
             arguments: None,
+            layout: None,
             inputs: Vec::new(),
             refused: None,
             failed: Vec::new(),
@@ -332,6 +369,9 @@ struct DeviceFiller<P: Platform> {
     /// The kernel's arguments, the luma plane's and the chroma's, which the CPU writes before each
     /// fill: the last fill was waited for.
     arguments: Option<P::Buffer>,
+    /// The layout the encoder gives its inputs of a shape, asked once a shape: it makes a surface
+    /// of the driver's to read it.
+    layout: Option<(TargetShape, InputLayout)>,
     inputs: Vec<Input<P>>,
     /// Why no input or pipeline is made, once one was refused: the session's later frames are
     /// declined with it, and no make is tried again.
@@ -361,7 +401,9 @@ impl<P: Platform> GpuFiller<P> for DeviceFiller<P> {
         let shape = encoder.input_shape();
         let settings = encoder.settings();
         let size = (settings.width, settings.height);
-        let fills = match plane_fills([Source::of(luma), Source::of(chroma)], size, shape) {
+        let layout = self.layout_for(encoder, shape);
+        let sources = [Source::of(luma), Source::of(chroma)];
+        let fills = match plane_fills(sources, size, shape, layout) {
             Ok(fills) => fills,
             Err(why) => return Ok(Filled::Declined(why)),
         };
@@ -372,7 +414,7 @@ impl<P: Platform> GpuFiller<P> for DeviceFiller<P> {
             Ok(pipeline) => pipeline,
             Err(why) => return Ok(Filled::Declined(self.refused.insert(why).clone())),
         };
-        let index = match self.input_for(encoder, shape) {
+        let index = match self.input_for(encoder, shape, layout) {
             Ok(index) => index,
             Err(why) => return Ok(Filled::Declined(self.refused.insert(why).clone())),
         };
@@ -400,22 +442,46 @@ impl<P: Platform> GpuFiller<P> for DeviceFiller<P> {
 }
 
 impl<P: Platform> DeviceFiller<P> {
+    /// The layout `encoder` gives its inputs of `shape` (module doc), asked where the session has
+    /// not asked it of this shape.
+    fn layout_for(&mut self, encoder: &VideoEncoder, shape: TargetShape) -> InputLayout {
+        match self.layout {
+            Some((of, layout)) if of == shape => layout,
+            _ => *self.layout.insert((shape, encoder.input_layout())).1,
+        }
+    }
+
     /// The index of the session's input of `shape` that `encoder` no longer holds, made where
-    /// there is none (module doc); the others are let go of. `Err` says why none is made.
-    fn input_for(&mut self, encoder: &VideoEncoder, shape: TargetShape) -> Result<usize, String> {
+    /// there is none (module doc), laid out as `layout` says; the others are let go of. `Err`
+    /// says why none is made.
+    fn input_for(
+        &mut self,
+        encoder: &VideoEncoder,
+        shape: TargetShape,
+        layout: InputLayout,
+    ) -> Result<usize, String> {
         self.inputs
             .retain(|input| input.shape == shape && !input.target.is_held());
         if self.inputs.is_empty() {
-            let input = self.make_input(encoder, shape)?;
+            let input = self.make_input(encoder, shape, layout)?;
             self.inputs.push(input);
         }
         Ok(0)
     }
 
-    /// A new input of `shape`, imported on `encoder`'s display.
-    fn make_input(&self, encoder: &VideoEncoder, shape: TargetShape) -> Result<Input<P>, String> {
-        let pitch = pitch_of(shape);
-        let (length, chroma_at) = input_bytes(shape, pitch);
+    /// A new input of `shape`, laid out as `layout` says, imported on `encoder`'s display.
+    fn make_input(
+        &self,
+        encoder: &VideoEncoder,
+        shape: TargetShape,
+        layout: InputLayout,
+    ) -> Result<Input<P>, String> {
+        let InputLayout {
+            tiling,
+            pitch,
+            chroma_at,
+            length,
+        } = layout;
         let made = self
             .pipeline
             .device
@@ -452,6 +518,7 @@ impl<P: Platform> DeviceFiller<P> {
                 exported.fd.as_fd(),
                 exported.allocation_size,
                 planes,
+                tiling,
                 Box::new(buffer.clone_ref()),
             )
             .map_err(|error| format!("the import of an input: {error}"))?;

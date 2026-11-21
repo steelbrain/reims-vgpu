@@ -114,6 +114,8 @@ pub(crate) const VA_EXPORT_SURFACE_SEPARATE_LAYERS: u32 = 0x0004;
 pub(crate) const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = 0x0008;
 /// `DRM_FORMAT_MOD_LINEAR` (drm_fourcc.h).
 pub(crate) const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+/// `I915_FORMAT_MOD_Y_TILED` (drm_fourcc.h): `fourcc_mod_code(INTEL, 2)`.
+pub(crate) const I915_FORMAT_MOD_Y_TILED: u64 = (0x01 << 56) | 2;
 /// `DRM_FORMAT_NV12` and `DRM_FORMAT_P010` (drm_fourcc.h): the same codes
 /// as VA's fourccs.
 pub(crate) const DRM_FORMAT_NV12: u32 = VA_FOURCC_NV12;

@@ -27,7 +27,7 @@ pub use va::{PlaneDraw, PlaneTargets};
 
 pub use va::{
     TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,
-    TargetShape,
+    TargetShape, TargetTiling,
 };
 
 /// The probe of decodes into targets over memory of ours, which `crate::probes` runs by hand.
@@ -39,6 +39,6 @@ pub(crate) use va::target_probe;
 pub(crate) use va::gated;
 
 pub use va::{
-    EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, InputSurface,
-    UploadMethod, VideoEncoder, encoder_support,
+    EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, InputLayout,
+    InputSurface, UploadMethod, VideoEncoder, encoder_support,
 };
