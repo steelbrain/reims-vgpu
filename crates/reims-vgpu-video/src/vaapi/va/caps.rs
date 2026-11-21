@@ -656,9 +656,10 @@ impl Drop for Config {
         // SAFETY: made by vaCreateConfig on this display, destroyed once,
         // here, behind the destroy of every context on it, as each holds
         // its config.
-        self.display.release_teardown(Teardown::Config, move |raw| unsafe {
-            ffi::vaDestroyConfig(raw, id);
-        });
+        self.display
+            .release_teardown(Teardown::Config, move |raw| unsafe {
+                ffi::vaDestroyConfig(raw, id);
+            });
     }
 }
 
@@ -726,8 +727,9 @@ impl Drop for Context {
         let id = self.id;
         // SAFETY: made by vaCreateContext on this display, destroyed once,
         // here, before its config, whose destroy is made behind this.
-        self.display.release_teardown(Teardown::Context, move |raw| unsafe {
-            ffi::vaDestroyContext(raw, id);
-        });
+        self.display
+            .release_teardown(Teardown::Context, move |raw| unsafe {
+                ffi::vaDestroyContext(raw, id);
+            });
     }
 }

@@ -26,12 +26,12 @@ mod export;
 mod fence;
 mod ffi;
 mod frame;
-#[cfg(any(windows, test))]
-mod held;
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) mod gated;
 mod h264;
+#[cfg(any(windows, test))]
+mod held;
 mod hevc;
 #[cfg(unix)]
 mod host_memory;

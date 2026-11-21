@@ -178,8 +178,12 @@ struct DisplayInner {
     /// On Windows, the display's live contexts and the teardowns held while one lives
     /// ([`Display::release_teardown`]).
     #[cfg(windows)]
-    teardowns: Mutex<Held<Box<dyn FnOnce(ffi::VADisplay) + Send>>>,
+    teardowns: Mutex<Held<HeldRelease>>,
 }
+
+/// A teardown held on Windows ([`Display::release_teardown`]).
+#[cfg(windows)]
+type HeldRelease = Box<dyn FnOnce(ffi::VADisplay) + Send>;
 
 /// What a teardown ends ([`Display::release_teardown`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
