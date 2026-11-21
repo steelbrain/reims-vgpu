@@ -1941,7 +1941,7 @@ whose `Cpuid1Data` is `0x00050654`:
 **Unknown**: a boot on Skylake-Client-noTSX-IBRS itself, and a boot behind
 an OpenCore that leaves leaf 1 as it is.
 
-**AVX-512 state on hosts whose layout is not Intel's.** A Zen 4 core runs
+**AVX-512 state on hosts with AVX-512.** A Zen 4 core runs
 a thread's code from its decoders, its op cache unused, while the thread's
 XCR0 leaves the AVX-512 state components (opmask, ZMM_Hi256 and Hi16_ZMM,
 bits 5 to 7) off. XNU runs every thread at XCR0 0x7 until the thread takes
@@ -1967,9 +1967,11 @@ components on, with no AVX-512 for apps:
 `reims-ctl` adds `x-avx512-xstate=on` to `-cpu`, after `vmx=on` and before
 the VM's `cpu_flags`, only where all of these hold (`qemu::avx512_xstate`):
 - the accelerator is KVM;
-- the host's XCR0 has bits 5 to 7, and the host's own leaf 0xD puts
-  components 5 to 7 at offsets other than Intel's 1088, 1152 and 1664
-  (`host::avx512_xstate_offsets`; a Zen 4 core's are 832, 896 and 1408);
+- the host's XCR0 has bits 5 to 7 (`host::avx512_xstate_offsets`, which
+  also reads where the host's own leaf 0xD puts components 5 to 7: a Zen 4
+  core's are 832, 896 and 1408, Intel's 1088, 1152 and 1664). Either
+  layout qualifies. On Intel's, XNU's own copy is right, and the gain is
+  unmeasured: no host measured below has that layout;
 - the VM is on reims-vgpu graphics and its OpenCore image holds this
   `reims-ctl`'s kexts, since without the route XNU's own promotion copies
   the state at Intel's offsets;
@@ -1977,14 +1979,15 @@ the VM's `cpu_flags`, only where all of these hold (`qemu::avx512_xstate`):
   since an install with `--skip-qemu` keeps an older QEMU, which would
   refuse it.
 
-There is no vendor or model check. Everywhere else (Intel hosts, hosts
-without AVX-512 state, WHPX and the Mac) the command is the same byte for
-byte. `x-avx512-xstate=off` at the end of a VM's `cpu_flags` turns it off
-for that VM, since QEMU applies `name=value` flags in order. A guest on a
-DEVELOPMENT or DEBUG kernel (a KDK's) needs that: such a kernel asserts at
-boot that leaf 0xD's size is Intel's 2688 bytes, and with AMD's layout it
-is 2432 (`fpu.c`, read from code; release kernels compile the assert out
-and size the save area as Intel's, which holds AMD's).
+There is no vendor or model check. Everywhere else (hosts without AVX-512
+state, WHPX and the Mac) the command is the same byte for byte.
+`x-avx512-xstate=off` at the end of a VM's `cpu_flags` turns it off for
+that VM, since QEMU applies `name=value` flags in order. A guest on a
+DEVELOPMENT or DEBUG kernel (a KDK's) on an AMD host needs that: such a
+kernel asserts at boot that leaf 0xD's size is Intel's 2688 bytes, and
+with AMD's layout it is 2432, where an Intel host's is 2688 (`fpu.c`, read
+from code; release kernels compile the assert out and size the save area
+as Intel's, which holds AMD's).
 
 **Measured** on Zen 4 hosts, a Ryzen 7 8745H and a Ryzen 7 7840HS:
 - On the 8745H, the op cache's share of the uops of guest code that never
