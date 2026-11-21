@@ -8,6 +8,14 @@
 //!   bases of 0.
 //! - **A pipeline state the encoder sets is kept by its command buffer** until the command buffer
 //!   completes ([`Kept`]), as the compute encoder's are (`super::compute`).
+//! - **Indirect draws** of primitives, indexed primitives and patches are rt's: the GPU reads the
+//!   draw's arguments (`MTLDrawPrimitivesIndirectArguments`,
+//!   `MTLDrawIndexedPrimitivesIndirectArguments`, `MTLDrawPatchIndirectArguments`) from the
+//!   buffer at the offset as the draw runs, so arguments of no vertices, indices or patches draw
+//!   nothing, and rt's command buffer keeps the buffer until it retires. An offset rt refuses (one
+//!   not a multiple of 4, or without the arguments' 16 or 20 bytes after it in the buffer) is
+//!   rt's refusal of Metal's (`Refusal::IndirectOffset`), counted (`rt-refused-metal`), and a patch
+//!   index buffer rt's gap, as the direct patch draw's is.
 //! - **Attribute strides** (`setVertexBufferOffset:attributeStride:atIndex:`,
 //!   `setVertexBuffers:offsets:attributeStrides:withRange:`) bind as the calls without them: only a
 //!   layout of `MTLBufferLayoutStrideDynamic` reads a stride, and rt refuses such a state as it is
@@ -29,9 +37,10 @@
 //!   default, a resolve texture of nil, a visibility result mode of `Disabled`, a line width of 1,
 //!   primitive restart enabled, the viewport transform enabled, one vertex amplification view and
 //!   a tessellation factor scale of 1.
-//! - **Unbuilt** ([`Unbuilt::RenderCommand`]), each encoding nothing, counted: indirect draws,
-//!   indexed patch draws, mesh draws, tile dispatches, a resolve texture, a visibility result
-//!   mode but `Disabled`, and the private settings of other than Metal's default rt has none of
+//! - **Unbuilt** ([`Unbuilt::RenderCommand`]), each encoding nothing, counted: indexed patch
+//!   draws, direct and indirect (rt has none, and refuses every state of a control point index
+//!   type), mesh draws, tile dispatches, a resolve texture, a visibility result mode but
+//!   `Disabled`, and the private settings of other than Metal's default rt has none of
 //!   (the alpha test's reference, a line width, a point size, the provoking vertex, primitive
 //!   restart disabled, the viewport transform disabled, vertex amplification, and an attachment
 //!   marked cleared). `tileWidth` and `tileHeight` answer 0, counted under
@@ -269,10 +278,43 @@ impl RtRenderEncoder {
                 let (instances, base) = (small(instance_count)?, small(base_instance)?);
                 e.draw_patches(points, start, count, patch_indices, instances, base)?;
             }
-            RenderCmd::DrawPrimitivesIndirect { .. }
-            | RenderCmd::DrawIndexedPrimitivesIndirect { .. }
-            | RenderCmd::DrawPatchesIndirect { .. }
-            | RenderCmd::DrawIndexedPatchesIndirect { .. }
+            RenderCmd::DrawPrimitivesIndirect {
+                primitive_type,
+                indirect_buffer,
+                indirect_buffer_offset,
+            } => {
+                set(*pipeline)?;
+                let kind = primitive(primitive_type)?;
+                e.draw_primitives_indirect(kind, indirect_buffer.rt(), indirect_buffer_offset)?;
+            }
+            RenderCmd::DrawIndexedPrimitivesIndirect {
+                primitive_type,
+                index_type,
+                index_buffer,
+                index_buffer_offset,
+                indirect_buffer,
+                indirect_buffer_offset,
+            } => {
+                set(*pipeline)?;
+                let indices = indices(index_buffer, index_buffer_offset, index_type)?;
+                let kind = primitive(primitive_type)?;
+                let (arguments, offset) = (indirect_buffer.rt(), indirect_buffer_offset);
+                e.draw_indexed_primitives_indirect(kind, indices, arguments, offset)?;
+            }
+            RenderCmd::DrawPatchesIndirect {
+                number_of_patch_control_points,
+                patch_index_buffer,
+                patch_index_buffer_offset,
+                indirect_buffer,
+                indirect_buffer_offset,
+            } => {
+                set(*pipeline)?;
+                let points = small(number_of_patch_control_points)?;
+                let patch_indices = patch_index_buffer.map(|b| (b.rt(), patch_index_buffer_offset));
+                let (arguments, offset) = (indirect_buffer.rt(), indirect_buffer_offset);
+                e.draw_patches_indirect(points, patch_indices, arguments, offset)?;
+            }
+            RenderCmd::DrawIndexedPatchesIndirect { .. }
             | RenderCmd::DrawIndexedPatches { .. }
             | RenderCmd::DrawMeshThreadgroups { .. }
             | RenderCmd::DrawMeshThreadgroupsIndirect { .. }
@@ -841,6 +883,11 @@ mod tests {
     /// A fragment function that returns the interpolated colour.
     const COLOR: &[u8] = include_bytes!("../../../../tests/shaders/render_color.metallib");
 
+    /// A post-tessellation vertex function of triangle patches, `render_tess`, that reads each
+    /// patch's three `float2` control points from buffer 0 at `3 * patch_id` and colours it
+    /// opaque blue.
+    const TESS: &[u8] = include_bytes!("../../../../tests/shaders/render_tess.metallib");
+
     /// A fragment function that reaches a texture beyond its slots: it writes `(1, 0, 1, 1)` to
     /// texel `(0, 0)` of the texture whose resource ID the argument buffer at fragment buffer 0
     /// holds, and returns opaque green.
@@ -989,20 +1036,38 @@ mod tests {
     /// One opaque green triangle over the whole of a target, (-1, -1), (3, -1), (-1, 3), in a
     /// Shared buffer of `device` that [`vdesc_state`]'s vertex descriptor reads.
     fn triangle(device: &RtObj<RtDevice>) -> RtObj<RtBuffer> {
+        shared(device, &vertices(&[[0, 255, 0, 255]]))
+    }
+
+    /// For each of `colours`, a triangle over the whole of a target, (-1, -1), (3, -1), (-1, 3),
+    /// in that colour, as [`vdesc_state`]'s vertex descriptor reads them: three vertices each.
+    fn vertices(colours: &[[u8; 4]]) -> Vec<u8> {
         let mut vertices = Vec::new();
-        for (x, y) in [(-1.0f32, -1.0f32), (3.0, -1.0), (-1.0, 3.0)] {
-            vertices.extend_from_slice(&x.to_le_bytes());
-            vertices.extend_from_slice(&y.to_le_bytes());
-            vertices.extend_from_slice(&[0, 255, 0, 255]);
+        for colour in colours {
+            for (x, y) in [(-1.0f32, -1.0f32), (3.0, -1.0), (-1.0, 3.0)] {
+                vertices.extend_from_slice(&x.to_le_bytes());
+                vertices.extend_from_slice(&y.to_le_bytes());
+                vertices.extend_from_slice(colour);
+            }
         }
-        let buffer = device.new_buffer_of_length(OnFault::Return, vertices.len().to_u64(), 0);
+        vertices
+    }
+
+    /// A Shared buffer of `device` that holds `bytes`.
+    fn shared(device: &RtObj<RtDevice>, bytes: &[u8]) -> RtObj<RtBuffer> {
+        let buffer = device.new_buffer_of_length(OnFault::Return, bytes.len().to_u64(), 0);
         let buffer = buffer.expect("never a raise").expect("a buffer");
-        // SAFETY: the Shared buffer's contents are mapped, `vertices` long.
+        // SAFETY: the Shared buffer's contents are mapped, `bytes` long.
         unsafe {
             let at = buffer.contents().as_ptr::<u8>();
-            at.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
+            at.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
         }
         buffer
+    }
+
+    /// `words`' little-endian bytes.
+    fn words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 
     /// Render encoders clear, load and store their pass's attachment, and draw through a
@@ -1171,11 +1236,6 @@ mod tests {
                 offsets: &[],
                 range: NsRange::new(0, 1),
             },
-            RenderCmd::DrawPrimitivesIndirect {
-                primitive_type: TRIANGLE,
-                indirect_buffer: &buffer,
-                indirect_buffer_offset: 0,
-            },
             RenderCmd::SetVisibilityResultMode { mode: 1, offset: 0 },
             RenderCmd::SetLineWidth { line_width: 2.0 },
             RenderCmd::SetAlphaTestReferenceValue {
@@ -1218,13 +1278,168 @@ mod tests {
             assert_eq!(encoder.encode(on, cmd), Ok(()));
         }
         assert_eq!(counted(metal), before + 8);
-        assert_eq!(counted(unbuilt), unbuilt_before + 4);
+        assert_eq!(counted(unbuilt), unbuilt_before + 3);
         assert_eq!(counted(pass_unbuilt), pass_before + 2);
         assert_eq!(counted(scale), scale_before + 1);
         assert_eq!(commands.commit(on), Ok(()));
         assert_eq!(commands.wait_until_completed(on), Ok(()));
         assert_eq!(commands.status(), done);
         assert_eq!(texels(), every(red));
+    }
+
+    /// The commands that set `state` and `vertices` at vertex buffer 0, then `draw`.
+    fn bound<'a>(
+        state: &'a RtObj<RtRenderPipeline>,
+        vertices: &'a RtObj<RtBuffer>,
+        draw: RenderCmd<'a, RtPlatform>,
+    ) -> Vec<RenderCmd<'a, RtPlatform>> {
+        vec![
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(state),
+            },
+            RenderCmd::SetVertexBuffer {
+                buffer: Some(vertices),
+                offset: 0,
+                index: 0,
+            },
+            draw,
+        ]
+    }
+
+    /// Indirect draws of primitives, indexed primitives and patches each draw what the arguments
+    /// written into their buffer say, read at the draw's offset as the draw runs: a vertex start,
+    /// an index start and a base vertex, a patch start. Arguments of no vertices or patches draw
+    /// nothing. An offset off a multiple of 4, or without the arguments' bytes after it, is
+    /// Metal's refusal, and a patch index buffer rt's gap, each counted and drawing nothing.
+    /// None is counted unbuilt.
+    #[test]
+    fn indirect_draws_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let done = CommandBufferStatus::COMPLETED;
+        let (metal, gap) = (RtRefusal::Refused.code(), RtRefusal::Gap.code());
+        let unbuilt = Unbuilt::RenderCommand.code();
+        let before = (counted(metal), counted(gap), counted(unbuilt));
+        let target = device.new_texture(
+            on,
+            &platform.texture_descriptor(&TextureDesc {
+                width: 4,
+                height: 4,
+                usage: 5,
+                ..TextureDesc::default()
+            }),
+        );
+        let target = target.expect("never a raise").expect("a render target");
+        // Each draw's texels, in a pass of its own that clears the target to opaque red.
+        let drawn = |cmds| {
+            assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
+            let mut texels = [0u8; 64];
+            target.read_pixels(&mut texels, 16);
+            texels
+        };
+        let every = |texel: [u8; 4]| -> [u8; 64] { std::array::from_fn(|i| texel[i % 4]) };
+        let (red, green, blue) = ([255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]);
+
+        // Vertices 0 to 2 a green triangle over the target, 3 to 5 a blue one; indices 5, 5, 5
+        // (one vertex thrice, which draws no pixel), then 0, 1, 2.
+        let color = function(&device, COLOR, "render_color");
+        let state = &vdesc_state(&device, &color);
+        let triangles = &shared(&device, &vertices(&[green, blue]));
+        let index_bytes: Vec<u8> = [5u16, 5, 5, 0, 1, 2]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let indices = &shared(&device, &index_bytes);
+        // A word no draw reads; at byte 4 `MTLDrawPrimitivesIndirectArguments` of 3 vertices from
+        // vertex 3 (vertex count, instance count, vertex start, base instance); at byte 20 the
+        // same of no vertices; at byte 36 `MTLDrawIndexedPrimitivesIndirectArguments` of 3
+        // indices from index 3 with a base vertex of 3 (index count, instance count, index start,
+        // base vertex, base instance). 56 bytes.
+        let arguments = &shared(
+            &device,
+            &words(&[0xeeee_eeee, 3, 1, 3, 0, 0, 1, 0, 0, 3, 1, 3, 3, 0]),
+        );
+        let draw = move |offset: u64| {
+            let draw = RenderCmd::DrawPrimitivesIndirect {
+                primitive_type: TRIANGLE,
+                indirect_buffer: arguments,
+                indirect_buffer_offset: offset,
+            };
+            bound(state, triangles, draw)
+        };
+        assert_eq!(drawn(draw(4)), every(blue));
+        assert_eq!(drawn(draw(20)), every(red));
+        let indexed = RenderCmd::DrawIndexedPrimitivesIndirect {
+            primitive_type: TRIANGLE,
+            index_type: 0,
+            index_buffer: indices,
+            index_buffer_offset: 0,
+            indirect_buffer: arguments,
+            indirect_buffer_offset: 36,
+        };
+        assert_eq!(drawn(bound(state, triangles, indexed)), every(blue));
+        assert_eq!(counted(metal), before.0);
+
+        // An offset 2 bytes past a multiple of 4, and one 12 bytes before the buffer's end.
+        assert_eq!(drawn(draw(2)), every(red));
+        assert_eq!(drawn(draw(44)), every(red));
+        assert_eq!(counted(metal), before.0 + 2);
+
+        // Patch 0's control points all (0, 0), which draws no pixel; patch 1's a triangle over
+        // the target. Factors of 1 (`half`, edges and inside) for every patch, Metal's default
+        // step function reading the first patch's for each.
+        let tess = function(&device, TESS, "render_tess");
+        let mut desc = FullRenderPipelineDesc::new(&tess, Some(&color));
+        desc.colors = vec![(
+            0,
+            ColorAttachmentDesc {
+                pixel_format: 70,
+                ..ColorAttachmentDesc::default()
+            },
+        )];
+        let patches = device.new_render_pipeline_state_full(&desc);
+        let patches = &patches.expect("a render state").expect("a render state");
+        let mut point_bytes = vec![0u8; 24];
+        for (x, y) in [(-1.0f32, -1.0f32), (3.0, -1.0), (-1.0, 3.0)] {
+            point_bytes.extend_from_slice(&x.to_le_bytes());
+            point_bytes.extend_from_slice(&y.to_le_bytes());
+        }
+        let points = &shared(&device, &point_bytes);
+        let factors = &shared(&device, &words(&[0x3c00_3c00, 0x3c00_3c00]));
+        // A word no draw reads; at byte 4 `MTLDrawPatchIndirectArguments` of 1 patch from patch 1
+        // (patch count, instance count, patch start, base instance); at byte 20 of no patches.
+        let patch_arguments = &shared(&device, &words(&[0xeeee_eeee, 1, 1, 1, 0, 0, 1, 1, 0]));
+        let patch_draw = move |offset: u64, indexed: bool| {
+            let draw = RenderCmd::DrawPatchesIndirect {
+                number_of_patch_control_points: 3,
+                patch_index_buffer: indexed.then_some(indices),
+                patch_index_buffer_offset: 0,
+                indirect_buffer: patch_arguments,
+                indirect_buffer_offset: offset,
+            };
+            let mut cmds = bound(patches, points, draw);
+            cmds.insert(
+                2,
+                RenderCmd::SetTessellationFactorBuffer {
+                    buffer: Some(factors),
+                    offset: 0,
+                    instance_stride: 0,
+                },
+            );
+            cmds
+        };
+        assert_eq!(drawn(patch_draw(4, false)), every(blue));
+        assert_eq!(drawn(patch_draw(20, false)), every(red));
+        assert_eq!(drawn(patch_draw(4, true)), every(red));
+        assert_eq!(counted(gap), before.1 + 1);
+        assert_eq!(counted(metal), before.0 + 2);
+        assert_eq!(counted(unbuilt), before.2);
     }
 
     /// A pass whose colour attachment, a 4-sample texture, resolves into its resolve texture

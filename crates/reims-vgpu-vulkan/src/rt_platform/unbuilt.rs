@@ -68,9 +68,9 @@ pub enum Unbuilt {
     /// `newVisibleFunctionTableWithDescriptor:`): rt's kernels take no function table. Each
     /// answers nil.
     FunctionTable,
-    /// Render commands rt has no form of: indirect draws, indexed patch draws, mesh draws, tile
-    /// dispatches, resolve textures, visibility results, and the private settings of other than
-    /// Metal's default rt has none of (`super::render`). Each encodes nothing.
+    /// Render commands rt has no form of: indexed patch draws, mesh draws, tile dispatches,
+    /// resolve textures, visibility results, and the private settings of other than Metal's
+    /// default rt has none of (`super::render`). Each encodes nothing.
     RenderCommand,
     /// Compute commands rt has no form of: an indirect `dispatchThreads` and an indirect stage-in
     /// region. Each encodes nothing.
@@ -166,7 +166,7 @@ impl Unbuilt {
             Unbuilt::Heap => "a sparse heap",
             Unbuilt::MeshPipeline => "a mesh render pipeline state",
             Unbuilt::FunctionTable => "a function handle or a visible function table",
-            Unbuilt::RenderCommand => "an indirect, mesh or tile draw, a resolve or a GL setting",
+            Unbuilt::RenderCommand => "an indexed patch, mesh or tile draw, resolve or GL setting",
             Unbuilt::ComputeCommand => "an indirect dispatchThreads or stage-in region",
             Unbuilt::Predication => "command predication",
             Unbuilt::Protection => "a command buffer's protection options",
