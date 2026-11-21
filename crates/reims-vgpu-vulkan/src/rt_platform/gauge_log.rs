@@ -6,10 +6,10 @@
 //!
 //! - **Asked for by name.** [`start`] makes the thread at a device's open where `REIMS_VGPU_LOG`
 //!   names the target itself at debug (`info,reims_vgpu::rt_gauges=debug`:
-//!   `crate::core::logging::names`), as `crate::work_log` does. A lone level, such as a bug
-//!   report's `debug`, starts none, nor does a test's capture of the log, so no line comes
-//!   between the lines a test reads. Off, no thread is made. Reading the gauges is a load of each
-//!   of rt's counters, which costs the work they count nothing.
+//!   `crate::core::logging::names`), as reims-vgpu's work lines (`reims_vgpu::work`) are. A lone
+//!   level, such as a bug report's `debug`, starts none, nor does a test's capture of the log, so
+//!   no line comes between the lines a test reads. Off, no thread is made. Reading the gauges is a
+//!   load of each of rt's counters, which costs the work they count nothing.
 //! - **One thread a process.** It reads the latest device's gauges at each look, so a device made
 //!   after a let-go is read with no thread of its own, and a device torn down reads as zeros.
 //! - **A line** is `rt gauges: NAME VALUE, ...` ([`line()`]), each name the field of rt's `Gauges`

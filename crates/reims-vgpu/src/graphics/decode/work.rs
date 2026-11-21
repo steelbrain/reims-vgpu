@@ -2,8 +2,7 @@
 //! benches: every [`PERIOD`], while the target [`TARGET`] is enabled at debug, one line of what
 //! each context made since the line before. WindowServer's context is the first one its session
 //! opens (context 1 on the lane's guests), so its rates per frame or per second fall out, and
-//! every other app's beside them. The runtime's own counts go to the same target, on the same
-//! tick, from the Vulkan platform (`reims-vgpu-vulkan`'s `work_log`). A diagnostic: which lines
+//! every other app's beside them. Nothing else writes to the target. A diagnostic: which lines
 //! the host writes is free under the contract.
 //!
 //! - **Counted**: a command buffer made for a context's `COMMAND_BUFFER` message (its queue gave
@@ -11,8 +10,7 @@
 //! - **Asked for by name**: [`start`] turns counting on only where `REIMS_VGPU_LOG` names the
 //!   target itself at debug as the first decoder is made (`reims_vgpu_vulkan::core::logging::names`),
 //!   and makes the thread then: a lone level, such as a bug report's `debug`, or a pair of a
-//!   target above it (`reims_vgpu=debug`) does not, as for the runtime's counts on the same
-//!   target, whose reading costs the draws they count.
+//!   target above it (`reims_vgpu=debug`) does not.
 //! - **Off**, it costs one relaxed load a count.
 //! - **A line** is `graphics work over S s: context C: N command buffers, M render encoders;
 //!   ...`, the contexts in their numbers' order, each that made something since the line before.
