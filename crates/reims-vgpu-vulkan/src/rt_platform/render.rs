@@ -1309,7 +1309,8 @@ mod tests {
         // 16 samples: the pass writes 16 at 0 and a value other than 0 at 8.
         let result = |at: usize| {
             // SAFETY: as above; the command buffer has completed.
-            let bytes = unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u8>(), 16) };
+            let bytes =
+                unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u8>(), 16) };
             u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
         };
         let triangle_draw = || RenderCmd::DrawPrimitives {
