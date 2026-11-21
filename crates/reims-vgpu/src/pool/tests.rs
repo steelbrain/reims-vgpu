@@ -1666,10 +1666,18 @@ fn the_release_waits_for_a_keep_at_most_its_bound_then_forgets_the_source() {
     bell.ring();
     release.join().unwrap();
     assert_eq!(blocks.counts().0, 1, "the kept block stays out");
-    assert_eq!(Arc::strong_count(&blocks), 2, "the pool's hold of the source is kept");
+    assert_eq!(
+        Arc::strong_count(&blocks),
+        2,
+        "the pool's hold of the source is kept"
+    );
     let counts = blocks.counts();
     drop(keep);
-    assert_eq!(blocks.counts(), counts, "the keep's drop gives back nothing");
+    assert_eq!(
+        blocks.counts(),
+        counts,
+        "the keep's drop gives back nothing"
+    );
 }
 
 /// A piece whose block a keep holds, as an import of its bytes does until the platform frees the

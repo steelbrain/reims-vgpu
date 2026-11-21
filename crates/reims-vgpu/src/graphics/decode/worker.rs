@@ -359,11 +359,7 @@ impl Worker {
     /// go of where it is handed over. Where the OS refuses a thread and the worker runs none, the
     /// process ends here, at the refused spawn.
     pub(crate) fn drop_from_release<T: Send + 'static>(&self, key: u64, id: u64, value: T) {
-        self.hand_over(
-            key,
-            Box::new(move || super::drop_refused(id, value)),
-            false,
-        );
+        self.hand_over(key, Box::new(move || super::drop_refused(id, value)), false);
     }
 
     /// The jobs that found every thread busy and waited for one (tests only).

@@ -2323,7 +2323,10 @@ mod tests {
         // Every thread the worker runs, one at least, held in a job of a key of the test's.
         worker.hold();
         let running = worker.threads().max(1);
-        assert!(running < POOL_THREADS, "{running} threads: one more may start");
+        assert!(
+            running < POOL_THREADS,
+            "{running} threads: one more may start"
+        );
         for key in 0..running as u64 {
             worker.submit(1 << 48 | key, Box::new(|| {}));
         }
@@ -2336,7 +2339,10 @@ mod tests {
         worker.release();
         worker.flush();
         worker.refuse_threads(false);
-        assert!(gone.upgrade().is_none(), "let go of on a thread of the worker's");
+        assert!(
+            gone.upgrade().is_none(),
+            "let go of on a thread of the worker's"
+        );
         let dropped = r.p.world().handles_dropped_in_deallocators();
         assert!(dropped.is_empty(), "{dropped:?}");
     }
