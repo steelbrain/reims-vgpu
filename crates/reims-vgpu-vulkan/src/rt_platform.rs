@@ -545,9 +545,11 @@ impl Platform for RtPlatform {
         &self.threads
     }
 
-    /// The library's threads first, then rt's: closes the exit gate ahead of the exit, so that a
-    /// thread of the library's parks at its next step, and waits for the steps in progress on
-    /// other threads ([`crate::exit_gate::close_ahead`]); then, where the process's device lives,
+    /// The library's threads first, then rt's: closes the live device's stage fills
+    /// ([`stage`]), so that a dispatch held on one is refused at once, its helper killed, and none
+    /// starts; closes the exit gate ahead of the exit, so that a thread of the library's parks at
+    /// its next step, and waits for the steps in progress on other threads
+    /// ([`crate::exit_gate::close_ahead`]); then, where the process's device lives,
     /// rt's `Device::quiesce` of it with what is left of `bound`: rt's submit thread submits what
     /// is ready and ends the rest unrun, the GPU completes what was submitted, and rt's threads
     /// end. Nothing is freed. True where the steps ended in time and no device of rt's lives:
@@ -557,6 +559,14 @@ impl Platform for RtPlatform {
     /// and where a step outlasted the wait, which it warns of.
     fn quiesce(&self, bound: Duration) -> bool {
         let until = self.clock.now_mono().saturating_add(bound);
+        // First, so that no step the close waits for waits out a stage's fill.
+        let opened = match self.device.lock().as_ref() {
+            Some(Ok(device)) => Some(device.clone_ref()),
+            Some(Err(_)) | None => None,
+        };
+        if let Some(device) = opened {
+            device.stage_fills().close();
+        }
         let parked = crate::exit_gate::close_ahead(until);
         let live = match self.device.lock().as_ref() {
             Some(Ok(device)) => Some(device.clone_ref()),

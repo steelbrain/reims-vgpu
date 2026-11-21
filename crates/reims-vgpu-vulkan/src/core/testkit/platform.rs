@@ -294,9 +294,12 @@ impl Platform for FakePlatform {
         &self.threads
     }
 
-    /// Nothing runs on a GPU: nothing to stop, and true.
+    /// Closes the world's stage fills, as the rt platform closes its live device's: a dispatch
+    /// held on one is refused at once, and none starts. Nothing runs on a GPU: nothing else to
+    /// stop, and true.
     fn quiesce(&self, bound: std::time::Duration) -> bool {
         let _ = bound;
+        self.world.stages().fills().close();
         true
     }
 }

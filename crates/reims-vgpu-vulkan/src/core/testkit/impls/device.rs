@@ -453,6 +453,16 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         self.world().recoveries()
     }
 
+    /// Unlogged: suspends the world's stage fills, as the rt platform suspends its device's.
+    fn reset_begins(&self) {
+        self.world().stages().fills().suspend();
+    }
+
+    /// Unlogged: resumes the world's stage fills.
+    fn reset_ends(&self) {
+        self.world().stages().fills().resume();
+    }
+
     /// Unlogged, as the world answers it: [`World::answer_surface_pages`].
     ///
     /// [`World::answer_surface_pages`]: crate::core::testkit::objects::World::answer_surface_pages

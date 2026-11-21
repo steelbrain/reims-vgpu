@@ -273,6 +273,16 @@ pub trait GpuDevice<P: Platform>: Handle {
     fn recoveries(&self) -> u64 {
         0
     }
+    /// No Metal counterpart: the host's reset of the device begins, and waits for the work of the
+    /// guest's that began before it (`reims-vgpu`'s graphics device's reset). The platform ends at
+    /// once every wait of a call of the device's for a compile that runs outside the process (a
+    /// stage's fill, [`stage`](super::stage)), cancels what runs it, and starts none until
+    /// [`Self::reset_ends`]: a dispatch held on one is refused, so the reset waits for no compile.
+    /// Nothing by default, where no call waits so.
+    fn reset_begins(&self) {}
+    /// No Metal counterpart: the reset [`Self::reset_begins`] began has ended: a compile outside
+    /// the process starts again where a call asks for one. Nothing by default.
+    fn reset_ends(&self) {}
     /// No Metal counterpart: whether the device copies between its buffers and the guest's RAM
     /// by the RAM's host addresses ([`BlitEncoder::copy_from_guest_ram`],
     /// [`BlitEncoder::copy_to_guest_ram`]), so a copy of guest pages needs no view of them.

@@ -40,8 +40,21 @@ pub(super) fn with_states(
     Guest,
     QueueRing,
 ) {
+    with_states_over(Arc::new(FakePlatform::new()), states)
+}
+
+/// [`with_states`] on `platform`.
+pub(super) fn with_states_over(
+    platform: Arc<FakePlatform>,
+    states: &[u64],
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    Guest,
+    QueueRing,
+) {
     let raised = Arc::new(AtomicU32::new(0));
-    let (device, platform) = headless_on(&raised);
+    let (device, platform) = headless_over(&raised, platform);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
     let rings = (SUBMIT_OFF, COMPLETE_OFF);

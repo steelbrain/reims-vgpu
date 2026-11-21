@@ -22,9 +22,11 @@
 //!   thread steps out of the lane's walks while it waits, so the lane's other buffers walk on.
 //!   Where none is installed, the wait is the wait alone.
 //! - **Cancels.** [`StageFills::cancel_all`] ends every fill running as cancelled, and cancels what
-//!   runs it, at once: a device's reset waits for no fill. [`StageFills::close`] does too, and ends
-//!   every later fill as cancelled as it is asked for: a process's exit waits for none, and starts
-//!   none. Dropping the fills closes them.
+//!   runs it, at once. [`StageFills::suspend`] does too, and ends every fill asked for as cancelled
+//!   until its [`StageFills::resume`]: a device's reset so waits for no fill, neither one a walk
+//!   that began before it waits for nor one a walk asks for while the reset waits for that walk.
+//!   [`StageFills::close`] does it for good: a process's exit waits for no fill, and starts none.
+//!   Dropping the fills closes them.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -172,6 +174,9 @@ struct FillsState<K> {
     ended: HashMap<K, FillEnd>,
     /// Closed: every fill asked for ends cancelled at once.
     closed: bool,
+    /// The suspends not yet resumed: while there is one, every fill asked for ends cancelled at
+    /// once.
+    suspended: usize,
 }
 
 /// What [`StageFills`] and the ends of its fills share.
@@ -258,6 +263,7 @@ impl<K: Eq + Hash + Clone + Send + 'static> StageFills<K> {
                     running: HashMap::new(),
                     ended: HashMap::new(),
                     closed: false,
+                    suspended: 0,
                 }),
                 start,
             }),
@@ -269,7 +275,7 @@ impl<K: Eq + Hash + Clone + Send + 'static> StageFills<K> {
     pub fn fill(&self, key: K) -> Arc<Fill> {
         let fill = {
             let mut state = self.shared.state.lock();
-            if state.closed {
+            if state.closed || state.suspended > 0 {
                 return Fill::ended_with(FillEnd::Cancelled);
             }
             if let Some(&end) = state.ended.get(&key) {
@@ -301,22 +307,38 @@ impl<K: Eq + Hash + Clone + Send + 'static> StageFills<K> {
 
     /// Ends every fill running as cancelled, and cancels what runs each; returns at once.
     pub fn cancel_all(&self) {
-        self.shared.cancel(false);
+        self.shared.cancel(|_| {});
+    }
+
+    /// [`Self::cancel_all`], and every fill asked for ends cancelled at once, starting none, until
+    /// [`Self::resume`]: a device's reset, which waits for its walks, waits for no fill. Suspends
+    /// nest: the fills start again once each has been resumed.
+    pub fn suspend(&self) {
+        self.shared.cancel(|state| {
+            state.suspended = state.suspended.saturating_add(1);
+        });
+    }
+
+    /// Ends a [`Self::suspend`]: once none is left, a fill asked for starts again, the keys whose
+    /// fills the suspends cancelled among them.
+    pub fn resume(&self) {
+        let mut state = self.shared.state.lock();
+        state.suspended = state.suspended.saturating_sub(1);
     }
 
     /// [`Self::cancel_all`], and every fill asked for from now on ends cancelled at once.
     pub fn close(&self) {
-        self.shared.cancel(true);
+        self.shared.cancel(|state| state.closed = true);
     }
 }
 
 impl<K> Shared<K> {
-    /// Ends every fill running as cancelled, and cancels what runs each; `closing`, closes the
-    /// fills too.
-    fn cancel(&self, closing: bool) {
+    /// Ends every fill running as cancelled, and cancels what runs each; `mark` changes the fills'
+    /// state first, under the same lock, so that no fill starts between the two.
+    fn cancel(&self, mark: impl FnOnce(&mut FillsState<K>)) {
         let running = {
             let mut state = self.state.lock();
-            state.closed |= closing;
+            mark(&mut state);
             std::mem::take(&mut state.running)
         };
         for fill in running.into_values() {
@@ -330,7 +352,7 @@ impl<K> Shared<K> {
 impl<K> Drop for StageFills<K> {
     /// Closes the fills: what runs each is cancelled, and their waiters go on.
     fn drop(&mut self) {
-        self.shared.cancel(true);
+        self.shared.cancel(|state| state.closed = true);
     }
 }
 
@@ -551,6 +573,28 @@ mod tests {
         assert_eq!(fills.fill(2).end(), Some(FillEnd::Cancelled));
         assert_eq!(fills.fill(1).end(), Some(FillEnd::Cancelled));
         assert_eq!((fake.starts(), fake.cancels()), (1, 1));
+    }
+
+    /// A suspend ends every fill running as cancelled, cancels what runs each, and ends every fill
+    /// asked for while it lasts as cancelled at once, starting none; suspends nest, and once each
+    /// is resumed, a key whose fill was cancelled starts its fill again.
+    #[test]
+    fn suspended_fills_start_none_until_resumed() {
+        let fake = Fake::default();
+        let fills = fake.fills();
+        let running = fills.fill(1);
+        fills.suspend();
+        assert_eq!(running.end(), Some(FillEnd::Cancelled));
+        assert_eq!(fills.fill(1).end(), Some(FillEnd::Cancelled));
+        assert_eq!(fills.fill(2).end(), Some(FillEnd::Cancelled));
+        fills.suspend();
+        fills.resume();
+        assert_eq!(fills.fill(2).end(), Some(FillEnd::Cancelled));
+        assert_eq!((fake.starts(), fake.cancels()), (1, 1));
+        fills.resume();
+        assert_eq!(fills.fill(1).end(), None);
+        assert_eq!(fills.fill(2).end(), None);
+        assert_eq!((fake.starts(), fake.cancels()), (3, 1));
     }
 
     /// Dropping the fills cancels what runs each, and their waiters go on.

@@ -1988,15 +1988,18 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// The device's reset (`Host::device_reset`): every context's objects dropped as at its close
     /// ([`Self::close_context`]), with no answer owed, and everything else the decoder keeps for
     /// the guest's processes ([`GraphicsDecoder::reset`]); the pipelines compiling are not stored,
-    /// the presents waiting are dropped, and the display shows the scanout in place of any
-    /// surface. The device is then as one just made, to the guest: the ids it picks, the
+    /// a dispatch that waits for its stage's compile outside the process is refused, that compile
+    /// cancelled, the presents waiting are dropped, and the display shows the scanout in place of
+    /// any surface. The device is then as one just made, to the guest: the ids it picks, the
     /// texture resource ids and samplers' ids it is handed, and what a library lookup finds.
     fn reset(&self) {
         entry::run(|_| {
             let (contexts, dropped) = {
                 // After everything of the guest's that began before the reset has ended, its
-                // waits for other queues' buffers cut short.
+                // waits for other queues' buffers cut short, and its dispatches' waits for a
+                // compile outside the process (`GpuDevice::reset_begins`).
                 self.decoders.resetting();
+                self.device.reset_begins();
                 let _alone = self.reset_gate.write();
                 self.pending.reset();
                 let decoder = self.decoder();
@@ -2019,6 +2022,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     color.lock().reset();
                 }
                 self.decoders.reset_done();
+                self.device.reset_ends();
                 (contexts, dropped)
             };
             for presented in &self.presented {

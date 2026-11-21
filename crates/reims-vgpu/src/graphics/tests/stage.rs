@@ -2,15 +2,19 @@
 //! (`reims_vgpu_vulkan::core::platform::stage`): its walk waits for the stage's fill, and the
 //! dispatch is made once more after the fill filled the store, or refused after any other end; a
 //! make ahead's refusal starts the fill that the walk's dispatch then joins. A buffer whose
-//! dispatch may wait so is walked on its queue's lane, never on the queue's service thread.
+//! dispatch may wait so is walked on its queue's lane, never on the queue's service thread. The
+//! device's reset and the process's quiesce ahead of its exit wait for no fill: the fills a walk
+//! waits for end cancelled, and its dispatch is refused.
 
 use reims_vgpu_vulkan::core::platform::stage::FillEnd;
 use reims_vgpu_vulkan::core::testkit::Step;
 
 use super::prepass::{
     CONTEXT, begin, command_buffer_of, completed, end, set_state, threads, with_states,
+    with_states_over,
 };
 use super::*;
+use crate::platform::ApiPlatform;
 
 /// The fake's selector of a [`threads`] dispatch.
 const THREADS: &str = "dispatchThreads:threadsPerThreadgroup:";
@@ -34,6 +38,22 @@ fn none_completes(platform: &FakePlatform, ring: &mut QueueRing) -> bool {
         std::thread::sleep(Duration::from_millis(1));
     }
     !ring.has_event()
+}
+
+/// Whether `call`, on a thread of its own, returns within 5 s while the fill of `stage` runs; the
+/// fill is ended filled after, so that a call that waits for it returns either way.
+fn returns_unfilled(platform: &FakePlatform, stage: u64, call: impl FnOnce() + Send) -> bool {
+    let world = platform.world();
+    std::thread::scope(|scope| {
+        let (returned, returns) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            call();
+            let _ = returned.send(());
+        });
+        let returned = returns.recv_timeout(Duration::from_secs(5)).is_ok();
+        let _ = world.stages().end(stage, FillEnd::Filled);
+        returned
+    })
 }
 
 /// A dispatch refused for its stage holds its walk until the stage's fill ends, and its buffer
@@ -172,4 +192,53 @@ fn a_dispatch_held_on_its_stage_s_fill_holds_no_message_of_its_queue() {
         "the held buffer walked on {:?}",
         walked[0]
     );
+}
+
+/// A device's reset while a dispatch waits for its stage's fill waits for no fill: the fill ends
+/// cancelled and what runs it is cancelled, the held dispatch is refused and its walk ends, and
+/// the reset returns; once the reset is done, a refusal of the stage starts its fill again
+#[test]
+fn a_reset_ends_the_fill_a_dispatch_waits_for() {
+    let (device, platform, _guest, mut ring) = with_states(&[11]);
+    let world = platform.world();
+    world.script.push(THREADS, Step::Stage(7));
+    ring.send(&device, dispatching(100));
+    assert!(
+        eventually(|| world.stages().started() == [7]),
+        "no fill started"
+    );
+    assert!(
+        returns_unfilled(&platform, 7, || device.reset()),
+        "the reset waited for the fill a dispatch waits for"
+    );
+    assert_eq!(world.stages().cancels(), 1);
+    assert_eq!(world.stages().refused(), [(THREADS, 7)]);
+    assert_eq!(world.stages().fills().fill(7).end(), None);
+    assert_eq!(world.stages().started(), [7, 7]);
+}
+
+/// The process's quiesce ahead of its exit while a dispatch waits for its stage's fill ends the
+/// fill: the fills close, so the held dispatch is refused and its buffer completes with no end
+/// of the fill's, and no fill starts after
+#[test]
+fn a_quiesce_for_exit_ends_the_fill_a_dispatch_waits_for() {
+    // The process's platform, which the quiesce asks: the test thread's.
+    let (device, platform, _guest, mut ring) = with_states_over(FakePlatform::process(), &[11]);
+    let world = platform.world();
+    world.script.push(THREADS, Step::Stage(7));
+    ring.send(&device, dispatching(100));
+    assert!(
+        eventually(|| world.stages().started() == [7]),
+        "no fill started"
+    );
+    let may_exit = GraphicsDevice::<FakePlatform>::quiesce_for_exit(Duration::from_secs(1));
+    assert!(may_exit);
+    assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+    assert_eq!(world.stages().cancels(), 1);
+    assert_eq!(world.stages().refused(), [(THREADS, 7)]);
+    assert_eq!(
+        world.stages().fills().fill(8).end(),
+        Some(FillEnd::Cancelled)
+    );
+    assert_eq!(world.stages().started(), [7]);
 }

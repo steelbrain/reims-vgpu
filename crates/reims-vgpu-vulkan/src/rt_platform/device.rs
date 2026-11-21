@@ -971,6 +971,17 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         false
     }
 
+    /// Suspends its stage fills (`super::stage`): each running ends cancelled and its helper is
+    /// killed, and none starts until [`Self::reset_ends`].
+    fn reset_begins(&self) {
+        self.stage_fills.suspend();
+    }
+
+    /// Resumes its stage fills.
+    fn reset_ends(&self) {
+        self.stage_fills.resume();
+    }
+
     /// rt's `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8, the device's linear row
     /// rounding; 0 where rt refuses it.
     fn linear_row_alignment(&self) -> u64 {
