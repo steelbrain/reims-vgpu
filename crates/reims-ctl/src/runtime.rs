@@ -1120,7 +1120,10 @@ mod tests {
         let windows = Duration::from_millis(28_100);
         assert!(!follows_the_measured_exit(Duration::from_secs(15), windows));
         assert!(follows_the_measured_exit(Duration::from_secs(60), windows));
-        assert!(!follows_the_measured_exit(Duration::from_secs(120), windows));
+        assert!(!follows_the_measured_exit(
+            Duration::from_secs(120),
+            windows
+        ));
         let linux = Duration::from_millis(440);
         assert!(follows_the_measured_exit(Duration::from_secs(10), linux));
         assert!(!follows_the_measured_exit(Duration::from_secs(5), linux));

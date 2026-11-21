@@ -594,7 +594,10 @@ pub const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// exit", with QEMU gone 2 s later.
 pub const QEMU_EXIT_MEASURED: std::time::Duration = std::time::Duration::from_millis(28_100);
 
-const _: () = assert!(super::follows_the_measured_exit(QUIT_WAIT, QEMU_EXIT_MEASURED));
+const _: () = assert!(super::follows_the_measured_exit(
+    QUIT_WAIT,
+    QEMU_EXIT_MEASURED
+));
 
 /// The ways a stop ends a QEMU that QMP's `quit` did not: TerminateProcess. Windows has no
 /// signal that asks a process with no console to end.

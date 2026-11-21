@@ -260,7 +260,10 @@ pub const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// ran a WebGL page. Not measured on macOS hosts.
 pub const QEMU_EXIT_MEASURED: std::time::Duration = std::time::Duration::from_millis(440);
 
-const _: () = assert!(super::follows_the_measured_exit(QUIT_WAIT, QEMU_EXIT_MEASURED));
+const _: () = assert!(super::follows_the_measured_exit(
+    QUIT_WAIT,
+    QEMU_EXIT_MEASURED
+));
 
 /// The ways a stop ends a QEMU that QMP's `quit` did not, in order, each with what the stop says
 /// once QEMU is gone: SIGTERM, then SIGKILL.
