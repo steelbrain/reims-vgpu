@@ -297,6 +297,26 @@ fn sps(spec: &SpsSpec) -> Vec<u8> {
     w.nal(nal_type::SPS, 0)
 }
 
+/// A 64x48 SPS of `profile_idc`, `chroma_format_idc` and `bit_depth_minus8` (luma's and
+/// chroma's), with the range extensions where `range_extension` and a VUI of `full_range` where
+/// it is given, the rest as [`SpsSpec`]'s default: a stream's SPS for other modules' tests.
+pub(crate) fn sps_of(
+    profile_idc: u8,
+    chroma_format_idc: u32,
+    bit_depth_minus8: u32,
+    range_extension: bool,
+    full_range: Option<bool>,
+) -> Vec<u8> {
+    sps(&SpsSpec {
+        profile_idc,
+        chroma_format_idc,
+        bit_depth_minus8,
+        range_extension,
+        vui_full_range: full_range,
+        ..SpsSpec::default()
+    })
+}
+
 #[derive(Clone, Default)]
 struct PpsSpec {
     dependent_slices: bool,

@@ -9,11 +9,16 @@
 //! session's queue.
 //!
 //! - **`dsta`** starts the session once: its format description (`,fds`) names the codec, the
-//!   size and the configuration record (`avcC`, `hvcC`). A record of 3-byte NAL unit lengths is
-//!   refused with `kVTVideoDecoderUnsupportedDataFormatErr`, an H.264 SPS that lets pictures be
-//!   fields with `kVTVideoDecoderMalfunctionErr`, and the backend refuses what it does not decode,
-//!   each with no `Dpba`. A started session sends `Dpba`, the attributes the guest's output
-//!   buffers are to have, before its reply. A second `dsta` is answered
+//!   size and the configuration record (`avcC`, `hvcC`). A record of 3-byte NAL unit lengths, and
+//!   a stream whose pictures the host decodes none of, are refused with
+//!   `kVTVideoDecoderUnsupportedDataFormatErr`, an H.264 SPS that lets pictures be fields with
+//!   `kVTVideoDecoderMalfunctionErr`, and the backend refuses what it does not decode, each with
+//!   no `Dpba`. The host decodes 4:2:0 pictures alone, at 8 bits, and HEVC's at 10 too, in the
+//!   profiles and tools the codec's `check_supported` takes, which every arm's decode of a picture
+//!   checks: a stream of 4:4:4, 4:2:2 or monochrome pictures (a HEIC image's 4:4:4 thumbnail,
+//!   its alpha), or of deeper samples, is refused at its start, not at each frame. A started
+//!   session sends `Dpba`, the attributes the guest's output buffers are to have (the 4:2:0
+//!   format of its depth and range), before its reply. A second `dsta` is answered
 //!   `kVTVideoDecoderBadDataErr`, and the session goes on as the first left it.
 //! - **`dfrm`** decodes one sample: the host asks the guest for an output buffer (`Dbuf`, waiting
 //!   [`BUFFER_REPLY_WAIT`]), which lends the buffer's surface; the backend decodes the sample's
@@ -31,6 +36,9 @@
 //!   tiles into regions ([`BackendDecoder::tile_limits`]), sending `TDrs` first: the attributes
 //!   the guest's output buffers are to have (`,cba`) and the tiles it decodes (`,trd`); else it
 //!   answers `kVTUnimplementedErr`, and the guest's VideoToolbox decodes the image in software.
+//!   It answers the same for a stream whose pictures the host decodes none of (as `dsta` refuses
+//!   it), so a session's tiles land only in the 4:2:0 format `TDrs` names, laid out as the
+//!   guest lent each buffer.
 //!   `dtil` decodes one tile's sample (`,sbf`, in fragments as `dfrm`'s) into the one surface it
 //!   lends: the `,tcd` columns and rows of the tile's picture from `,tco` land at `,obp` in it
 //!   ([`TileRegion`]). The host emits the tile (`TDem`: its `,til`, status, info flags and the
@@ -50,10 +58,10 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use crate::codec::h264::avcc;
+use crate::codec::h264::{self, avcc};
 use crate::codec::h264::nal::LengthPrefixed;
 use crate::codec::h264::sps::Sps as H264Sps;
-use crate::codec::hevc::hvcc;
+use crate::codec::hevc::{self, hvcc};
 use crate::codec::hevc::nal::nal_type;
 use crate::codec::hevc::sps::Sps as HevcSps;
 use crate::core::fourcc::FourCc;
@@ -368,9 +376,19 @@ impl Worker {
         self.reply_status(message, status)
     }
 
-    /// Opens a decoder of `config`, sending `Dpba`, or the status it is refused with.
+    /// Opens a decoder of `config`, sending `Dpba`, or the status it is refused with:
+    /// `kVTVideoDecoderUnsupportedDataFormatErr` for a stream whose pictures the host decodes
+    /// none of.
     fn open(&mut self, config: &DecoderConfig) -> Result<(), OsStatus> {
         let record = read_record(config)?;
+        if let Some(why) = &record.undecoded {
+            log::warn!(
+                kind:% = why;
+                "hardware video: a decoder session of a stream the host does not decode, \
+                 refused: {why}"
+            );
+            return Err(status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT);
+        }
         let decoder = self.backend.open(config)?;
         self.send_buffer_attributes(config, &record);
         self.decoder = Some(decoder);
@@ -493,10 +511,20 @@ impl Worker {
     }
 
     /// Opens a tile session's decoder of `config`, sending `TDrs`, or the status it is refused
-    /// with: `kVTUnimplementedErr` where the backend decodes no tiles.
+    /// with: `kVTUnimplementedErr` where the backend decodes no tiles, and for a stream whose
+    /// pictures the host decodes none of, whose tiles the guest then decodes in software, as
+    /// where the backend decodes none.
     fn open_tiles(&mut self, config: &DecoderConfig) -> Result<(), OsStatus> {
         self.tiles = None;
         let record = read_record(config)?;
+        if let Some(why) = &record.undecoded {
+            log::warn!(
+                kind:% = why;
+                "hardware video: a tile session of a stream the host does not decode, \
+                 refused: {why}"
+            );
+            return Err(status::UNIMPLEMENTED);
+        }
         let decoder = self.backend.open(config)?;
         let limits = decoder.tile_limits().ok_or(status::UNIMPLEMENTED)?;
         self.send_tile_requirements(&record, limits);
@@ -990,20 +1018,25 @@ struct Record {
     length_size: u8,
     /// Its parameter sets, Annex B.
     parameter_sets: Vec<u8>,
-    /// Whether the luma samples have more than 8 bits.
+    /// Whether the luma samples have more than 8 bits: 10, in a stream the host decodes.
     ten_bit: bool,
     /// Whether the samples use the full range.
     full_range: bool,
+    /// Why the host's decoders take none of the stream's pictures, where they take none: what the
+    /// codec's `check_supported` refuses of its SPS (a profile, chroma format, bit depths or
+    /// tools outside 4:2:0 at 8 bits, or HEVC's at 8 or 10), which every arm's decode of each
+    /// picture checks.
+    undecoded: Option<String>,
 }
 
 /// Reads `config`'s record, or the status a session on it is refused with: a record that does
-/// not read, 3-byte NAL unit lengths, which ISO/IEC 14496-15 does not allow, and samples of more
-/// than 10 bits, `kVTVideoDecoderUnsupportedDataFormatErr`; an H.264 SPS that lets pictures be
-/// fields (`frame_mbs_only_flag` 0), `kVTVideoDecoderMalfunctionErr`, as no backend here decodes a
-/// field.
+/// not read, and 3-byte NAL unit lengths, which ISO/IEC 14496-15 does not allow,
+/// `kVTVideoDecoderUnsupportedDataFormatErr`; an H.264 SPS that lets pictures be fields
+/// (`frame_mbs_only_flag` 0), `kVTVideoDecoderMalfunctionErr`, as no backend here decodes a field.
+/// A stream whose pictures the host decodes none of reads, with why ([`Record::undecoded`]).
 fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
     let unsupported = status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT;
-    let (length_size, units, ten_bit, full_range) = match config.codec {
+    let (length_size, units, ten_bit, full_range, undecoded) = match config.codec {
         Codec::H264 => {
             let record =
                 avcc::DecoderConfiguration::parse(&config.record).map_err(|_| unsupported)?;
@@ -1021,8 +1054,10 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
                 .chain(&record.picture_parameter_sets)
                 .copied()
                 .collect();
-            let depth = sps.bit_depth_luma_minus8;
-            (record.length_size, units, depth > 0, sps.is_full_range())
+            let undecoded = h264::check_supported(&sps).err().map(|e| e.to_string());
+            let ten_bit = sps.bit_depth_luma_minus8 > 0;
+            let full_range = sps.is_full_range();
+            (record.length_size, units, ten_bit, full_range, undecoded)
         }
         Codec::Hevc => {
             let record =
@@ -1040,18 +1075,17 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
                 .vui
                 .as_ref()
                 .is_some_and(|vui| vui.video_full_range_flag);
+            let undecoded = hevc::check_supported(&sps).err().map(|e| e.to_string());
             (
                 record.length_size,
                 record.nal_units,
                 sps.bit_depth_luma_minus8 > 0,
                 full,
+                undecoded,
             )
         }
     };
     if length_size == 3 || !matches!(length_size, 1 | 2 | 4) {
-        return Err(unsupported);
-    }
-    if ten_bit && config.codec == Codec::H264 {
         return Err(unsupported);
     }
     let mut parameter_sets = Vec::new();
@@ -1064,6 +1098,7 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
         parameter_sets,
         ten_bit,
         full_range,
+        undecoded,
     })
 }
 

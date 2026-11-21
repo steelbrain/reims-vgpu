@@ -428,7 +428,10 @@ pub(super) fn layout_of(record: &RgfxVtSurface) -> Result<SurfaceLayout, String>
 /// The part of a surface laid out as `layout` that a tile's `region` lands in: each plane from the
 /// region's first row and column, `region.width` by `region.height` luma samples (half, rounded
 /// up, of a 4:2:0 chroma plane's, of pairs), with the surface's rows. A region past the surface,
-/// or one from an odd column or row, is refused.
+/// or one from an odd column or row, is refused, as is a surface of a format other than the
+/// 4:2:0 ones: a tile session starts only on a stream of 4:2:0 pictures, which the arm decodes
+/// (`reims_vgpu_video::paravirt`'s decoder refuses the rest at the session's `dsts`), and its
+/// `TDrs` names their format.
 fn region_layout(layout: &SurfaceLayout, region: TileRegion) -> Result<SurfaceLayout, String> {
     let format = layout.pixel_format;
     let sample = if [*b"420v", *b"420f"].map(FourCc::new).contains(&format) {

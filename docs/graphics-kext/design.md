@@ -1802,7 +1802,16 @@ Stages:
       narrowed to the tile's region, written as a whole picture is): each
       tile (`dtil`) lands in the surface it lends, emitted (`TDem`) before
       its reply. An arm that lands no parts answers `kVTUnimplementedErr`,
-      and VideoToolbox decodes the image in software. Measured on an M3 Max
+      and VideoToolbox decodes the image in software. So does a tile session
+      on a stream whose pictures the host decodes none of, and a decoder
+      session's `dsta` on one is refused with
+      `kVTVideoDecoderUnsupportedDataFormatErr`: the arms decode 4:2:0
+      pictures alone, of 8 bits, or 10 in HEVC, in the profiles and tools
+      the codec's `check_supported` takes. A stream of 4:4:4, 4:2:2 or
+      monochrome pictures (a HEIC image's 4:4:4 thumbnail, or its alpha
+      item) is then refused at the session's start, not at each tile or
+      frame, and every tile a session takes lands in the 4:2:0 format its
+      `TDrs` names. Measured on an M3 Max
       on macOS 27.0.1 (oracle job m3-max-39549): CMPhoto decodes Mac Blue,
       6016x6016, as 36 tiles of 1024x1024, each whole into a 1024x1024
       `420f` buffer of its own, asynchronous, and Apple's hardware decoder

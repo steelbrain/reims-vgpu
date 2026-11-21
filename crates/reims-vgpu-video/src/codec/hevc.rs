@@ -23,7 +23,7 @@ pub mod scaling;
 pub mod slice;
 pub mod sps;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use crate::codec::h264::{NalFormat, OutputOrder};
 pub use decoder::{

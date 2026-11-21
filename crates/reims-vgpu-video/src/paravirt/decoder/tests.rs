@@ -5,6 +5,7 @@
 use std::sync::mpsc;
 
 use super::*;
+use crate::codec::hevc::tests::BitWriter;
 use crate::core::runtime::StdRuntime;
 use crate::core::sync::Mutex;
 use crate::paravirt::host::Decoder;
@@ -126,6 +127,8 @@ struct Guest {
     uuid: GuestUuid,
     calls: Calls,
     regions: Regions,
+    /// The session's codec, as its descriptions name it.
+    codec: [u8; 4],
 }
 
 impl Guest {
@@ -135,6 +138,11 @@ impl Guest {
 
     /// A session on a backend whose decoders decode `tiles`.
     fn with_tiles(result: Result<Decoded, OsStatus>, tiles: Option<TileLimits>) -> Self {
+        Self::of(Codec::H264, result, tiles)
+    }
+
+    /// A session of `codec` on a backend whose decoders decode `tiles`.
+    fn of(codec: Codec, result: Result<Decoded, OsStatus>, tiles: Option<TileLimits>) -> Self {
         let calls = Calls::default();
         let regions = Regions::default();
         let backend = Arc::new(FakeBackend {
@@ -143,10 +151,14 @@ impl Guest {
             result,
             tiles,
         });
+        let (fourcc, profiles, max_level) = match codec {
+            Codec::H264 => (*b"avc1", vec![66, 77, 100], 52),
+            Codec::Hevc => (*b"hvc1", vec![1, 2, 3], 156),
+        };
         let decoders = vec![Decoder {
-            codec: Codec::H264,
-            profiles: vec![66, 77, 100],
-            max_level: 52,
+            codec,
+            profiles,
+            max_level,
         }];
         let (sender, sent) = mpsc::channel();
         let guest = Self {
@@ -156,6 +168,7 @@ impl Guest {
             uuid: GuestUuid([0x5a; 16]),
             calls,
             regions,
+            codec: fourcc,
         };
         let answer = guest.send(
             b"+dec",
@@ -163,7 +176,7 @@ impl Guest {
             1,
             Vec::new(),
             |m| {
-                m.s32(names::CODEC, i32::from_be_bytes(*b"avc1"));
+                m.s32(names::CODEC, i32::from_be_bytes(fourcc));
                 m.u32(names::VERSION, 6);
             },
         );
@@ -235,7 +248,7 @@ impl Guest {
 
     /// Starts the session on a 64x48 description of `record`.
     fn start(&self, record: &[u8]) {
-        let description = hand_written(b"avc1", 64, 48, record);
+        let description = hand_written(&self.codec, 64, 48, record);
         self.send(
             b"dsta",
             MessageFlags::GUEST_EXPECTS_REPLY,
@@ -250,7 +263,7 @@ impl Guest {
 
     /// Starts a tile session on a 64x48 description of `record`.
     fn start_tiles(&self, record: &[u8]) {
-        let description = hand_written(b"avc1", 64, 48, record);
+        let description = hand_written(&self.codec, 64, 48, record);
         self.send(
             b"dsts",
             MessageFlags::GUEST_EXPECTS_REPLY,
@@ -844,6 +857,124 @@ fn a_tile_session_on_a_backend_that_decodes_no_tiles_is_refused_unimplemented() 
     guest.tile_emitted(0, NO_DECODER, buffer, 30);
     assert!(guest.calls.lock().is_empty());
     assert!(guest.quiet());
+}
+
+/// A 64x48 SPS of the High profile `profile_idc`, of `chroma_format_idc` and `bit_depth_minus8`
+/// (luma's and chroma's), progressive, with no VUI.
+fn high_sps(profile_idc: u8, chroma_format_idc: u32, bit_depth_minus8: u32) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.u(8, u32::from(profile_idc)).u(8, 0).u(8, 30).ue(0);
+    w.ue(chroma_format_idc);
+    if chroma_format_idc == 3 {
+        w.bit(false); // separate_colour_plane_flag
+    }
+    // The depths, then no transform bypass and no scaling matrix.
+    w.ue(bit_depth_minus8).ue(bit_depth_minus8).bit(false).bit(false);
+    // log2_max_frame_num_minus4, pic_order_cnt_type 0 and its lsb's size; one reference, no gaps.
+    w.ue(0).ue(0).ue(0).ue(1).bit(false);
+    // Four by three macroblocks, frames alone, direct 8x8 inference, no cropping, no VUI.
+    w.ue(3).ue(2).bit(true).bit(true).bit(false).bit(false);
+    let mut unit = vec![0x67];
+    unit.extend(w.finish());
+    unit
+}
+
+/// An `hvcC` of `sps`, with a VPS and a PPS the host passes on unread.
+fn hvcc_of(sps: &[u8]) -> Vec<u8> {
+    let vps = [0x40, 0x01, 0x0c];
+    let pps = [0x44, 0x01, 0xc0];
+    crate::codec::encode::hevc::hvcc(&vps, sps, &pps).expect("an hvcC")
+}
+
+/// Starts a decoder session and a tile session of `codec` on `record`, and checks that each
+/// names `format` for its buffers, or, where it is `None`, that each is refused at its start:
+/// the decoder session `kVTVideoDecoderUnsupportedDataFormatErr` without `Dpba`, the tile
+/// session `kVTUnimplementedErr` without `TDrs`, and neither decodes after.
+fn starts_in(codec: Codec, record: &[u8], format: Option<&[u8; 4]>, what: &str) {
+    let named = format.map(|f| Value::Array(vec![Value::Integer(i64::from(u32::from_be_bytes(*f)))]));
+    let guest = Guest::of(codec, Ok(Decoded::Landed), Some(TILES));
+    guest.start(record);
+    if let Some(named) = &named {
+        let (_, dpba) = guest.next_of(b"Dpba");
+        let attributes = plist_of(&dpba, names::PIXEL_BUFFER_ATTRIBUTES);
+        assert_eq!(attributes.get("PixelFormatType"), Some(named), "{what}");
+    }
+    let (_, reply) = guest.next_of(b"dsta");
+    let refused = status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT;
+    assert_eq!(status_of(&reply), Some(if named.is_some() { 0 } else { refused }), "{what}");
+    if named.is_none() {
+        guest.frame(0, 0, &one_sample(&SAMPLE, None, false));
+        let (_, frame) = guest.next_of(b"dfrm");
+        assert_eq!(status_of(&frame), Some(NO_DECODER), "{what}");
+    }
+    assert!(guest.quiet(), "{what}");
+
+    let guest = Guest::of(codec, Ok(Decoded::Landed), Some(TILES));
+    guest.start_tiles(record);
+    if let Some(named) = &named {
+        let (_, tdrs) = guest.next_of(b"TDrs");
+        let attributes = plist_of(&tdrs, names::TILE_BUFFER_ATTRIBUTES);
+        assert_eq!(attributes.get("PixelFormatType"), Some(named), "{what}");
+    }
+    let (_, reply) = guest.next_of(b"dsts");
+    let refused = status::UNIMPLEMENTED;
+    assert_eq!(status_of(&reply), Some(if named.is_some() { 0 } else { refused }), "{what}");
+    if named.is_none() {
+        let buffer = GuestUuid([0xc1; 16]);
+        guest.tile(0, ((0, 0), (64, 48), (0, 0)), buffer, 31, &one_sample(&SAMPLE, None, false));
+        guest.tile_emitted(0, NO_DECODER, buffer, 31);
+        assert!(guest.calls.lock().is_empty(), "{what}");
+    }
+    assert!(guest.quiet(), "{what}");
+}
+
+#[test]
+fn each_hevc_stream_lands_in_its_4_2_0_format_or_is_refused_at_its_start() {
+    // general_profile_idc, chroma_format_idc, the depths past 8, the range extensions, the
+    // VUI's range, and the format the pictures land in. Apple's HEIC images hold 4:2:0 items
+    // of Main Still Picture and Main, and 4:4:4 thumbnails and monochrome alpha items of the
+    // range extensions' profile (read with ffprobe on an M3 Max's own, macOS 27.0.1); no
+    // arm here decodes the last two, so their sessions are refused at their start, not at
+    // each tile.
+    for (profile, chroma, deeper, range_extension, full_range, format) in [
+        (1, 1, 0, false, None, Some(b"420v")),
+        (1, 1, 0, false, Some(true), Some(b"420f")),
+        (3, 1, 0, false, Some(true), Some(b"420f")),
+        (2, 1, 2, false, Some(false), Some(b"x420")),
+        (2, 1, 2, false, Some(true), Some(b"xf20")),
+        (4, 3, 0, true, Some(true), None),
+        (4, 3, 2, true, None, None),
+        (4, 2, 0, true, Some(true), None),
+        (4, 2, 2, true, None, None),
+        (4, 0, 0, true, Some(true), None),
+        (1, 3, 0, false, Some(true), None),
+        (2, 2, 2, false, None, None),
+        (1, 0, 0, false, None, None),
+        (2, 1, 4, false, None, None),
+        (4, 1, 0, true, None, None),
+    ] {
+        let sps = crate::codec::hevc::tests::sps_of(profile, chroma, deeper, range_extension, full_range);
+        let what = format!("profile {profile}, chroma {chroma}, 8+{deeper} bits, {full_range:?}");
+        starts_in(Codec::Hevc, &hvcc_of(&sps), format, &what);
+    }
+}
+
+#[test]
+fn each_h264_stream_lands_in_its_4_2_0_format_or_is_refused_at_its_start() {
+    // profile_idc, chroma_format_idc, the depths past 8, and the format the pictures land in:
+    // 8-bit 4:2:0 alone decodes here.
+    for (profile, chroma, deeper, format) in [
+        (100, 1, 0, Some(b"420v")),
+        (100, 0, 0, None),
+        (110, 1, 2, None),
+        (122, 2, 0, None),
+        (122, 2, 2, None),
+        (244, 3, 0, None),
+        (244, 3, 2, None),
+    ] {
+        let what = format!("profile {profile}, chroma {chroma}, 8+{deeper} bits");
+        starts_in(Codec::H264, &avcc(&high_sps(profile, chroma, deeper), 4), format, &what);
+    }
 }
 
 #[test]
