@@ -70,7 +70,7 @@ fn now() -> PoolNow {
 /// A clock that stands still until the test moves it on ([`Hand::on`]): a pool on it gives a
 /// piece back only once the test has moved the clock past the piece's delay, so a step the test
 /// takes before that comes first however slowly a loaded host runs it. The Private blocks' tests
-/// run their workers' idle time on it too.
+/// run their workers' idle time and time their takes on it too.
 #[derive(Default)]
 pub(super) struct Hand(Arc<std::sync::atomic::AtomicU64>);
 

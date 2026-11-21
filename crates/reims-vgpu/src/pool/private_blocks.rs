@@ -668,9 +668,9 @@ fn micros(d: Duration) -> u64 {
 }
 
 #[cfg(test)]
-// Test scaffolding: real time bounds the waits and runs the workers' idle time, but for a test
-// that counts the workers within it, which runs on a clock that stands (the pool tests' `Hand`);
-// helper threads stand in for the device's.
+// Test scaffolding: real time bounds the waits and runs the workers' idle time, but for the tests
+// that count the workers within it or the takes' times, which run on a clock that stands
+// (the pool tests' `Hand`); helper threads stand in for the device's.
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use std::sync::LazyLock;
@@ -985,27 +985,35 @@ mod tests {
     }
 
     /// A take of the source's holds the thread that carried it out for none of the source's
-    /// time: it returns while the source waits, and the worker answers once the source gives
-    /// the block; counted, with the source's time, and the lane's longest stays short.
+    /// time: it returns while the source waits at its gate, which only the test opens, and the
+    /// worker answers once the source gives the block; counted, with the source's time, and the
+    /// lane's longest holds none of it. The clock stands but for the 50 ms the test moves it
+    /// while the source waits, so both times are exact however slowly a loaded host runs this
+    /// test.
     #[test]
     fn a_take_from_the_source_waits_on_its_worker_never_on_the_lane() {
-        let source = Source::shut();
-        let blocks = ledger(Some(source.clone()));
+        let (source, hand) = (Source::shut(), Hand::default());
+        let blocks = ledger_at(Some(source.clone()), hand.clock());
         let got = take(&blocks, 3, GATED);
         source.wait_waiting(1);
         assert_eq!(got.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
-        std::thread::sleep(Duration::from_millis(50));
+        let waited = Duration::from_millis(50);
+        hand.on(waited);
         source.open();
         let (at, len) = answered(&got).unwrap();
         assert_eq!((at, len), ((1 << 40) + (1 << 30), GATED));
         assert_eq!(blocks.held(), [(at, 3, len, false)]);
         assert_eq!(counted(SOURCED_CODE), 1);
-        assert!(
-            counted(SOURCED_US_CODE) >= 50_000,
+        assert_eq!(
+            counted(SOURCED_US_CODE),
+            micros(waited),
             "the source's time, summed"
         );
-        let lane = counted(LANE_US_MOST_CODE);
-        assert!((1..50_000).contains(&lane), "the lane's longest: {lane} us");
+        // The take returned before the clock moved: none of the source's time, counted as the
+        // lane's floor of 1 us.
+        assert_eq!(counted(LANE_US_MOST_CODE), 1, "the lane's longest");
+        // Idle on a clock that stands, the worker goes only at the release.
+        blocks.close();
     }
 
     /// A context's takes are answered in its order: a take behind its context's earlier one
