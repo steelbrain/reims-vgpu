@@ -101,6 +101,8 @@ enum RgfxSize {
 	kRgfxSizeArgumentBuffersSupport,
 	kRgfxSizeReadWriteTextureSupport,
 	kRgfxSizeSparseTileSizeInBytes,
+	// The host's compile threads: the device answers the guest's own count instead
+	// (rgfxConcurrentCompilationTaskCount), and reads nothing here.
 	kRgfxSizeMaximumConcurrentCompilationTaskCount,
 	kRgfxSizeLargestVertexAmplificationCount,
 	kRgfxSizeLargestRasterizationRateMapLayerCount,
@@ -224,6 +226,20 @@ std::string rgfxVendorNameOf(const char *name);
 /// minimum requirements and still listed only the CPU (walk m3-max-61607). The prefix gives each
 /// GPU the vendor of the Mac GPU of its type: AMD's, discrete, or Intel's, integrated.
 std::string rgfxMetalNameOf(const char *hostName, bool integrated);
+
+/// `maximumConcurrentCompilationTaskCount`: the guest's own logical processor count, its kernel's
+/// `hw.logicalcpu`, whatever `shouldMaximizeConcurrentCompilation` answers, in an x86-64 and an
+/// arm64 guest alike. A Mac answers by its own processors, so nothing of the host's (its cores,
+/// its compile threads, the blob's kRgfxSizeMaximumConcurrentCompilationTaskCount) reaches it.
+/// With `shouldMaximizeConcurrentCompilation` YES, both Macs measured answer their
+/// `hw.logicalcpu`: the M3 Max 16 (macOS 27.0.1, m3-max-64461), the 2019 MacBook Pro 12 on its AMD
+/// Radeon Pro 5300M and on its Intel UHD 630 (macOS 26.7.1, m3-max-64462). At NO, the one state
+/// where the two differ, the M3 Max answers its 16 and the MacBook Pro's GPUs answer 2. Nothing
+/// documented promises a smaller count at NO, so the device answers the wider count at both. Apps
+/// size their compile threads by it: a 3D modelling app's renderer starts max(2, count - 1)
+/// (read from its source), 7 in a guest of 8 processors, where the host's 4 held it to 3. 1 where
+/// the guest's kernel answers no count.
+uint64_t rgfxConcurrentCompilationTaskCount();
 
 /// `iosurfaceTextureAlignmentBytes` and `iosurfaceReadOnlyTextureAlignmentBytes`: 16, as Metal's
 /// devices answer the first (measured: the AMD 5300M, the Intel 630 and the M3 Max,

@@ -771,12 +771,12 @@ setPluginData: base %base-spi
 setRawBVHBuilderPtr: base %base-spi
 setRequiresLegacyCompilerProcessesCount: base %base-spi
 setShaderDebugInfoCaching: base %base-spi
-setShouldMaximizeConcurrentCompilation: base %base-spi
+setShouldMaximizeConcurrentCompilation: implemented
 setWritableHeapsEnabled: base %base-spi
 setupMPSFunctionTable: absent %absent-as-metal
 shaderDebugInfoCaching base %base-spi
 sharedMemorySize base %base-spi
-shouldMaximizeConcurrentCompilation base %base-spi
+shouldMaximizeConcurrentCompilation implemented
 singleFPConfig implemented
 sizeOfCounterHeapEntry: unsupported Metal 4 counter heaps
 sparseTexturesSupport base %base-spi

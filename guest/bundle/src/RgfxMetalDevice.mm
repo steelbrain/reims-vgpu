@@ -970,6 +970,7 @@ id rgfxTargetDeviceArchitecture()
 	// mapped none, and the kext's doorbell call rings.
 	volatile uint32_t *_doorbellPage;
 	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
+	std::atomic<bool> _maximizeCompilation; // setShouldMaximizeConcurrentCompilation:'s, read back
 	RgfxStateCache *_stateCache; // samplers and depth/stencil states; nil until the handshake
 	// The slabs Shared and Managed buffers lie in, and their sources: the region's, and before
 	// it the Shared pool's where the device has one, else the process's own pages where the host
@@ -1678,9 +1679,30 @@ static NSString *rgfxHostNameOf(const RgfxCaps &caps)
 	return _caps.size(kRgfxSizeRecommendedMaxWorkingSetSize);
 }
 
+// The guest's own logical processor count, at either state of
+// shouldMaximizeConcurrentCompilation (rgfxConcurrentCompilationTaskCount, RgfxCaps.hpp, which
+// says why), never the host's.
 - (NSUInteger)maximumConcurrentCompilationTaskCount
 {
-	return _caps.size(kRgfxSizeMaximumConcurrentCompilationTaskCount);
+	return static_cast<NSUInteger>(rgfxConcurrentCompilationTaskCount());
+}
+
+// NO in each new device, then what setShouldMaximizeConcurrentCompilation: set; the count above
+// does not follow it.
+- (BOOL)shouldMaximizeConcurrentCompilation
+{
+	return _maximizeCompilation.load(std::memory_order_relaxed);
+}
+
+// Kept per device, and passed on to _MTLDevice's setter where the base has it (MTLDevice's from
+// macOS 13.3; RgfxMetalPrivate.h), which took every call before the device kept its own: whatever
+// the base does with it, which is not measured, it still does. The device's source libraries
+// compile through the base, in Metal's compiler service (RgfxCompileOverMetal).
+- (void)setShouldMaximizeConcurrentCompilation:(BOOL)maximize
+{
+	_maximizeCompilation.store(maximize, std::memory_order_relaxed);
+	if ([IOGPUMetalDevice instancesRespondToSelector:_cmd])
+		[super setShouldMaximizeConcurrentCompilation:maximize];
 }
 
 // --- limits (RgfxCaps) -------------------------------------------------------

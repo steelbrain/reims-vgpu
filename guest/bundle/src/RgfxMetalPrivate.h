@@ -98,6 +98,13 @@ NS_ASSUME_NONNULL_BEGIN
                                                       error:(NSError *_Nullable *_Nullable)error;
 @end
 
+// measured: macOS 27.0.1 Metal.framework, `v20@0:8c16` on the x86-64 slice and `v20@0:8B16` on
+// arm64, implemented only by _MTLDevice (m3-max-64488): MTLDevice's setter of
+// shouldMaximizeConcurrentCompilation, which the device's own setter passes on to its base.
+@interface IOGPUMetalDevice (RgfxConcurrentCompilation)
+- (void)setShouldMaximizeConcurrentCompilation:(BOOL)maximize;
+@end
+
 // measured: macOS 27 and 26.6.1 Metal.framework — the private selectors of Metal's own library
 // (_MTLLibrary) the link route reads: its extern functions' names (`@16@0:8`), one of them by
 // name (`@24@0:8@16`, nil for a name it does not hold), and the bytes it was made from or linked

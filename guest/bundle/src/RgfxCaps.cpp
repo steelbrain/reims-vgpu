@@ -10,6 +10,7 @@
 #include <algorithm>
 
 #include <cstring>
+#include <sys/sysctl.h>
 #include <vector>
 
 // The enum counts match the blob's arrays: a drift in either is caught here, at
@@ -328,6 +329,15 @@ std::string rgfxMetalNameOf(const char *hostName, bool integrated)
 	std::string out = integrated ? "Intel - " : "AMD - ";
 	out += hostName[0] != '\0' ? hostName : "reims-graphics";
 	return out;
+}
+
+uint64_t rgfxConcurrentCompilationTaskCount()
+{
+	int cpus = 0;
+	size_t length = sizeof(cpus);
+	if (sysctlbyname("hw.logicalcpu", &cpus, &length, nullptr, 0) != 0 || cpus < 1)
+		return 1;
+	return static_cast<uint64_t>(cpus);
 }
 
 std::string rgfxFamilyNameOf(const char *name)

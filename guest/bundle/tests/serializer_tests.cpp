@@ -1095,6 +1095,17 @@ void test_metal_names()
 	CHECK(!refused.load(info) && !refused.hostIntegrated());
 }
 
+// maximumConcurrentCompilationTaskCount is the logical processor count of the system the bundle
+// runs on, its kernel's hw.logicalcpu, read here beside it; never the host's compile threads,
+// which the blob still carries.
+void test_concurrent_compilation_task_count()
+{
+	int cpus = 0;
+	size_t length = sizeof(cpus);
+	CHECK(sysctlbyname("hw.logicalcpu", &cpus, &length, nullptr, 0) == 0 && cpus >= 1);
+	CHECK(rgfxConcurrentCompilationTaskCount() == static_cast<uint64_t>(cpus));
+}
+
 // Heap and buffer creates carry the three modes and Metal's bit 24 to the host, and no other
 // bit: the GL renderer's no-copy buffers' bit 20 (0x100000) among them.
 void test_host_resource_options()
@@ -5597,6 +5608,7 @@ int main(int argc, char **argv)
 	test_family_names();
 	test_vendor_names();
 	test_metal_names();
+	test_concurrent_compilation_task_count();
 	test_host_resource_options();
 	test_buffer_over_pages_at_the_host_s_address();
 	test_buffer_over_pages_at_the_host_s_address_later();
