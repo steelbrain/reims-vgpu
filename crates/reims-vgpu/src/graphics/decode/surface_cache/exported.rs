@@ -1379,6 +1379,77 @@ mod drawn_tests {
         assert!(drawn.owes_zeros(), "the picture's draw writes them");
     }
 
+    /// A decode whose textures show the planes of a cache whose surface lies over Direct3D 11
+    /// textures whole is given the surface's planes, which its picture is drawn into, and makes
+    /// no memory of the cache's buffer, a deferred one whose memory is not made, as a Windows
+    /// video cache's is (the module doc of `surface_cache`, "Deferred memory"). One whose
+    /// textures do not show them whole lands its picture in the buffer, and makes it, once
+    #[test]
+    #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+    fn a_decode_drawn_into_a_caches_surface_makes_no_memory_of_its_buffer() {
+        use super::super::tests::{surface_texture_as, with_facts};
+        use reims_vgpu_graphics::wire::RgfxTextureFromIOSurface;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
+        use reims_vgpu_vulkan::core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        use reims_vgpu_vulkan::core::testkit::objects::{CompleteOn, Model};
+        use zerocopy::{FromBytes as _, IntoBytes as _};
+        let draw = Arc::new(PlaneDraw::new(None).expect("the plane draws"));
+        for whole in [true, false] {
+            let mut r = cached();
+            let page = r.page;
+            assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+            // Textures 21 and 22 over buffer 10, each over its plane of [`PLANES`], as a decode's
+            // luma (`R8Unorm`) and chroma (`RG8Unorm`) textures.
+            for (obj_id, plane) in [(21, 0u32), (22, 1)] {
+                let laid = PLANES[plane as usize];
+                let texel = u64::from(plane + 1);
+                let info = PixelFormatInfo {
+                    block_bytes: texel,
+                    block_width: 1,
+                    block_height: 1,
+                    block_depth: 1,
+                    ..PixelFormatInfo::default()
+                };
+                r.p.script().clear();
+                (r.p.script()).always("MTLPixelFormatGetInfoForDevice()", Step::value(info));
+                let size = ((laid.row_bytes / texel) as u32, laid.rows as u32);
+                let bytes = surface_texture_as(obj_id, 10, [10, 30][plane as usize], size, (1, 0));
+                let mut m = RgfxTextureFromIOSurface::read_from_bytes(&bytes).unwrap();
+                m.offset = laid.offset;
+                m.bytes_per_row = laid.bytes_per_row;
+                m.plane = plane;
+                let mut message = m.as_bytes().to_vec();
+                if whole {
+                    let chroma = (PLANES[1].offset, PLANES[1].bytes_per_row);
+                    message = with_facts(message, (64, 48), chroma);
+                }
+                assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+            }
+            drop(drawn_cache(&r, &draw));
+            r.p.world().complete_all(CompleteOn::Caller);
+            if let Some(buffer) = r.dec.caches().buffer(BLOCK)
+                && let Model::Buffer(m) = &mut buffer.state().model
+            {
+                m.deferred = Some(false);
+            }
+            let mark = r.p.call_log().mark();
+            let (luma, chroma) = r.dec.video_planes(0, 21, 22, true).unwrap();
+            assert_eq!(
+                (luma.drawn.is_some(), chroma.drawn.is_some()),
+                (whole, whole),
+                "whole {whole}: the surface's planes"
+            );
+            drop((luma, chroma));
+            let calls = r.p.call_log().since(mark);
+            let made = calls.iter().filter(|c| c.sel == MAKE_MEMORY).count();
+            assert_eq!(made, usize::from(!whole), "whole {whole}: the buffer's memory");
+            let memory = r.dec.caches().buffer(BLOCK).is_some_and(|b| b.memory_made());
+            assert_eq!(memory, !whole, "whole {whole}: made");
+        }
+    }
+
     /// Where such a decode answers nothing at all, its command buffer's finish clears the
     /// textures to the zeros they owe; where it answers no picture, the cache's first fill is
     /// made, which fills the plane shapes from the buffer: either way the textures owe nothing

@@ -7281,26 +7281,46 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// where the platform refuses it, the raise is [`refused::out_of_memory`]'s, which drops the
     /// op, and the command buffer fails ([`Self::out_of_memory`]).
     pub(crate) fn require_buffer(&self, id: u64) -> RaiseResult<&P::Buffer> {
+        let (entry, buffer) = self.buffer_entry(id)?;
+        self.note_over_cache(entry);
+        self.cache_memory(id, entry, buffer)?;
+        Ok(buffer)
+    }
+
+    /// The entry of the buffer `id` names, and the buffer, neither noted nor its memory made
+    /// ([`Self::require_buffer`] does both); an exec fault when `id` is 0 or names no buffer.
+    pub(super) fn buffer_entry(&self, id: u64) -> RaiseResult<(&Entry<P>, &P::Buffer)> {
         match self.entry(id) {
             Some(
                 entry @ Entry {
                     handle: ObjHandle::Buffer(h),
                     ..
                 },
-            ) => {
-                self.note_over_cache(entry);
-                if entry.over_cache && !self.surface_caches.memory_of(h) {
-                    self.out_of_memory.set(true);
-                    return Err(refused::out_of_memory(id));
-                }
-                Ok(h)
-            }
+            ) => Ok((entry, h)),
             Some(Entry {
                 handle: ObjHandle::Refused(r),
                 ..
             }) => Err(r.reference(id)),
             _ => Err(bad_reference()),
         }
+    }
+
+    /// Makes the memory of `buffer`, the buffer `id` names, whose entry is `entry`, where it is a
+    /// device cache's buffer itself ([`Entry::over_cache`]) whose memory is not made yet (the
+    /// cache's module doc, "Deferred memory"): where the platform refuses it, the raise is
+    /// [`refused::out_of_memory`]'s, which drops the op, and the command buffer fails
+    /// ([`Self::out_of_memory`]).
+    pub(super) fn cache_memory(
+        &self,
+        id: u64,
+        entry: &Entry<P>,
+        buffer: &P::Buffer,
+    ) -> RaiseResult<()> {
+        if !entry.over_cache || self.surface_caches.memory_of(buffer) {
+            return Ok(());
+        }
+        self.out_of_memory.set(true);
+        Err(refused::out_of_memory(id))
     }
 
     /// The buffer `id` names, `None` for 0; an exec fault when a non-zero `id` names no buffer.

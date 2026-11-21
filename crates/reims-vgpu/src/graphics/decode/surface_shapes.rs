@@ -1771,6 +1771,15 @@ mod tests {
     /// where the fake's own answer is four.
     #[cfg(unix)]
     fn plane_texture_over(r: &mut Rig, obj_id: u64, buffer: u64, plane: u32) -> u64 {
+        plane_texture_with(r, obj_id, buffer, plane, false)
+    }
+
+    /// [`plane_texture_over`], its message carrying the surface's facts where `facts`, as a
+    /// decoder's output's texture's does: a decode through it shows the plane whole
+    /// (`video::whole_plane`).
+    #[cfg(unix)]
+    fn plane_texture_with(r: &mut Rig, obj_id: u64, buffer: u64, plane: u32, facts: bool) -> u64 {
+        use super::super::surface_cache::tests::with_facts;
         use reims_vgpu_graphics::wire::RgfxTextureFromIOSurface;
         use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
         use zerocopy::{FromBytes as _, IntoBytes as _};
@@ -1794,8 +1803,14 @@ mod tests {
         m.offset = laid.offset;
         m.bytes_per_row = laid.bytes_per_row;
         m.plane = plane;
+        let mut message = m.as_bytes().to_vec();
+        if facts {
+            let [luma, chroma] = nv12_planes();
+            let size = (luma.row_bytes as u32, luma.rows as u32);
+            message = with_facts(message, size, (chroma.offset, chroma.bytes_per_row));
+        }
         let mark = r.p.call_log().mark();
-        assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
         views(&r.p.call_log().since(mark))[0].0
     }
 
@@ -2114,6 +2129,50 @@ mod tests {
         assert!(filled.contains(&(cache, luma)), "{filled:?}");
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (0, 2));
+    }
+
+    /// A decode whose textures show a video cache's planes whole, where the cache has its
+    /// surface, is given the surface's planes, which its picture lands in, and makes no memory of
+    /// the cache's buffer, which the picture does not touch: the buffer here stands in for a
+    /// deferred one whose memory is not made, as a Windows video cache's is, its surface over
+    /// Direct3D 11 textures ("Deferred memory"). A decode whose picture lands in the buffer (its
+    /// textures not showing the planes whole, or the cache having no surface) makes it, once, as
+    /// before
+    #[cfg(unix)]
+    #[test]
+    fn a_decode_into_a_caches_surface_makes_no_memory_of_its_buffer() {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        use reims_vgpu_vulkan::core::testkit::objects::Model;
+        // (the textures show the planes whole, the platform makes the surface): whether the
+        // picture lands in the surface.
+        for (whole, surfaces) in [(true, true), (false, true), (true, false)] {
+            let case = format!("whole {whole}, surfaces {surfaces}");
+            let mut r = video_shaped();
+            r.p.world().give_exported_surfaces(surfaces);
+            plane_texture_with(&mut r, 21, 10, 0, whole);
+            plane_texture_with(&mut r, 22, 10, 1, whole);
+            r.p.world().complete_all(CompleteOn::Caller);
+            if let Some(buffer) = r.dec.caches().buffer(BLOCK)
+                && let Model::Buffer(m) = &mut buffer.state().model
+            {
+                m.deferred = Some(false);
+            }
+            let mark = r.p.call_log().mark();
+            let (luma, chroma) = r.dec.video_planes(0, 21, 22, true).unwrap();
+            let apart = whole && surfaces;
+            assert_eq!(
+                (luma.surface.is_some(), chroma.surface.is_some()),
+                (apart, apart),
+                "{case}: the surface's planes"
+            );
+            drop((luma, chroma));
+            let made = r.p.call_log().since(mark);
+            let made = made.iter().filter(|c| c.sel == MAKE_MEMORY).count();
+            assert_eq!(made, usize::from(!apart), "{case}: the buffer's memory");
+            let memory = r.dec.caches().buffer(BLOCK).is_some_and(|b| b.memory_made());
+            assert_eq!(memory, !apart, "{case}: made");
+        }
     }
 
     /// Library 30 and compute pipeline `obj_id` of a function in it.

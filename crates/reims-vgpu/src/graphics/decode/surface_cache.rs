@@ -401,8 +401,10 @@
 //!   copies that go through it: a fill from the pages or into a new shape, a write-back, a
 //!   download, an early copy, a release's copy, a write's copy into another shape of its plane,
 //!   and a command buffer that names an object over the buffer itself, the host's video's among
-//!   them. A cache whose memory is not made for the host's video (exportable, or a dma-buf) is
-//!   made so that the platform makes the buffer's memory at its first use alone
+//!   them where its picture lands in the buffer: a decode given the planes of the cache's surface
+//!   ([`exported`]) makes none (`super::GraphicsDecoder::video_planes`). A cache whose memory is
+//!   not made for the host's video (exportable, or a dma-buf) is made so that the platform makes
+//!   the buffer's memory at its first use alone
 //!   ([`GpuDevice::new_deferred_buffer_of_length`]), as zeros, as a new cache's are: a cache no
 //!   such copy reaches holds none. Each copy makes it first ([`Buffer::make_memory`]), a
 //!   download's, a release's, an early copy's and a write's copy into another shape's with the
@@ -6628,6 +6630,14 @@ impl<P: Platform> Caches<P> {
     /// Whether the block at `block` has a cache.
     pub(crate) fn has(&self, block: u64) -> bool {
         self.lock().has(block)
+    }
+
+    /// Whether the block at `block`'s cache has its surface ([`exported`]): a decode that shows
+    /// its planes whole lands its picture there rather than in the cache's buffer
+    /// (`surface_targets`, on Windows `drawn_targets`, which count the landing; this does not).
+    pub(crate) fn has_surface(&self, block: u64) -> bool {
+        let state = self.state.lock();
+        (state.by_block.get(&block)).is_some_and(|cache| cache.surface.is_made())
     }
 
     /// The plane of the block at `block`'s cache's surface whose image the shape `reference`
@@ -14228,6 +14238,36 @@ pub(super) mod tests {
         }
         .as_bytes()
         .to_vec()
+    }
+
+    /// `message`, a `TEXTURE_FROM_IOSURFACE`, carrying the facts of a two-plane 4:2:0 surface
+    /// `width` by `height` pixels whose plane 1 lies at `chroma` (its first byte and pitch), as a
+    /// decoder's output's texture's message does: a texture of its plane's size shows the plane
+    /// whole (`video::whole_plane`).
+    pub(crate) fn with_facts(
+        mut message: Vec<u8>,
+        (width, height): (u32, u32),
+        chroma: (u64, u64),
+    ) -> Vec<u8> {
+        use reims_vgpu_graphics::wire::{
+            RGFX_SURFACE_FACTS_OFFSET, RGFX_YCBCR_MATRIX_ITU_R_709_2, RgfxSurfaceFacts,
+        };
+        let facts = RgfxSurfaceFacts {
+            surface_pixel_format: u32::from_be_bytes(*b"420v"),
+            plane_count: 2,
+            width,
+            height,
+            chroma_offset: chroma.0,
+            chroma_bytes_per_row: chroma.1,
+            ycbcr_matrix: RGFX_YCBCR_MATRIX_ITU_R_709_2,
+            reserved_24: 0,
+        };
+        message.resize(RGFX_SURFACE_FACTS_OFFSET as usize, 0);
+        message.extend_from_slice(facts.as_bytes());
+        let size = std::mem::offset_of!(RgfxMsgHeader, size);
+        let length = u32::try_from(message.len()).unwrap_or(u32::MAX);
+        message[size..size + 4].copy_from_slice(&length.to_le_bytes());
+        message
     }
 
     /// The buffer each `newTextureWithDescriptor:iosurface:plane:` in `calls` was made over, and

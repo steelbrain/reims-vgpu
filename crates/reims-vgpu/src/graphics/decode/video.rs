@@ -78,7 +78,7 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::FromBytes;
 
 use super::worker::Worker;
-use super::{GraphicsDecoder, ObjHandle, bad_reference, op_fault};
+use super::{Entry, GraphicsDecoder, ObjHandle, bad_reference, op_fault};
 
 /// How long a video op waits on the CPU for the host's own work on its surface's device cache
 /// before the log names the wait (diagnostics only): it waits on after
@@ -1059,16 +1059,32 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// waited for first, so a picture never lands over a fill's older bytes and a copy never
     /// reads a picture landing, and a read finds the cache whole. A `decode` whose textures show
     /// their cache's planes whole, where it keeps them in a surface, is given the surface's planes
-    /// (`VideoPlane::surface`, on Unix hosts).
-    fn video_planes(
+    /// (`VideoPlane::surface`, on Unix hosts; `VideoPlane::drawn`, on Windows), and the memory of
+    /// the cache's buffer, which its picture does not land in, is not made for it (the cache's
+    /// module doc, "Deferred memory"); a buffer a plane lies in otherwise has its memory made
+    /// first, as [`Self::require_buffer`] makes it.
+    pub(super) fn video_planes(
         &self,
         tag: u16,
         luma_id: u64,
         chroma_id: u64,
         decode: bool,
     ) -> RaiseResult<(VideoPlane<'_, P>, VideoPlane<'_, P>)> {
-        let (luma_place, luma) = self.plane_of(luma_id)?;
-        let (chroma_place, chroma) = self.plane_of(chroma_id)?;
+        // Each plane's buffer is noted, and its memory made where the picture lands there, in
+        // the order a lookup of each plane that made it would take: luma's, then chroma's.
+        let made = |(place, entry, buffer): (PlanePlace, &Entry<P>, &P::Buffer)| {
+            self.cache_memory(place.buffer_obj_id, entry, buffer)
+        };
+        let luma_plane = self.plane_of(luma_id)?;
+        self.note_over_cache(luma_plane.1);
+        let chroma_plane = match self.plane_of(chroma_id) {
+            Ok(plane) => plane,
+            Err(raise) => {
+                made(luma_plane)?;
+                return Err(raise);
+            }
+        };
+        let ((luma_place, _, luma), (chroma_place, _, chroma)) = (luma_plane, chroma_plane);
         // The block of a plane in its surface's device cache.
         let cache_of = |buffer_obj_id| {
             (self.span_of(buffer_obj_id))
@@ -1079,6 +1095,21 @@ impl<P: Platform> GraphicsDecoder<P> {
             cache_of(luma_place.buffer_obj_id),
             cache_of(chroma_place.buffer_obj_id),
         );
+        // A decode of both planes whole, in one cache, lands in the cache's surface where it
+        // has one, and the buffer's memory is made only where it lands there after all.
+        let whole = decode
+            && luma_place.whole == Some(0)
+            && chroma_place.whole == Some(1)
+            && luma_place.buffer_obj_id == chroma_place.buffer_obj_id;
+        let landing_apart = (luma_cache.filter(|_| whole))
+            .is_some_and(|block| self.surface_caches.has_surface(block));
+        if landing_apart {
+            self.note_over_cache(chroma_plane.1);
+        } else {
+            made(luma_plane)?;
+            self.note_over_cache(chroma_plane.1);
+            made(chroma_plane)?;
+        }
         for block in luma_cache.into_iter().chain(chroma_cache) {
             self.wait_for_cache(tag, block)?;
         }
@@ -1088,12 +1119,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             let laid = self.surface_caches.repitched(cache?)?;
             Some((laid.rows_from(place.in_surface.0, place.in_surface.1)).unwrap_or(place.height))
         };
-        // A decode of both planes whole, in one cache, lands in the cache's surface where it
-        // has one.
-        let whole = decode
-            && luma_place.whole == Some(0)
-            && chroma_place.whole == Some(1)
-            && luma_place.buffer_obj_id == chroma_place.buffer_obj_id;
         #[cfg(unix)]
         let [luma_surface, chroma_surface] = match luma_cache.filter(|_| whole) {
             Some(block) => (self.surface_caches.surface_targets(block))
@@ -1106,6 +1131,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .map_or([None, None], |targets| targets.map(Some)),
             None => [None, None],
         };
+        // A surface gone during the waits leaves the picture to the buffer.
+        #[cfg(unix)]
+        let landed_apart = luma_surface.is_some();
+        #[cfg(windows)]
+        let landed_apart = luma_drawn.is_some();
+        if landing_apart && !landed_apart {
+            made(luma_plane)?;
+            made(chroma_plane)?;
+        }
         let plane = |place: PlanePlace, buffer, cache: Option<u64>| VideoPlane {
             buffer,
             offset: place.offset,
@@ -1279,17 +1313,19 @@ impl<P: Platform> GraphicsDecoder<P> {
             .collect()
     }
 
-    /// Where texture `id`, one over an IOSurface plane, lies, and the buffer it lies in; an exec
+    /// Where texture `id`, one over an IOSurface plane, lies, and the buffer it lies in, with
+    /// the buffer's entry, neither noted nor its memory made ([`Self::buffer_entry`]); an exec
     /// fault where `id` names no such texture, and a refused reference where its create was
     /// refused ([`super::refused`]).
-    fn plane_of(&self, id: u64) -> RaiseResult<(PlanePlace, &P::Buffer)> {
+    fn plane_of(&self, id: u64) -> RaiseResult<(PlanePlace, &Entry<P>, &P::Buffer)> {
         let place = match self.entry(id).map(|e| (&e.handle, e.place)) {
             Some((ObjHandle::Texture(_), place)) => place,
             Some((ObjHandle::Refused(r), _)) => return Err(r.reference(id)),
             _ => None,
         }
         .ok_or_else(bad_reference)?;
-        Ok((place, self.require_buffer(place.buffer_obj_id)?))
+        let (entry, buffer) = self.buffer_entry(place.buffer_obj_id)?;
+        Ok((place, entry, buffer))
     }
 }
 
