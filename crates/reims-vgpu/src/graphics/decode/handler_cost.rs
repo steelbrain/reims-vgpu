@@ -8,9 +8,8 @@
 //! host's threads asleep for 2 ms before each, as between a client's frames, after [`WARM`] to
 //! warm up. Each buffer carries both handlers, which read the host's clock. Printed: p50, p90
 //! and p99 in microseconds of the GPU's start after the commit call began, of each handler's
-//! time after the buffer's GPU end, which the platform counts on the host's clock
-//! (`CLOCK_UPTIME_RAW` on macOS, `mach_absolute_time`'s; `CLOCK_MONOTONIC_RAW` on Linux), and of
-//! the completed handler's after the completion-seen one's. A measurement, run by hand in a
+//! time after the buffer's GPU end, which the platform counts on the runtime's host clock
+//! ([`host_ns`]), and of the completed handler's after the completion-seen one's. A measurement, run by hand in a
 //! release build holding the host's GPU (`cargo test --release -p reims-vgpu --lib handler_cost
 //! -- --ignored --nocapture`).
 
@@ -31,38 +30,11 @@ use crate::platform::ApiPlatform;
 const ROUNDS: usize = 2000;
 const WARM: usize = 100;
 
-/// The host's clock, in nanoseconds: the one the platform gives GPU times in.
-#[cfg(unix)]
+/// The host's clock, in nanoseconds: the runtime's (`metal2vulkan_runtime::host_time`), which
+/// the platform's GPU times count (`rt_platform/command.rs`): `CLOCK_MONOTONIC` on Linux,
+/// `CLOCK_MONOTONIC_RAW` on macOS and the performance counter on Windows.
 pub(super) fn host_ns() -> u64 {
-    #[cfg(target_os = "macos")]
-    let clock = libc::CLOCK_UPTIME_RAW;
-    #[cfg(not(target_os = "macos"))]
-    let clock = libc::CLOCK_MONOTONIC_RAW;
-    let mut t = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `t` is the timespec the call writes.
-    unsafe { libc::clock_gettime(clock, &mut t) };
-    (t.tv_sec as u64) * 1_000_000_000 + t.tv_nsec as u64
-}
-
-/// [`host_ns`] on Windows: the performance counter (`QueryPerformanceCounter`), the clock Windows
-/// GPUs' timestamps are calibrated against, in nanoseconds.
-#[cfg(windows)]
-pub(super) fn host_ns() -> u64 {
-    use windows_sys::Win32::System::Performance::{
-        QueryPerformanceCounter, QueryPerformanceFrequency,
-    };
-    let (mut count, mut frequency) = (0i64, 0i64);
-    // SAFETY: two live out-parameters; neither call fails on a supported Windows.
-    unsafe {
-        QueryPerformanceCounter(&mut count);
-        QueryPerformanceFrequency(&mut frequency);
-    }
-    let ns = u128::from(count.cast_unsigned()) * 1_000_000_000
-        / u128::from(frequency.cast_unsigned().max(1));
-    u64::try_from(ns).unwrap_or(u64::MAX)
+    metal2vulkan_runtime::host_time()
 }
 
 /// Which handler told, when on the host's clock, and the buffer's GPU times it learned.

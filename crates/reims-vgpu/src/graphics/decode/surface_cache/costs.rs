@@ -13,7 +13,7 @@
 //! over it is its cache. Each round a command buffer of queue 1 names the surface's use as a
 //! write (`RGFX_OP_SURFACE_USE`, `RGFX_SURFACE_USE_WRITES`) and does nothing else; after a pause
 //! of `RGK_BENCH_GAP_US` microseconds (default 3000), in which the GPU runs it, the cache is
-//! downloaded, timed on the host's clock, which the platform's GPU times are on
+//! downloaded, timed on the runtime's host clock, which the platform's GPU times are on
 //! (`handler_cost::host_ns`):
 //!
 //! - `write`: the writing command buffer's decode, which, once a download has copied the surface
