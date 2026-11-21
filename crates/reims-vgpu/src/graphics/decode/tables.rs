@@ -220,7 +220,7 @@ pub(crate) struct Entry<P: Platform> {
     /// The table's clock at its make.
     made: u64,
     /// The first clock of a view that names it: its make's, or the making message's view's where
-    /// that was taken before ([`Context::insert`]'s `seen_from`).
+    /// that was taken before ([`Context::insert_after`]'s `seen_from`).
     seen: u64,
     /// An object counted as made by its kind, live while its entry is ([`super::unkept`]); `None`
     /// where none is counted. It drops after the object.
@@ -479,11 +479,11 @@ struct Tables<P: Platform> {
     /// The region spans the live entries lie over ([`Entry::span`]), each with how many lie over
     /// it: what [`Context::span_in`] looks through, a few keys about the range it asks of, where
     /// the entries themselves are thousands. It cannot go stale: an entry's span is counted where
-    /// the entry goes into `live` ([`Context::insert`], [`Context::insert_if`]) and taken out where
-    /// it leaves ([`Self::retire`], which every removal from `live` goes through: a remove, a make
-    /// over its id again, a close's removal of every entry), each under the table's write lock with
-    /// the change itself, and a span is set at the entry's make and never changed while it is in
-    /// the table (the module doc). A context dropped takes its spans with it.
+    /// the entry goes into `live` ([`Context::insert_after`], [`Context::insert_if`]) and taken
+    /// out where it leaves ([`Self::retire`], which every removal from `live` goes through: a
+    /// remove, a make over its id again, a close's removal of every entry), each under the table's
+    /// write lock with the change itself, and a span is set at the entry's make and never changed
+    /// while it is in the table (the module doc). A context dropped takes its spans with it.
     spans: BTreeMap<(u64, u64), usize>,
     /// The longest span `spans` ever counted: how far before a range a span that reaches into it
     /// may start.
@@ -698,18 +698,18 @@ impl<P: Platform> Context<P> {
         }
     }
 
-    /// Stores `entry` under `id`, in place of what the id named, and the pointer to it; what it
-    /// replaced, to let go of where no view needs it. `seen_from` is the clock of the making
-    /// message's view of this table, where it has one ([`View::at`]), which names the entry
-    /// though taken before its make ([`View::made`]). The entry's object is told `id` for its
-    /// device's loss ([`name_for_loss`]).
+    /// [`Self::insert_after`] with no command buffer to wait for.
     #[cfg(test)]
     pub(crate) fn insert(&self, id: u64, entry: Entry<P>, seen_from: Option<u64>) -> Made<P> {
         self.insert_after(id, entry, seen_from, Vec::new())
     }
 
-    /// [`Self::insert`], what the id named waiting for the command buffers of `pending` before it
-    /// is let go of (the module doc, "After the buffers posted before it").
+    /// Stores `entry` under `id`, in place of what the id named, and the pointer to it; what it
+    /// replaced, to let go of where no view needs it and every command buffer of `pending` is
+    /// committed (the module doc, "After the buffers posted before it"). `seen_from` is the clock
+    /// of the making message's view of this table, where it has one ([`View::at`]), which names
+    /// the entry though taken before its make ([`View::made`]). The entry's object is told `id`
+    /// for its device's loss ([`name_for_loss`]).
     pub(crate) fn insert_after(
         &self,
         id: u64,
@@ -756,15 +756,15 @@ impl<P: Platform> Context<P> {
         Some((at, replaced))
     }
 
-    /// Removes `id`'s entry, where it has one: whether it was a texture, and it, to let go of,
-    /// where no view needs it.
+    /// [`Self::remove_after`] with no command buffer to wait for.
     #[cfg(test)]
     pub(crate) fn remove(&self, id: u64) -> Option<(bool, Option<Removed<P>>)> {
         self.remove_after(id, Vec::new())
     }
 
-    /// [`Self::remove`], the entry waiting for the command buffers of `pending` before it is let
-    /// go of (the module doc, "After the buffers posted before it").
+    /// Removes `id`'s entry, where it has one: whether it was a texture, and it, to let go of
+    /// where no view needs it and every command buffer of `pending` is committed (the module doc,
+    /// "After the buffers posted before it").
     pub(crate) fn remove_after(
         &self,
         id: u64,
