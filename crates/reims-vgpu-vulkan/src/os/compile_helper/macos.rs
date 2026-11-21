@@ -21,7 +21,12 @@ pub(super) fn free_memory() -> Option<u64> {
     let mut count = libc::HOST_VM_INFO64_COUNT;
     // SAFETY: `stats` is a vm_statistics64, the flavor HOST_VM_INFO64 fills, of `count` integers.
     let read = unsafe {
-        libc::host_statistics64(host, libc::HOST_VM_INFO64, (&raw mut stats).cast(), &mut count)
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&raw mut stats).cast(),
+            &mut count,
+        )
     };
     if read != libc::KERN_SUCCESS {
         return None;

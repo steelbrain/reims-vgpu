@@ -39,7 +39,9 @@ pub(super) fn host_memory() -> Option<u64> {
 /// where Windows does not say.
 pub(super) fn free_memory() -> Option<u64> {
     memory_status().map(|status| {
-        let charged = status.ullTotalPageFile.saturating_sub(status.ullAvailPageFile);
+        let charged = status
+            .ullTotalPageFile
+            .saturating_sub(status.ullAvailPageFile);
         (status.ullAvailPhys).min(status.ullTotalPhys.saturating_sub(charged))
     })
 }

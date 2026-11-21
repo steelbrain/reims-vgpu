@@ -382,7 +382,11 @@ fn helpers_take_seats_in_the_order_they_were_started() {
     assert_eq!(first.wait(), HelperEnd::Cancelled);
     pid_of(&second);
     std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(third.pid(), None, "the third took the seat before the second");
+    assert_eq!(
+        third.pid(),
+        None,
+        "the third took the seat before the second"
+    );
     second.cancel();
     assert_eq!(second.wait(), HelperEnd::Cancelled);
     pid_of(&third);

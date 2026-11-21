@@ -102,9 +102,11 @@ fn cgroup_room(root: &Path, path: &str) -> u64 {
     let mut dir = root.join(path.trim_start_matches('/'));
     loop {
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
-        if let (Some(max), Some(current), Some(stat)) =
-            (read("memory.max"), read("memory.current"), read("memory.stat"))
-            && let Some(level) = headroom_of(&max, &current, &stat)
+        if let (Some(max), Some(current), Some(stat)) = (
+            read("memory.max"),
+            read("memory.current"),
+            read("memory.stat"),
+        ) && let Some(level) = headroom_of(&max, &current, &stat)
         {
             room = room.min(level);
         }

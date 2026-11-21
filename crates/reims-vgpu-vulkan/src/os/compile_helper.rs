@@ -207,7 +207,9 @@ impl Seats {
     /// The host's seats at `guard`: one per logical CPU of the host ([`host_cpus`]), and the
     /// host's room ([`room_of_host`]).
     pub(crate) fn of_host(guard: PathBuf) -> Seats {
-        let count = host_cpus().and_then(|n| usize::try_from(n).ok()).unwrap_or(1);
+        let count = host_cpus()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(1);
         Seats {
             guard,
             count,
@@ -600,8 +602,8 @@ fn take_seat(
         }
         if place.first() {
             let now = clock.now_mono();
-            let may_read = room_read
-                .is_none_or(|at| now.saturating_duration_since(at) >= ROOM_POLL);
+            let may_read =
+                room_read.is_none_or(|at| now.saturating_duration_since(at) >= ROOM_POLL);
             let cap = run.limits.memory;
             let tried = MutexGuard::unlocked(&mut state, || {
                 try_seat(seats, cap, place, &guard, &files, may_read)
@@ -800,7 +802,9 @@ fn run_watched<T: Send + 'static>(
         }
     };
     let deadline = Deadline::Mono(started.saturating_add(run.limits.time));
-    let (end, footprints) = poll(&mut child, &watched, run.limits, deadline, place, shared, clock);
+    let (end, footprints) = poll(
+        &mut child, &watched, run.limits, deadline, place, shared, clock,
+    );
     // The talk ends once the process has: its pipes read their end, and its writes fail.
     let said = talking.join().ok();
     // `watched` goes before `child`, whose process handle it reads on Windows.
