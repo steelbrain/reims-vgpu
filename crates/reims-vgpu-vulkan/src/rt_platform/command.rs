@@ -116,6 +116,7 @@ use crate::core::platform::command::{
     ScheduledHandler, WorkNames, run_completed,
 };
 use crate::core::platform::event::EventRef;
+use crate::core::platform::os::Clock as _;
 use crate::core::platform::types::{CommandBufferStatus, NsErrorText};
 use crate::core::platform::values::ComputePassDesc;
 use crate::core::platform::{Handle, ObjId, Platform};
@@ -222,9 +223,10 @@ fn trace_commit(cb: &rt::CommandBuffer) -> Option<Handler> {
     }))
 }
 
-/// Writes rt's metrics to the trace at `now`, its clock's time, where [`METRICS_EVERY`] has
-/// passed since the last write: a commit and a completion call it, so a stall with neither has
-/// a line at most that long before it and one at its end.
+/// Writes rt's metrics (`rtmetrics`), and more of its counts with its gauges (`rtcounts`), to the
+/// trace at `now`, its clock's time, where [`METRICS_EVERY`] has passed since the last write: a
+/// commit and a completion call it, so a stall with neither has a line at most that long before
+/// it and one at its end.
 fn trace_metrics(now: u64) {
     let last = METRICS_WRITTEN.load(Ordering::Relaxed);
     if now.saturating_sub(last) < METRICS_EVERY
@@ -261,6 +263,64 @@ fn trace_metrics(now: u64) {
             m.maker_yields,
         ],
     );
+    trace::event_at(now, "rtcounts", &counts(&m));
+}
+
+/// How many values a trace's `rtcounts` event holds (`counts`).
+pub(super) const COUNTS: usize = 24 + super::device::OVER_COPY_METRICS + 5;
+
+/// The values of the `rtcounts` event of `m`, rt's metrics, with rt's gauges as they are now.
+fn counts(m: &rt::Metrics) -> Vec<u64> {
+    let wall = crate::os::OsClock::new().now_wall().as_nanos();
+    let g = super::device::gauges().unwrap_or_default();
+    // rtcounts: the wall clock's nanoseconds since 1970, which line the trace up with a guest's
+    // wall clock; then more of rt's counts since its device was made: the takes from its pool,
+    // their bytes, their nanoseconds in all and the longest; the host's writes of zeros into
+    // blocks, their bytes and nanoseconds, and the bytes zeroed in all; the blocks a GPU fill
+    // zeroed and their bytes; new textures' images cleared, their bytes and the barriers after
+    // them; textures' allocations of their own, then texture blocks' allocations, each the count
+    // and the bytes; the `VkDeviceMemory` allocations made for blocks and their bytes; the waits
+    // for the block-maker thread and the longest; the barriers and passes recorded; the
+    // over-copies and their bytes, those over an imported block, then each cause's
+    // (`device::over_copy_counts`); then rt's gauges now: its live textures, attachment views,
+    // held descriptor slots, buffers and `VkDeviceMemory` allocations
+    let head = [
+        wall,
+        m.takes.count,
+        m.takes.bytes,
+        m.takes.total_nanos,
+        m.takes.longest_nanos,
+        m.zero_writes.count,
+        m.zero_writes.bytes,
+        m.zero_writes.total_nanos,
+        m.bytes_zeroed,
+        m.block_zero_fills,
+        m.block_zero_fill_bytes,
+        m.texture_clears,
+        m.texture_clear_bytes,
+        m.texture_clear_barriers,
+        m.texture_allocations.count,
+        m.texture_allocations.bytes,
+        m.texture_block_allocations.count,
+        m.texture_block_allocations.bytes,
+        m.blocks_made,
+        m.block_bytes_made,
+        m.maker_waits,
+        m.maker_wait_max_nanos,
+        m.barriers,
+        m.passes,
+    ];
+    let over = super::device::over_copy_counts(m).map(|(_, count)| count);
+    let gauges = [
+        g.textures,
+        g.attachment_views,
+        g.descriptor_slots,
+        g.buffers,
+        g.blocks,
+    ];
+    let counts: Vec<u64> = head.into_iter().chain(over).chain(gauges).collect();
+    debug_assert_eq!(counts.len(), COUNTS);
+    counts
 }
 
 /// Writes to the trace, where it is on, an event op that `cb` encoded and rt took: `kind`, then

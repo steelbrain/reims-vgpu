@@ -102,9 +102,9 @@ pub const OVER_COPIES_IMPORTED_CODE: &str = "rt-over-copies-imported";
 /// The code of their bytes (`Metrics::over_copy_bytes_imported`).
 pub const OVER_COPY_BYTES_IMPORTED_CODE: &str = "rt-over-copy-bytes-imported";
 
-/// The over-copy metrics the counts line carries ([`over_copy_counts`]): the over-copies and their
-/// bytes, those over an imported block, and the 12 causes' pairs.
-const OVER_COPY_METRICS: usize = 4 + 2 * 12;
+/// The over-copy metrics the counts line and the trace's `rtcounts` carry ([`over_copy_counts`]):
+/// the over-copies and their bytes, those over an imported block, and the 12 causes' pairs.
+pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 
 /// The counters of the device the process made last ([`open`]), which [`fold_metrics`] reads,
 /// with what it folded so far of each of their metrics, in [`over_copy_counts`]'s order.
@@ -136,7 +136,7 @@ fn follow(counters: rt::Counters) {
 /// The over-copy metrics of `m`, each with its code (the module's docs): the over-copies and
 /// their bytes, those over an imported block, then each cause's copies and their bytes, the code
 /// named for rt's field.
-fn over_copy_counts(m: &rt::Metrics) -> [(&'static str, u64); OVER_COPY_METRICS] {
+pub(super) fn over_copy_counts(m: &rt::Metrics) -> [(&'static str, u64); OVER_COPY_METRICS] {
     macro_rules! by_cause {
         ($($cause:literal $copies:ident $bytes:ident),* $(,)?) => {
             [

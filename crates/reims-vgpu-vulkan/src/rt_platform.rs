@@ -675,7 +675,8 @@ mod tests {
     /// completion: its commit number, then its commit's time and rt's submission and GPU times
     /// on the trace's clock, in their order (an empty command buffer's GPU times are at its
     /// submission's end or later) and none after the line's own time; and its commit writes
-    /// rt's metrics (`command::trace_metrics`).
+    /// rt's metrics (`command::trace_metrics`), each `rtmetrics` with an `rtcounts` beside it
+    /// that holds all its values, the first the wall clock as it was written.
     #[test]
     fn on_vulkan_a_traced_commit_writes_its_cbdone_and_rt_metrics() {
         use std::sync::atomic::Ordering;
@@ -684,10 +685,11 @@ mod tests {
         // nextest runs each test in a process of its own, whose trace file is this one
         let path = std::env::temp_dir().join(format!("rvg-rt-cbdone-{}.txt", std::process::id()));
         assert!(trace::to_file(&path));
+        let clock = crate::os::OsClock::new();
+        let wall_before = clock.now_wall().as_nanos();
         let platform = RtPlatform::new();
         let device = (platform.system_default_device()).expect("an rt device on the GPU");
         let (_queue, ended) = commit_work(&device);
-        let clock = crate::os::OsClock::new();
         let start = clock.now_mono();
         while ended.load(Ordering::SeqCst) < 8 {
             let waited = clock.now_mono().saturating_duration_since(start);
@@ -695,6 +697,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         trace::flush_before_death();
+        let wall_after = clock.now_wall().as_nanos();
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         let lines = |kind: &str| -> Vec<Vec<u64>> {
@@ -737,6 +740,16 @@ mod tests {
         let metrics = lines("rtmetrics");
         assert!(!metrics.is_empty(), "{text}");
         assert!(metrics.iter().all(|f| f.len() == 14), "{text}");
+        let counts = lines("rtcounts");
+        assert_eq!(counts.len(), metrics.len(), "{text}");
+        assert!(
+            counts.iter().all(|f| f.len() == 1 + command::COUNTS),
+            "{text}"
+        );
+        assert!(
+            (counts.iter()).all(|f| (wall_before..=wall_after).contains(&f[1])),
+            "{text}"
+        );
     }
 
     /// Runs the test named `test` again in a child process, with `RVG_QUIESCE_CHILD` naming it:
