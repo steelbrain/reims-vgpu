@@ -58,7 +58,8 @@
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 #include "../../kext/src/RgfxQueuePublish.hpp"
 
-void rgfxProtocolTests();
+void rgfxProtocolTests(const char *self);
+int rgfxProtocolFairShareCase(const char *name);
 void drainRing(TestRing &ring); // shell_tests.mm
 
 namespace {
@@ -988,9 +989,9 @@ struct PublishingKext {
 	std::string calls;
 	uint64_t heldAtPublish = 0;
 	uint32_t word = 0;
-	// Posts every held message and publishes nothing, as the kext does for a queue whose ring
-	// header it keeps none of.
-	bool publishNothing = false;
+	// At most this many messages of a call are posted, the rest refused, as where the control ring
+	// fills.
+	uint32_t takes = UINT32_MAX;
 	// Run once, at the next batch call with a publish, before it posts: the bundle's held messages
 	// are locked for the call then.
 	std::function<void()> once = nullptr;
@@ -1010,7 +1011,7 @@ struct PublishingKext {
 	{
 		const uint8_t *m = static_cast<const uint8_t *>(messages);
 		uint32_t posted = 0;
-		for (uint32_t at = 0; at < bytes && !refuse; posted++) {
+		for (uint32_t at = 0; at < bytes && !refuse && posted < takes; posted++) {
 			RgfxMsgHeader header;
 			std::memcpy(&header, m + at, sizeof(header));
 			if (!direct->tryPost(header.type, m + at, header.size, nullptr))
@@ -1055,7 +1056,7 @@ struct PublishingKext {
 		}
 		const uint32_t posted = kext->post(messages, bytes);
 		*out_published = false;
-		if (posted == count && !kext->publishNothing) {
+		if (posted == count) {
 			kext->heldAtPublish = kext->control->producer();
 			Header h{kext->submit};
 			const uint64_t flags = (publish.answered ? kRgfxPublishAnswered : 0) |
@@ -1250,19 +1251,20 @@ void test_commit_hands_its_publish_to_the_held()
 
 // A create another thread makes while a commit's held messages are in the kext's call with the
 // buffer's publish (kRgfxKextFeatureQueuePublish) is none the buffer names, as it was made after
-// the commit began, and fails nothing: the buffer goes on its ring, published by the bundle where
-// the kext published nothing, and completes; the create, held once the call is done, goes before
-// the next post. The call is where a test can hold a create between the commit's post and its
-// answer; a commit with nothing held makes no call, and its answer is the same
+// the commit began, and fails nothing: where the kext refused only a held destroy, the buffer goes
+// on its ring, published by the bundle, and completes; the create, held once the call is done,
+// goes behind the destroy at the next post. Run in a process of its own on fair-share mutexes
+// (rgfxRunFairShare): the other thread then takes the held messages between the call's hold and
+// any later one. A commit with nothing held makes no call, and its answer is the same
 // (RgfxRingWriter::flushPublishing).
 void test_commit_counts_only_the_held_it_posted()
 {
+	CHECK(rgfxMutexesFairShare());
 	TestRing control(0x8000);
 	RgfxRingWriter direct(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
 	                      TestRing::doorbell, nullptr);
 	TestRing submit(0x8000);
 	PublishingKext kext{&direct, &control, &submit, false, {}, 0, 0};
-	kext.publishNothing = true;
 	RgfxRingWriter writer(&PublishingKext::submitOne, &kext, 0x4000);
 	writer.setBatch(&PublishingKext::batch, 4096, 600ull * 1000000000);
 	writer.setBatchPublish(&PublishingKext::batchPublish);
@@ -1308,10 +1310,13 @@ void test_commit_counts_only_the_held_it_posted()
 		CHECK(heap != nil);
 		drainRing(control);
 
-		// A heap-placed buffer, held; while its commit's call posts it, another thread makes a
-		// texture, whose create waits for the held messages the call has locked.
+		// A heap-placed buffer and a destroy, held; the commit's call posts the buffer and refuses
+		// the destroy, and meanwhile another thread makes a texture, whose create waits for the
+		// held messages the call has locked.
 		id<MTLBuffer> buffer = [heap newBufferWithLength:256 options:MTLResourceStorageModePrivate];
 		CHECK(buffer != nil);
+		CHECK(ser.destroy(0x101));
+		kext.takes = 1;
 		RgfxCreated made = {};
 		std::thread other;
 		kext.once = [&] {
@@ -1330,8 +1335,8 @@ void test_commit_counts_only_the_held_it_posted()
 		std::vector<uint8_t> bytes;
 		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
 		CHECK(!control.next(&h, &bytes));
-		// The held in the kext's call, which published nothing, then the bundle's publish and
-		// doorbell.
+		// The held in the kext's call, which refused the destroy and published nothing, then the
+		// bundle's publish and doorbell.
 		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER && h.seqno == 1);
 		CHECK(kext.calls == "PD");
 		RgfxCbComplete done = {};
@@ -1345,9 +1350,11 @@ void test_commit_counts_only_the_held_it_posted()
 		CHECK(cb.status == MTLCommandBufferStatusCompleted);
 		CHECK(cb.error == nil);
 
-		// The texture's create, held, goes before the next post.
+		// The texture's create, held behind the destroy, goes with it at the next post.
 		CHECK(writer.holdsBut(RGFX_CMD_OBJECT_DESTROY));
+		kext.takes = UINT32_MAX;
 		CHECK(ser.postHeldCreates());
+		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_OBJECT_DESTROY);
 		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_TEXTURE_CREATE);
 		uint64_t obj = 0;
 		std::memcpy(&obj, bytes.data() + sizeof(h), sizeof(obj));
@@ -3648,7 +3655,7 @@ void test_surface_texture_alloc_sizes()
 
 } // namespace
 
-void rgfxProtocolTests()
+void rgfxProtocolTests(const char *self)
 {
 	test_inline_bytes();
 	test_inline_bytes_parallel();
@@ -3658,7 +3665,7 @@ void rgfxProtocolTests()
 	test_inline_bytes_without_region();
 	test_commit_behind_an_untaken_buffer_fails();
 	test_commit_hands_its_publish_to_the_held();
-	test_commit_counts_only_the_held_it_posted();
+	rgfxRunFairShare(self, "--protocol-fair-share", "commit-counts-only-the-held-it-posted");
 	test_doorbell_page_rings_at_its_first_byte();
 	test_render_barriers();
 	test_compute_dispatch_type();
@@ -3687,4 +3694,16 @@ void rgfxProtocolTests()
 	test_heap_sizes();
 	test_surface_texture_alloc_sizes();
 	test_queue_barriers();
+}
+
+// A case rgfxRunFairShare runs in a process of its own (shell_tests --protocol-fair-share NAME): 0
+// where it passed.
+int rgfxProtocolFairShareCase(const char *name)
+{
+	if (std::strcmp(name, "commit-counts-only-the-held-it-posted") == 0) {
+		test_commit_counts_only_the_held_it_posted();
+		return 0;
+	}
+	std::fprintf(stderr, "no protocol fair-share case %s\n", name);
+	return 2;
 }

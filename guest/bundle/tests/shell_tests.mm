@@ -22483,7 +22483,8 @@ void test_reply_reader_close()
 	CHECK(ring.consumerCount() == 0);
 }
 
-void rgfxProtocolTests();
+void rgfxProtocolTests(const char *self);
+int rgfxProtocolFairShareCase(const char *name);
 void rgfxArchiveTests();
 void rgfxResourceTests();
 void rgfxQueueTests(const char *self);
@@ -22555,6 +22556,8 @@ int main(int argc, char **argv)
 		return rgfxQueueDiesCase(argv[2]);
 	if (argc == 3 && std::strcmp(argv[1], "--residency-dies") == 0)
 		return rgfxResidencyDiesCase(argv[2]);
+	if (argc == 3 && std::strcmp(argv[1], "--protocol-fair-share") == 0)
+		return rgfxProtocolFairShareCase(argv[2]);
 	// A measurement, run by hand: the guest's share of a buffer's scheduling and completion
 	// (tests/queue_tests.mm).
 	if (argc >= 2 && std::strcmp(argv[1], "--queue-timing") == 0)
@@ -22757,7 +22760,7 @@ int main(int argc, char **argv)
 		test_no_copy_shadows_lie_in_slabs();
 		test_binds_note_shadow_writes();
 		test_block_call();
-		rgfxProtocolTests(); // tests/protocol_tests.mm
+		rgfxProtocolTests(argv[0]); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm
 		rgfxResourceTests(); // tests/resource_tests.mm
 		rgfxQueueTests(argv[0]); // tests/queue_tests.mm

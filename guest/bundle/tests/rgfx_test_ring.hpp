@@ -21,8 +21,13 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <crt_externs.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "reims_graphics_wire.h"
@@ -39,6 +44,45 @@ inline std::atomic<int> g_checks{0};
 			std::abort();                                                                          \
 		}                                                                                          \
 	} while (0)
+
+/// Runs this binary, `self`, again as `self mode name`, with its mutexes on libpthread's fair-share
+/// policy (PTHREAD_MUTEX_DEFAULT_POLICY=1), and checks that it exits 0. On that policy a mutex
+/// unlocked with a waiter goes to the waiter; on the default one the unlocking thread can take it
+/// again first. A test of what another thread does between two holds of one mutex runs so: its
+/// thread waits on the mutex through the first hold and takes it before the second. Measured on
+/// the M3 Max, macOS 27.0.1: serializer_tests' test_held_since_the_post_is_not_counted, against
+/// the two-hold code it guards, passed on the default policy and failed on fair share.
+inline void rgfxRunFairShare(const char *self, const char *mode, const char *name)
+{
+	static const char kPolicy[] = "PTHREAD_MUTEX_DEFAULT_POLICY=";
+	std::vector<char *> env;
+	for (char **e = *_NSGetEnviron(); *e != nullptr; e++)
+		if (std::strncmp(*e, kPolicy, sizeof(kPolicy) - 1) != 0)
+			env.push_back(*e);
+	std::string fair = std::string(kPolicy) + "1";
+	env.push_back(fair.data());
+	env.push_back(nullptr);
+	char *args[] = {const_cast<char *>(self), const_cast<char *>(mode), const_cast<char *>(name),
+	                nullptr};
+	pid_t pid = 0;
+	CHECK(posix_spawn(&pid, self, nullptr, nullptr, args, env.data()) == 0);
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		std::fprintf(stderr, "%s %s ended with status %d\n", mode, name, status);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+/// Whether this process's mutexes take libpthread's fair-share policy (rgfxRunFairShare).
+inline bool rgfxMutexesFairShare()
+{
+	pthread_mutexattr_t attr;
+	pthread_mutexattr_init(&attr);
+	int policy = 0;
+	pthread_mutexattr_getpolicy_np(&attr, &policy);
+	pthread_mutexattr_destroy(&attr);
+	return policy == PTHREAD_MUTEX_POLICY_FAIRSHARE_NP;
+}
 
 // A ring's region: its 256-byte header then a power-of-two byte ring, in a plain
 // buffer, with a doorbell counter. Mirrors a BAR-mapped ring for the test.

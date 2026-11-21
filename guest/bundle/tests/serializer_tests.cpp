@@ -3523,9 +3523,12 @@ void test_held_creates()
 // texture another thread makes while the route's call refuses a held destroy, its create held
 // once the call is done, leaves the answer true, as a buffer committed then cannot name it. The
 // create stays held behind the destroy, counts for the commits after it, and goes with the
-// destroy at the next post the route takes.
+// destroy at the next post the route takes. Run in a process of its own on fair-share mutexes
+// (rgfxRunFairShare): the other thread then takes the held messages between the post's hold and
+// any later one.
 void test_held_since_the_post_is_not_counted()
 {
+	CHECK(rgfxMutexesFairShare());
 	constexpr uint64_t kNever = 600ull * 1000000000;
 	KextLog log;
 	RgfxRingWriter writer(&kextSubmit, &log, 4096);
@@ -5427,8 +5430,21 @@ void test_region_write_combined_parts()
 	CHECK(zeroed && mem[rings.submit_block] == 0xee);
 }
 
-int main()
+// A case rgfxRunFairShare runs in a process of its own: 0 where it passed.
+static int fair_share_case(const char *name)
 {
+	if (std::strcmp(name, "held-since-the-post-is-not-counted") == 0) {
+		test_held_since_the_post_is_not_counted();
+		return 0;
+	}
+	std::fprintf(stderr, "no fair-share case %s\n", name);
+	return 2;
+}
+
+int main(int argc, char **argv)
+{
+	if (argc == 3 && std::strcmp(argv[1], "--fair-share") == 0)
+		return fair_share_case(argv[2]);
 	test_id_space();
 	test_private_address_picks();
 	test_private_heaps_align_from_their_block();
@@ -5479,7 +5495,7 @@ int main()
 	test_held_destroys();
 	test_held_buffers();
 	test_held_creates();
-	test_held_since_the_post_is_not_counted();
+	rgfxRunFairShare(argv[0], "--fair-share", "held-since-the-post-is-not-counted");
 	test_library_key();
 	test_library_key_pieces();
 	test_library_key_of_file();
