@@ -4914,8 +4914,11 @@ pub struct RgfxDeviceInfo {
     /// the sampler's [`RgfxSamplerCreateExt`]; 0 from every other host, which wrote it as zero.
     /// No host writes it yet.
     pub sampler_reduction_support: u8,
-    /// Zero.
-    pub reserved_453: u8,
+    /// 1 where the host's GPU is an integrated one, as its platform answers: on the Vulkan
+    /// platform, where its driver reports the physical device's type as `INTEGRATED_GPU`; 0 for
+    /// every other type (discrete, virtual, CPU, other), and from a host older than the field,
+    /// which wrote it as zero. An x86-64 guest's Metal device names its GPU by it.
+    pub integrated: u8,
     /// The bytes the host's GPU aligns the offset and rows of a linear BGRA8 image to, to make
     /// one over a surface's bytes in place there, where the host offers the surfaces' pages
     /// (`SURFACE_PAGES`) to every guest, on a GPU of any memory, and its platform answers; else

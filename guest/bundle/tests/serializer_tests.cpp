@@ -746,8 +746,9 @@ static_assert(RGFX_SAMPLER_CREATE_EXT_OFFSET == sizeof(RgfxSamplerCreate) &&
 static_assert(sizeof(RgfxCommandBufferPart) == 56, "COMMAND_BUFFER_PART");
 static_assert(sizeof(RgfxBufferOverPages) == 72, "BUFFER_OVER_PAGES");
 static_assert(offsetof(RgfxDeviceInfo, features_lo) == 0x451 &&
-                  offsetof(RgfxDeviceInfo, sampler_reduction_support) == 0x452,
-              "the device info's feature and reduction bytes");
+                  offsetof(RgfxDeviceInfo, sampler_reduction_support) == 0x452 &&
+                  offsetof(RgfxDeviceInfo, integrated) == 0x453,
+              "the device info's feature, reduction and integrated bytes");
 
 // The features call's answer: taken where the kext gave its three words and its selector map is
 // this bundle's, as they are, bits from 3 and 32 among them; refused, with both words 0, where it
@@ -1050,6 +1051,48 @@ void test_vendor_names()
 	};
 	for (const auto &[name, vendor] : cases)
 		CHECK(rgfxVendorNameOf(name) == vendor);
+}
+
+// The x86-64 guest's Metal name: the host's name whole after "Intel - " where the host's GPU is
+// an integrated one and "AMD - " for every other type, whatever the name holds (the owner's
+// examples first); the host's spaces kept; "reims-graphics" after the prefix for no name.
+void test_metal_names()
+{
+	const struct {
+		const char *host;
+		bool integrated;
+		const char *metal;
+	} cases[] = {
+	    {"NVIDIA GeForce RTX 3090", false, "AMD - NVIDIA GeForce RTX 3090"},
+	    {"AMD Radeon 780M Graphics (RADV PHOENIX)", true,
+	     "Intel - AMD Radeon 780M Graphics (RADV PHOENIX)"},
+	    {"llvmpipe (LLVM 20.1.8, 256 bits)", false, "AMD - llvmpipe (LLVM 20.1.8, 256 bits)"},
+	    {"Intel(R) Iris(R) Xe Graphics (RPL-P)", true, "Intel - Intel(R) Iris(R) Xe Graphics (RPL-P)"},
+	    {"Intel(R) Arc(tm) A770 Graphics (DG2)", false, "AMD - Intel(R) Arc(tm) A770 Graphics (DG2)"},
+	    {"AMD Radeon RX 7900 XTX (RADV NAVI31)", false, "AMD - AMD Radeon RX 7900 XTX (RADV NAVI31)"},
+	    {"", false, "AMD - reims-graphics"},
+	    {"", true, "Intel - reims-graphics"},
+	    {" GPU ", false, "AMD -  GPU "},
+	    {"  ", true, "Intel -   "},
+	};
+	for (const auto &c : cases)
+		CHECK(rgfxMetalNameOf(c.host, c.integrated) == c.metal);
+
+	// The blob's byte: yes where the host wrote 1, no where it wrote 0 (an older host's), and no
+	// with no caps.
+	RgfxCaps none;
+	CHECK(!none.hostIntegrated());
+	CHECK(rgfxMetalNameOf(none.name(), none.hostIntegrated()) == "AMD - reims-graphics");
+	RgfxDeviceInfo info = {};
+	info.version = RGFX_DEVICE_INFO_VERSION;
+	RgfxCaps older;
+	CHECK(older.load(info) && !older.hostIntegrated());
+	info.integrated = 1;
+	RgfxCaps integrated;
+	CHECK(integrated.load(info) && integrated.hostIntegrated());
+	info.version = RGFX_DEVICE_INFO_VERSION + 1;
+	RgfxCaps refused;
+	CHECK(!refused.load(info) && !refused.hostIntegrated());
 }
 
 // Heap and buffer creates carry the three modes and Metal's bit 24 to the host, and no other
@@ -5553,6 +5596,7 @@ int main(int argc, char **argv)
 	test_spi_features();
 	test_family_names();
 	test_vendor_names();
+	test_metal_names();
 	test_host_resource_options();
 	test_buffer_over_pages_at_the_host_s_address();
 	test_buffer_over_pages_at_the_host_s_address_later();

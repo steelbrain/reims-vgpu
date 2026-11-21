@@ -637,6 +637,12 @@ fn linear_alignment(device: &rt::Device, format: u64) -> Option<u64> {
 /// `MTLResourceStorageModePrivate`, as resource options.
 const STORAGE_PRIVATE: u64 = 0x20;
 
+/// Whether a GPU whose driver reports Vulkan's device type `device_type` is an integrated one: of
+/// type `INTEGRATED_GPU`, and of no other (discrete, virtual, CPU, other).
+fn integrated(device_type: vk::PhysicalDeviceType) -> bool {
+    device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+}
+
 /// The raise of a query rt refused at `sel`, counted already under `kind`: Metal's exception at
 /// the send, its detail the kind's code and why.
 fn refused_raise(sel: &'static str, kind: RtRefusal, why: &dyn std::fmt::Display) -> Raise {
@@ -1281,6 +1287,16 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         identity::memory_heaps_total_of(&memory)
     }
 
+    /// Whether the driver reports rt's physical device as of type `INTEGRATED_GPU`
+    /// (`integrated`).
+    fn is_integrated(&self) -> bool {
+        let raw = self.rt.raw();
+        // SAFETY: as above.
+        let properties =
+            unsafe { (raw.instance).get_physical_device_properties(raw.physical_device) };
+        integrated(properties.device_type)
+    }
+
     /// Yes, as on the Vulkan platform: rt's translator links an OpenCL-mode kernel as Metal does.
     fn makes_opencl_mode_pipelines(&self) -> bool {
         true
@@ -1498,6 +1514,17 @@ mod tests {
     use super::*;
     use crate::core::platform::device::relaying_gaps;
     use crate::core::platform::values::{OptionSet, TextureDesc};
+
+    /// Only Vulkan's `INTEGRATED_GPU` is an integrated GPU: a discrete, virtual, CPU or other
+    /// device is not
+    #[test]
+    fn only_the_integrated_device_type_is_integrated() {
+        use vk::PhysicalDeviceType as T;
+        assert!(integrated(T::INTEGRATED_GPU));
+        for other in [T::OTHER, T::DISCRETE_GPU, T::VIRTUAL_GPU, T::CPU] {
+            assert!(!integrated(other), "{other:?}");
+        }
+    }
 
     /// Each fold counts what each over-copy metric rose by since the last, under its code, so the
     /// counts line carries the metrics' totals: the over-copies and their bytes, those over an

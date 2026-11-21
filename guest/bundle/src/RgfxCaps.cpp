@@ -323,6 +323,13 @@ std::string rgfxVendorNameOf(const char *name)
 	return "AMD";
 }
 
+std::string rgfxMetalNameOf(const char *hostName, bool integrated)
+{
+	std::string out = integrated ? "Intel - " : "AMD - ";
+	out += hostName[0] != '\0' ? hostName : "reims-graphics";
+	return out;
+}
+
 std::string rgfxFamilyNameOf(const char *name)
 {
 	std::vector<std::string> words;

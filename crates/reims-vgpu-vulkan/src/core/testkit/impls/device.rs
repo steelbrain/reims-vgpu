@@ -151,14 +151,19 @@ pub struct DeviceModel {
     /// What `identity_caps` answers for `hasUnifiedMemory`
     /// ([`set_unified_memory`](Fk::set_unified_memory)).
     pub unified_memory: bool,
+    /// What [`is_integrated`](GpuDevice::is_integrated) answers
+    /// ([`set_integrated`](Fk::set_integrated)).
+    pub integrated: bool,
 }
 
 impl Default for DeviceModel {
-    /// The fake's default capabilities ([`fake_caps`]), of a GPU that shares the CPU's memory.
+    /// The fake's default capabilities ([`fake_caps`]), of an integrated GPU, which shares the
+    /// CPU's memory.
     fn default() -> DeviceModel {
         DeviceModel {
             caps: Arc::new(fake_caps()),
             unified_memory: true,
+            integrated: true,
         }
     }
 }
@@ -717,6 +722,11 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         FAKE_LINEAR_ROW_ALIGNMENT
     }
 
+    /// As [`set_integrated`](Fk::set_integrated) set it (yes by default), unlogged.
+    fn is_integrated(&self) -> bool {
+        self.with_model(|m: &DeviceModel| m.integrated)
+    }
+
     /// `row_bytes` rounded up to the world's linear rows' alignment where it has one
     /// ([`World::lay_linear_rows`](super::super::objects::World::lay_linear_rows)), else `None`;
     /// unlogged.
@@ -1014,6 +1024,12 @@ impl Fk<kind::Device> {
     /// `false` makes the fake a GPU of its own memory.
     pub fn set_unified_memory(&self, unified: bool) {
         self.with_model_mut(|m: &mut DeviceModel| m.unified_memory = unified);
+    }
+
+    /// Sets whether the device's GPU is an integrated one, which
+    /// [`is_integrated`](GpuDevice::is_integrated) answers from then on.
+    pub fn set_integrated(&self, integrated: bool) {
+        self.with_model_mut(|m: &mut DeviceModel| m.integrated = integrated);
     }
 }
 

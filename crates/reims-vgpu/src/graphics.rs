@@ -851,6 +851,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 info.linear_row_alignment =
                     u32::try_from(gpu_device.linear_row_alignment()).unwrap_or_default();
             }
+            // Whether the host's GPU is an integrated one, by which an x86-64 guest's Metal
+            // device names its GPU (the bundle's `rgfxMetalNameOf`).
+            info.integrated = u8::from(gpu_device.is_integrated());
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             // The host's hardware video, whose codecs the video caps after the device info list
             // for the guest's video driver, and whose decoders VideoToolbox's paravirtual path

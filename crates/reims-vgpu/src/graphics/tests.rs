@@ -882,6 +882,31 @@ fn the_blob_answers_framebuffer_read_by_the_guest_s_architecture() {
     assert_eq!(x86_families, arm64_families);
 }
 
+/// The blob carries whether the host's GPU is an integrated one, as the platform answers, for an
+/// x86-64 and an arm64 guest alike: 1 on the fake's integrated GPU, 0 on one that is not; the
+/// name stays the platform's either way
+#[test]
+fn the_blob_carries_whether_the_host_s_gpu_is_integrated() {
+    let blob = |guest_arch: GuestArch, integrated: bool| {
+        let platform = Arc::new(FakePlatform::new());
+        platform.device().set_integrated(integrated);
+        assert_eq!(platform.device().is_integrated(), integrated);
+        let config = GraphicsConfig {
+            guest_arch,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+        let info = device_info_of(&device);
+        let name = platform.device().caps().name.clone().unwrap();
+        assert_eq!(&info.name[..info.name_len as usize], name.as_bytes());
+        info.integrated
+    };
+    for guest in [GuestArch::X86_64, GuestArch::Arm64] {
+        assert_eq!(blob(guest, true), 1, "{guest:?}");
+        assert_eq!(blob(guest, false), 0, "{guest:?}");
+    }
+}
+
 /// An object-create message on ring 0 reaches the decoder: its handle is held
 #[test]
 fn an_object_create_reaches_the_decoder() {

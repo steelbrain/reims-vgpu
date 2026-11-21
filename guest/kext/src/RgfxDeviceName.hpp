@@ -1,6 +1,8 @@
 // RgfxDeviceName: the GPU name the kext states to the guest, from the host's device name in the
 // device info (RgfxDeviceInfo's name_len and name, written at RGFX_DEVICE_INFO_OFFSET when the
-// device is made): the name the bundle answers for the guest's Metal device.
+// device is made), whole on either guest. The bundle's Metal device answers the same name on an
+// arm64 guest, and on an x86-64 guest after a prefix of the host GPU's type, "AMD - " or "Intel - "
+// (rgfxMetalNameOf, guest/bundle/src/RgfxCaps.hpp).
 //
 // A Mac's GPU states its name as its IOPCIDevice's `model`, an OSData of the name's bytes, which
 // System Information shows as the GPU's "Chipset Model"; without one it shows "Graphics" and the

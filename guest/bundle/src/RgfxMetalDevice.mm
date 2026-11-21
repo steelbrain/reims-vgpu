@@ -1502,29 +1502,47 @@ RGFX_LOG_UNRECOGNIZED
 
 // --- identity ----------------------------------------------------------------
 
-- (NSString *)name
+// The host's name of its GPU, as the device info carries it, or "reims-graphics" where it
+// carries none: the name an arm64 guest's device answers, and the one the kext states as the GPU's
+// `model`, which System Information shows (the kext's RgfxDeviceName.hpp), on either guest.
+static NSString *rgfxHostNameOf(const RgfxCaps &caps)
 {
-	if (_caps.valid() && _caps.name()[0] != '\0') {
-		return [NSString stringWithUTF8String:_caps.name()];
+	if (caps.valid() && caps.name()[0] != '\0') {
+		return [NSString stringWithUTF8String:caps.name()];
 	}
 	return @"reims-graphics";
 }
 
-// The MTLDeviceSPI family name, from the name the device answers (rgfxFamilyNameOf): "GeForce
-// RTX" for "NVIDIA GeForce RTX 5080 Laptop GPU". Metal's devices answer the name without the
-// vendor and the model number, each its own, so the answer is the lane's choice inside what they
-// give (dgpu-oracle.md class 2); the IOGPU base answered "", which no Mac does.
-- (NSString *)familyName
+// On an x86-64 guest the host's name after the prefix of the host GPU's type (rgfxMetalNameOf):
+// "AMD - NVIDIA GeForce RTX 3090" on a discrete GPU, "Intel - AMD Radeon 780M Graphics (RADV
+// PHOENIX)" on an integrated one. On an arm64 guest the host's name.
+- (NSString *)name
 {
-	return [NSString stringWithUTF8String:rgfxFamilyNameOf(self.name.UTF8String).c_str()];
+#if defined(__x86_64__)
+	const std::string name = rgfxMetalNameOf(_caps.name(), _caps.hostIntegrated());
+	return [NSString stringWithUTF8String:name.c_str()];
+#else
+	return rgfxHostNameOf(_caps);
+#endif
 }
 
-// The MTLDeviceSPI vendor name, the host GPU's vendor from the name the device answers
-// (rgfxVendorNameOf): "NVIDIA" for "NVIDIA GeForce RTX 5080 Laptop GPU". The IOGPU base answered
+// The MTLDeviceSPI family name, from the host's name (rgfxFamilyNameOf), on either guest:
+// "GeForce RTX" for "NVIDIA GeForce RTX 5080 Laptop GPU". Metal's devices answer the name without
+// the vendor and the model number, each its own, so the answer is the lane's choice inside what
+// they give (dgpu-oracle.md class 2); the IOGPU base answered "", which no Mac does.
+- (NSString *)familyName
+{
+	const std::string name = rgfxFamilyNameOf(rgfxHostNameOf(_caps).UTF8String);
+	return [NSString stringWithUTF8String:name.c_str()];
+}
+
+// The MTLDeviceSPI vendor name, the host GPU's vendor from the host's name (rgfxVendorNameOf), on
+// either guest: "NVIDIA" for "NVIDIA GeForce RTX 5080 Laptop GPU". The IOGPU base answered
 // "Apple", on which the system's GL renderer ends every process that makes a GL context.
 - (NSString *)vendorName
 {
-	return [NSString stringWithUTF8String:rgfxVendorNameOf(self.name.UTF8String).c_str()];
+	const std::string name = rgfxVendorNameOf(rgfxHostNameOf(_caps).UTF8String);
+	return [NSString stringWithUTF8String:name.c_str()];
 }
 
 - (uint64_t)registryID

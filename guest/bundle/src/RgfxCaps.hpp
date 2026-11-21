@@ -209,6 +209,22 @@ std::string rgfxFamilyNameOf(const char *name);
 /// with the others (tools/gl_cases.m, measured: macOS 26.6.1 on an RTX 5080 host).
 std::string rgfxVendorNameOf(const char *name);
 
+/// The `name` an x86-64 guest's Metal device answers where the host names its GPU `hostName`
+/// (the device info's name, NUL-terminated) and says whether it is an integrated one
+/// (`integrated`, RgfxCaps::hostIntegrated): "Intel - " then the host's name where it is, and
+/// "AMD - " then the host's name for every other type of GPU (discrete, virtual, CPU, other).
+/// The host's name is kept whole, byte for byte: its leading and trailing spaces stay, after the
+/// prefix's own. Where the host gave no name (an empty one, or no caps), the prefix and
+/// "reims-graphics", the name the device answers with none. Nothing in the name is read: no
+/// vendor, driver or device name decides the prefix, so a GPU of any vendor gets one.
+///
+/// Apps' rules for a GPU's vendor read the name: a 3D modelling app's (read from its source)
+/// looks for "Intel", then "AMD", then "Apple" anywhere in it, and with none of them found takes
+/// the GPU as unknown. Under the host's own name, an RTX 3090 host's guest passed that app's
+/// minimum requirements and still listed only the CPU (walk m3-max-61607). The prefix gives each
+/// GPU the vendor of the Mac GPU of its type: AMD's, discrete, or Intel's, integrated.
+std::string rgfxMetalNameOf(const char *hostName, bool integrated);
+
 /// `iosurfaceTextureAlignmentBytes` and `iosurfaceReadOnlyTextureAlignmentBytes`: 16, as Metal's
 /// devices answer the first (measured: the AMD 5300M, the Intel 630 and the M3 Max,
 /// docs/graphics-kext/dgpu-oracle.md) and the IOGPU base answered both, whatever the host's GPU
@@ -289,6 +305,10 @@ public:
 	uint64_t registryId() const { return m_info.registry_id; }
 	/// FEATURES_LO's low byte (RGFX_FEATURE_*), as the host wrote it; 0 from an older host.
 	uint8_t featuresLo() const { return m_valid ? m_info.features_lo : 0; }
+	/// Whether the host's GPU is an integrated one (the device info's `integrated`: its Vulkan
+	/// driver reports the device type INTEGRATED_GPU), as the host wrote it; no from an older
+	/// host, which wrote it as zero, and with no caps.
+	bool hostIntegrated() const { return m_valid && m_info.integrated != 0; }
 	/// Takes the kext's answer to the features call (kRgfxAccelMethodFeatures): `kr` its return,
 	/// 0 for success, and the `count` words it gave: the device's feature word, the kext's own and
 	/// the kext's selector map. True where it gave all three and the map is this bundle's

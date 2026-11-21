@@ -339,6 +339,14 @@ pub trait GpuDevice<P: Platform>: Handle {
     fn linear_row_alignment(&self) -> u64 {
         0
     }
+    /// No Metal counterpart: whether the host's GPU is an integrated one, as the platform
+    /// answers: on the Vulkan platform, whether its driver reports the physical device's type as
+    /// `INTEGRATED_GPU`, and no for every other type (discrete, virtual, CPU, other). The graphics
+    /// lane tells the guest in the device info (`integrated`), by which an x86-64 guest's Metal
+    /// device names its GPU. The default is no.
+    fn is_integrated(&self) -> bool {
+        false
+    }
     /// No Metal counterpart: the bytes apart the device's own linear 2D images of one level lay
     /// `rows` rows of `row_bytes` bytes of texels each, as the platform answers, where it lays
     /// them alike for every format a buffer backs whose texel size divides `row_bytes`: a texture
