@@ -103,6 +103,19 @@ and RADV's read garbage where those have left the control flow (measured by meta
 1x1 framebuffer, whose quad holds three helper invocations). The same reads in the first block,
 before any discard, are made.
 
+Among them too, a render pipeline state that fetches a colour attachment of one of Apple's
+extended-range formats (`BGR10_XR`, `BGRA10_XR`, `RGB10A8_2P_XR10` and their `_sRGB` twins), or
+blends onto one, is refused on every device, where Metal makes it (`Translation-Format`): Metal's
+tile holds such an attachment as `half` through the pass, so a fetch, and a blend after an
+earlier draw of the pass wrote it, read that draw's `half`, which the device's attachment, holding
+the format's codes, does not keep. A write with blending off is made. rt makes no texture of
+those formats either (`rt-refused-texture-format-<n>`). A fragment function whose SIMD-group
+operations read, combine or count other lanes is made where the device reports
+`shaderQuadControl` (`VK_KHR_shader_quad_control`), its quads run whole, helpers included, as
+Metal runs them, and is refused elsewhere (`Translation-SubgroupOperations`): metal2vulkan
+measured KosmicKrisp on the M3 Max and the UHD 630's Windows driver without it, and RADV, ANV,
+NVIDIA and lavapipe with it.
+
 ## Memory whose GPU writes Metal drops
 
 | Entry | What runs instead of Metal's answer |
