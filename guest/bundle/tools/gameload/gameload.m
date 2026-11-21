@@ -58,7 +58,7 @@
 //
 //   gameload [-d NAME] [-f FRAMES] [-w WARMUP] [-s WxH] [-n DRAWS] [-i ICB_OBJECTS]
 //            [-c CICB_COMMANDS] [-k FRAMES_IN_FLIGHT] [-b] [--off NAME,...] [--private NAME,...]
-//            [-q] [-l]
+//            [-r] [-q] [-l]
 //     -d NAME   the first of MTLCopyAllDevices whose name holds NAME (default: the first);
 //               never MTLCreateSystemDefaultDevice, which switches a dual-GPU MacBook's display.
 //     -f        measured frames (default 300), after -w warm-up frames (default 30).
@@ -73,6 +73,12 @@
 //     --off     the shapes to leave out (above; icb and cicb off also make none of their
 //               objects); --private, the buffers to make Private (above).
 //               Both may be given more than once.
+//     -r        each heap object a frame makes (heap on) is held until the start of the frame
+//               FRAMES_IN_FLIGHT + 1 frames later, after its command buffers completed, and
+//               released there, one at a time, each release timed, inside that frame's CPU time;
+//               a stream slot's old texture from the frame that makes the slot again. By default
+//               each goes with its last reference: an old slot's as the slot is made again, the
+//               others' as a command buffer that holds them completes.
 //     -q        no per-frame lines.
 //     -l        lists the devices and exits.
 //
@@ -85,6 +91,11 @@
 //            frame before's start to this one's (L), the GPU's span from the first command
 //            buffer's GPUStartTime to the second's GPUEndTime (G), and each buffer's own span.
 //   "GAMELOAD shape NAME cpu_ms P50 MEAN"   each shape's own CPU encode time a frame.
+//   "GAMELOAD calls ..."            the time inside each call that made a heap object (heap on:
+//            the stream slots, the vertex buffer and the bloom chain) in the measured frames, in
+//            ms: their count, p50, p90, the worst and their time a frame; then the same of their
+//            releases where -r times them, and of those how many another reference outlived
+//            (shared: CFGetRetainCount above 1 as it was released).
 //   "GAMELOAD summary ..."          per-frame p50/p90/mean of each number, fps, the work a frame
 //            holds (draws, dispatches, passes, heap objects made), command-buffer errors, and
 //            the compute ICB's sums checked (cicb_checks) and wrong (cicb_bad).
@@ -149,6 +160,7 @@ enum {
 	BLIT_BUF = 256 << 10,
 	READBACK = 256,
 	BLOOM = 4,
+	FRAME_OBJECTS = STREAMED + 1 + 2 * BLOOM - 1, // heap objects a frame makes, heap on
 	MAX_FRAMES = 100000,
 	CICB_LEAD = 64,     // words before the compute ICB's input (its binding's offset, 256 bytes)
 	CICB_SLOT = 256,    // bytes a frame in flight's sum takes; the sum lies 64 bytes into it
@@ -195,6 +207,22 @@ static void stats(const double *v, int n, double *p50, double *p90, double *mean
 	*p90 = n ? s[(int)(n * 0.9)] : 0;
 	*mean = n ? sum / n : 0;
 	free(s);
+}
+
+static double worst(const double *v, size_t n)
+{
+	double w = 0;
+	for (size_t i = 0; i < n; i++)
+		w = MAX(w, v[i]);
+	return w;
+}
+
+// -r: holds `o`, made or let go in frame place `g` of `held` (FRAME_OBJECTS a place), `*n` of
+// them held so far; nothing without -r (held NULL).
+static void hold(__strong id *held, int g, int *n, id o)
+{
+	if (held && o && *n < FRAME_OBJECTS)
+		held[g * FRAME_OBJECTS + (*n)++] = o;
 }
 
 static simd_float4x4 perspective(float fovy, float aspect, float near, float far)
@@ -327,7 +355,7 @@ int main(int argc, char **argv)
 	@autoreleasepool {
 		const char *want = "";
 		int frames = 300, warmup = 30, draws = 4000, icb_objects = 8192, inflight = 2, quiet = 0, icb_bound = 0;
-		int cicb_commands = 512;
+		int cicb_commands = 512, time_releases = 0;
 		int W = 1920, H = 1080;
 		for (int i = 1; i < argc; i++) {
 			const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -338,6 +366,8 @@ int main(int argc, char **argv)
 				quiet = 1;
 			} else if (!strcmp(a, "-b")) {
 				icb_bound = 1;
+			} else if (!strcmp(a, "-r")) {
+				time_releases = 1;
 			} else if (v && !strcmp(a, "-d")) {
 				want = v, i++;
 			} else if (v && !strcmp(a, "-f")) {
@@ -889,6 +919,13 @@ int main(int argc, char **argv)
 		const simd_float3 light_dir = simd_normalize((simd_float3){-60, -120, -60});
 		double window_start = 0, window_end = 0;
 		id<MTLCommandBuffer> last = nil;
+		// The time inside each heap object's make in the measured frames, and with -r each one's
+		// release; -r's held objects, FRAME_OBJECTS a frame for inflight + 1 frames.
+		const size_t calls_cap = (size_t)frames * FRAME_OBJECTS;
+		double *make_ms = calloc(calls_cap, sizeof(double)), *release_ms = calloc(calls_cap, sizeof(double));
+		size_t makes = 0, releases = 0, releases_shared = 0;
+		const int graves = inflight + 1;
+		__strong id *held = time_releases ? (__strong id *)calloc((size_t)graves * FRAME_OBJECTS, sizeof(id)) : NULL;
 
 		printf("GAMELOAD config device \"%s\" unified %d bc %d shapes", D.name.UTF8String, (int)D.hasUnifiedMemory, (int)bc);
 		for (int s = 0; s < S_COUNT; s++)
@@ -916,6 +953,22 @@ int main(int argc, char **argv)
 				f_start[f] = t1;
 				const int k = f % inflight;
 				int fp = 0, fd = 0;
+				// -r: the objects frame f - inflight - 1 held, whose command buffers completed, released
+				// one at a time; this frame's take their places.
+				const int hg = f % graves;
+				int hn = 0;
+				for (int i = 0; held && i < FRAME_OBJECTS; i++) {
+					__strong id *o = &held[hg * FRAME_OBJECTS + i];
+					if (!*o)
+						continue;
+					const int shared = CFGetRetainCount((__bridge CFTypeRef)*o) > 1;
+					const double tr = now_ms();
+					*o = nil;
+					if (f >= warmup && releases < calls_cap) {
+						release_ms[releases++] = now_ms() - tr;
+						releases_shared += shared;
+					}
+				}
 				if (on[S_CICB] && f >= inflight)
 					cicb_check(k, f - inflight);
 
@@ -977,16 +1030,25 @@ int main(int argc, char **argv)
 						[be waitForFence:scene_fence];
 						for (int i = 0; i < STREAMED; i++) {
 							int s = (f * STREAMED + i) % SLOTS;
-							slot_tex[s] = [place newTextureWithDescriptor:slot_desc[s] offset:slot_off[s]];
-							if (!slot_tex[s])
+							const double tm = now_ms();
+							id<MTLTexture> nt = [place newTextureWithDescriptor:slot_desc[s] offset:slot_off[s]];
+							if (f >= warmup && makes < calls_cap)
+								make_ms[makes++] = now_ms() - tm;
+							if (!nt)
 								die("a stream slot made again", nil);
+							hold(held, hg, &hn, slot_tex[s]);
+							slot_tex[s] = nt;
 							so += upload_chain(be, staging[k], so, slot_tex[s]);
 							heap_objects++;
 						}
 						so = heap_stage - STREAM_BUF;
+						const double tb = now_ms();
 						stream_buf = [place newBufferWithLength:STREAM_BUF options:MTLResourceStorageModePrivate offset:stream_off[k]];
+						if (f >= warmup && makes < calls_cap)
+							make_ms[makes++] = now_ms() - tb;
 						if (!stream_buf)
 							die("the streamed vertex buffer", nil);
+						hold(held, hg, &hn, stream_buf);
 						heap_objects++;
 						[be copyFromBuffer:staging[k] sourceOffset:so toBuffer:stream_buf destinationOffset:0 size:STREAM_BUF];
 						so += STREAM_BUF;
@@ -1189,12 +1251,17 @@ int main(int argc, char **argv)
 					id<MTLTexture> bl[2 * BLOOM - 1];
 					// Down chain first; up chain textures are made as the down levels they replace go.
 					for (int l = 0; l < BLOOM; l++) {
+						const double tm = now_ms();
 						bl[l] = th ? [th newTextureWithDescriptor:bloom_desc[l]] : bloom_fixed[l];
+						if (th && f >= warmup && makes < calls_cap)
+							make_ms[makes++] = now_ms() - tm;
 						if (!bl[l]) {
 							heap_failures++;
 							bl[l] = [D newTextureWithDescriptor:bloom_desc[l]];
-						} else if (th)
+						} else if (th) {
 							heap_objects++;
+							hold(held, hg, &hn, bl[l]);
+						}
 					}
 					id<MTLComputeCommandEncoder> ce = [b computeCommandEncoder];
 					[ce setComputePipelineState:hist_clear];
@@ -1227,12 +1294,17 @@ int main(int argc, char **argv)
 					id<MTLTexture> lo = bl[BLOOM - 1];
 					for (int l = BLOOM - 2; l >= 0; l--) {
 						// The level below and the one about to be read become aliasable once read.
+						const double tm = now_ms();
 						id<MTLTexture> out = th ? [th newTextureWithDescriptor:bloom_desc[BLOOM + l]] : bloom_fixed[BLOOM + l];
+						if (th && f >= warmup && makes < calls_cap)
+							make_ms[makes++] = now_ms() - tm;
 						if (!out) {
 							heap_failures++;
 							out = [D newTextureWithDescriptor:bloom_desc[BLOOM + l]];
-						} else if (th)
+						} else if (th) {
 							heap_objects++;
+							hold(held, hg, &hn, out);
+						}
 						[ce setTexture:lo atIndex:0];
 						[ce setTexture:bl[l] atIndex:1];
 						[ce setTexture:out atIndex:2];
@@ -1350,6 +1422,13 @@ int main(int argc, char **argv)
 			stats(shape_cpu[s] + warmup, frames, &p50, &p90, &mean);
 			printf("GAMELOAD shape %s on %d cpu_ms p50 %.3f mean %.3f\n", kShape[s], (int)on[s], p50, mean);
 		}
+		double k50, k90, km, r50, r90, rm;
+		stats(make_ms, (int)makes, &k50, &k90, &km);
+		stats(release_ms, (int)releases, &r50, &r90, &rm);
+		printf("GAMELOAD calls makes %zu ms p50 %.4f p90 %.4f worst %.4f per_frame %.4f"
+		       " releases_timed %d releases %zu ms p50 %.4f p90 %.4f worst %.4f per_frame %.4f shared %zu\n",
+		       makes, k50, k90, worst(make_ms, makes), km * makes / frames, time_releases, releases, r50, r90,
+		       worst(release_ms, releases), rm * releases / frames, releases_shared);
 		double c50, c90, cm, w50, w90, wm, l50, l90, lm, g50, g90, gm, a50, a90, am, b50, b90, bm;
 		stats(m_cpu, frames, &c50, &c90, &cm);
 		stats(m_wait, frames, &w50, &w90, &wm);
