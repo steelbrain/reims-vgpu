@@ -1460,7 +1460,10 @@ impl World {
     /// How many deallocators of refused no-copy buffers the world keeps unrun
     /// ([`World::keep_refused_deallocators`]): 0 until a test asks it to keep them.
     pub fn refused_deallocators(&self) -> usize {
-        self.refused_deallocators.lock().as_ref().map_or(0, Vec::len)
+        self.refused_deallocators
+            .lock()
+            .as_ref()
+            .map_or(0, Vec::len)
     }
 
     /// The deallocator of a no-copy buffer a device refused: kept unrun where the world keeps
