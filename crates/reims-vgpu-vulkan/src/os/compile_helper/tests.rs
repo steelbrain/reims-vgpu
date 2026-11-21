@@ -8,7 +8,9 @@ use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::{Helper, HelperEnd, HelperRun, Limits, MEMORY_MOST, TIME_MOST, end_with_parent, host};
+use super::{
+    Footprints, Helper, HelperEnd, HelperRun, Limits, MEMORY_MOST, TIME_MOST, end_with_parent, host,
+};
 use crate::core::platform::os::Clock;
 use crate::os::OsClock;
 
@@ -70,7 +72,7 @@ fn stand_in(test: &str) {
         "parent" => {
             let lock = lock_file("parent");
             let helper =
-                Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _| {}).unwrap();
+                Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
             let pid = pid_of(&helper);
             let mut stdout = io::stdout();
             writeln!(stdout, "helper-pid {pid}").unwrap();
@@ -161,7 +163,7 @@ fn a_helper_talks_over_its_pipes_and_ends_with_its_code() {
             stdout.read_to_end(&mut back).unwrap();
             back
         },
-        move |end, said| ends.send((end.clone(), said)).unwrap(),
+        move |end, _, said| ends.send((end.clone(), said)).unwrap(),
     )
     .unwrap();
     let end = helper.wait();
@@ -174,7 +176,7 @@ fn a_helper_talks_over_its_pipes_and_ends_with_its_code() {
 }
 
 /// A helper whose footprint passes its cap is killed, and the end says the footprint read that
-/// crossed it.
+/// crossed it, which is the peak of the footprints its reads saw.
 #[test]
 fn a_helper_past_its_memory_cap_is_killed_over_memory() {
     let test = "a_helper_past_its_memory_cap_is_killed_over_memory";
@@ -184,15 +186,21 @@ fn a_helper_past_its_memory_cap_is_killed_over_memory() {
         memory: 256 << 20,
         time: Duration::from_secs(60),
     };
-    let helper = Helper::start(run_of(test, "grow", limits, &lock), drain, |_, _| {}).unwrap();
+    let (ends, ended) = mpsc::channel();
+    let on_end = move |_: &HelperEnd, seen, _| ends.send(seen).unwrap();
+    let helper = Helper::start(run_of(test, "grow", limits, &lock), drain, on_end).unwrap();
     let pid = pid_of(&helper);
+    let seen: Footprints = ended.recv_timeout(Duration::from_secs(30)).unwrap();
     match helper.wait() {
         HelperEnd::OverMemory { bytes } => {
             assert!(bytes > limits.memory, "{bytes}");
+            assert_eq!(seen.peak, bytes, "{seen:?}");
+            assert!(seen.reads > 1 && seen.most_growth > 0, "{seen:?}");
             eprintln!(
-                "killed at {} MiB, the cap {} MiB",
+                "killed at {} MiB, the cap {} MiB, the most growth in a poll {} MiB",
                 bytes >> 20,
-                limits.memory >> 20
+                limits.memory >> 20,
+                seen.most_growth >> 20
             );
         }
         end => panic!("{end:?}"),
@@ -213,7 +221,7 @@ fn a_helper_past_its_time_cap_is_killed_over_time() {
     };
     let clock = OsClock::new();
     let start = clock.now_mono();
-    let helper = Helper::start(run_of(test, "sleep", limits, &lock), drain, |_, _| {}).unwrap();
+    let helper = Helper::start(run_of(test, "sleep", limits, &lock), drain, |_, _, _| {}).unwrap();
     let pid = pid_of(&helper);
     assert_eq!(helper.wait(), HelperEnd::OverTime);
     let took = clock.now_mono().saturating_duration_since(start);
@@ -229,7 +237,7 @@ fn a_cancelled_helper_is_killed_at_once() {
     let test = "a_cancelled_helper_is_killed_at_once";
     stand_in(test);
     let lock = lock_file("cancel");
-    let helper = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _| {}).unwrap();
+    let helper = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
     let pid = pid_of(&helper);
     assert!(host::alive(pid));
     let clock = OsClock::new();
@@ -248,9 +256,9 @@ fn helpers_on_one_lock_run_one_at_a_time() {
     let test = "helpers_on_one_lock_run_one_at_a_time";
     stand_in(test);
     let lock = lock_file("turns");
-    let first = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _| {}).unwrap();
+    let first = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
     pid_of(&first);
-    let second = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _| {}).unwrap();
+    let second = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(second.pid(), None, "the second started beside the first");
     first.cancel();
@@ -267,21 +275,21 @@ fn a_helper_cancelled_while_it_waits_for_the_lock_never_starts() {
     let test = "a_helper_cancelled_while_it_waits_for_the_lock_never_starts";
     stand_in(test);
     let lock = lock_file("waiting");
-    let first = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _| {}).unwrap();
+    let first = Helper::start(run_of(test, "sleep", ROOMY, &lock), drain, |_, _, _| {}).unwrap();
     pid_of(&first);
     let (ends, ended) = mpsc::channel();
     let second = Helper::start(
         run_of(test, "sleep", ROOMY, &lock),
         drain,
-        move |end, said| ends.send((end.clone(), said)).unwrap(),
+        move |end, seen, said| ends.send((end.clone(), seen, said)).unwrap(),
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(300));
     second.cancel();
     assert_eq!(second.wait(), HelperEnd::Cancelled);
     assert_eq!(second.pid(), None);
-    let (end, said) = ended.recv_timeout(Duration::from_secs(30)).unwrap();
-    assert_eq!((end, said), (HelperEnd::Cancelled, None));
+    let ends = ended.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert_eq!(ends, (HelperEnd::Cancelled, Footprints::default(), None));
     first.cancel();
     assert_eq!(first.wait(), HelperEnd::Cancelled);
     let _ = std::fs::remove_file(lock);
@@ -348,7 +356,7 @@ fn a_helper_whose_program_is_missing_never_starts() {
         limits: ROOMY,
         lock: lock.clone(),
     };
-    let helper = Helper::start(run, drain, |_, _| {}).unwrap();
+    let helper = Helper::start(run, drain, |_, _, _| {}).unwrap();
     let end = helper.wait();
     assert!(matches!(end, HelperEnd::NotStarted(_)), "{end:?}");
     assert_eq!(helper.pid(), None);
@@ -370,4 +378,18 @@ fn the_caps_are_the_smaller_of_8_gib_and_half_the_hosts_memory_and_10_minutes() 
     assert_eq!(TIME_MOST, Duration::from_secs(600));
     let host = Limits::of_host();
     assert!((1..=8 * GIB).contains(&host.memory), "{host:?}");
+}
+
+/// The footprints' reads keep the largest footprint, and the largest growth from one read to the
+/// next, a fall counting as none.
+#[test]
+fn footprints_keep_the_peak_and_the_most_growth_between_two_reads() {
+    let mut seen = Footprints::default();
+    for bytes in [100, 130, 125, 170, 40, 60] {
+        seen.read(bytes);
+    }
+    assert_eq!((seen.peak, seen.most_growth, seen.reads), (170, 45, 6));
+    let mut one = Footprints::default();
+    one.read(500);
+    assert_eq!((one.peak, one.most_growth, one.reads), (500, 0, 1));
 }

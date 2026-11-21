@@ -3,6 +3,7 @@
 
 use std::io;
 use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt as _;
 use std::process::{Child, Command};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -15,6 +16,7 @@ use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 /// The host's physical memory, in bytes; `None` where Windows does not say.
 pub(super) fn host_memory() -> Option<u64> {
@@ -25,8 +27,12 @@ pub(super) fn host_memory() -> Option<u64> {
     (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status.ullTotalPhys)
 }
 
-/// Nothing of the child's: the Job Object ends it ([`Watched::new`]).
-pub(super) fn prepare(_command: &mut Command) {}
+/// Has the child run with no console window of its own, so a library's process with no console
+/// (one started detached) shows none for its helper; its standard handles are the ones the
+/// command names all the same. The Job Object ends it ([`Watched::new`]).
+pub(super) fn prepare(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
 
 /// Nothing: a write to a helper that has ended fails, and Windows raises no signal.
 pub(super) fn mask_broken_pipes() {}

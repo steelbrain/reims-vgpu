@@ -21,23 +21,36 @@
 //! Where there is no helper to run, no fill starts, and the stage's fill ends
 //! [`FillEnd::Failed`] at once: nothing is recorded, and a make of the stage refuses as before.
 //!
+//! **The helper's side** is [`helper_main`], the main of the program `reims-vgpu-compile`
+//! (`src/bin/reims-vgpu-compile.rs`), which the dist tree and the installs put beside the
+//! library's host (QEMU). It opens its device on the card the VM's device is on, which its one
+//! argument names by `deviceUUID`, with the options the VM's device was opened with
+//! (`super::device::shared_options`): rt takes its compile only from a device that enabled what
+//! the VM's did.
+//!
+//! **Each helper's footprint** is logged as it ends, with its fill's key ([`footprints_line`]):
+//! the largest its reads saw, the largest growth from one read to the next, and how far past the
+//! cap it got, which a run reads the cap's margin from.
+//!
 //! Each fill's start is logged with the site that asked for it ([`Site`]), and rt's refusals are
 //! counted by their site, each under a code of its own, apart from the refusals the calls end
 //! with: a state's make refused ([`UNFILLED_AT_MAKE`]), and a dispatch refused
 //! ([`UNFILLED_AT_DISPATCH`]) whether or not it is made after its fill. The make ahead's refusals
 //! are not counted: what the guest meets is its dispatch's.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::process::{ChildStdin, ChildStdout};
+use std::io::Write as _;
+use std::process::{ChildStdin, ChildStdout, ExitCode};
 use std::sync::Arc;
 
+use ash::vk;
 use metal2vulkan_runtime as rt;
 
 use crate::core::platform::os::Clock;
 use crate::core::platform::stage::{Cancel, FillDone, FillEnd, Site, StageFills, Start};
 use crate::os::OsClock;
-use crate::os::compile_helper::{Helper, HelperEnd, HelperRun, Limits};
+use crate::os::compile_helper::{Footprints, Helper, HelperEnd, HelperRun, Limits};
 
 /// The helper's program, beside the process's executable, with the OS's executable suffix.
 pub(crate) const HELPER: &str = "reims-vgpu-compile";
@@ -125,14 +138,90 @@ fn helper_run(uuid: [u8; 16]) -> Result<HelperRun, String> {
     }
     let dir = crate::os::cache_directory().ok_or("the host names no cache directory")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let hex: String = uuid.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok(HelperRun {
         program,
-        args: vec![OsString::from(hex)],
+        args: vec![OsString::from(hex(&uuid))],
         envs: Vec::new(),
         limits: Limits::of_host(),
         lock: dir.join(LOCK),
     })
+}
+
+/// `uuid` in lowercase hex, as the helper's argument names its device's `deviceUUID`.
+fn hex(uuid: &[u8; 16]) -> String {
+    uuid.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The `deviceUUID` the helper's argument `arg` names in hex ([`hex`]).
+///
+/// Err: why `arg` names none.
+fn uuid_of(arg: Option<&OsStr>) -> Result<[u8; 16], String> {
+    let text = arg.ok_or("it has no argument naming a deviceUUID")?;
+    let text = (text.to_str())
+        .filter(|text| text.len() == 32 && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| format!("its argument {text:?} names no deviceUUID in hex"))?;
+    let mut uuid = [0_u8; 16];
+    for (byte, at) in uuid.iter_mut().zip((0..32).step_by(2)) {
+        let pair = text.get(at..at + 2).unwrap_or_default();
+        *byte = u8::from_str_radix(pair, 16).map_err(|e| format!("its argument {text}: {e}"))?;
+    }
+    Ok(uuid)
+}
+
+/// The `deviceUUID` of `physical`, one of `instance`'s devices.
+fn device_uuid(instance: &rt::Instance, physical: &rt::PhysicalDevice) -> [u8; 16] {
+    let (_, raw) = instance.raw();
+    let mut id = vk::PhysicalDeviceIDProperties::default();
+    let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+    // SAFETY: the instance listed the device and is alive; rt's instance is at Vulkan 1.3, where
+    // the structure is core.
+    unsafe { raw.get_physical_device_properties2(physical.raw(), &mut asked) };
+    id.device_uuid
+}
+
+/// The helper process's main, the program [`HELPER`]'s (the module's docs, "The helper's
+/// side"): arms its end with the library's process where the OS needs the helper's part
+/// (`os::compile_helper::end_with_parent`), makes rt's instance as the library's device does,
+/// finds the device whose `deviceUUID` its argument names ([`helper_run`]), and serves one fill
+/// over its stdin and stdout, rt's `serve_stage`, with the options the library's device was
+/// opened with. Every outcome of the compile is in its reply. Its lines go to stderr: its warnings
+/// and errors, or what `REIMS_VGPU_LOG` names where it is set (`crate::core::logging`).
+///
+/// A failure where it served no reply, as its line says; the library's fill then ends failed
+/// ([`fill_end`]).
+pub fn helper_main() -> ExitCode {
+    let hook: crate::core::logging::Hook = Box::new(|level, target, message| {
+        let line = crate::core::logging::stderr_line(level, target, message);
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    });
+    let _ = crate::core::logging::set_hook(log::LevelFilter::Warn, hook);
+    match serve_helper(std::env::args_os().nth(1).as_deref()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(why) => {
+            log::error!(target: super::TARGET, "the stage helper served no fill: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// [`helper_main`]'s work, for the device its argument `arg` names.
+///
+/// Err: why it served no reply.
+fn serve_helper(arg: Option<&OsStr>) -> Result<(), String> {
+    crate::os::compile_helper::end_with_parent()
+        .map_err(|e| format!("its watch of the library's process: {e}"))?;
+    let uuid = uuid_of(arg)?;
+    let instance = crate::os::rt_instance(&crate::os::rt_instance_extensions())
+        .map_err(|e| format!("rt's instance: {e}"))?;
+    let listed = (instance.physical_devices()).map_err(|e| format!("rt's devices: {e}"))?;
+    let physical = (listed.iter())
+        .find(|physical| device_uuid(&instance, physical) == uuid)
+        .ok_or_else(|| format!("no device has the deviceUUID {}", hex(&uuid)))?;
+    let (options, _) = super::device::shared_options(&instance, physical);
+    let mut to_parent = std::io::stdout().lock();
+    rt::serve_stage(&instance, options, std::io::stdin().lock(), &mut to_parent)
+        .and_then(|()| to_parent.flush())
+        .map_err(|e| format!("its pipes: {e}"))
 }
 
 /// A start of fills of stages past rt's bound: each runs the helper `run` names
@@ -217,10 +306,16 @@ where
         );
         let (talk, on_end) = (Arc::clone(&talk), Arc::clone(&on_end));
         let (talks, ends) = (key.clone(), key.clone());
+        let cap = run.limits.memory;
         let started = Helper::start(
             run,
             move |to_helper, from_helper| talk(&talks, to_helper, from_helper),
-            move |end, said| done.end(on_end(&ends, end, said)),
+            move |end, seen, said| {
+                if seen.reads > 0 {
+                    footprints_line(&ends, end, seen, cap);
+                }
+                done.end(on_end(&ends, end, said));
+            },
         );
         match started {
             // Dropped at the fill's end, which comes after the helper's: a cancel then is nothing.
@@ -236,6 +331,22 @@ where
             }
         }
     })
+}
+
+/// Writes the footprint of the helper of `key`'s fill that ended as `end`, as its reads `seen`
+/// it, beside its memory cap `cap` (`os::compile_helper`'s docs, "The memory cap").
+fn footprints_line<K: fmt::Debug>(key: &K, end: &HelperEnd, seen: Footprints, cap: u64) {
+    let mib = |bytes: u64| bytes >> 20;
+    log::info!(
+        target: super::TARGET,
+        "stage {key:?}: its helper ended {end:?}: its peak footprint {} MiB, its most growth \
+         between two reads {} MiB, its cap {} MiB, past the cap by {} MiB, in {} reads",
+        mib(seen.peak),
+        mib(seen.most_growth),
+        mib(cap),
+        mib(seen.peak.saturating_sub(cap)),
+        seen.reads
+    );
 }
 
 #[cfg(test)]
@@ -518,6 +629,24 @@ mod tests {
     fn a_process_with_no_helper_beside_it_runs_none() {
         let why = helper_run([7; 16]).unwrap_err();
         assert!(why.contains(HELPER), "{why}");
+    }
+
+    /// The helper's argument names its device's `deviceUUID` in hex, and an argument that names
+    /// none is refused, said so.
+    #[test]
+    fn a_device_uuid_goes_to_the_helper_in_hex_and_back() {
+        let uuid: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_mul(37) ^ 0xa5);
+        let named = hex(&uuid);
+        assert_eq!(named.len(), 32);
+        assert_eq!(uuid_of(Some(OsStr::new(&named))), Ok(uuid));
+        assert_eq!(uuid_of(Some(OsStr::new(&named.to_uppercase()))), Ok(uuid));
+        let short = &named[..30];
+        let signed = format!("+{}", &named[1..]);
+        for bad in ["", short, signed.as_str(), "zz9f8e7d6c5b4a39281706f5e4d3c2b1"] {
+            let refused = uuid_of(Some(OsStr::new(bad))).unwrap_err();
+            assert!(refused.contains("names no deviceUUID"), "{bad}: {refused}");
+        }
+        assert!(uuid_of(None).unwrap_err().contains("no argument"));
     }
 
     /// A cancel of the fills ends the fill at once and kills its helper, whose end then reaches

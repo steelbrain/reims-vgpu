@@ -39,7 +39,9 @@
 //! - Windows: its private commit (`PrivateUsage` of `GetProcessMemoryInfo`).
 //!
 //! The footprint read that crossed the cap is in the end, [`HelperEnd::OverMemory`], so a run
-//! can tell how far past the cap a helper got within one poll.
+//! can tell how far past the cap a helper got within one poll. Every end comes with what the
+//! reads saw ([`Footprints`]): the largest footprint, and the largest growth from one read to the
+//! next, which bounds how far past the cap a helper can get before its kill.
 //!
 //! **The time cap** is wall time from the process's start, [`Limits::time`], on every OS.
 //!
@@ -161,6 +163,32 @@ pub(crate) enum HelperEnd {
     Unwatched(String),
 }
 
+/// What the helper's thread read of a process's footprint, every [`POLL`] from its start to its
+/// end (the module's doc says what each OS counts).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Footprints {
+    /// The largest footprint read, in bytes: the one past the cap, for a process killed at it.
+    pub(crate) peak: u64,
+    /// The largest growth from one read to the next, in bytes.
+    pub(crate) most_growth: u64,
+    /// How many reads there were.
+    pub(crate) reads: u64,
+    /// The last read, in bytes.
+    last: u64,
+}
+
+impl Footprints {
+    /// Takes a read of `bytes`.
+    fn read(&mut self, bytes: u64) {
+        if self.reads > 0 {
+            self.most_growth = self.most_growth.max(bytes.saturating_sub(self.last));
+        }
+        self.peak = self.peak.max(bytes);
+        self.last = bytes;
+        self.reads = self.reads.saturating_add(1);
+    }
+}
+
 /// A helper's state, which its thread and its [`Helper`] share.
 #[derive(Debug, Default)]
 struct State {
@@ -197,22 +225,23 @@ impl Helper {
     /// Starts the helper `run` names on a thread of its own, which takes the host's lock, starts
     /// and watches the process, and runs `talk` with the process's stdin and stdout on another
     /// thread. Once the process has ended, the talk has returned and the lock is free, it calls
-    /// `on_end` with how the process ended and the talk's result: `None` where no talk ran, or
-    /// where it panicked. Returns at once; fails only where the helper's thread cannot start.
+    /// `on_end` with how the process ended, what its footprint's reads saw (none where it never
+    /// started) and the talk's result: `None` where no talk ran, or where it panicked. Returns at
+    /// once; fails only where the helper's thread cannot start.
     pub(crate) fn start<T: Send + 'static>(
         run: HelperRun,
         talk: impl FnOnce(ChildStdin, ChildStdout) -> T + Send + 'static,
-        on_end: impl FnOnce(&HelperEnd, Option<T>) + Send + 'static,
+        on_end: impl FnOnce(&HelperEnd, Footprints, Option<T>) + Send + 'static,
     ) -> io::Result<Helper> {
         let shared = Arc::new(Shared::default());
         let theirs = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("reims-vgpu.compile-helper".to_owned())
             .spawn(move || {
-                let (end, said) = watch(run, talk, &theirs);
+                let (end, footprints, said) = watch(run, talk, &theirs);
                 theirs.state.lock().end = Some(end.clone());
                 theirs.changed.notify_all();
-                on_end(&end, said);
+                on_end(&end, footprints, said);
             })?;
         Ok(Helper { shared })
     }
@@ -257,14 +286,14 @@ fn watch<T: Send + 'static>(
     run: HelperRun,
     talk: impl FnOnce(ChildStdin, ChildStdout) -> T + Send + 'static,
     shared: &Shared,
-) -> (HelperEnd, Option<T>) {
+) -> (HelperEnd, Footprints, Option<T>) {
     let clock = OsClock::new();
     let lock = match take_lock(&run.lock, shared, &clock) {
         Ok(Some(lock)) => lock,
-        Ok(None) => return (HelperEnd::Cancelled, None),
+        Ok(None) => return (HelperEnd::Cancelled, Footprints::default(), None),
         Err(e) => {
             let end = HelperEnd::NotStarted(format!("the lock {}: {e}", run.lock.display()));
-            return (end, None);
+            return (end, Footprints::default(), None);
         }
     };
     let ended = run_watched(run, talk, shared, &clock);
@@ -304,7 +333,8 @@ fn run_watched<T: Send + 'static>(
     talk: impl FnOnce(ChildStdin, ChildStdout) -> T + Send + 'static,
     shared: &Shared,
     clock: &OsClock,
-) -> (HelperEnd, Option<T>) {
+) -> (HelperEnd, Footprints, Option<T>) {
+    let none = Footprints::default();
     let mut command = Command::new(&run.program);
     command
         .args(&run.args)
@@ -318,7 +348,7 @@ fn run_watched<T: Send + 'static>(
         Ok(child) => child,
         Err(e) => {
             let end = HelperEnd::NotStarted(format!("{}: {e}", run.program.display()));
-            return (end, None);
+            return (end, none, None);
         }
     };
     let started = clock.now_mono();
@@ -326,7 +356,7 @@ fn run_watched<T: Send + 'static>(
         Ok(watched) => watched,
         Err(e) => {
             end_process(&mut child);
-            return (HelperEnd::NotStarted(format!("its watch: {e}")), None);
+            return (HelperEnd::NotStarted(format!("its watch: {e}")), none, None);
         }
     };
     shared.state.lock().pid = Some(child.id());
@@ -334,15 +364,15 @@ fn run_watched<T: Send + 'static>(
         Ok(talking) => talking,
         Err(e) => {
             end_process(&mut child);
-            return (HelperEnd::NotStarted(format!("its talk: {e}")), None);
+            return (HelperEnd::NotStarted(format!("its talk: {e}")), none, None);
         }
     };
     let deadline = Deadline::Mono(started.saturating_add(run.limits.time));
-    let end = poll(&mut child, &watched, run.limits, deadline, shared, clock);
+    let (end, footprints) = poll(&mut child, &watched, run.limits, deadline, shared, clock);
     // The talk ends once the process has: its pipes read their end, and its writes fail.
     let said = talking.join().ok();
     // `watched` goes before `child`, whose process handle it reads on Windows.
-    (end, said)
+    (end, footprints, said)
 }
 
 /// Runs `talk` with the process's pipes on a thread of its own.
@@ -362,7 +392,7 @@ fn start_talk<T: Send + 'static>(
 }
 
 /// Polls the process every [`POLL`] until it ends, or kills it at a cancel, past its memory cap,
-/// at its time cap, or where its footprint cannot be read.
+/// at its time cap, or where its footprint cannot be read; with what its footprint's reads saw.
 fn poll(
     child: &mut Child,
     watched: &host::Watched,
@@ -370,33 +400,35 @@ fn poll(
     deadline: Deadline,
     shared: &Shared,
     clock: &OsClock,
-) -> HelperEnd {
-    loop {
+) -> (HelperEnd, Footprints) {
+    let mut footprints = Footprints::default();
+    let end = loop {
         if let Some(end) = ended(child) {
-            return end;
+            break end;
         }
         let killed = if shared.state.lock().cancelled {
             Some(HelperEnd::Cancelled)
         } else {
-            match watched.footprint() {
+            match watched.footprint().inspect(|&bytes| footprints.read(bytes)) {
                 Ok(bytes) if bytes > limits.memory => Some(HelperEnd::OverMemory { bytes }),
                 Ok(_) => deadline.reached(clock).then_some(HelperEnd::OverTime),
                 // A process that ended since the look above has no footprint to read.
                 Err(e) => match ended(child) {
-                    Some(end) => return end,
+                    Some(end) => break end,
                     None => Some(HelperEnd::Unwatched(format!("its footprint: {e}"))),
                 },
             }
         };
         if let Some(end) = killed {
             end_process(child);
-            return end;
+            break end;
         }
         let mut state = shared.state.lock();
         if !state.cancelled {
             shared.wait_a_poll(clock, &mut state);
         }
-    }
+    };
+    (end, footprints)
 }
 
 /// How the process ended, where it has. A look that fails kills it, as its caps cannot hold.
@@ -420,13 +452,6 @@ fn end_process(child: &mut Child) {
 
 /// The helper's side: arms what ends the helper with the library's process where the OS needs the
 /// helper's part, on macOS (the module's doc). The helper's main calls it first.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "its caller, the helper's main, lands with the helper's binary"
-    )
-)]
 pub(crate) fn end_with_parent() -> io::Result<()> {
     host::watch_parent()
 }

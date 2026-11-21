@@ -449,29 +449,13 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
             "the chosen device has no device UUID".to_owned(),
         ));
     };
-    let mut options = rt::DeviceOptions::default();
+    let (mut options, fences) = shared_options(&instance, physical);
     // rt's pool allocations, noted as rt maps them and forgotten as it unmaps them, among which a
     // lost device's fault is placed (`super::fault`).
     let allocations = Arc::new(super::fault::Allocations::default());
     options.block_mappings = Some(Arc::clone(&allocations) as Arc<dyn rt::BlockMappings>);
     options.pipeline_cache_dir = crate::os::user_cache_directory().map(|dir| dir.join(CACHE));
     options.pipeline_cache_cap = Some(SHADER_CACHE_CAPACITY);
-    let fences = {
-        // SAFETY: the instance listed the device and is alive.
-        let names = unsafe { raw.enumerate_device_extension_properties(physical.raw()) }
-            .unwrap_or_default();
-        let lists =
-            |name: &std::ffi::CStr| (names.iter()).any(|p| p.extension_name_as_c_str() == Ok(name));
-        crate::os::rt_present_fences(instance.extensions(), lists)
-    };
-    if let Some(name) = fences {
-        let wanted = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
-            .swapchain_maintenance1(true);
-        let needs = |f: &vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static>| {
-            f.swapchain_maintenance1 == vk::TRUE
-        };
-        (options.extensions).push(rt::DeviceExtension::with_features(name, wanted, needs));
-    }
     let device = rt::Device::new(physical, options)?;
     // Where it binds no several dma-bufs behind one buffer, a view more than one holds is mapped
     // from its files from the first (`buffer`'s docs, "Pages no pin takes").
@@ -537,6 +521,35 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         loss,
         stage_fills,
     }))
+}
+
+/// The options a device on `physical`, one of `instance`'s, is opened with both in the VM's
+/// process ([`open`]) and in a stage's helper (`super::stage::helper_main`), where rt takes the
+/// helper's compile only from a device that enabled what the VM's did (its `StageFill::Enables`
+/// otherwise): the extension of present fences, with the feature it takes, where the device lists
+/// it and its instance extensions are on (the module's docs, "Its window system"). With that
+/// extension's name, where it is asked for.
+pub(crate) fn shared_options(
+    instance: &rt::Instance,
+    physical: &rt::PhysicalDevice,
+) -> (rt::DeviceOptions, Option<&'static std::ffi::CStr>) {
+    let mut options = rt::DeviceOptions::default();
+    let (_, raw) = instance.raw();
+    // SAFETY: the instance listed the device and is alive.
+    let names = unsafe { raw.enumerate_device_extension_properties(physical.raw()) }
+        .unwrap_or_default();
+    let lists =
+        |name: &std::ffi::CStr| (names.iter()).any(|p| p.extension_name_as_c_str() == Ok(name));
+    let fences = crate::os::rt_present_fences(instance.extensions(), lists);
+    if let Some(name) = fences {
+        let wanted = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
+            .swapchain_maintenance1(true);
+        let needs = |f: &vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static>| {
+            f.swapchain_maintenance1 == vk::TRUE
+        };
+        (options.extensions).push(rt::DeviceExtension::with_features(name, wanted, needs));
+    }
+    (options, fences)
 }
 
 /// What the answers of `device`, made with rt's floor answers `floor`, of `deviceUUID` `uuid`, on
