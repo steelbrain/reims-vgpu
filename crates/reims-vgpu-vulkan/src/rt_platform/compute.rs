@@ -21,12 +21,20 @@
 //!   ([`Unbuilt::ComputeCommand`]), and command predication (`encodeStart*`, `encodeEnd*`,
 //!   [`Unbuilt::Predication`]): each encodes nothing, counted, and an `encodeEnd*` answers NO, as
 //!   Metal's answers with nothing open.
+//! - **No usage**: `useResources:count:usage:` of usage 0 declares nothing, and is no refusal: no
+//!   line, no count (a nil resource of a concurrent encoder's is still Metal's refusal, below).
+//!   Measured with `useResource:usage:` and the render encoder's `useResource:usage:stages:` on a
+//!   Radeon Pro 5300M and a UHD 630 under macOS 26.7.1: Metal's API validation
+//!   (`MTL_DEBUG_LAYER=1`) accepts usage 0 with no message and ends the process at usage 8
+//!   ("usage (0x8) has an invalid value"), its GPU validation (`MTL_SHADER_VALIDATION=1`) finds
+//!   the resources either names not resident, as with no declaration, and without validation both
+//!   run as no declaration.
 //! - **Metal's refusals**, each encoding nothing, counted (`rt-refused-metal`): a nil indirect
 //!   buffer and a nil resource in a concurrent encoder's `useResources:count:usage:`, at each of
 //!   which Metal ends the process; a dispatch with no pipeline state set, or with nil set since; a
-//!   usage no Metal value is; an index, a length or a size past rt's 32 bits; a list of another
-//!   length than its range; and a command after `endEncoding`. A nil entry of a serial encoder's
-//!   resources, or of a heap list, is skipped, as Metal skips it.
+//!   usage with a bit past sample (4); an index, a length or a size past rt's 32 bits; a list of
+//!   another length than its range; and a command after `endEncoding`. A nil entry of a serial
+//!   encoder's resources, or of a heap list, is skipped, as Metal skips it.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
 //! before the refused one are bound.
@@ -266,8 +274,10 @@ impl RtComputeEncoder {
                         "a nil resource in a concurrent encoder, which ends Metal's process",
                     ));
                 }
-                for resource in resources.iter().flatten() {
-                    e.use_resource(declared(&self.kept, resource), usage)?;
+                if let Some(usage) = usage {
+                    for resource in resources.iter().flatten() {
+                        e.use_resource(declared(&self.kept, resource), usage)?;
+                    }
                 }
             }
         }
@@ -305,22 +315,22 @@ pub(super) fn slots(range: NsRange, lengths: &[usize]) -> Result<Range<u32>, Sto
     Ok(small(range.location)?..small(end)?)
 }
 
-/// `MTLResourceUsage` as rt's: a value of read (1), write (2) and sample (4), at least one. The
+/// `MTLResourceUsage` as rt's: a value of read (1), write (2) and sample (4), or none for 0, which
+/// declares nothing (the module's docs, "No usage"); a bit past sample is Metal's refusal. The
 /// render encoder's `useResources:` takes it too (`super::render`).
-pub(super) fn resource_usage(usage: u64) -> Result<rt::ResourceUsage, Stop> {
+pub(super) fn resource_usage(usage: u64) -> Result<Option<rt::ResourceUsage>, Stop> {
+    if usage & !7 != 0 {
+        return Err(Stop::Metal("a resource usage no Metal value is"));
+    }
     let bits = [
         (1, rt::ResourceUsage::READ),
         (2, rt::ResourceUsage::WRITE),
         (4, rt::ResourceUsage::SAMPLE),
     ];
-    let named = (bits.into_iter())
+    Ok((bits.into_iter())
         .filter(|&(bit, _)| usage & bit != 0)
         .map(|(_, named)| named)
-        .reduce(|a, b| a | b);
-    match named {
-        Some(named) if usage & !7 == 0 => Ok(named),
-        _ => Err(Stop::Metal("a resource usage no Metal value is")),
-    }
+        .reduce(|a, b| a | b))
 }
 
 /// rt's resource of `resource`, which a compute or render encoder's `useResources:` declares to the
@@ -862,6 +872,63 @@ mod tests {
         assert!(matches!(made.compute_encoder_for_pass(&unknown), Ok(None)));
         assert_eq!(counted(metal), before + 2);
         drop(made);
+    }
+
+    /// A declaration of no usage (`useResources:count:usage:` of 0) declares nothing and is no
+    /// refusal, in a serial and in a concurrent encoder (the module's docs, "No usage"), where a
+    /// usage with a bit past sample is Metal's refusal, counted; the dispatch after either runs.
+    #[test]
+    fn a_declaration_of_no_usage_is_no_refusal_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let done = CommandBufferStatus::COMPLETED;
+        let metal = RtRefusal::Refused.code();
+        let buffer = || {
+            let made = device.new_buffer_of_length(on, 16, 0);
+            made.expect("never a raise").expect("a buffer")
+        };
+        let library = device.new_library(ADD).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let function = library.new_function(on, "add_one").expect("never a raise");
+        let function = function.expect("a function of the table");
+        let add = device.new_compute_pipeline_state_for_function(Some(&function));
+        let add = add.expect("a compute state").expect("a compute state");
+        let concurrent = ComputePassDesc {
+            dispatch_type: Some(1),
+        };
+        for (pass, kind) in [(None, "serial"), (Some(&concurrent), "concurrent")] {
+            for (usage, refused) in [(0, 0), (8, 1)] {
+                let (output, input) = (buffer(), buffer());
+                // SAFETY: the Shared buffer's contents are mapped, 4 words long.
+                unsafe {
+                    let at = input.contents().as_ptr::<u32>();
+                    at.copy_from_nonoverlapping([1, 2, 3, 4].as_ptr(), 4);
+                }
+                let declared = [
+                    Some(ResourceRef::Buffer(&input)),
+                    Some(ResourceRef::Buffer(&output)),
+                ];
+                let before = counted(metal);
+                let status = run(
+                    &queue,
+                    pass,
+                    vec![
+                        ComputeCmd::UseResources {
+                            resources: &declared,
+                            usage,
+                        },
+                        ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                        bind(&[Some(&output), Some(&input)]),
+                        threads(4),
+                    ],
+                );
+                assert_eq!(status, done, "{kind} {usage}");
+                assert_eq!(counted(metal), before + refused, "{kind} {usage}");
+                assert_eq!(words(&output, 4), [2, 3, 4, 5], "{kind} {usage}");
+            }
+        }
     }
 
     /// A placement heap's buffers are one resource to a serial encoder's hazards, as Metal tracks a

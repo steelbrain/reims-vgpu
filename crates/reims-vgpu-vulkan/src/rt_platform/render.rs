@@ -36,6 +36,8 @@
 //! - **`useResources:`** in each form is rt's `use_resource` of each resource it names but nil, as
 //!   the compute encoder's is (`super::compute`): the command buffer keeps the resource until it
 //!   retires, and rt records nothing. A tiled texture it names is a use of it (`super::tiled`).
+//!   Of usage 0 it declares nothing, and is no refusal, as the compute encoder's (its docs, "No
+//!   usage").
 //!   After a usage that writes a texture made for shader writes with no storage element, each
 //!   draw of the encoder whose vertex or fragment function may reach a texture beyond its slots
 //!   (an argument buffer's `access::write` or `access::read_write` texture, a resource ID) is rt's
@@ -70,9 +72,9 @@
 //! - **Metal's refusals**, each encoding nothing, counted (`rt-refused-metal`): a draw with no
 //!   pipeline state set, or with nil set since; a value no Metal enumeration has (a primitive,
 //!   index or fill type, a cull mode, a winding, a depth clip mode, a store action, a visibility
-//!   result mode, a resource usage); an index, a count or a base past rt's 32 bits, and a range
-//!   of commands past them; a list of another length than its range; and a command after
-//!   `endEncoding`.
+//!   result mode, a resource usage with a bit past sample); an index, a count or a base past rt's
+//!   32 bits, and a range of commands past them; a list of another length than its range; and a
+//!   command after `endEncoding`.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
 //! before the refused one are bound.
@@ -380,9 +382,10 @@ impl RtRenderEncoder {
             | RenderCmd::UseResourcesStages {
                 resources, usage, ..
             } => {
-                let usage = resource_usage(usage)?;
-                for resource in resources.iter().flatten() {
-                    e.use_resource(declared(&self.kept, resource), usage)?;
+                if let Some(usage) = resource_usage(usage)? {
+                    for resource in resources.iter().flatten() {
+                        e.use_resource(declared(&self.kept, resource), usage)?;
+                    }
                 }
             }
             RenderCmd::EndEncoding
@@ -1412,6 +1415,71 @@ mod tests {
         assert_eq!(commands.wait_until_completed(on), Ok(()));
         assert_eq!(commands.status(), done);
         assert_eq!(texels(), every(red));
+    }
+
+    /// A declaration of no usage (`useResources:` of 0, in each form) declares nothing and is no
+    /// refusal, as the compute encoder's (`super::compute`'s docs, "No usage"), where a usage
+    /// with a bit past sample is Metal's refusal, counted; the draw after either draws.
+    #[test]
+    fn a_declaration_of_no_usage_is_no_refusal_on_vulkan() {
+        // `MTLRenderStageFragment`.
+        const FRAGMENT: u64 = 2;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = || {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let done = CommandBufferStatus::COMPLETED;
+        let metal = RtRefusal::Refused.code();
+        let state = vdesc_state(&device, &function(&device, COLOR, "render_color"));
+        let vertices = triangle(&device);
+        let target = device.new_texture(
+            on,
+            &platform.texture_descriptor(&TextureDesc {
+                width: 4,
+                height: 4,
+                usage: 5,
+                ..TextureDesc::default()
+            }),
+        );
+        let target = target.expect("never a raise").expect("a render target");
+        let texels = || {
+            let mut texels = [0u8; 64];
+            target.read_pixels(&mut texels, 16);
+            texels
+        };
+        let green: [u8; 64] = std::array::from_fn(|i| [0, 255, 0, 255][i % 4]);
+        for (usage, refused) in [(0, 0), (8, 1)] {
+            let declared = [Some(ResourceRef::Buffer(&vertices))];
+            let before = counted(metal);
+            let mut cmds = vec![
+                RenderCmd::UseResources {
+                    resources: &declared,
+                    usage,
+                },
+                RenderCmd::UseResourcesStages {
+                    resources: &declared,
+                    usage,
+                    stages: FRAGMENT,
+                },
+            ];
+            cmds.extend(bound(
+                &state,
+                &vertices,
+                RenderCmd::DrawPrimitives {
+                    primitive_type: TRIANGLE,
+                    vertex_start: 0,
+                    vertex_count: 3,
+                },
+            ));
+            // Cleared to red, then drawn green.
+            assert_eq!(run(&made(), &pass(&target, 2), cmds), done, "{usage}");
+            assert_eq!(counted(metal), before + 2 * refused, "{usage}");
+            assert_eq!(texels(), green, "{usage}");
+        }
     }
 
     /// The commands that set `state` and `vertices` at vertex buffer 0, then `draw`.
