@@ -2337,11 +2337,12 @@ mod tests {
         assert_eq!(counted(gap), before.1 + 5);
     }
 
-    /// The most buffer slots of a command whose state's vertex function reads all but one of them
-    /// and whose fragment function reads one that rt's push range holds: the slot words of the
-    /// state's 256-byte push range, on every device (measured on an RTX 3090 and a Radeon RX 7900
-    /// XTX).
-    const PUSHED_SLOTS: u32 = 25;
+    /// The most vertex buffer slots of a command that rt's push range holds: a 25th vertex slot
+    /// falls past the state's 256 push bytes into its parameter block. The bound is on the vertex
+    /// slots, not on a total: measured on an RTX 3090 and a Radeon RX 7900 XTX with a fragment
+    /// function reading one slot more, and on the 3090 a state reading 25 vertex slots below the
+    /// buffer's bind count is refused with a fragment bind count of 0 as of 1.
+    const PUSHED_VERTEX_SLOTS: u32 = 24;
 
     /// An execution carries each buffer slot its state's functions read below the buffer's bind
     /// counts as a slot word of rt's push range, and takes a token of the device's for each and
@@ -2349,8 +2350,8 @@ mod tests {
     /// (`IndirectCommandBuffers` of `DrawInput`), and one of more than the device's
     /// `maxIndirectCommandsTokenCount` leaves is too (of `Tokens`); each draws nothing and is
     /// counted. Commands of 24 to 30 slots (`icb_vertex_23` to `icb_vertex_29`, and the fragment
-    /// function's one), each executed on its own: those of at most [`PUSHED_SLOTS`] draw where the
-    /// device's tokens take them.
+    /// function's one), each executed on its own: those whose vertex function reads at most
+    /// [`PUSHED_VERTEX_SLOTS`] draw where the device's tokens take them.
     #[test]
     fn an_execution_of_more_slots_than_rt_carries_draws_nothing_on_vulkan() {
         let platform = RtPlatform::new();
@@ -2404,7 +2405,7 @@ mod tests {
             let red = texels.chunks(4).all(|texel| texel == [255, 0, 0, 255]);
             let kinds = [after[0] - before.1[0], after[1] - before.1[1]];
             seen.push((slots, drawn, red, counted(gap) - before.0, kinds));
-            let pushed = slots <= PUSHED_SLOTS;
+            let pushed = vertex <= PUSHED_VERTEX_SLOTS;
             let taken = slots + 3 <= tokens;
             let kinds = [u64::from(!pushed), u64::from(pushed && !taken)];
             let fits = pushed && taken;
