@@ -447,7 +447,7 @@ impl<P: Platform> DeviceFiller<P> {
     fn layout_for(&mut self, encoder: &VideoEncoder, shape: TargetShape) -> InputLayout {
         match self.layout {
             Some((of, layout)) if of == shape => layout,
-            _ => *self.layout.insert((shape, encoder.input_layout())).1,
+            _ => self.layout.insert((shape, encoder.input_layout())).1,
         }
     }
 
