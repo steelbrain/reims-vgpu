@@ -1657,8 +1657,8 @@ mod tests {
     /// one a memory breach is kept under.
     #[test]
     fn the_shared_options_carry_the_helpers_ceiling_on_vulkan() {
-        let instance = crate::os::rt_instance(&crate::os::rt_instance_extensions())
-            .expect("rt's instance");
+        let instance =
+            crate::os::rt_instance(&crate::os::rt_instance_extensions()).expect("rt's instance");
         let listed = instance.physical_devices().expect("rt's devices");
         let physical = listed.first().expect("a device on the GPU the test holds");
         let (options, _) = shared_options(&instance, physical);
