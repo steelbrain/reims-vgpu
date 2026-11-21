@@ -249,74 +249,83 @@ fn a_stream_started_at_a_p_picture_answers_picture_errors_until_its_idr_picture(
     }
 }
 
-/// An H.264 P picture whose slice is cut to half, which NVDEC answers failed: read back as NVDEC
-/// left it, telling its status, with the pictures after it decoded, where the decoder copies
-/// failed H.264 pictures; failed, with the next picture refused until an I picture, where it does
-/// not.
+/// An H.264 and an HEVC P picture whose slice is cut to half, which NVDEC answers failed: read
+/// back as NVDEC left it, telling its status, with the pictures after it decoded, where the
+/// decoder copies failed pictures; failed, with the next picture refused until an I or IRAP
+/// picture, where it does not.
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
-fn a_failed_h264_picture_is_copied_and_decoded_on_from_or_refused() {
+fn a_failed_picture_is_copied_and_decoded_on_from_or_refused() {
     let gpu = Arc::new(Gpu::open(&GpuSelector::First).expect("an NVIDIA GPU"));
     let runtime: Arc<dyn Runtime> = Arc::new(GatedRuntime);
-    let params = EncodeParams {
-        width: 1920,
-        height: 1080,
-        b_frames: 0,
-        ..params(EncodeProfile::H264High)
-    };
-    let mut encoder = NvencEncoder::new(Arc::clone(&gpu), &params).expect("an NVENC session");
-    let mut units = Vec::new();
-    for n in 0..8 {
-        let (luma, chroma, row) = noise(&params, n);
-        let packets = encoder
-            .encode(&RawFrame {
-                luma: (&luma, row),
-                chroma: (&chroma, row),
-                index: n,
-                force_idr: n == 0,
-            })
-            .expect("a frame NVENC takes");
-        for packet in packets {
-            units.push(packet.expect("a packet").data);
-        }
-    }
-    assert_eq!(units.len(), 8);
-    // The fourth picture, a P picture, its slice cut to half.
-    let cut = units[3].len() / 2;
-    units[3].truncate(cut);
-    for copies in [true, false] {
-        let mut decoder = AnnexBDecoder::new(&gpu, AnnexBCodec::H264, &runtime);
-        if copies {
-            decoder.copy_failed_h264_pictures();
-        }
-        decoder
-            .parameter_sets(encoder.sequence_parameters())
-            .expect("the parameter sets");
-        for (n, unit) in units.iter().enumerate() {
-            let decoded = decoder.decode(unit);
-            if !copies && n == 4 {
-                assert!(
-                    decoded.is_err(),
-                    "the picture after the failed one is refused"
-                );
-                break;
+    for (profile, codec) in [
+        (EncodeProfile::H264High, AnnexBCodec::H264),
+        (EncodeProfile::HevcMain, AnnexBCodec::Hevc),
+    ] {
+        let params = EncodeParams {
+            width: 1920,
+            height: 1080,
+            b_frames: 0,
+            ..params(profile)
+        };
+        let mut encoder = NvencEncoder::new(Arc::clone(&gpu), &params).expect("an NVENC session");
+        let mut units = Vec::new();
+        for n in 0..8 {
+            let (luma, chroma, row) = noise(&params, n);
+            let packets = encoder
+                .encode(&RawFrame {
+                    luma: (&luma, row),
+                    chroma: (&chroma, row),
+                    index: n,
+                    force_idr: n == 0,
+                })
+                .expect("a frame NVENC takes");
+            for packet in packets {
+                units.push(packet.expect("a packet").data);
             }
-            let picture = decoded.expect("a decode").expect("a picture");
-            let read = picture
-                .read_back((1920, 1080))
-                .map(|read| read.planes()[0].rows);
-            match (n, copies) {
-                (3, true) => {
-                    assert_eq!(read.ok(), Some(1080), "copied as NVDEC left it");
-                    let status = picture.copied_failed();
-                    assert!(matches!(status, Some(8 | 9)), "its status: {status:?}");
+        }
+        assert_eq!(units.len(), 8, "{codec:?}");
+        // The fourth picture, a P picture, its slice cut to half.
+        let cut = units[3].len() / 2;
+        units[3].truncate(cut);
+        for copies in [true, false] {
+            let mut decoder = AnnexBDecoder::new(&gpu, codec, &runtime);
+            if copies {
+                decoder.copy_failed_pictures();
+            }
+            decoder
+                .parameter_sets(encoder.sequence_parameters())
+                .expect("the parameter sets");
+            for (n, unit) in units.iter().enumerate() {
+                let decoded = decoder.decode(unit);
+                if !copies && n == 4 {
+                    assert!(
+                        decoded.is_err(),
+                        "{codec:?}: the picture after the failed one is refused"
+                    );
+                    break;
                 }
-                (3, false) => {
-                    assert!(matches!(read, Err(Error::DecodeFailed(_))), "{read:?}");
-                    assert_eq!(picture.copied_failed(), None);
+                let picture = decoded.expect("a decode").expect("a picture");
+                let read = picture
+                    .read_back((1920, 1080))
+                    .map(|read| read.planes()[0].rows);
+                match (n, copies) {
+                    (3, true) => {
+                        assert_eq!(read.ok(), Some(1080), "{codec:?}: copied as NVDEC left it");
+                        let status = picture.copied_failed();
+                        assert!(matches!(status, Some(8 | 9)), "{codec:?}: its status: {status:?}");
+                    }
+                    (3, false) => {
+                        assert!(matches!(read, Err(Error::DecodeFailed(_))), "{codec:?}: {read:?}");
+                        assert_eq!(picture.copied_failed(), None);
+                    }
+                    // The pictures after it decode from it, as NVDEC left it.
+                    _ => assert_eq!(
+                        read.ok(),
+                        Some(1080),
+                        "{codec:?} picture {n}, copies {copies}"
+                    ),
                 }
-                // The pictures after it decode from it, as NVDEC left it.
-                _ => assert_eq!(read.ok(), Some(1080), "picture {n}, copies {copies}"),
             }
         }
     }

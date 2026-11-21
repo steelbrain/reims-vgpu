@@ -22,10 +22,10 @@
 //! - **A picture NVDEC fails** fails its write or read back, as bad data
 //!   ([`Error::DecodeFailed`]), and the decoder then fails each picture
 //!   after it until an I picture (H.264) or an IRAP picture (HEVC) decodes
-//!   (`crate::nvidia::decode`'s `Failures`); or, for H.264 where the caller
-//!   asks ([`AnnexBDecoder::copy_failed_h264_pictures`]), is written or read
-//!   back as NVDEC left it, telling its status, and the pictures after it
-//!   decode, as a Mac's hardware decoder hands them on.
+//!   (`crate::nvidia::decode`'s `Failures`); or, where the caller asks
+//!   ([`AnnexBDecoder::copy_failed_pictures`]), is written or read back as
+//!   NVDEC left it, telling its status, and the pictures after it decode, as
+//!   a Mac's hardware decoders hand them on.
 //! - **A picture holds its decode surface** until it drops: the decoder has
 //!   [`AnnexBDecoder::SPARE_PICTURES`] surfaces beyond its references and
 //!   the picture being decoded, and a decode with none free is
@@ -67,9 +67,9 @@ pub struct AnnexBDecoder {
     failures: Failures,
     /// The id the next sample is decoded with.
     next_id: u64,
-    /// What its H.264 pictures' writes and read backs do with a decode NVDEC
-    /// answers failed ([`Self::copy_failed_h264_pictures`]).
-    h264_failed: OnFailed,
+    /// What its pictures' writes and read backs do with a decode NVDEC
+    /// answers failed ([`Self::copy_failed_pictures`]).
+    failed: OnFailed,
 }
 
 /// The codec crate's decoder of the stream, with NVDEC as its accelerator.
@@ -115,25 +115,30 @@ impl AnnexBDecoder {
             codec,
             failures: Failures::default(),
             next_id: 0,
-            h264_failed: OnFailed::Refuse,
+            failed: OnFailed::Refuse,
         }
     }
 
-    /// Has each H.264 picture NVDEC answers failed written or read back as
-    /// NVDEC left it, rather than failed, and the pictures after it decoded as
-    /// any, predicting from it, rather than refused until an I picture: as a
-    /// Mac's hardware decoder hands its client a picture it decoded with an
-    /// error, concealed, its status 0, and decodes on from it (**measured** on
-    /// a MacBook Pro of 2019, macOS 26.7.1, VideoToolbox's hardware decode of
-    /// an H.264 stream of 90 pictures whose 20th, a P picture, was cut to half
-    /// its slice or had 64 bytes of it changed: every picture came back with
-    /// status 0, the 20th and those after it 26.5 to 29.7 dB from the
-    /// undamaged stream's luma and none all zeros, until the IDR picture at
-    /// 45, which came back as the undamaged stream's). Each such picture tells
-    /// its status ([`AnnexBPicture::copied_failed`]). HEVC's pictures are failed
-    /// as before.
-    pub fn copy_failed_h264_pictures(&mut self) {
-        self.h264_failed = OnFailed::Copy;
+    /// Has each picture NVDEC answers failed written or read back as NVDEC
+    /// left it, rather than failed, and the pictures after it decoded as any,
+    /// predicting from it, rather than refused until an I (H.264) or IRAP
+    /// (HEVC) picture: as a Mac's hardware decoders hand their client a
+    /// picture they decoded with an error, concealed, its status 0, and decode
+    /// on from it. **Measured** on a MacBook Pro of 2019, macOS 26.7.1,
+    /// VideoToolbox's hardware decode: of an H.264 stream of 90 pictures whose
+    /// 20th, a P picture, was cut to half its slice or had 64 bytes of it
+    /// changed, every picture came back with status 0, the 20th and those
+    /// after it 26.5 to 29.7 dB from the undamaged stream's luma and none all
+    /// zeros, until the IDR picture at 45, which came back as the undamaged
+    /// stream's; of an HEVC stream at 1080p on the UHD 630 whose P picture at
+    /// 10 had its last slice segment cut to half, that picture and
+    /// each after it came back with status 0 and an image, their luma 19.6 to
+    /// 27.7 from the undamaged stream's on average (of 255, over a 64 by 36
+    /// thumbnail), until the IDR picture at 30, which came back as the
+    /// undamaged stream's. Each such picture tells its status
+    /// ([`AnnexBPicture::copied_failed`]).
+    pub fn copy_failed_pictures(&mut self) {
+        self.failed = OnFailed::Copy;
     }
 
     /// Takes parameter sets (H.264's SPS and PPS, HEVC's VPS, SPS and PPS),
@@ -181,10 +186,7 @@ impl AnnexBDecoder {
         let id = self.next_id;
         self.next_id += 1;
         let failed = self.failures.take();
-        let on_failed = match &self.codec {
-            Codec::H264(_) => self.h264_failed,
-            Codec::Hevc(_) => OnFailed::Refuse,
-        };
+        let on_failed = self.failed;
         let outputs = match &mut self.codec {
             Codec::H264(decoder) => {
                 if failed {
@@ -351,7 +353,7 @@ pub struct AnnexBPicture {
     /// Its decoder's, which a failed decode is noted in.
     failures: Failures,
     /// Whether its writes and read backs fail a decode NVDEC answers failed, or
-    /// copy it as NVDEC left it ([`AnnexBDecoder::copy_failed_h264_pictures`]).
+    /// copy it as NVDEC left it ([`AnnexBDecoder::copy_failed_pictures`]).
     on_failed: OnFailed,
 }
 
@@ -364,7 +366,7 @@ impl AnnexBPicture {
 
     /// NVDEC's status of its decode, where NVDEC answered it failed and a
     /// write or read back of it copied it as NVDEC left it
-    /// ([`AnnexBDecoder::copy_failed_h264_pictures`]): 8
+    /// ([`AnnexBDecoder::copy_failed_pictures`]): 8
     /// (`cuvidDecodeStatus_Error`) or 9 (`cuvidDecodeStatus_Error_Concealed`).
     /// Such a picture is not noted as failed, and the pictures after it decode.
     pub fn copied_failed(&self) -> Option<u32> {

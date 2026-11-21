@@ -456,10 +456,11 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
             _ => return None,
         };
         let mut annex_b = AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime);
-        // AppleGVA's H.264 path reports no failure (docs/video/bugs.md, D25): a picture NVDEC
-        // failed lands as NVDEC left it, and the pictures after it decode from it, as a Mac's
-        // hardware decoder hands them on, rather than as zeros.
-        annex_b.copy_failed_h264_pictures();
+        // A picture NVDEC failed lands as NVDEC left it, and the pictures after it decode from
+        // it, as a Mac's hardware decoders hand them on, H.264's and HEVC's: rather than as zeros
+        // where AppleGVA's H.264 path reports no failure (docs/video/bugs.md, D25), or as a
+        // failed command buffer, which AppleGVA's HEVC path answers for the rest of the session.
+        annex_b.copy_failed_pictures();
         let decoder = NvdecDecoder {
             decoder: annex_b,
             video: Arc::clone(video),

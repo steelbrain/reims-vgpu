@@ -175,14 +175,13 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   itself: a picture decoded into its output's cache, and one the driver's video processing
   copies there or into the pages, which on VA-API is issued right behind its decode and copies
   the decode surface whatever the decode answers (the VA crate's `zero_copy.rs`), the rt
-  platform's references among them. So does an H.264 picture NVDEC answers failed (below). Where
-  the runtime device's GPU or the CPU copies a picture, VA-API's last two ways, each waits for
-  the decode first, and a failed picture is not copied: its output holds what it held before, as
-  does an HEVC picture NVDEC answers failed, which it refuses (`OnFailed::Refuse`).
-- **An H.264 picture NVDEC answers failed** lands as NVDEC left it, its command buffer completing
-  as any, and the pictures after it decode from it, as a Mac's hardware decoder hands such a
-  picture on with no error ([nvidia.md](nvidia.md), "An H.264 picture NVDEC failed lands as
-  NVDEC left it").
+  platform's references among them. So does a picture NVDEC answers failed (below). Where the
+  runtime device's GPU or the CPU copies a picture, VA-API's last two ways, each waits for the
+  decode first, and a failed picture is not copied: its output holds what it held before.
+- **A picture NVDEC answers failed**, H.264's or HEVC's, lands as NVDEC left it, its command
+  buffer completing as any, and the pictures after it decode from it, as a Mac's hardware
+  decoders hand such a picture on with no error ([nvidia.md](nvidia.md), "A picture NVDEC
+  failed lands as NVDEC left it").
 - **A picture the stream's random access skips, or one of the stream's that does not decode,**
   lands nothing, and its command buffer completes as any other, its output keeping its bytes.
   One that does not decode is one whose bytes do not read as its standard reads them, one that

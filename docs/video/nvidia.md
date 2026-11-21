@@ -136,25 +136,30 @@ where it is NVIDIA's and CUDA opens it (`graphics/video_choice.rs`).
 
   Elsewhere the picture is read back and copied by the CPU.
 - **A picture that does not land is a decode error.** A picture whose planes
-  the session refuses, or whose HEVC decode NVDEC failed once it ran, still
-  signals the decode's value, so its command buffer completes, failed with
-  Metal's internal error. For HEVC the guest's video driver's schedule of
-  the picture waits for that verdict and fails (`kVTVideoDecoderMalfunctionErr`),
+  the session refuses still signals the decode's value, so its command
+  buffer completes, failed with Metal's internal error. For HEVC the guest's
+  video driver's schedule of the picture waits for that verdict and fails
+  (`kVTVideoDecoderMalfunctionErr`),
   which AppleGVA reports from that frame on, so no frame of the picture
   reaches the guest. AppleGVA's H.264 decoder reports no failure a driver can
   answer, so an H.264 picture that does not land reaches the guest as a
   decoded frame (`guest/bundle/src/RgfxVideoStatus.hpp`, bugs.md D25).
-- **An H.264 picture NVDEC failed lands as NVDEC left it.** The device's
-  sessions have their decoders copy such a picture
-  (`AnnexBDecoder::copy_failed_h264_pictures`): it lands as any, its command
+- **A picture NVDEC failed lands as NVDEC left it**, H.264's and HEVC's. The
+  device's sessions have their decoders copy such a picture
+  (`AnnexBDecoder::copy_failed_pictures`): it lands as any, its command
   buffer completing as any, and the pictures after it decode from it, as a
-  Mac's hardware decoder hands a picture it decoded with an error on, with no
-  error, and decodes on until the next IDR picture (**measured**, a MacBook
-  Pro of 2019 under macOS 26.7.1, 2026-11-16: a P picture cut to half its
-  slice, or with 64 bytes of it changed, and those after it came back with
-  status 0, 26.5 to 29.7 dB from the undamaged stream's luma, none all
-  zeros). The session counts each, and logs the first ones ("a picture the
-  hardware failed landed as it left it").
+  Mac's hardware decoders hand a picture they decoded with an error on, with
+  no error, and decode on until the next IDR picture (**measured**, a MacBook
+  Pro of 2019 under macOS 26.7.1: on 2026-11-16, an H.264 P picture cut to
+  half its slice, or with 64 bytes of it changed, and those after it came
+  back with status 0, 26.5 to 29.7 dB from the undamaged stream's luma, none
+  all zeros; on 2026-11-20, on the UHD 630, an HEVC P picture at 1080p whose
+  last slice segment was cut to half, and those after it, came back with
+  status 0 and an image each). A failed HEVC command buffer would instead
+  end the guest's session: AppleGVA's HEVC path answers
+  `kVTVideoDecoderMalfunctionErr` from that picture on. The session counts
+  each, and logs the first ones ("a picture the hardware failed landed as it
+  left it").
 - **Surfaces.** A picture holds its decode surface until it lands; the decoder
   has `AnnexBDecoder::SPARE_PICTURES` (2) beyond its references and the
   picture being decoded, and the session holds no more pictures unlanded than
