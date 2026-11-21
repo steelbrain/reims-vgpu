@@ -1667,15 +1667,18 @@ mod tests {
         height: 32,
     };
 
-    /// `presented` shows `surface`, under a hold of its own: the hold, weakly, whose strong count
-    /// is 1 while the display alone holds it.
+    /// `presented` shows `surface`, under a hold of its own, whose writes are all the platform's
+    /// work where `queued` ([`DisplayHold`]): the hold, weakly, whose strong count is 1 while the
+    /// display alone holds it.
     fn show_held(
         presented: &Presented<FakePlatform>,
         surface: &<FakePlatform as Platform>::Texture,
+        queued: bool,
     ) -> std::sync::Weak<DisplayHold> {
         let hold = Arc::new(DisplayHold {
             span: None,
             answers: Mutex::default(),
+            queued,
         });
         let weak = Arc::downgrade(&hold);
         *presented.texture.lock() = Some(ShownTexture {
@@ -1704,26 +1707,38 @@ mod tests {
         }
     }
 
-    /// On the runtime's own device the draw reads the presented surface itself: the presents it
-    /// takes and the surface's block go once the draw has finished, not before
+    /// On the runtime's own device the draw reads the presented surface itself: the surface's
+    /// block goes once the draw has finished, not before, past its scheduling (the testkit's
+    /// commit), whether every write of the surface is the platform's work, where the answers the
+    /// draw holds go at its scheduling, or not (`DrawnPresents::after`)
     #[test]
-    fn on_the_runtimes_device_the_presents_go_with_the_draw() {
-        let (platform, draw, presented, drawable) = rig();
-        let surface = texture(&draw, 80);
-        let hold = show_held(&presented, &surface);
-        let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None).unwrap();
-        assert_eq!(hold.strong_count(), 2, "the draw holds the surface");
-        presents.after(&command_buffer);
-        no_catch(command_buffer.commit(OnFault::Die));
-        assert_eq!(committed(&platform, 1), [command_buffer.id()]);
-        assert_eq!(hold.strong_count(), 2, "while the draw runs");
-        assert!(platform.world().complete(
-            command_buffer.id(),
-            CommandBufferStatus::COMPLETED,
-            None,
-            CompleteOn::Thread
-        ));
-        assert_eq!(hold.strong_count(), 1, "until it has finished");
+    fn on_the_runtimes_device_the_surface_s_block_goes_with_the_draw() {
+        for queued in [true, false] {
+            let (platform, draw, presented, drawable) = rig();
+            let surface = texture(&draw, 80);
+            let hold = show_held(&presented, &surface, queued);
+            let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None).unwrap();
+            assert_eq!(hold.strong_count(), 2, "the draw holds the surface");
+            presents.after(&command_buffer);
+            no_catch(command_buffer.commit(OnFault::Die));
+            assert_eq!(committed(&platform, 1), [command_buffer.id()]);
+            assert_eq!(
+                hold.strong_count(),
+                2,
+                "queued {queued}: while the draw runs"
+            );
+            assert!(platform.world().complete(
+                command_buffer.id(),
+                CommandBufferStatus::COMPLETED,
+                None,
+                CompleteOn::Thread
+            ));
+            assert_eq!(
+                hold.strong_count(),
+                1,
+                "queued {queued}: until it has finished"
+            );
+        }
     }
 
     /// With no scanout and no presented surface, display 0's window draws nothing, and the window
@@ -1778,6 +1793,7 @@ mod tests {
             hold: Arc::new(DisplayHold {
                 span: None,
                 answers: Mutex::default(),
+                queued: false,
             }),
         });
         let log = platform.call_log();
@@ -2205,6 +2221,7 @@ mod tests {
             hold: Arc::new(DisplayHold {
                 span: None,
                 answers: Mutex::default(),
+                queued: false,
             }),
         });
         let post: Table = Arc::from(vec![[0.0, 0.0, 0.0, 0.0], [0.5, 0.25, 1.0, 0.0]]);
@@ -2425,6 +2442,7 @@ mod tests {
             hold: Arc::new(DisplayHold {
                 span: None,
                 answers: Mutex::default(),
+                queued: false,
             }),
         });
         let region = PixelRect {
@@ -2614,6 +2632,7 @@ mod tests {
                 hold: Arc::new(DisplayHold {
                     span: None,
                     answers: Mutex::default(),
+                    queued: false,
                 }),
             });
             view
@@ -2721,6 +2740,7 @@ mod tests {
             hold: Arc::new(DisplayHold {
                 span: None,
                 answers: Mutex::default(),
+                queued: false,
             }),
         });
         let mark = log.mark();
@@ -2758,6 +2778,7 @@ mod tests {
             hold: Arc::new(DisplayHold {
                 span: None,
                 answers: Mutex::default(),
+                queued: false,
             }),
         });
         let refused = || {
@@ -2858,6 +2879,7 @@ mod tests {
                 hold: Arc::new(DisplayHold {
                     span: None,
                     answers: Mutex::default(),
+                    queued: false,
                 }),
             });
         };
@@ -3073,6 +3095,7 @@ mod tests {
                     hold: Arc::new(DisplayHold {
                         span: None,
                         answers: Mutex::default(),
+                        queued: false,
                     }),
                 }
             });
@@ -3265,6 +3288,7 @@ mod tests {
                         hold: Arc::new(DisplayHold {
                             span: None,
                             answers: Mutex::default(),
+                            queued: false,
                         }),
                     });
                     changes += 1;

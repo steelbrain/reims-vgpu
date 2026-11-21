@@ -829,6 +829,16 @@ pub(crate) struct SurfacePresent<P: Platform> {
     pub(crate) writers: Vec<RgfxSurfaceWriter>,
     /// The context that made the texture.
     pub(crate) owner: u32,
+    /// Whether every write of the bytes the texture reads is the platform's work, on its queue
+    /// behind each window draw scheduled before it (`DrawnPresents::after`): a texture over a
+    /// block's device cache, or a view of one of its shapes' images, Private memory that only the
+    /// platform's work writes (fills and copies on the caches' transfer queue, the guest's
+    /// command buffers), of a cache whose memory was not made for the host's video, which writes
+    /// its pictures on GPU work of its own ([`surface_cache::SurfaceCaches::identity`]). Not one
+    /// over a block that has no cache (the bundle's copy of the surface in the region, or its
+    /// pages), nor one over the block's view of its pages (a wide home there): the guest's CPU
+    /// writes those.
+    pub(crate) queued: bool,
 }
 
 /// The context an object id lies in.
@@ -3633,16 +3643,21 @@ impl<P: Platform> GraphicsDecoder<P> {
             let obj_id = *names.by_surface.get(&iosurface_id)?.last()?;
             (obj_id, names.writers.get(&obj_id).copied())
         };
-        let (texture, view, span) = self
+        let (texture, view, span, over_cache) = self
             .context_state(context_of(obj_id))?
             .with_live(obj_id, |e| match &e.handle {
                 ObjHandle::Texture(texture) => {
                     let view = e.shown_view.clone().unwrap_or_default();
-                    Some((texture.clone_ref(), view, e.span))
+                    let over_cache = (e.over_cache || e.shape.is_some()) && !e.over_view;
+                    Some((texture.clone_ref(), view, e.span, over_cache))
                 }
                 _ => None,
             })
             .flatten()?;
+        let queued = over_cache
+            && span.is_some_and(|(block, _)| {
+                self.surface_caches.has(block) && self.surface_caches.identity(block).is_none()
+            });
         let mut writers: Vec<RgfxSurfaceWriter> = writers_at
             .and_then(|at| self.region.surface_writers(at))
             .map(|record| {
@@ -3669,6 +3684,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             span,
             writers,
             owner: context_of(obj_id),
+            queued,
         })
     }
 

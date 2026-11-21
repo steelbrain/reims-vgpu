@@ -14291,6 +14291,103 @@ pub(super) mod tests {
         }
     }
 
+    /// A present's texture is one whose every write is the platform's work, on its queue
+    /// (`SurfacePresent`'s `queued`), so that the window's draw of it gives the presents' answers
+    /// back at its scheduling (`DrawnPresents::after`), only where it lies over its block's
+    /// device cache, of a cache the host's video did not make: not over the block's view of its
+    /// pages (a wide home there), nor over the pages of a block with no cache, which the guest's
+    /// CPU writes, nor over a cache made for the host's video, which writes its pictures with no
+    /// work on the queue
+    #[test]
+    fn a_present_is_queued_only_over_a_device_cache_of_its_own() {
+        let queued = |r: &Rig| r.dec.surface_present(0x77).expect("a present").queued;
+        let made = |r: &mut Rig, message: &[u8]| {
+            assert_eq!(r.dec.decode(&r.device, message).unwrap(), Ok(()));
+        };
+        // Texture ids of context 0, and R8 texels, as `wide_rig`'s.
+        let ready = |r: &mut Rig| {
+            r.dec.hold_resource_ids(0, 1);
+            r8_texels(r);
+        };
+        let mut r = cached();
+        let page = r.page;
+        ready(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, page), Ok(()));
+        made(&mut r, &surface_texture(11, 10, 10, (32, 8)));
+        assert!(queued(&r), "over the cache");
+
+        let mut r = rig(8);
+        ready(&mut r);
+        assert_eq!(r.pages(BLOCK, &[(1, 2)], 2 * page), RGFX_STATUS_OK);
+        assert_eq!(r.buffer(10, BLOCK, page), Ok(()));
+        made(&mut r, &surface_texture(11, 10, 10, (32, 8)));
+        assert!(!queued(&r), "over the pages of a block with no cache");
+
+        // Texture 12 lies over the pages' view, a later one of the plane's size over the cache.
+        let mut r = wide_rig(64, false);
+        assert!(!queued(&r), "over the pages' view");
+        made(&mut r, &surface_texture(13, 10, 10, (64, 8)));
+        assert!(queued(&r), "over the cache again");
+
+        #[cfg(unix)]
+        {
+            use reims_vgpu_graphics::wire::{RgfxSurfacePlaneLayout, RgfxTextureFromIOSurface};
+            use zerocopy::FromBytes as _;
+            // NV12 in four pages, as `only_a_cache_made_for_the_hosts_video_gives_it_its_identity`
+            // lays it, and a texture over its luma plane.
+            let mut layout = RgfxSurfacePagesLayout {
+                plane_count: 2,
+                ..Default::default()
+            };
+            layout.planes[0] = RgfxSurfacePlaneLayout {
+                offset: 0x20,
+                bytes_per_row: 512,
+                row_bytes: 480,
+                rows: 16,
+            };
+            layout.planes[1] = RgfxSurfacePlaneLayout {
+                offset: 0x20 + 16 * 512,
+                bytes_per_row: 512,
+                row_bytes: 480,
+                rows: 8,
+            };
+            let mut luma =
+                RgfxTextureFromIOSurface::read_from_bytes(&surface_texture(11, 10, 10, (480, 16)))
+                    .expect("a texture's message");
+            (luma.offset, luma.bytes_per_row) = (0x20, 512);
+            for video in [false, true] {
+                let mut r = rig(16);
+                r.dec.set_unified_memory(true);
+                if video {
+                    r.dec.set_dma_buf_caches();
+                }
+                ready(&mut r);
+                let world = Arc::clone(r.p.world());
+                world.answer_surface_pages(PagesInPlace::No("off the device's alignment".into()));
+                assert_eq!(
+                    r.pages_asking(BLOCK, &[(1, 4)], 4 * page, Some(layout)),
+                    RGFX_STATUS_CACHE
+                );
+                assert_eq!(
+                    r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
+                    RGFX_STATUS_OK
+                );
+                assert_eq!(r.dec.caches().identity(BLOCK).is_some(), video);
+                assert_eq!(r.buffer(10, BLOCK, 4 * page), Ok(()));
+                made(&mut r, luma.as_bytes());
+                assert!(
+                    (r.dec.entry(11)).is_some_and(|e| e.over_cache || e.shape.is_some()),
+                    "over the cache or a shape of it, video {video}"
+                );
+                assert_eq!(
+                    queued(&r),
+                    !video,
+                    "a cache made for the host's video: {video}"
+                );
+            }
+        }
+    }
+
     /// Command buffer `cb_obj_id` on queue 1 that uses [`BLOCK`] at generation 0, writing where
     /// `writes`, and holds one blit encoder of `op`'s.
     pub(crate) fn blit_with(r: &mut Rig, cb_obj_id: u64, writes: bool, op: (u16, Vec<u8>)) {

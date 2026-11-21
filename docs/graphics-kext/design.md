@@ -3338,11 +3338,19 @@ answers a `PRESENT_SURFACE` in the refresh that shows its surface, right after
 that refresh's `VBLANK`: the first refresh after the command buffers that write
 the surface have finished, whether or not the host's window has drawn it yet.
 An answer frees the surfaces of the presents before it, never its own, so the
-host holds it only while a read still running may read one of those: the
-window's draw, or, where the window draws on the compositor's GPU, the sync
-that copies the surface into the window's mirror (Decided 14, "the window
-shown by the compositor's GPU"; `crates/reims-vgpu/src/graphics/present.rs`
-and `sink.rs`). The kext maps each `VBLANK`'s
+host holds it while the window's draw of one of those may still be passed by
+the guest's next write of it. Where every write of the surface is work on the
+runtime's queue (a texture over a block's device cache or one of its shapes,
+whose cache the host's video did not make), the hold ends once the draw is
+scheduled: the runtime submits every command queue's work, the window's and
+the guest's, to its one Vulkan queue in commit order, so a write the guest
+commits after the answer runs after the draw (`DrawnPresents::after` in
+`crates/reims-vgpu/src/graphics.rs`, pinned by `reims-vgpu-vulkan`'s
+`work_committed_after_a_scheduling_runs_after_it_on_vulkan`). Otherwise (the
+surface's pages or the bundle's copy, which the guest's CPU writes, or a cache
+of the host's video) it ends once the draw has finished. The surface's block
+waits for the draw to finish either way (`BLOCK_RELEASE`, below). The kext
+maps each `VBLANK`'s
 host time into the guest's `mach_absolute_time` by the clocks' offset
 (`guest/kext/src/RgfxVblankClock.hpp`). Where it took `HOST_TIME`, it reads
 the host's clock at each `VBLANK`, `HOST_TIME_LO` between two reads of its

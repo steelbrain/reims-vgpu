@@ -146,7 +146,7 @@ use crate::graphics::decode::{
     SurfacePresent, Then, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
-use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
+use crate::graphics::present::{Drawing, LetGo, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
 use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
@@ -1514,6 +1514,11 @@ pub(crate) struct DisplayHold {
     span: Option<(u64, u64)>,
     /// Given when the hold goes.
     answers: Mutex<Vec<DrainAnswer>>,
+    /// Whether every write of the bytes the texture reads is the platform's work, queued behind
+    /// a window draw of it scheduled before ([`SurfacePresent`]'s `queued`): a draw of it
+    /// then holds the presents' answers until it is scheduled, not until it has finished
+    /// ([`DrawnPresents::after`]).
+    queued: bool,
 }
 
 impl Drop for DisplayHold {
@@ -1603,13 +1608,14 @@ pub(crate) enum Shows<P: Platform> {
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
 /// the decoder made over it, which the window's sink draws into the next drawable (`sink`), and
 /// the presents' answers, given at the first refresh of the device's display after their show,
-/// once no draw of the window still running may read the surface of a present before them
-/// ([`PresentAnswers`]). The window draws a present when it is made, and again where the
-/// window needs a frame (a new layout, the cursor): each present is the guest's own, and none is
-/// batched or repeated by the GPU's work. The texture's block is held until the next present, the
-/// device's reset or the device's end, and each draw of it until it has finished
-/// ([`DisplayHold`]); the texture itself is let go of at the device's refresh after the next
-/// present, or at its reset (`retired`).
+/// once no draw of the window that may read the surface of a present before them holds them: a
+/// draw holds them until the guest's next write of that surface is queued behind it, or until it
+/// has finished ([`PresentAnswers`], [`DrawnPresents::after`]). The window draws a present when
+/// it is made, and again where the window needs a frame (a new layout, the cursor): each present
+/// is the guest's own, and none is batched or repeated by the GPU's work. The texture's block is
+/// held until the next present, the device's reset or the device's end, and each draw of it until
+/// it has finished ([`DisplayHold`]); the texture itself is let go of at the device's refresh
+/// after the next present, or at its reset (`retired`).
 pub(crate) struct Presented<P: Platform> {
     /// The texture shown; `None` shows the scanout.
     pub(crate) texture: Mutex<Option<ShownTexture<P>>>,
@@ -1665,16 +1671,19 @@ impl<P: Platform> Presented<P> {
 
     /// `texture`, over a surface whose present was taken, held for the display from now, with
     /// `view`, the display's view of it ([`ShownView`]): the block at `span` it lies in is not
-    /// given back until the display is done with it ([`DisplayHold`]).
+    /// given back until the display is done with it ([`DisplayHold`]). `queued`: every write of
+    /// the bytes it reads is the platform's work ([`DisplayHold`]'s `queued`).
     fn hold(
         &self,
         texture: P::Texture,
         view: Arc<ShownView<P>>,
         span: Option<(u64, u64)>,
+        queued: bool,
     ) -> ShownTexture<P> {
         let hold = Arc::new(DisplayHold {
             span,
             answers: Mutex::default(),
+            queued,
         });
         if span.is_some() {
             let mut holds = self.holds.lock();
@@ -1709,6 +1718,7 @@ impl<P: Platform> Presented<P> {
         let join = Arc::new(DisplayHold {
             span: None,
             answers: Mutex::new(vec![answer]),
+            queued: false,
         });
         for hold in held {
             let join = Arc::clone(&join);
@@ -1853,11 +1863,15 @@ impl<P: Platform> Presented<P> {
     }
 
     /// The window draws the latest present: the presents shown after it are answered once the
-    /// draw has finished, or once it is dropped undone ([`DrawnPresents`]).
+    /// draw lets go of them, as it is scheduled or has finished ([`DrawnPresents::after`]), or
+    /// once it is dropped undone.
     pub(crate) fn drawn(self: &Arc<Self>) -> DrawnPresents<P> {
         DrawnPresents {
-            presented: Arc::clone(self),
-            drawing: self.answers.drawn(),
+            answers: HeldAnswers {
+                presented: Arc::clone(self),
+                drawing: self.answers.drawn(),
+                how: LetGo::Finished,
+            },
             hold: None,
         }
     }
@@ -1910,17 +1924,32 @@ impl<P: Platform> Presented<P> {
     }
 }
 
-/// What a window's draw holds of the presents until it has finished on the GPU
-/// ([`DrawnPresents::after`]), or is dropped before its commit: the answers of the presents shown
-/// after the latest one when it began, whose surface it may read ([`PresentAnswers::drawn`]),
-/// and the hold of the block of the surface it draws, let go of then too.
+/// What a window's draw holds ([`DrawnPresents::after`]): the answers of the presents shown after
+/// the latest one when it began, whose surface it may read ([`PresentAnswers::drawn`]), and the
+/// hold of the block of the surface it draws. Both go where it is dropped before its commit.
 pub(crate) struct DrawnPresents<P: Platform> {
+    /// The answers it holds.
+    answers: HeldAnswers<P>,
+    /// The hold of the block of the surface the draw reads, where it reads one.
+    hold: Option<Arc<DisplayHold>>,
+}
+
+/// The answers a window's draw holds ([`DrawnPresents`]), let go of as they drop.
+struct HeldAnswers<P: Platform> {
     /// Where they are answered.
     presented: Arc<Presented<P>>,
     /// The presents the draw took, and the answers it holds.
     drawing: Drawing,
-    /// The hold of the block of the surface the draw reads, where it reads one.
-    hold: Option<Arc<DisplayHold>>,
+    /// How the draw let go of them, for their timing lines: [`LetGo::Finished`] but where its
+    /// scheduled handler lets go of them.
+    how: LetGo,
+}
+
+impl<P: Platform> Drop for HeldAnswers<P> {
+    fn drop(&mut self) {
+        let drawing = std::mem::take(&mut self.drawing);
+        self.presented.answers.let_go(drawing, self.how);
+    }
 }
 
 impl<P: Platform> DrawnPresents<P> {
@@ -1929,24 +1958,53 @@ impl<P: Platform> DrawnPresents<P> {
         self.hold = Some(hold);
     }
 
-    /// The answers it holds, and the surface's block, are let go of after `command_buffer` has
-    /// finished, the one that reads the surface: the draw, or on the compositor's GPU the window's
-    /// mirror's sync (`sink`, "The compositor's GPU"). Its completed handler holds them. Called
-    /// before its commit; where the handler is refused, or the buffer is never committed, they
-    /// are let go of as if it had finished.
+    /// Lets go of what the draw holds as `command_buffer`, the draw, which reads the surface,
+    /// runs, through its handlers. Called before its commit; where a handler is refused, or the
+    /// buffer is never committed, what it holds goes as if it had finished.
+    ///
+    /// The surface's block goes once the draw has finished on the GPU, its last read of the
+    /// block's memory: a completed handler holds it.
+    ///
+    /// The answers go once the draw is scheduled, in its scheduled handler, where every write of
+    /// the surface is the platform's work ([`DisplayHold`]'s `queued`: a device cache's), or
+    /// where it reads none. The guest writes a surface again only once an answer the draw held
+    /// has freed it (`present`'s module doc), so the write is committed after the draw's
+    /// scheduling, and runs after the draw on the GPU, by the rule of the platform's queue: rt
+    /// submits every command queue's work, the sink's unshared queue's ([`sink::ScanoutDraw`]'s
+    /// `queue`) as the guest's and the caches' transfer queue's, to its device's one `VkQueue`
+    /// in commit order, from one thread, each command buffer's segments ending with a global
+    /// memory barrier that runs every later command after its own (metal2vulkan-runtime's
+    /// README, "Queues, command buffers and events"); and the draw, which presents the window's
+    /// drawable (`rt_window`), is never held in a group, and is scheduled only once its
+    /// submission has passed `vkQueueSubmit2` (the README, "Presenting"), so a command buffer
+    /// committed after it goes in a later submission. A second queue, where the device's queue
+    /// family has one, takes only the swapchain's presents. `reims-vgpu-vulkan`'s
+    /// `rt_platform::command` test `work_committed_after_a_scheduling_runs_after_it_on_vulkan`
+    /// fails where the sink's queue and the guest's stop sharing that order. Where a write of
+    /// the surface may go around the queue (the guest's CPU writing the pages or the copy the
+    /// texture lies over, the host's video writing a cache), the answers go once the draw has
+    /// finished, with the block.
     pub(crate) fn after(self, command_buffer: &P::CommandBuffer) {
-        if self.drawing.is_empty() && self.hold.is_none() {
+        let DrawnPresents { answers, hold } = self;
+        let held = !answers.drawing.is_empty();
+        let at_scheduling = hold.as_ref().is_none_or(|hold| hold.queued);
+        let answers = if held && at_scheduling {
+            // rt's one queue (above): the guest's next write of the surface runs after the draw.
+            let let_go = move || {
+                let mut answers = answers;
+                answers.how = LetGo::Scheduled;
+                drop(answers);
+            };
+            no_catch(command_buffer.add_scheduled_handler(OnFault::Die, Box::new(let_go)));
+            None
+        } else {
+            held.then_some(answers)
+        };
+        if answers.is_none() && hold.is_none() {
             return;
         }
-        no_catch(command_buffer.add_completed_handler(OnFault::Die, Box::new(move |_| drop(self))));
-    }
-}
-
-impl<P: Platform> Drop for DrawnPresents<P> {
-    fn drop(&mut self) {
-        self.presented
-            .answers
-            .done(std::mem::take(&mut self.drawing));
+        let finished = Box::new(move |_| drop((answers, hold)));
+        no_catch(command_buffer.add_completed_handler(OnFault::Die, finished));
     }
 }
 
@@ -3903,6 +3961,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 span,
                 writers,
                 owner,
+                queued,
             }) => {
                 // The process that made the texture over the surface the display shows owns the
                 // scanout (WindowServer): its compiles go first.
@@ -3912,7 +3971,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 reims_vgpu_vulkan::rt_platform::diag::presented(owner);
                 // Its block is held from here, before the texture's destroy and the block's
                 // release can come: the present shows it later.
-                let shown = presented.hold(texture, view, span);
+                let shown = presented.hold(texture, view, span, queued);
                 let color = staging.lock().take();
                 self.presents.present(
                     display,

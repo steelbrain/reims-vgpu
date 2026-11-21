@@ -1606,7 +1606,7 @@ mod tests {
     use crate::core::platform::event::SharedEvent as _;
     use crate::core::platform::resource::Buffer as _;
     use crate::core::platform::types::NsRange;
-    use crate::rt_platform::RtQueue;
+    use crate::rt_platform::{RtBuffer, RtQueue};
 
     fn counted(code: &str) -> u64 {
         (crate::answer::degradation_counts().into_iter())
@@ -2247,5 +2247,107 @@ mod tests {
         assert_eq!(protected.commit(on), Ok(()));
         assert_eq!(protected.wait_until_completed(on), Ok(()));
         assert_eq!(protected.status(), completed);
+    }
+
+    /// On the GPU the test holds, work committed on any command queue once a command buffer was
+    /// scheduled runs after that command buffer, which is what reims-vgpu's present path rests on
+    /// when a window's draw gives the guest its surfaces back at its scheduling
+    /// (`DrawnPresents::after`): rt submits every command queue's work, an unshared queue's as a
+    /// plain one's, to the device's one `VkQueue` from one thread in commit order, and ends each
+    /// segment with a global memory barrier (rt's README, "Queues, command buffers and events").
+    /// A command buffer of an unshared queue, the window sink's kind, copies a Shared buffer out
+    /// behind 2 GiB of copies within a Private one. Once its scheduled handler has run, the test's
+    /// thread commits fills of that Shared buffer on a plain queue and on another unshared one.
+    /// The copy reads none of them. The command buffer presents nothing, so it is scheduled as it
+    /// goes to the driver only while its queue has nothing in flight (that README section), as
+    /// here; a window's draw presents a drawable, and is never held.
+    #[test]
+    fn work_committed_after_a_scheduling_runs_after_it_on_vulkan() {
+        use crate::core::num::ToUsize as _;
+        const HALF: u64 = 64 << 20;
+        const READ: u64 = 4096;
+        fn copy<'a>(
+            (from, from_at): (&'a RtObj<RtBuffer>, u64),
+            (to, to_at): (&'a RtObj<RtBuffer>, u64),
+            size: u64,
+        ) -> BlitCmd<'a, RtPlatform> {
+            BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(from),
+                source_offset: from_at,
+                destination_buffer: Some(to),
+                destination_offset: to_at,
+                size,
+            }
+        }
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let made = |queue: &RtObj<RtQueue>| {
+            let made = queue.command_buffer(on).expect("never a raise");
+            made.expect("a command buffer")
+        };
+        let buffer = |length: u64, options: u64| {
+            let made = device.new_buffer_of_length(on, length, options);
+            made.expect("never a raise").expect("a buffer")
+        };
+        let encode = |made: &RtObj<RtCommandBuffer>, cmds: Vec<BlitCmd<'_, RtPlatform>>| {
+            let encoder = made.blit_encoder(on).expect("never a raise");
+            let encoder = encoder.expect("a blit encoder");
+            for cmd in cmds {
+                assert_eq!(encoder.encode(on, cmd), Ok(()));
+            }
+            assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        };
+        let (slow, read, out) = (buffer(2 * HALF, 0x20), buffer(READ, 0), buffer(READ, 0));
+        // SAFETY: a Shared buffer's contents are mapped, `READ` bytes long.
+        let bytes = |buffer: &RtObj<RtBuffer>| unsafe {
+            std::slice::from_raw_parts(buffer.contents().as_ptr::<u8>(), READ.to_usize()).to_vec()
+        };
+        // SAFETY: as `bytes`'s; no command buffer uses `read` yet.
+        unsafe { std::ptr::write_bytes(read.contents().as_ptr::<u8>(), 0x11, READ.to_usize()) };
+
+        let sink = device
+            .new_command_queue_unshared()
+            .expect("an unshared queue");
+        let reader = made(&sink);
+        let mut cmds: Vec<_> = (0..32u64)
+            .map(|n| copy((&slow, n % 2 * HALF), (&slow, (n + 1) % 2 * HALF), HALF))
+            .collect();
+        cmds.push(copy((&read, 0), (&out, 0), READ));
+        encode(&reader, cmds);
+        let (scheduled, signal) = std::sync::mpsc::channel();
+        let note = Box::new(move || scheduled.send(()).expect("the test waits"));
+        assert_eq!(reader.add_scheduled_handler(on, note), Ok(()));
+        assert_eq!(reader.commit(on), Ok(()));
+        let patience = std::time::Duration::from_secs(10);
+        signal.recv_timeout(patience).expect("the reader scheduled");
+
+        let plain = device.new_command_queue().expect("a queue");
+        let other = device
+            .new_command_queue_unshared()
+            .expect("an unshared queue");
+        let fills = [(&plain, 0, 0xee), (&other, READ / 2, 0xdd)].map(|(queue, at, value)| {
+            let fill = made(queue);
+            let range = NsRange::new(at, READ / 2);
+            encode(
+                &fill,
+                vec![BlitCmd::FillBuffer {
+                    buffer: &read,
+                    range,
+                    value,
+                }],
+            );
+            assert_eq!(fill.commit(on), Ok(()));
+            fill
+        });
+        for each in fills.iter().chain([&reader]) {
+            assert_eq!(each.wait_until_completed(on), Ok(()));
+            assert_eq!(each.status(), CommandBufferStatus::COMPLETED);
+        }
+        let half = READ.to_usize() / 2;
+        let filled = [vec![0xee; half], vec![0xdd; half]].concat();
+        assert_eq!(bytes(&read), filled, "the fills ran");
+        let unfilled = vec![0x11; READ.to_usize()];
+        assert_eq!(bytes(&out), unfilled, "the copy read before the fills");
     }
 }
