@@ -57,6 +57,7 @@ pub mod pipeline;
 pub mod queue;
 pub mod render;
 pub mod render_pipeline;
+pub mod stage;
 pub mod state;
 pub mod summary;
 #[cfg(unix)]

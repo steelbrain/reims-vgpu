@@ -19,6 +19,7 @@ pub mod os;
 pub mod rate_map;
 pub mod render;
 pub mod resource;
+pub mod stage;
 pub mod types;
 pub mod values;
 
