@@ -1148,17 +1148,22 @@ impl RtSwapchain {
 
 /// Where the swapchain's Vulkan call `call` on `device`, rt's, answered `result`: the one place a
 /// call of the window's sees rt's device lost. `VK_ERROR_DEVICE_LOST` is reported to rt as the
-/// device's loss, of `call` and `result` (rt's `Device::report_loss`): rt ends the device's work
-/// as at a loss it meets itself, every command buffer the loss reaches failing with the device
-/// lost, and names the call as its cause where it is the device's first loss. The device is lost
-/// from then on (`RtDevice::is_lost`), so the swapchain makes no Vulkan call on it but its end's
-/// destroys, and the window's sink makes no swapchain (the module doc, "A lost device").
+/// device's loss, of `call` and `result` with no fault report (rt's `Device::report_loss`): rt
+/// ends the device's work as at a loss it meets itself, every command buffer the loss reaches
+/// failing with the device lost, and names the call as its cause where it is the device's first
+/// loss. The device is lost from then on (`RtDevice::is_lost`), so the swapchain makes no Vulkan
+/// call on it but its end's destroys, and the window's sink makes no swapchain (the module doc, "A
+/// lost device").
 fn answer_seen(device: &RtDevice, call: &'static str, result: vk::Result) {
     if result == vk::Result::ERROR_DEVICE_LOST {
         if !device.is_lost() {
             log::info!(target: TARGET, "{call} answered VK_ERROR_DEVICE_LOST: rt's device is lost");
         }
-        device.rt().report_loss(rt::DeviceLoss { call, result });
+        device.rt().report_loss(rt::DeviceLoss {
+            call,
+            result,
+            fault: None,
+        });
     }
 }
 
@@ -1600,6 +1605,7 @@ mod tests {
             rt::DeviceLoss {
                 call: "vkCreateSwapchainKHR",
                 result: vk::Result::ERROR_DEVICE_LOST,
+                fault: None,
             }
         });
     }
@@ -1614,8 +1620,9 @@ mod tests {
             let loss = rt::DeviceLoss {
                 call: "vkQueueSubmit2",
                 result: vk::Result::ERROR_DEVICE_LOST,
+                fault: None,
             };
-            device.rt().report_loss(loss);
+            device.rt().report_loss(loss.clone());
             loss
         });
     }

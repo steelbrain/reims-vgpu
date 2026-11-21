@@ -881,19 +881,19 @@ mod tests {
             format!("{samples:?}").contains("sample_count: 4"),
             "{samples:?}"
         );
-        let clamp = rt::Error::Unsupported(rt::Gap::Draw {
-            kind: rt::DrawKind::DepthClamp,
+        let wide = rt::Error::Unsupported(rt::Gap::Draw {
+            kind: rt::DrawKind::LineWidth,
         });
         assert_eq!(
             detail_line(
                 "drawPrimitives:vertexStart:vertexCount:",
-                &clamp,
-                "Draw-DepthClamp",
+                &wide,
+                "Draw-LineWidth",
                 None
             ),
             "reims-vgpu: drawPrimitives:vertexStart:vertexCount:: metal2vulkan-runtime refused it \
-             (a draw with DepthClamp is not built; Unsupported(Draw { kind: DepthClamp \
-             })); the first of Draw-DepthClamp (rt-refused-gap)\n"
+             (a draw with LineWidth is not built; Unsupported(Draw { kind: LineWidth \
+             })); the first of Draw-LineWidth (rt-refused-gap)\n"
         );
         let format = rt::Error::Unsupported(rt::Gap::TextureFormat {
             pixel_format: rt::PixelFormat::BGRA8Unorm,

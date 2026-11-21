@@ -554,7 +554,7 @@ impl DeviceLoss {
         }
         let open = self.open.load(Ordering::SeqCst).max(0);
         let at = match cause() {
-            Some(rt::DeviceLoss { call, result }) => format!(" at {call} ({result:?})"),
+            Some(rt::DeviceLoss { call, result, .. }) => format!(" at {call} ({result:?})"),
             None => " with no call rt named".to_owned(),
         };
         say_lost(&format!(
@@ -1590,6 +1590,7 @@ mod tests {
                 Some(rt::DeviceLoss {
                     call: "vkQueueSubmit2",
                     result: ash::vk::Result::ERROR_DEVICE_LOST,
+                    fault: None,
                 })
             }),
             work: OnceLock::new(),
@@ -1737,6 +1738,7 @@ mod tests {
         device.rt().report_loss(rt::DeviceLoss {
             call: "vkQueuePresentKHR",
             result: ash::vk::Result::ERROR_DEVICE_LOST,
+            fault: None,
         });
         assert!(device.is_lost(), "the reported loss is the device's");
         let made = queue.command_buffer(on).expect("never a raise");
@@ -1915,13 +1917,13 @@ mod tests {
         assert_eq!(nil.encode_signal_when_scheduled(None, 1), Ok(()));
         assert_eq!(counted(metal), before + 3);
 
-        // A pass of no attachment, which rt renders none of, and unbuilt protection options; the
-        // command buffer still runs.
-        let gaps = counted(RtRefusal::Gap.code());
+        // A pass of no attachment at Metal's default sample count of 0, which Metal refuses, and
+        // unbuilt protection options; the command buffer still runs.
+        let refused = counted(metal);
         let protection = counted(Unbuilt::Protection.code());
         let pass = platform.new_render_pass_descriptor();
         assert!(matches!(nil.render_encoder(on, &pass), Ok(None)));
-        assert_eq!(counted(RtRefusal::Gap.code()), gaps + 1);
+        assert_eq!(counted(metal), refused + 1);
         assert_eq!(nil.set_protection_options(on, 0), Ok(()));
         assert_eq!(counted(Unbuilt::Protection.code()), protection);
         assert_eq!(nil.set_protection_options(on, 1), Ok(()));

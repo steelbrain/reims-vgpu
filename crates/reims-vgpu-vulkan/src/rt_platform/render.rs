@@ -1105,17 +1105,28 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u8>(), 16) };
         assert_eq!(bytes, [0xa5; 16]);
 
-        // A pass Metal refuses, and one rt refuses: nil, counted.
+        // Passes Metal refuses: an unknown load action, and a pass of no attachment at its
+        // default size and sample count of 0. Nil, counted.
         let before = counted(metal);
         assert!(matches!(
             made().render_encoder(on, &pass(&target, 7)),
             Ok(None)
         ));
-        assert_eq!(counted(metal), before + 1);
-        let gaps = counted(RtRefusal::Gap.code());
         let empty = platform.new_render_pass_descriptor();
         assert!(matches!(made().render_encoder(on, &empty), Ok(None)));
-        assert_eq!(counted(RtRefusal::Gap.code()), gaps + 1);
+        assert_eq!(counted(metal), before + 2);
+
+        // A pass of no attachment with a size and a sample count runs, and leaves the target as
+        // it was.
+        empty.set_pass(&PassSet {
+            render_target_width: Some(4),
+            render_target_height: Some(4),
+            default_raster_sample_count: Some(1),
+            ..PassSet::default()
+        });
+        assert_eq!(run(&made(), &empty, Vec::new()), done);
+        assert_eq!(counted(metal), before + 2);
+        assert_eq!(texels(), every(green));
 
         // What rt has no form of, what Metal's validation stops, and what records nothing; the
         // draws stopped draw nothing over the cleared target.

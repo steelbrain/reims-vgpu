@@ -252,6 +252,7 @@ mod tests {
             let loss = metal2vulkan_runtime::DeviceLoss {
                 call: "vkQueueSubmit2",
                 result: vk::Result::ERROR_DEVICE_LOST,
+                fault: None,
             };
             sink.draw.device.rt().report_loss(loss);
             assert!(sink.presenter(&window).is_none());

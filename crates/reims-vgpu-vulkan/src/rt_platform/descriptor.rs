@@ -374,13 +374,15 @@ struct Pass {
     clear_stencil: u32,
     render_target_width: u64,
     render_target_height: u64,
+    default_raster_sample_count: u64,
     visibility_result_buffer: Option<RtObj<RtBuffer>>,
 }
 
 impl Default for Pass {
     /// Metal's: colour attachments of `DontCare` loads and `Store` stores, cleared to opaque
     /// black; depth and stencil of `Clear` loads and `DontCare` stores, cleared to 1 and 0; no
-    /// texture, level and slice 0; no render target size and no visibility result buffer.
+    /// texture, level and slice 0; no render target size, a default raster sample count of 0 and
+    /// no visibility result buffer.
     fn default() -> Pass {
         let black = ClearColor {
             alpha: 1.0,
@@ -395,6 +397,7 @@ impl Default for Pass {
             clear_stencil: 0,
             render_target_width: 0,
             render_target_height: 0,
+            default_raster_sample_count: 0,
             visibility_result_buffer: None,
         }
     }
@@ -472,6 +475,9 @@ impl PassFields {
         // A size past 32 bits renders the area a size of the most 32 bits do: the attachments'.
         out.render_target_width = u32::try_from(pass.render_target_width).unwrap_or(u32::MAX);
         out.render_target_height = u32::try_from(pass.render_target_height).unwrap_or(u32::MAX);
+        // A count past 32 bits is no count Metal takes; rt refuses it as it refuses any other.
+        let samples = pass.default_raster_sample_count;
+        out.default_raster_sample_count = u32::try_from(samples).unwrap_or(u32::MAX);
         let kept = pass.visibility_result_buffer.as_ref();
         out.visibility_result_buffer = kept.map(|b| b.rt().clone());
         Ok(out)
@@ -563,8 +569,8 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
         recorded_answer
     }
 
-    /// The render target's width and height, and the visibility result buffer; the rest as the
-    /// module's docs say.
+    /// The render target's width and height, the default raster sample count and the visibility
+    /// result buffer; the rest as the module's docs say.
     fn set_pass(&self, set: &PassSet<'_, RtPlatform>) {
         let recorded_call = crate::recorder::rec_call!("m2v.setPass", self, set);
         crate::recorder::run(|| {
@@ -593,6 +599,9 @@ impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
             }
             if let Some(height) = set.render_target_height {
                 pass.render_target_height = height;
+            }
+            if let Some(samples) = set.default_raster_sample_count {
+                pass.default_raster_sample_count = samples;
             }
             if let Some(buffer) = set.visibility_result_buffer {
                 pass.visibility_result_buffer = buffer.map(Handle::clone_ref);
@@ -1032,6 +1041,30 @@ mod tests {
     /// none of or a level past 32 bits; a colour attachment past the eighth raises at the
     /// subscript; a property rt has no field of is counted where it is set to other than Metal's
     /// default.
+    /// rt makes a pass with no attachment at the descriptor's `defaultRasterSampleCount`, and
+    /// refuses one of 0, Metal's default: the guest's count reaches it as set.
+    #[test]
+    fn a_pass_hands_rt_its_default_raster_sample_count() {
+        let pass = RtObj::new(PassFields::default());
+        let d = pass.rt_pass().expect("rt's descriptor");
+        assert_eq!(d.default_raster_sample_count, 0);
+        for samples in [1, 4] {
+            pass.set_pass(&PassSet {
+                default_raster_sample_count: Some(samples),
+                ..PassSet::default()
+            });
+            let d = pass.rt_pass().expect("rt's descriptor");
+            assert_eq!(u64::from(d.default_raster_sample_count), samples);
+        }
+        // A set that sends no count keeps the last one.
+        pass.set_pass(&PassSet {
+            render_target_width: Some(16),
+            ..PassSet::default()
+        });
+        let d = pass.rt_pass().expect("rt's descriptor");
+        assert_eq!(d.default_raster_sample_count, 4);
+    }
+
     #[test]
     fn a_pass_keeps_what_rt_renders() {
         let pass = RtObj::new(PassFields::default());
