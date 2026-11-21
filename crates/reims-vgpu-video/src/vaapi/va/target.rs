@@ -379,7 +379,10 @@ fn y_tiled(size: u64, shape: TargetShape, luma: TargetPlane, chroma: TargetPlane
     }
     Some(Laid {
         object_size: u32::try_from(size).ok()?,
-        offsets: [u32::try_from(luma.offset).ok()?, u32::try_from(chroma.offset).ok()?],
+        offsets: [
+            u32::try_from(luma.offset).ok()?,
+            u32::try_from(chroma.offset).ok()?,
+        ],
         pitches: [u32::try_from(pitch).ok()?; 2],
         rows: u32::try_from(rows).ok()?,
         modifier: ffi::I915_FORMAT_MOD_Y_TILED,
@@ -541,7 +544,11 @@ mod tests {
         let fits = |size, luma, chroma| y_tiled(size, nv12, luma, chroma).is_some();
         // 384-byte rows, the chroma plane 192 rows on, its 96 rows of tiles in 110592 bytes.
         assert!(fits(110592, plane(0, 384), plane(73728, 384)));
-        assert!(fits(4096 + 110592, plane(4096, 384), plane(4096 + 73728, 384)));
+        assert!(fits(
+            4096 + 110592,
+            plane(4096, 384),
+            plane(4096 + 73728, 384)
+        ));
         // Its rows of tiles end past the dma-buf.
         assert!(!fits(110591, plane(0, 384), plane(73728, 384)));
         // A pitch not a whole number of tiles wide, or narrower than the coded row.

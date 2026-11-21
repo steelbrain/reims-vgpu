@@ -397,7 +397,15 @@ impl VideoEncoder {
         keep: Box<dyn Send + Sync>,
     ) -> Result<Target, Error> {
         let display = self.inner.accelerator().display();
-        Target::import_as(display, dma_buf, size, self.input_shape(), planes, tiling, keep)
+        Target::import_as(
+            display,
+            dma_buf,
+            size,
+            self.input_shape(),
+            planes,
+            tiling,
+            keep,
+        )
     }
 
     /// How an input imported for the encoder ([`Self::import_input`]) lays out its planes (module
@@ -481,7 +489,11 @@ impl InputLayout {
 /// least the coded height, and the dma-buf's bytes, taken as the layout's length, holding the
 /// chroma plane's rows of tiles. `None` otherwise, and where the driver makes or exports none.
 #[cfg(unix)]
-fn driver_layout(display: &Display, format: InputFormat, shape: TargetShape) -> Option<InputLayout> {
+fn driver_layout(
+    display: &Display,
+    format: InputFormat,
+    shape: TargetShape,
+) -> Option<InputLayout> {
     use super::target::{Y_TILE_ROWS, Y_TILE_WIDTH};
     let (width, height) = shape.coded;
     let pool = surfaces::Pool::new(display, format, width, height, 1).ok()?;

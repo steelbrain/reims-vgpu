@@ -401,7 +401,11 @@ fn on_rt_the_kernel_writes_a_frame_as_the_upload_writes_it() {
             if let Some(at) = (0..want.len()).find(|&at| written[at] != want[at]) {
                 panic!(
                     "{what}: byte {at} (of the {}) is {:#04x}, not {:#04x}",
-                    if plane_of[at].is_empty() { "unwritten" } else { plane_of[at] },
+                    if plane_of[at].is_empty() {
+                        "unwritten"
+                    } else {
+                        plane_of[at]
+                    },
                     written[at],
                     want[at]
                 );
