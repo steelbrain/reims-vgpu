@@ -273,7 +273,13 @@ fn pictures(decoder: &mut H264Decoder, samples: &[Vec<u8>]) -> Vec<u64> {
     };
     let mut hashes = Vec::new();
     for (id, sample) in (0u64..).zip(samples) {
-        hashes.extend(decoder.decode(sample, id).expect("a decode").iter().map(hash));
+        hashes.extend(
+            decoder
+                .decode(sample, id)
+                .expect("a decode")
+                .iter()
+                .map(hash),
+        );
     }
     hashes.extend(decoder.flush().expect("a flush").iter().map(hash));
     hashes

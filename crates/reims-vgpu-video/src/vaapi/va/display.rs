@@ -506,7 +506,7 @@ impl Display {
     /// `release`, the teardown `kind`, made as [`Display::release`] makes a release.
     ///
     /// On Windows a context's is held while another context lives on the display, and made,
-    /// behind the teardowns held and the contexts kept before it ([`Display::context_let_go`]),
+    /// behind the teardowns held and the contexts kept before it (`Display::context_let_go`),
     /// once the last live context's end is asked for. **Measured** on the UHD Graphics 630
     /// (vaon12 of Mesa 26.2.7 over Intel's Direct3D 12 video driver, 2026-11-17), two threads
     /// each decoding a 4K H.264 stream on one display, their decoders let go round after round

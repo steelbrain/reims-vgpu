@@ -210,10 +210,10 @@ mod tests {
         assert_eq!(held.let_go("4k"), Asked::Kept);
         assert_eq!(held.take(|kept| *kept == "4k"), Some("4k"));
         assert_eq!(held.let_go("4k"), Asked::Kept);
-        assert_eq!(held.ask(Teardown::Context, 1), Asked::Now(vec![
-            Kept::Context("4k"),
-            Kept::Release(1)
-        ]));
+        assert_eq!(
+            held.ask(Teardown::Context, 1),
+            Asked::Now(vec![Kept::Context("4k"), Kept::Release(1)])
+        );
     }
 
     #[test]

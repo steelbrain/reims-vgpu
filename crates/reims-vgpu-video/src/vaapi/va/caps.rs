@@ -690,7 +690,9 @@ pub(crate) struct Context {
     display: Display,
     pub(crate) id: ffi::VAContextID,
     /// Held so that the config outlives the context: it drops after
-    /// [`Context`]'s `drop` has destroyed the context.
+    /// [`Context`]'s `drop` has destroyed the context. Read on Windows alone, where a decoder's
+    /// context kept takes it along.
+    #[cfg_attr(unix, allow(dead_code))]
     config: Arc<Config>,
     /// Whether a picture of the context was ended (`vaEndPicture`), which
     /// for a decoder's context on radeonsi begins its session

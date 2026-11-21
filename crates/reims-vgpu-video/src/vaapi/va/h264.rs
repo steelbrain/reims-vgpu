@@ -281,8 +281,14 @@ impl Accelerator for VaH264 {
         let mut targets = pool.ids();
         // The DPB the driver sizes the decoder by: the pictures' `num_ref_frames`.
         let references = u32::from(sps.max_num_ref_frames);
-        let context =
-            Context::new_decoder(&self.display, config, width, height, &mut targets, references)?;
+        let context = Context::new_decoder(
+            &self.display,
+            config,
+            width,
+            height,
+            &mut targets,
+            references,
+        )?;
         self.session = Some(Session {
             profile,
             context: Some(context),
