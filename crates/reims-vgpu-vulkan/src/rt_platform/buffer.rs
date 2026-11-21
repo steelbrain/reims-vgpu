@@ -199,6 +199,7 @@
 //! each that goes unmade ([`DEFERRED_GONE_UNMADE_CODE`]); and each refusal of the memory
 //! ([`DEFERRED_REFUSED_CODE`]).
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::ptr::NonNull;
@@ -299,9 +300,8 @@ pub const DEFERRED_TAKE_NS_MOST_CODE: &str = "rt-deferred-buffers-take-ns-most";
 /// nanoseconds (`Device::new_buffer`, which asks its zeros).
 pub const DEFERRED_BUFFER_NS_MOST_CODE: &str = "rt-deferred-buffers-buffer-ns-most";
 
-/// The code whose count is the nanoseconds of rt's allocations on the consumer's threads while the
-/// block takes of deferred buffers' memory ran (`Metrics::consumer_allocation_nanos`, every
-/// thread's: an allocation of another thread's beside a take counts too).
+/// The code whose count is the nanoseconds of the block takes of deferred buffers' memory that made
+/// an allocation of rt's pool, no free range fitting them ([`pool_allocations_here`]).
 pub const DEFERRED_TAKE_ALLOCATION_NS_CODE: &str = "rt-deferred-buffers-take-allocation-ns";
 
 /// The code whose count is the most bytes of rt's Private allocations (`Gauges::
@@ -542,10 +542,11 @@ impl RtBuffer {
         }
         // As `own`'s, its two calls of rt's timed apart ([`DeferredSplit`]).
         let length = deferred.length;
-        let allocated = allocations_now();
+        let allocated = pool_allocations_here();
         let start = rt::host_time();
         let block = take(&self.device, DEFERRED_SEL, rt::MemoryClass::Private, length);
         let taken = rt::host_time();
+        let allocations = pool_allocations_here().wrapping_sub(allocated);
         let made = block.and_then(|block| {
             match (self.device.rt()).new_buffer(block.id, 0, length, Some(0)) {
                 Ok(made) => Some(made),
@@ -566,8 +567,7 @@ impl RtBuffer {
             made_for,
             take: taken.saturating_sub(start),
             buffer: end.saturating_sub(taken),
-            allocations: (allocations_now().zip(allocated))
-                .map(|(a, b)| (a.0.saturating_sub(b.0), a.1.saturating_sub(b.1))),
+            allocations,
         }
         .count();
         crate::answer::count_made(DEFERRED_MADE);
@@ -602,14 +602,14 @@ static DEFERRED_SPLIT_MOST: [AtomicU64; 3] =
 /// One deferred buffer's memory made (the module's docs, "Deferred memory"), of `length` bytes,
 /// for `made_for` (`None`, the use itself): its two calls of rt's apart, the block's take
 /// (`Device::take_block`, which allocates where no free range fits) and the buffer's make over it
-/// (`Device::new_buffer`, which asks its zeros), in nanoseconds; and rt's allocations on the
-/// consumer's threads while the take ran, how many and their nanoseconds.
+/// (`Device::new_buffer`, which asks its zeros), in nanoseconds; and the allocations of rt's pool
+/// the take made ([`pool_allocations_here`]).
 struct DeferredSplit {
     length: u64,
     made_for: Option<MemoryFor>,
     take: u64,
     buffer: u64,
-    allocations: Option<(u64, u64)>,
+    allocations: u64,
 }
 
 impl DeferredSplit {
@@ -620,7 +620,8 @@ impl DeferredSplit {
             let was = DEFERRED_SPLIT_MOST[at].fetch_max(value, Ordering::Relaxed);
             value.saturating_sub(was)
         };
-        let (allocations, allocation_ns) = self.allocations.unwrap_or((0, 0));
+        let allocations = self.allocations;
+        let allocation_ns = if allocations > 0 { self.take } else { 0 };
         crate::answer::count_kind_by(DEFERRED_TAKE_NS_MOST_CODE, rise(0, self.take));
         crate::answer::count_kind_by(DEFERRED_BUFFER_NS_MOST_CODE, rise(1, self.buffer));
         crate::answer::count_kind_by(DEFERRED_TAKE_ALLOCATION_NS_CODE, allocation_ns);
@@ -633,12 +634,11 @@ impl DeferredSplit {
             log::info!(
                 target: TARGET,
                 "a deferred buffer's memory of {} KiB took {:.3} ms to make for {made_for}, the \
-                 longest yet: its block's take {:.3} ms ({allocations} allocations of rt's on \
-                 the consumer's threads, {:.3} ms, while it ran), the buffer over it {:.3} ms",
+                 longest yet: its block's take {:.3} ms (which made {allocations} allocations of \
+                 rt's pool), the buffer over it {:.3} ms",
                 self.length.div_ceil(1024),
                 ms(whole),
                 ms(self.take),
-                ms(allocation_ns),
                 ms(self.buffer)
             );
         }
@@ -922,17 +922,17 @@ pub fn scratch_of_length(
         return made(device, sel, length, o, None, None);
     }
     let clock = crate::os::OsClock::new();
-    let allocated = allocations_now();
+    let allocated = pool_allocations_here();
     let began = clock.now_mono();
     let block = take(device, sel, rt::MemoryClass::Shared, length)?;
     let taken = clock.now_mono();
+    let allocations = pool_allocations_here().wrapping_sub(allocated);
     let made = device.rt().new_buffer(block.id, 0, length, None);
     let split = ScratchSplit {
         length,
         take: nanos(taken.saturating_duration_since(began)),
         buffer: nanos(clock.now_mono().saturating_duration_since(taken)),
-        allocations: (allocations_now().zip(allocated))
-            .map(|(a, b)| (a.0.saturating_sub(b.0), a.1.saturating_sub(b.1))),
+        allocations,
     };
     split.count();
     match made {
@@ -947,16 +947,15 @@ pub fn scratch_of_length(
 /// The Shared scratch buffers made ([`scratch_of_length`]); the nanoseconds their makes' two
 /// calls of rt's took in all, and the longest of each: the block's take (`Device::take_block`,
 /// which allocates where no free range fits) and the buffer's make over it
-/// (`Device::new_buffer`); and the nanoseconds of rt's allocations on the consumer's threads
-/// while the takes ran (`Metrics::consumer_allocation_nanos`, every thread's: an allocation of
-/// another thread's beside a take counts too). Each new longest make is logged with its split.
+/// (`Device::new_buffer`); and the nanoseconds of the takes that made an allocation of rt's pool,
+/// no free range fitting them ([`pool_allocations_here`]). Each new longest make is logged with
+/// its split.
 pub const SCRATCH_MAKES_CODE: &str = "rt-scratch-makes";
 /// The nanoseconds the block takes of [`SCRATCH_MAKES_CODE`] took in all.
 pub const SCRATCH_TAKE_NS_CODE: &str = "rt-scratch-take-ns";
 /// The longest block take of [`SCRATCH_MAKES_CODE`], which its count rises to.
 pub const SCRATCH_TAKE_MAX_NS_CODE: &str = "rt-scratch-take-max-ns";
-/// The nanoseconds of rt's allocations on the consumer's threads while the takes of
-/// [`SCRATCH_MAKES_CODE`] ran.
+/// The nanoseconds of the takes of [`SCRATCH_MAKES_CODE`] that made an allocation of rt's pool.
 pub const SCRATCH_TAKE_ALLOCATION_NS_CODE: &str = "rt-scratch-take-allocation-ns";
 /// The nanoseconds the buffers' makes over their blocks of [`SCRATCH_MAKES_CODE`] took in all.
 pub const SCRATCH_BUFFER_NS_CODE: &str = "rt-scratch-buffer-ns";
@@ -968,11 +967,24 @@ pub const SCRATCH_BUFFER_MAX_NS_CODE: &str = "rt-scratch-buffer-max-ns";
 /// is logged.
 static SCRATCH_MOST: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
-/// rt's allocations on the consumer's threads so far, and their nanoseconds
-/// (`Metrics::consumer_allocations`, `consumer_allocation_nanos`); `None` before the device is
-/// made.
-fn allocations_now() -> Option<(u64, u64)> {
-    super::device::metrics().map(|m| (m.consumer_allocations, m.consumer_allocation_nanos))
+thread_local! {
+    /// The allocations of rt's pool made on this thread so far ([`pool_allocations_here`]).
+    static POOL_ALLOCATIONS_HERE: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One more allocation of rt's pool made on this thread, which the device's `BlockMappings` is
+/// told of where it is made (`super::fault`'s `Allocations`).
+pub(super) fn pool_allocation_made_here() {
+    POOL_ALLOCATIONS_HERE.with(|n| n.set(n.get().wrapping_add(1)));
+}
+
+/// The allocations of rt's pool made on this thread so far, a thread-local read: what a take
+/// ([`take`]) made is the rise across it, as rt makes an allocation in a take that no free range
+/// fits on the take's own thread and tells the device's `BlockMappings` of it there. Allocations
+/// of other threads beside the take, and rt's own outside the pool (a texture's image of its own,
+/// a copy's staging buffer), are not in it.
+fn pool_allocations_here() -> u64 {
+    POOL_ALLOCATIONS_HERE.with(Cell::get)
 }
 
 /// `took` in nanoseconds.
@@ -980,14 +992,13 @@ fn nanos(took: std::time::Duration) -> u64 {
     u64::try_from(took.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// One scratch buffer's make of `length` bytes: its take's and its buffer's nanoseconds, and rt's
-/// allocations on the consumer's threads while the take ran, how many and their nanoseconds
-/// ([`SCRATCH_MAKES_CODE`]).
+/// One scratch buffer's make of `length` bytes: its take's and its buffer's nanoseconds, and the
+/// allocations of rt's pool the take made ([`SCRATCH_MAKES_CODE`]).
 struct ScratchSplit {
     length: u64,
     take: u64,
     buffer: u64,
-    allocations: Option<(u64, u64)>,
+    allocations: u64,
 }
 
 impl ScratchSplit {
@@ -997,7 +1008,8 @@ impl ScratchSplit {
             let was = SCRATCH_MOST[at].fetch_max(value, Ordering::Relaxed);
             value.saturating_sub(was)
         };
-        let (allocations, allocation_ns) = self.allocations.unwrap_or((0, 0));
+        let allocations = self.allocations;
+        let allocation_ns = if allocations > 0 { self.take } else { 0 };
         crate::answer::count_kind(SCRATCH_MAKES_CODE);
         crate::answer::count_kind_by(SCRATCH_TAKE_NS_CODE, self.take);
         crate::answer::count_kind_by(SCRATCH_TAKE_MAX_NS_CODE, rise(0, self.take));
@@ -1010,12 +1022,11 @@ impl ScratchSplit {
             log::info!(
                 target: TARGET,
                 "a scratch buffer of {} KiB took {:.3} ms, the longest yet: its block's take \
-                 {:.3} ms ({allocations} allocations of rt's on the consumer's threads, \
-                 {:.3} ms, while it ran), the buffer over it {:.3} ms",
+                 {:.3} ms (which made {allocations} allocations of rt's pool), the buffer over \
+                 it {:.3} ms",
                 self.length.div_ceil(1024),
                 ms(whole),
                 ms(self.take),
-                ms(allocation_ns),
                 ms(self.buffer)
             );
         }
@@ -3439,6 +3450,35 @@ mod tests {
         );
 
         assert!(scratch(0, 0).is_none() && scratch(64, 0x30).is_none());
+    }
+
+    /// A take that no free range fits makes its allocation on its own thread, which the device's
+    /// `BlockMappings` counts there ([`pool_allocations_here`]), on the GPU the test holds: a
+    /// take of 64 KiB lands in the Shared allocation the device made as it was made, and makes
+    /// none; one of 40 MiB, longer than the pool's 16 MiB allocations, makes one of its own on
+    /// the thread that takes it, and none on any other.
+    #[test]
+    fn a_take_counts_the_pool_s_allocation_it_made_on_its_own_thread_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let taken = |length| {
+            let before = pool_allocations_here();
+            let block = take(&device, "test", rt::MemoryClass::Shared, length);
+            let made = pool_allocations_here() - before;
+            (block.expect("a Shared block"), made)
+        };
+        let (small, made) = taken(64 << 10);
+        assert_eq!(made, 0, "a take a free range fits makes no allocation");
+        let here = pool_allocations_here();
+        let (long, made) = std::thread::scope(|s| {
+            (s.spawn(|| taken(40 << 20)).join()).expect("the other thread's take")
+        });
+        assert_eq!(
+            (made, pool_allocations_here()),
+            (1, here),
+            "a long take makes its allocation on its own thread, counted there alone"
+        );
+        drop((small, long));
     }
 
     /// Textures over the planes of a two-plane surface a Shared buffer stands for, on the GPU the
