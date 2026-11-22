@@ -26,10 +26,8 @@ parse_deps = false
 prefix = ""
 item_types = ["constants", "structs"]
 # The host side's constants, which the guest reads from the registers instead or never sees (SLOW_ANSWER_NS, the
-# host's mark for a slow answer).
-exclude = [
-  "MAX_DOORBELL_ROUTES", "REGION_SIZE", "RgfxOpSetDepthCleared", "RgfxOpSetStencilCleared", "SLOW_ANSWER_NS",
-]
+# host's mark for a slow answer). One line: tests/header.rs reads the list from it.
+exclude = ["MAX_DOORBELL_ROUTES", "REGION_SIZE", "RgfxOpSetDepthCleared", "RgfxOpSetStencilCleared", "SLOW_ANSWER_NS"]
 # The records, which no function names, listed so that cbindgen writes them.
 include = [
     "RgfxArgumentDescriptor",
