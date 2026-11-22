@@ -33,9 +33,9 @@
 //!   the host sees nothing, so the placement says only what lies around the address.
 //! - **rt's placement of each address** (`DeviceFault::places`), one line each, as rt's
 //!   `FaultPlace` displays it: the ranges of rt's own that meet the bytes (its pool's
-//!   allocations, its parameter ring's blocks, imports, exports, surfaces' buffers and indirect
-//!   command buffers' preprocess regions), live or among the last it freed, and the nearest below
-//!   and above. It answers another question than the host's placement above, which places among
+//!   allocations, its parameter ring's blocks, imports, exports, each by its block's number
+//!   (`export block N`, rt's `BlockInfo::id`), surfaces' buffers and indirect command buffers'
+//!   preprocess regions), live or among the last it freed, and the nearest below and above. It answers another question than the host's placement above, which places among
 //!   the guest's objects and the blocks the host sees: both are written.
 //! - **What the placement saw**: the live objects of each kind, the decoders and contexts whose
 //!   tables were walked and those not walked, the live textures with no GPU range the platform
