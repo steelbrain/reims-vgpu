@@ -33,8 +33,17 @@
 //! What stays bounded: the caller's thread is answered [`DEVICE_WAIT`]
 //! after the work was due at most, and so is not left waiting on a stuck
 //! call.
+//!
+//! **After the kept work.** A caller whose own memory the kept work writes
+//! (a device cache another API's import of it reaches) may ask whether the
+//! work it kept is let go yet: it takes a [`KeptMark`] on its thread before
+//! the call that may keep work, and [`Lingering::holds_since`] answers
+//! whether a work that thread kept after it is still kept, its device not
+//! done with it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use crate::core::runtime::{Bell, MonoTime, Runtime, park_for_good};
@@ -122,6 +131,33 @@ pub trait Unfinished: Send {
 /// The name of [`Lingering`]'s thread (ours).
 const LINGERING_THREAD_NAME: &str = "reims-vgpu-video.lingering";
 
+/// The process's list ([`Lingering::process`]).
+static PROCESS: OnceLock<Lingering> = OnceLock::new();
+
+/// The number of the last work kept in the process, on any list: each work
+/// kept takes the next, from 1.
+static LAST_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// The works kept up to a moment, on the thread that took the mark
+/// ([`KeptMark::here`]): [`Lingering::holds_since`] asks after what that
+/// thread kept after it.
+#[derive(Clone, Copy, Debug)]
+pub struct KeptMark {
+    last: u64,
+    thread: ThreadId,
+}
+
+impl KeptMark {
+    /// A mark of now on the calling thread, taken before a call that may
+    /// keep work, so that what the call keeps is told apart from the rest.
+    pub fn here() -> KeptMark {
+        KeptMark {
+            last: LAST_KEPT.load(Ordering::SeqCst),
+            thread: std::thread::current().id(),
+        }
+    }
+}
+
 /// Work devices did not finish by their deadlines, kept until they do
 /// (module docs): one list for the process, asked after on a thread of its
 /// own while it holds any, which the runtime it was made with starts.
@@ -135,6 +171,9 @@ struct LingeringState {
     work: Vec<Kept>,
     /// How many works a sweep has taken out of `work` to ask after.
     asking: usize,
+    /// The number and the keeping thread of each work kept whose device is
+    /// not done with it, those a sweep is asking after among them.
+    held: Vec<(u64, ThreadId)>,
     /// Whether the thread runs.
     running: bool,
     /// Work kept since the list was made, for the log.
@@ -144,6 +183,8 @@ struct LingeringState {
 struct Kept {
     what: String,
     since: MonoTime,
+    /// Its number ([`LAST_KEPT`]).
+    number: u64,
     work: Box<dyn Unfinished>,
 }
 
@@ -151,8 +192,13 @@ impl Lingering {
     /// The process's list, made with `runtime` the first time it is asked
     /// for: work outlives the session, and the backend, that kept it.
     pub fn process(runtime: &Arc<dyn Runtime>) -> &'static Lingering {
-        static PROCESS: OnceLock<Lingering> = OnceLock::new();
         PROCESS.get_or_init(|| Lingering::new(runtime))
+    }
+
+    /// The process's list where it was made, `None` where nothing asked for
+    /// it yet, so that it kept no work.
+    pub fn made() -> Option<&'static Lingering> {
+        PROCESS.get()
     }
 
     /// A list of its own, on `runtime`: for a test, whose work must not mix
@@ -172,6 +218,8 @@ impl Lingering {
         let what = what.into();
         let start = {
             let mut state = self.shared.lock();
+            let number = LAST_KEPT.fetch_add(1, Ordering::SeqCst) + 1;
+            state.held.push((number, std::thread::current().id()));
             state.ever_kept += 1;
             log::error!(
                 kind:% = what;
@@ -184,6 +232,7 @@ impl Lingering {
             state.work.push(Kept {
                 what,
                 since: self.runtime.now(),
+                number,
                 work,
             });
             !std::mem::replace(&mut state.running, true)
@@ -209,6 +258,14 @@ impl Lingering {
     pub fn count(&self) -> usize {
         let state = self.shared.lock();
         state.work.len() + state.asking
+    }
+
+    /// Whether a work that `mark`'s thread kept after the mark is still
+    /// kept: its device not yet found done with it. A work is let go here as
+    /// its device is found done, before what it kept is dropped.
+    pub fn holds_since(&self, mark: KeptMark) -> bool {
+        let state = self.shared.lock();
+        (state.held.iter()).any(|&(number, thread)| number > mark.last && thread == mark.thread)
     }
 }
 
@@ -253,6 +310,7 @@ fn sweep(shared: &Mutex<LingeringState>, runtime: &dyn Runtime) -> bool {
             {
                 let mut state = shared.lock();
                 state.asking = state.asking.saturating_sub(1);
+                state.held.retain(|&(number, _)| number != kept.number);
             }
             drop(kept);
         } else {

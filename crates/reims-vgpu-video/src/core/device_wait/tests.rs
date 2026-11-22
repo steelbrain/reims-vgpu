@@ -165,3 +165,32 @@ fn the_list_asks_again_after_it_has_emptied() {
         assert_eq!(lingering.count(), 0);
     }
 }
+
+/// A mark asks after the work its thread kept after it alone: not work kept
+/// before it, nor work another thread kept; and that work is let go once
+/// its device is done, before what it kept is dropped.
+#[test]
+fn a_mark_asks_after_what_its_thread_kept_after_it() {
+    let runtime = StdRuntime::shared();
+    let lingering = Lingering::new(&runtime);
+    let (before, before_done, _) = work();
+    lingering.keep("kept before the mark", before);
+    let mark = KeptMark::here();
+    assert!(!lingering.holds_since(mark), "work kept before the mark");
+    let (elsewhere, elsewhere_done, _) = work();
+    std::thread::scope(|s| {
+        s.spawn(|| lingering.keep("kept on another thread", elsewhere));
+    });
+    assert!(!lingering.holds_since(mark), "work another thread kept");
+    let (after, after_done, after_dropped) = work();
+    lingering.keep("kept after the mark", after);
+    assert!(lingering.holds_since(mark));
+    assert_eq!(lingering.count(), 3);
+    after_done.store(true, Ordering::SeqCst);
+    assert!(eventually(|| !lingering.holds_since(mark)));
+    assert!(eventually(|| after_dropped.load(Ordering::SeqCst) == 1));
+    assert_eq!(lingering.count(), 2, "the rest still kept");
+    before_done.store(true, Ordering::SeqCst);
+    elsewhere_done.store(true, Ordering::SeqCst);
+    assert!(eventually(|| lingering.count() == 0));
+}
