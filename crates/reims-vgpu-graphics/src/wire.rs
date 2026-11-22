@@ -675,8 +675,10 @@ pub const RGFX_REG_CONSUMED: u32 = 0x02c;
 /// a quarter of the budget of the GPU's device-local memory (`VK_EXT_memory_budget`'s heap budget
 /// where the device has it, else a quarter of the heap's size), read once at the device's start
 /// and the same for its life, so the kext's one read at its start holds. The kext defers no block
-/// past it, and lets dormant deferred blocks go past half of it. It reads 0 where the host offers
-/// neither feature, as at any offset a host does not know.
+/// past it. A dormant deferred block, which no process holds and whose bytes the device's cache
+/// alone holds, goes once the dormant deferred blocks pass the smaller of half of it and an eighth
+/// of the guest's RAM, the oldest first, or once it has slept 10 s, as every dormant block does.
+/// It reads 0 where the host offers neither feature, as at any offset a host does not know.
 pub const RGFX_REG_DEFERRED_BUDGET_LO: u32 = 0x030;
 /// `DEFERRED_BUDGET_HI`, RO: [`RGFX_REG_DEFERRED_BUDGET_LO`]'s high 32 bits.
 pub const RGFX_REG_DEFERRED_BUDGET_HI: u32 = 0x034;

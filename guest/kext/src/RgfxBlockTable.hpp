@@ -1,6 +1,9 @@
 // RgfxBlockTable: the accelerator kext's blocks of the device's region, past
-// RGFX_CONTEXT_ALLOCATIONS_OFFSET (a process's rings, Shared buffers and heaps, surfaces), each
-// owned by the client that asked for it. A first-fit allocator over a table sorted by offset.
+// RGFX_CONTEXT_ALLOCATIONS_OFFSET: a process's queue rings, its command buffers' bodies and its
+// libraries' staging chunks, the surfaces' blocks, and, where the device offers no Shared pool,
+// Shared buffers and heaps, which lie in the pool's blocks where it offers one (RgfxPoolBlocks.hpp;
+// docs/graphics-kext/design.md, Decided 5). Each is owned by the client that asked for it. A
+// first-fit allocator over a table sorted by offset.
 //
 // A block is given out again only once the device has said nothing of it is in use: a free marks
 // it freed, the kext posts its BLOCK_RELEASE, and the block leaves the table when the device
