@@ -955,6 +955,16 @@ impl<P: Platform> Context<P> {
         made.map(|(&id, _)| id).collect()
     }
 
+    /// The objects in the table, not those that stand for a refused create, each with its kind's
+    /// name (for the tests' failure messages).
+    #[cfg(test)]
+    pub(crate) fn kinds(&self) -> Vec<(u64, &'static str)> {
+        let t = self.tables.read();
+        let made = t.live.iter().filter(|(_, o)| o.made());
+        made.map(|(&id, o)| (id, o.entry().handle.kind_name()))
+            .collect()
+    }
+
     /// The ids that stand for a refused create ([`super::refused`]; for the tests).
     #[cfg(test)]
     pub(crate) fn refused_ids(&self) -> Vec<u64> {

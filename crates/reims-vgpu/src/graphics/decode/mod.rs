@@ -635,6 +635,34 @@ enum ObjHandle<P: Platform> {
     Refused(refused::Refused),
 }
 
+impl<P: Platform> ObjHandle<P> {
+    /// The kind's name (for the tests' failure messages).
+    #[cfg(test)]
+    fn kind_name(&self) -> &'static str {
+        match self {
+            ObjHandle::Event(_) => "Event",
+            ObjHandle::Fence(_) => "Fence",
+            ObjHandle::SharedEvent(_) => "SharedEvent",
+            ObjHandle::CommandQueue(_) => "CommandQueue",
+            ObjHandle::Library(_) => "Library",
+            ObjHandle::Sampler(_) => "Sampler",
+            ObjHandle::DepthStencil(_) => "DepthStencil",
+            ObjHandle::Buffer(_) => "Buffer",
+            ObjHandle::Texture(_) => "Texture",
+            ObjHandle::Heap(_) => "Heap",
+            ObjHandle::RenderPipeline(_) => "RenderPipeline",
+            ObjHandle::ComputePipeline(_) => "ComputePipeline",
+            ObjHandle::Icb(_) => "Icb",
+            ObjHandle::VideoSession(_) => "VideoSession",
+            ObjHandle::RateMap(_) => "RateMap",
+            ObjHandle::FunctionHandle(_) => "FunctionHandle",
+            ObjHandle::FunctionTable(_) => "FunctionTable",
+            ObjHandle::DynamicLibrary(_) => "DynamicLibrary",
+            ObjHandle::Refused(_) => "Refused",
+        }
+    }
+}
+
 /// Why a message was not carried out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
@@ -3421,6 +3449,16 @@ impl<P: Platform> GraphicsDecoder<P> {
             self.shared.contexts.lock().values().cloned().collect();
         contexts.sort_by_key(|c| c.id);
         contexts.iter().flat_map(|c| c.ids()).collect()
+    }
+
+    /// The objects the tables hold, by context, each in its table's order and with its kind's
+    /// name: what [`Self::object_count`] counts (for the tests' failure messages).
+    #[cfg(test)]
+    pub(crate) fn object_kinds(&self) -> Vec<(u64, &'static str)> {
+        let mut contexts: Vec<Arc<Context<P>>> =
+            self.shared.contexts.lock().values().cloned().collect();
+        contexts.sort_by_key(|c| c.id);
+        contexts.iter().flat_map(|c| c.kinds()).collect()
     }
 
     /// The ids that stand for a refused create ([`refused`]), by context (for the tests).

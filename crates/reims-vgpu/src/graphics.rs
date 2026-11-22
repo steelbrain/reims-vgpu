@@ -1155,6 +1155,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             .gpu_address_of(obj_id)
     }
 
+    /// The objects the stage-3 decoder holds, each with its kind's name: what
+    /// [`Self::decoder_object_count`] counts (for the tests' failure messages).
+    #[cfg(test)]
+    pub(crate) fn decoder_objects(&self) -> Vec<(u64, &'static str)> {
+        self.control
+            .decoders
+            .sender(None, Sinks::default())
+            .object_kinds()
+    }
+
     /// The ids that stand for a create the stage-3 decoder refused (`decode::refused`).
     #[cfg(test)]
     pub(crate) fn decoder_refused_ids(&self) -> Vec<u64> {

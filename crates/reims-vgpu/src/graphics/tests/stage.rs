@@ -526,5 +526,11 @@ fn a_quiesce_for_exit_lets_go_of_a_make_held_for_its_stage() {
     assert_eq!(world.log.count(MAKE), 1);
     assert!(!state_11_pending(&device));
     // The queue and the library.
-    assert_eq!(device.decoder_object_count(), 2);
+    assert_eq!(
+        device.decoder_object_count(),
+        2,
+        "the decoder held {:x?}, and refused ids {:x?}",
+        device.decoder_objects(),
+        device.decoder_refused_ids()
+    );
 }
