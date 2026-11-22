@@ -1275,8 +1275,8 @@ fn the_host_s_doorbell_file_wakes_the_device() {
     assert!(!rig.device.set_doorbell(bell.raw()), "one doorbell file");
     assert!(!rig.device.set_doorbell(wake::not_open()));
     rig.start();
-    // Let the control thread go to sleep on the empty ring.
-    std::thread::sleep(Duration::from_millis(50));
+    // The control thread sleeps on the empty ring, so the bell is what wakes it.
+    wait_control_parked(&rig);
     rig.seqno += 1;
     let mut bytes = get_displays();
     bytes[8..16].copy_from_slice(&rig.seqno.to_le_bytes());
@@ -1412,8 +1412,7 @@ fn a_post_waiting_for_room_looks_again_at_its_poll_and_stops_at_a_reset() {
         rig.send(vblank(0));
     }
     // The host has answered what the ring holds and waits for room for the next answer.
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(full(&rig), "the ring never filled");
+    assert!(eventually(|| full(&rig)), "the ring never filled");
     for seqno in 1..=count {
         assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     }
@@ -1427,8 +1426,7 @@ fn a_post_waiting_for_room_looks_again_at_its_poll_and_stops_at_a_reset() {
     for _ in 0..count {
         rig.send(vblank(0));
     }
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(full(&rig), "the ring never filled again");
+    assert!(eventually(|| full(&rig)), "the ring never filled again");
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);

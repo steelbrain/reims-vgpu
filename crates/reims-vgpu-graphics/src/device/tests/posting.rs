@@ -240,6 +240,19 @@ fn on_service_thread(name: &Option<String>) -> bool {
     name.as_deref() == Some(&*format!("reims-vgpu.graphics-queue-{QUEUE:#x}"))
 }
 
+/// Waits, after a post handed a record over onto the tests' queue's full ring, until the queue's
+/// service thread sleeps with no wake pending ([`crate::wake::Wake::parked`]). The hand-over woke
+/// it, and each take of a wake is followed by a look at the records handed over, so it has looked
+/// since and found no room, the record still handed over; with the device's poll for room at a
+/// minute, it looks again only when woken, which the guest's take of the ring does not do.
+fn wait_service_thread_parked(rig: &Rig) {
+    let queue = rig.device.shared.queues.lock().by_obj[&QUEUE].clone();
+    assert!(
+        eventually(|| queue.wake.parked(None)),
+        "the queue's service thread did not park"
+    );
+}
+
 /// A post that waits for nothing onto a full queue ring returns at once, the record handed to
 /// the queue's service thread with what follows it; a post that waits goes behind them, and waits
 /// for nothing either. Once the guest takes the ring, the service thread posts them in their
@@ -305,8 +318,9 @@ fn a_post_unwaiting_onto_a_full_queue_ring_returns_at_once_and_its_records_follo
 }
 
 /// A post that waits for nothing, finding records handed over and not yet posted, goes behind
-/// them though the ring has room by then, posting them first, and a tried post goes nowhere:
-/// here the guest takes the ring while the service thread, waiting for room, has not looked again
+/// them though the ring has room by then, and they are posted first, here or on the service
+/// thread its hand-over wakes; a tried post goes nowhere: here the guest takes the ring while the
+/// service thread, waiting for room, has not looked again
 #[test]
 fn a_post_unwaiting_goes_behind_records_handed_over_though_the_ring_has_room() {
     let host = PostingHost::default();
@@ -322,19 +336,24 @@ fn a_post_unwaiting_goes_behind_records_handed_over_though_the_ring_has_room() {
     poster.post_unwaiting(&record(HOLDS), None);
     // The service thread found no room for the record and looks again only after its poll; the
     // guest makes room, ringing nothing.
-    std::thread::sleep(Duration::from_millis(50));
+    wait_service_thread_parked(&rig);
     let (taken, consumed) = take_all(&rig, 0);
     assert_eq!(taken.len() as u64, HOLDS);
     assert!(!poster.try_post(&record(99)), "a tried post went ahead");
-    std::thread::sleep(Duration::from_millis(20));
     assert_eq!(
         produced(&rig),
         consumed,
         "a post went ahead of a record handed over"
     );
 
+    // Its hand-over wakes the service thread, which may take the records first: whichever
+    // thread posts them posts both, in their order.
     poster.post_unwaiting(&record(HOLDS + 1), None);
-    assert_eq!(produced(&rig), consumed + 16 + 2 * 48);
+    assert!(
+        eventually(|| produced(&rig) == consumed + 16 + 2 * 48),
+        "the records handed over were not posted: produced {}",
+        produced(&rig)
+    );
     let (taken, _) = take_all(&rig, consumed);
     assert_eq!(taken, [HOLDS, HOLDS + 1]);
     assert_eq!(rig.device.handed_over(), 2);
@@ -377,7 +396,7 @@ fn a_host_that_times_posts_on_a_thread_is_told_of_the_raises_and_handed_posts_th
         poster.post(&record(cb));
     }
     poster.post_unwaiting(&record(HOLDS), None);
-    std::thread::sleep(Duration::from_millis(50));
+    wait_service_thread_parked(&rig);
     let (taken, consumed) = take_all(&rig, 0);
     assert_eq!(taken.len() as u64, HOLDS);
     arm();
