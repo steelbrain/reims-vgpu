@@ -17,11 +17,13 @@
 //! (`SurfaceCaches::fill_planes_at_make`), where no command buffer begun and not finished uses
 //! the cache and no copy of it waits, as a placed image's fill is made (`shapes`, "Placed
 //! images"): the thread that makes the texture encodes and commits the fill and waits for
-//! nothing. A decode's begin then owes the planes no fill. The host's video writes them outside
-//! the platform's queues, so the decode op waits on its thread for the cache's last fill
-//! (`Caches::wait_filled`), which that fill, made ahead of it, has as a rule done by then; every
-//! command buffer that uses the cache after it waits for it on the GPU. A busy cache's planes owe
-//! their fill to its next use.
+//! nothing. Where the cache's buffer holds no memory yet (`super`'s "Deferred memory"), the
+//! fill copies the zeros it would read from a buffer of zeros made with the surface for that
+//! fill alone, so the buffer's memory stays unmade (`shapes`, "Zeros"). A decode's begin then
+//! owes the planes no fill. The host's video writes them outside the platform's queues, so the
+//! decode op waits on its thread for the cache's last fill (`Caches::wait_filled`), which that
+//! fill, made ahead of it, has as a rule done by then; every command buffer that uses the cache
+//! after it waits for it on the GPU. A busy cache's planes owe their fill to its next use.
 //!
 //! A decode whose luma and chroma textures show the planes whole is given the surface's planes
 //! (`Caches::surface_targets`), and its picture lands there, by the hardware or by a copy into
@@ -100,13 +102,13 @@ use reims_vgpu_video::core::device_memory::MemoryLife;
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::resource::{
+    Buffer as _, ExportedSurface, SurfaceDesc, SurfaceHandle, SurfaceMemory, SurfacePlaneDesc,
+};
 #[cfg(windows)]
 use reims_vgpu_vulkan::core::platform::resource::{
     D3d11PlaneDesc, ImportedSurface, ImportedSurfaceMemory,
-};
-#[cfg(unix)]
-use reims_vgpu_vulkan::core::platform::resource::{
-    ExportedSurface, SurfaceDesc, SurfaceHandle, SurfaceMemory, SurfacePlaneDesc,
 };
 use reims_vgpu_vulkan::core::platform::values::PagesPlane;
 use reims_vgpu_vulkan::core::raise::refusals;
@@ -122,6 +124,10 @@ use super::super::super::drawn::{DrawnPlanes, DrawnTarget};
 use super::super::video::SurfaceTarget;
 #[cfg(windows)]
 use super::Now;
+#[cfg(unix)]
+use super::STORAGE_PRIVATE;
+#[cfg(unix)]
+use super::shapes::ZEROS_LEN;
 use super::shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};
 #[cfg(windows)]
 use super::spares::{SpareCodes, Spares};
@@ -232,6 +238,13 @@ impl<P: Platform> CacheSurface<P> {
     /// Whether the cache has its surface.
     pub(super) fn is_made(&self) -> bool {
         self.made.is_some()
+    }
+
+    /// Whether the host's video writes the cache's memory itself
+    /// ([`VideoMemory::written_outside`]); `false` for a cache not made for it.
+    pub(super) fn written_outside(&self) -> bool {
+        self.video
+            .is_some_and(|(memory, _)| memory.written_outside())
     }
 
     /// The plane shapes of the surface to ask where `key`, a shape the cache's `shapes` hold none
@@ -604,11 +617,12 @@ impl<P: Platform> SurfaceCaches<P> {
 impl<P: Platform> SurfaceCaches<P> {
     /// The planes just added to the block at `block`'s cache ([`Self::add_planes`]) take their
     /// fill from its buffer at once (the module doc), with the cache's other shapes that owe one
-    /// and its dirty shapes written back first ([`Self::fill_shapes`]), where no command buffer
-    /// begun and not finished uses the cache and no copy of it waits; else they owe it to the
-    /// cache's next use, counted ([`ShapeCounts::planes_owed_busy`]). A fill the platform raises
-    /// at is logged, and the planes owe theirs still.
-    fn fill_planes_at_make(&mut self, device: &P::Device, block: u64) {
+    /// and its dirty shapes written back first ([`Self::fill_shapes`]), or from `zeros`, where
+    /// given, while the buffer holds no memory ([`Self::fill_shapes_over`]), where no command
+    /// buffer begun and not finished uses the cache and no copy of it waits; else they owe it to
+    /// the cache's next use, counted ([`ShapeCounts::planes_owed_busy`]). A fill the platform
+    /// raises at is logged, and the planes owe theirs still.
+    fn fill_planes_at_make(&mut self, device: &P::Device, block: u64, zeros: Option<&P::Buffer>) {
         if self.pending(block, false) > 0 || self.deferring(block) {
             self.counts.shapes.planes_owed_busy += 1;
             return;
@@ -616,7 +630,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let before = self.counts.shapes.plane_fills;
         // A refusal of a buffer's memory is a begin's to fail its command buffer on, not this.
         let refused = self.memory_refused;
-        if let Err(raise) = self.fill_shapes(device, block) {
+        if let Err(raise) = self.fill_shapes_over(device, block, zeros) {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: the platform raised at its video planes' fill \
@@ -703,14 +717,17 @@ impl<P: Platform> Caches<P> {
     /// its image. `None` where the cache takes no surface for `key`, or the platform made none
     /// (counted) or made it in its copy form, declined (counted, [`decline`]), or made its
     /// description so before, declined unmade (counted, [`unasked`]), for the caller to make the
-    /// shape's image of its own.
+    /// shape's image of its own. Where the cache's buffer holds no memory yet, a buffer of zeros
+    /// is made with the surface for the planes' fill at their make, and let go of after it
+    /// ([`SurfaceCaches::fill_planes_at_make`]): the planes copy their zeros from it, with the
+    /// buffer's memory left unmade.
     pub(super) fn plane_shape(
         &self,
         device: &P::Device,
         block: u64,
         key: &ShapeKey,
     ) -> Option<Held<P::Texture>> {
-        let ask = {
+        let (ask, unmade) = {
             let mut state = self.state.lock();
             let ask = state.surface_ask(block, key)?;
             if state.copy_forms.holds(&ask) {
@@ -719,7 +736,8 @@ impl<P: Platform> Caches<P> {
                 unasked(block);
                 return None;
             }
-            ask
+            let unmade = (state.by_block.get(&block)).is_some_and(|c| !c.device.memory_made());
+            (ask, unmade)
         };
         let made = match device.new_exported_surface(ON, &ask.desc()) {
             Ok(made) => made.filter(|m| m.planes.len() == 2),
@@ -743,16 +761,31 @@ impl<P: Platform> Caches<P> {
             state.copy_forms.note(&ask);
             return None;
         }
+        // A refusal leaves the planes to take the buffer's zeros, its memory made for them.
+        let zeros = match unmade {
+            true => match device.new_buffer_of_length(ON, ZEROS_LEN, STORAGE_PRIVATE) {
+                Ok(zeros) => zeros,
+                Err(raise) => {
+                    log::warn!(
+                        target: "reims_vgpu::graphics", kind:% = raise;
+                        "the IOSurface block at {block:#x}: the platform raised at the zeros of \
+                         its video planes' fill ({raise:?}); they take its buffer's"
+                    );
+                    None
+                }
+            },
+            false => None,
+        };
         // The caches' lock, whose let-go commits the planes' fill (`Locked`).
         let (found, gone) = {
             let mut state = self.lock();
             let added = state.add_planes(block, key, &ask, made);
             if added.0.is_some() {
-                state.fill_planes_at_make(device, block);
+                state.fill_planes_at_make(device, block, zeros.as_ref());
             }
             added
         };
-        if let Err(refusal) = refusals::refusing(move || drop(gone)) {
+        if let Err(refusal) = refusals::refusing(move || drop((gone, zeros))) {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:% = refusal;
                 "the IOSurface block at {block:#x}'s video planes or shapes past their bound were \

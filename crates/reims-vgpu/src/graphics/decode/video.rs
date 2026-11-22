@@ -1079,9 +1079,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         decode: bool,
     ) -> RaiseResult<(VideoPlane<'_, P>, VideoPlane<'_, P>)> {
         // Each plane's buffer is noted, and its memory made where the picture lands there, in
-        // the order a lookup of each plane that made it would take: luma's, then chroma's.
+        // the order a lookup of each plane that made it would take: luma's, then chroma's. A
+        // cache's memory made so is zeroed for the host's video, which writes it itself, before
+        // the waits for the cache's last fill.
         let made = |(place, entry, buffer): (PlanePlace, &Entry<P>, &P::Buffer)| {
-            self.cache_memory(place.buffer_obj_id, entry, buffer)
+            self.cache_memory(place.buffer_obj_id, entry, buffer)?;
+            match (entry.over_cache, entry.span) {
+                (true, Some((block, _))) => self.surface_caches.zero_for_video(block),
+                _ => Ok(()),
+            }
         };
         let luma_plane = self.plane_of(luma_id)?;
         self.note_over_cache(luma_plane.1);
@@ -1147,6 +1153,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         if landing_apart && !landed_apart {
             made(luma_plane)?;
             made(chroma_plane)?;
+            for block in luma_cache.into_iter().chain(chroma_cache) {
+                self.wait_for_cache(tag, block)?;
+            }
         }
         let plane = |place: PlanePlace, buffer, cache: Option<u64>| VideoPlane {
             buffer,

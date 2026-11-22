@@ -65,8 +65,10 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   them: NVDEC by its own GPU
   work, where CUDA imports the device's exportable buffers ([nvidia.md](nvidia.md)), the
   device's caches of surfaces of two planes (the outputs' NV12 and P010, as the layout a cached
-  block's `SURFACE_PAGES` carries gives them) then made exportable as they are made, and every
-  other cache made as any buffer; VA-API by the runtime device's copy
+  block's `SURFACE_PAGES` carries gives them) then made exportable as their memory is made (in
+  the per-shape form at its first use, such as a decode that lands in the cache's buffer, so that
+  a cache whose pictures all land in its surface may hold none), and every other cache made as
+  any buffer; VA-API by the runtime device's copy
   of the decode surface, or the CPU's through the session's staging ([vaapi.md](vaapi.md)).
   The guest's video driver then asks its output surfaces cached
   (`guest/bundle/src/RgfxMetalDevice+Video.mm`), with their layout, as for any other surface,

@@ -108,7 +108,12 @@
 //! ([`Shape::cleared`]), holds them already: its fill is taken as made, with no copy, and the
 //! buffer's memory is left unmade (`SurfaceCaches::fill_shapes`), counted ([`ZERO_TAKEN`]). The
 //! guest reads the same zeros either way. A placed image holds its memory's bytes as they were,
-//! so it is never taken so: its fill makes the buffer's memory and copies its zeros, as before.
+//! so it is never taken so: its fill makes the buffer's memory and copies its zeros, as before;
+//! and so does a plane shape's, whose image is its surface's plane, which holds undefined bytes
+//! at its make ("Plane shapes"), but where the fill is given a buffer of zeros of its own: then
+//! its shapes copy their zeros from that, a run of rows at a time, with the cache's buffer's
+//! memory left unmade ([`fill_zeros`], counted in [`ShapeCounts::zero_sourced`]). The planes'
+//! fill at their make is given one, made with the surface (`super::exported`).
 //! Where the cache would hold zeros so, a new shape is not placed: the platform's own image takes
 //! its zeros from the platform's clear, with no block taken for the buffer nor a copy
 //! (`super::Caches::shape`), counted ([`UNPLACED_ZEROS`]).
@@ -136,8 +141,9 @@
 //! holds undefined bytes at its make, so the planes take their fill from the buffer then, at the
 //! texture's make, as a placed image does, where no command buffer begun and not finished uses
 //! the cache and no copy of it waits (`super::exported`, counted
-//! [`ShapeCounts::planes_filled_at_make`]); a decode's begin then owes none, and its wait for the
-//! cache's last fill finds that fill made ahead of it. A busy cache's planes owe theirs to its
+//! [`ShapeCounts::planes_filled_at_make`]), from zeros of their own where the buffer holds no
+//! memory yet ("Zeros"); a decode's begin then owes none, and its wait for the cache's last fill
+//! finds that fill made ahead of it. A busy cache's planes owe theirs to its
 //! next use, as any new shape's ([`ShapeCounts::planes_owed_busy`]). A picture that lands over
 //! part of the planes alone (a picture smaller than them, or one not written) leaves the rest
 //! holding that fill. A CPU lock of the surface never reads the surface's memory beside the
@@ -483,6 +489,13 @@ pub(crate) struct ShapeCounts {
     pub(crate) zero_taken: u64,
     pub(crate) zero_taken_bytes: u64,
     pub(crate) unplaced_zeros: u64,
+    /// Shapes filled from the caches' zeros instead of their cache's buffer, which held no memory
+    /// yet, and their bytes ([`fill_zeros`], the module doc, "Zeros"); and caches for the host's
+    /// video whose memory, made at a first use since their make, was zeroed for it
+    /// (`SurfaceCaches::zero_for_video`).
+    pub(crate) zero_sourced: u64,
+    pub(crate) zero_sourced_bytes: u64,
+    pub(crate) video_zeroed: u64,
     /// Fills of plane shapes from their cache's buffer, and of them those made at the planes'
     /// make (the module doc, "Plane shapes"); surfaces whose planes owed their fill past their
     /// make, as a command buffer begun and not finished used the cache or a copy of it waited.
@@ -922,8 +935,82 @@ pub(crate) fn fill<P: Platform>(
     Ok(())
 }
 
-/// `shape` took its fill ([`fill`], [`fill_from`]): it owes none and holds no write the buffer
-/// lacks; counted in `counts`.
+/// The bytes of zeros a fill of shapes from zeros copies from ([`fill_zeros`]), a buffer of the
+/// platform's made for that fill alone (`super::Caches::plane_shape`): 4 rows of the widest a
+/// texture takes, 16384 texels of 16 bytes, and 136 of a 3840-wide plane of 2-byte samples.
+pub(crate) const ZEROS_LEN: u64 = 1 << 20;
+
+/// The pitch a fill from zeros copies `key`'s rows at ([`fill_zeros`]): its rows' bytes, up to a
+/// multiple of 256; `None` past [`ZEROS_LEN`].
+fn zeros_pitch(key: &ShapeKey) -> Option<u64> {
+    let row = key.width.checked_mul(key.texel_bytes)?;
+    (row.checked_next_multiple_of(256)).filter(|&pitch| pitch > 0 && pitch <= ZEROS_LEN)
+}
+
+/// Whether a fill from zeros copies every row of each shape of `table` that `pick` picks
+/// ([`fill_zeros`]).
+pub(crate) fn zeros_fit<T>(table: &ShapeTable<T>, pick: impl Fn(&Shape<T>) -> bool) -> bool {
+    (table.iter())
+        .filter(|s| pick(s))
+        .all(|s| zeros_pitch(&s.key).is_some())
+}
+
+/// Encodes in `cb`, in a blit encoder of its own, a copy of zeros into each shape of `table` that
+/// `pick` picks, from `zeros`, [`ZEROS_LEN`] bytes of zeros, in runs of the rows that fit there at
+/// [`zeros_pitch`]: the bytes its cache's buffer, which holds no memory yet, reads (the module
+/// doc, "Zeros"), with no copy through it. Each shape then owes no fill and holds no write the
+/// buffer lacks, as [`fill`] leaves it, counted in `counts` as a fill and as one from zeros.
+/// Nothing where it picks none, or the platform made no encoder; the caller made sure each row
+/// fits ([`zeros_fit`]), and a shape whose rows do not is left owing its fill.
+pub(crate) fn fill_zeros<P: Platform>(
+    cb: &P::CommandBuffer,
+    zeros: &P::Buffer,
+    table: &mut ShapeTable<P::Texture>,
+    pick: impl Fn(&Shape<P::Texture>) -> bool,
+    counts: &mut ShapeCounts,
+) -> RaiseResult<()> {
+    const ON: OnFault = OnFault::Return;
+    if !table.iter().any(&pick) {
+        return Ok(());
+    }
+    let Some(blit) = cb.blit_encoder(ON)? else {
+        return Ok(());
+    };
+    for shape in table.iter_mut().filter(|s| pick(s)) {
+        let key = shape.key;
+        let Some(pitch) = zeros_pitch(&key) else {
+            continue;
+        };
+        let rows = ZEROS_LEN / pitch;
+        let mut y = 0;
+        while y < key.height {
+            let run = rows.min(key.height - y);
+            blit.encode(
+                ON,
+                BlitCmd::CopyBufferToTexture {
+                    source_buffer: zeros,
+                    source_offset: 0,
+                    source_bytes_per_row: pitch,
+                    source_bytes_per_image: pitch * run,
+                    source_size: MtlSize::new(key.width, run, 1),
+                    destination_texture: &shape.image,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: MtlOrigin::new(0, y, 0),
+                },
+            )?;
+            y += run;
+        }
+        counts.zero_sourced += 1;
+        counts.zero_sourced_bytes += shape.bytes;
+        filled(shape, counts);
+    }
+    blit.encode(ON, BlitCmd::EndEncoding)?;
+    Ok(())
+}
+
+/// `shape` took its fill ([`fill`], [`fill_from`], [`fill_zeros`]): it owes none and holds no
+/// write the buffer lacks; counted in `counts`.
 fn filled<T>(shape: &mut Shape<T>, counts: &mut ShapeCounts) {
     shape.owed = false;
     shape.dirty = false;

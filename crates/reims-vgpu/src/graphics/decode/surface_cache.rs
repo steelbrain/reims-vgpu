@@ -24,8 +24,10 @@
 //!   its work reads them, so the host records no zeros of its own; only a cache whose memory is
 //!   made for the host's video (exportable, or a dma-buf), which the video writes with no work of
 //!   the platform's, is zeroed on the transfer queue before any use, ahead of such a write
-//!   ([`SurfaceCaches::zeros_of_new`]). The first thing that reads the cache makes the fill
-//!   before it reads
+//!   ([`SurfaceCaches::zeros_of_new`]), at its make, or, where its memory is made at its first
+//!   use ("Deferred memory"), as the video's use first makes it, the use waiting for that fill
+//!   as for the cache's last ([`SurfaceCaches::zero_for_video`]). The first thing that reads the
+//!   cache makes the fill before it reads
 //!   ([`SurfaceCaches::fill_owed`]): a use a command buffer names, a present, a command buffer of
 //!   render, compute or blit work in the process that made the first buffer over the block, and
 //!   a buffer over the block made by any other. So a texture over the surface that a command
@@ -408,11 +410,16 @@
 //!   download, an early copy, a release's copy, a write's copy into another shape of its plane,
 //!   and a command buffer that names an object over the buffer itself, the host's video's among
 //!   them where its picture lands in the buffer: a decode given the planes of the cache's surface
-//!   ([`exported`]) makes none (`super::GraphicsDecoder::video_planes`). A cache whose memory is
-//!   not made for the host's video (exportable, or a dma-buf) is made so that the platform makes
-//!   the buffer's memory at its first use alone
+//!   ([`exported`]) makes none (`super::GraphicsDecoder::video_planes`). A cache is made so that
+//!   the platform makes the buffer's memory at its first use alone
 //!   ([`GpuDevice::new_deferred_buffer_of_length`]), as zeros, as a new cache's are: a cache no
-//!   such copy reaches holds none. Each copy makes it first ([`Buffer::make_memory`]), a
+//!   such copy reaches holds none. A cache made for the host's video (exportable, or a dma-buf)
+//!   is made so too, its memory exported as it is made
+//!   (`GpuDevice::new_deferred_exportable_buffer_of_length`), and zeroed for the video at the
+//!   video's first use of it ("Fill", above): a cache whose pictures all land in its surface, and
+//!   whose shapes take their zeros from zeros of their own (the module doc of [`shapes`],
+//!   "Zeros") and the pages straight ("Straight fills"), holds none. Each copy makes it first
+//!   ([`Buffer::make_memory`]), a
 //!   download's, a release's, an early copy's and a write's copy into another shape's with the
 //!   caches' lock let go of ([`Caches::make_memory`]), as a cache's buffer is made
 //!   ([`CacheMaker`]); the others' on the thread of their use. Where the platform refuses the
@@ -430,7 +437,9 @@
 //! - **Straight fills.** In the per-shape form a fill of a cache whose buffer holds no memory
 //!   copies the pages straight into its shapes' images, with nothing copied into the buffer
 //!   ([`SurfaceCache::fills_straight`]): its pages are a view or copied through pieces, it keeps
-//!   their layout with no wide home and carries nothing, no texture lies over its buffer as a rule,
+//!   their layout with no wide home and carries nothing, no texture lies over its buffer as a rule
+//!   (a cache the host's video writes itself fills so too: a video op that reads or writes its
+//!   buffer makes its memory and has it take the pages first, at its command buffer's begin),
 //!   and each shape's rows cross a piece's end only between texels. From the view, a shape's rows
 //!   go in one GPU copy; from the pieces the host's CPU copied the pages into ("Staged copies"), in
 //!   a copy for each run of rows that lies in one piece, a row that crosses a piece's end split
@@ -514,6 +523,8 @@ use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue, Co
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::resource::SurfaceHandle;
 use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, MemoryFor};
 use reims_vgpu_vulkan::core::platform::types::NsRange;
 use reims_vgpu_vulkan::core::platform::values::{PagesPlane, TextureDesc};
@@ -724,6 +735,12 @@ struct BufferMemory {
     /// A command of the guest's named the buffer itself (an object over it,
     /// [`SurfaceCaches::over_written`]).
     commanded: bool,
+    /// The memory holds zeros that the host's video may write over, for a cache it writes itself
+    /// ([`exported::VideoMemory::written_outside`]): made at the cache's make, which zeroed it
+    /// on the transfer queue where the host's video writes it ([`SurfaceCaches::zeros_of_new`]);
+    /// zeroed so since ([`SurfaceCaches::zero_for_video`]); or reached by the platform's work, a
+    /// copy of the caches' through it, which the platform's own zeros are ahead of.
+    zeroed: bool,
 }
 
 /// What made a cache's buffer's memory ([`BufferMemory::by`]).
@@ -744,6 +761,7 @@ impl BufferMemory {
         BufferMemory {
             counted: made,
             by: made.then_some(MadeBy::Make),
+            zeroed: made,
             ..BufferMemory::default()
         }
     }
@@ -766,6 +784,7 @@ impl BufferMemory {
             self.seen();
         }
         self.through += 1;
+        self.zeroed = true;
     }
 
     /// The bytes of `bytes` the buffer holds that a fill, a download or anything else made, where
@@ -977,10 +996,12 @@ impl<P: Platform> SurfaceCache<P> {
     /// nothing copied into its buffer (the module doc, "Straight fills"): its buffer holds no
     /// memory, its pages are a view or are copied through pieces of `piece` bytes, it keeps the
     /// pages' layout with no wide home, no texture lies over the buffer as a rule
-    /// ([`Self::raw`]), and each shape's rows cross a piece's end only between texels.
+    /// ([`Self::raw`]; a cache the host's video writes itself is raw for its decodes, which
+    /// make its memory and have it take the pages first, [`Caches::before`]), and each shape's rows
+    /// cross a piece's end only between texels.
     fn fills_straight(&self, piece: u64) -> bool {
         if self.device.memory_made()
-            || self.raw
+            || (self.raw && !self.surface.written_outside())
             || self.carried.is_some()
             || self.repitched.is_some()
             || self.wide.is_some()
@@ -2344,6 +2365,41 @@ pub(crate) struct SurfaceCaches<P: Platform> {
 /// raise the guest's interrupt there. A block's are its key ([`Worker`]).
 pub(crate) const INTO_PAGES_THREADS: &str = "reims-vgpu.graphics-into-pages";
 
+/// Fills `length` bytes of `cache` with zeros on `transfer`'s queue, its command buffer owed to
+/// `owed_commits` ([`SurfaceCaches::zero`]): the transfer event's value at which it is done,
+/// `None` where the platform made no command buffer or encoder for it.
+fn zero_on<P: Platform>(
+    transfer: &mut Transfer<P>,
+    owed_commits: &mut Vec<P::CommandBuffer>,
+    cache: &P::Buffer,
+    length: u64,
+) -> RaiseResult<Option<u64>> {
+    let Some(cb) = transfer.queue.command_buffer(ON)? else {
+        return Ok(None);
+    };
+    let Some(blit) = cb.blit_encoder(ON)? else {
+        return Ok(None);
+    };
+    let range = NsRange::new(0, length);
+    blit.encode(
+        ON,
+        BlitCmd::FillBuffer {
+            buffer: cache,
+            range,
+            value: 0,
+        },
+    )?;
+    blit.encode(ON, BlitCmd::EndEncoding)?;
+    transfer.signalled += 1;
+    let value = transfer.signalled;
+    cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
+    let fills = Arc::clone(&transfer.fills);
+    // Told as the platform sees the fill done, with no handler thread woken between.
+    cb.add_completion_seen_handler(ON, Box::new(move |_: CompletedInfo| fills.finished(value)))?;
+    owed_commits.push(cb);
+    Ok(Some(value))
+}
+
 /// Makes the memory of `buffer`, a cache's, for `made_for`, where it was made deferred and its
 /// memory is not made yet (the module doc, "Deferred memory"): whether it holds its memory, `false`
 /// where the platform refused it.
@@ -3162,7 +3218,9 @@ impl<P: Platform> SurfaceCaches<P> {
     /// of the platform's reads them (a drawn cache's too, whose planes' pictures land in textures
     /// of their own); where the host's video writes it itself (`outside`: exportable, or a
     /// dma-buf, [`exported::VideoMemory::written_outside`]), with no work of the platform's, the
-    /// value at which [`Self::zero`]'s fill is done. `None`, the cache refused, where the
+    /// value at which [`Self::zero`]'s fill is done. A cache whose memory is not made yet
+    /// ("Deferred memory") is zeroed so as the host's video first uses its memory
+    /// ([`Self::zero_for_video`]), its make's value 0. `None`, the cache refused, where the
     /// platform made no transfer queue for its copies, or no command buffer or encoder for that
     /// fill.
     fn zeros_of_new(
@@ -3172,7 +3230,7 @@ impl<P: Platform> SurfaceCaches<P> {
         outside: bool,
         length: u64,
     ) -> RaiseResult<Option<u64>> {
-        if outside {
+        if outside && cache.memory_made() {
             return self.zero(device, cache, length);
         }
         Ok(self.make_transfer(device)?.then_some(0))
@@ -3193,33 +3251,38 @@ impl<P: Platform> SurfaceCaches<P> {
         let Some(transfer) = self.transfer.as_mut() else {
             return Ok(None);
         };
-        let Some(cb) = transfer.queue.command_buffer(ON)? else {
-            return Ok(None);
+        zero_on::<P>(transfer, &mut self.owed_commits, cache, length)
+    }
+
+    /// The memory of the block at `block`'s cache, made since the cache's make
+    /// ("Deferred memory") for a use of the host's video, which writes it itself
+    /// ([`exported::VideoMemory::written_outside`]), filled with zeros on the transfer queue
+    /// where nothing put zeros or bytes of the platform's work in it yet
+    /// ([`BufferMemory::zeroed`]), as [`Self::zeros_of_new`] fills a cache whose memory its make
+    /// made: the platform's own zeros come ahead of its next work, which a write of the host's
+    /// video does not wait for. The cache's uses wait for the fill as for its last
+    /// ([`Self::last_fill`]). A command of the guest's that made the memory (`Caches::memory_of`)
+    /// is no work of the caches', and its writes, were there any, would take these zeros over
+    /// them; the bundle names no such buffer.
+    /// Nothing for any other cache, and where the caches have no transfer queue or the platform
+    /// made no command buffer or encoder for the fill.
+    pub(super) fn zero_for_video(&mut self, block: u64) -> RaiseResult<()> {
+        let (Some(transfer), Some(cache)) = (self.transfer.as_mut(), self.by_block.get_mut(&block))
+        else {
+            return Ok(());
         };
-        let Some(blit) = cb.blit_encoder(ON)? else {
-            return Ok(None);
+        if !cache.surface.written_outside() || !cache.device.memory_made() || cache.memory.zeroed {
+            return Ok(());
+        }
+        let Some(value) =
+            zero_on::<P>(transfer, &mut self.owed_commits, &cache.device, cache.bytes)?
+        else {
+            return Ok(());
         };
-        let range = NsRange::new(0, length);
-        blit.encode(
-            ON,
-            BlitCmd::FillBuffer {
-                buffer: cache,
-                range,
-                value: 0,
-            },
-        )?;
-        blit.encode(ON, BlitCmd::EndEncoding)?;
-        transfer.signalled += 1;
-        let value = transfer.signalled;
-        cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
-        let fills = Arc::clone(&transfer.fills);
-        // Told as the platform sees the fill done, with no handler thread woken between.
-        cb.add_completion_seen_handler(
-            ON,
-            Box::new(move |_: CompletedInfo| fills.finished(value)),
-        )?;
-        self.owed_commits.push(cb);
-        Ok(Some(value))
+        cache.filled_at = cache.filled_at.max(value);
+        cache.memory.zeroed = true;
+        self.counts.shapes.video_zeroed += 1;
+        Ok(())
     }
 
     /// The pages of the deferred block at `block`, `named` by a view or by their runs, whose host
@@ -5091,6 +5154,19 @@ impl<P: Platform> SurfaceCaches<P> {
     /// ([`Self::take_zeros`]). The transfer event's value at which it is done; `None` where it
     /// made none, as where nothing was left to fill.
     fn fill_shapes(&mut self, device: &P::Device, block: u64) -> RaiseResult<Option<u64>> {
+        self.fill_shapes_over(device, block, None)
+    }
+
+    /// [`Self::fill_shapes`], given `zeros`, a buffer of [`shapes::ZEROS_LEN`] bytes of zeros of
+    /// its own, where one was made for it: a fill that would copy the cache's buffer's zeros
+    /// ([`SurfaceCache::fills_zeros`]) copies them from there instead, with the buffer's memory
+    /// left unmade (the module doc of `shapes`, "Zeros"; [`shapes::fill_zeros`]).
+    pub(super) fn fill_shapes_over(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+        zeros: Option<&P::Buffer>,
+    ) -> RaiseResult<Option<u64>> {
         self.touch_shapes(block);
         if self.take_zeros(block) {
             return Ok(None);
@@ -5110,8 +5186,13 @@ impl<P: Platform> SurfaceCaches<P> {
         let straight = cache.lacks
             && cache.fills_straight(self.spares.piece)
             && !cache.shapes.iter().any(|s| s.dirty && !s.owed);
+        // A buffer that holds no memory and would fill its shapes with its zeros fills them from
+        // `zeros`, where given, instead ("Zeros").
+        let zeroing = zeros.filter(|_| {
+            !straight && cache.fills_zeros() && shapes::zeros_fit(&cache.shapes, |s| s.owed)
+        });
         let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
-            if straight {
+            if straight || zeroing.is_some() {
                 return true;
             }
             let made = cache.copy_through(MemoryFor::FillShapes);
@@ -5129,6 +5210,11 @@ impl<P: Platform> SurfaceCaches<P> {
         reserve.extend(self.left_over.remove(&block).unwrap_or_default());
         let owed: &dyn Fn(&shapes::Shape<P::Texture>) -> bool = &|s| s.owed;
         let mut filled = || -> RaiseResult<Vec<u64>> {
+            if let Some(zeros) = zeroing {
+                let counts = &mut self.counts.shapes;
+                shapes::fill_zeros::<P>(&cb, zeros, &mut cache.shapes, owed, counts)?;
+                return Ok(Vec::new());
+            }
             let staging = (timed, &self.spares, &mut reserve);
             if straight {
                 let way = (Way::In, block, Some(owed));
@@ -6223,9 +6309,10 @@ impl CacheMaker {
     /// per-shape form, where no texture lies over it, one whose memory the platform makes at its
     /// first use ([`GpuDevice::new_deferred_buffer_of_length`], "Deferred memory"); else as any
     /// other buffer. An exportable cache places that byte alike
-    /// (`GpuDevice::new_exportable_buffer_of_length`). With the buffer, the cache's life where
-    /// its memory was made for the host's video, exportable or a dma-buf
-    /// ([`SurfaceCache::life`]).
+    /// (`GpuDevice::new_exportable_buffer_of_length`), and in the per-shape form its memory, and
+    /// a dma-buf cache's, is made at its first use too, exported as it is made
+    /// (`GpuDevice::new_deferred_exportable_buffer_of_length`). With the buffer, the cache's life
+    /// where it was made for the host's video, exportable or a dma-buf ([`SurfaceCache::life`]).
     fn make<P: Platform>(
         self,
         device: &P::Device,
@@ -6267,10 +6354,33 @@ impl CacheMaker {
         let two_planes = layout.is_some_and(|planes| planes.len() == 2);
         let mut counts = MakerCounts::default();
         let life = || Some(MemoryLife::new());
+        // In the per-shape form the guest's textures over a video cache are views of its shapes'
+        // images, its planes' in its surface where it takes one, and the buffer's memory, exported
+        // as the host's video takes it, is made at its first use alone ("Deferred memory").
+        #[cfg(unix)]
+        let video_made = |handle| match self.shaped {
+            true => device.new_deferred_exportable_buffer_of_length(
+                ON,
+                length,
+                STORAGE_PRIVATE,
+                aligned,
+                handle,
+            ),
+            false => match handle {
+                SurfaceHandle::OpaqueFd => {
+                    device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE, aligned)
+                }
+                SurfaceHandle::DmaBuf => device.new_dma_buf_buffer_of_length_padding_unobserved(
+                    ON,
+                    length,
+                    STORAGE_PRIVATE,
+                    aligned,
+                ),
+            },
+        };
         #[cfg(unix)]
         if self.exportable && two_planes {
-            let made =
-                device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE, aligned)?;
+            let made = video_made(SurfaceHandle::OpaqueFd)?;
             if let Some(cache) = made {
                 counts.exportable = true;
                 counts.aligned = aligned.is_some();
@@ -6280,12 +6390,7 @@ impl CacheMaker {
         }
         #[cfg(unix)]
         if self.dma_buf && two_planes {
-            let made = device.new_dma_buf_buffer_of_length_padding_unobserved(
-                ON,
-                length,
-                STORAGE_PRIVATE,
-                aligned,
-            )?;
+            let made = video_made(SurfaceHandle::DmaBuf)?;
             if let Some(cache) = made {
                 counts.dma_buf = true;
                 counts.aligned = aligned.is_some();
@@ -7052,6 +7157,13 @@ impl<P: Platform> Caches<P> {
         })
     }
 
+    /// The memory of the block at `block`'s cache zeroed for a use of the host's video where its
+    /// first use since the cache's make made it ([`SurfaceCaches::zero_for_video`]); the use waits
+    /// for it as for the cache's last fill ([`Self::wait_filled`]).
+    pub(crate) fn zero_for_video(&self, block: u64) -> RaiseResult<()> {
+        self.lock().zero_for_video(block)
+    }
+
     /// The identity of the cache of the block at `block` ([`SurfaceCaches::identity`]).
     pub(crate) fn identity(&self, block: u64) -> Option<MemoryIdentity> {
         self.lock().identity(block)
@@ -7433,20 +7545,26 @@ impl<P: Platform> Caches<P> {
         // The caches' buffers its video ops read or write, all but those of a decode that lands
         // in its cache's surface, hold their memory before its uses' fills, made with the lock
         // let go of, so none of those fills goes straight into the shapes alone, and a buffer
-        // that lacks the pages takes them (the module doc, "Straight fills").
+        // that lacks the pages takes them (the module doc, "Straight fills"). The memory of one
+        // the host's video writes itself is zeroed for it first, ahead of those fills.
         let named: Vec<u64> = (reach.named.iter())
             .filter(|&&(block, encoded)| {
                 encoded || !state.decodes_into_surface(block, decoded_of(block))
             })
             .map(|&(block, _)| block)
             .collect();
-        let unmade: Vec<P::Buffer> = (named.iter())
+        let (made, unmade): (Vec<u64>, Vec<P::Buffer>) = (named.iter())
             .filter_map(|&block| {
-                state.deferred_buffer(block, MemoryFor::Command, |c| !c.device.memory_made())
+                let unmade =
+                    state.deferred_buffer(block, MemoryFor::Command, |c| !c.device.memory_made());
+                unmade.map(|buffer| (block, buffer))
             })
-            .collect();
+            .unzip();
         if !unmade.is_empty() {
             state.unlocked(|| self.make_memory(unmade, MemoryFor::Command));
+        }
+        for block in made {
+            state.zero_for_video(block)?;
         }
         // The pieces the uses' staged fills would make for want of a spare are made with the
         // lock let go of, once, and reserved for their blocks (the module doc, "Staged copies").

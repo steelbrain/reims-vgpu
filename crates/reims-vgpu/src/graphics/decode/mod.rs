@@ -2163,13 +2163,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                     sh.unplaced_zeros
                 );
             }
-            if sh.zero_taken > 0 {
+            if sh.zero_taken + sh.zero_sourced + sh.video_zeroed > 0 {
                 log::info!(
                     target: "reims_vgpu::graphics",
                     "IOSurface device caches' shapes on zeros: {} took their fill as made ({} \
                      MiB), their cache's buffer holding no memory and their image the \
-                     platform's cleared one",
-                    sh.zero_taken, sh.zero_taken_bytes >> 20
+                     platform's cleared one; {} filled from the caches' zeros instead of a \
+                     buffer that held none ({} MiB); {} caches for the host's video zeroed \
+                     for it at their memory's make",
+                    sh.zero_taken, sh.zero_taken_bytes >> 20, sh.zero_sourced,
+                    sh.zero_sourced_bytes >> 20, sh.video_zeroed
                 );
             }
             if d.straight + d.buffer_refills + d.lacking_named > 0 {

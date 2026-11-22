@@ -2310,10 +2310,12 @@ mod tests {
         fills(calls).into_iter().map(|(b, _, i)| (b, i)).collect()
     }
 
-    /// A video cache's planes (`surface_cache::exported`) take their fill from the cache's buffer
-    /// as the first texture over either is made, which makes them: on the transfer queue,
-    /// committed, with no wait on the CPU, counted as filled at their make. A texture over the
-    /// other plane fills nothing, and the decode's begin owes the planes no fill
+    /// A video cache's planes (`surface_cache::exported`) take their fill as the first texture
+    /// over either is made, which makes them: on the transfer queue, committed, with no wait on
+    /// the CPU, counted as filled at their make. The cache's buffer holds no memory, so the zeros
+    /// it would give them come from a buffer of zeros of their own, counted, its memory left
+    /// unmade (`shapes`, "Zeros"). A texture over the other plane fills nothing, and the decode's
+    /// begin owes the planes no fill
     #[cfg(unix)]
     #[test]
     fn a_video_caches_planes_take_their_fill_at_their_make() {
@@ -2332,12 +2334,16 @@ mod tests {
         assert_eq!(surfaces, 2, "the surface's planes: {sels:?}");
         let filled = filled_images(&calls);
         assert_eq!(filled.len(), 2, "both planes: {filled:?}");
-        assert_eq!(filled[0], (cache, luma), "luma's from the buffer");
+        let zeros = filled[0].0;
+        assert!(zeros != cache, "from zeros of their own: {filled:?}");
+        assert_eq!(filled[0], (zeros, luma), "luma's");
         let chroma = filled[1].1;
         assert!(
-            filled[1].0 == cache && chroma != luma,
+            filled[1].0 == zeros && chroma != luma,
             "chroma's: {filled:?}"
         );
+        let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
+        assert!(!memory, "the cache's buffer holds no memory");
         assert!(
             first(&calls, FILL) < first(&calls, "commit"),
             "committed: {sels:?}"
@@ -2345,6 +2351,7 @@ mod tests {
         assert!(!sels.contains(&"waitUntilCompleted"), "no wait: {sels:?}");
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (2, 2));
+        assert_eq!(counts.zero_sourced, 2, "both from zeros");
         assert_eq!(counts.planes_owed_busy, 0);
         assert_eq!(
             (counts.surfaces, counts.surfaces_declined),
@@ -2503,13 +2510,14 @@ mod tests {
         );
     }
 
-    /// A picture smaller than its planes leaves the rest of them holding the cache's zeros, as a
-    /// new IOSurface reads: the cache's buffer took its zeros at its make, and nothing of the
-    /// pages since, as the decode takes the surface's first fill; the planes took the buffer at
-    /// their make, after the zeros, on the same queue; the decode op's wait on its thread for
-    /// the cache's last fill lasts until that fill is done, so the hardware's picture lands over
-    /// it; and its command buffer leaves the planes owing nothing, so no use after it fills them
-    /// from the buffer again. The fake holds no texels: the order pins the bytes
+    /// A picture smaller than its planes leaves the rest of them holding zeros, as a new
+    /// IOSurface reads: the planes took zeros at their make, copied from a buffer of zeros made
+    /// with the surface, the cache's buffer holding no memory (`shapes`, "Zeros"), and nothing of
+    /// the pages since, as the decode takes the surface's first fill; the decode op's wait on its
+    /// thread for the cache's last fill lasts until that fill is done, so the hardware's picture
+    /// lands over it; and its command buffer leaves the planes owing nothing, so no use after it
+    /// fills them again. The cache's buffer's memory is never made. The fake holds no texels: the
+    /// order pins the bytes
     #[cfg(unix)]
     #[test]
     fn a_picture_smaller_than_its_planes_leaves_the_rest_reading_zeros() {
@@ -2558,15 +2566,22 @@ mod tests {
         );
 
         let calls = r.p.call_log().since(0);
-        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
-        let zeros = (calls.iter())
-            .position(|c| c.sel == "fillBuffer:range:value:" && id(&c.args[0]) == cache)
-            .expect("the cache's zeros at its make");
-        assert_eq!(filled_images(&calls), [(cache, luma), (cache, chroma)]);
-        assert!(
-            first(&calls, FILL) > zeros,
-            "the planes' fill after the zeros"
+        assert_eq!(
+            zeros_into(&calls, cache),
+            0,
+            "no zeros of the cache's buffer"
         );
+        let filled = filled_images(&calls);
+        let zeros = filled.first().map_or(0, |&(from, _)| from);
+        assert!(zeros != cache, "not the cache's buffer: {filled:?}");
+        assert_eq!(filled, [(zeros, luma), (zeros, chroma)], "from one buffer");
+        let zeros_made = (calls.iter())
+            .filter(|c| c.sel == "newBufferWithLength:options:")
+            .filter(|c| c.args[0].as_u64() == Some(shapes::ZEROS_LEN))
+            .count();
+        assert_eq!(zeros_made, 1, "a buffer of zeros of their own");
+        let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
+        assert!(!memory, "the cache's buffer holds no memory");
         let into_cache: Vec<_> = (copies(&calls).into_iter())
             .filter(|&(_, to)| to == cache)
             .collect();
@@ -2584,10 +2599,13 @@ mod tests {
 
     /// A video cache's planes made while a command buffer begun and not finished uses the cache
     /// owe their fill to its next use, counted, as a placed image's make finds the cache busy
-    /// (`shapes`, "Placed images"): that use fills them, counted as filled at a later use
+    /// (`shapes`, "Placed images"): that use fills them, counted as filled at a later use, from
+    /// the pages straight, as the cache's buffer holds no memory (the module doc of
+    /// `surface_cache`, "Straight fills")
     #[cfg(unix)]
     #[test]
     fn a_busy_video_caches_planes_owe_their_fill_to_its_next_use() {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         let mut r = video_shaped();
         let cache = cache_id(&r);
         let queue = r.device.new_command_queue().unwrap();
@@ -2616,38 +2634,43 @@ mod tests {
         use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
         let filled = filled_images(&r.p.call_log().since(mark));
         assert_eq!(filled.len(), 2, "both planes at the next use: {filled:?}");
-        assert!(filled.contains(&(cache, luma)), "{filled:?}");
+        assert!(
+            filled
+                .iter()
+                .any(|&(from, image)| image == luma && from != cache),
+            "into the plane from the pages: {filled:?}"
+        );
+        let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
+        assert!(!memory, "the buffer's memory not made");
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (0, 2));
     }
 
     /// A decode whose textures show a video cache's planes whole, where the cache has its
     /// surface, is given the surface's planes, which its picture lands in, and makes no memory of
-    /// the cache's buffer, which the picture does not touch: the buffer here stands in for a
-    /// deferred one whose memory is not made, as a Windows video cache's is, its surface over
-    /// Direct3D 11 textures ("Deferred memory"). A decode whose picture lands in the buffer (its
-    /// textures not showing the planes whole, or the cache having no surface) makes it, once, as
-    /// before
+    /// the cache's buffer, which the picture does not touch ("Deferred memory"). A decode whose
+    /// picture lands in the buffer (its textures not showing the planes whole, or the cache having
+    /// no surface) makes it, once, and zeros it for the host's video, which writes it with no
+    /// work of the platform's, before its wait for the cache's fills (`SurfaceCaches`'s
+    /// `zero_for_video`)
     #[cfg(unix)]
     #[test]
     fn a_decode_into_a_caches_surface_makes_no_memory_of_its_buffer() {
         use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
-        use reims_vgpu_vulkan::core::testkit::objects::Model;
         // (the textures show the planes whole, the platform makes the surface): whether the
         // picture lands in the surface.
         for (whole, surfaces) in [(true, true), (false, true), (true, false)] {
             let case = format!("whole {whole}, surfaces {surfaces}");
             let mut r = video_shaped();
+            let cache = cache_id(&r);
             r.p.world().give_exported_surfaces(surfaces);
             plane_texture_with(&mut r, 21, 10, 0, whole);
             plane_texture_with(&mut r, 22, 10, 1, whole);
             r.p.world().complete_all(CompleteOn::Caller);
-            if let Some(buffer) = r.dec.caches().buffer(BLOCK)
-                && let Model::Buffer(m) = &mut buffer.state().model
-            {
-                m.deferred = Some(false);
-            }
+            // The zeros' command buffer completes as it is committed, so the planes' wait for it
+            // ends.
+            r.p.world().set_auto_complete(Some(CompleteOn::Thread));
             let mark = r.p.call_log().mark();
             let (luma, chroma) = r.dec.video_planes(0, 21, 22, true).unwrap();
             let apart = whole && surfaces;
@@ -2657,9 +2680,15 @@ mod tests {
                 "{case}: the surface's planes"
             );
             drop((luma, chroma));
-            let made = r.p.call_log().since(mark);
-            let made = made.iter().filter(|c| c.sel == MAKE_MEMORY).count();
+            let calls = r.p.call_log().since(mark);
+            let made = calls.iter().filter(|c| c.sel == MAKE_MEMORY).count();
             assert_eq!(made, usize::from(!apart), "{case}: the buffer's memory");
+            let zeroed = (
+                zeros_into(&calls, cache),
+                r.dec.caches().counts().shapes.video_zeroed,
+            );
+            let want = (usize::from(!apart), u64::from(!apart));
+            assert_eq!(zeroed, want, "{case}: the video's zeros");
             let memory = r
                 .dec
                 .caches()
@@ -2667,6 +2696,193 @@ mod tests {
                 .is_some_and(|b| b.memory_made());
             assert_eq!(memory, !apart, "{case}: made");
         }
+    }
+
+    /// The fills of the block's video cache's buffer with zeros in `calls`: its cache is `cache`.
+    #[cfg(unix)]
+    fn zeros_into(calls: &[Call], cache: u64) -> usize {
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        (calls.iter())
+            .filter(|c| c.sel == "fillBuffer:range:value:" && id(&c.args[0]) == cache)
+            .count()
+    }
+
+    /// A cache made for the host's video in the per-shape form is a deferred buffer whose memory
+    /// is made at its first use, exported then (a dma-buf for VA-API, an exportable buffer for
+    /// NVDEC), with no zeros at its make (the module doc of `surface_cache`, "Deferred memory")
+    #[cfg(unix)]
+    #[test]
+    fn a_video_cache_in_the_per_shape_form_is_made_deferred() {
+        use reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_CACHED;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::testkit::impls::device::{
+            DEFERRED_DMA_BUF_BUFFER, DEFERRED_EXPORTABLE_BUFFER, DMA_BUF_BUFFER, EXPORTABLE_BUFFER,
+        };
+        for exportable in [false, true] {
+            let mut r = rig(16);
+            let page = r.page;
+            let _made = take_shapes(&r);
+            if exportable {
+                r.dec.set_exportable_caches();
+            } else {
+                r.dec.set_dma_buf_caches();
+            }
+            let mark = r.p.call_log().mark();
+            let flags = RGFX_SURFACE_PAGES_CACHED;
+            let layout = Some(nv12_layout());
+            assert_eq!(
+                r.pages_laid_out(BLOCK, 0, &[(1, 4)], 4 * page, flags, layout),
+                RGFX_STATUS_OK
+            );
+            let sels = r.p.call_log().sels_since(mark);
+            let count = |sel: &str| sels.iter().filter(|&&s| s == sel).count();
+            let (deferred, whole) = match exportable {
+                true => (DEFERRED_EXPORTABLE_BUFFER, EXPORTABLE_BUFFER),
+                false => (DEFERRED_DMA_BUF_BUFFER, DMA_BUF_BUFFER),
+            };
+            assert_eq!(
+                (count(deferred), count(whole)),
+                (1, 0),
+                "exportable {exportable}: {sels:?}"
+            );
+            assert!(r.dec.caches().identity(BLOCK).is_some(), "given the video");
+            let memory = r.dec.caches().buffer(BLOCK).map(|b| b.memory_made());
+            assert_eq!(memory, Some(false), "exportable {exportable}: no memory");
+            assert!(
+                !sels.contains(&"fillBuffer:range:value:"),
+                "no zeros: {sels:?}"
+            );
+        }
+    }
+
+    /// A decode whose picture lands in a video cache's buffer, whose memory is not made, makes
+    /// it as its command buffer begins and fills it with zeros on the transfer queue, as the
+    /// buffer's make did when it made the memory: the host's video writes the memory itself,
+    /// ahead of the platform's own zeros of it (`SurfaceCaches::zero_for_video`). The decode's op
+    /// waits for those zeros, counted; a second decode makes and zeros nothing
+    #[cfg(unix)]
+    #[test]
+    fn a_decode_into_a_video_caches_buffer_makes_its_memory_and_zeros() {
+        use super::super::surface_cache::Reach;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
+        let r = video_shaped();
+        let cache = cache_id(&r);
+        assert_eq!(
+            zeros_into(&r.p.call_log().since(0), cache),
+            0,
+            "none at its make"
+        );
+        let memory = |r: &Rig| (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
+        assert!(!memory(&r));
+        let queue = r.device.new_command_queue().unwrap();
+        for (round, want) in [(1, 1), (0, 0)].into_iter().enumerate() {
+            let cb = queue.command_buffer(ON).unwrap().unwrap();
+            let decode = Reach {
+                video: true,
+                decoded: vec![(BLOCK, nv12_planes())],
+                named: vec![(BLOCK, false)],
+                ..Reach::default()
+            };
+            let writes = [RgfxOpSurfaceUse {
+                flags: RGFX_SURFACE_USE_WRITES,
+                ..reading(BLOCK, 0)[0]
+            }];
+            let mark = r.p.call_log().mark();
+            let (_, uses) = (r.dec.surface_caches)
+                .before(&r.device, &cb, &writes, &decode)
+                .unwrap();
+            let calls = r.p.call_log().since(mark);
+            let made = calls.iter().filter(|c| c.sel == MAKE_MEMORY).count();
+            assert_eq!(
+                (made, zeros_into(&calls, cache)),
+                want,
+                "decode {round}: made, zeroed"
+            );
+            if round == 0 {
+                assert!(
+                    r.dec.surface_caches.surface_targets(BLOCK).is_none(),
+                    "no surface: the picture lands in the buffer"
+                );
+                let mut short = || true;
+                let now = || reims_vgpu_vulkan::core::platform::os::clock::MonoTime::from_nanos(0);
+                assert!(
+                    !r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now),
+                    "the zeros not done: the decode's op waits"
+                );
+                assert_eq!(r.dec.caches().counts().shapes.video_fill_waits, 1);
+            }
+            r.p.world().complete_all(CompleteOn::Caller);
+            (r.dec.surface_caches)
+                .finish(&r.device, 1, None, &cb, uses.unwrap(), || cb.commit(ON))
+                .unwrap();
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(memory(&r), "decode {round}: made");
+        }
+        assert_eq!(r.dec.caches().counts().shapes.video_zeroed, 1);
+    }
+
+    /// A video cache's buffer that holds no memory takes a fill from the pages straight into its
+    /// shapes, as any deferred cache's does (the module doc of `surface_cache`, "Straight
+    /// fills"), its memory left unmade. A decode whose picture lands in the buffer then makes the
+    /// memory, zeros it, and fills it from the pages over the zeros, all before the decode's
+    /// command buffer: the buffer the video writes holds the pages, as an eager cache's did
+    #[cfg(unix)]
+    #[test]
+    fn a_video_caches_buffer_takes_the_pages_over_its_zeros_at_a_decode() {
+        use super::super::surface_cache::Reach;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        let mut r = video_shaped();
+        let cache = cache_id(&r);
+        r.p.world().give_exported_surfaces(false);
+        let luma = plane_texture(&mut r, 21, 0);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let calls = r.p.call_log().since(mark);
+        let memory = |r: &Rig| (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
+        assert!(!memory(&r), "the pages' fill went straight");
+        let filled = filled_images(&calls);
+        assert!(
+            filled
+                .iter()
+                .any(|&(from, image)| image == luma && from != cache),
+            "into the shape from the pages: {filled:?}"
+        );
+        assert_eq!(zeros_into(&calls, cache), 0);
+
+        let queue = r.device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let decode = Reach {
+            video: true,
+            decoded: vec![(BLOCK, nv12_planes())],
+            named: vec![(BLOCK, false)],
+            ..Reach::default()
+        };
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 1)[0]
+        }];
+        let mark = r.p.call_log().mark();
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &cb, &writes, &decode)
+            .unwrap();
+        let calls = r.p.call_log().since(mark);
+        assert!(memory(&r), "made for the decode");
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        let zeros = (calls.iter())
+            .position(|c| c.sel == "fillBuffer:range:value:" && id(&c.args[0]) == cache)
+            .expect("the memory's zeros");
+        let pages = (calls.iter())
+            .position(|c| c.sel == COPY && id(&c.args[2]) == cache)
+            .expect("the pages into the buffer");
+        assert!(zeros < pages, "the pages over the zeros");
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &cb, uses.unwrap(), || cb.commit(ON))
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(r.dec.caches().counts().shapes.video_zeroed, 1);
     }
 
     /// Library 30 and compute pipeline `obj_id` of a function in it.
