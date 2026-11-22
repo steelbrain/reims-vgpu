@@ -2180,7 +2180,10 @@ mod tests {
         raise_to(&mut highest, highest_gauges(&g));
         g.resolve_images = 3;
         raise_to(&mut highest, highest_gauges(&g));
-        assert_eq!(highest, [12 << 20, 64 << 20, 48 << 20, 16 << 20, 31 << 20, 3, 8 << 20]);
+        assert_eq!(
+            highest,
+            [12 << 20, 64 << 20, 48 << 20, 16 << 20, 31 << 20, 3, 8 << 20]
+        );
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
         assert_eq!(rose, highest);
