@@ -94,6 +94,17 @@
 //! - Windows: a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no other limit, whose
 //!   one handle the library's process holds. Its end closes the job, which ends the helper. The
 //!   process joins the job just after its start, before the talk begins.
+//!
+//! **A helper's crash writes no core file.** The helper's main first sets its own core-file
+//! limit to none ([`no_core_files`]), whatever the limit it inherits from the library's process,
+//! with no switch. A helper that crashes is said by its end ([`HelperEnd::Ended`], its signal
+//! where it had one), which the library logs with its fill's key, and by the stderr it shares with
+//! the library's process; its fill ends failed, as any end without a reply does.
+//! - Linux and macOS: `RLIMIT_CORE` at 0, soft and hard (`setrlimit`). The kernel writes no core
+//!   file under it, and `systemd-coredump`, where a `core_pattern` pipe hands it the crash, keeps
+//!   no core of a process whose limit is below a page.
+//! - Windows: nothing, as Windows has no core-file limit of a process's own; whether a crash
+//!   leaves a dump is Windows Error Reporting's, by the host's settings.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -965,7 +976,14 @@ fn end_process(child: &mut Child) {
 }
 
 /// The helper's side: arms what ends the helper with the library's process where the OS needs the
-/// helper's part, on macOS (the module's doc). The helper's main calls it first.
+/// helper's part, on macOS (the module's doc). The helper's main calls it as its work begins.
 pub(crate) fn end_with_parent() -> io::Result<()> {
     host::watch_parent()
+}
+
+/// The helper's side: sets the calling process's core-file limit to none, soft and hard, on Linux
+/// and macOS, and does nothing on Windows (the module's doc, "A helper's crash writes no core
+/// file"). The helper's main calls it first.
+pub(crate) fn no_core_files() -> io::Result<()> {
+    host::no_core_files()
 }

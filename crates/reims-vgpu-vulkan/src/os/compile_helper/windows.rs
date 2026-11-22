@@ -74,6 +74,12 @@ pub(super) fn watch_parent() -> io::Result<()> {
     Ok(())
 }
 
+/// Nothing: Windows has no core-file limit of a process's own. Whether a crash leaves a dump is
+/// Windows Error Reporting's, by the host's settings, which the helper leaves as they are.
+pub(super) fn no_core_files() -> io::Result<()> {
+    Ok(())
+}
+
 /// A running helper in a Job Object of its own, which kills it once the job's one handle, the
 /// library's, closes: at the end of the watch, or of the library's process.
 #[derive(Debug)]

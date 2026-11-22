@@ -39,6 +39,9 @@ fn full_name(test: &str) -> String {
 /// - `sleep`: sleeps.
 /// - `parent`: starts a `sleep` stand-in of `test`, prints `helper-pid <pid>`, and exits at once,
 ///   dropping nothing.
+/// - `core` (Linux and macOS): raises its soft core-file limit to its hard one, sets the limit to
+///   none as the helper's main does, then prints `core-limit <soft> <hard> of <inherited hard>`,
+///   the limit read back.
 fn stand_in(test: &str) {
     let Some(mode) = std::env::var_os(STAND_IN) else {
         return;
@@ -79,6 +82,33 @@ fn stand_in(test: &str) {
             writeln!(stdout, "helper-pid {pid}").unwrap();
             stdout.flush().unwrap();
             std::process::exit(0);
+        }
+        #[cfg(unix)]
+        "core" => {
+            let core_limit = || {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 1,
+                    rlim_max: 1,
+                };
+                // SAFETY: getrlimit writes the one rlimit it is given.
+                assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) }, 0);
+                limit
+            };
+            // The soft limit at the hard one, which needs no privilege, so a hard limit past 0
+            // leaves the call two limits to lower.
+            let inherited = core_limit();
+            let raised = libc::rlimit {
+                rlim_cur: inherited.rlim_max,
+                rlim_max: inherited.rlim_max,
+            };
+            // SAFETY: setrlimit reads the one rlimit it is given.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raised) }, 0);
+            super::no_core_files().unwrap();
+            let limit = core_limit();
+            let mut stdout = io::stdout();
+            let (soft, hard) = (limit.rlim_cur, limit.rlim_max);
+            writeln!(stdout, "core-limit {soft} {hard} of {}", inherited.rlim_max).unwrap();
+            stdout.flush().unwrap();
         }
         other => panic!("no stand-in mode {other}"),
     }
@@ -600,6 +630,35 @@ fn a_helper_ends_with_the_process_that_started_it() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A helper sets its own core-file limit to none, its soft limit and its hard one, so its crash
+/// writes no core file: a stand-in that sets it as the helper's main does reads back 0 and 0,
+/// from its soft limit raised to the hard one it inherited (which is already 0 where the test's
+/// process runs under `ulimit -c 0`).
+#[cfg(unix)]
+#[test]
+fn a_helper_sets_its_core_file_limit_to_none() {
+    let test = "a_helper_sets_its_core_file_limit_to_none";
+    stand_in(test);
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            full_name(test).as_str(),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(STAND_IN, "core")
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}: {said}", output.status);
+    // The harness names the test first, on the same line.
+    let limit = (said.split_once("core-limit "))
+        .map(|(_, limit)| limit.split_whitespace().take(2).collect::<Vec<_>>());
+    assert_eq!(limit, Some(vec!["0", "0"]), "{said}");
 }
 
 /// A program that cannot start is said so, and no helper runs.

@@ -1,5 +1,7 @@
 //! What Linux and macOS share of a helper's watch: the host's memory and CPUs, what of the guest's
-//! RAM is not resident, and the talk's broken pipes.
+//! RAM is not resident, the talk's broken pipes, and the helper's core-file limit.
+
+use std::io;
 
 use crate::core::num::{ToU64 as _, ToUsize as _};
 
@@ -79,5 +81,22 @@ pub(super) fn mask_broken_pipes() {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGPIPE);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Sets the calling process's core-file limit (`RLIMIT_CORE`) to 0, its soft limit and its hard
+/// one, so the process cannot raise it again: its crash writes no core file, and a `core_pattern`
+/// pipe that honours the limit keeps none (`systemd-coredump` keeps no core of a process whose
+/// limit is below a page).
+pub(super) fn no_core_files() -> io::Result<()> {
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit reads the one rlimit it is given; lowering a limit needs no privilege.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }

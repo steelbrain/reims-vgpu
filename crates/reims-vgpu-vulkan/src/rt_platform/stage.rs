@@ -33,7 +33,8 @@
 //! library's host (QEMU). It opens its device on the card the VM's device is on, which its one
 //! argument names by `deviceUUID`, with the options the VM's device was opened with
 //! (`super::device::shared_options`): rt takes its compile only from a device that enabled what
-//! the VM's did.
+//! the VM's did. Its first act is to set its own core-file limit to none, so its crash writes no
+//! core file (`crate::os::compile_helper`'s docs, "A helper's crash writes no core file").
 //!
 //! **Each helper's footprint** is logged as it ends, with its fill's key ([`footprints_line`]):
 //! the largest its reads saw, the largest growth from one read to the next, its own cap, and how
@@ -223,7 +224,9 @@ fn device_uuid(instance: &rt::Instance, physical: &rt::PhysicalDevice) -> [u8; 1
 }
 
 /// The helper process's main, the program [`HELPER`]'s (the module's docs, "The helper's
-/// side"): arms its end with the library's process where the OS needs the helper's part
+/// side"): first sets its own core-file limit to none (`os::compile_helper::no_core_files`; a
+/// failure to is logged, and the fill is served all the same), then arms its end with the
+/// library's process where the OS needs the helper's part
 /// (`os::compile_helper::end_with_parent`), makes rt's instance as the library's device does,
 /// finds the device whose `deviceUUID` its argument names ([`helper_run`]), and serves one fill
 /// over its stdin and stdout, rt's `serve_stage`, with the options the library's device was
@@ -233,11 +236,18 @@ fn device_uuid(instance: &rt::Instance, physical: &rt::PhysicalDevice) -> [u8; 1
 /// A failure where it served no reply, as its line says; the library's fill then ends failed
 /// ([`fill_end`]).
 pub fn helper_main() -> ExitCode {
+    let no_core_files = crate::os::compile_helper::no_core_files();
     let hook: crate::core::logging::Hook = Box::new(|level, target, message| {
         let line = crate::core::logging::stderr_line(level, target, message);
         let _ = std::io::stderr().write_all(line.as_bytes());
     });
     let _ = crate::core::logging::set_hook(log::LevelFilter::Warn, hook);
+    if let Err(e) = no_core_files {
+        log::warn!(
+            target: super::TARGET,
+            "the stage helper's core-file limit stays as it was: {e}"
+        );
+    }
     match serve_helper(std::env::args_os().nth(1).as_deref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
