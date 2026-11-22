@@ -141,6 +141,8 @@ use super::video_host::{
     BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
     HostVideoSession, Landing, OutputPlane, picture_error,
 };
+#[cfg(unix)]
+use super::video_host::failed_in_caches;
 
 mod encode;
 #[cfg(unix)]
@@ -1386,6 +1388,13 @@ impl VaGuestDecoder {
     }
 }
 
+/// Whether the driver's work that `error` failed has stopped writing: every error but a stall,
+/// whose work past its deadline may still write (the VA crate's `wait`).
+#[cfg(unix)]
+fn stopped(error: &reims_vgpu_video::vaapi::Error) -> bool {
+    !matches!(error, reims_vgpu_video::vaapi::Error::Stalled(_))
+}
+
 /// What a VideoToolbox decoder sees of `error`: a stream that does not decode as bad data, one the
 /// driver cannot decode as unsupported, and the rest as the decoder's malfunction.
 fn video_error(error: reims_vgpu_video::vaapi::Error) -> VideoError {
@@ -1416,14 +1425,14 @@ impl<P: Platform> VaPicture<P> {
     /// Writes the picture by the driver's video processing into `memory`, laid out as `layout`
     /// (the VA crate's `Frame::write_to_guest_telling`), calling `decoded` once the decode is
     /// done and the runs are issued behind it: `None` once it is there, or why it was not
-    /// written, nothing written. `Err` where the decode or a run failed or ran past its deadline:
-    /// no copy may race the GPU's write, so the picture fails.
+    /// written, nothing written. `Err` where the decode or a run failed or ran past its deadline
+    /// ([`stopped`] says which): no copy may race the GPU's write, so the picture fails.
     fn write_in_place(
         &self,
         layout: &SurfaceLayout,
         memory: &dyn DeviceMemory,
         decoded: &mut dyn FnMut(),
-    ) -> Result<Option<String>, BackendError> {
+    ) -> Result<Option<String>, reims_vgpu_video::vaapi::Error> {
         let target = match GuestTarget::new(layout, memory) {
             Ok(target) => target,
             Err(why) => return Ok(Some(why)),
@@ -1451,7 +1460,9 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
         // reads of the cache see it once the platform acquired what the driver wrote.
         #[cfg(unix)]
         if self.frame.is_in_target() {
-            self.frame.sync()?;
+            if let Err(error) = self.frame.sync() {
+                return Err(failed_in_caches(&[to.luma], stopped(&error), error.into()));
+            }
             to.luma.external_write_done()?;
             to.decoded_there();
             return Ok(());
@@ -1485,12 +1496,16 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
                 match targets.in_cache(to.luma, to.chroma, bit_depth) {
                     Ok((layout, bytes)) => {
                         to.writes_only(processed(&self.frame, &layout, bit_depth))?;
-                        match self.write_in_place(&layout, &bytes, &mut || to.decode_done())? {
-                            None => {
+                        match self.write_in_place(&layout, &bytes, &mut || to.decode_done()) {
+                            Ok(None) => {
                                 to.luma.external_write_done()?;
                                 return Ok(());
                             }
-                            Some(why) => format!("in its device cache: {why}"),
+                            Ok(Some(why)) => format!("in its device cache: {why}"),
+                            Err(error) => {
+                                let stopped = stopped(&error);
+                                return Err(failed_in_caches(&[to.luma], stopped, error.into()));
+                            }
                         }
                     }
                     Err(why) => why,
@@ -1524,7 +1539,10 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
                 }
                 let copied = (copier.lock()).copy(&self.frame, &self.imports, to.luma, to.chroma);
                 match copied? {
-                    DeviceWrite::Written => return Ok(()),
+                    DeviceWrite::Written => {
+                        to.copied_by_gpu();
+                        return Ok(());
+                    }
                     DeviceWrite::Declined(why) => format!("{declined}; and the GPU's copy: {why}"),
                 }
             }

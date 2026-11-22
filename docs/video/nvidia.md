@@ -138,7 +138,10 @@ where it is NVIDIA's and CUDA opens it (`graphics/video_choice.rs`).
   Elsewhere the picture is read back and copied by the CPU.
 - **A picture that does not land is a decode error.** A picture whose planes
   the session refuses still signals the decode's value, so its command
-  buffer completes, failed with Metal's internal error. For HEVC the guest's
+  buffer completes, failed with Metal's internal error. Where its write into
+  the device caches failed (a decode NVDEC failed, before the copies), the
+  caches are acquired first (`video_host::failed_in_caches`); work past its
+  deadline, which may still write, is acquired by nothing. For HEVC the guest's
   video driver's schedule of the picture waits for that verdict and fails
   (`kVTVideoDecoderMalfunctionErr`),
   which AppleGVA reports from that frame on, so no frame of the picture

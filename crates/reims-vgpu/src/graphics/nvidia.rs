@@ -94,7 +94,7 @@ use super::decode::{
 };
 use super::video_host::{
     BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture,
-    HostVideoSession, Landing, OutputPlane, SourcePlane, picture_error,
+    HostVideoSession, Landing, OutputPlane, SourcePlane, failed_in_caches, picture_error,
 };
 
 mod encode;
@@ -679,7 +679,21 @@ impl<P: Platform> NvdecPicture<P> {
         let written = unsafe {
             (self.picture).write_into_device(size, luma_plane, chroma_plane, Box::new(()))
         };
-        match written? {
+        // A decode NVDEC failed, or work past its deadline, which may still write: the caches
+        // are said written where the GPU has stopped, before the session's signal.
+        let written = match written {
+            Ok(written) => written,
+            Err(error) => {
+                let stopped = !matches!(error, reims_vgpu_video::nvidia::Error::Stalled(_));
+                let planes: &[&OutputPlane<P>] = if chroma_cache.key() == luma_cache.key() {
+                    &[luma]
+                } else {
+                    &[luma, chroma]
+                };
+                return Err(failed_in_caches(planes, stopped, error.into()));
+            }
+        };
+        match written {
             // The copies are done (the write waited for them): the device's reads of each cache,
             // or of its surface where the planes land there, see them once the platform acquired
             // what CUDA wrote, said before the session's signal lets a command buffer read the

@@ -29,7 +29,9 @@
 //!
 //!   A picture that fails to land is logged and counted, and its value is signalled all the
 //!   same: the command buffer goes on with its output as the landing left it, as a GPU decode's
-//!   error leaves one. A picture the hardware answered failed that the backend lands all the
+//!   error leaves one. Where the hardware wrote the output's device caches and stopped, the
+//!   caches are said written before the signal ([`failed_in_caches`]), so the device reads what
+//!   it left there. A picture the hardware answered failed that the backend lands all the
 //!   same, as the hardware left it ([`Landing::hardware_failed`]), is logged and counted apart,
 //!   and lands as any other: a Mac's hardware H.264 decoder hands such a picture on with no
 //!   error (`super::nvidia`). A copy into the caches that the platform makes no blit encoder
@@ -358,6 +360,9 @@ pub(crate) struct Landing<'a, P: Platform> {
     only: Option<[Extent; 2]>,
     /// Whether the CPU copied the picture.
     by_cpu: bool,
+    /// Whether the GPU copied the picture into the output's caches from a scratch the hardware
+    /// wrote ([`Landing::copied_by_gpu`]).
+    by_gpu_copy: bool,
     /// Whether the hardware decoded the picture straight into the output's planes
     /// ([`Landing::decoded_there`]).
     decoded: bool,
@@ -397,6 +402,12 @@ impl<P: Platform> Landing<'_, P> {
     /// nothing was copied (`super::vaapi`).
     pub(crate) fn decoded_there(&mut self) {
         self.decoded = true;
+    }
+
+    /// Says that the GPU copied the picture into the output's device caches from a scratch the
+    /// hardware wrote (`super::vaapi`'s GPU copier): it lands staged by the hardware and copied.
+    pub(crate) fn copied_by_gpu(&mut self) {
+        self.by_gpu_copy = true;
     }
 
     /// Says that the hardware answered the picture's decode failed, `why`, and that the picture
@@ -1081,7 +1092,8 @@ enum Way {
     Cache,
     /// In a device cache, decoded there by the backend's hardware, with no copy.
     Decoded,
-    /// In a device cache, through the staging buffer the backend's hardware wrote, and a copy.
+    /// In a device cache, through the staging buffer or scratch the backend's hardware wrote,
+    /// and a copy.
     Staged,
     /// In a device cache, through the staging buffer the CPU wrote, and a copy.
     StagedByCpu,
@@ -1488,6 +1500,7 @@ fn land<P: Platform>(
         staged: None,
         only: None,
         by_cpu: false,
+        by_gpu_copy: false,
         decoded: false,
         hardware_failed: None,
         cpu_from: None,
@@ -1503,6 +1516,7 @@ fn land<P: Platform>(
     let Landing {
         staged,
         by_cpu,
+        by_gpu_copy,
         decoded,
         stage,
         hardware_failed,
@@ -1513,10 +1527,37 @@ fn land<P: Platform>(
         stage.copy_into_caches(&output.luma, &output.chroma, staged)?;
     }
     let cached = output.luma.cached || output.chroma.cached;
+    let is_staged = is_staged || by_gpu_copy;
     if decoded && cached && !is_staged && !by_cpu {
         return Ok((Way::Decoded, hardware_failed, cpu));
     }
     Ok((Way::of(is_staged, cached, by_cpu), hardware_failed, cpu))
+}
+
+/// `error`, a picture's failed landing into `planes`' device caches, which the hardware wrote:
+/// where it has stopped (`stopped`), each plane is said written first
+/// ([`OutputPlane::external_write_done`]), as the landing would have said it, so the device's
+/// reads of the caches see what the hardware left there, as reads of an IOSurface that a failed
+/// decode wrote do, before the session's signal of the failure. Work that may still write (a
+/// stall) is said nothing of, since its writes may land after the acquire. A refused acquire is
+/// logged, and the landing fails with `error` either way, logged and counted as any failure.
+#[cfg(unix)]
+pub(crate) fn failed_in_caches<P: Platform>(
+    planes: &[&OutputPlane<P>],
+    stopped: bool,
+    error: BackendError,
+) -> BackendError {
+    if stopped {
+        for plane in planes {
+            if let Err(why) = plane.external_write_done() {
+                log::warn!(
+                    "hardware video: a picture that failed to land in its device cache, {error}: \
+                     the cache's acquire was refused: {why}"
+                );
+            }
+        }
+    }
+    error
 }
 
 mod encode;

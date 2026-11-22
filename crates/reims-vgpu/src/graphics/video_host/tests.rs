@@ -95,6 +95,13 @@ enum Picture {
     /// What the hardware writes into the planes where they lie, saying first that it covers
     /// `only` of them; the planes' bytes here are left alone.
     InPlaceOnly([Extent; 2]),
+    /// Landed by the GPU's copy into the output's device caches from a scratch the hardware
+    /// wrote, as the VA-API arm's GPU copier lands it.
+    GpuCopied,
+    /// A failure to land in the output's device caches, which the hardware wrote, its work
+    /// stopped where `true` ([`failed_in_caches`]).
+    #[cfg(unix)]
+    FailInCaches(bool),
 }
 
 impl HostPicture<P> for Picture {
@@ -188,6 +195,15 @@ impl HostPicture<P> for Picture {
                 Box::new(Picture::CpuOnly(n, only)).land(to)
             }
             Picture::InPlaceOnly(only) => to.writes_only(only),
+            Picture::GpuCopied => {
+                to.copied_by_gpu();
+                Ok(())
+            }
+            #[cfg(unix)]
+            Picture::FailInCaches(stopped) => {
+                let failed = "the hardware failed the decode".into();
+                Err(failed_in_caches(&[to.luma], stopped, failed))
+            }
         }
     }
 }
@@ -511,6 +527,123 @@ fn a_plane_in_a_device_cache_lands_staged_then_copied() {
             }
         ]
     );
+}
+
+/// A picture the GPU copied into its output's device caches from a scratch the hardware wrote
+/// is counted as landed staged by the hardware and copied, not as written there by the hardware,
+/// and the session copies nothing of it.
+#[test]
+fn a_picture_the_gpu_copied_from_a_scratch_counts_as_staged_by_the_hardware() {
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let s = session(&p, vec![Ok(Some(Picture::GpuCopied))], &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    let decoded = s
+        .decode(&decode(&bitstream, &[], planes(&cache, &cache, 128)))
+        .unwrap();
+    assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
+    assert!(decoded.landed.as_deref().is_some_and(|l| !l.failed()));
+    assert!(p.call_log().calls_to(COPY).is_empty(), "no copy of the session's");
+    let at = |way: Way| Way::ALL.iter().position(|w| *w == way).unwrap();
+    let counts = s.counts.lock();
+    assert_eq!(
+        (counts.landed[at(Way::Staged)], counts.landed[at(Way::Cache)]),
+        (1, 0)
+    );
+}
+
+/// A cache's surface memory that keeps the session's signalled value at each acquire said of it.
+#[cfg(unix)]
+struct Acquires {
+    event: <P as Platform>::SharedEvent,
+    seen: Mutex<Vec<u64>>,
+}
+
+#[cfg(unix)]
+impl reims_vgpu_vulkan::core::platform::resource::SurfaceMemory for Acquires {
+    fn export(&self) -> Result<ExportedMemory, String> {
+        Err("the test's memory exports nothing".to_owned())
+    }
+
+    fn external_writes_done(&self) -> Result<(), String> {
+        self.seen.lock().push(self.event.signaled_value());
+        Ok(())
+    }
+
+    fn handle(&self) -> reims_vgpu_vulkan::core::platform::resource::SurfaceHandle {
+        reims_vgpu_vulkan::core::platform::resource::SurfaceHandle::DmaBuf
+    }
+
+    fn in_place(&self) -> bool {
+        false
+    }
+
+    fn layout(&self) -> &[reims_vgpu_vulkan::core::platform::resource::SurfacePlaneLayout] {
+        &[]
+    }
+}
+
+/// A picture that fails to land in its output's device cache, which the hardware wrote, has the
+/// cache said written before the session signals its value where the hardware's work stopped,
+/// as the VA-API and NVDEC arms' failed decodes and writes into caches do
+/// ([`failed_in_caches`]): the device's reads see what the hardware left there. It is counted
+/// failed and its command buffer completes failed, as any failure to land. One whose work may
+/// still write, a stall, has nothing said.
+#[cfg(unix)]
+#[test]
+fn a_failed_landing_in_a_cache_says_it_written_before_its_signal_once_stopped() {
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let answers = vec![
+        Ok(Some(Picture::FailInCaches(true))),
+        Ok(Some(Picture::FailInCaches(false))),
+    ];
+    let s = session(&p, answers, &log);
+    let memory = Arc::new(Acquires {
+        event: event_of(&s).clone_ref(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    let life = MemoryLife::new();
+    let desc = p.texture_descriptor(&TextureDesc {
+        pixel_format: 10, // MTLPixelFormatR8Unorm
+        width: 96,
+        height: 64,
+        ..TextureDesc::default()
+    });
+    let texture = (p.device().new_texture(OnFault::Return, &desc))
+        .unwrap()
+        .unwrap();
+    let into = || {
+        let (mut luma, chroma) = planes(&cache, &cache, 96);
+        let memory: Arc<dyn reims_vgpu_vulkan::core::platform::resource::SurfaceMemory> =
+            Arc::clone(&memory) as _;
+        luma.surface = Some(SurfaceTarget {
+            memory,
+            identity: life.identity(),
+            texture: texture.clone_ref(),
+            offset: 0,
+            bytes_per_row: 128,
+            rows: 64,
+        });
+        s.decode(&decode(&bitstream, &[], (luma, chroma))).unwrap()
+    };
+
+    let stopped = into();
+    assert_eq!(stopped.value, 1);
+    assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
+    assert_eq!(*memory.seen.lock(), [0], "said written once, before the signal");
+    assert!(stopped.landed.as_deref().is_some_and(Landed::failed));
+
+    let stalled = into();
+    assert_eq!(stalled.value, 2);
+    assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
+    assert_eq!(memory.seen.lock().len(), 1, "nothing said of a stall");
+    assert!(stalled.landed.as_deref().is_some_and(Landed::failed));
+    assert_eq!(s.counts.lock().failed, 2);
 }
 
 /// A copy into the output's caches that the platform makes no blit encoder for is skipped, as

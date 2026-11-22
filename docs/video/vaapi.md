@@ -486,7 +486,8 @@ answers for its device, `rt_platform::HostGpu`). The arm
      declines a plane in the guest's pages, and a crop that does not fill
      the planes' rows in whole 32-bit words. Each picture copied so counts
      `video-pictures-gpu-copied`, and its crop's KiB
-     `video-gpu-copied-kib`. On Windows the platform's
+     `video-gpu-copied-kib`, and its session counts it landed `in a device
+     cache, staged by the hardware and copied`. On Windows the platform's
      copier declines every picture, each counted as
      `rt-video-gpu-copy-declined` (reims-vgpu's
      `src/graphics/vaapi/rt_windows.rs`): rt imports no image of the shared
@@ -523,7 +524,11 @@ answers for its device, `rt_platform::HostGpu`). The arm
   (`video_host`'s `Outputs`), and, where the CPU copied pictures, the
   copies' mean and longest time. A picture that
   does not land fails its decode's command buffer ([devices.md](devices.md),
-  "A decode").
+  "A decode"). Where it failed in its device cache, decoded there or written
+  by the video processing, the cache is acquired first
+  (`video_host::failed_in_caches`), once the driver answered: the device's
+  reads see what the hardware left, as a Mac's reads of an IOSurface do. A
+  stall's work, which may still write, is acquired by nothing.
 - **Surfaces.** A picture holds its decode surface until it lands, and
   the session holds no more pictures unlanded than the decoder's spare
   frames (`SPARE_FRAMES`, 2). The decoder's pool makes a surface only for
