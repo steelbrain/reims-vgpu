@@ -46,7 +46,7 @@ use crate::core::raise::{OnFault, Raise, RaiseResult};
 use crate::core::sync::{Mutex, MutexGuard};
 use metal2vulkan_runtime as rt;
 
-use super::diag::{Point, Target};
+use super::diag::{InBuffer, Point, Target};
 use super::tiled::Tiled;
 use super::unbuilt::{Unbuilt, refuse};
 use super::{RtBuffer, RtObj, RtPlatform, RtTexture};
@@ -773,7 +773,8 @@ struct PassAttachment {
 
 /// A texture an attachment names: its pixel format, type, sample count, size, usage and storage
 /// mode, and how it was made (`super::diag::Made::made_as`: `drawable` for a window
-/// swapchain's).
+/// swapchain's), with a texture over a buffer's bytes per row, offset in the buffer and the
+/// buffer's length, as its make gave them (`super::diag::Made::in_buffer`).
 struct AttachedTexture {
     /// Its pixel format.
     format: rt::PixelFormat,
@@ -789,6 +790,8 @@ struct AttachedTexture {
     storage: rt::StorageMode,
     /// How it was made.
     made_as: &'static str,
+    /// Where it lies in the buffer it was made over, where it was made over one.
+    in_buffer: Option<InBuffer>,
 }
 
 impl AttachedTexture {
@@ -803,6 +806,7 @@ impl AttachedTexture {
             usage: d.usage.as_raw(),
             storage: d.storage_mode,
             made_as: t.made().made_as(),
+            in_buffer: t.made().in_buffer(),
         }
     }
 }
@@ -874,7 +878,11 @@ impl std::fmt::Display for AttachedTexture {
             f,
             "{:?} {:?} {width}x{height}x{depth}, {} samples, usage {:#x}, storage {:?}, {}",
             self.format, self.texture_type, self.samples, self.usage, self.storage, self.made_as
-        )
+        )?;
+        if let Some(in_buffer) = self.in_buffer {
+            write!(f, " ({in_buffer})")?;
+        }
+        Ok(())
     }
 }
 
@@ -937,6 +945,7 @@ mod tests {
             usage: 0x4,
             storage: rt::StorageMode::Private,
             made_as: "ordinary",
+            in_buffer: None,
         };
         let colour = PassAttachment {
             point: Point::Color(0),
@@ -986,6 +995,96 @@ mod tests {
             "a pass of 0 attachments, render target 16x16, depth store Store, stencil store \
              MultisampleResolve"
         );
+    }
+
+    /// A refused pass's detail names where a texture over a buffer lies in it, as its make gave
+    /// it: its bytes per row, its offset in the buffer and the buffer's length, after how it was
+    /// made, a resolve texture's so too.
+    #[test]
+    fn a_refused_pass_s_detail_names_where_an_over_buffer_texture_lies() {
+        use rt::{LoadAction, PixelFormat, StoreAction, TextureType};
+        let colour = PassAttachment {
+            point: Point::Color(0),
+            texture: AttachedTexture {
+                format: PixelFormat::BGRA8Unorm,
+                texture_type: TextureType::Type2DMultisample,
+                samples: 4,
+                size: [640, 480, 1],
+                usage: 0x4,
+                storage: rt::StorageMode::Private,
+                made_as: "ordinary",
+                in_buffer: None,
+            },
+            at: [0, 0],
+            actions: (LoadAction::Clear, StoreAction::MultisampleResolve),
+            resolve: Some((
+                AttachedTexture {
+                    format: PixelFormat::BGRA8Unorm,
+                    texture_type: TextureType::Type2D,
+                    samples: 1,
+                    size: [640, 480, 1],
+                    usage: 0x5,
+                    storage: rt::StorageMode::Managed,
+                    made_as: "over-buffer",
+                    in_buffer: Some(InBuffer {
+                        bytes_per_row: 2560,
+                        offset: 256,
+                        buffer_length: 1_229_056,
+                    }),
+                },
+                [0, 0],
+            )),
+            clear_depth: None,
+        };
+        let what = PassDetail {
+            attachments: vec![colour],
+            stores: (StoreAction::DontCare, StoreAction::DontCare),
+            size: [640, 480],
+        };
+        assert_eq!(
+            what.to_string(),
+            "a pass of 1 attachments, render target 640x480, depth store DontCare, stencil store \
+             DontCare; colour 0 BGRA8Unorm Type2DMultisample 640x480x1, 4 samples, usage 0x4, \
+             storage Private, ordinary at level 0 slice 0, load Clear, store \
+             MultisampleResolve, resolve into BGRA8Unorm Type2D 640x480x1, 1 samples, usage 0x5, \
+             storage Managed, over-buffer (bytes per row 2560, offset 256, buffer length 1229056) \
+             at level 0 slice 0"
+        );
+    }
+
+    /// On the GPU the test holds: a texture made over a buffer
+    /// (`newTextureWithDescriptor:offset:bytesPerRow:`) names, as an attachment of a refused pass,
+    /// its bytes per row, its offset in the buffer and the buffer's length as its make gave them;
+    /// a texture of its own names none.
+    #[test]
+    fn an_over_buffer_texture_names_where_it_lies_on_vulkan() {
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Buffer as _;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let buffer = device.new_buffer_of_length(on, 12288, 0);
+        let buffer = buffer.expect("never a raise").expect("a buffer");
+        let descriptor = platform.texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width: 64,
+            height: 4,
+            usage: 0x1,
+            ..TextureDesc::default()
+        });
+        let texture = buffer.new_texture(on, &descriptor, 4096, 256);
+        let texture = texture
+            .expect("never a raise")
+            .expect("a texture over the buffer");
+        let named = AttachedTexture::of(&texture).to_string();
+        assert!(
+            named.ends_with(", over-buffer (bytes per row 256, offset 4096, buffer length 12288)"),
+            "{named}"
+        );
+        let own = device.new_texture(on, &descriptor);
+        let own = own.expect("never a raise").expect("a texture");
+        let named = AttachedTexture::of(&own).to_string();
+        assert!(named.ends_with(", ordinary"), "{named}");
     }
 
     /// A mipmapped 2D descriptor has the levels of its larger side down to 1×1; one not mipmapped

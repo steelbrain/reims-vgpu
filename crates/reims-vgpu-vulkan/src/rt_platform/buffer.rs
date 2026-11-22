@@ -229,7 +229,7 @@ use crate::gpu::device::descriptor_options;
 
 use super::copied::Kind;
 use super::device::RtDevice;
-use super::diag::{Call, ImportPath, Made, Shape};
+use super::diag::{Call, ImportPath, InBuffer, Made, Shape};
 use super::texture::{self, RtTexture, refused_metal};
 use super::tiled::{self, Tiled};
 use super::unbuilt::{Unbuilt, refuse_create, rt_refused, rt_refused_create};
@@ -2550,7 +2550,8 @@ fn texel_bytes(desc: &TextureDesc, offset: u64, bytes_per_row: u64, length: u64)
 impl RtObj<RtBuffer> {
     /// The texture `sel` makes of `descriptor` over the buffer's bytes from `offset`, rows
     /// `bytes_per_row` apart (`super::texture::make_over`), which keeps what bytes of the buffer
-    /// it lies over (`RtTexture::over`).
+    /// it lies over (`RtTexture::over`), and its diagnostics where it lies in the buffer
+    /// (`super::diag::Made::in_buffer`).
     pub(super) fn texture(
         &self,
         sel: &'static str,
@@ -2564,7 +2565,12 @@ impl RtObj<RtBuffer> {
             made.new_texture(d, index, offset, bytes_per_row)
         };
         let held = (self.options, texture::STORAGE_BITS);
-        let diag = |shape: &Shape| Made::over_buffer(made, shape, offset, bytes_per_row);
+        let in_buffer = InBuffer {
+            bytes_per_row,
+            offset,
+            buffer_length: self.byte_length(),
+        };
+        let diag = |shape: &Shape| Made::over_buffer(made, shape, in_buffer);
         let (desc, copied) = (descriptor.desc(), self.copied.as_ref());
         let texture = texture::make_over(&self.device, sel, &desc, held, over, diag, copied);
         self.lies_under(texture.as_ref(), &desc, offset, bytes_per_row);

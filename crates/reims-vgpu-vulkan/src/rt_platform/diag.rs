@@ -240,6 +240,9 @@ pub struct Made {
     over: Option<Over>,
     /// The block of the buffer it lies over; a view's, its texture's; `None` for any other.
     block: Option<rt::BlockId>,
+    /// A texture over a buffer's place in it, as its make gave it; `None` for any other, a view of
+    /// one among them.
+    in_buffer: Option<InBuffer>,
     /// A guest surface texture's plane ([`surface_texture`]).
     on_plane: OnceLock<OnPlane>,
     /// It is a view of a guest surface texture, or of a view of one ([`plane_view`]).
@@ -260,6 +263,33 @@ pub struct Shape {
     pub usage: u64,
 }
 
+/// Where a texture over a buffer's bytes lies in the buffer, as its make
+/// (`newTextureWithDescriptor:offset:bytesPerRow:`, or the platform's own over a buffer) gave it,
+/// for the lines that name such a texture ([`Made::in_buffer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InBuffer {
+    /// Its rows' distance apart in bytes.
+    pub bytes_per_row: u64,
+    /// Its first byte's offset in the buffer.
+    pub offset: u64,
+    /// The buffer's length, as `length` answers it.
+    pub buffer_length: u64,
+}
+
+impl std::fmt::Display for InBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let InBuffer {
+            bytes_per_row,
+            offset,
+            buffer_length,
+        } = self;
+        write!(
+            f,
+            "bytes per row {bytes_per_row}, offset {offset}, buffer length {buffer_length}"
+        )
+    }
+}
+
 /// The process's next texture number.
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -274,7 +304,7 @@ impl Made {
             call == Call::SurfaceImage,
             shape,
             (0, 0),
-            (None, None),
+            (None, None, None),
         )
     }
 
@@ -295,7 +325,7 @@ impl Made {
             of.surface,
             &shape,
             (level, slice),
-            (None, of.block),
+            (None, of.block, None),
         );
         if of.of_a_plane() {
             made.of_plane.store(true, Relaxed);
@@ -313,20 +343,15 @@ impl Made {
         self.on_plane.get().is_some() || self.of_plane.load(Relaxed)
     }
 
-    /// A texture of `shape` over `buffer`'s bytes from `offset`, rows `bytes_per_row` apart:
-    /// with what rt copies of it where the buffer's block was imported ([`imported`]).
-    pub fn over_buffer(
-        buffer: &rt::Buffer,
-        shape: &Shape,
-        offset: u64,
-        bytes_per_row: u64,
-    ) -> Arc<Made> {
+    /// A texture of `shape` over `buffer`'s bytes where `in_buffer` places it: with what rt
+    /// copies of it where the buffer's block was imported ([`imported`]).
+    pub fn over_buffer(buffer: &rt::Buffer, shape: &Shape, in_buffer: InBuffer) -> Arc<Made> {
         let id = NEXT.fetch_add(1, Relaxed);
         let image = Image::Buffer {
             block: buffer.block().get(),
             offset: buffer.offset(),
         };
-        let over = Over::of(buffer, shape, offset, bytes_per_row);
+        let over = Over::of(buffer, shape, in_buffer.offset, in_buffer.bytes_per_row);
         let block = Some(buffer.block());
         Made::of(
             id,
@@ -335,8 +360,14 @@ impl Made {
             false,
             shape,
             (0, 0),
-            (over, block),
+            (over, block, Some(in_buffer)),
         )
+    }
+
+    /// Where it lies in the buffer it was made over, as its make gave it: `None` but for a
+    /// texture over a buffer ([`Made::over_buffer`]).
+    pub fn in_buffer(&self) -> Option<InBuffer> {
+        self.in_buffer
     }
 
     fn of(
@@ -346,7 +377,7 @@ impl Made {
         surface: bool,
         shape: &Shape,
         (level, slice): (u32, u32),
-        (over, block): (Option<Over>, Option<rt::BlockId>),
+        (over, block, in_buffer): (Option<Over>, Option<rt::BlockId>, Option<InBuffer>),
     ) -> Arc<Made> {
         Arc::new(Made {
             id,
@@ -363,6 +394,7 @@ impl Made {
             slice,
             over,
             block,
+            in_buffer,
             on_plane: OnceLock::new(),
             of_plane: AtomicBool::new(false),
         })
@@ -2633,7 +2665,7 @@ mod tests {
                 false,
                 &shape,
                 (0, 0),
-                (None, None),
+                (None, None, None),
             )
         };
         let over = || over_at(7, 0x4000);
