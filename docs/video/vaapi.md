@@ -512,8 +512,11 @@ answers for its device, `rt_platform::HostGpu`). The arm
   no GPU copy: …` where the device made the session no copier), its GPU
   copies at its end, as `a decode session's pictures copied by the GPU
   into their device caches from a scratch the driver's video processing
-  wrote: 300, … ms each from the driver's write to the copy's end, … ms
-  at most`,
+  wrote: 303, 5.087 ms each from the driver's write to the copy's end,
+  8.387 ms at most` (measured on an RX 550, radeonsi, in a cold boot's
+  Safari video beside the guest's 3D work, 2026-11-21: a 1080p HEVC
+  session; its 1080p H.264 session's 591 took 2.145 ms each, 30.980 ms at
+  most),
   and its counts, as `a session ended after 300 decodes: landed 300 in the
   surface's pages, by the hardware; 0 skipped, 0 failed`, followed by how
   many surfaces' memory its outputs lay in and the most of it live at once
