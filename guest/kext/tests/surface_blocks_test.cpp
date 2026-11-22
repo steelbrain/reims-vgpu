@@ -314,7 +314,8 @@ void dormantDeferredCap()
 // A SURFACE_PAGES naming a block's pages: named, refused, or never answered, where the host may
 // yet take them and they stay wired.
 // A dormant block ages from its sleep: it goes once it has slept the age, and the next to age is
-// the earliest of those not yet aged and not pending; a block held again ages from its next sleep.
+// the earliest of those not yet aged, not pending and not deferred; a block held again ages from
+// its next sleep, and a deferred one never ages.
 void aging()
 {
 	RgfxSurfaceEntry entries[3] = {};
@@ -343,6 +344,11 @@ void aging()
 	check(rgfxSurfaceNextAge(t, 1050, age, &at) && at == 1100, "nor is it next");
 	g.pending = false;
 	check(rgfxSurfaceNextAge(t, 1150, age, &at) && at == 1200, "it is once posted");
+	// A deferred one neither ages nor is next: it goes past its caps alone.
+	g.deferred = true;
+	check(!rgfxSurfaceAged(g, 5000, age), "a deferred block does not age");
+	check(rgfxSurfaceNextAge(t, 1150, age, &at) && at == 1300, "nor is it next");
+	g.deferred = false;
 	// Held again, and asleep again later: timed from the new sleep.
 	rgfxSurfaceWake(t, e);
 	check(e.sleptAt == 0 && !rgfxSurfaceAged(e, 5000, age), "held again, it does not age");

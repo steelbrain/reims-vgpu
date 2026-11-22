@@ -1771,7 +1771,7 @@
 // and the same for its life, so the kext's one read at its start holds. The kext defers no block
 // past it. A dormant deferred block, which no process holds and whose bytes the device's cache
 // alone holds, goes once the dormant deferred blocks pass the smaller of half of it and an eighth
-// of the guest's RAM, the oldest first, or once it has slept 10 s, as every dormant block does.
+// of the guest's RAM, the oldest first; unlike a dormant block not deferred, it never ages out.
 // It reads 0 where the host offers neither feature, as at any offset a host does not know.
 #define RGFX_REG_DEFERRED_BUDGET_LO 48
 

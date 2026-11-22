@@ -28,10 +28,11 @@
 // of its own memory keeps a surface's copy past the textures over it. The dormant blocks are
 // let go past kRgfxDormantMaxBlocks of them or a byte cap the caller sets (rgfxSurfaceOverCaps),
 // those of volatile surfaces first, then the oldest, and for the causes RgfxDormantCause names;
-// and each once it has slept kRgfxDormantAgeMs (rgfxSurfaceAged), the host's age for a shape no
-// texture references, so a cache no process asked for that long goes, with its wired pages, as
-// the host's images of a cache whose textures went do. A revive after that makes a new block,
-// which the host fills from the pages.
+// and each not deferred once it has slept kRgfxDormantAgeMs (rgfxSurfaceAged), the host's age
+// for a shape no texture references, so a cache no process asked for that long goes, with its
+// wired pages, as the host's images of a cache whose textures went do. A revive after that makes
+// a new block, which the host fills from the pages. A deferred block does not age: it goes past
+// its caps and for the other causes alone.
 //
 // A cached block in place may be deferred (RGFX_SURFACE_PAGES_DEFERRED): its surface had no
 // pages at its first ask, a fresh surface only the GPU has touched, and the host's device cache
@@ -686,21 +687,23 @@ inline int32_t rgfxSurfaceOverCaps(const RgfxSurfaceTable &t, uint64_t maxBytes,
 
 // Whether the entry is dormant and slept `age` or more before `now`, both on the caller's clock
 // (kRgfxDormantAgeMs in its units), so it goes for its age. One still pending, its last holder's
-// BLOCK_UNSHARE not yet posted, does not, as rgfxSurfaceOldestDormant's does not.
+// BLOCK_UNSHARE not yet posted, does not, as rgfxSurfaceOldestDormant's does not, nor does a
+// deferred one, which never ages.
 inline bool rgfxSurfaceAged(const RgfxSurfaceEntry &e, uint64_t now, uint64_t age)
 {
-	return e.used && e.dormant && !e.pending && now >= age && e.sleptAt <= now - age;
+	return e.used && e.dormant && !e.pending && !e.deferred && now >= age &&
+	       e.sleptAt <= now - age;
 }
 
 // When the next dormant entry not yet aged at `now` ages (rgfxSurfaceAged): its sleep plus `age`,
-// the earliest of those not pending, in `*at`; false where there is none.
+// the earliest of those neither pending nor deferred, in `*at`; false where there is none.
 inline bool rgfxSurfaceNextAge(const RgfxSurfaceTable &t, uint64_t now, uint64_t age,
                                uint64_t *at)
 {
 	bool any = false;
 	for (uint32_t i = 0; t.dormantCount && i < t.capacity; i++) {
 		const RgfxSurfaceEntry &e = t.entries[i];
-		if (!e.used || !e.dormant || e.pending || rgfxSurfaceAged(e, now, age))
+		if (!e.used || !e.dormant || e.pending || e.deferred || rgfxSurfaceAged(e, now, age))
 			continue;
 		const uint64_t due = e.sleptAt + age;
 		if (!any || due < *at)
