@@ -2303,6 +2303,119 @@ mod tests {
         );
     }
 
+    /// A decoder's table of one buffer, walked at the loss as a graphics device's is
+    /// ([`buffer_parts`]).
+    struct OneBuffer {
+        id: u64,
+        buffer: RtObj<RtBuffer>,
+    }
+
+    impl LiveObjects for OneBuffer {
+        fn walk(&self) -> Walked {
+            let mut walked = Walked {
+                contexts: 1,
+                ..Walked::default()
+            };
+            walked.add(buffer_parts(3, self.id, false, &self.buffer), false);
+            walked
+        }
+
+        fn live(&self) -> bool {
+            true
+        }
+    }
+
+    /// On the GPU the test holds, an access in the import a live no-copy buffer lies in is placed
+    /// in the import's block at the loss, named with the kind of import it is, after another
+    /// import was made and released, its record gone (`super::super::diag::import_released`).
+    #[test]
+    fn a_live_import_s_fault_is_placed_in_its_block_past_a_released_one_on_vulkan() {
+        use std::alloc::Layout;
+        use std::sync::atomic::Ordering::{Acquire, Release};
+
+        use super::super::diag::import_range;
+        use crate::core::host::HostPtr;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::device::{GpuDevice as _, NoCopyDeallocator};
+        use crate::core::platform::host_range::HostRange;
+        use crate::core::raise::OnFault;
+
+        let platform = super::super::RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let layout = Layout::from_size_align(0x20000, 0x10000).expect("a layout");
+        // SAFETY: the layout's size is not 0.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+        // A no-copy buffer of a page `offset` bytes into the memory, `freed` once its deallocator
+        // ran.
+        let over = |offset: usize, freed: &Arc<AtomicBool>| {
+            let done = Arc::clone(freed);
+            let deallocator: NoCopyDeallocator = Box::new(move || done.store(true, Release));
+            let at = HostPtr::from_ptr(memory.wrapping_add(offset));
+            // SAFETY: the memory stays allocated until both deallocators ran (below).
+            let bytes = unsafe { HostRange::new(at, 0x1000) };
+            let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(deallocator));
+            made.expect("never a raise").expect("a no-copy buffer")
+        };
+        let block_of = |buffer: &RtObj<RtBuffer>| buffer.made_rt().expect("made by rt").block();
+        let waits_for = |done: &dyn Fn() -> bool| {
+            for _ in 0..1000 {
+                if done() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            done()
+        };
+
+        // One made and released: its record goes.
+        let gone_freed = Arc::new(AtomicBool::new(false));
+        let gone = over(0x1_0000, &gone_freed);
+        let gone_block = block_of(&gone);
+        assert!(import_range(gone_block).is_some(), "no record of the live import");
+        drop(gone);
+        assert!(waits_for(&|| gone_freed.load(Acquire)), "the deallocator never ran");
+        assert!(import_range(gone_block).is_none(), "the released import's record stayed");
+
+        // The live one's, at the loss.
+        let freed = Arc::new(AtomicBool::new(false));
+        let live = over(0, &freed);
+        let block = block_of(&live);
+        let import = import_range(block).expect("the live import's record");
+        let kind = import_kind(live.device_known(), block).expect("the kind of import it is");
+        let id = 0x300_0000_0007;
+        let watch = FaultWatch::default();
+        watch.watch(Arc::new(OneBuffer { id, buffer: live }));
+        let fault = rt::DeviceFault {
+            description: "a fault".to_owned(),
+            accesses: vec![rt::FaultAddress {
+                kind: Kind::READ_INVALID,
+                address: import.gpu_address,
+                precision: 0x10,
+            }],
+            instructions: Vec::new(),
+            vendor: Vec::new(),
+            places: Vec::new(),
+        };
+        let lines = watch.lines("GPU (10de:2204)", Some(&fault), LOSS);
+        let named = MappedBlock {
+            what: format!("buffer {id:#x}'s block {}", block.get()),
+            class: import.class,
+            import: Some(kind),
+            gpu_address: import.gpu_address,
+            len: import.len,
+        };
+        let placed = format!("in mapped block {} at offset 0x0", block_text(&named));
+        let access = lines.iter().find(|l| l.contains("READ_INVALID"));
+        let access = access.expect("the access's line");
+        assert!(access.contains(&placed), "{placed:?} not in {access}");
+        drop(watch);
+        assert!(waits_for(&|| freed.load(Acquire)), "the deallocator never ran");
+        // SAFETY: both deallocators ran: rt holds no import of the memory.
+        unsafe { std::alloc::dealloc(memory, layout) };
+    }
+
     /// Where rt read no report of the fault, its one line says so.
     #[test]
     fn a_loss_with_no_fault_report_says_so() {

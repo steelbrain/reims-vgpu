@@ -1633,7 +1633,8 @@ fn range_of(
 /// where they never change (`PagesAccess::Unchanging`). rt's release of the import runs
 /// `then`, after the import is freed; a copy's runs it as the copy goes ("A copy at the refusal
 /// point"), which the caller holds, from an object it makes over the block (`super::copied::of`),
-/// until its `super::copied::Fresh` of the block drops. `None` where Metal or rt refuses it,
+/// until its `super::copied::Fresh` of the block drops; the release lets go of the import's record
+/// in `super::diag` first (`super::diag::import_released`). `None` where Metal or rt refuses it,
 /// counted, `then` dropped unrun.
 pub(super) fn import_pages(
     device: &RtObj<RtDevice>,
@@ -1653,7 +1654,18 @@ pub(super) fn import_pages(
     };
     let codes = crate::answer::making().unwrap_or(IMPORTS_UNNAMED);
     let len = end - start;
-    let then: Then = Arc::new(Mutex::new(Some(Box::new(then))));
+    // The import's block, once it is made ([`made_import`]): its record in the diagnostics goes
+    // at its release.
+    let noted: Arc<OnceLock<rt::BlockId>> = Arc::new(OnceLock::new());
+    let then: Then = {
+        let noted = Arc::clone(&noted);
+        Arc::new(Mutex::new(Some(Box::new(move || {
+            if let Some(&block) = noted.get() {
+                super::diag::import_released(block);
+            }
+            then();
+        }))))
+    };
     if access.read_only() {
         let why = "pages whose GPU writes are dropped";
         let made = copied(
@@ -1669,7 +1681,7 @@ pub(super) fn import_pages(
             },
         )?;
         crate::answer::count_kind(IMPORTS_READ_ONLY);
-        return Some(made_import(sel, codes, made, first - start));
+        return Some(made_import(sel, codes, made, first - start, &noted));
     }
     // Held from before the pages' mappings are asked about, so no fold maps them through dma-bufs
     // before rt takes their pointer, nor while rt holds it.
@@ -1678,22 +1690,25 @@ pub(super) fn import_pages(
     {
         if crate::os::through_dma_bufs(at, len) {
             let made = unpinnable(device, sel, codes, (at, len), &then, held)?;
-            return Some(made_import(sel, codes, made, first - start));
+            return Some(made_import(sel, codes, made, first - start, &noted));
         }
     }
     let made = by_pointer(device, sel, codes, (at, len), &then, held)?;
-    Some(made_import(sel, codes, made, first - start))
+    Some(made_import(sel, codes, made, first - start, &noted))
 }
 
 /// [`import_pages`]'s import made, `made` its block and the offset of the pages' first byte in it,
-/// the bytes `skip` past that byte: counted, the block and the bytes' offset in it.
+/// the bytes `skip` past that byte: counted, and noted in `super::diag` and in `noted`, whose
+/// block the import's release lets go of there; the block and the bytes' offset in it.
 fn made_import(
     sel: &'static str,
     codes: crate::answer::MadeCodes,
     (block, offset): (rt::Block, u64),
     skip: u64,
+    noted: &OnceLock<rt::BlockId>,
 ) -> (rt::Block, u64) {
     imports_rise();
+    let _ = noted.set(block.id);
     super::diag::imported(&block, sel);
     crate::answer::count_made(codes);
     (block, offset + skip)

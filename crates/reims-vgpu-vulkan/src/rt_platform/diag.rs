@@ -683,7 +683,9 @@ struct Imported {
     class: rt::MemoryClass,
 }
 
-/// The blocks imported, by rt's number, which rt never reuses, with where and their ranges.
+/// The live imports' blocks, by rt's number, which rt never reuses, with where and their ranges:
+/// each noted at its import ([`imported`]) and let go at rt's release of it ([`import_released`]),
+/// so the record holds the imports live now and does not grow with each one a session makes.
 static IMPORTED: Mutex<BTreeMap<rt::BlockId, Imported>> = Mutex::new(BTreeMap::new());
 
 /// The imports by origin.
@@ -719,6 +721,13 @@ pub fn imported(block: &rt::BlockInfo, sel: &'static str) {
     *IMPORTS.lock().entry(origin).or_insert(0) += 1;
 }
 
+/// Lets go of the record of block `block` as an import ([`imported`]), at rt's release of the
+/// import (`super::buffer::import_pages`), once rt freed it or its copy went. The imports by origin
+/// keep their count.
+pub fn import_released(block: rt::BlockId) {
+    IMPORTED.lock().remove(&block);
+}
+
 /// An import block's range and storage mode, and whether it is a copy of its pages
 /// ([`import_range`]).
 pub(super) struct ImportRange {
@@ -732,10 +741,10 @@ pub(super) struct ImportRange {
     pub(super) copy: bool,
 }
 
-/// Import block `block`'s range, where it is an import the device made ([`imported`]), for a lost
-/// device's fault (`super::fault`). The record is kept for the process's life, as the origins'
-/// are: it says nothing of whether the import lives, so the fault asks only of blocks it knows
-/// live (a live buffer's, a live dma-buf import).
+/// Import block `block`'s range, where it is a live import the device made ([`imported`]), for a
+/// lost device's fault (`super::fault`). The record holds each import from its make to its
+/// release ([`import_released`]), and the fault asks only of blocks it knows live (a live
+/// buffer's, a known block's, a live dma-buf import), each of whose imports it holds.
 pub(super) fn import_range(block: rt::BlockId) -> Option<ImportRange> {
     let imported = *IMPORTED.lock().get(&block)?;
     Some(ImportRange {
@@ -2959,5 +2968,87 @@ mod tests {
         has("descriptor max_call_stack_depth: 3");
         has("descriptor max_total_threads_per_threadgroup: None");
         has(&format!("descriptor buffers: {:?}", d.buffers));
+    }
+
+    /// On the GPU the test holds, an import's record ([`imported`]) is kept while the no-copy
+    /// buffer over it lives and goes at its release, before the buffer's deallocator runs: for an
+    /// import of the host's pages as rt takes them (by their pointer where it can) and for a
+    /// read-only one's copy. The record holds the live imports alone, and does not grow with each
+    /// import a session makes; the imports by origin keep their count.
+    #[test]
+    fn an_import_s_record_goes_at_its_release_on_vulkan() {
+        use std::alloc::Layout;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering::{Acquire, Release};
+
+        use super::super::buffer::{READ_ONLY, RtBuffer};
+        use crate::core::host::HostPtr;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::device::{GpuDevice as _, NoCopyDeallocator};
+        use crate::core::platform::host_range::HostRange;
+        use crate::core::platform::values::{BufferDesc, OptionSet};
+        use crate::core::raise::OnFault;
+
+        let platform = super::super::RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let block_of = |buffer: &RtObj<RtBuffer>| buffer.made_rt().expect("made by rt").block();
+        let waits_for = |done: &dyn Fn() -> bool| {
+            for _ in 0..1000 {
+                if done() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            done()
+        };
+        let origins = || IMPORTS.lock().values().sum::<u64>();
+        let counted = origins();
+        let layout = Layout::from_size_align(0x20000, 0x10000).expect("a layout");
+        // SAFETY: the layout's size is not 0.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+
+        // The pages as rt takes them.
+        let freed = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&freed);
+        let deallocator: NoCopyDeallocator = Box::new(move || done.store(true, Release));
+        // SAFETY: the memory stays allocated until both deallocators ran (below).
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(memory), 0x1000) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(deallocator));
+        let buffer = made.expect("never a raise").expect("a no-copy buffer");
+        let block = block_of(&buffer);
+        assert!(import_range(block).is_some(), "no record of the live import");
+        drop(buffer);
+        assert!(waits_for(&|| freed.load(Acquire)), "the deallocator never ran");
+        assert!(import_range(block).is_none(), "the released import's record stayed");
+
+        // A read-only one's copy.
+        let given = Arc::new(AtomicBool::new(false));
+        let take = Arc::clone(&given);
+        let at = HostPtr::from_ptr(memory.wrapping_add(0x10000));
+        // SAFETY: as above.
+        let bytes = unsafe { HostRange::new(at, 0x1000) };
+        let made = device.new_buffer(BufferDesc {
+            length: 0x1000,
+            options: vec![OptionSet::ResourceOptions(READ_ONLY)],
+            pinned_gpu_address: None,
+            contents: Some(bytes),
+            no_copy: true,
+            deallocator: Some(Box::new(move |_, _| take.store(true, Release))),
+            zero_from: None,
+        });
+        let buffer = made
+            .expect("never a raise")
+            .expect("a read-only no-copy buffer");
+        let block = block_of(&buffer);
+        let copy = import_range(block).expect("no record of the live copy's import");
+        assert!(copy.copy, "a read-only import is a copy");
+        drop(buffer);
+        assert!(waits_for(&|| given.load(Acquire)), "the deallocator never ran");
+        assert!(import_range(block).is_none(), "the released copy's record stayed");
+        assert!(origins() >= counted + 2, "the imports by origin lost their count");
+        // SAFETY: both deallocators ran: rt holds no import of the memory.
+        unsafe { std::alloc::dealloc(memory, layout) };
     }
 }
