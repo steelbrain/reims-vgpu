@@ -44,7 +44,9 @@
 //!   have left the pages' bytes: Metal leaves a failed decode's output undefined, and a new
 //!   surface's texels are the kernel's zero-filled pages unless its client wrote them first,
 //!   which a read-write lock does and the use's newer generation then fills (below); no other
-//!   memory's bytes reach the guest, the cache made as zeros. A command
+//!   memory's bytes reach the guest, the cache made as zeros, and its surface's planes, whose
+//!   fills the decode takes as met too, zeroed where its picture does not write them, by the
+//!   host's video or by the fill of a decode that answers none (`exported`). A command
 //!   buffer names each cached surface it uses (`RGFX_OP_SURFACE_USE`), with the CPU's generation
 //!   of the surface when it was committed. Where the cache holds an older generation, or none,
 //!   the cache is filled from the pages before the buffer's work; a buffer of the same generation
@@ -4367,9 +4369,9 @@ impl<P: Platform> SurfaceCaches<P> {
     /// generation `generation`: where the fill owed is of that generation or a newer one, and no
     /// device of the host wrote the pages since the make. The cache holds that generation, its
     /// zeros until the picture lands ([`SurfaceCache::zeros`]), and copies into the pages only
-    /// the planes' rows where the kext gave no layout ([`SurfaceCache::texels`]). On Windows,
-    /// where its surface's planes lie over Direct3D 11 textures, its plane shapes' fills are
-    /// taken as met too (`exported::take_drawn_fill`).
+    /// the planes' rows where the kext gave no layout ([`SurfaceCache::texels`]). Where the cache
+    /// has its surface, its plane shapes' fills are taken as met too, as the picture lands over
+    /// them (`exported::take_plane_fills`).
     fn take_decoded(&mut self, block: u64, generation: u64, planes: &[PagesPlane; 2]) {
         let host = self.watched.writes(block);
         let Some(cache) = self.by_block.get_mut(&block) else {
@@ -4385,8 +4387,7 @@ impl<P: Platform> SurfaceCaches<P> {
         cache.first_fill = None;
         cache.owner = None;
         cache.zeros = true;
-        #[cfg(windows)]
-        exported::take_drawn_fill(&cache.surface, &mut cache.shapes, &mut self.counts.shapes);
+        exported::take_plane_fills(&cache.surface, &mut cache.shapes, &mut self.counts.shapes);
         if cache.texels.is_none() {
             cache.texels = Some(texel_spans(planes));
             cache.planes = planes.len();
@@ -5212,24 +5213,14 @@ impl<P: Platform> SurfaceCaches<P> {
     /// the buffer first, so the new ones take its writes (rule 2; the module doc of `shapes`);
     /// signalled as [`Self::fill`] signals, so the uses counted after it wait for it on the GPU
     /// ([`Self::wait_last_fill`]). The shapes the cache's zeros fill take none first
-    /// ([`Self::take_zeros`]). The transfer event's value at which it is done; `None` where it
-    /// made none, as where nothing was left to fill.
+    /// ([`Self::take_zeros`]). A fill that would copy the cache's buffer's zeros
+    /// ([`SurfaceCache::fills_zeros`]) into plane shapes alone, each taking a clear
+    /// ([`shapes::clears_fit`]) and its surface holding that clear (`exported`'s
+    /// `CacheSurface::clear_of`), clears their images instead, with the buffer's memory left
+    /// unmade (the module doc of `shapes`, "Zeros"; [`shapes::fill_clears`]); a fill that owes
+    /// another shape copies through the buffer, its memory made. The transfer event's value at
+    /// which it is done; `None` where it made none, as where nothing was left to fill.
     fn fill_shapes(&mut self, device: &P::Device, block: u64) -> RaiseResult<Option<u64>> {
-        self.fill_shapes_over(device, block, None)
-    }
-
-    /// [`Self::fill_shapes`], given `clears`, the platform to make render passes with, where the
-    /// fill may clear: a fill that would copy the cache's buffer's zeros
-    /// ([`SurfaceCache::fills_zeros`]) into shapes that each take a clear
-    /// ([`shapes::clears_fit`]) clears their images instead, with the buffer's memory left unmade
-    /// (the module doc of `shapes`, "Zeros"; [`shapes::fill_clears`]). A fill that owes another
-    /// shape copies through the buffer, its memory made, as one not given `clears` does.
-    pub(super) fn fill_shapes_over(
-        &mut self,
-        device: &P::Device,
-        block: u64,
-        clears: Option<&P>,
-    ) -> RaiseResult<Option<u64>> {
         self.touch_shapes(block);
         if self.take_zeros(block) {
             return Ok(None);
@@ -5250,12 +5241,15 @@ impl<P: Platform> SurfaceCaches<P> {
             && cache.fills_straight(self.spares.piece)
             && !cache.shapes.iter().any(|s| s.dirty && !s.owed);
         // A buffer that holds no memory and would fill its shapes with its zeros clears them
-        // instead, where `clears` is given and each takes a clear ("Zeros").
-        let clearing = clears.filter(|_| {
-            !straight && cache.fills_zeros() && shapes::clears_fit::<P>(&cache.shapes, |s| s.owed)
-        });
+        // instead, where each is a plane of the surface's that takes a clear ("Zeros").
+        let clearing = !straight
+            && cache.fills_zeros()
+            && shapes::clears_fit::<P>(&cache.shapes, |s| s.owed)
+            && (cache.shapes.iter())
+                .filter(|s| s.owed)
+                .all(|s| cache.surface.clear_of(&s.key).is_some());
         let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
-            if straight || clearing.is_some() {
+            if straight || clearing {
                 return true;
             }
             let made = cache.copy_through(MemoryFor::FillShapes);
@@ -5273,9 +5267,10 @@ impl<P: Platform> SurfaceCaches<P> {
         reserve.extend(self.left_over.remove(&block).unwrap_or_default());
         let owed: &dyn Fn(&shapes::Shape<P::Texture>) -> bool = &|s| s.owed;
         let mut filled = || -> RaiseResult<Vec<u64>> {
-            if let Some(platform) = clearing {
-                let counts = &mut self.counts.shapes;
-                shapes::fill_clears(platform, &cb, &mut cache.shapes, owed, counts)?;
+            if clearing {
+                let (surface, counts) = (&cache.surface, &mut self.counts.shapes);
+                let pass_of = |s: &shapes::Shape<P::Texture>| Ok(surface.clear_of(&s.key));
+                shapes::fill_clears::<P>(pass_of, &cb, &mut cache.shapes, owed, counts)?;
                 return Ok(Vec::new());
             }
             let staging = (timed, &self.spares, &mut reserve);
@@ -8454,6 +8449,17 @@ impl<P: Platform> Caches<P> {
             reserve_ahead(&mut state, device, &[(block, Way::In)]);
         }
         state.decoded(device, block, picture)
+    }
+
+    /// A decode into the block at `block`'s surface failed, answering no picture: where it took
+    /// the cache's first fill as met ([`SurfaceCache::zeros`]), the fill is made, on `device`, as
+    /// [`Self::decoded`] makes it for a decode that answers none; else nothing.
+    pub(crate) fn decode_failed(&self, device: Option<&P::Device>, block: u64) -> RaiseResult<()> {
+        let zeros = (self.lock().by_block.get(&block)).is_some_and(|cache| cache.zeros);
+        if !zeros {
+            return Ok(());
+        }
+        self.decoded(device, block, false)
     }
 
     /// The deferred block at `block`'s pages taken copied ([`SurfaceCaches::attach_copied`]),

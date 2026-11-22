@@ -1164,6 +1164,7 @@ fn a_short_picture_in_a_cache_s_surface_has_its_images_cleared_first() {
         bytes_per_row: laid[n].row_pitch,
         rows: descs[n].height,
         clear: Some(clears[n].clone_ref()),
+        zeros: false,
     };
     let mut stage = Stage {
         device: p.device(),
@@ -1190,6 +1191,88 @@ fn a_short_picture_in_a_cache_s_surface_has_its_images_cleared_first() {
     assert_eq!(passes[0].args, [Arg::obj(&clears[0])]);
     assert_eq!(passes[1].args, [Arg::obj(&clears[1])]);
     assert!(p.call_log().calls_to(FILL).is_empty());
+}
+
+/// A picture that fails to land in its planes in their cache's surface, where its decode took
+/// their fills as met (`SurfaceTarget::zeros`), has each plane's image cleared by its clear pass
+/// on the session's queue before its value is signalled, as the fill would have left them; where
+/// the decode took none, its planes are left as they were.
+#[cfg(unix)]
+#[test]
+fn a_picture_that_fails_to_land_in_planes_owed_zeros_has_them_cleared() {
+    use reims_vgpu_vulkan::core::platform::resource::{
+        SurfaceDesc, SurfaceHandle, SurfacePlaneDesc,
+    };
+    let p = FakePlatform::new();
+    p.world().set_auto_complete(Some(CompleteOn::Caller));
+    p.world().give_exported_surfaces(true);
+    let plane = |pixel_format, width, height| SurfacePlaneDesc {
+        pixel_format,
+        width,
+        height,
+        usage: 0x15,
+        rows_below: 0,
+    };
+    let descs = [plane(10, 96, 64), plane(30, 48, 32)];
+    let desc = SurfaceDesc {
+        handle: SurfaceHandle::DmaBuf,
+        pitch_multiple: 128,
+        start_multiple: 256,
+        planes: &descs,
+    };
+    let made = (p.device().new_exported_surface(OnFault::Return, &desc))
+        .unwrap()
+        .unwrap();
+    let laid = made.memory.layout().to_vec();
+    let life = MemoryLife::new();
+    let clears = [p.render_pass_descriptor(), p.render_pass_descriptor()];
+    let target = |n: usize, zeros: bool| SurfaceTarget {
+        memory: Arc::clone(&made.memory),
+        identity: life.identity(),
+        texture: made.planes[n].clone_ref(),
+        offset: laid[n].offset,
+        bytes_per_row: laid[n].row_pitch,
+        rows: descs[n].height,
+        clear: Some(clears[n].clone_ref()),
+        zeros,
+    };
+    let log = Log::default();
+    let answers = vec![Ok(Some(Picture::Fail)), Ok(Some(Picture::Fail))];
+    let s = session(&p, answers, &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    for (value, zeros) in [(1, true), (2, false)] {
+        let (luma, chroma) = planes(&cache, &cache, 96);
+        let (luma, chroma) = (
+            VideoPlane {
+                surface: Some(target(0, zeros)),
+                ..luma
+            },
+            VideoPlane {
+                surface: Some(target(1, zeros)),
+                ..chroma
+            },
+        );
+        let mark = p.call_log().mark();
+        let failed = s.decode(&decode(&bitstream, &[], (luma, chroma))).unwrap();
+        assert!(event_of(&s).wait_until_signaled_value(value, 10_000));
+        assert!(failed.landed.as_deref().is_some_and(Landed::failed));
+        let calls = p.call_log().since(mark);
+        let passes: Vec<_> = (calls.iter())
+            .filter(|c| c.sel == RENDER)
+            .map(|c| c.args.clone())
+            .collect();
+        let want = match zeros {
+            true => vec![vec![Arg::obj(&clears[0])], vec![Arg::obj(&clears[1])]],
+            false => Vec::new(),
+        };
+        assert_eq!(passes, want, "zeros {zeros}");
+        assert!(
+            !calls.iter().any(|c| c.sel == FILL),
+            "the cache's buffer takes no fill"
+        );
+    }
+    assert_eq!(s.counts.lock().failed, 2);
 }
 
 /// A 4:2:0 picture's extent: the luma's samples and rows, the chroma's pairs and rows, each half

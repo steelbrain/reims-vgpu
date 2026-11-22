@@ -629,6 +629,11 @@ pub struct SurfaceTarget<P: Platform> {
     /// clear and stored, for a picture shorter than the plane (`video_host`'s
     /// `Landing::writes_only`); `None` where the platform raised at its make.
     pub clear: Option<P::RenderPassDescriptor>,
+    /// The decode took the plane's fill as met (`surface_cache::exported`'s
+    /// `take_plane_fills`): its image holds undefined bytes until the picture lands, so a
+    /// picture that fails to land has it cleared to the zeros the fill would have left
+    /// (`video_host`'s `land_pictures`).
+    pub zeros: bool,
 }
 
 #[cfg(unix)]
@@ -643,6 +648,7 @@ impl<P: Platform> SurfaceTarget<P> {
             bytes_per_row: self.bytes_per_row,
             rows: self.rows,
             clear: self.clear.as_ref().map(|clear| clear.clone_ref()),
+            zeros: self.zeros,
         }
     }
 }
@@ -875,6 +881,53 @@ pub(super) fn decode_op<P: Platform>(
         return Ok(false);
     };
     let (m, rest) = read?;
+    let done = match decode_picture(tag, &m, rest, objs, session) {
+        Ok(done) => done,
+        Err(fault) => {
+            // A decode that fails answers no picture: a new output whose first fill the
+            // buffer's begin took as met, its planes' among it, takes the fill now, before
+            // anything reads the cache (`surface_cache`, "Fill").
+            let device = cb.device();
+            for block in objs.decode_blocks(m.luma_texture_obj_id, m.chroma_texture_obj_id) {
+                if let Err(raise) = (objs.surface_caches).decode_failed(device.as_ref(), block) {
+                    log::warn!(
+                        target: "reims_vgpu::graphics", kind:% = raise;
+                        "video op {tag:#06x}: the fill of the IOSurface block at {block:#x}'s new \
+                         device cache after its decode failed: {raise}"
+                    );
+                }
+            }
+            return Err(fault);
+        }
+    };
+    // The guest's decodes in flight, this one among them, as many as the spare surfaces of the
+    // caches over Direct3D 11 textures an ask keeps (`surface_cache`'s `exported`).
+    #[cfg(windows)]
+    if let EventRef::Shared(event) = session.event() {
+        let in_flight = done.value.saturating_sub(event.signaled_value());
+        objs.surface_caches.saw_decodes_in_flight(in_flight);
+    }
+    // A decoder's new output whose first fill the buffer's begin took as met holds the cache's
+    // zeros: a picture lands over them, and none makes the fill, before anything reads the cache
+    // (`surface_cache`, "Fill").
+    let device = done.skipped.then(|| cb.device()).flatten();
+    for block in objs.decode_blocks(m.luma_texture_obj_id, m.chroma_texture_obj_id) {
+        (objs.surface_caches).decoded(device.as_ref(), block, !done.skipped)?;
+    }
+    cb.encode_wait(Some(session.event()), done.value)?;
+    landings.extend(done.landed);
+    Ok(true)
+}
+
+/// The picture of decode op `tag`, `m` its body and `rest` the bytes after it, decoded on
+/// `session` ([`decode_op`]), once the buffers it runs after on other queues are done.
+fn decode_picture<P: Platform>(
+    tag: u16,
+    m: &DecodeOp,
+    rest: &[u8],
+    objs: &GraphicsDecoder<P>,
+    session: &Arc<dyn GraphicsVideoSession<P>>,
+) -> RaiseResult<Decoded> {
     if m.codec != session.codec() {
         return Err(op_fault(format_args!(
             "video op {tag:#06x}: a decode of codec {} on a session of codec {}",
@@ -916,24 +969,7 @@ pub(super) fn decode_op<P: Platform>(
     // After the buffers of other queues its command buffer runs after: the reads of the
     // output it would land over among them.
     objs.wait_for_order_on_cpu();
-    let done = session.decode(&decode)?;
-    // The guest's decodes in flight, this one among them, as many as the spare surfaces of the
-    // caches over Direct3D 11 textures an ask keeps (`surface_cache`'s `exported`).
-    #[cfg(windows)]
-    if let EventRef::Shared(event) = session.event() {
-        let in_flight = done.value.saturating_sub(event.signaled_value());
-        objs.surface_caches.saw_decodes_in_flight(in_flight);
-    }
-    // A decoder's new output whose first fill the buffer's begin took as met holds the cache's
-    // zeros: a picture lands over them, and none makes the fill, before anything reads the cache
-    // (`surface_cache`, "Fill").
-    let device = done.skipped.then(|| cb.device()).flatten();
-    for block in objs.decode_blocks(m.luma_texture_obj_id, m.chroma_texture_obj_id) {
-        (objs.surface_caches).decoded(device.as_ref(), block, !done.skipped)?;
-    }
-    cb.encode_wait(Some(session.event()), done.value)?;
-    landings.extend(done.landed);
-    Ok(true)
+    session.decode(&decode)
 }
 
 /// Decodes one encode op, `tag` of `codec`, its body at the front of `payload` and its settings

@@ -155,6 +155,10 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   plane's earlier bytes, another picture's or a staging buffer's. A VA-API decode straight into
   the output's cache takes only a coded picture that covers the planes; a shorter one is decoded
   elsewhere and lands as above (reims-vgpu's `graphics/video_host.rs`, "A short picture").
+  A new output in a device cache takes no fill before its first decode, which so waits for
+  none: its planes read zeros wherever no picture lands in them, the session clearing them
+  where a picture fails to land, and the device filling the cache from its pages where the
+  decode fails or answers no picture.
 - **The command buffer's later work, and its completion, wait** for the session's event to
   reach the value the decode signals once its picture has landed. So a CPU lock of the output
   waits for the picture, as for any GPU write.

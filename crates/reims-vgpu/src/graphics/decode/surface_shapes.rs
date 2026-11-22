@@ -2448,17 +2448,19 @@ mod tests {
             .collect()
     }
 
-    /// A video cache's planes (`surface_cache::exported`) take their fill as the first texture
-    /// over either is made, which makes them: on the transfer queue, committed, with no wait on
-    /// the CPU, counted as filled at their make. The cache's buffer holds no memory, so the zeros
-    /// it would give them come from a render pass for each that clears its image to zeros and
-    /// stores it, with no copy and no buffer made, counted, the cache's buffer's memory left
-    /// unmade (`shapes`, "Zeros"). A texture over the other plane fills nothing, and the decode's
-    /// begin owes the planes no fill
+    /// A video cache's planes (`surface_cache::exported`) owe their fill at their make, as any new
+    /// shape does: the first texture over either, which makes them, encodes nothing, with no
+    /// pass, copy, buffer or commit. A decode that takes the new cache's first fill as met takes
+    /// the planes' fills as met too, counted, as its picture lands over them whole: its begin
+    /// fills nothing, its op's wait on its thread for the cache's last fill finds none, and its
+    /// planes' targets say the fills were taken (`SurfaceTarget::zeros`), for a picture that fails
+    /// to land; once its picture is answered, a later decode's targets say none were. The cache's
+    /// buffer's memory is never made
     #[cfg(unix)]
     #[test]
-    fn a_video_caches_planes_take_their_fill_at_their_make() {
+    fn a_decode_takes_a_new_video_caches_planes_fills_as_met() {
         use super::super::surface_cache::Reach;
+        use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
         use reims_vgpu_vulkan::core::testkit::impls::device::EXPORTED_SURFACE_PLANE;
         let mut r = video_shaped();
         let cache = cache_id(&r);
@@ -2472,48 +2474,30 @@ mod tests {
             .filter(|&&s| s == EXPORTED_SURFACE_PLANE)
             .count();
         assert_eq!(surfaces, 2, "the surface's planes: {sels:?}");
-        let cleared = passes(&calls, &kept);
-        assert_eq!(cleared.len(), 2, "both planes: {cleared:?}");
-        assert_eq!(cleared[0], (luma, CLEARS), "luma's");
-        let chroma = cleared[1].0;
-        assert!(
-            cleared[1].1 == CLEARS && chroma != luma,
-            "chroma's: {cleared:?}"
-        );
+        assert!(passes(&calls, &kept).is_empty(), "no clear: {sels:?}");
         assert!(fills(&calls).is_empty(), "no copy into them");
-        assert_eq!(
-            zeros_into(&calls, cache),
-            0,
-            "no zeros of the cache's buffer"
-        );
         assert!(
             !sels.contains(&"newBufferWithLength:options:"),
             "no buffer made: {sels:?}"
         );
-        let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
-        assert!(!memory, "the cache's buffer holds no memory");
-        assert!(
-            first(&calls, PASS) < first(&calls, "commit"),
-            "committed: {sels:?}"
-        );
-        assert!(!sels.contains(&"waitUntilCompleted"), "no wait: {sels:?}");
+        assert!(!sels.contains(&"commit"), "nothing committed: {sels:?}");
         let counts = r.dec.caches().counts().shapes;
-        assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (2, 2));
-        assert_eq!(counts.zero_cleared, 2, "both cleared");
-        assert_eq!(counts.planes_owed_busy, 0);
+        assert_eq!(
+            (
+                counts.plane_fills,
+                counts.zero_cleared,
+                counts.plane_fills_taken
+            ),
+            (0, 0, 0)
+        );
         assert_eq!(
             (counts.surfaces, counts.surfaces_declined),
             (1, 0),
             "a surface in place is kept"
         );
-        assert!(r.dec.surface_caches.surface_targets(BLOCK).is_some());
-
         let mark = r.p.call_log().mark();
-        assert_eq!(
-            plane_texture(&mut r, 22, 1),
-            chroma,
-            "the chroma plane's image"
-        );
+        let chroma = plane_texture(&mut r, 22, 1);
+        assert_ne!(chroma, luma, "the chroma plane's image");
         assert!(fills(&r.p.call_log().since(mark)).is_empty());
 
         let queue = r.device.new_command_queue().unwrap();
@@ -2534,16 +2518,42 @@ mod tests {
         let calls = r.p.call_log().since(mark);
         assert!(fills(&calls).is_empty(), "none at the decode's begin");
         assert!(copies(&calls).is_empty(), "the decode takes the first fill");
+        assert!(
+            passes(&calls, &kept).is_empty(),
+            "no clear at the decode's begin"
+        );
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.plane_fills_taken, counts.plane_fills), (2, 0));
+        // The decode op, on its thread.
+        let mut short = || true;
+        let now = || MonoTime::from_nanos(0);
+        assert!(
+            r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now),
+            "no fill to wait for"
+        );
+        assert_eq!(r.dec.caches().counts().shapes.video_fill_waits, 0);
+        let targets = (r.dec.surface_caches.surface_targets(BLOCK)).expect("the planes");
+        assert!(targets.iter().all(|t| t.zeros), "the fills taken");
+        (r.dec.surface_caches)
+            .decoded(Some(&r.device), BLOCK, true)
+            .unwrap();
         (r.dec.surface_caches)
             .finish(&r.device, 1, None, &cb, uses.unwrap(), || cb.commit(ON))
             .unwrap();
         r.p.world().complete_all(CompleteOn::Caller);
-        let counts = r.dec.caches().counts().shapes;
+        let targets = (r.dec.surface_caches.surface_targets(BLOCK)).expect("the planes");
+        assert!(targets.iter().all(|t| !t.zeros), "a later decode's");
+        let calls = r.p.call_log().since(0);
         assert_eq!(
-            (counts.planes_filled_at_make, counts.plane_fills),
-            (2, 2),
-            "none at a later use"
+            zeros_into(&calls, cache),
+            0,
+            "no zeros of the cache's buffer"
         );
+        let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
+        assert!(!memory, "the cache's buffer holds no memory");
+        let counts = r.dec.caches().counts();
+        assert_eq!(counts.decode_firsts, 1, "the decode took the first fill");
+        assert_eq!(counts.shapes.plane_fills, 0, "none at a later use");
     }
 
     /// A video cache's surface the platform made in its copy form (`surface_cache::exported`),
@@ -2591,7 +2601,7 @@ mod tests {
             ),
             (0, 1, 0)
         );
-        assert_eq!((counts.planes_made, counts.planes_filled_at_make), (0, 0));
+        assert_eq!(counts.planes_made, 0);
         assert!(
             r.dec.surface_caches.surface_targets(BLOCK).is_none(),
             "a decode lands in the cache's buffer"
@@ -2658,23 +2668,22 @@ mod tests {
         );
     }
 
-    /// A picture smaller than its planes leaves the rest of them holding zeros, as a new
-    /// IOSurface reads: the planes took zeros at their make, each from a render pass that clears
-    /// it, the cache's buffer holding no memory (`shapes`, "Zeros"), and nothing of the pages
-    /// since, as the decode takes the surface's first fill; the decode op's wait on its
-    /// thread for the cache's last fill lasts until that fill is done, so the hardware's picture
-    /// lands over it; and its command buffer leaves the planes owing nothing, so no use after it
-    /// fills them again. The cache's buffer's memory is never made. The fake holds no texels: the
-    /// order pins the bytes
+    /// A decode over a new video cache's planes waits for no fill of them: the decode takes the
+    /// surface's first fill as met, the planes' among it, so its op's wait on its thread for the
+    /// cache's last fill ends at once, and the hardware's picture lands over planes that took no
+    /// zeros of the platform's, no clear and nothing of the pages; the host's video zeros what a
+    /// picture smaller than them does not write (`video_host`'s module docs, "A short picture").
+    /// Its command buffer leaves the planes owing nothing, so no use after it fills them. The
+    /// cache's buffer's memory is never made
     #[cfg(unix)]
     #[test]
-    fn a_picture_smaller_than_its_planes_leaves_the_rest_reading_zeros() {
+    fn a_decode_over_a_new_video_caches_planes_waits_for_no_fill() {
         use super::super::surface_cache::Reach;
         let mut r = video_shaped();
         let cache = cache_id(&r);
         let kept = keep_passes(&r, 8);
-        let luma = plane_texture(&mut r, 21, 0);
-        let chroma = plane_texture(&mut r, 22, 1);
+        plane_texture(&mut r, 21, 0);
+        plane_texture(&mut r, 22, 1);
         let queue = r.device.new_command_queue().unwrap();
         let cb = queue.command_buffer(ON).unwrap().unwrap();
         let decode = Reach {
@@ -2689,16 +2698,14 @@ mod tests {
         let (_, uses) = (r.dec.surface_caches)
             .before(&r.device, &cb, &writes, &decode)
             .unwrap();
-        // The decode op, on its thread.
+        // The decode op, on its thread, with nothing completed.
         let mut short = || true;
         let now = || reims_vgpu_vulkan::core::platform::os::clock::MonoTime::from_nanos(0);
         assert!(
-            !r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now),
-            "the planes' fill not done: the wait goes on"
+            r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now),
+            "no fill of the planes: the wait ends at once"
         );
-        assert_eq!(r.dec.caches().counts().shapes.video_fill_waits, 1);
-        r.p.world().complete_all(CompleteOn::Caller);
-        assert!(r.dec.surface_caches.wait_filled(BLOCK, &mut short, &now));
+        assert_eq!(r.dec.caches().counts().shapes.video_fill_waits, 0);
         assert!(
             r.dec.surface_caches.surface_targets(BLOCK).is_some(),
             "the picture lands in the planes"
@@ -2720,11 +2727,7 @@ mod tests {
             0,
             "no zeros of the cache's buffer"
         );
-        assert_eq!(
-            passes(&calls, &kept),
-            [(luma, CLEARS), (chroma, CLEARS)],
-            "each cleared"
-        );
+        assert!(passes(&calls, &kept).is_empty(), "no clear");
         let filled = filled_images(&calls);
         assert!(filled.is_empty(), "no copy into them: {filled:?}");
         let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
@@ -2739,16 +2742,75 @@ mod tests {
         let counts = r.dec.caches().counts();
         assert_eq!(counts.decode_firsts, 1, "the decode took the first fill");
         assert_eq!(
-            (counts.shapes.planes_landed, counts.shapes.plane_fills),
-            (1, 2)
+            (
+                counts.shapes.planes_landed,
+                counts.shapes.plane_fills,
+                counts.shapes.plane_fills_taken
+            ),
+            (1, 0, 2)
         );
     }
 
+    /// A video command buffer that took a new video cache's planes' fills as met with the cache's
+    /// first and landed no picture in them (its walk faulted before its decode op asked for the
+    /// planes) leaves every shape owing a fill from the buffer, which holds its make's zeros and
+    /// no memory: the next use fills the planes by a render pass for each that clears its image
+    /// to zeros and stores it, the surface's own clears, with no copy and the buffer's memory left
+    /// unmade (`shapes`, "Zeros")
+    #[cfg(unix)]
+    #[test]
+    fn planes_no_picture_landed_in_take_their_zeros_from_clears() {
+        use super::super::surface_cache::Reach;
+        let mut r = video_shaped();
+        let cache = cache_id(&r);
+        let kept = keep_passes(&r, 8);
+        let luma = plane_texture(&mut r, 21, 0);
+        let chroma = plane_texture(&mut r, 22, 1);
+        let queue = r.device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let decode = Reach {
+            video: true,
+            decoded: vec![(BLOCK, nv12_planes())],
+            ..Reach::default()
+        };
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &cb, &writes, &decode)
+            .unwrap();
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &cb, uses.unwrap(), || cb.commit(ON))
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(r.dec.caches().counts().shapes.plane_fills, 0);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let calls = r.p.call_log().since(mark);
+        assert_eq!(
+            passes(&calls, &kept),
+            [(luma, CLEARS), (chroma, CLEARS)],
+            "each cleared"
+        );
+        let filled = filled_images(&calls);
+        assert!(filled.is_empty(), "no copy into them: {filled:?}");
+        assert_eq!(
+            zeros_into(&calls, cache),
+            0,
+            "no zeros of the cache's buffer"
+        );
+        let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
+        assert!(!memory, "the cache's buffer holds no memory");
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.plane_fills, counts.zero_cleared), (2, 2));
+    }
+
     /// A video cache's planes made while a command buffer begun and not finished uses the cache
-    /// owe their fill to its next use, counted, as a placed image's make finds the cache busy
-    /// (`shapes`, "Placed images"): that use fills them, counted as filled at a later use, from
-    /// the pages straight, as the cache's buffer holds no memory (the module doc of
-    /// `surface_cache`, "Straight fills")
+    /// owe their fill to its next use, as any planes do at their make: a use that is no decode
+    /// fills them from the pages straight, as the cache's buffer, which lacks them, holds no
+    /// memory (the module doc of `surface_cache`, "Straight fills")
     #[cfg(unix)]
     #[test]
     fn a_busy_video_caches_planes_owe_their_fill_to_its_next_use() {
@@ -2766,11 +2828,7 @@ mod tests {
             fills(&r.p.call_log().since(mark)).is_empty(),
             "none while a command buffer uses the cache"
         );
-        let counts = r.dec.caches().counts().shapes;
-        assert_eq!(
-            (counts.planes_filled_at_make, counts.planes_owed_busy),
-            (0, 1)
-        );
+        assert_eq!(r.dec.caches().counts().shapes.plane_fills, 0);
         (r.dec.surface_caches)
             .finish(&r.device, 1, None, &reader, uses.unwrap(), || {
                 reader.commit(ON)
@@ -2790,7 +2848,7 @@ mod tests {
         let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
         assert!(!memory, "the buffer's memory not made");
         let counts = r.dec.caches().counts().shapes;
-        assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (0, 2));
+        assert_eq!((counts.plane_fills, counts.plane_fills_taken), (2, 0));
     }
 
     /// A decode whose textures show a video cache's planes whole, where the cache has its
@@ -2815,8 +2873,7 @@ mod tests {
             plane_texture_with(&mut r, 21, 10, 0, whole);
             plane_texture_with(&mut r, 22, 10, 1, whole);
             r.p.world().complete_all(CompleteOn::Caller);
-            // The clears' command buffer completes as it is committed, so the planes' wait for it
-            // ends.
+            // A fill's command buffer completes as it is committed, so a wait for it ends.
             r.p.world().set_auto_complete(Some(CompleteOn::Thread));
             let mark = r.p.call_log().mark();
             let (luma, chroma) = r.dec.video_planes(0, 21, 22, true).unwrap();

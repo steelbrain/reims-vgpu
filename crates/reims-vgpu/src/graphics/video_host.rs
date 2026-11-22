@@ -45,7 +45,10 @@
 //!   says first what it covers ([`Landing::writes_only`]), and the session zeros the rest of each
 //!   plane in host bytes by the CPU, and clears a plane in a device cache whole on its queue,
 //!   before the write. The rows past the crop that a plane holds for a coded picture
-//!   ([`OutputPlane::rows_held`]) are no texels of it, and keep what they held.
+//!   ([`OutputPlane::rows_held`]) are no texels of it, and keep what they held. A picture that
+//!   fails to land in a new output's planes, whose fill its decode took as met
+//!   (`SurfaceTarget::zeros`), has them cleared whole the same way, so they read the zeros the
+//!   fill would have left ([`land_pictures`]).
 //!
 //!   A picture holds the hardware's surface until it has landed, so the session holds no more
 //!   pictures unlanded than the decoder spares ([`HostDecoder::most_unlanded`]): a decode past
@@ -1409,6 +1412,8 @@ fn land_pictures<P: Platform>(
                 }
             }
             Some(Err(error)) => {
+                #[cfg(unix)]
+                clear_unlanded(&output, &mut stage, name);
                 // Before the signal: the command buffer waiting for it completes failed, or,
                 // where it completed at the decode already, the next decode's does.
                 carried = landed.fail();
@@ -1439,6 +1444,27 @@ fn land_pictures<P: Platform>(
                 "hardware video: {name}: the session's signal of {value}: {raise}"
             );
         }
+    }
+}
+
+/// The planes of `output` whose fill the decode took as met (`SurfaceTarget::zeros`), as its
+/// picture failed to land: cleared to zeros whole on the session's queue, as the fill would
+/// have left them (the module docs, "A short picture"); a clear that fails is logged.
+#[cfg(unix)]
+fn clear_unlanded<P: Platform>(output: &DecodeOutput<P>, stage: &mut Stage<P>, name: &str) {
+    let planes: Vec<&OutputPlane<P>> = [&output.luma, &output.chroma]
+        .into_iter()
+        .filter(|plane| (plane.surface.as_ref()).is_some_and(|target| target.zeros))
+        .collect();
+    if planes.is_empty() {
+        return;
+    }
+    if let Err(error) = stage.clear_planes(&planes) {
+        log::error!(
+            kind:% = error;
+            "hardware video: {name}: a new output's planes a picture did not land in were not \
+             cleared: {error}"
+        );
     }
 }
 
