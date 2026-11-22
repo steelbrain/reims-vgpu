@@ -823,7 +823,7 @@ supportsBufferlessClientStorageTexture base %base-spi
 supportsCMPIndirectCommandBuffers implemented
 supportsColorSpaceConversionMatrixSelection base %base-spi
 supportsCombinedMSAAStoreAndResolveAction implemented
-supportsCommandBufferJump base %spi-unverified
+supportsCommandBufferJump base the IOGPU base answers NO, which stands, though the M3 Max, the AMD 5300M and the Intel 630 answer YES (measured, tools/base_answers_probe.m): it gates GPU-side control flow, MPSGraph's if and while ops and MPSImage's while loops, which encode encodeStartIf: and encodeStartWhile: only on YES, MPSImage looping on the CPU otherwise (read from code, MPSGraph and MPSCore, arm64e macOS 27.0.1); the device's compute encoder refuses GPU-side control flow
 supportsCommandQueueBarriers base %base-spi
 supportsCompressedTextureViewSPI base %base-spi
 supportsComputeCompressedTextureWrite base %base-spi

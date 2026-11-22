@@ -27,13 +27,22 @@
  * stages, all resources). The order is the order the encoders were made in, which is the
  * queue's where its command buffers are committed in the order they were encoded.
  *
- * NOT MAPPED HERE (no RgfxEncoder op yet — follow-ups, no wire invented): the render SPI-only
- * ops that have no public selector (provoking-vertex, alpha-test ref, line width, point size,
- * viewport-transform, primitive-restart, depth/stencil "cleared", resolve textures,
- * tile-dispatch in-region, vertex-amplification mode); the compute indirect-command-encoding
- * ops (encodeStartIf/While/Else/DoWhile, compressed-texture flush) and
- * computeDispatchThreadsIndirect; the blit fill-texture, fill-buffer-pattern4 and
- * invalidate-compressed ops. The public members of features the device does not support
+ * The render SPI-only ops with no public selector (provoking-vertex, alpha-test ref, line width,
+ * point size, viewport-transform, primitive-restart, depth/stencil "cleared", resolve textures,
+ * tile-dispatch in-region, vertex-amplification mode), the compute encoder's GPU-side
+ * conditionals and loops (encodeStartIf/While/Else/DoWhile), its compressed-texture flush and
+ * computeDispatchThreadsIndirect, and the blit fill-texture, fill-buffer-pattern4 and
+ * invalidate-compressed ops each have an RgfxEncoder op, which the host decodes. These classes
+ * send three of them: line width, provoking vertex and primitive restart. They send none of the
+ * rest: the depth/stencil "cleared" hints do nothing, as Metal's base encoders do; tile
+ * dispatches over a region, vertex-amplification modes and GPU-side control flow are refused and
+ * logged (RgfxUnsupported.h); the blit fills and the invalidations raise an unrecognized
+ * selector, as Metal's x86 encoders do; and the others are absent, as from the x86 Macs'
+ * encoders (tests/protocol_members.txt). Of the ops, rt builds the alpha-test reference value, a
+ * line width of 1, an enabled primitive restart and viewport transform, no resolve texture, and a
+ * buffer fill of one byte value; the compressed-texture flush and the invalidations do nothing;
+ * the rest are Unbuilt (crates/reims-vgpu-vulkan's rt_platform render.rs, compute.rs and
+ * blit.rs). The public members of features the device does not support
  * (function tables, acceleration structures, mesh and object stages, counters, tensors,
  * depth bounds, colour attachment maps, depth store-action options) do nothing on the wire
  * and are logged (RgfxUnsupported.h).
