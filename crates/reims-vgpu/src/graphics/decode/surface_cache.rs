@@ -6832,7 +6832,10 @@ impl<P: Platform> Locked<'_, P> {
         for (_, left) in std::mem::take(&mut self.left_over) {
             self.give_back(left);
         }
-        let gone = (std::mem::take(&mut self.let_go), std::mem::take(&mut self.aged));
+        let gone = (
+            std::mem::take(&mut self.let_go),
+            std::mem::take(&mut self.aged),
+        );
         let owed = std::mem::take(&mut self.owed_commits);
         let any = !owed.is_empty();
         self.commits.owe(owed);

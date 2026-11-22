@@ -1638,7 +1638,11 @@ mod tests {
         let gone: Vec<u64> = (table.age_out(now - period, &mut counts).iter())
             .map(|s| s.image)
             .collect();
-        assert_eq!(gone, vec![11], "unused since 0; 14 was used at half the period");
+        assert_eq!(
+            gone,
+            vec![11],
+            "unused since 0; 14 was used at half the period"
+        );
         assert_eq!((counts.aged, counts.aged_bytes), (1, key(11, 4).bytes()));
         assert_eq!(table.iter().count(), 4);
         assert!(table.age_out(now - period, &mut counts).is_empty());

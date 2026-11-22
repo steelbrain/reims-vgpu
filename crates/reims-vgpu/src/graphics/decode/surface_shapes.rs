@@ -1132,13 +1132,21 @@ mod tests {
         r.p.virtual_clock().advance(half);
         texture(&mut r, 22, 80, (5, 8));
         destroy(&mut r, 22);
-        r.p.virtual_clock().advance(half + std::time::Duration::from_millis(1));
+        r.p.virtual_clock()
+            .advance(half + std::time::Duration::from_millis(1));
         assert_eq!(r.dec.caches().counts().shapes.dropped, 0);
         let message = surface_texture(30, 11, 80, (8, 8));
         assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
         let counts = r.dec.caches().counts().shapes;
-        assert_eq!((counts.dropped, counts.aged), (1, 1), "width 4's, at the other's make");
-        assert_eq!((counts.dropped_bytes, counts.aged_bytes), (4 * 8 * 4, 4 * 8 * 4));
+        assert_eq!(
+            (counts.dropped, counts.aged),
+            (1, 1),
+            "width 4's, at the other's make"
+        );
+        assert_eq!(
+            (counts.dropped_bytes, counts.aged_bytes),
+            (4 * 8 * 4, 4 * 8 * 4)
+        );
         texture(&mut r, 31, 80, (5, 8));
         texture(&mut r, 32, 80, (4, 8));
         let counts = r.dec.caches().counts().shapes;
