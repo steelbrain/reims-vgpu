@@ -768,6 +768,67 @@ mod tests {
         );
     }
 
+    /// A compute state made and kept, on the GPU the test holds, moves both of rt's kernel
+    /// gauges by one, its compiled kernel (`Gauges::kernels`) and its entry in the device's map
+    /// of compiled contents (`Gauges::kernel_entries`): the counts line carries each at least at
+    /// its value with the state kept (`device::fold_metrics`), and each `rtcounts` the commits
+    /// after it write ends with both as they are.
+    #[test]
+    fn on_vulkan_a_kernel_made_and_kept_moves_both_kernel_gauges() {
+        use std::sync::atomic::Ordering;
+
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::trace;
+
+        /// `tests/shaders/compute_tgstatic.metal`'s kernel.
+        const TGSTATIC: &[u8] = include_bytes!("../../../tests/shaders/compute_tgstatic.metallib");
+
+        // nextest runs each test in a process of its own, whose trace file is this one
+        let path = std::env::temp_dir().join(format!("rvg-rt-kernel-{}.txt", std::process::id()));
+        assert!(trace::to_file(&path));
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU");
+        let counters = device.rt().counters();
+        let before = counters.gauges();
+        let library = device.new_library(TGSTATIC).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let made = library.new_function(OnFault::Return, "tg_static");
+        let kernel = made.expect("never a raise").expect("the kernel");
+        let made = device.new_compute_pipeline_state_for_function(Some(&kernel));
+        let state = made.expect("a compute state").expect("a compute state");
+        let kept = counters.gauges();
+        assert_eq!(kept.kernels, before.kernels + 1);
+        assert_eq!(kept.kernel_entries, before.kernel_entries + 1);
+        device::fold_metrics();
+        assert!(counted(device::KERNELS_MOST_CODE) >= kept.kernels);
+        assert!(counted(device::KERNEL_ENTRIES_MOST_CODE) >= kept.kernel_entries);
+
+        let (_queue, ended) = commit_work(&device);
+        let clock = crate::os::OsClock::new();
+        let start = clock.now_mono();
+        while ended.load(Ordering::SeqCst) < 8 {
+            let waited = clock.now_mono().saturating_duration_since(start);
+            assert!(waited < Duration::from_secs(10), "8 completions in 10 s");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        trace::flush_before_death();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let counts: Vec<Vec<u64>> = (text.lines())
+            .map(|l| l.split(' ').collect::<Vec<_>>())
+            .filter(|f| f.get(2) == Some(&"rtcounts"))
+            .map(|f| f[3..].iter().map(|v| v.parse::<u64>().unwrap()).collect())
+            .collect();
+        assert!(!counts.is_empty(), "{text}");
+        for values in &counts {
+            assert_eq!(values.len(), command::COUNTS, "{text}");
+            let end = &values[command::COUNTS - 2..];
+            assert_eq!(end, [kept.kernels, kept.kernel_entries], "{text}");
+        }
+        drop(state);
+    }
+
     /// Runs the test named `test` again in a child process, with `RVG_QUIESCE_CHILD` naming it:
     /// its exit status and its standard error.
     fn run_child(test: &str) -> (Option<i32>, String) {

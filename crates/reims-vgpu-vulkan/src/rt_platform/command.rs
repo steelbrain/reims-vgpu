@@ -281,9 +281,10 @@ fn trace_metrics(now: u64) {
 }
 
 /// How many values a trace's `rtcounts` event holds (`counts`).
-pub(super) const COUNTS: usize = 24 + super::device::OVER_COPY_METRICS + 5;
+pub(super) const COUNTS: usize = 24 + super::device::OVER_COPY_METRICS + 7;
 
-/// The values of the `rtcounts` event of `m`, rt's metrics, with rt's gauges as they are now.
+/// The values of the `rtcounts` event of `m`, rt's metrics, with rt's gauges as they are now. A
+/// value added goes at the end, after those a reader of an older trace knows.
 fn counts(m: &rt::Metrics) -> Vec<u64> {
     let wall = crate::os::OsClock::new().now_wall().as_nanos();
     let g = super::device::gauges().unwrap_or_default();
@@ -297,7 +298,9 @@ fn counts(m: &rt::Metrics) -> Vec<u64> {
     // for the block-maker thread and the longest; the barriers and passes recorded; the
     // over-copies and their bytes, those over an imported block, then each cause's
     // (`device::over_copy_counts`); then rt's gauges now: its live textures, attachment views,
-    // held descriptor slots, buffers and `VkDeviceMemory` allocations
+    // held descriptor slots, buffers and `VkDeviceMemory` allocations, then its compiled kernels
+    // alive (a state's or only its map's) and the entries of its map of compiled contents,
+    // compute and render
     let head = [
         wall,
         m.takes.count,
@@ -331,6 +334,8 @@ fn counts(m: &rt::Metrics) -> Vec<u64> {
         g.descriptor_slots,
         g.buffers,
         g.blocks,
+        g.kernels,
+        g.kernel_entries,
     ];
     let counts: Vec<u64> = head.into_iter().chain(over).chain(gauges).collect();
     debug_assert_eq!(counts.len(), COUNTS);

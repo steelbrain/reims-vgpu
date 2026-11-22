@@ -156,11 +156,17 @@
 //! `VkPipelineCache` (`pipeline_cache_bytes`), which rt measures when its reaper last looked, once
 //! creation was quiet, and which falls when the reaper replaces a cache past 32 MiB with a fresh
 //! one. Two more are the resolve images a device holds (`resolve_images`) and the bytes of their
-//! memory (`resolve_image_bytes`). A gauge rises and falls, so the counts line carries the highest
-//! each reached at a look, `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it
-//! ([`note_gauges`]). The counts' fold looks ([`fold_metrics`]), and so does the gauges' thread
-//! where it runs (`super::gauge_log`, every 5 s): a value rt held between two looks, the blob's
-//! among them, is not seen.
+//! memory (`resolve_image_bytes`). The last two are the compiled kernels alive (`kernels`), each
+//! the translation of one compute pipeline content with its shader modules and their
+//! `VkPipeline`s, which lives while a state or the device's map of compiled contents holds it,
+//! and that map's entries, compute and render together, at most 1,024 (`kernel_entries`). A gauge
+//! rises and falls, so the counts line carries the highest each reached at a look,
+//! `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it ([`note_gauges`]). The
+//! counts' fold looks ([`fold_metrics`]), and so does the gauges' thread where it runs
+//! (`super::gauge_log`, every 5 s): a value rt held between two looks, the blob's among them, is
+//! not seen. The trace's `rtcounts` carries the two kernel gauges as they are at each of its
+//! events (`super::command`), at most one each 50 ms while command buffers commit or complete,
+//! so a traced run shows them over time.
 
 use std::sync::{Arc, OnceLock};
 
@@ -350,8 +356,16 @@ pub const RESOLVE_IMAGES_MOST_CODE: &str = "rt-resolve-images-most";
 /// (`Gauges::resolve_image_bytes`, [`note_gauges`]).
 pub const RESOLVE_IMAGE_BYTES_MOST_CODE: &str = "rt-resolve-image-bytes-most";
 
+/// The code of the most compiled kernels alive at a look (`Gauges::kernels`, [`note_gauges`]):
+/// those a state holds and those only the device's map of compiled contents holds.
+pub const KERNELS_MOST_CODE: &str = "rt-kernels-most";
+
+/// The code of the most entries of the device's map of compiled contents, compute and render, at
+/// a look (`Gauges::kernel_entries`, [`note_gauges`]).
+pub const KERNEL_ENTRIES_MOST_CODE: &str = "rt-kernel-entries-most";
+
 /// The gauges the counts line carries at their highest ([`highest_gauges`]).
-const HIGHEST_GAUGES: usize = 7;
+const HIGHEST_GAUGES: usize = 9;
 
 /// The highest of each of [`highest_gauges`]'s gauges a look saw, in its order, over the
 /// process's devices.
@@ -443,8 +457,10 @@ pub(super) fn note_gauges(g: &rt::Gauges) {
 /// preprocess regions used ([`PREPROCESS_USED_MOST_CODE`]) and idle
 /// ([`PREPROCESS_IDLE_MOST_CODE`]), the texture blocks held ([`TEXTURE_BLOCK_HELD_MOST_CODE`]),
 /// the Private blocks taken ([`PRIVATE_TAKE_MOST_CODE`]), the pipeline cache's data
-/// ([`PIPELINE_CACHE_MOST_CODE`]), and the resolve images ([`RESOLVE_IMAGES_MOST_CODE`]) and
-/// their memory ([`RESOLVE_IMAGE_BYTES_MOST_CODE`]).
+/// ([`PIPELINE_CACHE_MOST_CODE`]), the resolve images ([`RESOLVE_IMAGES_MOST_CODE`]) and their
+/// memory ([`RESOLVE_IMAGE_BYTES_MOST_CODE`]), and the compiled kernels alive
+/// ([`KERNELS_MOST_CODE`]) and the entries of the map of compiled contents
+/// ([`KERNEL_ENTRIES_MOST_CODE`]).
 fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
     [
         (PREPROCESS_USED_MOST_CODE, g.preprocess_used_bytes),
@@ -454,6 +470,8 @@ fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
         (PIPELINE_CACHE_MOST_CODE, g.pipeline_cache_bytes),
         (RESOLVE_IMAGES_MOST_CODE, g.resolve_images),
         (RESOLVE_IMAGE_BYTES_MOST_CODE, g.resolve_image_bytes),
+        (KERNELS_MOST_CODE, g.kernels),
+        (KERNEL_ENTRIES_MOST_CODE, g.kernel_entries),
     ]
 }
 
@@ -2161,12 +2179,13 @@ mod tests {
         assert_eq!(count() - before, 7_000);
     }
 
-    /// Seven of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by
+    /// Nine of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by
     /// its rise over the highest a look saw, so that one that falls leaves its count as it was and
     /// one that rises past it raises it, the pipeline cache's data falling as its reaper replaces
-    /// a full cache with a fresh one, and the resolve images as their textures drop.
+    /// a full cache with a fresh one, the resolve images as their textures drop, and the compiled
+    /// kernels as their states drop while the map of compiled contents stays full.
     #[test]
-    fn seven_gauges_count_at_their_highest() {
+    fn nine_gauges_count_at_their_highest() {
         let codes = [
             PREPROCESS_USED_MOST_CODE,
             PREPROCESS_IDLE_MOST_CODE,
@@ -2175,6 +2194,8 @@ mod tests {
             PIPELINE_CACHE_MOST_CODE,
             RESOLVE_IMAGES_MOST_CODE,
             RESOLVE_IMAGE_BYTES_MOST_CODE,
+            KERNELS_MOST_CODE,
+            KERNEL_ENTRIES_MOST_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -2189,6 +2210,8 @@ mod tests {
         g.pipeline_cache_bytes = 30 << 20;
         g.resolve_images = 2;
         g.resolve_image_bytes = 8 << 20;
+        g.kernels = 1_100;
+        g.kernel_entries = 1_024;
         let mut highest = [0; HIGHEST_GAUGES];
         raise_to(&mut highest, highest_gauges(&g));
         g.preprocess_used_bytes = 12 << 20;
@@ -2197,14 +2220,26 @@ mod tests {
         g.pipeline_cache_bytes = 1 << 20;
         g.resolve_images = 1;
         g.resolve_image_bytes = 4 << 20;
+        g.kernels = 1_030;
         raise_to(&mut highest, highest_gauges(&g));
         g.pipeline_cache_bytes = 31 << 20;
         raise_to(&mut highest, highest_gauges(&g));
         g.resolve_images = 3;
+        g.kernels = 1_150;
         raise_to(&mut highest, highest_gauges(&g));
         assert_eq!(
             highest,
-            [12 << 20, 64 << 20, 48 << 20, 16 << 20, 31 << 20, 3, 8 << 20]
+            [
+                12 << 20,
+                64 << 20,
+                48 << 20,
+                16 << 20,
+                31 << 20,
+                3,
+                8 << 20,
+                1_150,
+                1_024
+            ]
         );
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
