@@ -110,10 +110,12 @@
 //! guest reads the same zeros either way. A placed image holds its memory's bytes as they were,
 //! so it is never taken so: its fill makes the buffer's memory and copies its zeros, as before;
 //! and so does a plane shape's, whose image is its surface's plane, which holds undefined bytes
-//! at its make ("Plane shapes"), but where the fill is given a buffer of zeros of its own: then
-//! its shapes copy their zeros from that, a run of rows at a time, with the cache's buffer's
-//! memory left unmade ([`fill_zeros`], counted in [`ShapeCounts::zero_sourced`]). The planes'
-//! fill at their make is given one, made with the surface (`super::exported`).
+//! at its make ("Plane shapes"), but where the fill may clear: the planes' fill at their make
+//! (`super::exported`). Then each plane takes its zeros from a render pass that clears its image
+//! to 0.0, its samples' bytes of zeros, with no source and the cache's buffer's memory left
+//! unmade ([`fill_clears`], counted in [`ShapeCounts::zero_cleared`]). A fill that owes any other
+//! shape too, which may not take a clear ([`clears_fit`]), makes the buffer's memory and copies
+//! its zeros, as before.
 //! Where the cache would hold zeros so, a new shape is not placed: the platform's own image takes
 //! its zeros from the platform's clear, with no block taken for the buffer nor a copy
 //! (`super::Caches::shape`), counted ([`UNPLACED_ZEROS`]).
@@ -141,7 +143,7 @@
 //! holds undefined bytes at its make, so the planes take their fill from the buffer then, at the
 //! texture's make, as a placed image does, where no command buffer begun and not finished uses
 //! the cache and no copy of it waits (`super::exported`, counted
-//! [`ShapeCounts::planes_filled_at_make`]), from zeros of their own where the buffer holds no
+//! [`ShapeCounts::planes_filled_at_make`]), by a clear to zeros where the buffer holds no
 //! memory yet ("Zeros"); a decode's begin then owes none, and its wait for the cache's last fill
 //! finds that fill made ahead of it. A busy cache's planes owe theirs to its
 //! next use, as any new shape's ([`ShapeCounts::planes_owed_busy`]). A picture that lands over
@@ -179,7 +181,11 @@ use std::sync::Arc;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
-use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize, PixelFormatInfo};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
+use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+use reims_vgpu_vulkan::core::platform::types::{ClearColor, MtlOrigin, MtlSize, PixelFormatInfo};
+use reims_vgpu_vulkan::core::platform::values::ColorAttachmentSet;
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 use reims_vgpu_vulkan::gpu::no_texture::no_view;
 
@@ -489,12 +495,12 @@ pub(crate) struct ShapeCounts {
     pub(crate) zero_taken: u64,
     pub(crate) zero_taken_bytes: u64,
     pub(crate) unplaced_zeros: u64,
-    /// Shapes filled from the caches' zeros instead of their cache's buffer, which held no memory
-    /// yet, and their bytes ([`fill_zeros`], the module doc, "Zeros"); and caches for the host's
-    /// video whose memory, made at a first use since their make, was zeroed for it
+    /// Shapes filled by a clear of their image instead of from their cache's buffer, which held
+    /// no memory yet, and their bytes ([`fill_clears`], the module doc, "Zeros"); and caches for
+    /// the host's video whose memory, made at a first use since their make, was zeroed for it
     /// (`SurfaceCaches::zero_for_video`).
-    pub(crate) zero_sourced: u64,
-    pub(crate) zero_sourced_bytes: u64,
+    pub(crate) zero_cleared: u64,
+    pub(crate) zero_cleared_bytes: u64,
     pub(crate) video_zeroed: u64,
     /// Fills of plane shapes from their cache's buffer, and of them those made at the planes'
     /// make (the module doc, "Plane shapes"); surfaces whose planes owed their fill past their
@@ -935,81 +941,66 @@ pub(crate) fn fill<P: Platform>(
     Ok(())
 }
 
-/// The bytes of zeros a fill of shapes from zeros copies from ([`fill_zeros`]), a buffer of the
-/// platform's made for that fill alone (`super::Caches::plane_shape`): 4 rows of the widest a
-/// texture takes, 16384 texels of 16 bytes, and 136 of a 3840-wide plane of 2-byte samples.
-pub(crate) const ZEROS_LEN: u64 = 1 << 20;
+/// Metal's `MTLTextureUsageRenderTarget`, `MTLLoadActionClear` and `MTLStoreActionStore`: what
+/// a fill by clears asks of a shape's image and its pass ([`fill_clears`]).
+const USAGE_RENDER_TARGET: u64 = 0x4;
+const LOAD_ACTION_CLEAR: u64 = 2;
+const STORE_ACTION_STORE: u64 = 1;
 
-/// The pitch a fill from zeros copies `key`'s rows at ([`fill_zeros`]): its rows' bytes, up to a
-/// multiple of 256; `None` past [`ZEROS_LEN`].
-fn zeros_pitch(key: &ShapeKey) -> Option<u64> {
-    let row = key.width.checked_mul(key.texel_bytes)?;
-    (row.checked_next_multiple_of(256)).filter(|&pitch| pitch > 0 && pitch <= ZEROS_LEN)
+/// Whether `shape` takes a fill by a clear ([`fill_clears`]): a plane shape whose image declares
+/// `RenderTarget` usage, as a video cache's planes do, each of unsigned normalized samples
+/// (`R8Unorm`, `RG8Unorm`, `R16Unorm`, `RG16Unorm`), whose 0.0 is bytes of zeros (the module doc,
+/// "Zeros"). No other shape does: a storage shape's image declares the Unknown usage, and a plain
+/// shape's format may encode 0.0 otherwise (an extended-range format's).
+fn takes_clear<P: Platform>(shape: &Shape<P::Texture>) -> bool {
+    shape.plane && shape.image.usage() & USAGE_RENDER_TARGET != 0
 }
 
-/// Whether a fill from zeros copies every row of each shape of `table` that `pick` picks
-/// ([`fill_zeros`]).
-pub(crate) fn zeros_fit<T>(table: &ShapeTable<T>, pick: impl Fn(&Shape<T>) -> bool) -> bool {
-    (table.iter())
-        .filter(|s| pick(s))
-        .all(|s| zeros_pitch(&s.key).is_some())
+/// Whether a fill by clears fills each shape of `table` that `pick` picks ([`fill_clears`]).
+pub(crate) fn clears_fit<P: Platform>(
+    table: &ShapeTable<P::Texture>,
+    pick: impl Fn(&Shape<P::Texture>) -> bool,
+) -> bool {
+    (table.iter()).filter(|s| pick(s)).all(takes_clear::<P>)
 }
 
-/// Encodes in `cb`, in a blit encoder of its own, a copy of zeros into each shape of `table` that
-/// `pick` picks, from `zeros`, [`ZEROS_LEN`] bytes of zeros, in runs of the rows that fit there at
-/// [`zeros_pitch`]: the bytes its cache's buffer, which holds no memory yet, reads (the module
-/// doc, "Zeros"), with no copy through it. Each shape then owes no fill and holds no write the
-/// buffer lacks, as [`fill`] leaves it, counted in `counts` as a fill and as one from zeros.
-/// Nothing where it picks none, or the platform made no encoder; the caller made sure each row
-/// fits ([`zeros_fit`]), and a shape whose rows do not is left owing its fill.
-pub(crate) fn fill_zeros<P: Platform>(
+/// Encodes in `cb`, for each shape of `table` that `pick` picks, a render pass of its own whose
+/// one colour attachment is the shape's image, loaded by a clear to 0.0 and stored, with no draw:
+/// the zeros its cache's buffer, which holds no memory yet, reads (the module doc, "Zeros"), with
+/// no copy and no source. Each shape then owes no fill and holds no write the buffer lacks, as
+/// [`fill`] leaves it, counted in `counts` as a fill and as a clear. The caller made sure each
+/// takes a clear ([`clears_fit`]): one that does not, or whose pass the platform made no encoder
+/// for, is left owing its fill.
+pub(crate) fn fill_clears<P: Platform>(
+    platform: &P,
     cb: &P::CommandBuffer,
-    zeros: &P::Buffer,
     table: &mut ShapeTable<P::Texture>,
     pick: impl Fn(&Shape<P::Texture>) -> bool,
     counts: &mut ShapeCounts,
 ) -> RaiseResult<()> {
     const ON: OnFault = OnFault::Return;
-    if !table.iter().any(&pick) {
-        return Ok(());
-    }
-    let Some(blit) = cb.blit_encoder(ON)? else {
-        return Ok(());
-    };
-    for shape in table.iter_mut().filter(|s| pick(s)) {
-        let key = shape.key;
-        let Some(pitch) = zeros_pitch(&key) else {
+    for shape in (table.iter_mut()).filter(|s| pick(s) && takes_clear::<P>(s)) {
+        let pass = platform.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&shape.image)),
+            load_action: Some(LOAD_ACTION_CLEAR),
+            store_action: Some(STORE_ACTION_STORE),
+            clear_color: Some(ClearColor::default()),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(ON, 0, &attachment)?;
+        let Some(encoder) = cb.render_encoder(ON, &pass)? else {
             continue;
         };
-        let rows = ZEROS_LEN / pitch;
-        let mut y = 0;
-        while y < key.height {
-            let run = rows.min(key.height - y);
-            blit.encode(
-                ON,
-                BlitCmd::CopyBufferToTexture {
-                    source_buffer: zeros,
-                    source_offset: 0,
-                    source_bytes_per_row: pitch,
-                    source_bytes_per_image: pitch * run,
-                    source_size: MtlSize::new(key.width, run, 1),
-                    destination_texture: &shape.image,
-                    destination_slice: 0,
-                    destination_level: 0,
-                    destination_origin: MtlOrigin::new(0, y, 0),
-                },
-            )?;
-            y += run;
-        }
-        counts.zero_sourced += 1;
-        counts.zero_sourced_bytes += shape.bytes;
+        encoder.encode(ON, RenderCmd::EndEncoding)?;
+        counts.zero_cleared += 1;
+        counts.zero_cleared_bytes += shape.bytes;
         filled(shape, counts);
     }
-    blit.encode(ON, BlitCmd::EndEncoding)?;
     Ok(())
 }
 
-/// `shape` took its fill ([`fill`], [`fill_from`], [`fill_zeros`]): it owes none and holds no
+/// `shape` took its fill ([`fill`], [`fill_from`], [`fill_clears`]): it owes none and holds no
 /// write the buffer lacks; counted in `counts`.
 fn filled<T>(shape: &mut Shape<T>, counts: &mut ShapeCounts) {
     shape.owed = false;
@@ -1589,6 +1580,236 @@ mod tests {
         );
         assert!(table.owes());
         assert_eq!(table.take_plane_fills(), 0, "none owed");
+    }
+
+    /// A fill by clears ([`fill_clears`]) fills each plane shape that owes a fill by a render
+    /// pass of its own, whose one colour attachment is the shape's image, loaded by a clear to
+    /// 0.0 and stored, with no draw, no copy and no buffer, counted as a fill and as a clear. A
+    /// storage shape, whose image declares the Unknown usage, and a plain shape take no clear and
+    /// are left owing their fill, so a fill that owes either does not clear ([`clears_fit`]) but
+    /// copies through the cache's buffer (`SurfaceCaches::fill_shapes_over`)
+    #[test]
+    fn a_fill_by_clears_clears_the_plane_shapes_alone() {
+        use reims_vgpu_vulkan::core::platform::Handle as _;
+        use reims_vgpu_vulkan::core::platform::command::CommandQueue as _;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+        use reims_vgpu_vulkan::core::sync::Mutex;
+        use reims_vgpu_vulkan::core::testkit::FakePlatform;
+        use reims_vgpu_vulkan::core::testkit::impls::descriptor::PassModel;
+        use reims_vgpu_vulkan::core::testkit::objects::kind;
+
+        use crate::platform::ApiPlatform as _;
+        const ON: OnFault = OnFault::Die;
+        let platform = FakePlatform::new();
+        let device = platform.metal_device(None).unwrap();
+        let image = |pixel_format: u64, usage: u64| {
+            let desc = TextureDesc {
+                texture_type: 2,
+                pixel_format,
+                width: 32,
+                height: 8,
+                usage,
+                resource_options: Some(super::super::STORAGE_PRIVATE),
+                ..TextureDesc::default()
+            };
+            platform.own_texture(&device, &desc).unwrap()
+        };
+        let chroma = ShapeKey {
+            plane: 1,
+            offset: 64 * 4096,
+            ..key(32, 2)
+        };
+        let plane = image(30, 0x1 | 0x4 | 0x10);
+        let plane_id = plane.id();
+        let mut table = ShapeTable::default();
+        drop(table.insert_plane(chroma, plane, true, 0));
+        drop(table.insert(key(32, 4), image(80, 0), true, 1));
+        let plain = ShapeKey {
+            storage: false,
+            ..key(16, 4)
+        };
+        drop(table.insert(plain, image(80, 0x1 | 0x4), true, 2));
+        assert!(
+            !clears_fit::<FakePlatform>(&table, |s| s.owed),
+            "a storage and a plain shape take no clear"
+        );
+        assert!(
+            clears_fit::<FakePlatform>(&table, |s| s.owed && s.plane),
+            "a plane takes one"
+        );
+
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..3 {
+            let kept = Arc::clone(&kept);
+            (platform.world()).on_new::<kind::RenderPassDescriptor>(move |p| {
+                kept.lock().push(p.clone_ref());
+            });
+        }
+        let queue = device.new_command_queue().unwrap();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        let mark = platform.call_log().mark();
+        let mut counts = ShapeCounts::default();
+        fill_clears(&platform, &cb, &mut table, |s| s.owed, &mut counts).unwrap();
+        let calls = platform.call_log().since(mark);
+        let sels: Vec<&str> = calls.iter().map(|c| c.sel).collect();
+        assert_eq!(
+            sels,
+            ["renderCommandEncoderWithDescriptor:", "endEncoding"],
+            "one pass, ended with no draw"
+        );
+        let kept = kept.lock();
+        assert_eq!(kept.len(), 1, "one pass made");
+        let pass = &kept[0];
+        assert_eq!(calls[0].args[0].as_obj(), Some(pass.id()));
+        pass.with_model(|m: &PassModel| {
+            assert_eq!(
+                m.colors.keys().collect::<Vec<_>>(),
+                [&0u64],
+                "one attachment"
+            );
+            let a = &m.colors[&0];
+            assert_eq!(a.texture_id(), Some(plane_id), "the plane's image");
+            assert_eq!((a.load_action, a.store_action), (Some(2), Some(1)));
+            assert_eq!(
+                a.clear_color,
+                Some(ClearColor::default()),
+                "0.0 in each channel"
+            );
+        });
+        assert_eq!(
+            (counts.zero_cleared, counts.zero_cleared_bytes),
+            (1, 32 * 64 * 2),
+            "the plane's: its key's 64 rows of 32 two-byte texels"
+        );
+        assert_eq!((counts.fills, counts.plane_fills), (1, 1));
+        let owing: Vec<bool> = (table.iter().filter(|s| s.owed)).map(|s| s.plane).collect();
+        assert_eq!(owing, [false, false], "the other two owe their fill still");
+    }
+
+    /// On the Vulkan platform, a fill by clears ([`fill_clears`]) leaves a plane shape's image of
+    /// each of a video cache's planes' formats, `R8Unorm`, `RG8Unorm`, `R16Unorm` and
+    /// `RG16Unorm`, of the planes' `ShaderRead | RenderTarget | PixelFormatView` usage, holding
+    /// bytes of zeros where it held others: the zeros the cache's buffer reads
+    #[test]
+    fn on_vulkan_a_fill_by_clears_zeros_each_plane_format() {
+        use reims_vgpu_vulkan::core::num::ToUsize as _;
+        use reims_vgpu_vulkan::core::platform::blit::BlitEncoder as _;
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+
+        use crate::platform::ApiPlatform as _;
+        type V = reims_vgpu_vulkan::RtPlatform;
+        const ON: OnFault = OnFault::Die;
+        const WIDTH: u64 = 64;
+        const HEIGHT: u64 = 16;
+        let platform = V::process();
+        let device = platform.metal_device(None).unwrap();
+        crate::graphics::reserve_guest_texture_ids(&*platform, &device);
+        let queue = device.new_command_queue().unwrap();
+        // (pixel format, texel bytes): R8Unorm, RG8Unorm, R16Unorm, RG16Unorm.
+        let formats: [(u64, u64); 4] = [(10, 1), (30, 2), (20, 2), (60, 4)];
+        let mut table = ShapeTable::default();
+        let mut held = Vec::new();
+        for (n, &(pixel_format, texel_bytes)) in formats.iter().enumerate() {
+            let key = ShapeKey {
+                plane: n as u64,
+                offset: 0,
+                bytes_per_row: WIDTH * texel_bytes,
+                width: WIDTH,
+                height: HEIGHT,
+                texel_bytes,
+                storage: false,
+            };
+            let desc = TextureDesc {
+                texture_type: 2,
+                pixel_format,
+                width: WIDTH,
+                height: HEIGHT,
+                usage: 0x1 | 0x4 | 0x10,
+                resource_options: Some(super::super::STORAGE_PRIVATE),
+                ..TextureDesc::default()
+            };
+            let image = platform.own_texture(&device, &desc).unwrap();
+            held.push(table.insert_plane(key, image, true, n as u64).0);
+        }
+        let run = |encode: &dyn Fn(&<V as Platform>::CommandBuffer)| {
+            let cb = queue.command_buffer(ON).unwrap().unwrap();
+            encode(&cb);
+            cb.commit(ON).unwrap();
+            cb.wait_until_completed(ON).unwrap();
+        };
+        // Each image takes bytes of 0xa5 first, so a pass that writes nothing shows.
+        let length = WIDTH * 4 * HEIGHT;
+        let others = device.new_buffer_of_length(ON, length, 0).unwrap().unwrap();
+        // SAFETY: a Shared buffer of `length` bytes, which no command uses yet.
+        unsafe { std::ptr::write_bytes(others.contents().as_ptr::<u8>(), 0xa5, length.to_usize()) };
+        let image_copy = |image: &<V as Platform>::Texture,
+                          row: u64,
+                          to: bool,
+                          buffer: &<V as Platform>::Buffer| {
+            run(&|cb| {
+                let blit = cb.blit_encoder(ON).unwrap().unwrap();
+                let cmd = match to {
+                    true => BlitCmd::CopyBufferToTexture {
+                        source_buffer: buffer,
+                        source_offset: 0,
+                        source_bytes_per_row: row,
+                        source_bytes_per_image: row * HEIGHT,
+                        source_size: MtlSize::new(WIDTH, HEIGHT, 1),
+                        destination_texture: image,
+                        destination_slice: 0,
+                        destination_level: 0,
+                        destination_origin: MtlOrigin::default(),
+                    },
+                    false => BlitCmd::CopyTextureToBuffer {
+                        source_texture: image,
+                        source_slice: 0,
+                        source_level: 0,
+                        source_origin: MtlOrigin::default(),
+                        source_size: MtlSize::new(WIDTH, HEIGHT, 1),
+                        destination_buffer: buffer,
+                        destination_offset: 0,
+                        destination_bytes_per_row: row,
+                        destination_bytes_per_image: row * HEIGHT,
+                    },
+                };
+                blit.encode(ON, cmd).unwrap();
+                blit.encode(ON, BlitCmd::EndEncoding).unwrap();
+            });
+        };
+        let read = |image: &<V as Platform>::Texture, row: u64| -> Vec<u8> {
+            let out = device.new_buffer_of_length(ON, length, 0).unwrap().unwrap();
+            image_copy(image, row, false, &out);
+            // SAFETY: the Shared buffer's bytes, which no command writes any more.
+            let read = unsafe {
+                std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (row * HEIGHT).to_usize())
+            };
+            read.to_vec()
+        };
+        for (shape, &(pixel_format, texel_bytes)) in table.iter().zip(&formats) {
+            let row = WIDTH * texel_bytes;
+            image_copy(&shape.image, row, true, &others);
+            let bytes = read(&shape.image, row);
+            assert!(
+                bytes.iter().all(|&b| b == 0xa5),
+                "format {pixel_format}: the others first"
+            );
+        }
+        let mut counts = ShapeCounts::default();
+        let cb = queue.command_buffer(ON).unwrap().unwrap();
+        fill_clears(&*platform, &cb, &mut table, |s| s.owed, &mut counts).unwrap();
+        cb.commit(ON).unwrap();
+        cb.wait_until_completed(ON).unwrap();
+        assert_eq!(counts.zero_cleared, 4, "each cleared");
+        assert!(table.iter().all(|s| !s.owed && !s.dirty));
+        for (shape, &(pixel_format, texel_bytes)) in table.iter().zip(&formats) {
+            let bytes = read(&shape.image, WIDTH * texel_bytes);
+            let at = bytes.iter().position(|&b| b != 0);
+            assert_eq!(at, None, "format {pixel_format}: zeros, {:?}", &bytes[..16]);
+        }
     }
 
     /// On the Vulkan platform, shapes over one cache's buffer, of three formats, sizes and places,

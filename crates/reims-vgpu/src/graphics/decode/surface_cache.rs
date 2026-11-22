@@ -417,7 +417,7 @@
 //!   is made so too, its memory exported as it is made
 //!   (`GpuDevice::new_deferred_exportable_buffer_of_length`), and zeroed for the video at the
 //!   video's first use of it ("Fill", above): a cache whose pictures all land in its surface, and
-//!   whose shapes take their zeros from zeros of their own (the module doc of [`shapes`],
+//!   whose shapes take their zeros from clears of their own (the module doc of [`shapes`],
 //!   "Zeros") and the pages straight ("Straight fills"), holds none. Each copy makes it first
 //!   ([`Buffer::make_memory`]), a
 //!   download's, a release's, an early copy's and a write's copy into another shape's with the
@@ -5157,15 +5157,17 @@ impl<P: Platform> SurfaceCaches<P> {
         self.fill_shapes_over(device, block, None)
     }
 
-    /// [`Self::fill_shapes`], given `zeros`, a buffer of [`shapes::ZEROS_LEN`] bytes of zeros of
-    /// its own, where one was made for it: a fill that would copy the cache's buffer's zeros
-    /// ([`SurfaceCache::fills_zeros`]) copies them from there instead, with the buffer's memory
-    /// left unmade (the module doc of `shapes`, "Zeros"; [`shapes::fill_zeros`]).
+    /// [`Self::fill_shapes`], given `clears`, the platform to make render passes with, where the
+    /// fill may clear: a fill that would copy the cache's buffer's zeros
+    /// ([`SurfaceCache::fills_zeros`]) into shapes that each take a clear
+    /// ([`shapes::clears_fit`]) clears their images instead, with the buffer's memory left unmade
+    /// (the module doc of `shapes`, "Zeros"; [`shapes::fill_clears`]). A fill that owes another
+    /// shape copies through the buffer, its memory made, as one not given `clears` does.
     pub(super) fn fill_shapes_over(
         &mut self,
         device: &P::Device,
         block: u64,
-        zeros: Option<&P::Buffer>,
+        clears: Option<&P>,
     ) -> RaiseResult<Option<u64>> {
         self.touch_shapes(block);
         if self.take_zeros(block) {
@@ -5186,13 +5188,13 @@ impl<P: Platform> SurfaceCaches<P> {
         let straight = cache.lacks
             && cache.fills_straight(self.spares.piece)
             && !cache.shapes.iter().any(|s| s.dirty && !s.owed);
-        // A buffer that holds no memory and would fill its shapes with its zeros fills them from
-        // `zeros`, where given, instead ("Zeros").
-        let zeroing = zeros.filter(|_| {
-            !straight && cache.fills_zeros() && shapes::zeros_fit(&cache.shapes, |s| s.owed)
+        // A buffer that holds no memory and would fill its shapes with its zeros clears them
+        // instead, where `clears` is given and each takes a clear ("Zeros").
+        let clearing = clears.filter(|_| {
+            !straight && cache.fills_zeros() && shapes::clears_fit::<P>(&cache.shapes, |s| s.owed)
         });
         let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
-            if straight || zeroing.is_some() {
+            if straight || clearing.is_some() {
                 return true;
             }
             let made = cache.copy_through(MemoryFor::FillShapes);
@@ -5210,9 +5212,9 @@ impl<P: Platform> SurfaceCaches<P> {
         reserve.extend(self.left_over.remove(&block).unwrap_or_default());
         let owed: &dyn Fn(&shapes::Shape<P::Texture>) -> bool = &|s| s.owed;
         let mut filled = || -> RaiseResult<Vec<u64>> {
-            if let Some(zeros) = zeroing {
+            if let Some(platform) = clearing {
                 let counts = &mut self.counts.shapes;
-                shapes::fill_zeros::<P>(&cb, zeros, &mut cache.shapes, owed, counts)?;
+                shapes::fill_clears(platform, &cb, &mut cache.shapes, owed, counts)?;
                 return Ok(Vec::new());
             }
             let staging = (timed, &self.spares, &mut reserve);
@@ -6890,13 +6892,16 @@ impl<P: Platform> Caches<P> {
 
     /// The shape `key` of the block at `block`'s cache, its image made of `desc` where the cache
     /// holds none yet, with the lock let go of, and added ([`SurfaceCaches::add_shape`]): a
-    /// reference to it and its image. Its image is placed where its first fill is made with its
-    /// make ([`Self::placed_shape`]), in a block taken now, where its fill would copy more than
-    /// zeros ([`Self::fills_zeros`]); else it is the platform's own as before. `None` where the
-    /// caches take the default form, the block has no cache, or the platform made no image
-    /// (counted). What goes is let go of with no lock held, a refusal logged.
+    /// reference to it and its image. A video cache's plane is its surface's, whose fill at its
+    /// make may clear by `platform`'s render passes ([`Self::plane_shape`]). Its image is placed
+    /// where its first fill is made with its make ([`Self::placed_shape`]), in a block taken now,
+    /// where its fill would copy more than zeros ([`Self::fills_zeros`]); else it is the
+    /// platform's own as before. `None` where the caches take the default form, the block has no
+    /// cache, or the platform made no image (counted). What goes is let go of with no lock held,
+    /// a refusal logged.
     pub(crate) fn shape(
         &self,
+        platform: &P,
         device: &P::Device,
         block: u64,
         key: ShapeKey,
@@ -6909,7 +6914,7 @@ impl<P: Platform> Caches<P> {
             Some(None) => {}
         }
         // A video cache's plane takes its surface's ([`exported`]).
-        if let Some(found) = self.plane_shape(device, block, &key) {
+        if let Some(found) = self.plane_shape(platform, device, block, &key) {
             return Some(found);
         }
         if self.shapes_placed.load(Ordering::Acquire)

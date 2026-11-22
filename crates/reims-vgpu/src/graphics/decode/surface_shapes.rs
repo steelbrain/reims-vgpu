@@ -215,7 +215,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             resource_options: Some(STORAGE_PRIVATE),
             ..TextureDesc::default()
         };
-        let Some(mut held) = caches.shape(device, block, key, &image) else {
+        let Some(mut held) = caches.shape(&self.platform, device, block, key, &image) else {
             return unshaped(|_| {});
         };
         if held.1.usage() == PLAIN_USAGE && !self.views_plain(m, held.1.pixel_format()) {
@@ -225,7 +225,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             drop(held);
             let key = key.as_storage();
             let image = TextureDesc { usage: 0, ..image };
-            let Some(storage) = caches.shape(device, block, key, &image) else {
+            let Some(storage) = caches.shape(&self.platform, device, block, key, &image) else {
                 return unshaped(|_| {});
             };
             held = storage;
@@ -368,6 +368,8 @@ mod tests {
     use reims_vgpu_vulkan::core::raise::OnFault;
     use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 
+    #[cfg(unix)]
+    use reims_vgpu_vulkan::core::platform::types::ClearColor;
     use reims_vgpu_vulkan::core::platform::types::MtlSize;
     #[cfg(unix)]
     use reims_vgpu_vulkan::core::platform::values::PagesPlane;
@@ -2310,10 +2312,80 @@ mod tests {
         fills(calls).into_iter().map(|(b, _, i)| (b, i)).collect()
     }
 
+    /// The render passes' descriptors the fake platform makes.
+    #[cfg(unix)]
+    type Passes = Arc<Mutex<Vec<<FakePlatform as Platform>::RenderPassDescriptor>>>;
+
+    /// A render pass begun ([`shapes::fill_clears`]).
+    #[cfg(unix)]
+    const PASS: &str = "renderCommandEncoderWithDescriptor:";
+
+    /// A render pass's colour attachment's (load action, store action, clear colour).
+    #[cfg(unix)]
+    type Attachment = (Option<u64>, Option<u64>, Option<ClearColor>);
+
+    /// The attachment of a pass that clears its image to zeros and stores it:
+    /// `MTLLoadActionClear`, `MTLStoreActionStore`, 0.0 in each channel.
+    #[cfg(unix)]
+    const CLEARS: Attachment = (
+        Some(2),
+        Some(1),
+        Some(ClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 0.0,
+        }),
+    );
+
+    /// The render passes' descriptors the fake platform makes from here on, kept alive (up to
+    /// `n`), so a test reads what each pass's attachments were set to.
+    #[cfg(unix)]
+    fn keep_passes(r: &Rig, n: usize) -> Passes {
+        use reims_vgpu_vulkan::core::platform::Handle as _;
+        use reims_vgpu_vulkan::core::testkit::objects::kind;
+        let kept = Passes::default();
+        for _ in 0..n {
+            let kept = Arc::clone(&kept);
+            (r.p.world()).on_new::<kind::RenderPassDescriptor>(move |p| {
+                kept.lock().push(p.clone_ref());
+            });
+        }
+        kept
+    }
+
+    /// The image of each render pass begun in `calls`, each of one colour attachment, and that
+    /// attachment's (load action, store action, clear colour); each pass's descriptor one that
+    /// `kept` holds.
+    #[cfg(unix)]
+    fn passes(calls: &[Call], kept: &Passes) -> Vec<(u64, Attachment)> {
+        use reims_vgpu_vulkan::core::platform::Handle as _;
+        use reims_vgpu_vulkan::core::testkit::impls::descriptor::PassModel;
+        let kept = kept.lock();
+        (calls.iter())
+            .filter(|c| c.sel == PASS)
+            .map(|c| {
+                let id = c.args[0].as_obj();
+                let pass = (kept.iter().find(|p| Some(p.id()) == id)).expect("a kept descriptor");
+                pass.with_model(|m: &PassModel| {
+                    assert_eq!(
+                        m.colors.keys().collect::<Vec<_>>(),
+                        [&0u64],
+                        "one attachment"
+                    );
+                    let a = &m.colors[&0];
+                    let image = a.texture_id().map_or(0, |t| t.0);
+                    (image, (a.load_action, a.store_action, a.clear_color))
+                })
+            })
+            .collect()
+    }
+
     /// A video cache's planes (`surface_cache::exported`) take their fill as the first texture
     /// over either is made, which makes them: on the transfer queue, committed, with no wait on
     /// the CPU, counted as filled at their make. The cache's buffer holds no memory, so the zeros
-    /// it would give them come from a buffer of zeros of their own, counted, its memory left
+    /// it would give them come from a render pass for each that clears its image to zeros and
+    /// stores it, with no copy and no buffer made, counted, the cache's buffer's memory left
     /// unmade (`shapes`, "Zeros"). A texture over the other plane fills nothing, and the decode's
     /// begin owes the planes no fill
     #[cfg(unix)]
@@ -2323,6 +2395,7 @@ mod tests {
         use reims_vgpu_vulkan::core::testkit::impls::device::EXPORTED_SURFACE_PLANE;
         let mut r = video_shaped();
         let cache = cache_id(&r);
+        let kept = keep_passes(&r, 4);
         let mark = r.p.call_log().mark();
         let luma = plane_texture(&mut r, 21, 0);
         let calls = r.p.call_log().since(mark);
@@ -2332,26 +2405,34 @@ mod tests {
             .filter(|&&s| s == EXPORTED_SURFACE_PLANE)
             .count();
         assert_eq!(surfaces, 2, "the surface's planes: {sels:?}");
-        let filled = filled_images(&calls);
-        assert_eq!(filled.len(), 2, "both planes: {filled:?}");
-        let zeros = filled[0].0;
-        assert!(zeros != cache, "from zeros of their own: {filled:?}");
-        assert_eq!(filled[0], (zeros, luma), "luma's");
-        let chroma = filled[1].1;
+        let cleared = passes(&calls, &kept);
+        assert_eq!(cleared.len(), 2, "both planes: {cleared:?}");
+        assert_eq!(cleared[0], (luma, CLEARS), "luma's");
+        let chroma = cleared[1].0;
         assert!(
-            filled[1].0 == zeros && chroma != luma,
-            "chroma's: {filled:?}"
+            cleared[1].1 == CLEARS && chroma != luma,
+            "chroma's: {cleared:?}"
+        );
+        assert!(fills(&calls).is_empty(), "no copy into them");
+        assert_eq!(
+            zeros_into(&calls, cache),
+            0,
+            "no zeros of the cache's buffer"
+        );
+        assert!(
+            !sels.contains(&"newBufferWithLength:options:"),
+            "no buffer made: {sels:?}"
         );
         let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
         assert!(!memory, "the cache's buffer holds no memory");
         assert!(
-            first(&calls, FILL) < first(&calls, "commit"),
+            first(&calls, PASS) < first(&calls, "commit"),
             "committed: {sels:?}"
         );
         assert!(!sels.contains(&"waitUntilCompleted"), "no wait: {sels:?}");
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.planes_filled_at_make, counts.plane_fills), (2, 2));
-        assert_eq!(counts.zero_sourced, 2, "both from zeros");
+        assert_eq!(counts.zero_cleared, 2, "both cleared");
         assert_eq!(counts.planes_owed_busy, 0);
         assert_eq!(
             (counts.surfaces, counts.surfaces_declined),
@@ -2511,9 +2592,9 @@ mod tests {
     }
 
     /// A picture smaller than its planes leaves the rest of them holding zeros, as a new
-    /// IOSurface reads: the planes took zeros at their make, copied from a buffer of zeros made
-    /// with the surface, the cache's buffer holding no memory (`shapes`, "Zeros"), and nothing of
-    /// the pages since, as the decode takes the surface's first fill; the decode op's wait on its
+    /// IOSurface reads: the planes took zeros at their make, each from a render pass that clears
+    /// it, the cache's buffer holding no memory (`shapes`, "Zeros"), and nothing of the pages
+    /// since, as the decode takes the surface's first fill; the decode op's wait on its
     /// thread for the cache's last fill lasts until that fill is done, so the hardware's picture
     /// lands over it; and its command buffer leaves the planes owing nothing, so no use after it
     /// fills them again. The cache's buffer's memory is never made. The fake holds no texels: the
@@ -2524,6 +2605,7 @@ mod tests {
         use super::super::surface_cache::Reach;
         let mut r = video_shaped();
         let cache = cache_id(&r);
+        let kept = keep_passes(&r, 8);
         let luma = plane_texture(&mut r, 21, 0);
         let chroma = plane_texture(&mut r, 22, 1);
         let queue = r.device.new_command_queue().unwrap();
@@ -2571,15 +2653,13 @@ mod tests {
             0,
             "no zeros of the cache's buffer"
         );
+        assert_eq!(
+            passes(&calls, &kept),
+            [(luma, CLEARS), (chroma, CLEARS)],
+            "each cleared"
+        );
         let filled = filled_images(&calls);
-        let zeros = filled.first().map_or(0, |&(from, _)| from);
-        assert!(zeros != cache, "not the cache's buffer: {filled:?}");
-        assert_eq!(filled, [(zeros, luma), (zeros, chroma)], "from one buffer");
-        let zeros_made = (calls.iter())
-            .filter(|c| c.sel == "newBufferWithLength:options:")
-            .filter(|c| c.args[0].as_u64() == Some(shapes::ZEROS_LEN))
-            .count();
-        assert_eq!(zeros_made, 1, "a buffer of zeros of their own");
+        assert!(filled.is_empty(), "no copy into them: {filled:?}");
         let memory = (r.dec.caches().buffer(BLOCK)).is_some_and(|b| b.memory_made());
         assert!(!memory, "the cache's buffer holds no memory");
         let into_cache: Vec<_> = (copies(&calls).into_iter())
@@ -2668,7 +2748,7 @@ mod tests {
             plane_texture_with(&mut r, 21, 10, 0, whole);
             plane_texture_with(&mut r, 22, 10, 1, whole);
             r.p.world().complete_all(CompleteOn::Caller);
-            // The zeros' command buffer completes as it is committed, so the planes' wait for it
+            // The clears' command buffer completes as it is committed, so the planes' wait for it
             // ends.
             r.p.world().set_auto_complete(Some(CompleteOn::Thread));
             let mark = r.p.call_log().mark();
