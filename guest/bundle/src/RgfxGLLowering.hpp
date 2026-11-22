@@ -89,6 +89,12 @@
  * and control stages in software. The variant keeps its module's normalized text
  * (RgfxGLLowered::stageInText), and its pipeline is one of the kernel made a kernel without the
  * input under the pipeline's descriptor (RgfxGLSpecializeStageIn).
+ * The generator declares the AIR functions a variant calls in an order that can change from one
+ * lowering of the variant to the next, in one process and across runs (measured: macOS 26.7.2,
+ * Heaven run twice in one boot on an RTX 3090: 24 of its 135 fragment variants, their
+ * air.sample_texture_* declarations in another order, no other line changed), and the bitcode
+ * writes the module's functions in its order. The declarations are put in the order of their
+ * names (RgfxGLSortDeclarations), so each lowering of a variant writes the same bytes.
  * Measured on an x86 Mac (macOS 26.7.1, Intel UHD 630 and AMD 5300M): the .metallib of each of
  * a vertex and a fragment shader's variants loads with newLibraryWithData:, makes a render
  * pipeline, and draws what the renderer's own pipeline draws (tools/gld_lower.m).
@@ -158,6 +164,11 @@ struct RgfxGLSignature {
 /// `signature` gives its value (an input's by its parameter index), and an air.arg_name where it
 /// has none. True where it changed `text`; `text` is unchanged otherwise.
 bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signature);
+
+/// Puts the function declarations of `text`, a module as LLVM prints it (its lines that start
+/// "declare "), in the order of their names, each in the place of one of them, and leaves every
+/// other line where it was. True where it changed `text`; `text` is unchanged otherwise.
+bool RgfxGLSortDeclarations(std::string &text);
 
 /// Makes `text`, a GL kernel variant's normalized module (RgfxGLLowered::stageInText), a kernel
 /// that takes no patch control point input, under the stage input descriptor `in`, as the rules

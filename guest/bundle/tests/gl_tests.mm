@@ -20,7 +20,9 @@
 //     name given its signature's name and a name, and every other line as it was;
 //   - a tessellated draw's kernel made one under a stage input descriptor (src/RgfxGLLowering.*),
 //     over kernels' text written here in the generator's shape, and on this Mac's GPU against its
-//     own [[stage_in]] kernels (tests/stage_in_oracle.metal), bit for bit, for every format.
+//     own [[stage_in]] kernels (tests/stage_in_oracle.metal), bit for bit, for every format;
+//   - a module's declarations put in the order of their names (src/RgfxGLLowering.*), so two
+//     orders make one text and, through the system's LLVM, one metallib.
 // A variant is not lowered here: the GL code generator lowers the IR the renderer gives a device,
 // which only a GL context makes; tools/gl_probe.m, tools/gl_inject.mm and tools/gl_cases.m check
 // that on a device.
@@ -1523,6 +1525,67 @@ bool has(const std::string &text, const std::string &part)
 	return text.find(part) != std::string::npos;
 }
 
+// The generator declares the functions a variant calls in an order that changes from one
+// lowering to the next (RgfxGLLowering.hpp); RgfxGLSortDeclarations puts the declarations in the
+// order of their names, in their own places, every other line where it was, so two orders make
+// one text, and one metallib.
+void test_declarations_sorted()
+{
+	const std::string head = "; ModuleID = 'x'\ndefine void @f() {\nentry:\n  ret void\n}\n\n";
+	const std::string tail = "\n!air.version = !{!0}\n!0 = !{i32 2, i32 3, i32 0}\n";
+	const std::string a = "declare float @air.b(float) #1", b = "declare float @air.a(float, i32) #1",
+	                  c = "declare i32 @\"air.c(\"(i32) #2"; // a quoted name, '"' before every letter
+	auto module = [&](const std::string &x, const std::string &y, const std::string &z) {
+		return head + "; Function Attrs: nounwind\n" + x + "\n\n" + y + "\n\n; Function Attrs: readnone\n" + z + "\n" +
+		       tail;
+	};
+	const std::string sorted = module(c, b, a);
+	for (const std::string &order : {module(a, b, c), module(c, a, b), module(b, c, a), module(a, c, b)}) {
+		std::string text = order;
+		CHECK(RgfxGLSortDeclarations(text) && text == sorted);
+	}
+	std::string text = sorted;
+	CHECK(!RgfxGLSortDeclarations(text) && text == sorted);
+	// One declaration, or none: nothing to order.
+	text = head + a + "\n" + tail;
+	CHECK(!RgfxGLSortDeclarations(text) && text == head + a + "\n" + tail);
+	text = head + tail;
+	CHECK(!RgfxGLSortDeclarations(text) && text == head + tail);
+	// A text that does not end in a newline keeps its last line's.
+	text = "declare float @z()\ndeclare float @y()";
+	CHECK(RgfxGLSortDeclarations(text) && text == "declare float @y()\ndeclare float @z()");
+	// A line that names "declare " inside it is no declaration.
+	text = "  ; declare float @b()\ndeclare float @a()\n";
+	CHECK(!RgfxGLSortDeclarations(text));
+
+	// Through the system's LLVM: a kernel whose two declarations come in either order writes other
+	// bytes, and, sorted, the same.
+	RgfxGLStageIn tess;
+	tess.attributes[0] = {MTLAttributeFormatFloat4, 0, 5};
+	tess.attributes[1] = {MTLAttributeFormatFloat2, 0, 6};
+	tess.layouts[5] = {16, MTLStepFunctionThreadPositionInGridX, 1};
+	tess.layouts[6] = {8, MTLStepFunctionThreadPositionInGridX, 1};
+	tess.indexType = MTLIndexTypeUInt16;
+	tess.indexBufferIndex = 19;
+	const std::string anchor = "declare { <4 x float>, <2 x float> } @gld.cs_cpf(i32, i8*)\n\n";
+	auto kernel = [&](const char *first, const char *second) {
+		std::string t = tessKernel(false);
+		const size_t at = t.find(anchor);
+		CHECK(at != std::string::npos);
+		t.insert(at + anchor.size(), std::string(first) + "\n\n" + second + "\n\n");
+		return t;
+	};
+	const char *sinDecl = "declare float @air.fast_sin.f32(float)", *cosDecl = "declare float @air.fast_cos.f32(float)";
+	std::string one = kernel(sinDecl, cosDecl), two = kernel(cosDecl, sinDecl);
+	std::string why;
+	RgfxGLLowered x, y;
+	CHECK(RgfxGLSpecializeStageIn(one, tess, x, why) && RgfxGLSpecializeStageIn(two, tess, y, why));
+	CHECK(!x.metallib.empty() && x.metallib != y.metallib);
+	CHECK(RgfxGLSortDeclarations(one) && RgfxGLSortDeclarations(two) && one == two);
+	CHECK(RgfxGLSpecializeStageIn(one, tess, x, why) && RgfxGLSpecializeStageIn(two, tess, y, why));
+	CHECK(!x.metallib.empty() && x.metallib == y.metallib);
+}
+
 // A GL kernel's patch control point input made a kernel under a stage input descriptor
 // (RgfxGLSpecializeStageIn), over modules written here in the generator's shape: the wrapper
 // takes the kernel's arguments but the input, then a buffer at each index the fields read that the
@@ -1744,6 +1807,7 @@ void rgfxGLTests()
 		test_reflection_answers_return_data();
 		test_stage_metadata_normalized();
 		test_stage_in_specialized();
+		test_declarations_sorted();
 		test_stage_in_matches_metal();
 	}
 }

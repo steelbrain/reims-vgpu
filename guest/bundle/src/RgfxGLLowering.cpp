@@ -708,6 +708,69 @@ bool normalizeNode(std::string &line, bool input, const std::string &type, const
 
 } // namespace
 
+bool RgfxGLSortDeclarations(std::string &text)
+{
+	struct Line {
+		size_t begin, end; // end at its '\n' or the text's end
+	};
+	std::vector<Line> lines;
+	std::vector<size_t> slots; // the declarations' lines
+	for (size_t a = 0; a < text.size();) {
+		size_t b = text.find('\n', a);
+		if (b == std::string::npos)
+			b = text.size();
+		if (text.compare(a, 8, "declare ") == 0)
+			slots.push_back(lines.size());
+		lines.push_back({a, b});
+		a = b + 1;
+	}
+	if (slots.size() < 2)
+		return false;
+	// A declaration's name: from its '@' to its '(' (past a quoted name's closing quote).
+	auto nameOf = [&](size_t i) {
+		const std::string line = text.substr(lines[i].begin, lines[i].end - lines[i].begin);
+		const size_t at = line.find(" @");
+		if (at == std::string::npos)
+			return line;
+		size_t from = at + 2;
+		if (from < line.size() && line[from] == '"') {
+			const size_t quote = line.find('"', from + 1);
+			from = quote == std::string::npos ? line.size() : quote;
+		}
+		const size_t paren = line.find('(', from);
+		return line.substr(at + 1, paren == std::string::npos ? std::string::npos : paren - at - 1);
+	};
+	std::vector<std::pair<std::string, size_t>> order;
+	for (size_t i : slots)
+		order.emplace_back(nameOf(i), i);
+	// By name, then by the whole line, so that the order is the text's own whatever came first.
+	std::sort(order.begin(), order.end(), [&](const auto &x, const auto &y) {
+		if (x.first != y.first)
+			return x.first < y.first;
+		return text.compare(lines[x.second].begin, lines[x.second].end - lines[x.second].begin, text,
+		                    lines[y.second].begin, lines[y.second].end - lines[y.second].begin) < 0;
+	});
+	bool moved = false;
+	for (size_t k = 0; k < slots.size(); k++)
+		if (order[k].second != slots[k] &&
+		    text.compare(lines[slots[k]].begin, lines[slots[k]].end - lines[slots[k]].begin, text,
+		                 lines[order[k].second].begin, lines[order[k].second].end - lines[order[k].second].begin) != 0)
+			moved = true;
+	if (!moved)
+		return false;
+	std::string out;
+	out.reserve(text.size());
+	size_t next = 0;
+	for (size_t i = 0; i < lines.size(); i++) {
+		const Line &from = next < slots.size() && slots[next] == i ? lines[order[next++].second] : lines[i];
+		out.append(text, from.begin, from.end - from.begin);
+		if (lines[i].end < text.size())
+			out.push_back('\n');
+	}
+	text = std::move(out);
+	return true;
+}
+
 bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signature)
 {
 	std::vector<std::string> lines;
@@ -1744,7 +1807,8 @@ bool RgfxLowerGLIR(const uint8_t *ir, size_t irLength, const uint8_t *plugin, si
 		std::string text = printed != nullptr ? printed : "";
 		if (printed != nullptr)
 			l.disposeMessage(printed);
-		const bool normalized = RgfxGLNormalizeStageText(text, signatureOf(l, module, f.name));
+		const bool sorted = RgfxGLSortDeclarations(text);
+		const bool normalized = RgfxGLNormalizeStageText(text, signatureOf(l, module, f.name)) || sorted;
 		// A kernel of a patch control point input is made per stage input descriptor, from its text.
 		if (f.stage == RgfxMetallibStage::Kernel && text.find("!\"air.patch_control_point_input\"") != std::string::npos)
 			out.stageInText = text;
