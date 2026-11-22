@@ -494,13 +494,14 @@ fn a_command_buffer_hands_its_first_shapes_up_to_the_most() {
 fn a_made_key_takes_no_place_and_no_compile() {
     let (device, platform, _guest, mut ring) = with_states(&[11]);
     let world = platform.world();
-    // Each width its own key, the first four and those from 1000 made.
+    // Each width its own key, the first four and four past the first buffer's widths made.
     let made_keys = 4;
+    let later = 1 << 20;
     world.key_dispatches(|p| match p.dispatch {
         PreparedGrid::Threads(w, _, _) => Some(w),
         _ => None,
     });
-    world.variants_made((1..=made_keys).chain(1000..1004));
+    world.variants_made((1..=made_keys).chain(later..later + 4));
     let widths = |platform: &FakePlatform| -> Vec<u64> {
         let mut widths: Vec<u64> = (made(platform).into_iter())
             .map(|p| match p.dispatch {
@@ -531,7 +532,7 @@ fn a_made_key_takes_no_place_and_no_compile() {
     assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
 
     let mut ops = vec![begin(), set_state(11)];
-    ops.extend((1000..1004).map(|w| threads([w, 1, 1], [1, 1, 1])));
+    ops.extend((later..later + 4).map(|w| threads([w, 1, 1], [1, 1, 1])));
     ops.push(end());
     ring.send(&device, command_buffer_of(101, &ops));
     assert_eq!(completed(&platform, &mut ring, 101), RGFX_CB_OK);

@@ -29,8 +29,8 @@
 //!   or a dispatch before) enters the memo as handed and hands nothing: it takes no place of
 //!   the buffer's [`MOST`] and gives the pool nothing. A key not made is handed as above. A
 //!   dispatch with no key, one the platform would make nothing for, hands nothing, counted
-//!   (`dispatch-prepass-no-variant`). A buffer hands [`MOST`] at the most; the rest are counted
-//!   (`dispatch-prepass-past-most`) and left to the walk.
+//!   (`dispatch-prepass-no-variant`). A buffer hands [`MOST`] at the most, as many keys as the
+//!   memo holds; the rest are counted (`dispatch-prepass-past-most`) and left to the walk.
 //! - **One memo for the device.** The rt platform's key is of the kernel's compiled content,
 //!   which every state of one kernel shares with its `VkPipeline`s, and names no other content's
 //!   pipeline even once its own is gone. So one memo serves every state: the states the guest's
@@ -53,8 +53,8 @@
 //!   desktop came up: 659.9 ms in 16 waits at makes running on a compile thread, which took the
 //!   boot's 52 makes ahead three at a time, after 4265.6 ms of queueing in all, and 384.6 ms in
 //!   15 at makes the walk ran itself, one at each dispatch, while the compile threads were idle,
-//!   those of the 15 shapes past [`MOST`] of one buffer of 452 dispatches with 47 new shapes
-//!   (um790's RTX 2080, m3-max-65818; measured).
+//!   those of the 15 shapes past the 32 a buffer then handed at the most, of one buffer of 452
+//!   dispatches with 47 new shapes (um790's RTX 2080, m3-max-65818; measured).
 //! - **Closed at the walk's end.** Right after the buffer's walk and commit, before the message's
 //!   views of the table close, the pre-pass is closed ([`Prepass::close`]): the shapes no thread
 //!   took are dropped (`dispatch-prepass-dropped`), and the walk's thread waits for those being
@@ -108,8 +108,9 @@ use super::cmdbuf::{op_bodies, ops_of};
 use super::tables::Entry;
 use super::{DecodeError, GraphicsDecoder, ObjHandle, read};
 
-/// The most shapes one command buffer hands over.
-pub(crate) const MOST: usize = 32;
+/// The most shapes one command buffer hands over: as many keys as the device's memo holds
+/// ([`MEMO`]), past which a buffer's later keys would push its first out.
+pub(crate) const MOST: usize = MEMO;
 
 /// The most keys of pipelines handed that the device remembers, of every compute state
 /// ([`Handed`]). A pipeline whose key it forgot is handed again at its next dispatch, one make
