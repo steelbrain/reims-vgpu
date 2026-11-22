@@ -298,8 +298,8 @@ mod tests {
         assert_eq!(buffer.exported_block(), Some(block));
         let parts = super::super::fault::buffer_parts(3, 7, false, buffer);
         assert!(parts.object.is_none() && parts.block.is_none());
-        let held = parts.exported.expect("the buffer kept by its exported block");
-        assert_eq!((held.block, held.offset, held.len), (block.0, block.1, length));
+        let held = parts.exported.expect("kept by its block");
+        assert_eq!(((held.block, held.offset), held.len), (block, length));
         assert_eq!((held.context, held.id, held.storage), (3, 7, 2));
     }
 

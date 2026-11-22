@@ -1487,7 +1487,9 @@ impl FaultWatch {
         // rt's own placement of each address among its ranges, live and recently freed, with
         // the tables' objects in each exported block it names.
         for place in &fault.places {
-            let ranges = (place.holders.iter()).chain(&place.below).chain(&place.above);
+            let ranges = (place.holders.iter())
+                .chain(&place.below)
+                .chain(&place.above);
             let exports = exports_text(&export_blocks(ranges), &exported);
             lines.push(format!("{head}rt places {place}{exports}\n"));
         }
@@ -1498,7 +1500,14 @@ impl FaultWatch {
 
     /// What the host sees now: the live objects of the tables' walk, every mapped block it sees,
     /// and what it saw and did not, as the line says it.
-    fn seen(&self) -> (Vec<LiveObject>, Vec<ExportedObject>, Vec<MappedBlock>, String) {
+    fn seen(
+        &self,
+    ) -> (
+        Vec<LiveObject>,
+        Vec<ExportedObject>,
+        Vec<MappedBlock>,
+        String,
+    ) {
         let tables = (self.tables.lock().iter())
             .filter(|t| t.live())
             .cloned()
@@ -1907,6 +1916,7 @@ mod tests {
         let shared = (rt::MemoryClass::Shared, 0x53_0000_0000, 0x100_0000);
         allocations.0.lock().extend([(7, private), (8, shared)]);
         let watch = FaultWatch::new(Arc::clone(&allocations), KnownBlocks::default());
+        let in_export = exported(12, ObjectKind::Texture, 0x1_0000_0004, 0x100, 0x800);
         watch.watch(Arc::new(Tables {
             objects: vec![buffer(0x9, 0x1000, 0x1000)],
             exported: Vec::new(),
@@ -1922,7 +1932,7 @@ mod tests {
                     ..buffer(0x1_0000_0002, 0x52_0000_0800, 0x400)
                 },
             ],
-            exported: vec![exported(12, ObjectKind::Texture, 0x1_0000_0004, 0x100, 0x800)],
+            exported: vec![in_export],
             blocks: vec![block(
                 "buffer 0x100000003's block 44",
                 0x60_0000_0000,
