@@ -106,6 +106,16 @@
 //! [`EXPORTED_BLOCKS_ADDRESSED_CODE`], so a boot's line says whether any exported block's address
 //! went out, and with it whether such a submission could copy a texture over one in.
 //!
+//! **Its pipeline cache past its bound.** rt's reaper replaces the device's `VkPipelineCache` with
+//! a fresh, empty one at a look that finds it past its bound of 32 MiB, and the pipelines the old
+//! one held compile again where made again (rt's `Metrics::pipeline_caches_replaced`); and rt skips
+//! a write of the cache's data over the device's blob where the data is past that bound, as at the
+//! device's teardown where the cache grew past it after the reaper's last look, so the blob keeps
+//! what it held (`Metrics::pipeline_cache_writes_skipped`). The counts line carries both as
+//! amounts, [`PIPELINE_CACHES_REPLACED_CODE`] and [`PIPELINE_CACHE_WRITES_SKIPPED_CODE`], so a
+//! boot's line says whether its pipelines met a fresh cache, and whether the blob the next boot
+//! seeds from missed a write.
+//!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
@@ -245,6 +255,16 @@ pub const FIRST_USE_WAIT_MAX_NS_CODE: &str = "rt-first-use-variant-wait-max-ns";
 /// ([`fold_metrics`]).
 pub const EXPORTED_BLOCKS_ADDRESSED_CODE: &str = "rt-exported-blocks-addressed";
 
+/// The code of the replacements of the device's `VkPipelineCache` by a fresh, empty one past its
+/// bound of 32 MiB (`Metrics::pipeline_caches_replaced`), an amount on the counts line
+/// ([`fold_metrics`]).
+pub const PIPELINE_CACHES_REPLACED_CODE: &str = "rt-pipeline-caches-replaced";
+
+/// The code of the writes of the pipeline cache's data over the device's blob that rt skipped
+/// because the data was past the bound of 32 MiB (`Metrics::pipeline_cache_writes_skipped`), an
+/// amount on the counts line ([`fold_metrics`]).
+pub const PIPELINE_CACHE_WRITES_SKIPPED_CODE: &str = "rt-pipeline-cache-writes-skipped";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -283,8 +303,9 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// translations, the translations loaded, the translator's nanoseconds, the `VkPipeline`s made
 /// and the driver's nanoseconds making them, the render records read and stale, the render
 /// pipelines made with a stage past the kernels' bound, the compute dispatches' first-use waits
-/// and their nanoseconds, and the exported blocks whose address went out.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 14;
+/// and their nanoseconds, the exported blocks whose address went out, and the pipeline caches
+/// replaced and the cache's writes skipped past its bound.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 16;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -305,7 +326,8 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
 /// device, its command buffers held for room, its cache writes, its translations, its pipelines'
 /// makes and their time, its render makes past the kernels' bound, its compute dispatches'
-/// first-use waits and its exported blocks addressed rose by since the last fold
+/// first-use waits, its exported blocks addressed and its pipeline caches replaced and cache
+/// writes skipped past their bound rose by since the last fold
 /// ([`folded_counts`]), so the counts line carries their totals, then its maxima
 /// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
 /// docs). Nothing before the device is made.
@@ -400,8 +422,10 @@ fn follow(counters: rt::Counters) {
 /// ([`PIPELINE_CREATION_NS_CODE`]), the render records read ([`RENDER_RECORDS_READ_CODE`])
 /// and stale ([`RENDER_RECORDS_STALE_CODE`]), the render pipelines made with a stage past the
 /// kernels' bound ([`RENDER_MAKES_PAST_KERNEL_BOUND_CODE`]), the compute dispatches' first-use
-/// waits ([`FIRST_USE_WAITS_CODE`]) and their nanoseconds ([`FIRST_USE_WAIT_NS_CODE`]), and the
-/// exported blocks whose address went out ([`EXPORTED_BLOCKS_ADDRESSED_CODE`]).
+/// waits ([`FIRST_USE_WAITS_CODE`]) and their nanoseconds ([`FIRST_USE_WAIT_NS_CODE`]), the
+/// exported blocks whose address went out ([`EXPORTED_BLOCKS_ADDRESSED_CODE`]), and the pipeline
+/// caches replaced ([`PIPELINE_CACHES_REPLACED_CODE`]) and the cache's writes skipped
+/// ([`PIPELINE_CACHE_WRITES_SKIPPED_CODE`]) past its bound.
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -422,6 +446,11 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (FIRST_USE_WAITS_CODE, m.first_use_variant_waits),
         (FIRST_USE_WAIT_NS_CODE, m.first_use_variant_wait_nanos),
         (EXPORTED_BLOCKS_ADDRESSED_CODE, m.exported_blocks_addressed),
+        (PIPELINE_CACHES_REPLACED_CODE, m.pipeline_caches_replaced),
+        (
+            PIPELINE_CACHE_WRITES_SKIPPED_CODE,
+            m.pipeline_cache_writes_skipped,
+        ),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -1908,7 +1937,8 @@ mod tests {
     /// translations loaded, the translator's nanoseconds, the `VkPipeline`s made and the driver's
     /// nanoseconds making them, the render records read and stale, the render pipelines made with
     /// a stage past the kernels' bound, the compute dispatches' first-use waits and their
-    /// nanoseconds, and the exported blocks whose address went out.
+    /// nanoseconds, the exported blocks whose address went out, and the pipeline caches replaced
+    /// and the cache's writes skipped past its bound.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -1936,6 +1966,8 @@ mod tests {
             FIRST_USE_WAITS_CODE,
             FIRST_USE_WAIT_NS_CODE,
             EXPORTED_BLOCKS_ADDRESSED_CODE,
+            PIPELINE_CACHES_REPLACED_CODE,
+            PIPELINE_CACHE_WRITES_SKIPPED_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -1963,6 +1995,7 @@ mod tests {
         m.first_use_variant_waits = 2;
         m.first_use_variant_wait_nanos = 5_000;
         m.exported_blocks_addressed = 1;
+        m.pipeline_caches_replaced = 1;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -1983,6 +2016,8 @@ mod tests {
         m.first_use_variant_waits = 3;
         m.first_use_variant_wait_nanos = 9_000;
         m.exported_blocks_addressed = 2;
+        m.pipeline_caches_replaced = 3;
+        m.pipeline_cache_writes_skipped = 1;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -1991,7 +2026,7 @@ mod tests {
             rose,
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
-                28_500_000, 3, 1, 2, 3, 9_000, 2
+                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
