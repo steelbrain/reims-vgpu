@@ -2210,8 +2210,8 @@ void armAge(UInt64 now)
 		thread_call_enter_delayed(ageTimer, ageArmedAt);
 }
 
-// The dormant entry `i`, not deferred, goes for its age. One whose release copies its cache into
-// its pages (`written`: the GPU wrote it since its last copy) is
+// The dormant entry `i` goes for its age. One whose release copies its cache into its pages
+// (`written`: the GPU wrote it since its last copy, a deferred one's pages named first for it) is
 // the one such in flight (agePace) until its answer. Where clients of its surface are left, the
 // release worker's sample of them takes it. Under contextLock, on the release worker; whether a
 // release is to be posted.
