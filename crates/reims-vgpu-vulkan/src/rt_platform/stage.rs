@@ -34,7 +34,10 @@
 //! argument names by `deviceUUID`, with the options the VM's device was opened with
 //! (`super::device::shared_options`): rt takes its compile only from a device that enabled what
 //! the VM's did. Its first act is to set its own core-file limit to none, so its crash writes no
-//! core file (`crate::os::compile_helper`'s docs, "A helper's crash writes no core file").
+//! core file (`crate::os::compile_helper`'s docs, "A helper's crash writes no core file"). Where
+//! it serves no reply of its own accord (no device of the argument's, no instance, a failed watch
+//! of the library's process, its pipes), it exits with a code of its own
+//! (`os::compile_helper::SERVED_NONE`).
 //!
 //! **Each helper's footprint** is logged as it ends, with its fill's key ([`footprints_line`]):
 //! the largest its reads saw, the largest growth from one read to the next, its own cap, and how
@@ -62,7 +65,9 @@ use metal2vulkan_runtime as rt;
 use crate::core::platform::os::Clock;
 use crate::core::platform::stage::{Cancel, FillDone, FillEnd, Site, StageFills, Start};
 use crate::os::OsClock;
-use crate::os::compile_helper::{Footprints, Helper, HelperEnd, HelperRun, Limits, Seats};
+use crate::os::compile_helper::{
+    Footprints, Helper, HelperEnd, HelperRun, Limits, SERVED_NONE, Seats,
+};
 
 /// The helper's program, beside the process's executable, with the OS's executable suffix.
 pub(crate) const HELPER: &str = "reims-vgpu-compile";
@@ -233,7 +238,8 @@ fn device_uuid(instance: &rt::Instance, physical: &rt::PhysicalDevice) -> [u8; 1
 /// opened with. Every outcome of the compile is in its reply. Its lines go to stderr: its warnings
 /// and errors, or what `REIMS_VGPU_LOG` names where it is set (`crate::core::logging`).
 ///
-/// A failure where it served no reply, as its line says; the library's fill then ends failed
+/// A failure where it served no reply, as its line says, exits with the code of a helper that
+/// served none (`os::compile_helper::SERVED_NONE`); the library's fill then ends failed
 /// ([`fill_end`]).
 pub fn helper_main() -> ExitCode {
     let no_core_files = crate::os::compile_helper::no_core_files();
@@ -252,7 +258,7 @@ pub fn helper_main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(why) => {
             log::error!(target: super::TARGET, "the stage helper served no fill: {why}");
-            ExitCode::FAILURE
+            ExitCode::from(SERVED_NONE)
         }
     }
 }

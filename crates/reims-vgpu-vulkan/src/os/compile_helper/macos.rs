@@ -97,11 +97,12 @@ pub(super) fn watch_parent() -> io::Result<()> {
     Ok(())
 }
 
-/// Ends the helper's process at once, with no atexit handler: a driver's destructors must not run
-/// while its compiler may still be working on another thread.
+/// Ends the helper's process at once, with no atexit handler, with the code of a helper that
+/// served no reply ([`super::SERVED_NONE`]): a driver's destructors must not run while its
+/// compiler may still be working on another thread.
 fn exit_now() -> ! {
     // SAFETY: _exit ends the process; it takes no pointer.
-    unsafe { libc::_exit(1) }
+    unsafe { libc::_exit(i32::from(super::SERVED_NONE)) }
 }
 
 /// A running helper's physical footprint.

@@ -95,6 +95,10 @@
 //!   one handle the library's process holds. Its end closes the job, which ends the helper. The
 //!   process joins the job just after its start, before the talk begins.
 //!
+//! **A helper's own end.** A helper that ends of its own accord having served no reply, as the
+//! helper's main does where it finds nothing to serve the request on, exits with a code of its
+//! own, [`SERVED_NONE`], which no fault ends a process with.
+//!
 //! **A helper's crash writes no core file.** The helper's main first sets its own core-file
 //! limit to none ([`no_core_files`]), whatever the limit it inherits from the library's process,
 //! with no switch. A helper that crashes is said by its end ([`HelperEnd::Ended`], its signal
@@ -154,6 +158,13 @@ pub(crate) const POLL: Duration = Duration::from_millis(100);
 /// How often the first helper that waits reads the host's room again while the room keeps it
 /// waiting: a read walks the guest's RAM's pages (`mincore`).
 const ROOM_POLL: Duration = Duration::from_secs(1);
+
+/// The exit code of a helper that ends of its own accord having served no reply: the helper's
+/// main where it found nothing to serve the request on or its pipes failed
+/// (`rt_platform::stage::helper_main`), and on macOS its watch of its parent
+/// (`macos::watch_parent`), at the parent's exit or where the watch fails. 75, `EX_TEMPFAIL` of
+/// `sysexits.h`: a later ask may be served. No fault ends a process with it.
+pub(crate) const SERVED_NONE: u8 = 75;
 
 /// A helper's caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
