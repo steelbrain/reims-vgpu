@@ -67,8 +67,11 @@ Stages:
      and far more queues than engines. RADV and ANV expose one graphics
      queue and NVIDIA 16, so on AMD and Intel the graphics work of every guest
      queue meets on one host queue, as native apps' work does.
-   - WindowServer's queue runs at high priority where the host driver offers
-     queue priorities.
+   - Every queue's work, WindowServer's among them, goes to the runtime's one
+     GPU queue in submission order, and no queue priority reaches Vulkan: the
+     bundle sends 0 for every queue ("Rings", below), and a queue the kext asks
+     unshared is the runtime's plain queue ("WindowServer's queues are
+     unshared", below).
    - Completion records (seqno, status, Metal's error and the failing
      encoders' info, GPU times) go in the queue's completion ring.
    - An interrupt fires only when the guest armed one, on several MSI-X
@@ -2913,21 +2916,24 @@ signing identifier and its platform-binary status (`cs_identity_get`,
 outside Apple's namespace cannot link. Resolving them at run time through the
 loader is not worth its risk.
 
-**WindowServer's queues are unshared.** The host's runtime may let command
-queues share a GPU queue, which raises the rate of small command buffers on a
-GPU whose switches between queues idle it. A shared queue can then hold
-another process's long command buffer ahead of the compositor's frame. So
-the accelerator flags every queue WindowServer's process creates
-`RGFX_QUEUE_UNSHARED` in its `QUEUE_CREATE`'s tail, where the host offered
-`UNSHARED_QUEUES` and the framebuffer took it (`rgfxQueueFlagsSent`,
-`RgfxFeatures.hpp`). It decides from its own test of the client's task at
-the open (above), never from what the process asks: `QueueCreate`'s seventh
-input never grants the flag. The host makes such a queue with the platform's
-`new_command_queue_unshared` (`GpuDevice`): on the Vulkan platform the
-runtime's queue `unshared_queue` makes, and on Metal the queue any create
-makes. The host logs each unshared queue
-at debug level, on its own target (`reims_vgpu::graphics::queues`). Nothing
-the guest's processes see changes.
+**WindowServer's queues are unshared.** A runtime that lets command queues
+share a GPU queue, which raises the rate of small command buffers on a GPU
+whose switches between queues idle it, can then hold another process's long
+command buffer ahead of the compositor's frame. So the accelerator flags
+every queue WindowServer's process creates `RGFX_QUEUE_UNSHARED` in its
+`QUEUE_CREATE`'s tail, where the host offered `UNSHARED_QUEUES` and the
+framebuffer took it (`rgfxQueueFlagsSent`, `RgfxFeatures.hpp`). It decides
+from its own test of the client's task at the open (above), never from what
+the process asks: `QueueCreate`'s seventh input never grants the flag. The
+host makes such a queue with the platform's `new_command_queue_unshared`
+(`GpuDevice`). On the Vulkan platform that is the platform's plain
+`new_command_queue`: the runtime submits every command queue's work to its
+one GPU queue, a `VkQueue` it makes at priority 1.0 as it makes its queue for
+presents, with no global priority. So an unshared queue's buffers wait
+behind every buffer submitted before them, as any queue's do ("A command
+buffer in parts"), and no queue priority reaches Vulkan (dgpu-oracle.md,
+Q50). The host logs each unshared queue at debug level, on its own target
+(`reims_vgpu::graphics::queues`). Nothing the guest's processes see changes.
 
 **Reset.** A reset leaves the device as one just made, as a device's
 function reset does: `STATUS` 0, which the framebuffer writes at its start,
