@@ -7385,9 +7385,11 @@ typedef struct {
   uint32_t submit_data_size;
   // The completion ring's byte-ring size, after its header: a power of two.
   uint32_t complete_data_size;
-  // The queue's priority, 0 normal and higher higher. The bundle sends 0 for
-  // every queue (a `setGPUPriority:` stays in the guest), and the host reads
-  // none: each queue is the platform's plain `newCommandQueue`.
+  // A priority for the queue, which no side acts on: the bundle sends 0 for every
+  // queue (a guest's `setGPUPriority:` stays in the guest), and the host reads
+  // none, so no queue the platform makes takes one. Metal's own GPU priority is
+  // 1 on a new queue, and on an Intel 630 a lower value runs first
+  // (docs/graphics-kext/dgpu-oracle.md, Q50).
   uint32_t priority;
   // The MSI-X vector the completion ring raises.
   uint32_t vector;
