@@ -49,12 +49,12 @@ use crate::core::sync::{Condvar, Mutex};
 pub enum FillEnd {
     /// The store has the stage's compile: a make of the stage finds it there.
     Filled,
-    /// The compile passed its memory or time cap, or failed, and the platform recorded the breach:
-    /// a make of the stage refuses.
+    /// The compile passed its memory or time cap, failed, or ended what ran it by a fault before
+    /// its answer, and the platform recorded the breach: a make of the stage refuses.
     Breached,
-    /// The fill ended with nothing recorded (what runs it did not start, ended early, could not
-    /// open its device, or passed a memory cap the host's room set): a make of the stage refuses
-    /// as before the fill.
+    /// The fill ended with nothing recorded (what runs it did not start, ended early with no
+    /// fault, could not open its device, or passed a memory cap the host's room set): a make of
+    /// the stage refuses as before the fill.
     Failed,
     /// The fill was cancelled (a device's reset, the process's exit). Nothing is kept for its key.
     Cancelled,

@@ -9,8 +9,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::{
-    Beside, Footprints, GUEST_RAM, Helper, HelperEnd, HelperRun, Limits, MEMORY_MOST, Seats,
-    TIME_MOST, admits, end_with_parent, hold_guest_ram, host, seat_cap,
+    Beside, Footprints, GUEST_RAM, Helper, HelperEnd, HelperRun, Limits, MEMORY_MOST, SERVED_NONE,
+    Seats, TIME_MOST, admits, end_with_parent, hold_guest_ram, host, seat_cap,
 };
 use crate::core::platform::os::Clock;
 use crate::os::OsClock;
@@ -659,6 +659,89 @@ fn a_helper_sets_its_core_file_limit_to_none() {
     let limit = (said.split_once("core-limit "))
         .map(|(_, limit)| limit.split_whitespace().take(2).collect::<Vec<_>>());
     assert_eq!(limit, Some(vec!["0", "0"]), "{said}");
+}
+
+/// A helper died only where a fault ended it, or a panic of its main thread (exit code 101):
+/// not where it exited with a code of its own, the code of a helper that served no reply among
+/// them, nor where another process ended it, a host's policy killed it, or its loader failed.
+#[test]
+fn a_helper_died_only_of_a_fault_or_a_panic() {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    #[cfg(unix)]
+    let (exited, faults, others) = {
+        let exited = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let signal = std::process::ExitStatus::from_raw;
+        // A fault's signal, and one whose process dumped core.
+        let faults = [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGABRT,
+            libc::SIGTRAP,
+            0x80 | libc::SIGSEGV,
+        ]
+        .map(signal);
+        let others = [
+            libc::SIGKILL,
+            libc::SIGTERM,
+            libc::SIGINT,
+            libc::SIGHUP,
+            libc::SIGQUIT,
+            libc::SIGPIPE,
+            libc::SIGSYS,
+        ]
+        .map(signal);
+        (exited, faults, others)
+    };
+    #[cfg(windows)]
+    let (exited, faults, others) = {
+        use windows_sys::Win32::Foundation::{
+            NTSTATUS, STATUS_ACCESS_VIOLATION, STATUS_BREAKPOINT, STATUS_CONTROL_C_EXIT,
+            STATUS_DLL_NOT_FOUND, STATUS_HEAP_CORRUPTION, STATUS_ILLEGAL_INSTRUCTION,
+            STATUS_IN_PAGE_ERROR, STATUS_INTEGER_DIVIDE_BY_ZERO, STATUS_STACK_BUFFER_OVERRUN,
+            STATUS_STACK_OVERFLOW,
+        };
+        let exited = |code: i32| std::process::ExitStatus::from_raw(code.cast_unsigned());
+        let status = |code: NTSTATUS| std::process::ExitStatus::from_raw(code.cast_unsigned());
+        let faults = [
+            STATUS_ACCESS_VIOLATION,
+            STATUS_IN_PAGE_ERROR,
+            STATUS_ILLEGAL_INSTRUCTION,
+            STATUS_INTEGER_DIVIDE_BY_ZERO,
+            STATUS_STACK_OVERFLOW,
+            STATUS_STACK_BUFFER_OVERRUN,
+            STATUS_HEAP_CORRUPTION,
+            STATUS_BREAKPOINT,
+        ]
+        .map(status);
+        let others = [STATUS_CONTROL_C_EXIT, STATUS_DLL_NOT_FOUND, 3].map(status);
+        (exited, faults, others)
+    };
+    let died = |status| HelperEnd::Ended(status).died();
+    for status in faults {
+        assert!(died(status), "{status:?}");
+    }
+    assert!(died(exited(101)));
+    for status in others {
+        assert!(!died(status), "{status:?}");
+    }
+    for code in [0, 1, i32::from(SERVED_NONE), 127] {
+        assert!(!died(exited(code)), "exit code {code}");
+    }
+    for end in [
+        HelperEnd::OverMemory { bytes: 1 },
+        HelperEnd::OverRoom { bytes: 2, cap: 1 },
+        HelperEnd::OverTime,
+        HelperEnd::Cancelled,
+        HelperEnd::NotStarted("its seats".to_owned()),
+        HelperEnd::Unwatched("its status".to_owned()),
+    ] {
+        assert!(!end.died(), "{end:?}");
+    }
 }
 
 /// A program that cannot start is said so, and no helper runs.

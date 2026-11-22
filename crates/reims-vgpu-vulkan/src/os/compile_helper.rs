@@ -95,15 +95,22 @@
 //!   one handle the library's process holds. Its end closes the job, which ends the helper. The
 //!   process joins the job just after its start, before the talk begins.
 //!
-//! **A helper's own end.** A helper that ends of its own accord having served no reply, as the
-//! helper's main does where it finds nothing to serve the request on, exits with a code of its
-//! own, [`SERVED_NONE`], which no fault ends a process with.
+//! **A helper's own end and its death.** A helper that ends of its own accord having served no
+//! reply, as the helper's main does where it finds nothing to serve the request on, exits with a
+//! code of its own, [`SERVED_NONE`]. A helper died ([`HelperEnd::died`]) where a fault ended it
+//! with no kill of the library's: a fault's signal on Linux and macOS, an exception's status on
+//! Windows, or a panic of its main thread. No other end is a death: an exit with a code, an end
+//! another process asks for (a terminal's Ctrl+C or its close, a service's stop, the OOM killer),
+//! a host policy's kill, or a start the loader failed on Linux or Windows. The library keeps a
+//! death before the helper's reply as its stage's breach, and asks again at the VM's next start
+//! after any other end (`rt_platform::stage`).
 //!
 //! **A helper's crash writes no core file.** The helper's main first sets its own core-file
 //! limit to none ([`no_core_files`]), whatever the limit it inherits from the library's process,
 //! with no switch. A helper that crashes is said by its end ([`HelperEnd::Ended`], its signal
 //! where it had one), which the library logs with its fill's key, and by the stderr it shares with
-//! the library's process; its fill ends failed, as any end without a reply does.
+//! the library's process; a crash before its reply is a death, which its fill keeps as a breach
+//! (above).
 //! - Linux and macOS: `RLIMIT_CORE` at 0, soft and hard (`setrlimit`). The kernel writes no core
 //!   file under it, and `systemd-coredump`, where a `core_pattern` pipe hands it the crash, keeps
 //!   no core of a process whose limit is below a page.
@@ -163,8 +170,11 @@ const ROOM_POLL: Duration = Duration::from_secs(1);
 /// main where it found nothing to serve the request on or its pipes failed
 /// (`rt_platform::stage::helper_main`), and on macOS its watch of its parent
 /// (`macos::watch_parent`), at the parent's exit or where the watch fails. 75, `EX_TEMPFAIL` of
-/// `sysexits.h`: a later ask may be served. No fault ends a process with it.
+/// `sysexits.h`: a later ask may be served. No fault ends a process with it ([`HelperEnd::died`]).
 pub(crate) const SERVED_NONE: u8 = 75;
+
+/// Rust's exit code of a process whose main thread panicked.
+const PANICKED: i32 = 101;
 
 /// A helper's caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,6 +475,27 @@ pub(crate) enum HelperEnd {
     /// It was killed because its footprint or its status could not be read, as said, so its caps
     /// could not hold.
     Unwatched(String),
+}
+
+impl HelperEnd {
+    /// Whether the helper died of a fault, with no kill of the library's (the module's doc, "A
+    /// helper's own end and its death"): it ended ([`HelperEnd::Ended`]) by a panic of its main
+    /// thread, Rust's exit code 101, or by a fault: a fault's signal on Linux and macOS
+    /// (`unix::faulted`), an exception's status on Windows (`windows::faulted`). No other end is a
+    /// death: an exit with a code of its own, [`SERVED_NONE`] among them, Linux's dynamic
+    /// loader's 127 and Windows' `STATUS_DLL_NOT_FOUND` at a start the loader failed, and every
+    /// other signal or status, among them those another process ends it with: `SIGKILL` (the OOM
+    /// killer's among them), `SIGTERM` (a service's stop), `SIGINT` and `SIGHUP` (a terminal's
+    /// Ctrl+C and its close, which reach the helper in the library's process group), Windows'
+    /// `STATUS_CONTROL_C_EXIT`, and a seccomp filter's `SIGSYS`, a host's policy. macOS's `dyld`
+    /// ends a start it failed with `SIGABRT`, a death; the helper links only the system's
+    /// libraries there, and opens the Vulkan loader and its driver with `dlopen`.
+    pub(crate) fn died(&self) -> bool {
+        match self {
+            HelperEnd::Ended(status) => status.code() == Some(PANICKED) || host::faulted(*status),
+            _ => false,
+        }
+    }
 }
 
 /// What the helper's thread read of a process's footprint, every [`POLL`] from its start to its

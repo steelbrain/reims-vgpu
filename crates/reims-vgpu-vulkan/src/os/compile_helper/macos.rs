@@ -7,7 +7,7 @@ use std::process::{Child, Command};
 use std::sync::OnceLock;
 
 pub(super) use super::unix::{
-    host_cpus, host_memory, mask_broken_pipes, no_core_files, unresident,
+    faulted, host_cpus, host_memory, mask_broken_pipes, no_core_files, unresident,
 };
 
 /// What the host can give now, in bytes: its free pages less the speculative ones, which the

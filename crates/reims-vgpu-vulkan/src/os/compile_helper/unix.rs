@@ -1,7 +1,9 @@
 //! What Linux and macOS share of a helper's watch: the host's memory and CPUs, what of the guest's
-//! RAM is not resident, the talk's broken pipes, and the helper's core-file limit.
+//! RAM is not resident, the talk's broken pipes, a fault's end, and the helper's core-file limit.
 
 use std::io;
+use std::os::unix::process::ExitStatusExt as _;
+use std::process::ExitStatus;
 
 use crate::core::num::{ToU64 as _, ToUsize as _};
 
@@ -82,6 +84,25 @@ pub(super) fn mask_broken_pipes() {
         libc::sigaddset(&mut set, libc::SIGPIPE);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
+}
+
+/// The signals a fault ends a process with ([`faulted`]).
+const FAULTS: [libc::c_int; 6] = [
+    libc::SIGSEGV,
+    libc::SIGBUS,
+    libc::SIGILL,
+    libc::SIGFPE,
+    libc::SIGABRT,
+    libc::SIGTRAP,
+];
+
+/// Whether a process that ended with `status` was ended by a fault's signal: `SIGSEGV`, `SIGBUS`,
+/// `SIGILL`, `SIGFPE`, `SIGABRT` (an abort: a failed assertion's, Rust's) or `SIGTRAP` (a trap
+/// instruction, arm64's for a compiler's trap).
+pub(super) fn faulted(status: ExitStatus) -> bool {
+    status
+        .signal()
+        .is_some_and(|signal| FAULTS.contains(&signal))
 }
 
 /// Sets the calling process's core-file limit (`RLIMIT_CORE`) to 0, its soft limit and its hard

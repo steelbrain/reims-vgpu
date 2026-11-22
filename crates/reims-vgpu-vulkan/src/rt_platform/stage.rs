@@ -10,19 +10,32 @@
 //!   helper's own times (`StageSpans`): its device's creation and its compile, logged with the
 //!   talk's wall time and the module's weight (`StageRequest::weight`).
 //! - **The fill's end** ([`fill_end`]) is the talk's answer first: data kept fills the stage, and
-//!   a compile the driver failed is a breach rt kept. Otherwise it is how the helper ended: killed
-//!   at its memory cap at the ceiling (`Limits::memory`) or at its time cap, a breach recorded
-//!   with rt (`Device::record_stage_breach`), so the pipeline's makes refuse it (`Gap::StageSize`)
-//!   with no helper asked again. rt keeps a memory breach with the ceiling the device was opened
-//!   with (`DeviceOptions::stage_memory_ceiling`, `super::device::shared_options`), and on a device
-//!   given a higher ceiling, a host with more memory, the breach is a miss and a helper is asked
-//!   again; cancelled; or failed, with nothing recorded (no helper, one of
-//!   another build's wire, one that found no device of the request's or enabled other features, a
-//!   cache directory that took no entry, a helper that ended before its reply, and a helper killed
-//!   at a memory cap the host's room set below the ceiling, as the same stage fits on a host with
-//!   room). A failed fill's end is kept for the process's run, as every end is: the guest's
-//!   create of the pipeline fails, and its dispatches are skipped, until the VM's next start asks a
-//!   helper again.
+//!   a compile the driver failed is a breach rt kept. Otherwise it is how the helper ended. Killed
+//!   at its memory cap at the ceiling (`Limits::memory`) or at its time cap, or dead before its
+//!   whole reply (`HelperEnd::died`: a fault's signal, an exception's status or a panic, as a
+//!   driver that faults in its compile ends it, and alike where the death came before rt's
+//!   serve, in rt's instance or its devices' listing), the helper breached its stage: the breach is
+//!   recorded with rt (`Device::record_stage_breach`, `StageBreach::Ended` for a death), so the
+//!   pipeline's makes refuse it (`Gap::StageSize`) with no helper asked again. rt keeps a memory
+//!   breach with the ceiling the device was opened with (`DeviceOptions::stage_memory_ceiling`,
+//!   `super::device::shared_options`), and on a device given a higher ceiling, a host with more
+//!   memory, the breach is a miss and a helper is asked again; a death with the version of rt's
+//!   helper code, so a runtime whose helper code changed asks again; and under a driver of
+//!   another version every breach is a miss, as the stage's key holds the driver's cache header.
+//!   Otherwise the fill is cancelled, or failed, with nothing recorded: no helper, one of another
+//!   build's wire, one that found no device of the request's or enabled other features, a cache
+//!   directory that took no entry, a helper that ended before its reply with no death (its own
+//!   failure's exit, `os::compile_helper::SERVED_NONE`, or an end another process asked for, as a
+//!   terminal's Ctrl+C), and a helper killed at a memory cap the host's room set below the
+//!   ceiling, as the same stage fits on a host with room.
+//! - **What the guest meets.** A fill's end is kept for the process's run, as every end is. A
+//!   failed or a breached fill alike fails the guest's create of the pipeline held for it, and
+//!   skips the dispatches that waited for it, counted under its end's code. After a failed fill,
+//!   each later make or dispatch of the stage in the run is answered the kept end as these were,
+//!   and the VM's next start asks a helper again. After a breach, each later make or dispatch of
+//!   the stage, in this run or a later one, is rt's refusal at once (`Gap::StageSize`, counted
+//!   under `rt-refused-gap`), with no helper asked: a create fails, and a dispatch encodes
+//!   nothing.
 //! - A cancel of the fill kills the helper.
 //!
 //! Where there is no helper to run, no fill starts, and the stage's fill ends
@@ -144,7 +157,7 @@ pub(crate) fn unfilled_at_dispatch(error: &rt::Error) -> Option<StageKey> {
 
 /// The fills of `device`, whose physical device's `deviceUUID` is `uuid`: each runs the helper
 /// ([`helper_run`]), hands its pipes to rt's `fill_stage`, and records the breach of a helper
-/// killed at the ceiling or its time cap (the module's docs).
+/// killed at the ceiling or its time cap, or dead before its reply (the module's docs).
 pub(crate) fn fills(device: rt::Device, uuid: [u8; 16]) -> StageFills<StageKey> {
     let talks = device.clone();
     StageFills::new(stage_start(
@@ -327,7 +340,13 @@ fn fill_end<S>(
         (_, HelperEnd::OverMemory { .. }) => (FillEnd::Breached, Some(rt::StageBreach::Memory)),
         (_, HelperEnd::OverTime) => (FillEnd::Breached, Some(rt::StageBreach::Time)),
         (_, HelperEnd::Cancelled) => (FillEnd::Cancelled, None),
-        // A cap the host's room set is no breach: the stage fits on a host with room.
+        // A fault ended the helper before its whole reply, with no kill of ours: a breach, which
+        // rt keeps under the version of its helper code.
+        (Some(Err(rt::StageFill::Ended)), _) if end.died() => {
+            (FillEnd::Breached, Some(rt::StageBreach::Ended))
+        }
+        // A cap the host's room set is no breach: the stage fits on a host with room. Nor is an
+        // end with no death: the helper's own failure, or an end another process asked for.
         (
             _,
             HelperEnd::OverRoom { .. }
@@ -424,7 +443,7 @@ mod tests {
 
     use super::*;
     use crate::core::platform::stage::StageFills;
-    use crate::os::compile_helper::{Limits, end_with_parent};
+    use crate::os::compile_helper::{Limits, end_with_parent, no_core_files};
 
     /// A refusal of a stage is counted under its site's code, and one of no stage is not
     #[test]
@@ -470,6 +489,10 @@ mod tests {
     /// returns at once. A stand-in arms its end with its parent first, as the helper's main does.
     /// - `echo`: writes back what its stdin carries, then exits with 0.
     /// - `grow`: dirties 32 MiB more every 10 ms, up to 2 GiB, then sleeps for a minute.
+    /// - `abort`: sets its core-file limit to none, as the helper's main does, and aborts, as a
+    ///   driver that faults in its compile ends the helper.
+    /// - `unserved`: exits with the code of a helper that served no reply (`SERVED_NONE`), as the
+    ///   helper's main does where it finds no device of the request's.
     /// - `sleep`: sleeps for a minute, past every test's wait.
     fn stand_in() {
         let Some(mode) = std::env::var_os(STAND_IN) else {
@@ -482,6 +505,12 @@ mod tests {
             let mut stdout = io::stdout();
             stdout.write_all(&request).unwrap();
             stdout.flush().unwrap();
+        } else if mode == "abort" {
+            let _ = no_core_files();
+            #[allow(clippy::disallowed_methods)] // the stand-in's own death
+            std::process::abort();
+        } else if mode == "unserved" {
+            std::process::exit(i32::from(SERVED_NONE));
         } else if mode == "grow" {
             let mut held = Vec::new();
             for _ in 0..64 {
@@ -549,6 +578,20 @@ mod tests {
         drop(stdin);
         io::copy(&mut stdout, &mut io::sink()).unwrap_or(0);
         Err(rt::StageFill::Ended)
+    }
+
+    /// An exit status of a process a fault ended: `SIGSEGV`'s on Linux and macOS, an access
+    /// violation's on Windows.
+    fn faulted() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        #[cfg(unix)]
+        let raw = libc::SIGSEGV;
+        #[cfg(windows)]
+        let raw = windows_sys::Win32::Foundation::STATUS_ACCESS_VIOLATION.cast_unsigned();
+        std::process::ExitStatus::from_raw(raw)
     }
 
     /// An exit status of `code`.
@@ -648,8 +691,9 @@ mod tests {
 
     /// The talk's answer decides first: data kept fills the stage, and a failed compile is a
     /// breach rt kept. Otherwise a kill at the ceiling or the time cap is a breach to record, a
-    /// cancel is a cancel, and every other end, a kill at a cap the room set among them, fails the
-    /// fill with nothing recorded.
+    /// cancel is a cancel, a death before the whole reply is a breach to record
+    /// ([`a_fill_whose_helper_died_before_its_reply_breaches_it`]), and every other end, a kill at
+    /// a cap the room set among them, fails the fill with nothing recorded.
     #[test]
     fn a_fill_ends_by_its_talk_first_then_by_its_helper() {
         use rt::{StageBreach, StageFill};
@@ -690,6 +734,42 @@ mod tests {
         assert_eq!(fill_end(&over_room, Some(&ended)), failed);
         assert_eq!(fill_end::<()>(&over_room, None), failed);
         assert_eq!(fill_end(&over_room, Some(&ok)), (FillEnd::Filled, None));
+    }
+
+    /// A helper that died of a fault or a panic (exit code 101) before its whole reply, which
+    /// rt's talk answers `StageFill::Ended`, breaches its stage: `StageBreach::Ended` is recorded.
+    /// One that exited with the code of a helper that served no reply, or with 0, fails the fill
+    /// with nothing recorded, as does a death whose talk named another reason, or where no talk
+    /// ran; a reply that came whole decides first, as for every end.
+    #[test]
+    fn a_fill_whose_helper_died_before_its_reply_breaches_it() {
+        use rt::{StageBreach, StageFill};
+        type Said = Result<(), StageFill>;
+        let ended: Said = Err(StageFill::Ended);
+        let died = || HelperEnd::Ended(faulted());
+        let panicked = HelperEnd::Ended(exit_status(101));
+        let breach = (FillEnd::Breached, Some(StageBreach::Ended));
+        assert_eq!(fill_end(&died(), Some(&ended)), breach);
+        assert_eq!(fill_end(&panicked, Some(&ended)), breach);
+        let failed = (FillEnd::Failed, None);
+        let served_none = HelperEnd::Ended(exit_status(i32::from(SERVED_NONE)));
+        assert_eq!(fill_end(&served_none, Some(&ended)), failed);
+        assert_eq!(
+            fill_end(&HelperEnd::Ended(exit_status(0)), Some(&ended)),
+            failed
+        );
+        for reason in [
+            StageFill::Version,
+            StageFill::NoDevice,
+            StageFill::Enables,
+            StageFill::Unkept,
+        ] {
+            assert_eq!(fill_end(&died(), Some(&Err::<(), _>(reason))), failed);
+        }
+        assert_eq!(fill_end::<()>(&died(), None), failed);
+        assert_eq!(fill_end(&died(), Some(&Ok(()))), (FillEnd::Filled, None));
+        let compile: Said = Err(StageFill::Compile(ash::vk::Result::ERROR_DEVICE_LOST));
+        assert_eq!(fill_end(&died(), Some(&compile)), (FillEnd::Breached, None));
     }
 
     /// A helper killed at a cap the host's room set below the ceiling, here a room of nothing,
@@ -735,6 +815,53 @@ mod tests {
             recorded.recv_timeout(WAIT).unwrap(),
             (7, rt::StageBreach::Memory)
         );
+        seats_of(test).remove_files();
+    }
+
+    /// A helper that aborts before its reply, as one whose driver faults in its compile does,
+    /// breaches its stage: the fill ends breached, `StageBreach::Ended` is recorded, and the end is
+    /// kept: no helper is asked again.
+    #[test]
+    fn a_helper_that_aborts_before_its_reply_records_an_ended_breach() {
+        let test = "a_helper_that_aborts_before_its_reply_records_an_ended_breach";
+        stand_in();
+        let (records, recorded) = mpsc::channel();
+        let (talks, talked) = mpsc::channel();
+        let fills = StageFills::new(stage_start(
+            move || Ok(run_of(test, "abort")),
+            move |key: &u32, stdin, stdout| {
+                talks.send(*key).unwrap();
+                no_reply(key, stdin, stdout)
+            },
+            move |key, breach| records.send((*key, breach)).unwrap(),
+        ));
+        assert_eq!(fills.fill(8, Site::Dispatch).wait(), FillEnd::Breached);
+        assert_eq!(
+            recorded.recv_timeout(WAIT).unwrap(),
+            (8, rt::StageBreach::Ended)
+        );
+        assert_eq!(talked.recv_timeout(WAIT).unwrap(), 8);
+        assert_eq!(fills.fill(8, Site::Dispatch).end(), Some(FillEnd::Breached));
+        assert!(talked.try_recv().is_err());
+        assert!(recorded.try_recv().is_err());
+        seats_of(test).remove_files();
+    }
+
+    /// A helper that ends of its own accord before its reply, with the code of a helper that
+    /// served none, fails its fill with nothing recorded, and the end is kept for the run.
+    #[test]
+    fn a_helper_that_served_no_reply_fails_its_fill_with_nothing_recorded() {
+        let test = "a_helper_that_served_no_reply_fails_its_fill_with_nothing_recorded";
+        stand_in();
+        let (records, recorded) = mpsc::channel();
+        let fills = StageFills::new(stage_start(
+            move || Ok(run_of(test, "unserved")),
+            no_reply,
+            move |key, breach| records.send((*key, breach)).unwrap(),
+        ));
+        assert_eq!(fills.fill(10, Site::Dispatch).wait(), FillEnd::Failed);
+        assert_eq!(fills.fill(10, Site::Dispatch).end(), Some(FillEnd::Failed));
+        assert!(recorded.try_recv().is_err());
         seats_of(test).remove_files();
     }
 

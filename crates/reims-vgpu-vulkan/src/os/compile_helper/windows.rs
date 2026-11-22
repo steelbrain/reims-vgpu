@@ -1,12 +1,16 @@
 //! A helper's watch on Windows: its private commit, a Job Object that ends it with the library's
-//! process, and the host's memory and CPUs.
+//! process, an exception's end, and the host's memory and CPUs.
 
 use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt as _;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, NTSTATUS, STATUS_ACCESS_VIOLATION, STATUS_BREAKPOINT,
+    STATUS_HEAP_CORRUPTION, STATUS_ILLEGAL_INSTRUCTION, STATUS_IN_PAGE_ERROR,
+    STATUS_INTEGER_DIVIDE_BY_ZERO, STATUS_STACK_BUFFER_OVERRUN, STATUS_STACK_OVERFLOW,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -72,6 +76,26 @@ pub(super) fn mask_broken_pipes() {}
 /// The helper's end comes with its parent's by the Job Object: nothing of the helper's is needed.
 pub(super) fn watch_parent() -> io::Result<()> {
     Ok(())
+}
+
+/// The statuses an exception ends a process with ([`faulted`]).
+const FAULTS: [NTSTATUS; 8] = [
+    STATUS_ACCESS_VIOLATION,
+    STATUS_IN_PAGE_ERROR,
+    STATUS_ILLEGAL_INSTRUCTION,
+    STATUS_INTEGER_DIVIDE_BY_ZERO,
+    STATUS_STACK_OVERFLOW,
+    STATUS_STACK_BUFFER_OVERRUN,
+    STATUS_HEAP_CORRUPTION,
+    STATUS_BREAKPOINT,
+];
+
+/// Whether a process that ended with `status` was ended by an exception: an access violation or
+/// an in-page error, an illegal instruction, an integer division by zero, a stack overflow, a
+/// fail-fast (`STATUS_STACK_BUFFER_OVERRUN`, which Rust's abort and the C runtime's buffer checks
+/// end with), a heap corruption or a breakpoint.
+pub(super) fn faulted(status: ExitStatus) -> bool {
+    status.code().is_some_and(|code| FAULTS.contains(&code))
 }
 
 /// Nothing: Windows has no core-file limit of a process's own. Whether a crash leaves a dump is

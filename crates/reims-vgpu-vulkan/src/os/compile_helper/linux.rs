@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 pub(super) use super::unix::{
-    host_cpus, host_memory, mask_broken_pipes, no_core_files, unresident,
+    faulted, host_cpus, host_memory, mask_broken_pipes, no_core_files, unresident,
 };
 
 /// Has the child the helper runs in ask for `SIGKILL` at its parent thread's end: the helper's
