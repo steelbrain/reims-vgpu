@@ -185,9 +185,12 @@
 //! desktop, a browser and ten apps (11-21, 7.5 minutes) referenced an unreferenced shape again
 //! 2312 times, at gaps since its last use of 18 ms at the median, 57 ms at the 90th percentile
 //! and 1.1 s at the 99th. Of the unreferenced shapes that reached an age of 1 s, 1 in 86 was
-//! referenced again; of 2 s, 1 in 142; of 10 s, 1 in 364. The period is the first of those ages
-//! past 1 in 100: 16 of the walk's re-uses came later, which the rule makes again, 121 MiB of
-//! fills, and at the walk's end every one of its 458 unreferenced shapes (2106 MiB) was older.
+//! referenced again; of 2 s, 1 in 142; of 10 s, 1 in 364. Run with a period of 2 s, the same
+//! walk made again 0.1 to 0.3% of its shapes after their age, and an arm64 macOS 26 guest's cold
+//! boot under TCG (11-21), a guest that runs many times slower, 76 of its 551 (13.8%). The period
+//! is 10 s, one on every host: 4 of the walk's re-uses came later, which the rule makes again,
+//! 10 MiB of fills, and at the walk's end 444 of its 458 unreferenced shapes (1929 MiB) were
+//! older.
 //!
 //! **Formats.** A shape is made for a texture of an ordinary colour format ([`texel_bytes`]). A
 //! compressed or 4:2:2 texture reads blocks of texels, a two-plane YCbCr one both of its surface's
@@ -216,7 +219,7 @@ pub(crate) const UNREFERENCED_KEPT: usize = 4;
 
 /// How long an unreferenced shape is kept unused (the module doc, "The bound"), one period on
 /// every host and GPU.
-pub(crate) const UNREFERENCED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const UNREFERENCED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The counts' code of a texture over a plain shape in a format that is neither the shape's nor
 /// its sRGB sibling, a view of the plain image rt refuses, as Metal's validation refuses a view in
