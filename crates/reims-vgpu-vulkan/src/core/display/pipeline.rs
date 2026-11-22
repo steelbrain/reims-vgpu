@@ -4,7 +4,7 @@
 use crate::core::collections::LookupMap;
 use crate::core::display::DeathKind;
 use crate::core::platform::device::GpuDevice;
-use crate::core::platform::resource::Library;
+use crate::core::platform::resource::{Library, RenderPipeline as _};
 use crate::core::platform::values::RenderPipelineDesc;
 use crate::core::platform::{Handle, Platform};
 use crate::core::raise::OnFault;
@@ -82,9 +82,13 @@ impl<P: Platform> DisplayPipelineCache<P> {
         Some(made)
     }
 
-    /// The pipeline for `key` (a new reference), made and kept on a miss. A failed creation
-    /// answers nil and keeps nothing, so it is tried again next time. No path reaches it under a
-    /// handler: a raise making the pipeline dies at its send.
+    /// The pipeline for `key` (a new reference), made and kept on a miss. A miss makes it in both
+    /// of its steps, its creation and then its finish ([`RenderPipeline::finish`]), here on the
+    /// calling thread under the table's lock, so the display's first draw with it makes nothing.
+    /// A failed creation or finish answers nil and keeps nothing, so it is tried again next time.
+    /// No path reaches it under a handler: a raise making the pipeline dies at its send.
+    ///
+    /// [`RenderPipeline::finish`]: crate::core::platform::resource::RenderPipeline::finish
     pub fn pipeline_for(&self, key: PipelineKey) -> Option<P::RenderPipeline> {
         let mut table = self.table.lock();
         if let Some(pipeline) = table.get(&key) {
@@ -104,7 +108,9 @@ impl<P: Platform> DisplayPipelineCache<P> {
                 resource_index: None,
             })
             .ok()
-            .flatten();
+            .flatten()
+            // The finish's error is never read either.
+            .filter(|p| p.finish().is_ok());
         if let Some(p) = &pipeline {
             table.insert(key, p.clone_ref());
         }
@@ -126,6 +132,7 @@ mod tests {
     use super::*;
     use crate::core::testkit::calllog::Arg;
     use crate::core::testkit::capture::catch_death;
+    use crate::core::testkit::impls::resource::FINISH;
     use crate::core::testkit::{FakePlatform, Step};
 
     fn cache(p: &FakePlatform) -> DisplayPipelineCache<FakePlatform> {
@@ -260,6 +267,26 @@ mod tests {
             assert_eq!(a.id(), b.id());
         }
 
+        /// A miss finishes the pipeline it made, once, on the calling thread, before it answers
+        /// it; a hit finishes nothing.
+        #[test]
+        fn miss_finishes_the_pipeline_it_made() {
+            let p = FakePlatform::new();
+            let c = cache(&p);
+            let key = PipelineKey {
+                format: 80,
+                gamma: false,
+            };
+            let a = c.pipeline_for(key).unwrap();
+            let finished = p.world().finished();
+            assert_eq!(finished.len(), 1, "{finished:?}");
+            assert_eq!(finished[0].state, a.id());
+            let thread = std::thread::current().name().map(str::to_owned);
+            assert_eq!(finished[0].thread, thread);
+            c.pipeline_for(key).unwrap();
+            assert_eq!(p.world().finished().len(), 1);
+        }
+
         /// Without gamma the plain fragment function; each key its own pipeline.
         #[test]
         fn no_gamma_uses_plain_fragment() {
@@ -297,6 +324,31 @@ mod tests {
             assert!(c.pipeline_for(key).is_none());
             assert!(c.table.lock().is_empty());
             assert!(c.pipeline_for(key).is_some());
+            assert_eq!(
+                p.call_log()
+                    .count("newRenderPipelineStateWithDescriptor:error:"),
+                2
+            );
+        }
+
+        /// A failed finish answers nil and keeps nothing, as a failed creation does, and a miss
+        /// then makes and finishes the pipeline again.
+        #[test]
+        fn a_failed_finish_is_not_cached() {
+            let p = FakePlatform::new();
+            let c = cache(&p);
+            let key = PipelineKey {
+                format: 80,
+                gamma: true,
+            };
+            p.script().push(FINISH, Step::Error(Default::default()));
+            assert!(c.pipeline_for(key).is_none());
+            assert!(c.table.lock().is_empty());
+            let made = c.pipeline_for(key).unwrap();
+            let finished = p.world().finished();
+            assert_eq!(finished.len(), 2, "{finished:?}");
+            assert_eq!(finished[1].state, made.id());
+            assert_ne!(finished[0].state, made.id());
             assert_eq!(
                 p.call_log()
                     .count("newRenderPipelineStateWithDescriptor:error:"),

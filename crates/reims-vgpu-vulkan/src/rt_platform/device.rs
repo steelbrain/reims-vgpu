@@ -105,10 +105,12 @@
 //! **Its states' finishes.** rt's creators answer before the driver's create of a state's main
 //! pipeline, which the state's finish then makes on the device's compile thread, after the
 //! create's reply and before its store (`finish_pipeline`, `super::pipeline`, "Its main
-//! pipeline"); a dispatch or draw that needs the main pipeline before a finish made it waits for
-//! the finish in flight, or makes it itself (rt's `Metrics::first_use_unfinished_waits`, a share
-//! of its first-use waits apart from the variants'). The counts line carries the main pipelines
-//! the finishes made, [`FINISHED_PIPELINES_CODE`], and their nanoseconds,
+//! pipeline"), and, for the display's present pipelines, on the thread that made them, before
+//! the display keeps them (core's `DisplayPipelineCache`); a dispatch or draw that needs the main
+//! pipeline before a finish made it waits for the finish in flight, or makes it itself (rt's
+//! `Metrics::first_use_unfinished_waits`, a share of its first-use waits apart from the
+//! variants'), so those waits are the guest's states' alone. The counts line carries the main
+//! pipelines the finishes made, [`FINISHED_PIPELINES_CODE`], and their nanoseconds,
 //! [`FINISHED_PIPELINE_NS_CODE`], as amounts; the waits on an unfinished main pipeline,
 //! [`UNFINISHED_WAITS_CODE`], and their nanoseconds, [`UNFINISHED_WAIT_NS_CODE`], as amounts; and
 //! the longest, [`UNFINISHED_WAIT_MAX_NS_CODE`], as an amount risen to it over the process's

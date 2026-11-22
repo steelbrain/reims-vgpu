@@ -965,4 +965,35 @@ mod tests {
         assert_eq!(state.finish(), Ok(()));
         assert_eq!(made(), (before.0 + 1, before.1 + 1));
     }
+
+    /// The display's present pipeline, on the GPU the test holds, is made in both of its steps
+    /// at its cache's miss (`core::display::pipeline`): the miss creates its main `VkPipeline`,
+    /// counted as finished, so the display's first draw with it waits for no make; a hit, and a
+    /// finish of the pipeline it answered, make nothing
+    #[test]
+    fn the_display_s_pipeline_is_finished_at_its_make_on_vulkan() {
+        use crate::core::display::pipeline::{DisplayPipelineCache, PipelineKey};
+        use crate::core::platform::Handle as _;
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let counters = device.rt().counters();
+        // The pipelines made, and those the finishes made.
+        let made = || {
+            let m = counters.metrics();
+            (m.pipelines_created, m.finished_pipelines)
+        };
+        let cache = DisplayPipelineCache::<RtPlatform>::new(device.clone_ref());
+        let cache = cache.expect("the display's functions");
+        let key = PipelineKey {
+            format: 80,
+            gamma: false,
+        };
+        let before = made();
+        let pipeline = cache.pipeline_for(key).expect("the display's pipeline");
+        assert_eq!(made(), (before.0 + 1, before.1 + 1));
+        let again = cache.pipeline_for(key).expect("the display's pipeline");
+        assert_eq!(pipeline.id(), again.id());
+        assert_eq!(pipeline.finish(), Ok(()));
+        assert_eq!(made(), (before.0 + 1, before.1 + 1));
+    }
 }

@@ -664,9 +664,12 @@ pub trait RenderPipeline: Handle {
     }
     /// No Metal counterpart: the second step of the state's make, as
     /// [`ComputePipeline::finish`] is a compute state's, run once on the thread that made it
-    /// before the state is stored for the guest's draws: `Err` is the driver's failure, for the
-    /// host's log, and a draw of the state then makes what is left again at its encode, failing
-    /// as an encode the platform refuses fails. A second call does nothing.
+    /// before the state is stored for the guest's draws, or kept for the display's
+    /// ([`DisplayPipelineCache`]): `Err` is the driver's failure, for the host's log, and a draw
+    /// of the state then makes what is left again at its encode, failing as an encode the
+    /// platform refuses fails. A second call does nothing.
+    ///
+    /// [`DisplayPipelineCache`]: crate::core::display::pipeline::DisplayPipelineCache
     fn finish(&self) -> Result<(), String>;
 }
 
