@@ -482,7 +482,7 @@ creator returns, as the M3 does.
 
 ## Q8: errors and refusals
 
-Probe: `oracle_errors DEVICE [purgeable|creates|residency|timeout]`.
+Probe: `oracle_errors DEVICE [purgeable|creates|residency|timeout|bounds]`.
 
 | failure | AMD | Intel 630 |
 |---|---|---|
@@ -503,6 +503,36 @@ were kept. An 8 s kernel completes on both.
 Our stack: the bundle's code 2 carries the M3's "Caused GPU Hang Error
 (00000003:kIOGPUCommandBufferCallbackErrorHang)", and code 9 an underlying
 `IOGPUCommandQueueErrorDomain` error (measured on the M3). **Relaxation: none.**
+
+The creates Metal bounds by a length (`bounds`, each step in a child process of its own,
+`MTL_DEBUG_LAYER` unset). L is the device's `maxBufferLength`, 3208642560 on the AMD and
+2147483648 on the Intel, and P is a 4 KiB page. No step ended the process.
+
+| create | AMD | Intel 630 |
+|---|---|---|
+| `newBufferWithLength:` of L | made | made |
+| `newBufferWithLength:` of L + 1 and of L + P | made | nil |
+| `newBufferWithBytes:` of L + P | not measured: the job's 2 GiB memory cap ended it in the create | nil |
+| `newBufferWithBytesNoCopy:` of 1 MiB, of P + 1 and of L | made | made |
+| `newBufferWithBytesNoCopy:` of L + 1 and of L + P | made | nil |
+| a Private heap of L | made | made |
+| a Private heap of L + 1 and of L + P | made, of 3208904704 bytes | nil |
+| in a 1 MiB Private Placement heap, a buffer of 64 KiB at its last 64 KiB | made | made |
+| a buffer of 128 KiB there, and of 1 MiB + 64 KiB at 0 | nil | nil |
+| a 128 x 128 RGBA8Unorm texture at the last offset of its alignment that holds it | made | made |
+| the same texture one alignment on (AMD: 65536, at the heap's end; Intel: 4096, partly past it) | nil | nil |
+| the tiled texture SPI, `newTiledTextureWithBytesNoCopy:length:deallocator:descriptor:offset:bytesPerRow:`, over 1 MiB and over L | made | made |
+| the tiled texture SPI over L + P | made | nil |
+
+The lengths past `maxBufferLength` diverge *(class 2)*; the placements past a heap's size agree
+on the two x86 Macs *(class 3; the M3 not measured)*.
+
+Our stack: the device's `maxBufferLength` is at most 2 GiB, the Intel's, and every create here
+answers nil where the Intel does, posting nothing to the host and logging the bundle's note of a
+nil: a buffer of a length, of bytes or over the caller's bytes, a heap, the tiled texture (over the
+device's no-copy buffer), and a Placement heap's buffer or texture past the heap's size, the
+texture's bytes the host's answer to `heapTextureSizeAndAlignWithDescriptor:`. Nil costs the host
+least, and is what the app's resource then shows. **Relaxation: none.**
 
 ## Q9: limits and formats
 
@@ -2744,3 +2774,5 @@ What our stack does:
   except that a read-write lock does not wait for a buffer that only reads the surface).
 - Page faults: no probe made a GPU address fault, on a Mac whose Intel GPU drives the display.
 - Surfaces whose rows miss the host's alignment.
+- A no-copy buffer past the M3's `maxBufferLength`, 41.7 GB there: the M3 is used little, and
+  the x86 Macs' answers bound the lane's.
