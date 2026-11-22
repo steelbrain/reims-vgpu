@@ -2768,6 +2768,91 @@ What our stack does:
   frames a GL app keeps in flight on them (about 1.7 on the 5300M's driver, lane mbpscene) belong
   to that driver, and are no reference for the guest's GL.
 
+## Q50: a background service's queue priority marks, and another process's short buffer
+
+Probe: `oracle_prio DEVICE ARM 8 60 20`, 11-22, on the Intel UHD Graphics 630 and the AMD Radeon
+Pro 5300M under macOS 26.7.1 (25G241), off screen: on the 630 arms 1, 2, 3 and 1 in m3-max-68129
+and arms 1, 4 and 1 in m3-max-68139, on the 5300M arms 1, 2, 3, 4 and 1 in m3-max-68137 (built
+in m3-max-68121 and m3-max-68136). It asks what an Intel Mac's queues do with the priority marks a
+guest's processes set. The guest bundle's log of the setters (lane priolog's set, in a walk on the
+Iris Xe) shows the guest's background media-analysis service marking each of its five heavy queues
+`setBackgroundGPUPriority: 2` and then `setGPUPriority: 2`, and WindowServer marking two of its
+queues `setGPUPriority: 0`. No process used an offset form. Process A makes one queue, marks it as
+the arm says before its first buffer, and each round commits 4 compute buffers (L0 to L3) of about
+60 ms of GPU time each. 17.7 to 20.1 ms into L0's GPU run, process B commits one short compute
+buffer, 0.04 to 0.09 ms of GPU time alone, on a queue of its own over a buffer of its own. So L1 to
+L3 are committed and waiting when B commits. The arms:
+1. no marks;
+2. A marked as the service marks its queues, B unmarked;
+3. A as in 2, and B marked `setGPUPriority: 0`, as WindowServer marks its own;
+4. A unmarked, and B marked `setGPUPriority: 0`.
+
+A run of an arm is 8 rounds. Times are ms from B's commit, on one clock for both processes. The
+buffers' `GPUStartTime` and `GPUEndTime` are on it: each run's calibration buffer started 0.20 to
+0.56 ms after its commit, and its completed handler ran 0.09 to 0.16 ms after its GPU end.
+m3-max-68129 ran the probe before its arm 4 and its 500 ms warm-up were added. That job's first run
+calibrated short, and its buffers ran 46.7 ms. In every other run, L1 to L3 ran 59.84 to 60.27 ms.
+
+What a queue answers, the same on both GPUs *(class 3: both x86 GPUs; the M3 did not run it)*:
+- The queue is `MTLIGAccelCommandQueue` on the 630 and `GFXAAMD_MtlCmdQueue` on the 5300M, each a
+  `MTLIOAccelCommandQueue`. It answers all four setters: `setGPUPriority:` and
+  `setBackgroundGPUPriority:` as `c24@0:8Q16`, and their offset forms as `c28@0:8Q16S24`. Each
+  returned 1 for every value set here. `MTLIOAccelCommandQueue` also has `getGPUPriority` and
+  `getBackgroundGPUPriority` (`Q16@0:8`), and `_setGPUPriority:backgroundPriority:`
+  (`c32@0:8Q16Q24`).
+- A new queue reads GPU priority 1 and background priority 2.
+  - `setBackgroundGPUPriority: 2` leaves both as they were.
+  - After it, `setGPUPriority: 2` reads 2.
+  - `setGPUPriority: 0` reads 0.
+  - The offset forms set the same values (`setGPUPriority: 2 offset: 1` reads 2), and no getter
+    reads an offset back.
+- So the service's marks change one value: its queues' GPU priority, from 1 to 2. WindowServer's
+  change its own GPU priority from 1 to 0.
+
+| what | Intel 630 | AMD 5300M |
+|---|---|---|
+| arm 1, no marks: B's GPU start | +221.74 to +223.47 in 3 runs, and +166.99 to +169.23 in the run of 46.7 ms buffers; 180.01 to 180.33 (140.25 to 140.29) ms after L0's end, after all 3 waiting buffers, 32 of 32 | +0.21 to +0.44; 49.18 to 49.95 ms before L0's end, ahead of all 3 waiting buffers, 16 of 16 |
+| arm 2, A marked | +0.38 to +0.44; 41.54 to 42.06 ms before L0's end, ahead of all 3, 8 of 8 | +0.20 to +0.37; 49.19 to 49.77 ms before L0's end, ahead of all 3, 8 of 8 |
+| arm 3, A and B marked | +0.38 to +0.43; 41.45 to 41.78 ms before L0's end, ahead of all 3, 8 of 8 | +0.20 to +0.41; 49.38 to 49.91 ms before L0's end, ahead of all 3, 8 of 8 |
+| arm 4, B marked | +0.37 to +0.42; 41.51 to 41.93 ms before L0's end, ahead of all 3, 8 of 8 | +0.28 to +0.39; 49.28 to 50.02 ms before L0's end, ahead of all 3, 8 of 8 |
+| B completes, where it starts beside L0 | +0.47 to +0.59 | +0.61 to +1.44 |
+| B's scheduled handler, every arm | +0.08 to +0.14 | +0.10 to +0.31 |
+| B's GPU run | 0.04 in every round (0.036 to 0.069 alone, in its warm-up) | 0.36 to 0.89 (0.050 to 0.094 alone) |
+| L0's GPU run past the median of L1 to L3, a run's median | 1.80 to 1.83 in arm 1's runs of 60 ms buffers; 2.00, 1.96 and 1.96 in arms 2, 3 and 4 | 7.65 to 7.87 in every arm, arm 1's included |
+
+Neither GPU holds back B's scheduling: its scheduled handler runs within 0.31 ms of its commit in
+every arm. How soon B runs differs *(class 2)*:
+- **The 630 orders by the queues' GPU priority, and preempts for it.**
+  - Between queues of one GPU priority it runs the two processes' work first in, first out (arm 1,
+    as in Q48).
+  - A buffer whose queue's GPU priority value is below the running buffer's starts within 0.44 ms
+    of its commit, about 41.5 ms before the running buffer ends, and ahead of every buffer waiting
+    behind it. That holds for the service's 2 against the default 1 (arm 2) and for WindowServer's
+    0 against the default (arm 4). The background priority kept its default of 2 in every arm, so
+    no effect of it shows apart from the GPU priority.
+  - B's GPU run beside L0 is what it is alone, so B did not share the GPU with A's kernel. L0's run
+    grows about 0.15 ms over the controls', B's 0.04 ms and about 0.1 ms more: A is switched out
+    for B and back.
+- **The 5300M runs B beside A's long buffer, marked or not.** In every arm B starts within 0.44
+  ms, about 49.5 ms before L0 ends, so the marks change nothing measured here.
+  - B's GPU run grows from 0.05 to 0.09 ms alone to 0.36 to 0.89 ms. So B shares the GPU with A's
+    running kernel: concurrent execution, not a switch.
+  - L0 runs 7.5 to 7.95 ms past L1 to L3 in every arm alike. No round left B out, so B's share of
+    that is not measured. On the 630, the first buffer after the rounds' 300 ms idle runs 1.8 ms
+    long with no B beside it.
+
+What our stack does:
+- **The marks.** The bundle keeps each setter's value and answers it back from the getters
+  (`RgfxCommandObjects.mm`). A new queue there answers 0 from both getters, where both Macs answer
+  1 and 2. The bundle sends the host no priority: a `QUEUE_CREATE` carries 0 for every queue
+  (design.md, "Rings").
+- **The order.** The runtime runs every queue's work on one `VkQueue` in submission order
+  (design.md, "A command buffer in parts"). So B would start only once L0 to L3 had all run, in
+  every arm: the 630's answer for queues of one GPU priority. With the guest's marks, a
+  compositor's buffer committed behind the service's long buffers starts at once on both GPUs. On
+  the 630 that is because its queue's priority value is below theirs; on the 5300M it happens
+  whatever the marks.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,
