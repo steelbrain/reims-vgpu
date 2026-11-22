@@ -149,7 +149,9 @@ use crate::graphics::decode::{
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, LetGo, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
-use crate::graphics::slow_answers::{ReleaseMarks, Split, answering, writing_back};
+use crate::graphics::slow_answers::{
+    CloseFrees, CloseMarks, Freed, ReleaseMarks, Split, answering, writing_back,
+};
 use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
 use crate::pool::{
@@ -2070,11 +2072,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// committed has finished: the kext then gives the context's blocks, texture resource ids and
     /// GPU addresses out again.
     fn close_context(&self, context: u32, answer: CompleteAnswer) {
+        // Its waits' ends and its frees, for a slow answer's line (`slow_answers`).
+        let marks = Arc::new(CloseMarks::asked());
         // Its groups of views being formed make nothing (`decode::surface_pages`, "Group
         // dma-bufs"); then after its no-copy buffers being made, so none lands in the table its
         // close empties.
         self.decoder().drop_groups(context);
         self.pages_buffers.wait(pages_context(context));
+        marks.pages();
         entry::run(|_| {
             let decoder = self.decoder();
             // Its compiles first, so none stores a pipeline in the table its close empties.
@@ -2092,18 +2097,42 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             // And so do its Private blocks.
             let private = self.private_blocks.clone();
             let private_gone = private.context_closed(context);
+            let m = Arc::clone(&marks);
             let drain = decoder.drain_context(
                 context,
                 true,
                 Box::new(move || {
+                    let drained = host_time();
+                    let mut shared = Freed::default();
                     if let Some((ledger, gone)) = gone {
+                        shared.blocks = gone.len();
                         ledger.free(&gone);
                     }
-                    private.free(&private_gone);
-                    answer.answer(RGFX_STATUS_OK);
+                    let shared_freed = host_time();
+                    // rt's release of its Private blocks, apart from the ledger's free.
+                    let releasing = private.free(&private_gone);
+                    let ledger = host_time();
+                    let freed = Freed {
+                        blocks: releasing.blocks(),
+                        bytes: releasing.bytes(),
+                    };
+                    drop(releasing);
+                    let split = m.split(CloseFrees {
+                        drained,
+                        shared,
+                        shared_freed,
+                        ledger,
+                        released: host_time(),
+                        private: freed,
+                    });
+                    answering(split, || answer.answer(RGFX_STATUS_OK));
                 }),
             );
-            decoder.let_go_later(closed, drain);
+            marks.closed();
+            let m = Arc::clone(&marks);
+            decoder.let_go_later(closed, drain, move |closed| {
+                m.letting_go(closed.objects(), || closed.let_go());
+            });
             log::info!(
                 target: "reims_vgpu::graphics",
                 "context {context} closed: {dropped} objects dropped"
@@ -2225,6 +2254,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 &self.device,
                 offset,
                 flags,
+                || marks.settled(),
                 Box::new(move || {
                     m.written();
                     writing_back(|| drop(held));
@@ -2314,6 +2344,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             Give::Given(carve) => {
                 let given = host_time();
+                let length = give.length;
                 let ledger = ledger.clone();
                 let drain = decoder.drain_context(
                     give.context,
@@ -2326,6 +2357,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                             given,
                             drained,
                             freed: host_time(),
+                            bytes: length,
                         };
                         answering(split, || answer.answer(RGFX_STATUS_OK));
                     }),
@@ -2372,6 +2404,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// else answered, and the block freed, once every command buffer of the context the decoder
     /// committed has finished ([`PrivateBlocks::give`]).
     fn give_private_block(&self, give: &RgfxPrivateGive, answer: CompleteAnswer) {
+        // For a slow answer's line (`slow_answers`).
+        let asked = host_time();
         let decoder = self.decoder();
         let given =
             (self.private_blocks).give(give.context, give.gpu_address, give.length, |at, len| {
@@ -2389,13 +2423,30 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 answer.answer(RGFX_STATUS_REFUSED);
             }
             PrivateGive::Given(block) => {
+                let given = host_time();
                 let blocks = self.private_blocks.clone();
                 let drain = decoder.drain_context(
                     give.context,
                     false,
                     Box::new(move || {
-                        blocks.free(&[block]);
-                        answer.answer(RGFX_STATUS_OK);
+                        let drained = host_time();
+                        // rt's release of the block, apart from the ledger's free.
+                        let releasing = blocks.free(&[block]);
+                        let ledger = host_time();
+                        let freed = Freed {
+                            blocks: releasing.blocks(),
+                            bytes: releasing.bytes(),
+                        };
+                        drop(releasing);
+                        let split = Split::PrivateGive {
+                            asked,
+                            given,
+                            drained,
+                            ledger,
+                            released: host_time(),
+                            freed,
+                        };
+                        answering(split, || answer.answer(RGFX_STATUS_OK));
                     }),
                 );
                 drop(decoder);

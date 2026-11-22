@@ -5474,7 +5474,7 @@ mod tests {
             keys.iter().all(|&k| k == keys[0]),
             "one identity for the block"
         );
-        dec.block_released(&device, block, 0, Box::new(|| ()), no_raise());
+        dec.block_released(&device, block, 0, || (), Box::new(|| ()), no_raise());
         assert!(
             pages
                 .iter()
@@ -8108,7 +8108,7 @@ mod tests {
         let flag = Arc::clone(&drained);
         let answer = Box::new(move || flag.store(true, Ordering::Release));
         let drain = dec.drain_context(1, true, answer);
-        dec.let_go_later(closed, drain);
+        dec.let_go_later(closed, drain, |closed| closed.let_go());
         dec.closes_let_go();
         assert_eq!(since(), [[0, 1]; 2]);
         // The spare of each is given back after them, the buffer committed before it too: the

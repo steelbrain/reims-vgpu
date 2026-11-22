@@ -213,6 +213,35 @@ impl WorkerHold {
     }
 }
 
+/// The blocks a free took out of the ledger for the source ([`PrivateBlocks::free`]), which go
+/// back to it as this drops, in the order the free named them: a caller times the source's
+/// releases apart from the ledger's free by where it drops this.
+pub(crate) struct Releasing {
+    inner: Arc<Inner>,
+    blocks: Vec<BlockId>,
+    /// Their lengths' sum, as their contexts held them.
+    bytes: u64,
+}
+
+impl Releasing {
+    /// How many blocks go back to the source.
+    pub(crate) fn blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Their bytes, as their contexts held them.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for Releasing {
+    /// Gives the blocks back to the source, with no lock of the ledger's held.
+    fn drop(&mut self) {
+        self.inner.release(std::mem::take(&mut self.blocks));
+    }
+}
+
 /// The contexts' Private blocks ([module doc](self)): a handle, which clones share.
 #[derive(Clone)]
 pub(crate) struct PrivateBlocks {
@@ -373,10 +402,12 @@ impl PrivateBlocks {
         gone
     }
 
-    /// Frees `blocks`: each that is still held under its name goes back to the source, or its
-    /// address to the picks.
-    pub(crate) fn free(&self, blocks: &[HeldRef]) {
+    /// Frees `blocks`: each that is still held under its name goes back to the source as the
+    /// [`Releasing`] returned drops, at the end of the caller's statement where it keeps none, or
+    /// its address to the picks now.
+    pub(crate) fn free(&self, blocks: &[HeldRef]) -> Releasing {
         let mut released = Vec::new();
+        let mut bytes = 0u64;
         {
             let mut state = self.inner.state.lock();
             for name in blocks {
@@ -388,13 +419,20 @@ impl PrivateBlocks {
                     continue;
                 }
                 let held = state.held.remove(&name.at);
-                match held.and_then(|held| held.block) {
-                    Some(block) => released.push(block),
+                match held.and_then(|held| held.block.map(|block| (block, held.len))) {
+                    Some((block, len)) => {
+                        released.push(block);
+                        bytes = bytes.saturating_add(len);
+                    }
                     None => state.addresses.free(name.at),
                 }
             }
         }
-        self.inner.release(released);
+        Releasing {
+            inner: Arc::clone(&self.inner),
+            blocks: released,
+            bytes,
+        }
     }
 
     /// The device's reset: every take not yet answered ends unanswered, and every block is freed

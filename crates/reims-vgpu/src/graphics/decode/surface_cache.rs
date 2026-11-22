@@ -11385,6 +11385,7 @@ pub(super) mod tests {
             &r.device,
             BLOCK,
             0,
+            || (),
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -11408,7 +11409,7 @@ pub(super) mod tests {
         let cache = reims_vgpu_vulkan::core::platform::ObjId(cache_id(&r));
         r.dec.let_go_worker().hold();
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         assert_eq!(r.dec.caches().len(), 0, "the cache went with its block");
         let (tx, rx) = std::sync::mpsc::channel();
         r.dec.hand_off_surface_pages(BLOCK + 0x8000, move |settle| {
@@ -11445,6 +11446,7 @@ pub(super) mod tests {
             &r.device,
             BLOCK,
             RGFX_BLOCK_RELEASE_NO_CLIENT,
+            || (),
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -11479,6 +11481,7 @@ pub(super) mod tests {
             &r.device,
             BLOCK,
             RGFX_BLOCK_RELEASE_NO_CLIENT,
+            || (),
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -11516,6 +11519,7 @@ pub(super) mod tests {
                 &r.device,
                 BLOCK,
                 flags,
+                || (),
                 Box::new(move || set.store(true, Ordering::SeqCst)),
                 no_raise(),
             );
@@ -11571,6 +11575,7 @@ pub(super) mod tests {
                 &r.device,
                 BLOCK,
                 unheld,
+                || (),
                 Box::new(move || set.store(true, Ordering::SeqCst)),
                 no_raise(),
             );
@@ -12003,6 +12008,7 @@ pub(super) mod tests {
                 &r.device,
                 BLOCK,
                 RGFX_BLOCK_RELEASE_NO_CLIENT | RGFX_BLOCK_RELEASE_UNHELD,
+                || (),
                 Box::new(move || set.store(true, Ordering::SeqCst)),
                 no_raise(),
             );
@@ -12855,6 +12861,7 @@ pub(super) mod tests {
             &r.device,
             BLOCK,
             0,
+            || (),
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -13036,6 +13043,7 @@ pub(super) mod tests {
             &r.device,
             BLOCK,
             0,
+            || (),
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -14170,7 +14178,7 @@ pub(super) mod tests {
         use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, true)]);
         let mark = r.p.call_log().mark();
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| {}), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| {}), no_raise());
         r.p.world().complete_all(CompleteOn::Caller);
         inside(&r.p.call_log().since(mark), "the release");
     }
@@ -15609,6 +15617,7 @@ pub(super) mod tests {
             &r.device,
             BLOCK,
             0,
+            || (),
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );
@@ -16194,6 +16203,7 @@ pub(super) mod tests {
             &r.device,
             block,
             0,
+            || (),
             Box::new(move || set.store(true, Ordering::SeqCst)),
             no_raise(),
         );

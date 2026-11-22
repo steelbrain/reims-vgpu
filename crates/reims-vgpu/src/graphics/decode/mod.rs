@@ -3044,17 +3044,20 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// is let go of on the surface worker, where it may be the last of an import or a mapping,
     /// and its cache on the let-go worker, behind none of the surface worker's jobs: a burst of
     /// releases' caches, whose drops may take a while each, keeps no `SURFACE_PAGES` waiting for
-    /// a thread.
+    /// a thread. `settled` is told on this thread once the block's `SURFACE_PAGES` settled, for a
+    /// slow answer's split (`slow_answers`).
     pub(crate) fn block_released(
         &self,
         device: &P::Device,
         offset: u64,
         flags: u32,
+        settled: impl FnOnce(),
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
         let asked = self.platform.clock().now_mono();
         self.settle_surface(offset);
+        settled();
         let (ran, trace, done) = self.timed("BLOCK_RELEASE", offset, asked, done);
         let idle_mappings = self.platform.vm().idle_view_mappings();
         let gone = (self.shared.surface_views.lock()).released(offset, idle_mappings);
@@ -3929,15 +3932,21 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// Lets go of `closed` on the close worker, then of `drain`, its close's: the close's answer,
-    /// which the drain gives once its command buffers have finished too, comes once its objects
-    /// are let go of, as the kext gives the context's texture resource ids and GPU addresses out
-    /// again at the answer.
-    pub(crate) fn let_go_later(&self, closed: Closed<P>, drain: Arc<Drain>) {
+    /// Lets go of `closed` on the close worker, through `let_go`, which calls its
+    /// [`Closed::let_go`] (timed there for a slow answer's split, `slow_answers`), then of
+    /// `drain`, its close's: the close's answer, which the drain gives once its command buffers
+    /// have finished too, comes once its objects are let go of, as the kext gives the context's
+    /// texture resource ids and GPU addresses out again at the answer.
+    pub(crate) fn let_go_later(
+        &self,
+        closed: Closed<P>,
+        drain: Arc<Drain>,
+        let_go: impl FnOnce(Closed<P>) + Send + 'static,
+    ) {
         self.shared.close_worker.submit(
             u64::from(closed.context),
             Box::new(move || {
-                closed.let_go();
+                let_go(closed);
                 drop(drain);
             }),
         );
@@ -7035,6 +7044,11 @@ pub(crate) struct Closed<P: Platform> {
 }
 
 impl<P: Platform> Closed<P> {
+    /// How many objects it took out of the tables.
+    pub(crate) fn objects(&self) -> usize {
+        self.objects.len()
+    }
+
     /// Lets go of every object, then of their CPU copies, then of the views, each in a refusal
     /// scope of its own ([`drop_refused`]), so a release the platform dies at is refused, logged,
     /// and the rest go on. An object a message's view still needs goes when that message ends

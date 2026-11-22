@@ -3972,7 +3972,7 @@ pub(super) mod tests {
         );
         // The buffer holds the view after the block's release.
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         assert_eq!(r.buffer(13, BLOCK, page), Err(DecodeError::Refused));
         assert!(
             Arc::strong_count(&view) > 2,
@@ -4025,7 +4025,7 @@ pub(super) mod tests {
         assert_eq!(r.pages(BLOCK, &[(3, 1), (0, 1)], 2 * page), RGFX_STATUS_OK);
         let first = r.view(BLOCK);
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         let mark = r.p.call_log().mark();
         assert_eq!(
             r.pages(BLOCK + 0x8000, &[(3, 1), (0, 1)], 2 * page),
@@ -4046,7 +4046,7 @@ pub(super) mod tests {
         }
         assert_eq!(r.dec.views_of_surfaces().len().1, CACHED_VIEWS);
         r.dec
-            .block_released(&r.device, BLOCK + 0x8000, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK + 0x8000, 0, || (), Box::new(|| ()), no_raise());
         // The block's hold goes on the surface worker.
         r.dec.surface_worker().flush();
         assert_eq!(
@@ -4081,7 +4081,7 @@ pub(super) mod tests {
             );
             unheld.push(Arc::downgrade(&r.view(at)));
             r.dec
-                .block_released(&r.device, at, 0, Box::new(|| ()), no_raise());
+                .block_released(&r.device, at, 0, || (), Box::new(|| ()), no_raise());
         }
         // The blocks' holds go on the surface worker.
         r.dec.surface_worker().flush();
@@ -4181,7 +4181,7 @@ pub(super) mod tests {
             assert_eq!(r.pages(at, runs, 2 * page), RGFX_STATUS_OK);
             unheld.push(Arc::downgrade(&r.view(at)));
             r.dec
-                .block_released(&r.device, at, 0, Box::new(|| ()), no_raise());
+                .block_released(&r.device, at, 0, || (), Box::new(|| ()), no_raise());
         }
         // The oldest unheld view's memory, held by a device that lets go of it on a thread of
         // its own a little after the view's life ends, as a CUDA registration's reaper does.
@@ -4239,7 +4239,7 @@ pub(super) mod tests {
         // No room at all, three mappings short: the view of block 4, unheld since and no
         // device's, covers it alone.
         r.dec
-            .block_released(&r.device, block(4), 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, block(4), 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
         r.p.fake_vm().set_view_room(Some(0));
         let mark = r.p.call_log().mark();
@@ -4257,7 +4257,7 @@ pub(super) mod tests {
         // before the view is mapped.
         let last = Arc::downgrade(&r.view(block(5)));
         r.dec
-            .block_released(&r.device, block(5), 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, block(5), 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
         let pages = block(6);
         assert_eq!(
@@ -4283,7 +4283,7 @@ pub(super) mod tests {
         r.p.fake_vm().set_view_mappings(other.base(), Some(1));
         let other = Arc::downgrade(&other);
         r.dec
-            .block_released(&r.device, block(7), 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, block(7), 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
         let mark = r.p.call_log().mark();
         assert_eq!(r.pages(block(8), &[(60, 1)], page), RGFX_STATUS_OK);
@@ -4550,7 +4550,7 @@ pub(super) mod tests {
             "the object is gone at once"
         );
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         assert_eq!(
             Arc::strong_count(&view),
             held,
@@ -4601,7 +4601,7 @@ pub(super) mod tests {
         assert_eq!(memory.length(), page.to_usize());
         drop((view, memory));
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         for i in 0..CACHED_VIEWS as u64 {
             assert_eq!(
                 r.pages(BLOCK + 0x8000, &[(10 + i, 1)], page),
@@ -4765,7 +4765,7 @@ pub(super) mod tests {
         assert_eq!(send(&mut r, destroy(10).as_bytes()), Ok(()));
         for block in [BLOCK, PAGES] {
             r.dec
-                .block_released(&r.device, block, 0, Box::new(|| ()), no_raise());
+                .block_released(&r.device, block, 0, || (), Box::new(|| ()), no_raise());
         }
         for i in 0..CACHED_VIEWS as u64 {
             assert_eq!(
@@ -4861,7 +4861,7 @@ pub(super) mod tests {
         };
         assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         assert_eq!(r.buffer(12, BLOCK, page), Err(DecodeError::Refused));
         assert_eq!(r.pages(BLOCK, &[(3, 1)], page), RGFX_STATUS_OK);
         let next = r.view(BLOCK);
@@ -4956,7 +4956,7 @@ pub(super) mod tests {
         assert_eq!(r.buffer(12, BLOCK, page), Err(DecodeError::Refused));
 
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         let views = r.dec.views_of_surfaces();
         assert_eq!((views.len(), views.private_len()), ((1, 2), 0));
         drop(views);
@@ -5059,7 +5059,7 @@ pub(super) mod tests {
         destroy(&mut r, 11);
         destroy(&mut r, 12);
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         // The block's entry goes on the surface worker.
         r.dec.surface_worker().flush();
         assert_eq!(r.dec.views_of_surfaces().view_addresses_held(), 0);
@@ -5255,7 +5255,7 @@ pub(super) mod tests {
             assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
         }
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
         assert!(log.lock().1.is_empty(), "the cache keeps it known");
 
@@ -5277,7 +5277,7 @@ pub(super) mod tests {
         };
         assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
         r.dec
-            .block_released(&r.device, read_only, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, read_only, 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
         let writable = BLOCK + 0x10000;
         assert_eq!(
@@ -5343,7 +5343,7 @@ pub(super) mod tests {
         };
         assert_eq!(*log.lock(), [file_cow], "asked unchanging, copy-on-write");
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
 
         // The same kind over the same runs takes the cached view.
@@ -5355,7 +5355,7 @@ pub(super) mod tests {
         assert_eq!(r.dec.pages_address(&r.device, again), at, "the cached view");
         assert_eq!(log.lock().len(), 1, "no import more");
         r.dec
-            .block_released(&r.device, again, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, again, 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
 
         // A read-only block, and an unchanging one not copy-on-write, over the same runs: each an
@@ -5456,7 +5456,7 @@ pub(super) mod tests {
         let first = r.private_view(BLOCK);
         destroy(&mut r, 10);
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
         assert_eq!(
             r.dec.views_of_surfaces().len(),
@@ -5506,7 +5506,7 @@ pub(super) mod tests {
         let big_view = r.private_view(big);
         destroy(&mut r, 13);
         r.dec
-            .block_released(&r.device, big, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, big, 0, || (), Box::new(|| ()), no_raise());
         r.dec.surface_worker().flush();
         assert_eq!(r.dec.views_of_surfaces().len().1, 1, "the first view alone");
         assert_eq!(Arc::strong_count(&big_view), 1, "only the test holds it");
@@ -5858,7 +5858,7 @@ pub(super) mod tests {
         };
         let release = |r: &mut Rig, block: u64| {
             r.dec
-                .block_released(&r.device, block, 0, Box::new(|| ()), no_raise());
+                .block_released(&r.device, block, 0, || (), Box::new(|| ()), no_raise());
             r.dec.surface_worker().flush();
         };
         let made = |r: &Rig, mark| {
@@ -6197,7 +6197,7 @@ pub(super) mod tests {
         drop(view);
         r.destroy(20);
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         for i in 0..CACHED_VIEWS as u64 {
             assert_eq!(
                 r.pages(BLOCK + 0x8000, &[(20 + i, 1)], page),
@@ -6248,7 +6248,7 @@ pub(super) mod tests {
         r.p.world().run_deallocators_late();
         r.destroy(21);
         r.dec
-            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
         for i in 0..CACHED_VIEWS as u64 {
             assert_eq!(
                 r.pages(BLOCK + 0x8000, &[(20 + i, 1)], page),

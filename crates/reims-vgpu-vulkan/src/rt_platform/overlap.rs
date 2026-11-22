@@ -5,11 +5,14 @@
 //! - **The makes of rt's pool.** rt tells the device's `BlockMappings` (`super::fault`'s
 //!   `Allocations`) of each allocation of its pool right after it made it, on the thread that made
 //!   it: the block-maker thread's makes ahead of need, a take's make on the take's thread, and
-//!   each class's first in the device's make. [`pool_made`] keeps when each of the last
-//!   [`KEPT`] ended, on rt's host clock (`rt::host_time`), one clock read and two relaxed atomics a
-//!   make. rt tells nothing as a make begins, so an answer counts as over a make where a make ended
-//!   during it ([`pool_makes_ended`]): every answer that waited for a make to end, but not one that
-//!   ended inside a make.
+//!   each class's first in the device's make. [`pool_made`] keeps the last [`KEPT`]
+//!   ([`PoolMake`]): when each ended, on rt's host clock (`rt::host_time`), its allocation's
+//!   length and storage mode, which rt's `AllocationInfo` gives, and the thread rt told it on, the
+//!   one that made it; one clock read, a clone of the thread's handle and an uncontended lock a
+//!   make. rt tells nothing as a make begins (its `AllocationInfo` carries no start and no
+//!   duration), so an answer counts as over a make where a make ended during it
+//!   ([`pool_makes_ended`]): every answer that waited for a make to end, but not one that ended
+//!   inside a make, and how much of an answer a make covered cannot be read.
 //! - **The first-use waits of compute pipelines.** rt keeps its last 256 ended makes of a compute
 //!   kernel's `VkPipeline` for a dispatch's variant, with when each began and ended, how many
 //!   dispatches waited for it (its first-use waits, rt's `Metrics::first_use_variant_waits`) and
@@ -17,41 +20,62 @@
 //!   reads them, only for a slow answer, and counts each make's waits once.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::thread::Thread;
 
 use metal2vulkan_runtime as rt;
 
 use crate::core::sync::Mutex;
 
-/// The makes of rt's pool whose ends [`pool_made`] keeps: the last 16.
+/// The makes of rt's pool [`pool_made`] keeps: the last 16.
 pub const KEPT: usize = 16;
 
-/// When each of the last [`KEPT`] makes of rt's pool ended, on rt's host clock, at its number's
-/// place modulo [`KEPT`]; 0 where none yet.
-static MADE_AT: [AtomicU64; KEPT] = [const { AtomicU64::new(0) }; KEPT];
+/// A make of rt's pool, as [`pool_made`] keeps it.
+#[derive(Clone, Debug)]
+pub struct PoolMake {
+    /// When it ended, on rt's host clock: when rt told the device's `BlockMappings` of it.
+    pub ended: u64,
+    /// Its allocation's length, in bytes.
+    pub len: u64,
+    /// The storage mode of its blocks.
+    pub class: rt::MemoryClass,
+    /// The thread that made it, which rt told it on.
+    pub thread: Thread,
+}
 
-/// The makes of rt's pool so far, the next one's number.
-static MADE: AtomicUsize = AtomicUsize::new(0);
+/// The last [`KEPT`] makes of rt's pool, the oldest first.
+static MADE: Mutex<VecDeque<PoolMake>> = Mutex::new(VecDeque::new());
 
 /// The numbers of rt's variant makes whose waits [`first_use_waits_met`] counted, the last 256:
 /// as many as rt keeps.
 static TOLD: Mutex<VecDeque<u64>> = Mutex::new(VecDeque::new());
 
-/// rt made an allocation of its pool just now (`super::fault`'s `Allocations`, which rt tells of
-/// each right after its make).
-pub(super) fn pool_made() {
-    let at = MADE.fetch_add(1, Relaxed) % KEPT;
-    MADE_AT[at].store(rt::host_time(), Relaxed);
+/// rt made an allocation of its pool just now, on this thread, `len` bytes of `class`
+/// (`super::fault`'s `Allocations`, which rt tells of each right after its make).
+pub(super) fn pool_made(len: u64, class: rt::MemoryClass) {
+    let make = PoolMake {
+        ended: rt::host_time(),
+        len,
+        class,
+        thread: std::thread::current(),
+    };
+    let mut made = MADE.lock();
+    if made.len() == KEPT {
+        made.pop_front();
+    }
+    made.push_back(make);
 }
 
 /// The makes of rt's pool among the last [`KEPT`] that ended within `start..=end` of rt's host
-/// clock: how many, and when the latest of them ended (0 where none did).
-pub fn pool_makes_ended(start: u64, end: u64) -> (u64, u64) {
-    let within = MADE_AT
-        .iter()
-        .map(|at| at.load(Relaxed))
-        .filter(|&at| at != 0 && (start..=end).contains(&at));
-    within.fold((0, 0), |(n, latest), at| (n + 1, latest.max(at)))
+/// clock, in the order they ended.
+pub fn pool_makes_ended(start: u64, end: u64) -> Vec<PoolMake> {
+    let made = MADE.lock();
+    let mut within: Vec<PoolMake> = (made.iter())
+        .filter(|make| (start..=end).contains(&make.ended))
+        .cloned()
+        .collect();
+    drop(made);
+    within.sort_by_key(|make| make.ended);
+    within
 }
 
 /// The first-use waits of compute pipelines (rt's variant makes that dispatches waited for) that
@@ -86,17 +110,44 @@ pub fn first_use_waits_met(start: u64, end: u64) -> u64 {
 mod tests {
     use super::*;
 
-    /// A make of rt's pool told now is found ended within a span that holds now, and not within
-    /// one that ended before it
+    /// A make of rt's pool told now is found ended within a span that holds now, with its length,
+    /// its storage mode and the thread it was told on, and not within one that ended before it
     #[test]
     fn a_make_ended_during_a_span_is_found_in_it_and_not_before_it() {
+        const LEN: u64 = 0x123_0000;
+        let thread = std::thread::Builder::new().name("reims-vgpu.test-maker".into());
         let before = rt::host_time();
-        pool_made();
+        let told = thread.spawn(|| pool_made(LEN, rt::MemoryClass::Private));
+        told.expect("a thread").join().expect("the make told");
         let after = rt::host_time();
-        let (n, latest) = pool_makes_ended(before, after);
-        assert!(n >= 1, "{n} makes ended in {before}..={after}");
-        assert!((before..=after).contains(&latest), "{latest}");
-        let (_, earlier) = pool_makes_ended(0, before.saturating_sub(1));
-        assert!(earlier < before, "{earlier} ended before {before}");
+        let ended = pool_makes_ended(before, after);
+        let make = ended.iter().find(|make| make.len == LEN);
+        let make = make.unwrap_or_else(|| panic!("{ended:?} ended in {before}..={after}"));
+        assert!((before..=after).contains(&make.ended), "{make:?}");
+        assert_eq!(make.class, rt::MemoryClass::Private, "{make:?}");
+        assert_eq!(make.thread.name(), Some("reims-vgpu.test-maker"));
+        let earlier = pool_makes_ended(0, before.saturating_sub(1));
+        assert!(earlier.iter().all(|make| make.ended < before), "{earlier:?}");
+    }
+
+    /// Of more makes than [`KEPT`], the last [`KEPT`] are kept, in the order they ended
+    #[test]
+    fn the_last_kept_makes_are_found_in_the_order_they_ended() {
+        const LEN: u64 = 0x456_0000;
+        let kept = u64::try_from(KEPT).unwrap();
+        let before = rt::host_time();
+        for n in 0..kept + 4 {
+            pool_made(LEN + n, rt::MemoryClass::Shared);
+        }
+        let ended = pool_makes_ended(before, rt::host_time());
+        let ours: Vec<u64> = (ended.iter())
+            .filter(|make| (LEN..LEN + 0x1_0000).contains(&make.len))
+            .map(|make| make.len - LEN)
+            .collect();
+        assert!(ours.len() <= KEPT, "{ours:?}");
+        assert!(ours.windows(2).all(|w| w[0] < w[1]), "{ours:?}");
+        assert_eq!(ours.last(), Some(&(kept + 3)), "{ours:?}");
+        let ends: Vec<u64> = ended.iter().map(|make| make.ended).collect();
+        assert!(ends.windows(2).all(|w| w[0] <= w[1]), "{ends:?}");
     }
 }

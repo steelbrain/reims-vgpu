@@ -274,7 +274,7 @@ impl<P: ApiPlatform> Bench<P> {
         };
         let gone = self.dec.decode(&self.device, destroy.as_bytes());
         assert_eq!(gone.ok(), Some(Ok(())));
-        (self.dec).block_released(&self.device, block, 0, Box::new(|| ()), no_raise());
+        (self.dec).block_released(&self.device, block, 0, || (), Box::new(|| ()), no_raise());
     }
 
     /// A command buffer of [`QUEUE`] that names a write of each block of `blocks`, at the CPU's
