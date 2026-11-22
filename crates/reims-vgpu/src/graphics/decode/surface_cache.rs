@@ -423,7 +423,9 @@
 //!   copy into the other shapes of its plane, at the end of its encoder, fails its command buffer
 //!   so, and leaves those shapes as they were. A create of a texture over the buffer is refused
 //!   (nil) where the platform refuses its memory. A fill straight into the shapes makes none
-//!   ("Straight fills", below).
+//!   ("Straight fills", below), nor does a copy out that moves none of its bytes, a write-back,
+//!   a download's or a release's, which reads nothing of the buffer
+//!   ([`SurfaceCache::moves_none_out`]): the cache's fills then go on going straight.
 //!
 //! - **Straight fills.** In the per-shape form a fill of a cache whose buffer holds no memory
 //!   copies the pages straight into its shapes' images, with nothing copied into the buffer
@@ -5723,12 +5725,12 @@ impl<P: Platform> SurfaceCaches<P> {
             done();
             return Ok(());
         };
-        // The buffer's memory first, as for every copy through it ("Deferred memory").
-        let Some(cb) = transfer
-            .queue
-            .command_buffer(ON)?
-            .filter(|_| cache.pages.is_some() && cache.copy_through(MemoryFor::WriteBack))
-        else {
+        // The buffer's memory first, as for every copy through it ("Deferred memory"); none for
+        // a copy that moves none of its bytes, which reads nothing of the buffer.
+        let moves_none = cache.moves_none_out();
+        let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
+            cache.pages.is_some() && (moves_none || cache.copy_through(MemoryFor::WriteBack))
+        }) else {
             done();
             return Ok(());
         };
@@ -5740,7 +5742,7 @@ impl<P: Platform> SurfaceCaches<P> {
         // A buffer that lacks the pages takes them first ("Straight fills"), so the copy moves
         // the pages' own bytes beside the shapes' writes; not for a copy that moves none.
         let staging = (timed, &self.spares, &mut reserve);
-        let refilled = if cache.moves_none_out() {
+        let refilled = if moves_none {
             Ok(())
         } else {
             refill::<P>(device, &cb, cache, block, &mut self.counts, staging)
@@ -7635,12 +7637,17 @@ impl<P: Platform> Caches<P> {
             state.unseen_writes(&uses.blocks, &unseen, uses.video);
             state.shapes_written(&uses.blocks, &uses.shapes);
             state.over_written(&uses.blocks, &uses.over);
-            // An early copy goes through the cache's buffer: one whose CPU reads its writes back.
+            // An early copy goes through the cache's buffer: one whose CPU reads its writes back,
+            // its pages in a buffer or by their runs, as copied pages take none
+            // ([`SurfaceCaches::early_copies`]).
             let buffers = (uses.blocks.iter())
                 .filter(|c| c.writes)
                 .filter_map(|c| {
                     let early = MemoryFor::EarlyCopy;
-                    state.deferred_buffer(c.block, early, |cache| cache.read_back.on)
+                    state.deferred_buffer(c.block, early, |cache| {
+                        let copied = matches!(cache.pages, Some(CachePages::Copied(_)) | None);
+                        cache.read_back.on && !copied
+                    })
                 })
                 .collect();
             (state.after(device, queue, cb, &uses.blocks), buffers)
@@ -7738,10 +7745,13 @@ impl<P: Platform> Caches<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
-        // A written cache's copy goes through its buffer.
+        // A written cache's copy goes through its buffer, but for one that moves none of its
+        // bytes ([`SurfaceCache::moves_none_out`]).
         let buffer = self
             .lock()
-            .deferred_buffer(block, MemoryFor::Download, |c| c.written);
+            .deferred_buffer(block, MemoryFor::Download, |c| {
+                c.written && !c.moves_none_out()
+            });
         self.make_memory(buffer.into_iter().collect(), MemoryFor::Download);
         let mut state = self.lock();
         // The pieces a staged copy of its cache, and a recovery's refills, would make for want of
@@ -7838,7 +7848,9 @@ impl<P: Platform> Caches<P> {
         let (done, failed, may_copy, reserve, buffer) = {
             let mut state = self.lock();
             let may_copy = state.release_may_copy(block, unheld);
-            let buffer = state.deferred_buffer(block, MemoryFor::Release, |_| may_copy);
+            let buffer = state.deferred_buffer(block, MemoryFor::Release, |c| {
+                may_copy && !c.moves_none_out()
+            });
             let lacking = may_copy.then(|| state.lacking(block, Way::Out)).flatten();
             let reserve = lacking.map(|(lens, first)| Reserve {
                 spares: Arc::clone(&state.spares),

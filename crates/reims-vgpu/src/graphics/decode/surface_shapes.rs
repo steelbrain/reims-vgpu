@@ -3107,9 +3107,13 @@ mod tests {
 
     /// A staged download after a writer that wrote nothing the host copied into the cache's
     /// buffer moves nothing and makes no staging buffer, counted, and is answered; its buffer,
-    /// which lacks the pages its shape's straight fill took, takes none of them
+    /// which lacks the pages its shape's straight fill took, takes none of them, and makes no
+    /// memory, so the next fill goes straight again. The next such writer of the surface, which
+    /// reads its writes back, makes none for an early copy, which copied pages take none of;
+    /// nor does its release
     #[test]
     fn a_staged_download_with_nothing_written_moves_nothing() {
+        use reims_vgpu_vulkan::core::testkit::impls::resource::MAKE_MEMORY;
         let mut r = shaped_staged();
         let cache = cache_id(&r);
         let length = 2 * r.page;
@@ -3134,6 +3138,24 @@ mod tests {
             counts.buffer_refills, 0,
             "nor a fill of the buffer that lacks the pages"
         );
+        assert_eq!(r.p.call_log().count(MAKE_MEMORY), 0, "no memory made");
+        assert_eq!(r.dec.caches().live().buffer_made_bytes, 0);
+
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 3, false)]);
+        complete_staged(&r);
+        let shapes = r.dec.caches().counts().shapes;
+        assert_eq!(shapes.straight_fills, 2, "straight again");
+        computes(&mut r, 0x102, &[bind_pipeline(31)]);
+        complete_staged(&r);
+        assert_eq!(
+            r.p.call_log().count(MAKE_MEMORY),
+            0,
+            "nor for an early copy behind the writer, which copied pages take none of"
+        );
+        let released = release(&r, BLOCK);
+        complete_staged(&r);
+        assert!(released.load(Ordering::SeqCst));
+        assert_eq!(r.p.call_log().count(MAKE_MEMORY), 0, "nor for the release");
     }
 
     /// Where the caches' copies are staged, a fill of a cache whose buffer holds no memory copies
