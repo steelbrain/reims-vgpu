@@ -164,6 +164,7 @@ mod answers;
 mod color;
 mod compile;
 mod completion;
+mod create_waits;
 mod decode;
 mod device_info;
 #[cfg(windows)]
@@ -973,6 +974,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     let clock = Arc::clone(&platform);
                     PrivateBlocks::new(block_source, Box::new(move || clock.clock().now_mono()))
                 },
+                create_waits: {
+                    let clock = Arc::clone(&platform);
+                    create_waits::CreateWaits::new(Box::new(move || clock.clock().now_mono()))
+                },
             });
             let cursors: Vec<Arc<HostCursor>> = (0..count)
                 .map(|display| {
@@ -1457,6 +1462,9 @@ struct GraphicsControl<P: ApiPlatform> {
     /// [`Self::take_private_block`]): the host's picks of addresses until the device runs on
     /// metal2vulkan-runtime, whose Private blocks then fill it.
     private_blocks: PrivateBlocks,
+    /// The pipeline creates waiting for their replies, timed for the counts line
+    /// (`create_waits`): from their take ([`Self::handle_stage3`]) to their reply's post.
+    create_waits: create_waits::CreateWaits,
 }
 
 /// The longest `COMMAND_BUFFER` message, in bytes, that is walked and committed on its queue's
@@ -2606,6 +2614,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ) {
         let message: &[u8] = &bytes;
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
+        // A pipeline create waits for its reply from its take, here (`create_waits`).
+        if create_waits::is_create(r#type) {
+            let (_, seqno, obj_id) = message_identity(message);
+            self.create_waits.taken(obj_id, seqno);
+        }
         if (r#type == RGFX_CMD_BUFFER_OVER_PAGES || r#type == RGFX_CMD_HEAP_OVER_PAGES)
             && self.start_over_pages(poster, message)
         {
@@ -3222,6 +3235,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // Refused at its op, and answered at once: its process waits for the reply.
                 if let Some(refused) = refused_reply(message) {
                     poster.post(refused.as_bytes());
+                    self.create_waits.replied(obj_id, seqno);
+                } else {
+                    self.create_waits.let_go(obj_id, seqno);
                 }
                 return;
             }
@@ -3304,6 +3320,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                         creating.seqno,
                         creating.obj_id
                     );
+                    self.create_waits.let_go(creating.obj_id, creating.seqno);
+                } else {
+                    self.create_waits.replied(creating.obj_id, creating.seqno);
                 }
                 drop(again);
                 drop(first);
@@ -3346,7 +3365,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     }
 
     /// The reply step of a create's settling ([`Self::settle`]): logs the refusal of `compiled`,
-    /// the create `creating`'s compile, and posts its reply through `poster`. Every answer the
+    /// the create `creating`'s compile, and posts its reply through `poster`, which ends the
+    /// create's wait for the counts line (`create_waits`). Every answer the
     /// reply carries was made by the make's first step; the pipeline stays pending, so whatever
     /// names it from now on waits for its store.
     fn post_reply(
@@ -3363,6 +3383,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             );
         }
         poster.post(&compiled.reply().bytes());
+        self.create_waits.replied(obj_id, seqno);
     }
 
     /// The store step of a create's settling ([`Self::settle`]), after its reply: finishes the

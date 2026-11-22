@@ -16,6 +16,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
 
+mod create_waits;
 mod displays;
 mod full_ring;
 mod prepass;

@@ -203,7 +203,14 @@ repeats the ones code cites.
     of rt's pool ran, and `slow-answer-over-make-max-ns` the longest;
     `slow-answer-first-use-waits`, the compute dispatches' first-use waits,
     `rt-first-use-variant-waits`, that met any such answer: no degradation,
-    `graphics/slow_answers.rs`); a boot's degradations are
+    `graphics/slow_answers.rs`), and the guest's pipeline creates' waits for
+    their replies (`pipeline-create-replies`, the replies posted;
+    `pipeline-create-reply-ns` and `pipeline-create-reply-max-ns`, each
+    create's nanoseconds from the host's take of it off ring 0 to its
+    reply's post, summed, and the longest; `pipeline-create-replies-over-16ms`,
+    those of 16.7 ms or more; `pipeline-create-waiting-ns`, the nanoseconds
+    during which at least one create waited, the waits' union: no
+    degradation, `graphics/create_waits.rs`); a boot's degradations are
     read from its last such line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
     repeated since the last count: <n> more of <file>:<line>[ [<kind>]]
     (<target>: <the first line's message>); …` is how many lines of each
