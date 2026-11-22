@@ -14,8 +14,10 @@
 //! - rt's own command buffers (its uploads and Managed buffers' copy-ins) it submitted, and their
 //!   GPU time in all, from their own timestamp pairs;
 //! - the bytes rt copied for calls: in all, then by cause: staging (`replace_region` and
-//!   `get_bytes`), attachments' images into their shadows, and the over-copies between a texture
-//!   over a buffer and its image of its own, by the cause rt gives each, those of none left out;
+//!   `get_bytes`), attachments' images into their shadows, the over-copies between a texture
+//!   over a buffer and its image of its own, by the cause rt gives each, those of none left out,
+//!   and the copies of what passes resolved into a texture's resolve image into the bytes of the
+//!   buffer the texture is in place over;
 //! - `counted`, more of what rt counted, by their fields' names: new textures' images zeroed,
 //!   their bytes and the barriers that moved them home after it; the acquires of another API's
 //!   writes; the barriers rt recorded; the bytes its commits' copy-ins copied from Managed
@@ -28,10 +30,11 @@
 //!   as not available;
 //! - `gauges`, some of rt's gauges as they are now, by their fields' names: the live textures,
 //!   those held in an image of their own beside their buffer, the bytes of textures' places in
-//!   texture blocks, of textures' allocations of their own and of the spills; then the bytes of
-//!   the texture blocks it holds, of the sparse ones among them and their count; and the bytes of
-//!   the Private allocations that hold taken blocks, of the taken blocks in them, and of the
-//!   sparse allocations among them and their count.
+//!   texture blocks, of textures' allocations of their own and of the spills, and the textures'
+//!   resolve images and the bytes of their memory; then the bytes of the texture blocks it holds,
+//!   of the sparse ones among them and their count; and the bytes of the Private allocations that
+//!   hold taken blocks, of the taken blocks in them, and of the sparse allocations among them and
+//!   their count.
 //!
 //! A device made after the one before reads as counted from none again: each count is what it rose
 //! by, or what it is where it fell.
@@ -94,12 +97,13 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         .filter(|(_, bytes)| *bytes > 0)
         .map(|(cause, bytes)| format!("{cause} {bytes}"))
         .collect();
-    let (copied, attachments, over) = (
+    let (copied, attachments, over, resolve) = (
         rose!(bytes_copied),
         rose!(attachment_read_copy_bytes),
         rose!(over_copy_bytes),
+        rose!(resolve_copy_bytes),
     );
-    let staging = copied.saturating_sub(attachments).saturating_sub(over);
+    let staging = copied.saturating_sub(attachments + over + resolve);
     // What rose, and the gauges as they are, each by its field's name.
     macro_rules! rose_by_name {
         ($($field:ident),* $(,)?) => {
@@ -134,6 +138,8 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         texture_block_bytes,
         texture_own_bytes,
         spilled_bytes,
+        resolve_images,
+        resolve_image_bytes,
         texture_block_held_bytes,
         texture_block_sparse_bytes,
         texture_block_sparse_blocks,
@@ -148,7 +154,8 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
          submits {} in {:.1} ms ({} over 100 ms), the longest since the device was made {:.1} \
          ms; queue-lock waits {:.1} ms, the longest since the device was made {:.1} ms; own \
          command buffers {} in {:.1} ms on the GPU; bytes copied {copied}: staging {staging}, \
-         attachment reads {attachments}, over-copies {over}{}; counted {}; gauges {}",
+         attachment reads {attachments}, over-copies {over}{}, resolve copies {resolve}; counted \
+         {}; gauges {}",
         rose!(pipelines_created),
         rose!(first_use_waits),
         ms(rose!(first_use_wait_nanos)),
@@ -191,8 +198,9 @@ mod tests {
 
     /// A part says what rose since the metrics before, the maxima since the device was made as
     /// they are, each over-copy cause with bytes by name and none without, staging as the copies
-    /// neither of attachments nor over-copies, then the other counts' rises and the gauges by name,
-    /// the gauges as they are; a count that fell, a new device's, reads as it is.
+    /// neither of attachments, nor over-copies, nor resolve copies, then the other counts' rises
+    /// and the gauges by name, the gauges as they are; a count that fell, a new device's, reads as
+    /// it is.
     #[test]
     fn an_rt_part_says_what_rose_with_each_copy_cause_by_name() {
         let mut before = rt::Metrics::default();
@@ -227,7 +235,9 @@ mod tests {
         before.runtime_command_buffer_gpu_nanos = 4_000_000;
         now.runtime_command_buffers = 30 + 12;
         now.runtime_command_buffer_gpu_nanos = 4_000_000 + 1_700_000;
-        now.bytes_copied = 1_000 + 4_096 + 512 + 64;
+        now.bytes_copied = 1_000 + 4_096 + 512 + 2_048 + 64;
+        now.resolve_copies = 1;
+        now.resolve_copy_bytes = 2_048;
         now.attachment_read_copy_bytes = 512;
         now.over_copy_bytes = 4_096;
         now.over_copy_bytes_dma_buf = 4_000;
@@ -261,6 +271,8 @@ mod tests {
         gauges.texture_block_bytes = 20_971_520;
         gauges.texture_own_bytes = 33_554_432;
         gauges.spilled_bytes = 0;
+        gauges.resolve_images = 1;
+        gauges.resolve_image_bytes = 65_536;
         gauges.texture_block_held_bytes = 50_331_648;
         gauges.texture_block_sparse_bytes = 16_777_216;
         gauges.texture_block_sparse_blocks = 1;
@@ -274,15 +286,17 @@ mod tests {
              1.5 ms, points 1 in 0.5 ms), the longest since the device was made 4.2 ms; submits 60 \
              in 312.5 ms (2 over 100 ms), the longest since the device was made 140.0 ms; \
              queue-lock waits 2.3 ms, the longest since the device was made 0.9 ms; own command \
-             buffers 12 in 1.7 ms on the GPU; bytes copied 4672: staging 64, attachment reads 512, \
-             over-copies 4096 (dma-buf 4000, pitch 96); counted texture_clears 2, \
+             buffers 12 in 1.7 ms on the GPU; bytes copied 6720: staging 64, attachment reads 512, \
+             over-copies 4096 (dma-buf 4000, pitch 96), resolve copies 2048; counted \
+             texture_clears 2, \
              texture_clear_bytes 524288, texture_clear_barriers 1, external_acquires 2, barriers \
              9, managed_bytes_captured 98304, held_releases 3, held_release_bytes 16842752, \
              held_release_starts 1, held_starts 6, held_start_gap_nanos 250000, \
              pipeline_creation_nanos 7250000, translation_nanos 3125000, untimed_command_buffers \
              4, stamps_not_available 1; gauges textures 12, \
              textures_copied_over 2, texture_block_bytes 20971520, texture_own_bytes 33554432, \
-             spilled_bytes 0, texture_block_held_bytes 50331648, texture_block_sparse_bytes \
+             spilled_bytes 0, resolve_images 1, resolve_image_bytes 65536, \
+             texture_block_held_bytes 50331648, texture_block_sparse_bytes \
              16777216, texture_block_sparse_blocks 1, private_take_held_bytes 33554432, \
              private_take_bytes 18874368, private_take_sparse_bytes 16777216, \
              private_take_sparse_allocations 1"
@@ -296,14 +310,14 @@ mod tests {
         );
         assert!(
             part.ends_with(
-                "over-copies 0; counted texture_clears 0, texture_clear_bytes 0, \
+                "over-copies 0, resolve copies 0; counted texture_clears 0, texture_clear_bytes 0, \
                  texture_clear_barriers 0, external_acquires 0, barriers 0, \
                  managed_bytes_captured 0, held_releases 0, held_release_bytes 0, \
                  held_release_starts 0, held_starts 0, held_start_gap_nanos 0, \
                  pipeline_creation_nanos 0, translation_nanos 0, untimed_command_buffers 0, \
                  stamps_not_available 0; gauges textures 0, textures_copied_over 0, \
-                 texture_block_bytes 0, texture_own_bytes 0, spilled_bytes 0, \
-                 texture_block_held_bytes 0, texture_block_sparse_bytes 0, \
+                 texture_block_bytes 0, texture_own_bytes 0, spilled_bytes 0, resolve_images 0, \
+                 resolve_image_bytes 0, texture_block_held_bytes 0, texture_block_sparse_bytes 0, \
                  texture_block_sparse_blocks 0, private_take_held_bytes 0, private_take_bytes 0, \
                  private_take_sparse_bytes 0, private_take_sparse_allocations 0"
             ),

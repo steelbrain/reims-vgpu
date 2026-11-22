@@ -129,6 +129,16 @@
 //! line says how often its kernels took the emulated SIMD-group form, and whether two makes of one
 //! content compiled it at once.
 //!
+//! **Its resolve copies.** A pass that resolves into a texture in place over a buffer whose linear
+//! image takes no attachment usage resolves into the texture's resolve image, a one-sample image rt
+//! makes at the first such pass and frees with the texture, and as the pass ends rt copies the
+//! pass's render area from it into the buffer's bytes at the texture's pitch, a copy Metal does
+//! not make (`Metrics::resolve_copies`, one a pass, and their bytes, `resolve_copy_bytes`, which
+//! count in `bytes_copied` too). The counts line carries both as amounts, [`RESOLVE_COPIES_CODE`]
+//! and [`RESOLVE_COPY_BYTES_CODE`], so a boot's line says whether its resolves into textures over
+//! buffers went in place or through a resolve image, and the images go to it at their highest
+//! (below).
+//!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
@@ -136,11 +146,12 @@
 //! not given back (`private_take_bytes`). A fifth is the size of the data in the device's
 //! `VkPipelineCache` (`pipeline_cache_bytes`), which rt measures when its reaper last looked, once
 //! creation was quiet, and which falls when the reaper replaces a cache past 32 MiB with a fresh
-//! one. A gauge rises and falls, so the counts line carries the highest each reached at a look,
-//! `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it ([`note_gauges`]). The counts'
-//! fold looks ([`fold_metrics`]), and so does the gauges' thread where it runs
-//! (`super::gauge_log`, every 5 s): a value rt held between two looks, the blob's among them,
-//! is not seen.
+//! one. Two more are the resolve images a device holds (`resolve_images`) and the bytes of their
+//! memory (`resolve_image_bytes`). A gauge rises and falls, so the counts line carries the highest
+//! each reached at a look, `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it
+//! ([`note_gauges`]). The counts' fold looks ([`fold_metrics`]), and so does the gauges' thread
+//! where it runs (`super::gauge_log`, every 5 s): a value rt held between two looks, the blob's
+//! among them, is not seen.
 
 use std::sync::{Arc, OnceLock};
 
@@ -287,6 +298,15 @@ pub const EMULATED_SIMDGROUP_DISPATCHES_CODE: &str = "rt-emulated-simdgroup-disp
 /// ([`fold_metrics`]).
 pub const KERNEL_MAKES_DROPPED_CODE: &str = "rt-kernel-makes-dropped";
 
+/// The code of the copies of what a pass resolved into a texture's resolve image into the bytes
+/// of the buffer the texture is in place over (`Metrics::resolve_copies`), an amount on the counts
+/// line ([`fold_metrics`]).
+pub const RESOLVE_COPIES_CODE: &str = "rt-resolve-copies";
+
+/// The code of the bytes of those copies (`Metrics::resolve_copy_bytes`), an amount on the counts
+/// line ([`fold_metrics`]).
+pub const RESOLVE_COPY_BYTES_CODE: &str = "rt-resolve-copy-bytes";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -308,8 +328,16 @@ pub const PRIVATE_TAKE_MOST_CODE: &str = "rt-private-take-bytes-most";
 /// read only at the looks.
 pub const PIPELINE_CACHE_MOST_CODE: &str = "rt-pipeline-cache-bytes-most";
 
+/// The code of the most resolve images a device held at a look (`Gauges::resolve_images`,
+/// [`note_gauges`]).
+pub const RESOLVE_IMAGES_MOST_CODE: &str = "rt-resolve-images-most";
+
+/// The code of the most bytes of the resolve images' memory at a look
+/// (`Gauges::resolve_image_bytes`, [`note_gauges`]).
+pub const RESOLVE_IMAGE_BYTES_MOST_CODE: &str = "rt-resolve-image-bytes-most";
+
 /// The gauges the counts line carries at their highest ([`highest_gauges`]).
-const HIGHEST_GAUGES: usize = 5;
+const HIGHEST_GAUGES: usize = 7;
 
 /// The highest of each of [`highest_gauges`]'s gauges a look saw, in its order, over the
 /// process's devices.
@@ -327,8 +355,9 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// pipelines made with a stage past the kernels' bound, the compute dispatches' first-use waits
 /// and their nanoseconds, the exported blocks whose address went out, the pipeline caches
 /// replaced and the cache's writes skipped past its bound, the dispatches that ran an
-/// emulated-SIMD-group module, and the compiled contents a state's make dropped.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 18;
+/// emulated-SIMD-group module, the compiled contents a state's make dropped, and the copies out of
+/// resolve images and their bytes.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 20;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -350,8 +379,8 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// device, its command buffers held for room, its cache writes, its translations, its pipelines'
 /// makes and their time, its render makes past the kernels' bound, its compute dispatches'
 /// first-use waits, its exported blocks addressed, its pipeline caches replaced and cache writes
-/// skipped past their bound, its emulated-SIMD-group dispatches and its dropped makes rose by
-/// since the last fold
+/// skipped past their bound, its emulated-SIMD-group dispatches, its dropped makes and its resolve
+/// copies rose by since the last fold
 /// ([`folded_counts`]), so the counts line carries their totals, then its maxima
 /// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
 /// docs). Nothing before the device is made.
@@ -399,8 +428,9 @@ pub(super) fn note_gauges(g: &rt::Gauges) {
 /// The gauges of `g` the counts line carries at their highest, each with its code: the
 /// preprocess regions used ([`PREPROCESS_USED_MOST_CODE`]) and idle
 /// ([`PREPROCESS_IDLE_MOST_CODE`]), the texture blocks held ([`TEXTURE_BLOCK_HELD_MOST_CODE`]),
-/// the Private blocks taken ([`PRIVATE_TAKE_MOST_CODE`]) and the pipeline cache's data
-/// ([`PIPELINE_CACHE_MOST_CODE`]).
+/// the Private blocks taken ([`PRIVATE_TAKE_MOST_CODE`]), the pipeline cache's data
+/// ([`PIPELINE_CACHE_MOST_CODE`]), and the resolve images ([`RESOLVE_IMAGES_MOST_CODE`]) and
+/// their memory ([`RESOLVE_IMAGE_BYTES_MOST_CODE`]).
 fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
     [
         (PREPROCESS_USED_MOST_CODE, g.preprocess_used_bytes),
@@ -408,6 +438,8 @@ fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
         (TEXTURE_BLOCK_HELD_MOST_CODE, g.texture_block_held_bytes),
         (PRIVATE_TAKE_MOST_CODE, g.private_take_bytes),
         (PIPELINE_CACHE_MOST_CODE, g.pipeline_cache_bytes),
+        (RESOLVE_IMAGES_MOST_CODE, g.resolve_images),
+        (RESOLVE_IMAGE_BYTES_MOST_CODE, g.resolve_image_bytes),
     ]
 }
 
@@ -450,8 +482,9 @@ fn follow(counters: rt::Counters) {
 /// exported blocks whose address went out ([`EXPORTED_BLOCKS_ADDRESSED_CODE`]), the pipeline
 /// caches replaced ([`PIPELINE_CACHES_REPLACED_CODE`]) and the cache's writes skipped
 /// ([`PIPELINE_CACHE_WRITES_SKIPPED_CODE`]) past its bound, the dispatches that ran an
-/// emulated-SIMD-group module ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), and the compiled
-/// contents a state's make dropped ([`KERNEL_MAKES_DROPPED_CODE`]).
+/// emulated-SIMD-group module ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), the compiled contents a
+/// state's make dropped ([`KERNEL_MAKES_DROPPED_CODE`]), and the copies out of resolve images
+/// ([`RESOLVE_COPIES_CODE`]) and their bytes ([`RESOLVE_COPY_BYTES_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -482,6 +515,8 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
             m.emulated_simdgroup_dispatches,
         ),
         (KERNEL_MAKES_DROPPED_CODE, m.kernel_makes_dropped),
+        (RESOLVE_COPIES_CODE, m.resolve_copies),
+        (RESOLVE_COPY_BYTES_CODE, m.resolve_copy_bytes),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -1970,7 +2005,8 @@ mod tests {
     /// a stage past the kernels' bound, the compute dispatches' first-use waits and their
     /// nanoseconds, the exported blocks whose address went out, the pipeline caches replaced and
     /// the cache's writes skipped past its bound, the dispatches that ran an emulated-SIMD-group
-    /// module, and the compiled contents a state's make dropped.
+    /// module, the compiled contents a state's make dropped, and the copies out of resolve images
+    /// and their bytes.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2002,6 +2038,8 @@ mod tests {
             PIPELINE_CACHE_WRITES_SKIPPED_CODE,
             EMULATED_SIMDGROUP_DISPATCHES_CODE,
             KERNEL_MAKES_DROPPED_CODE,
+            RESOLVE_COPIES_CODE,
+            RESOLVE_COPY_BYTES_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -2031,6 +2069,8 @@ mod tests {
         m.exported_blocks_addressed = 1;
         m.pipeline_caches_replaced = 1;
         m.emulated_simdgroup_dispatches = 4;
+        m.resolve_copies = 1;
+        m.resolve_copy_bytes = 3_686_400;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -2055,6 +2095,8 @@ mod tests {
         m.pipeline_cache_writes_skipped = 1;
         m.emulated_simdgroup_dispatches = 11;
         m.kernel_makes_dropped = 2;
+        m.resolve_copies = 4;
+        m.resolve_copy_bytes = 4 * 3_686_400;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -2063,7 +2105,7 @@ mod tests {
             rose,
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
-                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 11, 2
+                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 11, 2, 4, 14_745_600
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
@@ -2097,18 +2139,20 @@ mod tests {
         assert_eq!(count() - before, 7_000);
     }
 
-    /// Five of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by its
-    /// rise over the highest a look saw, so that one that falls leaves its count as it was and
+    /// Seven of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by
+    /// its rise over the highest a look saw, so that one that falls leaves its count as it was and
     /// one that rises past it raises it, the pipeline cache's data falling as its reaper replaces
-    /// a full cache with a fresh one.
+    /// a full cache with a fresh one, and the resolve images as their textures drop.
     #[test]
-    fn five_gauges_count_at_their_highest() {
+    fn seven_gauges_count_at_their_highest() {
         let codes = [
             PREPROCESS_USED_MOST_CODE,
             PREPROCESS_IDLE_MOST_CODE,
             TEXTURE_BLOCK_HELD_MOST_CODE,
             PRIVATE_TAKE_MOST_CODE,
             PIPELINE_CACHE_MOST_CODE,
+            RESOLVE_IMAGES_MOST_CODE,
+            RESOLVE_IMAGE_BYTES_MOST_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -2121,16 +2165,22 @@ mod tests {
         g.texture_block_held_bytes = 48 << 20;
         g.private_take_bytes = 16 << 20;
         g.pipeline_cache_bytes = 30 << 20;
+        g.resolve_images = 2;
+        g.resolve_image_bytes = 8 << 20;
         let mut highest = [0; HIGHEST_GAUGES];
         raise_to(&mut highest, highest_gauges(&g));
         g.preprocess_used_bytes = 12 << 20;
         g.preprocess_idle_bytes = 0;
         g.texture_block_held_bytes = 32 << 20;
         g.pipeline_cache_bytes = 1 << 20;
+        g.resolve_images = 1;
+        g.resolve_image_bytes = 4 << 20;
         raise_to(&mut highest, highest_gauges(&g));
         g.pipeline_cache_bytes = 31 << 20;
         raise_to(&mut highest, highest_gauges(&g));
-        assert_eq!(highest, [12 << 20, 64 << 20, 48 << 20, 16 << 20, 31 << 20]);
+        g.resolve_images = 3;
+        raise_to(&mut highest, highest_gauges(&g));
+        assert_eq!(highest, [12 << 20, 64 << 20, 48 << 20, 16 << 20, 31 << 20, 3, 8 << 20]);
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
         assert_eq!(rose, highest);

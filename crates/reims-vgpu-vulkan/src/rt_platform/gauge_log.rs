@@ -20,10 +20,10 @@
 //!   imports, the surface imports, and the preprocess regions, each a buffer on an allocation of
 //!   its own, that executions of indirect command buffers hold (each taken at an execution's
 //!   record and given back when its command buffer completes) and that no execution holds, kept
-//!   for the next ones; then the live `VkDeviceMemory` allocations, the imports, surface imports
-//!   and exports among them, the live buffers and textures, and the releases that wait for the
-//!   command buffers committed before them. A look at which none changed writes no line
-//!   ([`Lines`]).
+//!   for the next ones, and the textures' resolve images; then the live `VkDeviceMemory`
+//!   allocations, the imports, surface imports and exports among them, the live buffers and
+//!   textures, the resolve images, and the releases that wait for the command buffers committed
+//!   before them. A look at which none changed writes no line ([`Lines`]).
 //! - **The completed handlers' line.** Each look also writes the line of the completed handlers
 //!   that held rt's completion thread (`super::handler_times`), where it changed since the line
 //!   before, whether or not a device is made.
@@ -72,12 +72,14 @@ pub(crate) fn line(gauges: &rt::Gauges) -> String {
         surface_import_bytes,
         preprocess_used_bytes,
         preprocess_idle_bytes,
+        resolve_image_bytes,
         blocks,
         imports,
         surface_imports,
         exports,
         buffers,
         textures,
+        resolve_images,
         releases_waiting,
     );
     let pairs: Vec<String> = (named.iter())
@@ -164,10 +166,12 @@ mod tests {
         gauges.import_bytes = 3_145_728;
         gauges.preprocess_used_bytes = 1_179_648;
         gauges.preprocess_idle_bytes = 524_288;
+        gauges.resolve_image_bytes = 3_686_400;
         gauges.blocks = 6;
         gauges.imports = 3;
         gauges.buffers = 4;
         gauges.textures = 5;
+        gauges.resolve_images = 1;
         gauges.releases_waiting = 2;
         let expected = "rt gauges: private_allocation_bytes 33554432, private_idle_bytes 16777216, \
                         private_reserve_bytes 16777216, private_placed_bytes 8388608, \
@@ -177,9 +181,9 @@ mod tests {
                         shared_buffer_bytes 65536, shared_long_reused_bytes 0, \
                         texture_own_bytes 2097152, spilled_bytes 0, managed_spilled_bytes 0, \
                         import_bytes 3145728, surface_import_bytes 0, \
-                        preprocess_used_bytes 1179648, preprocess_idle_bytes 524288, blocks 6, \
-                        imports 3, surface_imports 0, exports 0, buffers 4, textures 5, \
-                        releases_waiting 2";
+                        preprocess_used_bytes 1179648, preprocess_idle_bytes 524288, \
+                        resolve_image_bytes 3686400, blocks 6, imports 3, surface_imports 0, \
+                        exports 0, buffers 4, textures 5, resolve_images 1, releases_waiting 2";
         assert_eq!(line(&gauges), expected);
 
         let mut lines = Lines::default();
@@ -188,7 +192,7 @@ mod tests {
         gauges.textures = 6;
         let changed = lines.next(&gauges).expect("a gauge changed");
         assert!(
-            changed.ends_with("buffers 4, textures 6, releases_waiting 2"),
+            changed.ends_with("buffers 4, textures 6, resolve_images 1, releases_waiting 2"),
             "{changed}"
         );
         let zeros = line(&rt::Gauges::default());
