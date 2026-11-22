@@ -7,18 +7,22 @@
 //                 heap past the working set
 //   bounds [STEP] each create of a length or size Metal bounds, at its bound and past it, each
 //                 step in a child of its own (L is maxBufferLength, P the page size): a buffer
-//                 of a length (len.L, len.L+1, len.L+P), of bytes (bytes.L, bytes.L+P), over the
-//                 caller's bytes (nocopy.L, nocopy.L+P, nocopy.L+1, and nocopy.P+1, a length
-//                 off the page); a Private heap (heap.L, heap.L+1, heap.L+P); a buffer and a
-//                 texture of a 1 MiB Private Placement heap at its end and past it
-//                 (place.buf.end, place.buf.past, place.buf.long, place.tex.end, place.tex.past);
-//                 the tiled texture SPI over the caller's bytes (tiled.1M, tiled.L, tiled.L+P).
-//                 Each line says made or nil, and the parent says how a step's process ended.
+//                 of a length (len.L, len.L+1, len.L+P), over the caller's bytes (nocopy.1M,
+//                 nocopy.L, nocopy.L+P, nocopy.L+1, and nocopy.P+1, a length off the page); a
+//                 Private heap (heap.L, heap.L+1, heap.L+P); a buffer and a texture of a 1 MiB
+//                 Private Placement heap at its end and past it (place.buf.end, place.buf.past,
+//                 place.buf.long, place.tex.end, place.tex.past); the tiled texture SPI over the
+//                 caller's bytes (tiled.1M, tiled.L, tiled.L+P); last, a buffer of bytes past
+//                 the bound (bytes.L+P), which commits them where it is made (bytes.L is not
+//                 asked: it would). The caller's bytes are a sparse file's pages. Each line says
+//                 made or nil and the process's footprint after the create, and the parent says
+//                 how a step's process ended.
 //   residency GIB GIB 1 GiB Private buffers made and all filled in one command buffer
 //   timeout SEC   one kernel that runs about SEC seconds (the GPU's watchdog may end it); run it
 //                 only on a GPU that does not drive a display
 // Build: see README.md.
 #import "oracle_common.h"
+#include <libproc.h>
 #include <objc/message.h>
 #include <spawn.h>
 #include <sys/mman.h>
@@ -148,10 +152,10 @@ static void case_creates(void)
 }
 
 static const char *const kBoundsSteps[] = {
-    "len.L",          "len.L+1",        "len.L+P",        "bytes.L",       "bytes.L+P",
-    "nocopy.L",       "nocopy.L+P",     "nocopy.L+1",     "nocopy.P+1",    "heap.L",
-    "heap.L+1",       "heap.L+P",       "place.buf.end",  "place.buf.past", "place.buf.long",
-    "place.tex.end",  "place.tex.past", "tiled.1M",       "tiled.L",       "tiled.L+P",
+    "len.L",          "len.L+1",        "len.L+P",        "nocopy.1M",      "nocopy.L",
+    "nocopy.L+P",     "nocopy.L+1",     "nocopy.P+1",     "heap.L",         "heap.L+1",
+    "heap.L+P",       "place.buf.end",  "place.buf.past", "place.buf.long", "place.tex.end",
+    "place.tex.past", "tiled.1M",       "tiled.L",        "tiled.L+P",      "bytes.L+P",
 };
 
 // The length a step's suffix names: L, L+1, L+P, P+1 or 1M.
@@ -171,13 +175,24 @@ static uint64_t bounds_length(const char *suffix, uint64_t L, uint64_t P)
 	exit(2);
 }
 
-// `length` bytes of fresh anonymous memory, whole pages, untouched (they read zero).
+// `length` bytes of a sparse file of their own, whole pages, mapped shared: they read zero, and
+// the process's footprint does not count them, so a create that wires or reads them stays inside
+// a small job's memory limit.
 static void *bounds_bytes(uint64_t length, uint64_t P)
 {
-	void *p = mmap(NULL, (length + P - 1) & ~(P - 1), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
-	               -1, 0);
+	const uint64_t size = (length + P - 1) & ~(P - 1);
+	const char *dir = getenv("TMPDIR");
+	char path[1024];
+	snprintf(path, sizeof path, "%s/oracle_errors.bounds.XXXXXX", dir ? dir : "/tmp");
+	const int fd = mkstemp(path);
+	if (fd < 0 || unlink(path) != 0 || ftruncate(fd, (off_t)size) != 0) {
+		printf("  no file of %llu bytes at %s\n", (unsigned long long)size, path);
+		exit(1);
+	}
+	void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
 	if (p == MAP_FAILED) {
-		printf("  mmap of %llu bytes failed\n", (unsigned long long)length);
+		printf("  mmap of %llu bytes failed\n", (unsigned long long)size);
 		exit(1);
 	}
 	return p;
@@ -190,7 +205,10 @@ static void bounds_say(const char *step, uint64_t length, id object, double t0)
 		printf(", length %lu", (unsigned long)[(id<MTLBuffer>)object length]);
 	else if ([object conformsToProtocol:@protocol(MTLHeap)])
 		printf(", size %lu", (unsigned long)[(id<MTLHeap>)object size]);
-	printf(" (%.1f ms)\n", oracle_now_ms() - t0);
+	struct rusage_info_v2 ri = {0};
+	proc_pid_rusage(getpid(), RUSAGE_INFO_V2, (rusage_info_t *)&ri);
+	printf(" (%.1f ms, footprint %llu)\n", oracle_now_ms() - t0,
+	       (unsigned long long)ri.ri_phys_footprint);
 }
 
 // A Private Placement heap of 1 MiB.
