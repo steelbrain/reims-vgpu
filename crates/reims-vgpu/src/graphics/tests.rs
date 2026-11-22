@@ -5970,6 +5970,14 @@ fn a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun() {
     ring.send(&device, long(101));
     complete(&mut ring, 101);
     assert_eq!(wakes().1, 1, "the begin woke no thread for the long buffer");
+    // Its completion can be posted before its job ends and its turn passes: sent before, the short
+    // buffer's turn would not be next, its commit would wait, and it would go to the lane. Once the
+    // lane's thread waits for a job again, the turn has passed.
+    assert!(
+        eventually(|| wakes().2 == 1),
+        "the lane's thread: {:?}",
+        wakes()
+    );
     ring.send(&device, sampler_command_buffer(obj(1, 1), 102, obj(1, 4)));
     complete(&mut ring, 102);
     assert_eq!(wakes().1, 1, "a short buffer woke a thread");
