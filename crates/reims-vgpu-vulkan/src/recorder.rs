@@ -5245,10 +5245,10 @@ mod tests {
     /// the stream and back: its map's `stageInput` holds each layout (`bufferIndex`, `stride`,
     /// `stepFunction`, `stepRate`), each attribute (`attributeIndex`, `format`, `offset`,
     /// `bufferIndex`), the `indexType` and the `indexBufferIndex`, each as given, none of them
-    /// Metal's default but the attribute's index, which the kernel names. rt refuses the
-    /// pipeline, with an error that names its code (`rt-refused-gap`), counted under it: the
-    /// kernel reads a stage input, which rt's compute encoder does not supply yet. The record
-    /// carries the descriptor all the same.
+    /// Metal's default but the attribute's index, which the kernel names. rt makes the pipeline,
+    /// with no refusal counted: a layout of a fixed stride stepped by the thread's position in X
+    /// (`MTLStepFunctionThreadPositionInGridX`, here at a rate of 2) is a form rt fetches by the
+    /// compute encoder's stage-in region.
     #[test]
     fn on_vulkan_a_compute_pipeline_record_carries_its_stage_input() {
         in_recording_child(
@@ -5289,9 +5289,10 @@ mod tests {
                 };
                 let refused = counted("rt-refused-gap");
                 let made = device.new_compute_pipeline_state_full(&desc);
-                let error = made.expect_err("rt refuses a kernel with stage input");
-                assert!(error.description.contains("(rt-refused-gap)"), "{error:?}");
-                assert_eq!(counted("rt-refused-gap") - refused, 1);
+                let made = made.map_err(|error| format!("{error:?}"));
+                let state = made.expect("rt makes a kernel whose stage input has a fixed stride");
+                let state = state.expect("a pipeline state");
+                assert_eq!(counted("rt-refused-gap"), refused);
                 let (calls, _) =
                     recorded(streams, |calls| calls.iter().any(|c| c.selector == MADE));
                 let made = (calls.iter())
@@ -5329,7 +5330,7 @@ mod tests {
                     ("indexBufferIndex", Value::Uint(2)),
                 ]);
                 assert_eq!(stage_input, Some(expected), "{made:?}");
-                drop((function, library));
+                drop((state, function, library));
             },
         );
     }

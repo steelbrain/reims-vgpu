@@ -11,7 +11,9 @@
 //!   (`super::pipeline`) go back only once no work recorded with it can read them.
 //! - **Attribute strides** (`setBufferOffset:attributeStride:atIndex:`,
 //!   `setBuffers:offsets:attributeStrides:withRange:`) bind as the calls without them: only a
-//!   kernel's `[[stage_in]]` reads a stride, and rt refuses such a kernel as its state is made.
+//!   kernel's `[[stage_in]]` read through a layout of `MTLBufferLayoutStrideDynamic` takes a
+//!   stride from the encoder, and rt refuses such a kernel as its state is made (`Gap::StageIn`,
+//!   kind `DynamicStride`).
 //! - **Barriers**: `memoryBarrierWithScope:` and `memoryBarrierWithResources:count:` are rt's one
 //!   global barrier, whatever the scope or the resources.
 //! - **Nothing to record**: `setImageblockWidth:height:` (rt makes no kernel that reads an
