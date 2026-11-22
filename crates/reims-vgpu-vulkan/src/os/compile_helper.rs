@@ -127,8 +127,8 @@ use crate::core::platform::os::{Clock, Deadline, MonoTime};
 use crate::core::sync::{Condvar, Mutex, MutexGuard};
 use crate::os::OsClock;
 
-/// The most memory a helper may hold on any host: 8 GiB.
-const MEMORY_MOST: u64 = 8 << 30;
+/// The most memory a helper may hold on any host: 3 GiB.
+const MEMORY_MOST: u64 = 3 << 30;
 
 /// The longest a helper may run: 10 minutes.
 const TIME_MOST: Duration = Duration::from_secs(10 * 60);
@@ -153,12 +153,12 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
-    /// The caps on this host: the smaller of 8 GiB and half the host's memory, and 10 minutes.
+    /// The caps on this host: the smaller of 3 GiB and half the host's memory, and 10 minutes.
     pub(crate) fn of_host() -> Limits {
         Limits::for_host_memory(host::host_memory())
     }
 
-    /// The caps on a host with `total` bytes of memory; 8 GiB where the OS does not say, as a cap
+    /// The caps on a host with `total` bytes of memory; 3 GiB where the OS does not say, as a cap
     /// of nothing would kill every helper, and record a breach for every stage it compiles.
     fn for_host_memory(total: Option<u64>) -> Limits {
         let half = total.map_or(MEMORY_MOST, |total| {

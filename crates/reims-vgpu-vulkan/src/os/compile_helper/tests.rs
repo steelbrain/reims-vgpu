@@ -621,21 +621,22 @@ fn a_helper_whose_program_is_missing_never_starts() {
     seats.remove_files();
 }
 
-/// The memory cap is the smaller of 8 GiB and half the host's memory, and 8 GiB where the OS does
+/// The memory cap is the smaller of 3 GiB and half the host's memory, and 3 GiB where the OS does
 /// not say; the time cap is 10 minutes.
 #[test]
-fn the_caps_are_the_smaller_of_8_gib_and_half_the_hosts_memory_and_10_minutes() {
+fn the_caps_are_the_smaller_of_3_gib_and_half_the_hosts_memory_and_10_minutes() {
     const GIB: u64 = 1 << 30;
     let memory = |total| Limits::for_host_memory(total).memory;
-    assert_eq!(memory(Some(12 * GIB)), 6 * GIB);
-    assert_eq!(memory(Some(16 * GIB)), 8 * GIB);
-    assert_eq!(memory(Some(64 * GIB)), 8 * GIB);
+    assert_eq!(memory(Some(4 * GIB)), 2 * GIB);
+    assert_eq!(memory(Some(6 * GIB)), 3 * GIB);
+    assert_eq!(memory(Some(12 * GIB)), 3 * GIB);
+    assert_eq!(memory(Some(64 * GIB)), 3 * GIB);
     assert_eq!(memory(None), MEMORY_MOST);
-    assert_eq!(MEMORY_MOST, 8 * GIB);
+    assert_eq!(MEMORY_MOST, 3 * GIB);
     assert_eq!(Limits::for_host_memory(None).time, Duration::from_secs(600));
     assert_eq!(TIME_MOST, Duration::from_secs(600));
     let host = Limits::of_host();
-    assert!((1..=8 * GIB).contains(&host.memory), "{host:?}");
+    assert!((1..=3 * GIB).contains(&host.memory), "{host:?}");
 }
 
 /// The footprints' reads keep the largest footprint, and the largest growth from one read to the
