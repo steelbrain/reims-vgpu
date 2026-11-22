@@ -68,15 +68,19 @@ repeats the ones code cites.
   - **Speed comes from what every run gets**: fewer and smaller pipelines,
     sharing, concurrency inside a wait. Nothing is loaded or ordered by what
     an earlier run drew, and no measurement starts from a cache seeded for
-    it. Two stores stand in for Metal's own caches across runs, as a Mac
+    it. Three stores stand in for Metal's own caches across runs, as a Mac
     keeps its compiled pipelines on disk: rt's shader and pipeline caches,
     in `reims-vgpu-rt` under the user's cache directory
     (`crates/reims-vgpu-vulkan/src/rt_platform/device.rs`, `CACHE`), across
-    a host's processes, and the device's kept pipeline answers
-    (`crates/reims-vgpu/src/graphics/answers.rs`), across boots. Each holds
-    only what the platform or the device gave before, under the identity of
-    what decides it, so it changes no value the guest reads, only how soon
-    the guest has it; neither is ever seeded for a measurement.
+    a host's processes; the device's kept pipeline answers
+    (`crates/reims-vgpu/src/graphics/answers.rs`), across boots; and, in
+    the guest, the GL shader variants the bundle lowered, in each app's own
+    cache directory beside Metal's (`guest/bundle/src/RgfxGLStore.hpp`),
+    across the app's runs, as Metal's compiler service keeps what it
+    compiled. Each holds only what the platform, the device or the
+    generator gave before, under the identity of what decides it, so it
+    changes no value the guest reads, only how soon the guest has it; none
+    is ever seeded for a measurement.
   - **A workaround for the OS or a driver** lives in the runtime's code that
     calls it, never in core or the library's threads: a compile the system
     runs at its caller's priority is raised by the runtime, not by raising

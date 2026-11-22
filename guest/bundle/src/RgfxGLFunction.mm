@@ -8,6 +8,17 @@
  * newArgumentEncoderWithBufferIndex: asserts, for buffer 0 of a shader that binds none, "bufferIndex
  * 0 does not identify an argument buffer". Each newFunctionWithPluginData:bitcodeType: makes a
  * new variant.
+ *
+ * A variant's lowering, and a tessellated draw's kernel's under each stage input descriptor, are
+ * kept across the app's runs (RgfxGLStore.hpp), as Metal's compiler service keeps what it
+ * compiled for an app, in the app's own cache directory beside Metal's:
+ * confstr(_CS_DARWIN_USER_CACHE_DIR), then the app's bundle identifier (its program's name where
+ * it has none), then ai.aneesiqbal.reims-graphics/gl. Metal keeps an app's libraries at the same
+ * place, in com.apple.metal (measured: macOS 26.7.2, a sandboxed agent's
+ * <cache>/com.apple.iconservicesagent/com.apple.iconservicesagent/com.apple.metal/32023/
+ * libraries.data, the sandbox's confstr already the app's own), so a sandboxed app writes there
+ * as Metal does for it. A variant the process asks for again is answered from its memory
+ * (RgfxGLMemo), with or without a store.
  */
 #import "RgfxGLFunction.h"
 #import "RgfxInterop.h"
@@ -15,14 +26,18 @@
 #import "RgfxUnsupported.h"
 
 #include "RgfxGLLowering.hpp"
+#include "RgfxGLStore.hpp"
 #include "RgfxLog.hpp"
 
 #import <objc/runtime.h>
 
 #include <CommonCrypto/CommonDigest.h>
+#include <climits>
+#include <cstdlib>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unistd.h>
 
 namespace {
 
@@ -47,6 +62,73 @@ void logOnce(const std::string &why)
 	logOnce("a GL shader variant was not made; answered nil", why);
 }
 
+// The bytes of entries an app's store keeps (RgfxGLStore.hpp): 64 MiB. Heaven, the heaviest GL
+// app measured, asks for 298 variants and 34 stage-in kernels over all its scenes, whose IR,
+// plugin data and lowered bytes take 9.5 MB (measured: macOS 26.7.2, an RTX 3090), so the cap
+// holds an app's variants at several settings, and an app's directory holds no more.
+constexpr uint64_t kStoreCap = 64ull << 20;
+
+// The bytes of keys and variants a process's memo holds (RgfxGLMemo): 32 MiB, over three times
+// Heaven's 9.5 MB.
+constexpr uint64_t kMemoCap = 32ull << 20;
+
+// What decides a lowering besides its inputs (RgfxGLLoweringIdentity), or empty where the
+// lowering cannot run.
+const std::string &loweringIdentity()
+{
+	static std::string identity;
+	static std::once_flag once;
+	std::call_once(once, [] {
+		std::string why;
+		if (!RgfxGLLoweringIdentity(identity, why))
+			identity.clear();
+	});
+	return identity;
+}
+
+// The app's store of lowered variants, or null where it has none: no libraries to lower with, or
+// no cache directory (said once).
+RgfxGLStore *store()
+{
+	static RgfxGLStore *kept = nullptr;
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const std::string &identity = loweringIdentity();
+		if (identity.empty())
+			return;
+		char cache[PATH_MAX];
+		const size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, cache, sizeof cache);
+		NSString *app = NSBundle.mainBundle.bundleIdentifier;
+		std::string name = app.length != 0 ? app.UTF8String : getprogname() != nullptr ? getprogname() : "";
+		if (n == 0 || n > sizeof cache || name.empty() || name.find('/') != std::string::npos || name[0] == '.') {
+			rgfxLogLine(@"RGFX: GL shader variants are lowered in each run: no cache directory for this app");
+			return;
+		}
+		std::string directory = cache;
+		if (!directory.empty() && directory.back() != '/')
+			directory += '/';
+		kept = new RgfxGLStore(directory + name + "/ai.aneesiqbal.reims-graphics/gl", kStoreCap, identity);
+	});
+	return kept;
+}
+
+// The process's memo of lowered variants (RgfxGLMemo).
+RgfxGLMemo *memo()
+{
+	static RgfxGLMemo *kept = new RgfxGLMemo(kMemoCap);
+	return kept;
+}
+
+// Logs the store's first failure, once a process.
+void logStoreFailure(RgfxGLStore *kept)
+{
+	std::string why;
+	if (kept != nullptr && kept->takeFirstFailure(why))
+		rgfxLogLine(@"RGFX: the store of lowered GL shader variants failed, and its variants are lowered where it "
+		            @"fails: %s",
+		            why.c_str());
+}
+
 } // namespace
 
 // A kernel variant's module text, which takes a patch control point input, and its kernels made
@@ -57,6 +139,7 @@ void logOnce(const std::string &why)
 @implementation RgfxGLStageInVariant {
 @public
 	std::string _text;
+	std::string _storeKey; // the variant's key in the store (RgfxGLVariantKey)
 	std::mutex _lock;
 	NSMutableDictionary<NSData *, id<MTLFunction>> *_kernels;
 }
@@ -99,7 +182,16 @@ BOOL RgfxGLStageInKernel(id<MTLFunction> function, MTLStageInputOutputDescriptor
 	if (made == nil) {
 		RgfxGLLowered lowered;
 		std::string why;
-		if (RgfxGLSpecializeStageIn(variant->_text, in, lowered, why)) {
+		RgfxGLStore *kept = store();
+		const bool keyed = !variant->_storeKey.empty();
+		const bool specialized = RgfxGLLowerKept(
+		    keyed ? kept : nullptr, keyed ? RgfxGLStageInKey(variant->_storeKey, k) : std::string(),
+		    [&](RgfxGLLowered &out, std::string &reason) {
+			    return RgfxGLSpecializeStageIn(variant->_text, in, out, reason);
+		    },
+		    lowered, why, nullptr, keyed ? memo() : nullptr);
+		logStoreFailure(kept);
+		if (specialized) {
 			dispatch_data_t data = dispatch_data_create(lowered.metallib.data(), lowered.metallib.size(), nullptr,
 			                                            DISPATCH_DATA_DESTRUCTOR_DEFAULT);
 			NSError *refusal = nil;
@@ -161,14 +253,26 @@ RGFX_LOG_UNRECOGNIZED
 
 - (id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(uint8_t)bitcodeType
 {
-	(void)bitcodeType;
 	const uint8_t *payload = nullptr;
 	size_t length = 0;
 	RgfxGLIRPayload(_rgfxIR.bytes, &payload, &length);
+	const uint8_t *plugin = static_cast<const uint8_t *>(pluginData.bytes);
+	const size_t pluginLength = pluginData.length;
 	RgfxGLLowered lowered;
 	std::string why;
-	if (!RgfxLowerGLIR(payload, length, static_cast<const uint8_t *>(pluginData.bytes), pluginData.length, lowered,
-	                   why)) {
+	RgfxGLStore *kept = store();
+	const std::string &identity = loweringIdentity();
+	const std::string key = !identity.empty() ? RgfxGLVariantKey(identity, payload, length, plugin, pluginLength,
+	                                                             bitcodeType, static_cast<uint64_t>(_functionType))
+	                                          : std::string();
+	const bool made = RgfxGLLowerKept(
+	    !key.empty() ? kept : nullptr, key,
+	    [&](RgfxGLLowered &out, std::string &reason) {
+		    return RgfxLowerGLIR(payload, length, plugin, pluginLength, out, reason);
+	    },
+	    lowered, why, nullptr, !key.empty() ? memo() : nullptr);
+	logStoreFailure(kept);
+	if (!made) {
 		logOnce(why);
 		return nil;
 	}
@@ -192,6 +296,7 @@ RGFX_LOG_UNRECOGNIZED
 	if (!lowered.stageInText.empty()) {
 		RgfxGLStageInVariant *stageIn = [RgfxGLStageInVariant new];
 		stageIn->_text = std::move(lowered.stageInText);
+		stageIn->_storeKey = key;
 		stageIn->_kernels = [NSMutableDictionary dictionary];
 		objc_setAssociatedObject(variant, &kStageInKey, stageIn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 	}

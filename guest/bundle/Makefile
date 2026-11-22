@@ -203,7 +203,7 @@ $(SER_TESTBIN): $(CORE_OBJ_ARCH) tests/serializer_tests.cpp tests/slab_tests.cpp
 SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm tests/archive_tests.mm \
 	tests/resource_tests.mm tests/queue_tests.mm \
 	tests/create_tests.mm tests/known_pipeline_tests.mm tests/icb_tests.mm tests/gl_tests.mm \
-	tests/cl_mode_tests.mm tests/residency_tests.mm
+	tests/gl_store_tests.mm tests/cl_mode_tests.mm tests/residency_tests.mm
 
 $(SHELL_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(HEADERS) $(TESTHEADERS) Makefile
 	@mkdir -p $(@D)

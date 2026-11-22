@@ -1,9 +1,11 @@
 #!/bin/bash
-# bundle_files_check.sh BUNDLE: that the bundle writes no file of its own. Every Metal process
-# loads it, sandboxed ones too, where a write outside the process's own paths is refused and
-# reported to the kernel's log: so the bundle's executable names no temporary directory and
-# imports none of open(2)'s family. What it writes is the app's own, through Foundation (a binary
-# archive at the app's URL); what it reports goes to os_log. Part of `make test`.
+# bundle_files_check.sh BUNDLE: that the bundle writes no file outside the app's own paths. Every
+# Metal process loads it, sandboxed ones too, where a write outside the process's own paths is
+# refused and reported to the kernel's log: so the bundle's executable names no temporary
+# directory and imports none of open(2)'s family. What it writes is the app's own, through
+# Foundation: a binary archive at the app's URL, and the GL shader variants it lowered, in the
+# app's own cache directory beside Metal's (src/RgfxGLStore.hpp); what it reports goes to os_log.
+# Part of `make test`.
 set -euo pipefail
 exe=$1
 [ -f "$exe" ] || exe=$1/Contents/MacOS/reims-graphics

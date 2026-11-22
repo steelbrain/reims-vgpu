@@ -22,7 +22,8 @@
 //     over kernels' text written here in the generator's shape, and on this Mac's GPU against its
 //     own [[stage_in]] kernels (tests/stage_in_oracle.metal), bit for bit, for every format;
 //   - a module's declarations put in the order of their names (src/RgfxGLLowering.*), so two
-//     orders make one text and, through the system's LLVM, one metallib.
+//     orders make one text and, through the system's LLVM, one metallib;
+//   - the store of lowered variants across an app's runs (src/RgfxGLStore.*): gl_store_tests.mm.
 // A variant is not lowered here: the GL code generator lowers the IR the renderer gives a device,
 // which only a GL context makes; tools/gl_probe.m, tools/gl_inject.mm and tools/gl_cases.m check
 // that on a device.
@@ -67,6 +68,7 @@ void drainRing(TestRing &ring); // shell_tests.mm
 @end
 
 void rgfxGLTests();
+void rgfxGLStoreTests(); // gl_store_tests.mm
 
 namespace {
 
@@ -1809,5 +1811,6 @@ void rgfxGLTests()
 		test_stage_in_specialized();
 		test_declarations_sorted();
 		test_stage_in_matches_metal();
+		rgfxGLStoreTests();
 	}
 }

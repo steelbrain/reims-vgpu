@@ -202,6 +202,22 @@ bool RgfxGLSpecializeStageInText(std::string &text, const RgfxGLStageIn &in, std
 bool RgfxGLSpecializeStageIn(const std::string &stageInText, const RgfxGLStageIn &in, RgfxGLLowered &out,
                              std::string &why);
 
+/// Everything outside a variant's IR and plugin data that its lowering reads, as text, for the
+/// key a lowered variant is kept under (RgfxGLStore.hpp), in `identity`:
+///   - the build of the image that holds this code (the bundle's LC_UUID, its slice's);
+///   - the GL code generator's and the system's LLVM's paths and LC_UUIDs (the libraries
+///     RgfxLowerGLIR calls);
+///   - the OS's build (kern.osversion): the generator's own libraries (libGLVMPlugin) and its
+///     builtins, which it reads from AppleMetalOpenGLRenderer.bundle's GLDBuiltins.bc, are the
+///     sealed system volume's, which changes only with the build; and the builtins file's size
+///     and modification time besides;
+///   - the environment variables the generator names (GLDPLUGIN_OPT, GLR_ABORT_ON_UNSUPPORTED,
+///     GLR_BREAK_ON_UNSUPPORTED), each value or its absence.
+/// The lowering takes no device: what the device answered the renderer reaches the generator
+/// only through the plugin data. Computed once per process, which loads the libraries; false,
+/// with `why`, where they are not there.
+bool RgfxGLLoweringIdentity(std::string &identity, std::string &why);
+
 /// The GL IR a renderer's pointer holds: the u32 length at `ir`, then that many bytes. Writes the
 /// bytes' start and their length; false where `ir` is null.
 bool RgfxGLIRPayload(const void *ir, const uint8_t **payload, size_t *length);

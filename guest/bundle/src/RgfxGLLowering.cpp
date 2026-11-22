@@ -4,6 +4,9 @@
 #include "RgfxGLLowering.hpp"
 
 #include <dlfcn.h>
+#include <mach-o/loader.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -20,6 +23,7 @@ namespace {
 
 constexpr char kCompilerVersions[] = "/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/";
 constexpr char kPlugins[] = "/System/Library/Extensions/AppleMetalOpenGLRenderer.bundle/Contents/PlugIns/";
+constexpr char kBuiltins[] = "/System/Library/Extensions/AppleMetalOpenGLRenderer.bundle/Contents/Resources/GLDBuiltins.bc";
 // The version where GPUCompiler.framework's Current names none (measured: macOS 26.6.1, 26.7.1 and
 // 27.0.1 all ship 32023).
 constexpr char kDefaultVersion[] = "32023";
@@ -62,6 +66,7 @@ struct Libraries {
 	Ref (*bufferCopy)(const char *data, size_t length, const char *name) = nullptr;
 	int (*parseIR)(Ref context, Ref buffer, Ref *module, char **message) = nullptr;
 	GenerateFn generate = nullptr;
+	std::string llvmPath, pluginPath;
 };
 
 std::string compilerVersion()
@@ -90,8 +95,9 @@ Libraries &libraries()
 	static std::once_flag once;
 	std::call_once(once, [] {
 		const std::string version = compilerVersion();
-		const std::string llvmPath = std::string(kCompilerVersions) + version + "/Libraries/libLLVM.dylib";
-		const std::string pluginPath = std::string(kPlugins) + "libGLDPlugin" + version + ".dylib";
+		const std::string llvmPath = libs.llvmPath =
+		    std::string(kCompilerVersions) + version + "/Libraries/libLLVM.dylib";
+		const std::string pluginPath = libs.pluginPath = std::string(kPlugins) + "libGLDPlugin" + version + ".dylib";
 		void *llvm = dlopen(llvmPath.c_str(), RTLD_NOW | RTLD_LOCAL);
 		if (llvm == nullptr) {
 			libs.why = "no " + llvmPath;
@@ -1745,6 +1751,72 @@ bool RgfxGLSpecializeStageIn(const std::string &stageInText, const RgfxGLStageIn
 		l.disposeModule(module);
 	l.contextDispose(context);
 	return ok;
+}
+
+namespace {
+
+// The LC_UUID of the image that holds `address`, in hex; "none" where it has none.
+std::string imageUUID(const void *address)
+{
+	Dl_info info;
+	if (address == nullptr || dladdr(address, &info) == 0 || info.dli_fbase == nullptr)
+		return "none";
+	const auto *header = static_cast<const mach_header_64 *>(info.dli_fbase);
+	if (header->magic != MH_MAGIC_64)
+		return "none";
+	const uint8_t *p = reinterpret_cast<const uint8_t *>(header + 1);
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		load_command command;
+		std::memcpy(&command, p, sizeof command);
+		if (command.cmd == LC_UUID) {
+			uuid_command u;
+			std::memcpy(&u, p, sizeof u);
+			static const char kHex[] = "0123456789abcdef";
+			std::string out;
+			for (uint8_t b : u.uuid) {
+				out.push_back(kHex[b >> 4]);
+				out.push_back(kHex[b & 15]);
+			}
+			return out;
+		}
+		p += command.cmdsize;
+	}
+	return "none";
+}
+
+} // namespace
+
+bool RgfxGLLoweringIdentity(std::string &identity, std::string &why)
+{
+	static std::string text;
+	static std::once_flag once;
+	Libraries &l = libraries();
+	if (!l.loaded) {
+		why = l.why;
+		return false;
+	}
+	std::call_once(once, [&l] {
+		text = "bundle " + imageUUID(reinterpret_cast<const void *>(&RgfxLowerGLIR)) + "\n";
+		text += "generator " + l.pluginPath + " " + imageUUID(reinterpret_cast<const void *>(l.generate)) + "\n";
+		text += "llvm " + l.llvmPath + " " + imageUUID(reinterpret_cast<const void *>(l.contextCreate)) + "\n";
+		char build[64] = {};
+		size_t length = sizeof build - 1;
+		text += std::string("os ") + (sysctlbyname("kern.osversion", build, &length, nullptr, 0) == 0 ? build : "?") +
+		        "\n";
+		struct stat st;
+		text += std::string("builtins ") + kBuiltins +
+		        (stat(kBuiltins, &st) == 0 ? " " + std::to_string(st.st_size) + " " +
+		                                         std::to_string(st.st_mtimespec.tv_sec) + "." +
+		                                         std::to_string(st.st_mtimespec.tv_nsec)
+		                               : std::string(" none")) +
+		        "\n";
+		for (const char *name : {"GLDPLUGIN_OPT", "GLR_ABORT_ON_UNSUPPORTED", "GLR_BREAK_ON_UNSUPPORTED"}) {
+			const char *v = getenv(name);
+			text += std::string("env ") + name + (v != nullptr ? "=" + std::string(v) : std::string(" unset")) + "\n";
+		}
+	});
+	identity = text;
+	return true;
 }
 
 bool RgfxGLIRPayload(const void *ir, const uint8_t **payload, size_t *length)
