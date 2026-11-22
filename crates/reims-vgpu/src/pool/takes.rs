@@ -28,8 +28,10 @@
 //! ([`super::TAKE_WAIT_CODES`]): behind its context's earlier takes (its worker's start among
 //! them), for a piece of its own, and its worker's zeroing, which for a piece of its own runs
 //! while the host maps it and is left out of the wait for the piece; the whole wait apart, as the
-//! three leave out the waits for the pool's lock. Each is counted in nanoseconds in all and at its
-//! longest, and a take whose whole wait is the longest yet is logged with its three.
+//! three leave out the waits for the pool's lock; and, of the wait for a piece, the source's take
+//! of its block. Each is counted in nanoseconds in all and at its longest, and a take whose whole
+//! wait is the longest yet is logged with its parts. Where the trace is on, each answered take
+//! is an event of it, `pooltake`, with its parts.
 //!
 //! # Zeros ahead
 //!
@@ -106,6 +108,7 @@ use std::time::Duration;
 
 use parking_lot::MutexGuard;
 use reims_vgpu_vulkan::answer::count_kind_by;
+use reims_vgpu_vulkan::core::trace;
 
 use super::{
     Error, Live, Mapped, MemoryClass, MonoTime, Own, OwnTake, Piece, PieceKeep, Placed, Shared,
@@ -241,16 +244,17 @@ static TAKE_CLAIM_WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
 /// The longest of each of [`TAKE_WAIT_CODES`]' waits so far, in nanoseconds, which their
 /// `-max-ns` codes' counts rise to.
-static TAKE_WAIT_MAX_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static TAKE_WAIT_MAX_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Counts an answered take's wait ([`TAKE_WAIT_CODES`]): its whole, then behind its context's
-/// earlier takes, for a piece of its own and zeroing; the take itself last
-/// ([`TAKE_WAITS_CODE`]), once its waits are counted. Logs the take, `len` bytes of context
-/// `context`'s, where its whole wait is the longest yet.
-fn count_wait(context: u32, len: u64, waits: [Duration; 4]) {
+/// earlier takes, for a piece of its own, zeroing, and of the wait for a piece the source's take;
+/// the take itself last ([`TAKE_WAITS_CODE`]), once its waits are counted. Logs the take, `len`
+/// bytes of context `context`'s, where its whole wait is the longest yet, and writes it to the
+/// trace where that is on.
+fn count_wait(context: u32, len: u64, waits: [Duration; 5]) {
+    let ns = waits.map(|wait| u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX));
     let mut longest = false;
-    for (i, wait) in waits.iter().enumerate() {
-        let ns = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+    for (i, &ns) in ns.iter().enumerate() {
         let (all, max) = TAKE_WAIT_CODES[i];
         count_kind_by(all, ns);
         let was = TAKE_WAIT_MAX_NS[i].fetch_max(ns, Ordering::Relaxed);
@@ -259,15 +263,24 @@ fn count_wait(context: u32, len: u64, waits: [Duration; 4]) {
             longest |= i == 0;
         }
     }
+    // pooltake: the context, the take's length, then its whole wait, behind its context's
+    // earlier takes, for a piece of its own, zeroing, and of the wait for a piece the source's
+    // take, in nanoseconds
+    trace::event(
+        "pooltake",
+        &[u64::from(context), len, ns[0], ns[1], ns[2], ns[3], ns[4]],
+    );
     if longest {
         let ms = |i: usize| waits[i].as_secs_f64() * 1000.0;
         log::info!(
             "pool: context {context}'s take of {} KiB waited {:.2} ms, the longest yet: {:.2} ms \
-             behind its earlier takes, {:.2} ms for a piece, {:.2} ms zeroing",
+             behind its earlier takes, {:.2} ms for a piece ({:.2} ms of it the source's take), \
+             {:.2} ms zeroing",
             len >> 10,
             ms(0),
             ms(1),
             ms(2),
+            ms(4),
             ms(3)
         );
     }
@@ -340,9 +353,9 @@ pub(super) struct Taker {
 /// What came of a carve that waited for the pool to grow.
 enum Grown {
     /// Carved at this address, under this number; how long the take waited for a piece of its
-    /// own where it asked for one; and how long its worker zeroed it for, where it zeroed it
-    /// while the host mapped the piece.
-    At(u64, u64, Option<Duration>, Option<Duration>),
+    /// own where it asked for one; how long its worker zeroed it for, where it zeroed it while
+    /// the host mapped the piece; and how long the source's takes of its blocks took.
+    At(u64, u64, Option<Duration>, Option<Duration>, Duration),
     /// The pool has no room for it.
     NoRoom,
     /// The take ended unanswered: its context closed, the device was reset or released.
@@ -961,12 +974,14 @@ impl Shared {
             };
             let started = (self.now)();
             let carved = match job.carved {
-                Some(carved) => Grown::At(carved.0, carved.1, None, None),
+                Some(carved) => Grown::At(carved.0, carved.1, None, None, Duration::ZERO),
                 None => self.carve_grown(&mut st, context, job.life, job.len),
             };
             let grown = (self.now)().saturating_duration_since(started);
-            let (at, serial, waited, zeroed) = match carved {
-                Grown::At(at, serial, waited, zeroed) => (at, serial, waited, zeroed),
+            let (at, serial, waited, zeroed, sourced) = match carved {
+                Grown::At(at, serial, waited, zeroed, sourced) => {
+                    (at, serial, waited, zeroed, sourced)
+                }
                 Grown::NoRoom => {
                     MutexGuard::unlocked(&mut st, || {
                         log::warn!(
@@ -1005,7 +1020,7 @@ impl Shared {
                     let whole = (self.now)().saturating_duration_since(job.asked);
                     let queued = started.saturating_duration_since(job.asked);
                     (job.answer)(Some(taken));
-                    count_wait(context, job.len, [whole, queued, grown, zeroed]);
+                    count_wait(context, job.len, [whole, queued, grown, zeroed, sourced]);
                     // Each wait for a piece, in every boot's log: the first line, then a count.
                     if let Some(waited) = waited {
                         log::info!(
@@ -1060,6 +1075,7 @@ impl Shared {
         len: u64,
     ) -> Grown {
         let mut asked: Option<MonoTime> = None;
+        let mut sourced = Duration::ZERO;
         loop {
             if !st.stands(context, life) {
                 return Grown::Stale;
@@ -1068,7 +1084,7 @@ impl Shared {
                 // The carve may have asked the pool's thread for a block, as headroom.
                 self.wake();
                 let waited = asked.map(|since| (self.now)().saturating_duration_since(since));
-                return Grown::At(at, serial, waited, None);
+                return Grown::At(at, serial, waited, None, sourced);
             }
             if st.spot(len) == Err(true) {
                 let since = (self.now)();
@@ -1086,7 +1102,9 @@ impl Shared {
             let Some(source) = st.source.clone() else {
                 return Grown::Stale;
             };
+            let taking = (self.now)();
             let block = MutexGuard::unlocked(st, || source.take_block(MemoryClass::Shared, len));
+            sourced = sourced.saturating_add((self.now)().saturating_duration_since(taking));
             let block = match block {
                 Ok(block) => block,
                 Err(e) => {
@@ -1144,7 +1162,7 @@ impl Shared {
                             let all = (self.now)().saturating_duration_since(since);
                             all.saturating_sub(zeroed)
                         });
-                        return Grown::At(piece, serial, waited, Some(zeroed));
+                        return Grown::At(piece, serial, waited, Some(zeroed), sourced);
                     }
                     // Its take ended, or the host took the piece out unmapped: the carve goes,
                     // and a take that stands carves again.

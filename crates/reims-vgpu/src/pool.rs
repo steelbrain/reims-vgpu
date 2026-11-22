@@ -182,12 +182,18 @@ pub const TAKE_WAITS_CODE: &str = "pool-take-waits";
 /// The codes of the answered takes' waits, from each take's carry-out to its answer (`takes`):
 /// the whole wait, then its parts behind the context's earlier takes, for a piece of the take's
 /// own, and the take worker's zeroing, which for a piece of its own runs while the host maps the
-/// piece and is left out of the wait for it; each the nanoseconds in all, then the longest.
-pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
+/// piece and is left out of the wait for it; then, of the wait for a piece, the source's takes of
+/// its blocks ([`BlockSource::take_block`]), the rest being their place and the host's map; each
+/// the nanoseconds in all, then the longest.
+pub const TAKE_WAIT_CODES: [(&str, &str); 5] = [
     ("pool-take-wait-ns", "pool-take-wait-max-ns"),
     ("pool-take-wait-queue-ns", "pool-take-wait-queue-max-ns"),
     ("pool-take-wait-growth-ns", "pool-take-wait-growth-max-ns"),
     ("pool-take-wait-zero-ns", "pool-take-wait-zero-max-ns"),
+    (
+        "pool-take-wait-growth-source-ns",
+        "pool-take-wait-growth-source-max-ns",
+    ),
 ];
 
 /// The length of each piece the pool asks for as headroom (the module doc's "Headroom and giving

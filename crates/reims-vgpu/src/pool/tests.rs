@@ -1217,7 +1217,8 @@ fn a_take_only_the_claimed_chunk_keeps_out_waits_for_its_write_and_asks_no_piece
 /// An answered take's wait is counted by its cause ([`TAKE_WAIT_CODES`]), the take counted once
 /// its waits are: a take that fits no piece waits for one of its own, which the host maps 50 ms
 /// after its ask, and that wait, but for the zeroing its worker does meanwhile, is its growth
-/// part's and at most the longest's; its parts lie within its whole wait
+/// part's and at most the longest's; its parts lie within its whole wait, and the source's take
+/// of its block within its growth part
 #[test]
 fn a_takes_wait_is_counted_by_its_cause() {
     let codes = || {
@@ -1228,6 +1229,7 @@ fn a_takes_wait_is_counted_by_its_cause() {
             TAKE_WAIT_CODES[2].0,
             TAKE_WAIT_CODES[3].0,
             TAKE_WAIT_CODES[2].1,
+            TAKE_WAIT_CODES[4].0,
         ]
         .map(counted)
     };
@@ -1260,6 +1262,12 @@ fn a_takes_wait_is_counted_by_its_cause() {
     assert!(
         grew(2) + grew(3) + grew(4) <= grew(1),
         "the parts within the whole"
+    );
+    assert!(
+        grew(6) > 0 && grew(6) <= grew(3),
+        "the source's take within the growth: {} of {} ns",
+        grew(6),
+        grew(3)
     );
 }
 
