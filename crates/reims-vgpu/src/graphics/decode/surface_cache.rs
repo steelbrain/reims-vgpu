@@ -997,8 +997,8 @@ impl<P: Platform> SurfaceCache<P> {
     /// memory, its pages are a view or are copied through pieces of `piece` bytes, it keeps the
     /// pages' layout with no wide home, no texture lies over the buffer as a rule
     /// ([`Self::raw`]; a cache the host's video writes itself is raw for its decodes, which
-    /// make its memory and have it take the pages first, [`Caches::before`]), and each shape's rows
-    /// cross a piece's end only between texels.
+    /// make its memory and have it take the pages first, [`Caches::before_answering`]), and each
+    /// shape's rows cross a piece's end only between texels.
     fn fills_straight(&self, piece: u64) -> bool {
         if self.device.memory_made()
             || (self.raw && !self.surface.written_outside())
