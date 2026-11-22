@@ -1432,7 +1432,7 @@ impl<P: Platform> VaPicture<P> {
     /// (the VA crate's `Frame::write_to_guest_telling`), calling `decoded` once the decode is
     /// done and the runs are issued behind it: `None` once it is there, or why it was not
     /// written, nothing written. `Err` where the decode or a run failed or ran past its deadline
-    /// ([`stopped`] says which): no copy may race the GPU's write, so the picture fails.
+    /// ([`work_ended`] says which): no copy may race the GPU's write, so the picture fails.
     fn write_in_place(
         &self,
         layout: &SurfaceLayout,

@@ -230,7 +230,8 @@ impl HostPicture<P> for Picture {
                 let since = KeptMark::here();
                 if let Some(done) = kept {
                     let runtime = StdRuntime::shared();
-                    Lingering::process(&runtime).keep("a test's stalled write", Box::new(Stuck(done)));
+                    Lingering::process(&runtime)
+                        .keep("a test's stalled write", Box::new(Stuck(done)));
                 }
                 let failed = "the hardware's write ran past its deadline".into();
                 Err(to.failed_in_caches(&[to.luma], Failed::Stalled(since), failed))
@@ -673,6 +674,8 @@ impl InCache {
             offset: 0,
             bytes_per_row: 128,
             rows: 64,
+            clear: None,
+            zeros: false,
         });
         (self.s)
             .decode(&decode(&self.bitstream, &[], (luma, chroma)))
@@ -764,7 +767,10 @@ fn a_stalled_landing_whose_kept_work_is_not_let_go_ends_the_process() {
     let lingering = Lingering::process(&runtime);
     let error: BackendError = "the hardware's write ran past its deadline".into();
     let before = Arc::new(AtomicBool::new(false));
-    lingering.keep("a test's work kept before", Box::new(Stuck(Arc::clone(&before))));
+    lingering.keep(
+        "a test's work kept before",
+        Box::new(Stuck(Arc::clone(&before))),
+    );
     let since = KeptMark::here();
     let elsewhere = Arc::new(AtomicBool::new(false));
     let kept = Arc::clone(&elsewhere);
@@ -780,13 +786,19 @@ fn a_stalled_landing_whose_kept_work_is_not_let_go_ends_the_process() {
         "nothing this thread kept since the mark"
     );
     let stuck = Arc::new(AtomicBool::new(false));
-    lingering.keep("a test's stalled write", Box::new(Stuck(Arc::clone(&stuck))));
+    lingering.keep(
+        "a test's stalled write",
+        Box::new(Stuck(Arc::clone(&stuck))),
+    );
     let started = runtime.now();
     assert_eq!(
         catch_death(|| hold_while_kept(&*runtime, since, within, &error)),
         Err(decode_fault("").site())
     );
-    assert!(runtime.elapsed_since(started) >= within, "held to its bound");
+    assert!(
+        runtime.elapsed_since(started) >= within,
+        "held to its bound"
+    );
     for done in [&before, &elsewhere, &stuck] {
         done.store(true, Ordering::SeqCst);
     }
