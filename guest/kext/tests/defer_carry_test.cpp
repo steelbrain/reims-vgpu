@@ -41,7 +41,11 @@ void lists()
 	      "page 5, a run of its own");
 	check(!rgfxResidentAdd(r, 3 * kPage, kPage) && r.count == 2,
 	      "a page before the last listed is refused, the list unchanged");
-	check(!rgfxResidentAdd(r, 6 * kPage, 0) && r.count == 2, "a page of no bytes is refused");
+	check(!rgfxResidentAdd(r, 6 * kPage, 0) && r.count == 2,
+	      "a page of no bytes is refused, before the runs are counted in pages");
+	RgfxSurfaceResident none = {};
+	check(!rgfxResidentAdd(none, 0, 0) && none.count == 0,
+	      "so is the first page of a list, with no bytes");
 	check(rgfxResidentPages(r, kLength, kPage) == 3, "three pages listed");
 
 	RgfxSurfaceResident full = {};

@@ -47,16 +47,19 @@ struct RgfxSurfaceResident {
 };
 
 // Adds the resident page at `offset` of `page` bytes to `r`, past the pages before it, merged
-// with the run it follows: false, `r` unchanged, where it would take `r` past kRgfxCarryPagesMost
-// pages, or it does not follow them.
+// with the run it follows: false, `r` unchanged, for a page of no bytes, where it would take `r`
+// past kRgfxCarryPagesMost pages, or where it does not follow them. The page of no bytes is
+// refused before the runs are counted in pages, which divides by it.
 inline bool rgfxResidentAdd(RgfxSurfaceResident &r, uint64_t offset, uint64_t page)
 {
+	if (page == 0)
+		return false;
 	uint64_t pages = 0, end = 0;
 	for (uint32_t i = 0; i < r.count; i++) {
 		pages += r.runs[i].length / page;
 		end = r.runs[i].offset + r.runs[i].length;
 	}
-	if (page == 0 || pages >= kRgfxCarryPagesMost || (r.count != 0 && offset < end))
+	if (pages >= kRgfxCarryPagesMost || (r.count != 0 && offset < end))
 		return false;
 	if (r.count != 0 && offset == end) {
 		r.runs[r.count - 1].length += page;
