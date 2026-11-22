@@ -496,7 +496,9 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   process's releases (`reims-vgpu.graphics-closes-<i>`), staged copies of surfaces' caches into
   their pages (`reims-vgpu.graphics-into-pages-<i>`), the video caches' spare surfaces made
   ahead on Windows (`reims-vgpu.graphics-drawn-spares-<i>`), video
-  (`reims-vgpu.graphics-video-<i>`) and event waits (`reims-vgpu.graphics-event-waits`). How
+  (`reims-vgpu.graphics-video-<i>`) and event waits (`reims-vgpu.graphics-event-waits`), and
+  the thread a decoder's state is let go of on where the walk of its tables at the device's loss
+  held it last (`reims-vgpu.graphics-tables-let-go`, `graphics::decode`'s `TableWalk::each`). How
   long a pool keeps an idle thread is `reims-vgpu-graphics`'s `keep`. The guest's Shared pool
   has two threads of its own (15.1): its taker (`reims-vgpu.graphics-pool-ahead`), which takes
   the blocks of its own asks for more pool, and its thread (`reims-vgpu.graphics-pool`), which

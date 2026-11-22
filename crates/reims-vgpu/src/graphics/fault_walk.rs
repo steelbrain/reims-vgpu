@@ -2,8 +2,10 @@
 //! at its loss to place the driver's fault addresses among their live objects
 //! (`reims_vgpu_vulkan::rt_platform::fault`'s docs). The walk keeps no record before the loss: it
 //! reads the tables as they are then, waiting `fault::BOUND` in all at most for their locks, and
-//! names the contexts whose tables it did not have in time. A device of another platform is told
-//! nothing.
+//! names the contexts whose tables it did not have in time. Where the decoder goes during the
+//! walk, so the walk holds its state last, the state is let go of on a thread of its own, not on
+//! the walk's, which may be rt's completion thread (`decode::TableWalk::each`). A device of
+//! another platform is told nothing.
 //!
 //! As a table stores a buffer, texture or heap, the object is told the guest's id for it
 //! ([`name`]), which the device's history of released ranges and its lines of the command buffers

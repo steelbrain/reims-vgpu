@@ -865,6 +865,14 @@ pub(crate) type EachTableObject<'a, P> = dyn for<'o> FnMut(u32, u64, bool, Table
 /// A decoder's tables, held weakly, for the walk at its device's loss (`super::fault_walk`).
 pub(crate) struct TableWalk<P: Platform>(Weak<Shared<P>>);
 
+/// The thread a decoder's state is let go of on where the walk at its device's loss held it last
+/// ([`TableWalk::each`]).
+pub(crate) const TABLES_LET_GO: &str = "reims-vgpu.graphics-tables-let-go";
+
+/// That thread's stack: a std thread's, as the decoder's workers have, which let go of the same
+/// objects.
+const TABLES_LET_GO_STACK: usize = 2 << 20;
+
 impl<P: Platform> TableWalk<P> {
     /// Whether the decoder's state is still there.
     pub(crate) fn is_live(&self) -> bool {
@@ -876,6 +884,13 @@ impl<P: Platform> TableWalk<P> {
     /// `bound` at most in all for the locks: the map of contexts, held through the walk, so no
     /// context is let go of here, and each table's. Answers the contexts walked, those whose
     /// table was not had in time, and whether the map was not.
+    ///
+    /// The walk holds the decoder's state from its start to its end. Where the decoder went
+    /// meanwhile, so the walk's hold is the last, the state is let go of on a thread of its own
+    /// ([`TABLES_LET_GO`]), not on the walk's: that is the thread that reads a lost device's
+    /// first failed command buffer, rt's completion thread among them, and a drop of the
+    /// decoder's objects there that waited for a command buffer's completion would hang it. A
+    /// refused thread ends the process, as the platform's threads do.
     pub(crate) fn each(
         &self,
         bound: std::time::Duration,
@@ -884,6 +899,26 @@ impl<P: Platform> TableWalk<P> {
         let Some(shared) = self.0.upgrade() else {
             return (0, Vec::new(), false);
         };
+        let walked = Self::each_of(&shared, bound, f);
+        if let Some(last) = Arc::into_inner(shared) {
+            let threads = last.platform.threads().handle();
+            reims_vgpu_vulkan::core::rt::spawn_named(
+                &*threads,
+                TABLES_LET_GO,
+                TABLES_LET_GO_STACK,
+                Box::new(last),
+                || {},
+            );
+        }
+        walked
+    }
+
+    /// [`Self::each`]'s walk of `shared`.
+    fn each_of(
+        shared: &Shared<P>,
+        bound: std::time::Duration,
+        f: &mut EachTableObject<'_, P>,
+    ) -> (usize, Vec<u32>, bool) {
         let clock = shared.platform.clock();
         let start = clock.now_mono().as_nanos();
         let left = || {
@@ -14346,5 +14381,75 @@ lacks {part}"
             (r[2].status, r[2].kind),
             (RGFX_PIPELINE_REFUSED, RGFX_PIPELINE_KIND_RENDER)
         );
+    }
+
+    /// The walk of a decoder's tables at its device's loss lets go of the decoder's state, where
+    /// the decoder went during the walk and its hold is the last, on a thread of its own, not on
+    /// the walk's (rt's completion thread at a loss); where the decoder is still there, the walk
+    /// lets go of nothing and starts no thread
+    #[test]
+    fn a_loss_walk_holding_a_decoder_s_state_last_lets_it_go_off_its_own_thread() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        /// Sends the name of the thread it is dropped on.
+        struct Tell(mpsc::Sender<Option<String>>);
+        impl Drop for Tell {
+            fn drop(&mut self) {
+                let _ = self
+                    .0
+                    .send(std::thread::current().name().map(str::to_owned));
+            }
+        }
+
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 1,
+            gpu_address: 0x4_0000,
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        dec.end_message();
+        // The state's drop drops the hook, which tells the thread it was dropped on.
+        let (tx, rx) = mpsc::channel();
+        let tell = Tell(tx);
+        dec.set_walk_hook(Some(Arc::new(move |_: usize| {
+            let _ = &tell;
+        })));
+        let walk = dec.table_walk();
+        let spawned = |p: &FakePlatform| {
+            (p.fake_threads().spawned().into_iter())
+                .filter(|&(name, _)| name == TABLES_LET_GO)
+                .count()
+        };
+
+        // The decoder outlives the walk: nothing is let go of, and no thread started.
+        let mut seen = 0;
+        let walked = walk.each(Duration::from_secs(5), &mut |_, _, _, _| seen += 1);
+        assert_eq!((walked, seen), ((1, Vec::new(), false), 1));
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(spawned(&p), 0);
+
+        // The decoder goes during the walk: the walk's hold is the last, and the state goes on
+        // the let-go thread once the walk is done.
+        let mut held = Some(dec);
+        let walked = walk.each(Duration::from_secs(5), &mut |_, _, _, _| drop(held.take()));
+        assert_eq!(walked, (1, Vec::new(), false));
+        assert!(held.is_none());
+        let on = rx.recv_timeout(Duration::from_secs(10));
+        assert_eq!(on, Ok(Some(TABLES_LET_GO.to_owned())));
+        assert_eq!(spawned(&p), 1);
+        assert!(!walk.is_live());
     }
 }
