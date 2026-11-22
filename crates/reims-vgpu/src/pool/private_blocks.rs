@@ -1149,10 +1149,6 @@ mod tests {
     /// context's worker, a take longer than rt's unit among them; a block goes back to rt at its
     /// free, and the device's release lets every worker go.
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
-    )]
     fn on_vulkan_rt_a_private_take_is_an_rt_block_answered_on_its_worker() {
         use crate::platform::ApiPlatform as _;
         let platform = crate::rt_test_end::platform();

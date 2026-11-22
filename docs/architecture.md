@@ -891,9 +891,10 @@ line is the point of the test (14).
 
 The Vulkan crate's tests run its platform on an rt device of the host's GPU, strict
 (`answer::strict`): the platform's tests on the device the platform picks (`device_choice`), and
-the seam's on the one `seam::test_device` makes. The seam's tests and those of the pool's rt
-blocks (`reims-vgpu`'s `pool/rt_blocks.rs` and `pool/private_blocks.rs`) are ignored on macOS,
-since rt's floor refuses MoltenVK. No test reads answers recorded from Metal.
+the seam's on the one `seam::test_device` makes on the platform's instance. On a Mac both are
+over Mesa's KosmicKrisp (`os/macos/rt_driver.rs`), which `cargo xtask check` links in `../lib`
+of each test binary's directory, as rt's floor refuses MoltenVK. No test reads answers recorded
+from Metal.
 
 ### 13.5 The C API's harness
 

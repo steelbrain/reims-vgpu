@@ -1,8 +1,8 @@
 //! [`RtBlocks`], the pool's [`BlockSource`] over metal2vulkan-runtime's blocks
 //! (`Device::take_block` and `release_block`), the runtime the device runs on from the cutover: the
 //! source of the guest's Shared pool and of its contexts' Private blocks on the rt platform
-//! (`ApiPlatform::block_source`). Its tests run it on the GPU each test host holds, but on the
-//! Mac, whose Vulkan, MoltenVK, rt's floor refuses.
+//! (`ApiPlatform::block_source`). Its tests run it on the GPU each test host holds, on a Mac over
+//! Mesa's KosmicKrisp, as the platform does there.
 //!
 //! rt hands out a `Block` handle and takes a block back by its handle, and the pool names a block
 //! by its number ([`BlockId`]). The source keeps each handle it hands out by its number, the
@@ -180,10 +180,6 @@ mod tests {
     /// take until its release, Shared and Private alike. A long block given back is taken again
     /// by the next take of its length, under a new number.
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
-    )]
     fn on_vulkan_rt_blocks_give_a_block_back_by_its_number() {
         let platform = crate::rt_test_end::platform();
         let device = platform.metal_device(None).expect("rt's device on the GPU");
@@ -248,10 +244,6 @@ mod tests {
     /// device down on its own thread: it returns after the source's drop, rt's gauges of the
     /// device at zero.
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "MoltenVK: rt's floor refuses it (no nullDescriptor), and these have not run on KosmicKrisp, which the M3 Max lacks; ledger: rt on the Mac"
-    )]
     fn on_vulkan_rt_the_let_go_of_the_device_waits_for_its_block_source() {
         const HELD: Duration = Duration::from_millis(300);
         let platform = crate::rt_test_end::platform();

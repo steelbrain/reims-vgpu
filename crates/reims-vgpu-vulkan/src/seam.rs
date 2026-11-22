@@ -1,7 +1,7 @@
 //! Our side of metal2vulkan-runtime's seam: what the Vulkan platform gives rt, built on rt at the
-//! commit the workspace pins. Its tests run it on the GPU each test host holds, but on the Mac:
-//! rt's floor refuses MoltenVK (it lacks `nullDescriptor`), and the tests have not run on
-//! KosmicKrisp.
+//! commit the workspace pins. Its tests run it on the GPU each test host holds, on the platform's
+//! instance: on a Mac over Mesa's KosmicKrisp (`os/macos/rt_driver.rs`), as rt's floor refuses
+//! MoltenVK, the driver the system's loader finds there.
 //!
 //! - **Sampler IDs** ([`sampler_ids`]): rt's creation of a pipeline state takes one sampler ID
 //!   for each sampler the state numbers, each constexpr sampler's an index of a live grant.
@@ -24,20 +24,22 @@ pub use testkit::test_device;
 
 #[cfg(any(test, feature = "testkit"))]
 mod testkit {
-    use metal2vulkan_runtime::{Device, DeviceOptions, Instance, PhysicalDevice};
+    use metal2vulkan_runtime::{Device, DeviceOptions, PhysicalDevice};
 
     /// The variables that name the host's pick of GPU, in the order they are read, as the
     /// platform's device choice reads them (`crate::device_choice`): `vendor:device` in hex, with
     /// or without `0x` and Mesa's `!`.
     const SELECTION: [&str; 2] = ["MESA_VK_DEVICE_SELECT", "VK_LOADER_DEVICE_SELECT"];
 
-    /// Tests: an rt device, made with rt's default options, on the physical device the first
+    /// Tests: an rt device, made with rt's default options on the platform's instance
+    /// (`crate::os::rt_instance`, on a Mac over KosmicKrisp), on the physical device the first
     /// selection variable set names, else on the first one that meets rt's floor; with its name
     /// and `vendor:device` IDs, which a test prints.
     ///
     /// Err: what rt answered, or that no physical device meets the floor, as text.
     pub fn test_device() -> Result<(Device, String), String> {
-        let instance = Instance::new(&[]).map_err(|error| format!("rt's instance: {error}"))?;
+        let instance =
+            crate::os::rt_instance(&[]).map_err(|error| format!("rt's instance: {error}"))?;
         let physical = (instance.physical_devices())
             .map_err(|error| format!("rt's physical devices: {error}"))?;
         let (_, raw) = instance.raw();
