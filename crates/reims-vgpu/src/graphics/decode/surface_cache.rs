@@ -6823,12 +6823,15 @@ impl<P: Platform> DerefMut for Locked<'_, P> {
     }
 }
 
+/// What [`Locked::hand_over`] gives to let go of once the lock is let go of: the scratch pieces,
+/// and the images of the shapes the age rule took out at a use ([`SurfaceCaches::aged`]).
+type LetGo<P> = (Vec<<P as Platform>::Buffer>, Vec<<P as Platform>::Texture>);
+
 impl<P: Platform> Locked<'_, P> {
     /// Hands over the command buffers owed their commits under the lock, and gives back the
-    /// pieces left over ([`SurfaceCaches::left_over`]); whether any commits were owed, and the
-    /// scratch pieces and the aged shapes' images ([`SurfaceCaches::aged`]) to let go of once
-    /// the lock is let go of.
-    fn hand_over(&mut self) -> (bool, (Vec<P::Buffer>, Vec<P::Texture>)) {
+    /// pieces left over ([`SurfaceCaches::left_over`]); whether any commits were owed, and what
+    /// to let go of once the lock is let go of ([`LetGo`]).
+    fn hand_over(&mut self) -> (bool, LetGo<P>) {
         for (_, left) in std::mem::take(&mut self.left_over) {
             self.give_back(left);
         }
