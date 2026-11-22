@@ -5,7 +5,9 @@
  * byte for byte, in a later store over the same directory too, as in an app's next run; an entry
  * that does not read whole, hash to its hash, hold its key or decode is lowered again, and the
  * first failure is said once; a read or write the system refuses turns the store off; a write is
- * a whole entry or none; past the cap the least recently used go first. A process's memo answers
+ * a whole entry or none; past the cap the least recently used go first. A lowering's write is
+ * queued, so its caller waits for none; queued writes keep the cap, hold at most its bytes, and a
+ * write the process ends before is lost alone. A process's memo answers
  * a variant asked for again with the bytes it answered first, the oldest going past its cap. No GL
  * generator: the guest's runs check the store under the real lowering.
  */
@@ -145,6 +147,16 @@ std::string keyOf(uint8_t n, const std::string &identity = "bundle 1\n")
 	return RgfxGLVariantKey(identity, ir, sizeof ir, plugin, sizeof plugin, 2, 1);
 }
 
+// RgfxGLLowerKept, then the store's queued writes done, as a later process finds them.
+bool lowerKeptDone(RgfxGLStore *store, const std::string &key,
+                   const std::function<bool(RgfxGLLowered &, std::string &)> &lower, RgfxGLLowered &out,
+                   std::string &why, bool *hit)
+{
+	const bool made = RgfxGLLowerKept(store, key, lower, out, why, hit);
+	store->drain();
+	return made;
+}
+
 void test_keys()
 {
 	const uint8_t ab[2] = {'a', 'b'}, c[1] = {'c'}, a[1] = {'a'}, bc[2] = {'b', 'c'};
@@ -208,25 +220,25 @@ void test_hit_is_miss()
 	RgfxGLLowered missed, hit, again;
 	std::string why;
 	bool wasHit = true;
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), missed, why, &wasHit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), missed, why, &wasHit));
 	CHECK(!wasHit && f.calls == 1);
 	CHECK(listNames(dir).size() == 1);
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), hit, why, &wasHit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), hit, why, &wasHit));
 	CHECK(wasHit && f.calls == 1);
 	CHECK(sameLowered(missed, hit));
 	CHECK(RgfxGLEncodeLowered(missed) == RgfxGLEncodeLowered(hit));
 	RgfxGLStore next(dir, 1 << 20, "bundle 1\n");
-	CHECK(RgfxGLLowerKept(&next, keyOf(1), f.fn(), again, why, &wasHit));
+	CHECK(lowerKeptDone(&next, keyOf(1), f.fn(), again, why, &wasHit));
 	CHECK(wasHit && f.calls == 1 && sameLowered(missed, again));
 	// Another key misses, and the lowering it makes is kept beside the first.
 	f.seed = 2;
-	CHECK(RgfxGLLowerKept(&next, keyOf(2), f.fn(), again, why, &wasHit));
+	CHECK(lowerKeptDone(&next, keyOf(2), f.fn(), again, why, &wasHit));
 	CHECK(!wasHit && f.calls == 2 && !sameLowered(missed, again));
 	CHECK(listNames(dir).size() == 2);
 	// A failed lowering keeps nothing, and answers its reason.
 	f.ok = false;
 	why.clear();
-	CHECK(!RgfxGLLowerKept(&next, keyOf(3), f.fn(), again, why, &wasHit));
+	CHECK(!lowerKeptDone(&next, keyOf(3), f.fn(), again, why, &wasHit));
 	CHECK(why == "the fake lowering failed" && listNames(dir).size() == 2);
 	// No store lowers each time.
 	f.ok = true;
@@ -249,7 +261,7 @@ void test_bad_entries_lower_again()
 	RgfxGLLowered first, out;
 	std::string why, failure;
 	bool hit = false;
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), first, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), first, why, &hit));
 	const std::string path = store.pathOf(keyOf(1));
 	const std::vector<uint8_t> good = readFile(path);
 	CHECK(good.size() > 56);
@@ -258,7 +270,7 @@ void test_bad_entries_lower_again()
 	std::vector<uint8_t> bad = good;
 	bad[good.size() / 2] ^= 0x40;
 	writeFile(path, bad);
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), out, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), out, why, &hit));
 	CHECK(!hit && f.calls == 2 && sameLowered(first, out));
 	CHECK(store.takeFirstFailure(failure) && failure.find("does not hash to its hash") != std::string::npos);
 	CHECK(!store.takeFirstFailure(failure));
@@ -266,34 +278,34 @@ void test_bad_entries_lower_again()
 
 	// Short: a write cut off, and an empty file.
 	writeFile(path, std::vector<uint8_t>(good.begin(), good.end() - 7));
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), out, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), out, why, &hit));
 	CHECK(!hit && f.calls == 3 && sameLowered(first, out));
 	writeFile(path, {});
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), out, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), out, why, &hit));
 	CHECK(!hit && f.calls == 4 && sameLowered(first, out));
 	CHECK(readFile(path) == good);
 
 	// Another key's entry under this key's name.
 	f.seed = 2;
 	RgfxGLLowered second;
-	CHECK(RgfxGLLowerKept(&store, keyOf(2), f.fn(), second, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(2), f.fn(), second, why, &hit));
 	writeFile(path, readFile(store.pathOf(keyOf(2))));
 	f.seed = 1;
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), out, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), out, why, &hit));
 	CHECK(!hit && f.calls == 6 && sameLowered(first, out));
 
 	// An entry, whole and hashed, whose value is no variant.
 	CHECK(store.put(keyOf(1), {1, 2, 3}));
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), out, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), out, why, &hit));
 	CHECK(!hit && f.calls == 7 && sameLowered(first, out));
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), out, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), out, why, &hit));
 	CHECK(hit && f.calls == 7 && sameLowered(first, out));
 
 	// The first failure only, once: a fresh store over the same bad bytes says it again.
 	CHECK(!store.takeFirstFailure(failure));
 	writeFile(path, bad);
 	RgfxGLStore other(dir, 1 << 20);
-	CHECK(RgfxGLLowerKept(&other, keyOf(1), f.fn(), out, why, &hit));
+	CHECK(lowerKeptDone(&other, keyOf(1), f.fn(), out, why, &hit));
 	CHECK(!hit && other.takeFirstFailure(failure) && !other.takeFirstFailure(failure));
 }
 
@@ -308,9 +320,9 @@ void test_unwritable_store_lowers()
 	RgfxGLLowered a, b;
 	std::string why, failure;
 	bool hit = true;
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), a, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), a, why, &hit));
 	CHECK(!hit && f.calls == 1);
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), b, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), b, why, &hit));
 	CHECK(!hit && f.calls == 2 && sameLowered(a, b));
 	CHECK(store.takeFirstFailure(failure) && failure.find("could not make") != std::string::npos);
 	CHECK(!store.takeFirstFailure(failure));
@@ -329,22 +341,22 @@ void test_refused_read_turns_store_off()
 	RgfxGLLowered a, b;
 	std::string why, failure;
 	bool hit = true;
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), a, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), a, why, &hit));
 	const std::string path = store.pathOf(keyOf(1));
 	CHECK(chmod(path.c_str(), 0) == 0);
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), b, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), b, why, &hit));
 	CHECK(!hit && f.calls == 2 && sameLowered(a, b));
 	CHECK(store.takeFirstFailure(failure) && failure.find("could not read") != std::string::npos);
 	CHECK(chmod(path.c_str(), 0644) == 0);
 	// Off: the entry, readable again, is not read, and a new one is not written.
-	CHECK(RgfxGLLowerKept(&store, keyOf(1), f.fn(), b, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), b, why, &hit));
 	CHECK(!hit && f.calls == 3);
-	CHECK(RgfxGLLowerKept(&store, keyOf(2), f.fn(), b, why, &hit));
+	CHECK(lowerKeptDone(&store, keyOf(2), f.fn(), b, why, &hit));
 	CHECK(!hit && f.calls == 4 && listNames(dir).size() == 1);
 	CHECK(!store.takeFirstFailure(failure));
 	// The next process's store reads it.
 	RgfxGLStore next(dir, 1 << 20);
-	CHECK(RgfxGLLowerKept(&next, keyOf(1), f.fn(), b, why, &hit));
+	CHECK(lowerKeptDone(&next, keyOf(1), f.fn(), b, why, &hit));
 	CHECK(hit && f.calls == 4 && sameLowered(a, b));
 }
 
@@ -397,8 +409,82 @@ void test_cap_drops_least_recently_used()
 	CHECK(listNames(dir).size() == 3);
 }
 
-// Writers and readers of one directory at once, in threads as in processes: every read answers a
-// whole value of its key, and no temporary file is left.
+// A lowering's write is queued: the lowering returns before its entry is written, and a store over
+// the same directory meanwhile misses it. Writes a process ends before (held here, as in a process
+// that ends with them queued, with the next process's store opened meanwhile) lose only their own
+// entries: the entries written before read whole, and the lost ones are lowered again.
+void test_queued_writes_lose_only_their_own()
+{
+	ScratchDirectory scratch;
+	const std::string dir = scratch.path + "/gl";
+	FakeLowering f;
+	RgfxGLLowered first, second, out;
+	std::string why, failure;
+	bool hit = true;
+	RgfxGLStore store(dir, 1 << 20);
+	CHECK(lowerKeptDone(&store, keyOf(1), f.fn(), first, why, &hit) && !hit);
+	store.holdWrites(true);
+	f.seed = 2;
+	CHECK(RgfxGLLowerKept(&store, keyOf(2), f.fn(), second, why, &hit) && !hit && f.calls == 2);
+	store.drain(); // waits for none while held
+	CHECK(listNames(dir).size() == 1);
+
+	RgfxGLStore next(dir, 1 << 20);
+	CHECK(lowerKeptDone(&next, keyOf(1), f.fn(), out, why, &hit) && hit && f.calls == 2);
+	CHECK(sameLowered(first, out));
+	CHECK(lowerKeptDone(&next, keyOf(2), f.fn(), out, why, &hit) && !hit && f.calls == 3);
+	CHECK(sameLowered(second, out));
+	CHECK(listNames(dir).size() == 2);
+
+	// The held write, let go, writes the same entry over the next store's, whole.
+	const std::vector<uint8_t> written = readFile(next.pathOf(keyOf(2)));
+	store.holdWrites(false);
+	store.drain();
+	CHECK(readFile(store.pathOf(keyOf(2))) == written);
+	CHECK(listNames(dir).size() == 2);
+	CHECK(!store.takeFirstFailure(failure) && !next.takeFirstFailure(failure));
+}
+
+// Queued writes keep the cap and its order: past it the least recently used go first. The writes
+// queued at once hold at most the cap's bytes, and one past them is dropped, its variant lowered
+// again in a later run.
+void test_queued_writes_keep_the_cap()
+{
+	ScratchDirectory scratch;
+	const std::string dir = scratch.path + "/gl";
+	const std::vector<uint8_t> value(3000, 7);
+	const uint64_t cap = 10000; // three of these writes, queued or kept, and not four
+	RgfxGLStore store(dir, cap);
+	store.holdWrites(true);
+	for (uint8_t n = 1; n <= 4; n++)
+		store.putLater(keyOf(n), value);
+	store.holdWrites(false);
+	store.drain();
+	struct stat st;
+	CHECK(listNames(dir).size() == 3);
+	CHECK(stat(store.pathOf(keyOf(4)).c_str(), &st) != 0);
+
+	// Entry 2 is read: entries 1 and 3 are the least recently used, and a fourth entry, past the
+	// cap, drops them (three quarters of the cap hold two).
+	struct timeval now;
+	gettimeofday(&now, nullptr);
+	for (uint8_t n = 1; n <= 3; n++)
+		setTime(store.pathOf(keyOf(n)), now.tv_sec - 10000 + n);
+	std::vector<uint8_t> got;
+	CHECK(store.get(keyOf(2), got) && got == value);
+	store.putLater(keyOf(4), value);
+	store.drain();
+	CHECK(stat(store.pathOf(keyOf(1)).c_str(), &st) != 0);
+	CHECK(stat(store.pathOf(keyOf(2)).c_str(), &st) == 0);
+	CHECK(stat(store.pathOf(keyOf(3)).c_str(), &st) != 0);
+	CHECK(stat(store.pathOf(keyOf(4)).c_str(), &st) == 0);
+	CHECK(listNames(dir).size() == 2);
+	std::string failure;
+	CHECK(!store.takeFirstFailure(failure));
+}
+
+// Writers and readers of one directory at once, in threads as in processes, writing now and
+// queued: every read answers a whole value of its key, and no temporary file is left.
 void test_concurrent_writes_are_whole()
 {
 	ScratchDirectory scratch;
@@ -412,8 +498,10 @@ void test_concurrent_writes_are_whole()
 			for (int i = 0; i < 200; i++) {
 				const uint8_t n = static_cast<uint8_t>(i % 5);
 				const std::vector<uint8_t> value(20000 + n * 1000, n);
-				if (t < 4)
+				if (t < 2)
 					s.put(keyOf(n), value);
+				else if (t < 4)
+					s.putLater(keyOf(n), value);
 				std::vector<uint8_t> got;
 				if (s.get(keyOf(n), got)) {
 					reads++;
@@ -424,6 +512,8 @@ void test_concurrent_writes_are_whole()
 		});
 	for (auto &t : threads)
 		t.join();
+	a.drain();
+	b.drain();
 	CHECK(wrong == 0 && reads > 0);
 	for (const auto &name : listNames(dir))
 		CHECK(name.size() == 68 && name.compare(64, 4, ".rgl") == 0);
@@ -501,6 +591,8 @@ void rgfxGLStoreTests()
 		test_unwritable_store_lowers();
 		test_refused_read_turns_store_off();
 		test_cap_drops_least_recently_used();
+		test_queued_writes_lose_only_their_own();
+		test_queued_writes_keep_the_cap();
 		test_concurrent_writes_are_whole();
 		test_memo_answers_repeats();
 	}

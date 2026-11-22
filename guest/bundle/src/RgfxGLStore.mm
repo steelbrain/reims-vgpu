@@ -156,9 +156,62 @@ bool RgfxGLDecodeLowered(const uint8_t *value, size_t length, RgfxGLLowered &out
 	return true;
 }
 
+struct RgfxGLStore::Writes {
+	dispatch_queue_t queue;
+	bool held = false; // guarded by the store's lock_
+};
+
 RgfxGLStore::RgfxGLStore(std::string directory, uint64_t capBytes, std::string identity)
-    : directory_(std::move(directory)), cap_(capBytes), identity_(std::move(identity))
+    : directory_(std::move(directory)), cap_(capBytes), identity_(std::move(identity)),
+      writes_(new Writes{dispatch_queue_create(
+          "ai.aneesiqbal.reims-graphics.gl-store",
+          dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0))})
 {
+}
+
+RgfxGLStore::~RgfxGLStore()
+{
+	holdWrites(false);
+	drain();
+}
+
+void RgfxGLStore::putLater(std::string key, std::vector<uint8_t> value)
+{
+	if (off())
+		return;
+	const uint64_t size = key.size() + value.size();
+	if (queued_.fetch_add(size) + size > cap_) {
+		queued_ -= size;
+		return;
+	}
+	auto *write = new std::pair<std::string, std::vector<uint8_t>>(std::move(key), std::move(value));
+	dispatch_async(writes_->queue, ^{
+		put(write->first, write->second);
+		queued_ -= size;
+		delete write;
+	});
+}
+
+void RgfxGLStore::drain()
+{
+	{
+		std::lock_guard<std::mutex> hold(lock_);
+		if (writes_->held)
+			return;
+	}
+	dispatch_sync(writes_->queue, ^{});
+}
+
+void RgfxGLStore::holdWrites(bool held)
+{
+	std::lock_guard<std::mutex> hold(lock_);
+	if (writes_->held == held)
+		return;
+	writes_->held = held;
+	if (held)
+		dispatch_suspend(writes_->queue);
+	else
+		dispatch_resume(writes_->queue);
 }
 
 std::string RgfxGLStore::pathOf(const std::string &key) const
@@ -191,7 +244,6 @@ void RgfxGLStore::refuse(const std::string &why)
 
 bool RgfxGLStore::off()
 {
-	std::lock_guard<std::mutex> hold(lock_);
 	return off_;
 }
 
@@ -426,7 +478,7 @@ bool RgfxGLLowerKept(RgfxGLStore *store, const std::string &key,
 	if (!lower(lowered, why))
 		return false;
 	if (store != nullptr)
-		store->put(key, RgfxGLEncodeLowered(lowered));
+		store->putLater(key, RgfxGLEncodeLowered(lowered));
 	if (memo != nullptr)
 		memo->put(key, lowered);
 	out = std::move(lowered);

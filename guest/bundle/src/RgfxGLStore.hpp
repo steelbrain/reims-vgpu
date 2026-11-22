@@ -16,6 +16,13 @@
  * takes an entry only where it reads whole, its hash is the bytes' and its key is the one asked
  * for; any other entry is removed and the variant lowered again. A write goes to a file of its
  * own and is renamed into place (Foundation's atomic write), so no process reads half an entry.
+ * RgfxGLLowerKept queues its writes on the store's own serial queue (putLater), so the app's
+ * thread does not wait on an entry's hash, its write or a trim (measured: Heaven on macOS 26.7.2,
+ * an RTX 3090, spent 39 ms of its main thread's time at one scene change of its first run in the
+ * store's writes). A write the process ends before is lost alone: every entry is a file of its
+ * own, renamed into place whole, and an atomic write's own file left behind goes at a later trim.
+ * The queued writes hold at most the cap's bytes; a write past them is dropped, and its variant
+ * lowered again in a later run.
  * The entries' bytes are capped: past the cap the least recently used are dropped, oldest first,
  * until three quarters of it are left; a read marks its entry used.
  *
@@ -31,10 +38,12 @@
 #ifndef RGFX_GL_STORE_HPP_
 #define RGFX_GL_STORE_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -68,6 +77,9 @@ public:
 	/// bytes of entries, for lowerings of `identity` (RgfxGLLoweringIdentity).
 	RgfxGLStore(std::string directory, uint64_t capBytes, std::string identity = std::string());
 
+	/// Waits for the writes putLater queued.
+	~RgfxGLStore();
+
 	/// The value kept under `key`, in `value`, and marks the entry used. False where there is
 	/// none, or where the entry does not read whole, with its hash and the key asked for (the
 	/// entry is then removed).
@@ -76,6 +88,18 @@ public:
 	/// Keeps `value` under `key`, in place of any entry there, and drops the least recently used
 	/// entries while they hold more than the cap. False where it was not kept.
 	bool put(const std::string &key, const std::vector<uint8_t> &value);
+
+	/// Keeps `value` under `key` as put() does, later, on the store's own serial queue: the caller
+	/// does not wait for the write. Dropped where the writes queued would hold more than the cap's
+	/// bytes, and where the store is off.
+	void putLater(std::string key, std::vector<uint8_t> value);
+
+	/// Waits until the writes putLater queued before it are done.
+	void drain();
+
+	/// For tests: holds the queued writes, none starting until it is called with false, as in a
+	/// process that ends with writes queued. drain() waits for none while they are held.
+	void holdWrites(bool held);
 
 	/// True, with the first failure in `why`, the first time it is called after a failure; false
 	/// before and after. A missing entry is no failure.
@@ -95,15 +119,20 @@ public:
 	const std::string &identity() const { return identity_; }
 
 private:
+	struct Writes; // the queue putLater's writes go to (RgfxGLStore.mm)
+
 	void trim(); // with lock_ held
 	bool off();
 
 	const std::string directory_;
 	const uint64_t cap_;
 	const std::string identity_;
-	std::mutex lock_;          // guards everything below
-	bool made_ = false;        // the directory is there
-	bool off_ = false;         // refused: nothing is read or written
+	std::unique_ptr<Writes> writes_;
+	std::atomic<uint64_t> queued_{0}; // the bytes of the writes queued and not done
+	std::atomic<bool> off_{false};    // refused: nothing is read or written; read without lock_, so
+	                                  // a read waits on no write's trim
+	std::mutex lock_;                 // guards everything below
+	bool made_ = false;               // the directory is there
 	bool counted_ = false;     // bytes_ counts the entries in the directory
 	uint64_t bytes_ = 0;       // the entries' bytes, as last counted and written since
 	std::string failure_;      // the first failure
@@ -137,7 +166,8 @@ private:
 };
 
 /// The variant under `key`: the memo's, where `memo` holds one; else the store's, where `store`
-/// holds one that reads and decodes whole; else what `lower` makes, which the store then keeps.
+/// holds one that reads and decodes whole; else what `lower` makes, which the store then keeps,
+/// written on its queue (putLater).
 /// The memo keeps what the store or `lower` gave. `*hit` (where given) says whether `lower` was
 /// spared. False, with `why`, where `lower` fails. A null `store` or `memo` is not asked.
 bool RgfxGLLowerKept(RgfxGLStore *store, const std::string &key,
