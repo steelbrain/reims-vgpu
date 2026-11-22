@@ -63,11 +63,14 @@
 //! **Its translations.** Beside the cache's bytes the counts line carries, as amounts, the
 //! functions rt's translator lowered, [`TRANSLATIONS_CODE`] (`Metrics::translations`), and the
 //! lowered kernels pipeline states took from the cache directory in their stead,
-//! [`TRANSLATIONS_LOADED_CODE`] (`Metrics::translations_loaded`), and the most bytes of the
-//! device's pipeline cache blob, [`PIPELINE_CACHE_MOST_CODE`] (below), so that a boot's reader can
-//! tell a boot on a cold directory, which lowers what a warm one loads, and set the bytes it wrote
-//! beside its blob's size. The counts line carries only the codes counted above zero, so an absent
-//! code reads as 0.
+//! [`TRANSLATIONS_LOADED_CODE`] (`Metrics::translations_loaded`), the render contents' records
+//! pipeline states read from the directory, [`RENDER_RECORDS_READ_CODE`]
+//! (`Metrics::render_records_read`, each record's stages among the translations loaded), and those
+//! that named a lowering the directory no longer held, [`RENDER_RECORDS_STALE_CODE`]
+//! (`Metrics::render_records_stale`), and the most bytes of the device's pipeline cache blob,
+//! [`PIPELINE_CACHE_MOST_CODE`] (below), so that a boot's reader can tell a boot on a cold
+//! directory, which lowers what a warm one loads, and set the bytes it wrote beside its blob's
+//! size. The counts line carries only the codes counted above zero, so an absent code reads as 0.
 //!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
@@ -158,6 +161,16 @@ pub const TRANSLATIONS_CODE: &str = "rt-translations";
 /// lowering (`Metrics::translations_loaded`), an amount on the counts line ([`fold_metrics`]).
 pub const TRANSLATIONS_LOADED_CODE: &str = "rt-translations-loaded";
 
+/// The code of the render contents' records pipeline states read from rt's cache directory, each
+/// naming the lowerings of the content's stages, which count among the translations loaded
+/// (`Metrics::render_records_read`), an amount on the counts line ([`fold_metrics`]).
+pub const RENDER_RECORDS_READ_CODE: &str = "rt-render-records-read";
+
+/// The code of the render contents' records that named a lowering rt's cache directory no longer
+/// held, so the content was lowered again (`Metrics::render_records_stale`), an amount on the
+/// counts line ([`fold_metrics`]).
+pub const RENDER_RECORDS_STALE_CODE: &str = "rt-render-records-stale";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -193,8 +206,8 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 
 /// The metrics the counts line carries ([`folded_counts`]): the over-copy metrics, then the
 /// command buffers held for room, the cache writes dropped, the cache bytes written, the
-/// translations and the translations loaded.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 5;
+/// translations, the translations loaded, and the render records read and stale.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 7;
 
 /// The counters of the device the process made last ([`open`]), which [`fold_metrics`] reads,
 /// with what it folded so far of each of their metrics, in [`folded_counts`]'s order.
@@ -268,8 +281,9 @@ fn follow(counters: rt::Counters) {
 /// The metrics of `m` the counts line carries, each with its code: the over-copy metrics
 /// ([`over_copy_counts`]), then the command buffers held for room ([`HELD_FOR_ROOM_CODE`]), the
 /// cache writes dropped ([`CACHE_WRITES_DROPPED_CODE`]), the cache bytes written
-/// ([`CACHE_BYTES_WRITTEN_CODE`]), the translations ([`TRANSLATIONS_CODE`]) and the translations
-/// loaded ([`TRANSLATIONS_LOADED_CODE`]).
+/// ([`CACHE_BYTES_WRITTEN_CODE`]), the translations ([`TRANSLATIONS_CODE`]), the translations
+/// loaded ([`TRANSLATIONS_LOADED_CODE`]), and the render records read
+/// ([`RENDER_RECORDS_READ_CODE`]) and stale ([`RENDER_RECORDS_STALE_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -278,6 +292,8 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (CACHE_BYTES_WRITTEN_CODE, m.cache_bytes_written),
         (TRANSLATIONS_CODE, m.translations),
         (TRANSLATIONS_LOADED_CODE, m.translations_loaded),
+        (RENDER_RECORDS_READ_CODE, m.render_records_read),
+        (RENDER_RECORDS_STALE_CODE, m.render_records_stale),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -1713,8 +1729,8 @@ mod tests {
     /// Each fold counts what each over-copy metric rose by since the last, under its code, so the
     /// counts line carries the metrics' totals: the over-copies and their bytes, those over an
     /// imported block, and each cause's, by the cause's name; and after them the command buffers
-    /// held for room, the cache writes dropped, the cache bytes written, the translations and the
-    /// translations loaded.
+    /// held for room, the cache writes dropped, the cache bytes written, the translations, the
+    /// translations loaded, and the render records read and stale.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -1733,6 +1749,8 @@ mod tests {
             CACHE_BYTES_WRITTEN_CODE,
             TRANSLATIONS_CODE,
             TRANSLATIONS_LOADED_CODE,
+            RENDER_RECORDS_READ_CODE,
+            RENDER_RECORDS_STALE_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -1752,6 +1770,7 @@ mod tests {
         m.cache_writes_dropped = 1;
         m.cache_bytes_written = 65_536;
         m.translations = 7;
+        m.render_records_read = 2;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -1763,6 +1782,8 @@ mod tests {
         m.cache_bytes_written = 98_304;
         m.translations = 9;
         m.translations_loaded = 4;
+        m.render_records_read = 3;
+        m.render_records_stale = 1;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -1770,7 +1791,7 @@ mod tests {
         assert_eq!(
             rose,
             [
-                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4
+                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 3, 1
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
