@@ -119,6 +119,16 @@
 //! boot's line says whether its pipelines met a fresh cache, and whether the blob the next boot
 //! seeds from missed a write.
 //!
+//! **Its pipeline cache's looks skipped.** rt's reaper reads the cache's size, which
+//! [`PIPELINE_CACHE_MOST_CODE`]'s gauge holds from the seed on, and the data it writes over the
+//! blob only while no creation runs: a look where a creation began after creation was quiet is
+//! skipped, and the reaper looks again once creation is quiet again (rt's
+//! `Metrics::pipeline_cache_looks_skipped`). The counts line carries the looks skipped as an
+//! amount, [`PIPELINE_CACHE_LOOKS_SKIPPED_CODE`], so that a boot's line whose cache size stays at
+//! its seed's says whether the reaper's looks met creations. rt counts neither the looks it made
+//! nor the blob's writes in a metric of its own; the blob's bytes are among
+//! [`CACHE_BYTES_WRITTEN_CODE`]'s.
+//!
 //! **Its emulated SIMD groups and its dropped makes.** rt counts the dispatches, direct and
 //! indirect, that ran a kernel's emulated-SIMD-group module, a threadgroup not whole groups of the
 //! width the kernel's own module runs, as 80 threads, or 32 on a device of 64-lane subgroups
@@ -168,20 +178,24 @@
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
 //! the texture blocks held whole (`texture_block_held_bytes`), and the Private blocks taken and
 //! not given back (`private_take_bytes`). A fifth is the size of the data in the device's
-//! `VkPipelineCache` (`pipeline_cache_bytes`), which rt measures when its reaper last looked, once
-//! creation was quiet, and which falls when the reaper replaces a cache past 32 MiB with a fresh
-//! one. Two more are the resolve images a device holds (`resolve_images`) and the bytes of their
-//! memory (`resolve_image_bytes`). The last two are the compiled kernels alive (`kernels`), each
-//! the translation of one compute pipeline content with its shader modules and their
-//! `VkPipeline`s, which lives while a state or the device's map of compiled contents holds it,
-//! and that map's entries, compute and render together, at most 1,024 (`kernel_entries`). A gauge
-//! rises and falls, so the counts line carries the highest each reached at a look,
-//! `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it ([`note_gauges`]). The
-//! counts' fold looks ([`fold_metrics`]), and so does the gauges' thread where it runs
-//! (`super::gauge_log`, every 5 s): a value rt held between two looks, the blob's among them, is
-//! not seen. The trace's `rtcounts` carries the two kernel gauges as they are at each of its
-//! events (`super::command`), at most one each 50 ms while command buffers commit or complete,
-//! so a traced run shows them over time.
+//! `VkPipelineCache` (`pipeline_cache_bytes`), which rt measures at its seed and when its reaper
+//! last looked, once creation was quiet, and which falls when the reaper replaces a cache past
+//! 32 MiB with a fresh one. Two more are the resolve images a device holds (`resolve_images`) and
+//! the bytes of their memory (`resolve_image_bytes`). The last two are the compiled kernels alive
+//! (`kernels`), each the translation of one compute pipeline content with its shader modules and
+//! their `VkPipeline`s, which lives while a state or the device's map of compiled contents holds
+//! it, and that map's entries, compute and render together, at most 1,024 (`kernel_entries`). A
+//! gauge rises and falls, so the counts line carries the highest each reached at a look,
+//! `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it ([`note_gauges`]): the
+//! in-run highest, to within the looks. The gauges' thread looks every 5 s from the process's
+//! first device's open on, whether or not its lines are in the log (`super::gauge_log`); so do
+//! the counts' folds ([`fold_metrics`]: a guest device's reset, after its objects dropped, and
+//! the process's exit), and the let-go of a device once every handle but the platform's is gone,
+//! before rt's quiesce and teardown of it (`RtPlatform::let_go_of_device`), since the teardown
+//! sets every gauge to zero and the counts line of an exit after a let-go, as at a host's quit,
+//! comes after it. A value rt held between two looks is not seen. The trace's `rtcounts` carries
+//! the two kernel gauges as they are at each of its events (`super::command`), at most one each
+//! 50 ms while command buffers commit or complete, so a traced run shows them over time.
 
 use std::sync::{Arc, OnceLock};
 
@@ -319,6 +333,11 @@ pub const PIPELINE_CACHES_REPLACED_CODE: &str = "rt-pipeline-caches-replaced";
 /// amount on the counts line ([`fold_metrics`]).
 pub const PIPELINE_CACHE_WRITES_SKIPPED_CODE: &str = "rt-pipeline-cache-writes-skipped";
 
+/// The code of the reaper's looks at the pipeline cache that rt skipped because a creation began
+/// after creation was quiet (`Metrics::pipeline_cache_looks_skipped`), an amount on the counts
+/// line ([`fold_metrics`]).
+pub const PIPELINE_CACHE_LOOKS_SKIPPED_CODE: &str = "rt-pipeline-cache-looks-skipped";
+
 /// The code of the dispatches that ran a kernel's emulated-SIMD-group module
 /// (`Metrics::emulated_simdgroup_dispatches`), an amount on the counts line ([`fold_metrics`]).
 pub const EMULATED_SIMDGROUP_DISPATCHES_CODE: &str = "rt-emulated-simdgroup-dispatches";
@@ -364,8 +383,9 @@ pub const TEXTURE_BLOCK_HELD_MOST_CODE: &str = "rt-texture-block-held-bytes-most
 pub const PRIVATE_TAKE_MOST_CODE: &str = "rt-private-take-bytes-most";
 
 /// The code of the most bytes of data in the device's `VkPipelineCache` at a look
-/// (`Gauges::pipeline_cache_bytes`, [`note_gauges`]): rt's size of it when its reaper last looked,
-/// read only at the looks.
+/// (`Gauges::pipeline_cache_bytes`, [`note_gauges`]): rt's size of it at its seed and when its
+/// reaper last looked, read only at the looks, so a look the reaper skipped
+/// ([`PIPELINE_CACHE_LOOKS_SKIPPED_CODE`]) leaves it at the size before.
 pub const PIPELINE_CACHE_MOST_CODE: &str = "rt-pipeline-cache-bytes-most";
 
 /// The code of the most resolve images a device held at a look (`Gauges::resolve_images`,
@@ -402,11 +422,11 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// and the driver's nanoseconds making them, the render records read and stale, the render
 /// pipelines made with a stage past the kernels' bound, the compute dispatches' first-use waits
 /// and their nanoseconds, the exported blocks whose address went out, the pipeline caches
-/// replaced and the cache's writes skipped past its bound, the dispatches that ran an
-/// emulated-SIMD-group module, the compiled contents a state's make dropped, the resolves of
-/// multisample attachments, the copies out of resolve images and their bytes, and the whole grids
-/// that ran a partial-threadgroups variant.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 22;
+/// replaced, the cache's writes skipped past its bound and the reaper's looks at it skipped, the
+/// dispatches that ran an emulated-SIMD-group module, the compiled contents a state's make
+/// dropped, the resolves of multisample attachments, the copies out of resolve images and their
+/// bytes, and the whole grids that ran a partial-threadgroups variant.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 23;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -428,9 +448,9 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// device, its command buffers held for room, its cache writes, its translations, its pipelines'
 /// makes and their time, its render makes past the kernels' bound, its compute dispatches'
 /// first-use waits, its exported blocks addressed, its pipeline caches replaced and cache writes
-/// skipped past their bound, its emulated-SIMD-group dispatches, its dropped makes, its resolves,
-/// its resolve copies and its whole grids on a partial-threadgroups variant rose by since the last
-/// fold
+/// skipped past their bound, its reaper's looks at the cache skipped, its emulated-SIMD-group
+/// dispatches, its dropped makes, its resolves, its resolve copies and its whole grids on a
+/// partial-threadgroups variant rose by since the last fold
 /// ([`folded_counts`]), so the counts line carries their totals, then its maxima
 /// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
 /// docs). Nothing of rt's before the device is made. First it counts the dispatches the rt
@@ -472,7 +492,10 @@ fn highest_metrics(m: &rt::Metrics) -> [(&'static str, u64); HIGHEST_METRICS] {
 
 /// Looks at `g`, the gauges of the process's device now: counts each of [`highest_gauges`]'s by
 /// its rise over the highest a look saw before, so that the counts line carries the highest (the
-/// module's docs).
+/// module's docs). The looks: the gauges' thread's, every 5 s from the process's first device's
+/// open on, whether or not its lines are in the log (`super::gauge_log`); each fold
+/// ([`fold_metrics`]) and the open of a device after another ([`follow`]); and a let-go's, before
+/// rt's teardown of the device sets its gauges to zero (`RtPlatform::let_go_of_device`).
 pub(super) fn note_gauges(g: &rt::Gauges) {
     raise_to(&mut GAUGES_HIGHEST.lock(), highest_gauges(g));
 }
@@ -537,7 +560,8 @@ fn follow(counters: rt::Counters) {
 /// waits ([`FIRST_USE_WAITS_CODE`]) and their nanoseconds ([`FIRST_USE_WAIT_NS_CODE`]), the
 /// exported blocks whose address went out ([`EXPORTED_BLOCKS_ADDRESSED_CODE`]), the pipeline
 /// caches replaced ([`PIPELINE_CACHES_REPLACED_CODE`]) and the cache's writes skipped
-/// ([`PIPELINE_CACHE_WRITES_SKIPPED_CODE`]) past its bound, the dispatches that ran an
+/// ([`PIPELINE_CACHE_WRITES_SKIPPED_CODE`]) past its bound, the reaper's looks at the cache
+/// skipped ([`PIPELINE_CACHE_LOOKS_SKIPPED_CODE`]), the dispatches that ran an
 /// emulated-SIMD-group module ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), the compiled contents a
 /// state's make dropped ([`KERNEL_MAKES_DROPPED_CODE`]), the resolves of multisample attachments
 /// ([`RESOLVES_CODE`]), the copies out of resolve images ([`RESOLVE_COPIES_CODE`]) and their bytes
@@ -567,6 +591,10 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (
             PIPELINE_CACHE_WRITES_SKIPPED_CODE,
             m.pipeline_cache_writes_skipped,
+        ),
+        (
+            PIPELINE_CACHE_LOOKS_SKIPPED_CODE,
+            m.pipeline_cache_looks_skipped,
         ),
         (
             EMULATED_SIMDGROUP_DISPATCHES_CODE,
@@ -2066,11 +2094,11 @@ mod tests {
     /// translations loaded, the translator's nanoseconds, the `VkPipeline`s made and the driver's
     /// nanoseconds making them, the render records read and stale, the render pipelines made with
     /// a stage past the kernels' bound, the compute dispatches' first-use waits and their
-    /// nanoseconds, the exported blocks whose address went out, the pipeline caches replaced and
-    /// the cache's writes skipped past its bound, the dispatches that ran an emulated-SIMD-group
-    /// module, the compiled contents a state's make dropped, the resolves of multisample
-    /// attachments, the copies out of resolve images and their bytes, and the whole grids that ran
-    /// a partial-threadgroups variant.
+    /// nanoseconds, the exported blocks whose address went out, the pipeline caches replaced, the
+    /// cache's writes skipped past its bound and the reaper's looks at it skipped, the dispatches
+    /// that ran an emulated-SIMD-group module, the compiled contents a state's make dropped, the
+    /// resolves of multisample attachments, the copies out of resolve images and their bytes, and
+    /// the whole grids that ran a partial-threadgroups variant.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2100,6 +2128,7 @@ mod tests {
             EXPORTED_BLOCKS_ADDRESSED_CODE,
             PIPELINE_CACHES_REPLACED_CODE,
             PIPELINE_CACHE_WRITES_SKIPPED_CODE,
+            PIPELINE_CACHE_LOOKS_SKIPPED_CODE,
             EMULATED_SIMDGROUP_DISPATCHES_CODE,
             KERNEL_MAKES_DROPPED_CODE,
             RESOLVES_CODE,
@@ -2134,6 +2163,7 @@ mod tests {
         m.first_use_variant_wait_nanos = 5_000;
         m.exported_blocks_addressed = 1;
         m.pipeline_caches_replaced = 1;
+        m.pipeline_cache_looks_skipped = 2;
         m.emulated_simdgroup_dispatches = 4;
         m.resolves = 3;
         m.resolve_copies = 1;
@@ -2161,6 +2191,7 @@ mod tests {
         m.exported_blocks_addressed = 2;
         m.pipeline_caches_replaced = 3;
         m.pipeline_cache_writes_skipped = 1;
+        m.pipeline_cache_looks_skipped = 7;
         m.emulated_simdgroup_dispatches = 11;
         m.kernel_makes_dropped = 2;
         m.resolves = 10;
@@ -2175,7 +2206,7 @@ mod tests {
             rose,
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
-                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 11, 2, 10, 4, 14_745_600, 13
+                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 11, 2, 10, 4, 14_745_600, 13
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);

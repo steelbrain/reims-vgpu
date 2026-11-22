@@ -322,6 +322,9 @@ impl RtPlatform {
     ///   still running, a thread that holds one, the pool's source of blocks), looking every
     ///   [`POLL`]. Where one outlives the wait, nothing goes, and `Err` says how many still held
     ///   it;
+    /// - it gives the device's gauges to the counts line's highest (`device::note_gauges`), as
+    ///   they are with every handle but the platform's gone: rt's teardown sets them to zero, and
+    ///   the counts line of an exit after a let-go is written after the teardown;
     /// - rt's `Device::quiesce`, so that the drop's wait for rt's threads and GPU work, which
     ///   has no deadline, finds them ended. Where it answers false, the device is kept to the
     ///   exit, and `Err` says so;
@@ -366,6 +369,10 @@ impl RtPlatform {
         let facts = device.facts();
         let named = format!("{} (registry ID {:#x})", facts.name, facts.registry_id);
         let counters = device.rt().counters();
+        // Its gauges to the counts line's highest while it lives: rt's teardown sets them to
+        // zero, and the exit's counts line comes after it (`device`'s docs, "Its memory at its
+        // highest").
+        device::note_gauges(&counters.gauges());
         let left = until.saturating_duration_since(self.clock.now_mono());
         if !device.rt().quiesce(left) {
             self.unended.lock().push(Unended {
