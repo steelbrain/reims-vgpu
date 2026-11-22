@@ -243,7 +243,7 @@ impl SurfaceMemory for RtSurfaceMemory {
 mod tests {
     use super::*;
     use crate::core::platform::device::GpuDevice as _;
-    use crate::core::platform::resource::{SurfacePlaneDesc, Texture as _};
+    use crate::core::platform::resource::{Buffer as _, SurfacePlaneDesc, Texture as _};
     use crate::core::raise::OnFault;
     use crate::rt_platform::RtPlatform;
 
@@ -271,9 +271,14 @@ mod tests {
         ]
     }
 
-    /// Whether the device the test holds exports a buffer's memory as `handle`: rt's copy form
-    /// of a surface is such an export, so a device that exports one makes every surface.
-    fn exports(device: &RtObj<RtDevice>, handle: SurfaceHandle) -> bool {
+    /// A buffer whose memory the device the test holds exports as `handle`, in an exported block
+    /// of its own (`super::export`, `Device::new_exported_block`), as a video cache's buffer is,
+    /// where the device exports one: rt's copy form of a surface is such an export, so a device
+    /// that exports one makes every surface.
+    fn exported_buffer(
+        device: &RtObj<RtDevice>,
+        handle: SurfaceHandle,
+    ) -> Option<RtObj<crate::rt_platform::RtBuffer>> {
         let on = OnFault::Return;
         let made = match handle {
             SurfaceHandle::OpaqueFd => device.new_exportable_buffer_of_length(on, 4096, 0x20, None),
@@ -281,7 +286,7 @@ mod tests {
                 device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0x20, None)
             }
         };
-        made.expect("never a raise").is_some()
+        made.expect("never a raise")
     }
 
     /// Exported surfaces of a 1080p NV12 picture's planes and a 2160p P010 picture's on the GPU
@@ -295,8 +300,10 @@ mod tests {
     /// RG8Uint, R16Uint and RG16Uint) are made where the surface is in place. No address of the
     /// surface's memory goes out, in either form: rt's count of the exported blocks whose address
     /// a call handed out (`Metrics::exported_blocks_addressed`) does not rise from the make
-    /// through the views, the exports and the acquire to the drop. A handle the device exports no
-    /// buffer as is refused, counted, and answers `None`.
+    /// through the views, the exports and the acquire to the drop. Nor does a buffer of the
+    /// handle's in an exported block of its own (the buffer form, as a video cache's buffer is)
+    /// count its block at its make: the count rises by 1 once the buffer's address is taken. A
+    /// handle the device exports no buffer as is refused, counted, and answers `None`.
     #[test]
     fn exported_surfaces_on_vulkan() {
         use std::os::fd::AsRawFd as _;
@@ -315,11 +322,23 @@ mod tests {
         ];
         let addressed = || device.rt().counters().metrics().exported_blocks_addressed;
         for (handle, pitch_multiple) in asks {
-            let exported = exports(&device, handle);
+            let before = addressed();
+            let buffer = exported_buffer(&device, handle);
+            let exported = buffer.is_some();
+            assert_eq!(
+                addressed() - before,
+                0,
+                "{handle:?}: the buffer form's block counted at its make"
+            );
+            if let Some(buffer) = buffer {
+                assert_ne!(buffer.gpu_address(), 0);
+                assert_eq!(
+                    addressed() - before,
+                    1,
+                    "{handle:?}: the buffer form's block once its buffer's address is taken"
+                );
+            }
             for (formats, views, width, height, texel) in shapes {
-                // Counted past the probe (`exports`): a buffer rt makes in an exported block of
-                // its own, as a video cache's buffer is (`super::export`), counts at its make, by
-                // rt's rule that the block's handle states its address.
                 let before = addressed();
                 let planes = planes(formats, width, height);
                 let desc = SurfaceDesc {

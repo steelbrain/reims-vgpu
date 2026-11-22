@@ -100,11 +100,14 @@
 //!
 //! **Its exported blocks whose address went out.** At a submission that writes through a device
 //! address, rt owes the textures over an exported block their copy in only once a public call
-//! handed out an address in that block: a buffer's `gpu_address` in it, the block's own handle, or
-//! a texture buffer's storage element over its bytes (rt's `Metrics::exported_blocks_addressed`,
-//! each block counted at the first). The counts line carries them as an amount,
-//! [`EXPORTED_BLOCKS_ADDRESSED_CODE`], so a boot's line says whether any exported block's address
-//! went out, and with it whether such a submission could copy a texture over one in.
+//! handed out an address in that block: a buffer's `gpu_address` in it, or a texture buffer's
+//! storage element over its bytes (rt's `Metrics::exported_blocks_addressed`, each block counted
+//! at the first). The block's own handle states none (`BlockInfo::gpu_address` is `None` for an
+//! exported block), so a block's make counts nothing, and a video cache's buffer in a block of its
+//! own (`super::export`) counts its block only once its address is read. The counts line carries
+//! them as an amount, [`EXPORTED_BLOCKS_ADDRESSED_CODE`], so a boot's line says whether any
+//! exported block's address went out, and with it whether such a submission could copy a texture
+//! over one in.
 //!
 //! **Its pipeline cache past its bound.** rt's reaper replaces the device's `VkPipelineCache` with
 //! a fresh, empty one at a look that finds it past its bound of 32 MiB, and the pipelines the old
@@ -251,8 +254,8 @@ pub const FIRST_USE_WAIT_NS_CODE: &str = "rt-first-use-variant-wait-ns";
 pub const FIRST_USE_WAIT_MAX_NS_CODE: &str = "rt-first-use-variant-wait-max-ns";
 
 /// The code of the exported blocks a public call handed out a device address in, each counted at
-/// the first (`Metrics::exported_blocks_addressed`), an amount on the counts line
-/// ([`fold_metrics`]).
+/// the first, which a block's make never is (`Metrics::exported_blocks_addressed`), an amount on
+/// the counts line ([`fold_metrics`]).
 pub const EXPORTED_BLOCKS_ADDRESSED_CODE: &str = "rt-exported-blocks-addressed";
 
 /// The code of the replacements of the device's `VkPipelineCache` by a fresh, empty one past its
