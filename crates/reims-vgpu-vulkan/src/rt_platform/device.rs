@@ -143,10 +143,13 @@
 //! it is what shows that a boot's resolves ran.
 //!
 //! **Its partial-threadgroups variant's whole grids.** A kernel that observes its threadgroup
-//! partition runs every direct dispatch on its partial-threadgroups variant, whole grids
-//! (`dispatchThreads` of whole threadgroups, `dispatchThreadgroups`) among them, so rt makes one
-//! `VkPipeline` of a size for it, where Metal compiles one function; its indirect dispatches run
-//! the plain module. rt counts the whole grids that ran the variant
+//! partition runs every dispatch on its partial-threadgroups variant, whole grids
+//! (`dispatchThreads` of whole threadgroups, `dispatchThreadgroups`) and indirect dispatches
+//! among them, so rt makes one `VkPipeline` of a size for it, where Metal compiles one function.
+//! A dispatch runs the plain module instead where the variant does not take its threadgroup, or
+//! where the variant's threadgroup memory, its predicated walk's 4-byte vote word included, passes
+//! the device's `maxComputeSharedMemorySize`, decided per dispatch from the encoder's lengths. rt
+//! counts the dispatches of whole threadgroups, direct and indirect, that ran the variant
 //! (`Metrics::partial_variant_whole_grids`), and the counts line carries them as an amount,
 //! [`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`], so a boot's line says how often its whole grids took the
 //! variant.
@@ -157,8 +160,8 @@
 //! (`dispatchThreadgroupsWithIndirectBuffer`). [`fold_metrics`] folds them onto the counts line as
 //! amounts, `rt-dispatches-direct` and `rt-dispatches-indirect`
 //! (`super::compute::DISPATCHES_DIRECT_CODE`, `super::compute::DISPATCHES_INDIRECT_CODE`), so a
-//! boot's line says what share of its direct dispatches ran whole grids on a
-//! partial-threadgroups variant.
+//! boot's line says what share of its dispatches, direct and indirect, ran whole threadgroups on
+//! a partial-threadgroups variant.
 //!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
@@ -339,9 +342,9 @@ pub const RESOLVE_COPIES_CODE: &str = "rt-resolve-copies";
 /// line ([`fold_metrics`]).
 pub const RESOLVE_COPY_BYTES_CODE: &str = "rt-resolve-copy-bytes";
 
-/// The code of the direct dispatches of a whole grid that ran a kernel's partial-threadgroups
-/// variant (`Metrics::partial_variant_whole_grids`), an amount on the counts line
-/// ([`fold_metrics`]).
+/// The code of the dispatches of whole threadgroups, direct and indirect, that ran a kernel's
+/// partial-threadgroups variant (`Metrics::partial_variant_whole_grids`), an amount on the counts
+/// line ([`fold_metrics`]).
 pub const PARTIAL_VARIANT_WHOLE_GRIDS_CODE: &str = "rt-partial-variant-whole-grids";
 
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
