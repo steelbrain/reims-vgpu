@@ -30,8 +30,8 @@ pub(super) const CONTEXT: u32 = 3;
 /// The fake's class of a compute state.
 const CLASS: &str = "MTLComputePipelineState";
 
-/// A device whose context [`CONTEXT`] has queue 1, library 10 and the compute states `states`
-/// made: the device, its platform, the guest and the queue's rings.
+/// A device whose context [`CONTEXT`] has queue 1, its handle made, library 10 and the compute
+/// states `states` made: the device, its platform, the guest and the queue's rings.
 pub(super) fn with_states(
     states: &[u64],
 ) -> (
@@ -61,6 +61,13 @@ pub(super) fn with_states_over(
     assert_eq!(
         create_queue(&device, &mut guest, CONTEXT, 1, rings, RING_DATA, 0),
         RGFX_STATUS_OK
+    );
+    // The queue's handle is made on its service thread after its create is answered: the
+    // decoder's objects are counted from here on.
+    let queue = obj(CONTEXT, 1);
+    assert!(
+        eventually(|| device.decoder_objects().iter().any(|&(id, _)| id == queue)),
+        "queue 1's handle was never made"
     );
     make_library(&device, &mut guest, obj(CONTEXT, 10));
     for &n in states {

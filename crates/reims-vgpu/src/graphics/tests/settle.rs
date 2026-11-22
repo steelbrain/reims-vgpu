@@ -488,7 +488,7 @@ fn a_make_held_for_its_stage_answers_after_its_fill_before_its_finish() {
 const AGAIN_QUEUE: u64 = 2;
 
 /// What a process given [`CONTEXT`]'s number makes first, as [`with_states`]'s does: queue
-/// [`AGAIN_QUEUE`] over [`AGAIN_RINGS`], then library 10. The queue's rings.
+/// [`AGAIN_QUEUE`] over [`AGAIN_RINGS`], its handle made, then library 10. The queue's rings.
 fn opened_again(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest) -> QueueRing {
     assert_eq!(
         create_queue(
@@ -501,6 +501,12 @@ fn opened_again(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest) -> Que
             0
         ),
         RGFX_STATUS_OK
+    );
+    // Its handle made, as with_states waits for queue 1's.
+    let queue = obj(CONTEXT, AGAIN_QUEUE);
+    assert!(
+        eventually(|| device.decoder_objects().iter().any(|&(id, _)| id == queue)),
+        "queue {AGAIN_QUEUE}'s handle was never made"
     );
     make_library(device, guest, obj(CONTEXT, 10));
     QueueRing::new(device, AGAIN_RINGS.0, AGAIN_RINGS.1, u64::from(AGAIN_DATA))
