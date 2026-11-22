@@ -52,7 +52,8 @@ static const NSUInteger kBit24 = 1ull << 24;
 static const size_t kRegion = 64 * 1024;
 static const uint8_t kPad = 0xAB;
 static const NSUInteger kOffset = 0x1000;
-static const NSUInteger kSide = 4;
+// An enum, not a const variable, so the arrays cpuShape sizes by it have a constant length.
+enum { kSide = 4 };
 static const NSUInteger kPitch = 256;
 
 static id<MTLDevice> gDevice;

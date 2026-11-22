@@ -2026,7 +2026,7 @@ static void case_iosurf_buffer(id<MTLDevice> d, int which)
 		NSDictionary *p = @{
 			(id)kIOSurfaceWidth : @64,
 			(id)kIOSurfaceHeight : @64,
-			(id)kIOSurfacePixelFormat : @('420v'),
+			(id)kIOSurfacePixelFormat : @((uint32_t)'420v'),
 			(id)kIOSurfacePlaneInfo : @[ plane0, plane1 ],
 		};
 		IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)p);
