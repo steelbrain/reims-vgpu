@@ -2335,7 +2335,6 @@ mod tests {
 
         use super::super::diag::import_range;
         use crate::core::host::HostPtr;
-        use crate::core::platform::Platform as _;
         use crate::core::platform::device::{GpuDevice as _, NoCopyDeallocator};
         use crate::core::platform::host_range::HostRange;
         use crate::core::raise::OnFault;
