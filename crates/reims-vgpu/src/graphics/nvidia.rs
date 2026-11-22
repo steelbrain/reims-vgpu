@@ -75,6 +75,7 @@ use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::device_memory::{
     DeviceImports, GuestTarget, MemoryIdentity, TargetPlane,
 };
+use reims_vgpu_video::core::device_wait::KeptMark;
 use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::nvidia::{
     AnnexBCodec, AnnexBDecoder, AnnexBPicture, ChromaFormat, DecodeCapabilities, DevicePlane,
@@ -93,8 +94,8 @@ use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
 };
 use super::video_host::{
-    BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture,
-    HostVideoSession, Landing, OutputPlane, SourcePlane, failed_in_caches, picture_error,
+    BackendError, DecodeOutput, Extent, Failed, HostDecoder, HostEncodeSession, HostPicture,
+    HostVideoSession, Landing, OutputPlane, SourcePlane, picture_error,
 };
 
 mod encode;
@@ -606,7 +607,7 @@ impl<P: Platform> NvdecPicture<P> {
             u64::from(crop_height.min(height)),
             sample,
         ))?;
-        if self.write_in_cache((width, height), luma, chroma)? {
+        if self.write_in_cache((width, height), to)? {
             return Ok(());
         }
         if self.write_in_place((width, height), luma, chroma)? {
@@ -625,15 +626,11 @@ impl<P: Platform> NvdecPicture<P> {
         unsafe { to.copy_rows(source(&luma), source(&chroma)) }
     }
 
-    /// Writes the picture into `luma` and `chroma`'s device caches by a copy within the GPU,
-    /// where both lie in caches CUDA imports: `Ok(true)` once there, `Ok(false)` where the caches
-    /// are not to be had so.
-    fn write_in_cache(
-        &self,
-        size: (u32, u32),
-        luma: &OutputPlane<P>,
-        chroma: &OutputPlane<P>,
-    ) -> Result<bool, BackendError> {
+    /// Writes the picture into `to`'s planes' device caches by a copy within the GPU, where both
+    /// lie in caches CUDA imports: `Ok(true)` once there, `Ok(false)` where the caches are not to
+    /// be had so.
+    fn write_in_cache(&self, size: (u32, u32), to: &Landing<'_, P>) -> Result<bool, BackendError> {
+        let (luma, chroma) = (to.luma, to.chroma);
         let Some(imports) = &self.video.imports else {
             return Ok(false);
         };
@@ -673,6 +670,7 @@ impl<P: Platform> NvdecPicture<P> {
         ) else {
             return Err("a plane past the host's address space".into());
         };
+        let since = KeptMark::here();
         // SAFETY: the planes are the decode's output, which the guest writes no other way until
         // the command buffer that waits for the session's signal completes, and which lie apart
         // (the decode's check); the imports, which a late copy keeps, hold the caches' memory.
@@ -680,17 +678,21 @@ impl<P: Platform> NvdecPicture<P> {
             (self.picture).write_into_device(size, luma_plane, chroma_plane, Box::new(()))
         };
         // A decode NVDEC failed, or work past its deadline, which may still write: the caches
-        // are said written where the GPU has stopped, before the session's signal.
+        // are said written before the session's signal, a stall's once the work it kept, with
+        // the imports, is let go.
         let written = match written {
             Ok(written) => written,
             Err(error) => {
-                let stopped = !matches!(error, reims_vgpu_video::nvidia::Error::Stalled(_));
+                let failed = match &error {
+                    reims_vgpu_video::nvidia::Error::Stalled(_) => Failed::Stalled(since),
+                    _ => Failed::Stopped,
+                };
                 let planes: &[&OutputPlane<P>] = if chroma_cache.key() == luma_cache.key() {
                     &[luma]
                 } else {
                     &[luma, chroma]
                 };
-                return Err(failed_in_caches(planes, stopped, error.into()));
+                return Err(to.failed_in_caches(planes, failed, error.into()));
             }
         };
         match written {

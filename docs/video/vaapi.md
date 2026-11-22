@@ -526,9 +526,12 @@ answers for its device, `rt_platform::HostGpu`). The arm
   does not land fails its decode's command buffer ([devices.md](devices.md),
   "A decode"). Where it failed in its device cache, decoded there or written
   by the video processing, the cache is acquired first
-  (`video_host::failed_in_caches`), once the driver answered: the device's
-  reads see what the hardware left, as a Mac's reads of an IOSurface do. A
-  stall's work, which may still write, is acquired by nothing.
+  (`video_host`'s `Landing::failed_in_caches`), once the driver answered:
+  the device's reads see what the hardware left, as a Mac's reads of an
+  IOSurface do. A stall's work, which may still write, is waited for first:
+  the landing waits for the work it kept (the stalled pool, the frame's
+  target, a stalled write into the cache) to be let go, up to
+  `video_host::STALL_HOLD` (10 s), and the process dies past it.
 - **Surfaces.** A picture holds its decode surface until it lands, and
   the session holds no more pictures unlanded than the decoder's spare
   frames (`SPARE_FRAMES`, 2). The decoder's pool makes a surface only for

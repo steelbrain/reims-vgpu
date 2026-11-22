@@ -109,6 +109,8 @@ use reims_vgpu_video::core::device_memory::{
     DeviceImports, DmaBufError, MemoryIdentity, SurfaceDmaBuf,
 };
 use reims_vgpu_video::core::device_memory::{DeviceMemory, GuestTarget};
+#[cfg(unix)]
+use reims_vgpu_video::core::device_wait::KeptMark;
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
@@ -138,7 +140,7 @@ use super::decode::{
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
 
 #[cfg(unix)]
-use super::video_host::failed_in_caches;
+use super::video_host::Failed;
 use super::video_host::{
     BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
     HostVideoSession, Landing, OutputPlane, picture_error,
@@ -1388,11 +1390,15 @@ impl VaGuestDecoder {
     }
 }
 
-/// Whether the driver's work that `error` failed has stopped writing: every error but a stall,
-/// whose work past its deadline may still write (the VA crate's `wait`).
+/// How the driver's work that `error` failed ended: stopped, for every error but a stall, whose
+/// work past its deadline may still write (the VA crate's `wait`), what the landing's thread kept
+/// of it from `since` on.
 #[cfg(unix)]
-fn stopped(error: &reims_vgpu_video::vaapi::Error) -> bool {
-    !matches!(error, reims_vgpu_video::vaapi::Error::Stalled(_))
+fn work_ended(error: &reims_vgpu_video::vaapi::Error, since: KeptMark) -> Failed {
+    match error {
+        reims_vgpu_video::vaapi::Error::Stalled(_) => Failed::Stalled(since),
+        _ => Failed::Stopped,
+    }
 }
 
 /// What a VideoToolbox decoder sees of `error`: a stream that does not decode as bad data, one the
@@ -1457,11 +1463,16 @@ impl<P: Platform> VaPicture<P> {
 impl<P: Platform> HostPicture<P> for VaPicture<P> {
     fn land(self: Box<Self>, to: &mut Landing<'_, P>) -> Result<(), BackendError> {
         // Decoded into its output's cache: there once its decode is done, and the device's
-        // reads of the cache see it once the platform acquired what the driver wrote.
+        // reads of the cache see it once the platform acquired what the driver wrote. A decode
+        // that failed is said written all the same; one that stalled once the work the stall
+        // kept is let go, the frame's target among it, which the frame keeps as it drops.
         #[cfg(unix)]
         if self.frame.is_in_target() {
+            let since = KeptMark::here();
             if let Err(error) = self.frame.sync() {
-                return Err(failed_in_caches(&[to.luma], stopped(&error), error.into()));
+                let failed = work_ended(&error, since);
+                drop(self);
+                return Err(to.failed_in_caches(&[to.luma], failed, error.into()));
             }
             to.luma.external_write_done()?;
             to.decoded_there();
@@ -1496,6 +1507,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
                 match targets.in_cache(to.luma, to.chroma, bit_depth) {
                     Ok((layout, bytes)) => {
                         to.writes_only(processed(&self.frame, &layout, bit_depth))?;
+                        let since = KeptMark::here();
                         match self.write_in_place(&layout, &bytes, &mut || to.decode_done()) {
                             Ok(None) => {
                                 to.luma.external_write_done()?;
@@ -1503,8 +1515,8 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
                             }
                             Ok(Some(why)) => format!("in its device cache: {why}"),
                             Err(error) => {
-                                let stopped = stopped(&error);
-                                return Err(failed_in_caches(&[to.luma], stopped, error.into()));
+                                let failed = work_ended(&error, since);
+                                return Err(to.failed_in_caches(&[to.luma], failed, error.into()));
                             }
                         }
                     }

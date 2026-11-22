@@ -1,8 +1,12 @@
 use std::collections::VecDeque;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use reims_vgpu_graphics::wire::RGFX_VIDEO_CODEC_H264;
 use reims_vgpu_video::core::device_memory::MemoryLife;
+#[cfg(unix)]
+use reims_vgpu_video::core::device_wait::Unfinished;
 use reims_vgpu_video::core::runtime::StdRuntime;
 use reims_vgpu_vulkan::core::testkit::FakePlatform;
 use reims_vgpu_vulkan::core::testkit::calllog::Arg;
@@ -99,9 +103,26 @@ enum Picture {
     /// wrote, as the VA-API arm's GPU copier lands it.
     GpuCopied,
     /// A failure to land in the output's device caches, which the hardware wrote, its work
-    /// stopped where `true` ([`failed_in_caches`]).
+    /// stopped ([`Landing::failed_in_caches`]).
     #[cfg(unix)]
-    FailInCaches(bool),
+    FailInCaches,
+    /// A failure to land in the output's device caches whose work ran past its deadline: the
+    /// work it keeps on the landing's thread, where it keeps one, which its device is done with
+    /// once the flag is set ([`Stuck`]).
+    #[cfg(unix)]
+    StallInCaches(Option<Arc<AtomicBool>>),
+}
+
+/// A stalled picture's work, kept on the process's list until its device is done with it, once
+/// the flag is set.
+#[cfg(unix)]
+struct Stuck(Arc<AtomicBool>);
+
+#[cfg(unix)]
+impl Unfinished for Stuck {
+    fn finished(&mut self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl HostPicture<P> for Picture {
@@ -200,9 +221,19 @@ impl HostPicture<P> for Picture {
                 Ok(())
             }
             #[cfg(unix)]
-            Picture::FailInCaches(stopped) => {
+            Picture::FailInCaches => {
                 let failed = "the hardware failed the decode".into();
-                Err(failed_in_caches(&[to.luma], stopped, failed))
+                Err(to.failed_in_caches(&[to.luma], Failed::Stopped, failed))
+            }
+            #[cfg(unix)]
+            Picture::StallInCaches(kept) => {
+                let since = KeptMark::here();
+                if let Some(done) = kept {
+                    let runtime = StdRuntime::shared();
+                    Lingering::process(&runtime).keep("a test's stalled write", Box::new(Stuck(done)));
+                }
+                let failed = "the hardware's write ran past its deadline".into();
+                Err(to.failed_in_caches(&[to.luma], Failed::Stalled(since), failed))
             }
         }
     }
@@ -590,70 +621,175 @@ impl reims_vgpu_vulkan::core::platform::resource::SurfaceMemory for Acquires {
     }
 }
 
-/// A picture that fails to land in its output's device cache, which the hardware wrote, has the
-/// cache said written before the session signals its value where the hardware's work stopped,
-/// as the VA-API and NVDEC arms' failed decodes and writes into caches do
-/// ([`failed_in_caches`]): the device's reads see what the hardware left there. It is counted
-/// failed and its command buffer completes failed, as any failure to land. One whose work may
-/// still write, a stall, has nothing said.
+/// A session whose decodes land in one output whose luma plane lies in a device cache over
+/// [`Acquires`], which keeps the session's signalled value at each acquire: the session, the
+/// memory, and a decode into the output.
 #[cfg(unix)]
-#[test]
-fn a_failed_landing_in_a_cache_says_it_written_before_its_signal_once_stopped() {
-    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
-    let p = FakePlatform::new();
-    let log = Log::default();
-    let answers = vec![
-        Ok(Some(Picture::FailInCaches(true))),
-        Ok(Some(Picture::FailInCaches(false))),
-    ];
-    let s = session(&p, answers, &log);
-    let memory = Arc::new(Acquires {
-        event: event_of(&s).clone_ref(),
-        seen: Mutex::new(Vec::new()),
-    });
-    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
-    let cache = buffer(&p, 16384, PRIVATE);
-    let life = MemoryLife::new();
-    let desc = p.texture_descriptor(&TextureDesc {
-        pixel_format: 10, // MTLPixelFormatR8Unorm
-        width: 96,
-        height: 64,
-        ..TextureDesc::default()
-    });
-    let texture = (p.device().new_texture(OnFault::Return, &desc))
-        .unwrap()
-        .unwrap();
-    let into = || {
-        let (mut luma, chroma) = planes(&cache, &cache, 96);
+struct InCache {
+    s: HostVideoSession<P>,
+    memory: Arc<Acquires>,
+    bitstream: FakeBuffer,
+    cache: FakeBuffer,
+    life: MemoryLife,
+    texture: <P as Platform>::Texture,
+}
+
+#[cfg(unix)]
+impl InCache {
+    fn new(p: &FakePlatform, answers: Vec<Result<Option<Picture>, &'static str>>) -> Self {
+        use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+        let s = session(p, answers, &Log::default());
+        let memory = Arc::new(Acquires {
+            event: event_of(&s).clone_ref(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let desc = p.texture_descriptor(&TextureDesc {
+            pixel_format: 10, // MTLPixelFormatR8Unorm
+            width: 96,
+            height: 64,
+            ..TextureDesc::default()
+        });
+        let texture = (p.device().new_texture(OnFault::Return, &desc))
+            .unwrap()
+            .unwrap();
+        InCache {
+            s,
+            memory,
+            bitstream: buffer(p, 4096, STORAGE_SHARED),
+            cache: buffer(p, 16384, PRIVATE),
+            life: MemoryLife::new(),
+            texture,
+        }
+    }
+
+    fn decode(&self) -> Decoded {
+        let (mut luma, chroma) = planes(&self.cache, &self.cache, 96);
         let memory: Arc<dyn reims_vgpu_vulkan::core::platform::resource::SurfaceMemory> =
-            Arc::clone(&memory) as _;
+            Arc::clone(&self.memory) as _;
         luma.surface = Some(SurfaceTarget {
             memory,
-            identity: life.identity(),
-            texture: texture.clone_ref(),
+            identity: self.life.identity(),
+            texture: self.texture.clone_ref(),
             offset: 0,
             bytes_per_row: 128,
             rows: 64,
         });
-        s.decode(&decode(&bitstream, &[], (luma, chroma))).unwrap()
-    };
+        (self.s)
+            .decode(&decode(&self.bitstream, &[], (luma, chroma)))
+            .unwrap()
+    }
+}
 
-    let stopped = into();
+/// A picture that fails to land in its output's device cache, which the hardware wrote, has the
+/// cache said written before the session signals its value, as the VA-API and NVDEC arms' failed
+/// decodes and writes into caches do ([`Landing::failed_in_caches`]): the device's reads see
+/// what the hardware left there. It is counted failed and its command buffer completes failed,
+/// as any failure to land. One whose work ran past its deadline (a stall) and kept nothing is
+/// said written at once too.
+#[cfg(unix)]
+#[test]
+fn a_failed_landing_in_a_cache_says_it_written_before_its_signal() {
+    let p = FakePlatform::new();
+    let answers = vec![
+        Ok(Some(Picture::FailInCaches)),
+        Ok(Some(Picture::StallInCaches(None))),
+    ];
+    let c = InCache::new(&p, answers);
+
+    let stopped = c.decode();
     assert_eq!(stopped.value, 1);
-    assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
+    assert!(event_of(&c.s).wait_until_signaled_value(1, 10_000));
     assert_eq!(
-        *memory.seen.lock(),
+        *c.memory.seen.lock(),
         [0],
         "said written once, before the signal"
     );
     assert!(stopped.landed.as_deref().is_some_and(Landed::failed));
 
-    let stalled = into();
+    let stalled = c.decode();
     assert_eq!(stalled.value, 2);
-    assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
-    assert_eq!(memory.seen.lock().len(), 1, "nothing said of a stall");
+    assert!(event_of(&c.s).wait_until_signaled_value(2, 10_000));
+    assert_eq!(
+        *c.memory.seen.lock(),
+        [0, 1],
+        "a stall that kept nothing, said written before its signal"
+    );
     assert!(stalled.landed.as_deref().is_some_and(Landed::failed));
-    assert_eq!(s.counts.lock().failed, 2);
+    assert_eq!(c.s.counts.lock().failed, 2);
+}
+
+/// A picture whose landing in its output's device cache ran past the hardware's deadline (a
+/// stall), with work kept that may still write the cache, has the cache said written only once
+/// that work is let go, its device done with it, and then before the session signals its value
+/// ([`Landing::failed_in_caches`]): no read of the cache comes before its acquire. Until then the
+/// session signals nothing, the later pictures' landings behind it; the next picture lands after
+/// it as any.
+#[cfg(unix)]
+#[test]
+fn a_stalled_landing_in_a_cache_says_it_written_once_its_kept_work_is_let_go() {
+    let p = FakePlatform::new();
+    let done = Arc::new(AtomicBool::new(false));
+    let answers = vec![
+        Ok(Some(Picture::StallInCaches(Some(Arc::clone(&done))))),
+        Ok(Some(Picture::FailInCaches)),
+    ];
+    let c = InCache::new(&p, answers);
+    let stalled = c.decode();
+    let next = c.decode();
+    assert_eq!((stalled.value, next.value), (1, 2));
+    assert!(
+        !event_of(&c.s).wait_until_signaled_value(1, 500),
+        "no signal while the work is kept"
+    );
+    assert!(c.memory.seen.lock().is_empty(), "nothing said while kept");
+    done.store(true, Ordering::SeqCst);
+    assert!(event_of(&c.s).wait_until_signaled_value(2, 10_000));
+    assert_eq!(
+        *c.memory.seen.lock(),
+        [0, 1],
+        "said written once let go, before its signal, then the next picture's"
+    );
+    assert!(stalled.landed.as_deref().is_some_and(Landed::failed));
+    assert_eq!(c.s.counts.lock().failed, 2);
+}
+
+/// A stalled landing whose kept work is not let go within its bound ends the process, at a
+/// fault of the decode ([`hold_while_kept`]): the cache is never read unacquired, and nothing
+/// waits for it unbounded. Work kept before the mark, or on another thread, holds nothing.
+#[cfg(unix)]
+#[test]
+fn a_stalled_landing_whose_kept_work_is_not_let_go_ends_the_process() {
+    use reims_vgpu_vulkan::core::testkit::capture::catch_death;
+    let runtime = StdRuntime::shared();
+    let lingering = Lingering::process(&runtime);
+    let error: BackendError = "the hardware's write ran past its deadline".into();
+    let before = Arc::new(AtomicBool::new(false));
+    lingering.keep("a test's work kept before", Box::new(Stuck(Arc::clone(&before))));
+    let since = KeptMark::here();
+    let elsewhere = Arc::new(AtomicBool::new(false));
+    let kept = Arc::clone(&elsewhere);
+    std::thread::spawn(move || {
+        lingering.keep("a test's work kept elsewhere", Box::new(Stuck(kept)));
+    })
+    .join()
+    .unwrap();
+    let within = Duration::from_millis(300);
+    assert_eq!(
+        catch_death(|| hold_while_kept(&*runtime, since, within, &error)),
+        Ok(()),
+        "nothing this thread kept since the mark"
+    );
+    let stuck = Arc::new(AtomicBool::new(false));
+    lingering.keep("a test's stalled write", Box::new(Stuck(Arc::clone(&stuck))));
+    let started = runtime.now();
+    assert_eq!(
+        catch_death(|| hold_while_kept(&*runtime, since, within, &error)),
+        Err(decode_fault("").site())
+    );
+    assert!(runtime.elapsed_since(started) >= within, "held to its bound");
+    for done in [&before, &elsewhere, &stuck] {
+        done.store(true, Ordering::SeqCst);
+    }
 }
 
 /// A copy into the output's caches that the platform makes no blit encoder for is skipped, as

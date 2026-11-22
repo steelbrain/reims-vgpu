@@ -29,14 +29,17 @@
 //!
 //!   A picture that fails to land is logged and counted, and its value is signalled all the
 //!   same: the command buffer goes on with its output as the landing left it, as a GPU decode's
-//!   error leaves one. Where the hardware wrote the output's device caches and stopped, the
-//!   caches are said written before the signal ([`failed_in_caches`]), so the device reads what
-//!   it left there. A picture the hardware answered failed that the backend lands all the
-//!   same, as the hardware left it ([`Landing::hardware_failed`]), is logged and counted apart,
-//!   and lands as any other: a Mac's hardware H.264 decoder hands such a picture on with no
-//!   error (`super::nvidia`). A copy into the caches that the platform makes no blit encoder
-//!   for is skipped, as the decoder skips whole a pass the platform makes no encoder of: the
-//!   picture lands with the caches as they were, and is not counted as a failure to land
+//!   error leaves one. Where the hardware wrote the output's device caches, the caches are said
+//!   written before the signal ([`Landing::failed_in_caches`]), so the device reads what it left
+//!   there. Where its work ran past its deadline and may still write (a stall), the landing
+//!   first waits up to [`STALL_HOLD`] for the work the backend kept to be let go, its device done
+//!   with it, and the process dies past it: no read of the caches comes before their acquire,
+//!   and none waits for them unbounded. A picture the hardware answered failed that the backend
+//!   lands all the same, as the hardware left it ([`Landing::hardware_failed`]), is logged and
+//!   counted apart, and lands as any other: a Mac's hardware H.264 decoder hands such a picture
+//!   on with no error (`super::nvidia`). A copy into the caches that the platform makes no blit
+//!   encoder for is skipped, as the decoder skips whole a pass the platform makes no encoder of:
+//!   the picture lands with the caches as they were, and is not counted as a failure to land
 //!   (`Stage::copy_with_caches`).
 //!
 //!   **A short picture**, one whose write covers less of a plane than its crop (each plane's
@@ -87,6 +90,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use reims_vgpu_video::core::device_memory::MemoryIdentity;
+#[cfg(unix)]
+use reims_vgpu_video::core::device_wait::{KeptMark, Lingering, poll_until};
 use reims_vgpu_video::core::runtime::{MonoTime, Runtime};
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::platform::Handle as _;
@@ -115,6 +120,14 @@ use super::drawn::DrawnTarget;
 
 /// How long a session's end waits for its last picture to land.
 pub(crate) const TEARDOWN_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a picture's landing that failed in device caches when the hardware's work ran past
+/// its deadline waits for that work to be let go, before it acquires the caches
+/// ([`Landing::failed_in_caches`]): 10 s on the session's clock, twice the hardware's own deadline
+/// (`reims_vgpu_video::core::device_wait::DEVICE_WAIT`), so that the work has 15 s from its first
+/// wait to finish. Ours. Past it, the process dies.
+#[cfg(unix)]
+pub(crate) const STALL_HOLD: Duration = Duration::from_secs(10);
 
 /// `MTLResourceStorageModeShared`: the staging buffers' storage, host bytes the GPU reads.
 const STORAGE_SHARED: u64 = 0;
@@ -1534,20 +1547,38 @@ fn land<P: Platform>(
     Ok((Way::of(is_staged, cached, by_cpu), hardware_failed, cpu))
 }
 
-/// `error`, a picture's failed landing into `planes`' device caches, which the hardware wrote:
-/// where it has stopped (`stopped`), each plane is said written first
-/// ([`OutputPlane::external_write_done`]), as the landing would have said it, so the device's
-/// reads of the caches see what the hardware left there, as reads of an IOSurface that a failed
-/// decode wrote do, before the session's signal of the failure. Work that may still write (a
-/// stall) is said nothing of, since its writes may land after the acquire. A refused acquire is
-/// logged, and the landing fails with `error` either way, logged and counted as any failure.
+/// How the hardware's work ended where a picture failed to land in device caches
+/// ([`Landing::failed_in_caches`]).
 #[cfg(unix)]
-pub(crate) fn failed_in_caches<P: Platform>(
-    planes: &[&OutputPlane<P>],
-    stopped: bool,
-    error: BackendError,
-) -> BackendError {
-    if stopped {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Failed {
+    /// It has stopped: nothing it wrote is still being written.
+    Stopped,
+    /// It ran past its deadline (a stall), and what the landing's thread kept of it from the
+    /// mark on (`reims_vgpu_video::core::device_wait::Lingering`) may still write.
+    Stalled(KeptMark),
+}
+
+impl<P: Platform> Landing<'_, P> {
+    /// `error`, the picture's failed landing into `planes`' device caches, which the hardware
+    /// wrote: each plane is said written ([`OutputPlane::external_write_done`]), as the landing
+    /// would have said it, so the device's reads of the caches see what the hardware left there,
+    /// as reads of an IOSurface that a failed decode wrote do, before the session's signal of the
+    /// failure. Where the work stalled, its writes may land after an acquire, so the acquire
+    /// waits first for the work kept since the mark to be let go, its device done with it, up to
+    /// [`STALL_HOLD`] on the session's clock ([`hold_while_kept`]); past it, the process dies. A
+    /// refused acquire is logged, and the landing fails with `error` either way, logged and
+    /// counted as any failure.
+    #[cfg(unix)]
+    pub(crate) fn failed_in_caches(
+        &self,
+        planes: &[&OutputPlane<P>],
+        failed: Failed,
+        error: BackendError,
+    ) -> BackendError {
+        if let Failed::Stalled(since) = failed {
+            hold_while_kept(self.clock, since, STALL_HOLD, &error);
+        }
         for plane in planes {
             if let Err(why) = plane.external_write_done() {
                 log::warn!(
@@ -1556,8 +1587,26 @@ pub(crate) fn failed_in_caches<P: Platform>(
                 );
             }
         }
+        error
     }
-    error
+}
+
+/// Waits on `clock` until no work the thread of `since` kept after the mark is held, its device
+/// not done with it ([`Lingering::holds_since`]), asking after it as a backend asks after its
+/// device ([`poll_until`]): at once where none was kept. Past `within`, the process dies with a
+/// fault of the decode (`error`'s): the device's memory the work may still write is never read
+/// before it is acquired, and no read of it waits unbounded.
+#[cfg(unix)]
+fn hold_while_kept(clock: &dyn Runtime, since: KeptMark, within: Duration, error: &BackendError) {
+    let held = || Lingering::made().is_some_and(|kept| kept.holds_since(since));
+    let let_go = poll_until(clock, clock.deadline_in(within), || (!held()).then_some(()));
+    if let_go.is_none() {
+        decode_fault(format_args!(
+            "a picture's landing in its device caches, {error}: the hardware's work, which may \
+             still write them, was not done {within:?} past its deadline"
+        ))
+        .fatal()
+    }
 }
 
 mod encode;

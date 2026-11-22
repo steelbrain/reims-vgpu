@@ -140,9 +140,12 @@ where it is NVIDIA's and CUDA opens it (`graphics/video_choice.rs`).
   the session refuses still signals the decode's value, so its command
   buffer completes, failed with Metal's internal error. Where its write into
   the device caches failed (a decode NVDEC failed, before the copies), the
-  caches are acquired first (`video_host::failed_in_caches`); work past its
-  deadline, which may still write, is acquired by nothing. For HEVC the guest's
-  video driver's schedule of the picture waits for that verdict and fails
+  caches are acquired first (`video_host`'s `Landing::failed_in_caches`).
+  Where the work ran past its deadline and may still write, the landing
+  first waits for the work it kept, with the imports, to be let go, up to
+  `video_host::STALL_HOLD` (10 s), and the process dies past it. For HEVC
+  the guest's video driver's schedule of the picture waits for that verdict
+  and fails
   (`kVTVideoDecoderMalfunctionErr`),
   which AppleGVA reports from that frame on, so no frame of the picture
   reaches the guest. AppleGVA's H.264 decoder reports no failure a driver can
