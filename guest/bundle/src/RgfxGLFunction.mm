@@ -63,13 +63,13 @@ void logOnce(const std::string &why)
 }
 
 // The bytes of entries an app's store keeps (RgfxGLStore.hpp): 64 MiB. Heaven, the heaviest GL
-// app measured, asks for 298 variants and 34 stage-in kernels over all its scenes, whose IR,
-// plugin data and lowered bytes take 9.5 MB (measured: macOS 26.7.2, an RTX 3090), so the cap
-// holds an app's variants at several settings, and an app's directory holds no more.
+// app measured, asks for 298 variants and 34 stage-in kernels over all its scenes, which its
+// store keeps in 332 entries of 22.3 MB (measured: macOS 26.7.2, an RTX 3090), so the cap holds
+// Heaven's variants three times over, and an app's directory holds no more.
 constexpr uint64_t kStoreCap = 64ull << 20;
 
-// The bytes of keys and variants a process's memo holds (RgfxGLMemo): 32 MiB, over three times
-// Heaven's 9.5 MB.
+// The bytes of keys and variants a process's memo holds (RgfxGLMemo): 32 MiB, above the 22.3 MB
+// of Heaven's.
 constexpr uint64_t kMemoCap = 32ull << 20;
 
 // What decides a lowering besides its inputs (RgfxGLLoweringIdentity), or empty where the
