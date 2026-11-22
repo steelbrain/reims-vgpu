@@ -344,9 +344,15 @@ fn a_create_destroyed_before_its_finish_begins_is_not_finished() {
         (reflection.obj_id, reflection.status),
         (id, RGFX_PIPELINE_OK)
     );
-    assert!(eventually(|| !pending(&device, id)), "the create never settled");
+    assert!(
+        eventually(|| !pending(&device, id)),
+        "the create never settled"
+    );
     let finished = world.finished();
-    assert!(finished.is_empty(), "a cancelled create was finished: {finished:?}");
+    assert!(
+        finished.is_empty(),
+        "a cancelled create was finished: {finished:?}"
+    );
     // The queue and the library.
     assert_eq!(device.decoder_object_count(), 2);
 }

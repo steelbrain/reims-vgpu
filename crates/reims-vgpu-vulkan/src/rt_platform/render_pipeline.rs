@@ -934,9 +934,10 @@ mod tests {
         let counters = device.rt().counters();
         let library = device.new_library(NUMBERED).expect("never a raise");
         let library = library.expect("a metallib").expect("a library");
+        let on = OnFault::Return;
         let function = |name: &str| {
-            let made = library.new_function(OnFault::Return, name);
-            made.expect("never a raise").expect("a function of the table")
+            let made = library.new_function(on, name).expect("never a raise");
+            made.expect("a function of the table")
         };
         let (vertex, fragment) = (
             function("numbered_vertex"),
