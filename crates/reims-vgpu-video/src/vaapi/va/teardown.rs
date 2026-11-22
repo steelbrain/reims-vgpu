@@ -19,6 +19,16 @@
 //!
 //! Two decoders that decode at once compare their pictures with a lone decoder's: on Windows,
 //! with one video decode queue on the device between them (`super::decode_queue`).
+//!
+//! On Windows these tests pass by the teardowns held and the contexts kept
+//! (`super::display::Display::release_teardown` and `context_let_go`), one decode queue on the
+//! device or not. Measured on the UHD Graphics 630 under vaon12, with that one queue (potluck job
+//! m3-max-65641, 2026-11-21): the same build with every teardown made at once and no context kept
+//! failed every run of the three tests that let a decoder go beside another, each of which passed
+//! with the holds. The full-pace test failed 3 of 3 (`vaEndPicture` failed, or an access
+//! violation, 0xc0000005); the churn test 3 of 3, an access violation 3 to 4 s in, after the first
+//! short decoder's let-go had dropped DXGI's local count from 407.7 MB to 252.4 MB at once; and
+//! `a_decoder_let_go_while_another_decodes_leaves_it_whole` 2 of 2, an access violation.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
