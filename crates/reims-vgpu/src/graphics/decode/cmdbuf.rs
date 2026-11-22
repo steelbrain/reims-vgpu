@@ -1223,6 +1223,8 @@ struct Take {
     predicates: bool,
     /// The luma and chroma textures of each of its decodes, in stream order.
     decodes: Vec<(u64, u64)>,
+    /// The source luma and chroma textures of each of its encodes, in stream order.
+    encodes: Vec<(u64, u64)>,
     /// How many video ops (decodes and encodes) it holds.
     video_ops: usize,
     /// The `Managed` buffers its first `UPLOADS_WRITTEN` names, with the bytes the buffer wrote
@@ -1304,6 +1306,7 @@ fn take(mut ops: &[u8]) -> Take {
                 RGFX_OP_GROUP_VIDEO => {
                     let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
                     out.decodes.extend(video::decode_textures(tag, body));
+                    out.encodes.extend(video::encode_textures(tag, body));
                     out.video_ops += 1;
                 }
                 _ => {}
@@ -1965,7 +1968,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             self.settle_surface(u.block_offset);
         }
         // What its work reaches of the caches beyond its uses: a decode's new output takes its
-        // first fill as met, where the buffer holds no other work ([`Reach`]).
+        // first fill as met, where the buffer holds no other work, and the caches' buffers its
+        // video ops read or write take the pages first ([`Reach`]).
         let reach = Reach {
             context: self.context,
             work: take.work,
@@ -1974,6 +1978,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 true => Vec::new(),
                 false => self.decoded_whole(&take.decodes),
             },
+            named: self.video_named(&take.decodes, &take.encodes),
         };
         let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
         // Owed by its queue from now until it is posted, after every buffer begun before it.

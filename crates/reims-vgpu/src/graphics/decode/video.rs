@@ -833,6 +833,14 @@ pub(super) fn decode_textures(tag: u16, payload: &[u8]) -> Option<(u64, u64)> {
     Some((m.luma_texture_obj_id, m.chroma_texture_obj_id))
 }
 
+/// The source luma and chroma textures an encode op `tag` of body `payload` reads; `None` for a
+/// tag that is no encode, or a body too short.
+pub(super) fn encode_textures(tag: u16, payload: &[u8]) -> Option<(u64, u64)> {
+    encode_codec(tag)?;
+    let (m, _) = RgfxVideoOpEncode::read_from_prefix(payload).ok()?;
+    Some((m.source_luma_texture_obj_id, m.source_chroma_texture_obj_id))
+}
+
 /// The session codec of an encode op `tag`; `None` for a tag that is no encode.
 fn encode_codec(tag: u16) -> Option<u32> {
     match tag {
@@ -1311,6 +1319,37 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Some((block, [plane(luma), plane(chroma)]))
             })
             .collect()
+    }
+
+    /// The blocks whose device caches' buffers the decodes `decodes` write and the encodes
+    /// `encodes` read (each one's luma and chroma textures), each once, with whether an encode
+    /// reads it ([`Reach::named`](super::surface_cache::Reach::named)): those of the textures
+    /// over an IOSurface plane whose buffer lies over its cache's buffer itself.
+    pub(super) fn video_named(
+        &self,
+        decodes: &[(u64, u64)],
+        encodes: &[(u64, u64)],
+    ) -> Vec<(u64, bool)> {
+        let block = |id| {
+            let place = self.entry(id)?.place?;
+            if !self.over_cache_of(place.buffer_obj_id) {
+                return None;
+            }
+            self.span_of(place.buffer_obj_id).map(|(block, _)| block)
+        };
+        let mut named: Vec<(u64, bool)> = Vec::new();
+        for (pairs, encoded) in [(decodes, false), (encodes, true)] {
+            for id in pairs.iter().flat_map(|&(luma, chroma)| [luma, chroma]) {
+                let Some(block) = block(id) else {
+                    continue;
+                };
+                match named.iter_mut().find(|(b, _)| *b == block) {
+                    Some((_, read)) => *read |= encoded,
+                    None => named.push((block, encoded)),
+                }
+            }
+        }
+        named
     }
 
     /// Where texture `id`, one over an IOSurface plane, lies, and the buffer it lies in, with

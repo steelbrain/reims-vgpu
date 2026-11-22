@@ -85,7 +85,11 @@
 //! finish, once their walks' shapes are marked; the uses counted after it wait for it on the GPU
 //! either way. A fill of the buffer from the pages (a newer CPU generation, a recovery, a block
 //! named again) refills every shape from the buffer, and the CPU's bytes win over the GPU's
-//! unwritten-back ones, as they win over the buffer's.
+//! unwritten-back ones, as they win over the buffer's. Where the buffer holds no memory, that
+//! fill copies the pages straight into every shape instead, and while the buffer lacks the pages
+//! after it, a fill of the shapes alone copies them straight into the new shapes, where no shape
+//! holds a write the buffer lacks ([`fill_from`]; `super::SurfaceCaches`'s "Straight fills"):
+//! one GPU copy of a shape's bytes, not one into the buffer and one out of it.
 //!
 //! **Placed images.** A new shape's image is made by the platform, which clears it. Where the
 //! platform places images (`ApiPlatform::PLACED_SHAPE_IMAGES`) and no command buffer begun and
@@ -98,7 +102,8 @@
 //!
 //! **Zeros.** A cache's buffer whose memory is not made yet (`super::SurfaceCaches`'s "Deferred
 //! memory") reads zero, as a new IOSurface's bytes do: every copy into it makes its memory first.
-//! While it holds none and no shape holds a write the buffer lacks, a fill from it would copy
+//! While it holds none, no fill went straight into the shapes (whose new shapes take the pages'
+//! bytes, "Fills"), and no shape holds a write the buffer lacks, a fill from it would copy
 //! zeros, and a shape on the platform's own image, which the platform cleared at its make
 //! ([`Shape::cleared`]), holds them already: its fill is taken as made, with no copy, and the
 //! buffer's memory is left unmade (`SurfaceCaches::fill_shapes`), counted ([`ZERO_TAKEN`]). The
@@ -201,6 +206,12 @@ pub(crate) const UNPLACED_UNFILLED: &str = "rt-shape-unplaced-unfilled";
 /// them, as its cache would hold zeros ([`ShapeCounts::unplaced_zeros`]).
 pub(crate) const ZERO_TAKEN: &str = "rt-shape-zero-taken";
 pub(crate) const UNPLACED_ZEROS: &str = "rt-shape-unplaced-zeros";
+
+/// The counts' code of a command that named a cache's buffer that lacked the pages its shapes
+/// took straight from them, with no begin having readied it (`SurfaceCaches`' module doc,
+/// "Straight fills"): it reads the zeros of the buffer's memory's make, not the pages
+/// (`Caches::memory_of`). The bundle never names such a buffer.
+pub(crate) const LACKING_NAMED: &str = "rt-shape-lacking-named";
 
 /// The degradation code of an encoder that may have written two shapes of one plane: Metal
 /// would write the plane's one texture memory through both in the order the GPU ran them, which
@@ -372,6 +383,13 @@ pub(crate) struct ShapeCounts {
     /// all of an entry's at a fill of its buffer.
     pub(crate) fills: u64,
     pub(crate) filled_bytes: u64,
+    /// Of `fills`, those straight from the surface's pages, with no copy through the cache's
+    /// buffer, and their bytes ([`fill_from`]); the copies they took, a run of rows that lie in
+    /// one piece each, and of those, the rows split at a piece's end.
+    pub(crate) straight_fills: u64,
+    pub(crate) straight_bytes: u64,
+    pub(crate) straight_copies: u64,
+    pub(crate) straight_split_rows: u64,
     /// Fills of the shapes alone, made on the transfer queue
     /// (`SurfaceCaches::fill_shapes`), and of those, ones asked behind command buffers not
     /// finished.
@@ -898,17 +916,116 @@ pub(crate) fn fill<P: Platform>(
                 destination_origin: MtlOrigin::default(),
             },
         )?;
-        shape.owed = false;
-        shape.dirty = false;
-        counts.fills += 1;
-        counts.filled_bytes += shape.bytes;
-        counts.plane_fills += u64::from(shape.plane);
-        if std::mem::take(&mut shape.video) {
-            counts.video_fills += 1;
-            counts.video_filled_bytes += shape.bytes;
-        }
+        filled(shape, counts);
     }
     blit.encode(ON, BlitCmd::EndEncoding)?;
+    Ok(())
+}
+
+/// `shape` took its fill ([`fill`], [`fill_from`]): it owes none and holds no write the buffer
+/// lacks; counted in `counts`.
+fn filled<T>(shape: &mut Shape<T>, counts: &mut ShapeCounts) {
+    shape.owed = false;
+    shape.dirty = false;
+    counts.fills += 1;
+    counts.filled_bytes += shape.bytes;
+    counts.plane_fills += u64::from(shape.plane);
+    if std::mem::take(&mut shape.video) {
+        counts.video_fills += 1;
+        counts.video_filled_bytes += shape.bytes;
+    }
+}
+
+/// A buffer that holds some of a surface's bytes for a fill straight from its pages
+/// ([`fill_from`]): the buffer, the surface's bytes it holds, and the offset in it of the first.
+pub(crate) type Source<'a, B> = (&'a B, std::ops::Range<u64>, u64);
+
+/// Encodes on `blit` a copy into each shape of `table` that `pick` picks of its bytes straight
+/// from the surface's pages, with none through the cache's buffer (`surface_cache`'s module doc,
+/// "Straight fills"): from `sources`, the pages' view, or the pieces a staged fill copied them
+/// into, which together hold every byte of the shapes. A shape's rows go in runs, each of the
+/// rows that lie in one source; a row that crosses a source's end goes in parts split there,
+/// each its own texels, which the caller made sure the split lies between
+/// (`SurfaceCache::fills_straight`). The shape then owes no fill and holds no write the buffer
+/// lacks, as [`fill`] leaves it, counted in `counts` as a fill and as one made straight, with the
+/// copies encoded. A row no source holds ends its shape's copies there.
+pub(crate) fn fill_from<P: Platform>(
+    blit: &P::BlitEncoder,
+    sources: &[Source<'_, P::Buffer>],
+    table: &mut ShapeTable<P::Texture>,
+    pick: &dyn Fn(&Shape<P::Texture>) -> bool,
+    counts: &mut ShapeCounts,
+) -> RaiseResult<()> {
+    const ON: OnFault = OnFault::Return;
+    let source_of = |byte: u64| sources.iter().find(|(_, held, _)| held.contains(&byte));
+    for shape in table.iter_mut().filter(|s| pick(s)) {
+        let key = shape.key;
+        let row = key.width.saturating_mul(key.texel_bytes);
+        let mut y = 0;
+        'rows: while y < key.height {
+            let start = (key.offset).saturating_add(y.saturating_mul(key.bytes_per_row));
+            let end = start.saturating_add(row);
+            let Some(&(buffer, ref held, at)) = source_of(start) else {
+                break;
+            };
+            if end <= held.end {
+                // The rows from `y` that end in this source.
+                let rows = ((held.end - end).checked_div(key.bytes_per_row))
+                    .map_or(1, |more| more.saturating_add(1))
+                    .min(key.height - y);
+                blit.encode(
+                    ON,
+                    BlitCmd::CopyBufferToTexture {
+                        source_buffer: buffer,
+                        source_offset: at + (start - held.start),
+                        source_bytes_per_row: key.bytes_per_row,
+                        source_bytes_per_image: key.bytes_per_row.saturating_mul(rows),
+                        source_size: MtlSize::new(key.width, rows, 1),
+                        destination_texture: &shape.image,
+                        destination_slice: 0,
+                        destination_level: 0,
+                        destination_origin: MtlOrigin { x: 0, y, z: 0 },
+                    },
+                )?;
+                counts.straight_copies += 1;
+                y += rows;
+                continue;
+            }
+            // The row crosses its source's end: each part from the source that holds it.
+            let mut from = start;
+            while from < end {
+                let Some(&(buffer, ref held, at)) = source_of(from) else {
+                    break 'rows;
+                };
+                let part = held.end.min(end) - from;
+                blit.encode(
+                    ON,
+                    BlitCmd::CopyBufferToTexture {
+                        source_buffer: buffer,
+                        source_offset: at + (from - held.start),
+                        source_bytes_per_row: part,
+                        source_bytes_per_image: part,
+                        source_size: MtlSize::new(part / key.texel_bytes, 1, 1),
+                        destination_texture: &shape.image,
+                        destination_slice: 0,
+                        destination_level: 0,
+                        destination_origin: MtlOrigin {
+                            x: (from - start) / key.texel_bytes,
+                            y,
+                            z: 0,
+                        },
+                    },
+                )?;
+                counts.straight_copies += 1;
+                counts.straight_split_rows += u64::from(from == start);
+                from += part;
+            }
+            y += 1;
+        }
+        counts.straight_fills += 1;
+        counts.straight_bytes += shape.bytes;
+        filled(shape, counts);
+    }
     Ok(())
 }
 

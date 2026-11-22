@@ -2137,6 +2137,20 @@ impl<P: Platform> GraphicsDecoder<P> {
                     sh.zero_taken, sh.zero_taken_bytes >> 20
                 );
             }
+            if d.straight + d.buffer_refills + d.lacking_named > 0 {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "IOSurface device caches' straight fills: {} fills of a cache whose buffer \
+                     held no memory went straight from the pages into its shapes, none through \
+                     the buffer ({} shapes, {} MiB, in {} copies, {} rows split at a piece's \
+                     end); {} buffers took the pages after one, before a copy through them ({} \
+                     MiB), {} of them for a texture over the buffer or a video op; {} commands \
+                     named a buffer that lacked them, reading zeros",
+                    d.straight, sh.straight_fills, sh.straight_bytes >> 20, sh.straight_copies,
+                    sh.straight_split_rows, d.buffer_refills, d.buffer_refilled_bytes >> 20,
+                    d.buffer_refills_named, d.lacking_named
+                );
+            }
         }
         Some(status)
     }
@@ -4627,6 +4641,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
+                self.texture_over_cache(device, m.buffer_obj_id)?;
                 // The texture reads the guest's named buffer; a buffer the host
                 // does not hold is a guest protocol error, not a refusal.
                 let made = {
@@ -4690,6 +4705,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let descriptor = self.platform.texture_descriptor(&desc);
                 // As TEXTURE_FROM_BUFFER's, by the platform's linear form, which takes a 2D
                 // array and the bytes between its slices.
+                self.texture_over_cache(device, m.buffer_obj_id)?;
                 let made = {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
@@ -4855,6 +4871,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let (made, shape) = match shaped {
                     Some((texture, shape)) => (Some(texture), Some(shape)),
                     None => {
+                        if wide.is_none() {
+                            self.texture_over_cache(device, m.buffer_obj_id)?;
+                        }
                         let Some(ObjHandle::Buffer(cache)) = self.named(m.buffer_obj_id) else {
                             return Ok(Err(DecodeError::BadReference));
                         };
@@ -5284,6 +5303,20 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`Entry::over_cache`]).
     pub(super) fn over_cache_of(&self, obj_id: u64) -> bool {
         self.entry(obj_id).is_some_and(|e| e.over_cache)
+    }
+
+    /// A texture is about to be made over the buffer `obj_id` names: where that is a device
+    /// cache's buffer itself ([`Entry::over_cache`]) that lacks the pages its shapes took, the
+    /// buffer takes them first, so the texture reads the surface, not the zeros of its memory's
+    /// make ([`surface_cache::Caches::texture_over`]; the cache's module doc, "Straight fills").
+    fn texture_over_cache(&self, device: &P::Device, obj_id: u64) -> RaiseResult<()> {
+        match self.entry(obj_id) {
+            Some(e) if e.over_cache => match e.span {
+                Some((block, _)) => self.surface_caches.texture_over(device, block),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
     }
 
     /// The host bytes of the heap over a pages block's guest RAM `obj_id` names
@@ -7311,7 +7344,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// [`refused::out_of_memory`]'s, which drops the op, and the command buffer fails
     /// ([`Self::out_of_memory`]).
     fn cache_memory(&self, id: u64, entry: &Entry<P>, buffer: &P::Buffer) -> RaiseResult<()> {
-        if !entry.over_cache || self.surface_caches.memory_of(buffer) {
+        let block = entry.span.map(|(block, _)| block);
+        if !entry.over_cache || self.surface_caches.memory_of(block, buffer) {
             return Ok(());
         }
         self.out_of_memory.set(true);

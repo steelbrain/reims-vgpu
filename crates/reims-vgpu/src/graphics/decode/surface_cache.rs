@@ -344,9 +344,11 @@
 //!   copies a command buffer's finish makes (the copies deferred behind it), by the thread that
 //!   finishes it, and those of a first fill a begin, a buffer or a decode reaches, of a block named
 //!   again, of a cache's refills after a recovery of the device, each by the thread that asks
-//!   it ([`reserve_ahead`]). The copy takes them first; what it leaves is the next copy's of the
-//!   block under the same hold of the lock ([`SurfaceCaches::left_over`]), and what is left is
-//!   given back as the lock is let go of, the scratch pieces let go of with no lock held. A copy
+//!   it ([`reserve_ahead`]); a copy out of a buffer that lacks the pages ("Straight fills")
+//!   reserves those of its fill of the buffer too. The copy takes them first; what it leaves is
+//!   the next copy's of the block under the same hold of the lock ([`SurfaceCaches::left_over`]),
+//!   and what is left is given back as the lock is let go of, the scratch pieces let go of with
+//!   no lock held. A copy
 //!   that still finds no piece (one with no reservation, or one that moves more bytes than its
 //!   reservation saw) makes its piece on its own thread, under the caches' lock, counted
 //!   (`rt-staging-piece-makes-locked`). Each piece taken is counted (`rt-staging-pieces`, and
@@ -420,7 +422,38 @@
 //!   ([`CommandBuffer::fail_out_of_memory`], `super::GraphicsDecoder::require_buffer`); a write's
 //!   copy into the other shapes of its plane, at the end of its encoder, fails its command buffer
 //!   so, and leaves those shapes as they were. A create of a texture over the buffer is refused
-//!   (nil) where the platform refuses its memory.
+//!   (nil) where the platform refuses its memory. A fill straight into the shapes makes none
+//!   ("Straight fills", below).
+//!
+//! - **Straight fills.** In the per-shape form a fill of a cache whose buffer holds no memory
+//!   copies the pages straight into its shapes' images, with nothing copied into the buffer
+//!   ([`SurfaceCache::fills_straight`]): its pages are a view or copied through pieces, it keeps
+//!   their layout with no wide home and carries nothing, no texture lies over its buffer as a rule,
+//!   and each shape's rows cross a piece's end only between texels. From the view, a shape's rows
+//!   go in one GPU copy; from the pieces the host's CPU copied the pages into ("Staged copies"), in
+//!   a copy for each run of rows that lies in one piece, a row that crosses a piece's end split
+//!   there ([`shapes::fill_from`]). A fill through the buffer makes two GPU copies of each byte,
+//!   the pages into the buffer and the buffer into each shape, and holds the buffer's memory from
+//!   then on; a straight one makes one, and a surface filled so and never copied through makes no
+//!   memory of its buffer. A shape made later fills the same way while no shape holds a write the
+//!   buffer lacks. The buffer then lacks the pages ([`SurfaceCache::lacks`]), and each copy through
+//!   it fills it from them first, in the same command buffer ([`refill`]): a fill of its shapes
+//!   from it, a write-back, a download, a release's copy and an early copy, but for a copy out that
+//!   moves none of its bytes; a fill into the buffer ends it. Its pieces are reserved with the
+//!   copy's ("Staged copies"). What else reads or writes the buffer has it take the pages before it
+//!   runs: a command buffer whose video ops decode into the buffer or encode from it makes its
+//!   memory at its begin, with the caches' lock let go of, so no fill of its uses goes straight,
+//!   and a buffer that lacks the pages takes them as a fill of its shapes would ([`Reach::named`]);
+//!   a texture made over the buffer has it take them as it is made, on the transfer queue, before
+//!   the uses counted after it ([`Caches::texture_over`]). A command that names the buffer with no
+//!   begin having readied it reads the zeros of its memory's make, counted
+//!   ([`shapes::LACKING_NAMED`], [`Caches::memory_of`]); the bundle names the buffer only in
+//!   `TEXTURE_FROM_IOSURFACE` creates. A cache that lacks the pages never takes a shape's fill as
+//!   zeros ([`SurfaceCache::fills_zeros`]). A refill reads the pages as they are then, not as the
+//!   straight fill read them: where the CPU wrote them since without a read-write lock, the buffer,
+//!   and a copy out of all of it after a refill, holds those later bytes beside the shapes' writes.
+//!   The straight fills, the shapes they filled, their bytes, copies and split rows, and the
+//!   refills, are on the caches' straight fills line.
 //!
 //! [`GpuDevice::new_deferred_buffer_of_length`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_deferred_buffer_of_length
 //! [`Buffer::make_memory`]: reims_vgpu_vulkan::core::platform::resource::Buffer::make_memory
@@ -508,6 +541,10 @@ static UNORDERED_LOGGED: AtomicBool = AtomicBool::new(false);
 /// Whether a shape was made over a plane holding one of the other kind ([`shapes::ORDER_CASE`]):
 /// its line is logged the first time alone, the rest counted (docs/conventions.md).
 static ORDER_CASE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a command named a cache's buffer that lacked the pages ([`shapes::LACKING_NAMED`]):
+/// its line is logged the first time alone, the rest counted (docs/conventions.md).
+static LACKING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The copies run under a live raise handler (the ring loop's, or the entry of the ring-0 thread
 /// that asks for them).
@@ -657,6 +694,10 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// Whether the caches' budget counts the buffer's bytes, its memory made, and what made it
     /// and copied through it since ([`BufferMemory`]).
     memory: BufferMemory,
+    /// The buffer lacks the pages' bytes its shapes hold: a fill made while its memory was not
+    /// made copied the pages into the shapes' images alone (the module doc, "Straight fills").
+    /// A copy through the buffer fills it from the pages first ([`refill`]), which ends it.
+    lacks: bool,
 }
 
 /// A cache's buffer's memory as the caches' budget counts it ([`SurfaceCache::held`]): a buffer
@@ -902,6 +943,17 @@ impl<P: Platform> SurfaceCache<P> {
         (cpu, Some(written))
     }
 
+    /// Whether a copy of the cache out to its pages moves none of its bytes, with no shape
+    /// holding a write to copy into the buffer first: a staged copy out whose record holds none of
+    /// the texels that may differ from the pages ([`Self::out_bytes`]).
+    fn moves_none_out(&self) -> bool {
+        let whole = 0..self.length;
+        let texels = (self.texels.clone()).unwrap_or_else(|| vec![whole]);
+        matches!(self.pages, Some(CachePages::Copied(_)))
+            && !self.shapes.iter().any(|s| s.dirty)
+            && (self.written_spans()).is_some_and(|written| clip(&written, &texels).is_empty())
+    }
+
     /// The host's copies of the shapes `ids` into the cache's buffer are encoded, each its whole
     /// extent at its place ([`shapes::write_back`]): their bytes may differ from the pages'.
     fn wrote_shapes(&mut self, ids: &[u64]) {
@@ -912,10 +964,39 @@ impl<P: Platform> SurfaceCache<P> {
 
     /// Whether a fill of its shapes from its buffer would copy zeros (the module doc of `shapes`,
     /// "Zeros"): its buffer holds no memory yet, so it reads zero, as every copy into it makes its
-    /// memory first; and no shape holds a write the buffer lacks, none that
+    /// memory first; no fill went straight into the shapes ([`Self::lacks`]), whose new shapes
+    /// take the pages' bytes; and no shape holds a write the buffer lacks, none that
     /// [`shapes::write_back`] would copy into it first.
     fn fills_zeros(&self) -> bool {
-        !self.device.memory_made() && !self.shapes.iter().any(|s| s.dirty && !s.owed)
+        !self.device.memory_made() && !self.lacks && !self.shapes.iter().any(|s| s.dirty && !s.owed)
+    }
+
+    /// Whether a fill of the cache from its pages goes straight into its shapes' images, with
+    /// nothing copied into its buffer (the module doc, "Straight fills"): its buffer holds no
+    /// memory, its pages are a view or are copied through pieces of `piece` bytes, it keeps the
+    /// pages' layout with no wide home, no texture lies over the buffer as a rule
+    /// ([`Self::raw`]), and each shape's rows cross a piece's end only between texels.
+    fn fills_straight(&self, piece: u64) -> bool {
+        if self.device.memory_made()
+            || self.raw
+            || self.carried.is_some()
+            || self.repitched.is_some()
+            || self.wide.is_some()
+        {
+            return false;
+        }
+        match &self.pages {
+            Some(CachePages::View(_)) => true,
+            Some(CachePages::Copied(_)) => (self.shapes.iter()).all(|s| {
+                let key = &s.key;
+                let texel = key.texel_bytes;
+                texel != 0
+                    && piece.is_multiple_of(texel)
+                    && key.offset.is_multiple_of(texel)
+                    && key.bytes_per_row.is_multiple_of(texel)
+            }),
+            Some(CachePages::Runs { .. }) | None => false,
+        }
     }
 }
 
@@ -1934,6 +2015,18 @@ pub(crate) struct CacheCounts {
     /// Fills, and the bytes they moved.
     pub(crate) fills: u64,
     pub(crate) filled_bytes: u64,
+    /// Of the fills, those straight into the shapes' images, with no copy into the buffer (the
+    /// module doc, "Straight fills"); and the fills of a buffer that lacked the pages after one,
+    /// before a copy through it ([`refill`]), and their bytes; and the fills of such a buffer
+    /// asked for a texture made over it ([`SurfaceCaches::take_pages`]) or for a command
+    /// buffer's video ops ([`Reach::named`]).
+    pub(crate) straight: u64,
+    pub(crate) buffer_refills: u64,
+    pub(crate) buffer_refilled_bytes: u64,
+    pub(crate) buffer_refills_named: u64,
+    /// Commands that named a cache's buffer that lacked the pages with no begin having readied
+    /// it, which read the zeros of its memory's make ([`shapes::LACKING_NAMED`]).
+    pub(crate) lacking_named: u64,
     /// Downloads, and the bytes they moved.
     pub(crate) downloads: u64,
     pub(crate) downloaded_bytes: u64,
@@ -2775,6 +2868,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 shapes: ShapeTable::default(),
                 shadow: ShapeTable::default(),
                 memory,
+                lacks: false,
             },
         );
         let pages = Pages {
@@ -3041,6 +3135,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 shapes: ShapeTable::default(),
                 shadow: ShapeTable::default(),
                 memory,
+                lacks: false,
             },
         );
         if carries {
@@ -3389,6 +3484,16 @@ impl<P: Platform> SurfaceCaches<P> {
         self.by_block.get(&block).map(|c| &c.device)
     }
 
+    /// The view of the pages of the block at `block` that its cache copies from, where it has
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn pages_view(&self, block: u64) -> Option<&P::Buffer> {
+        match &self.by_block.get(&block)?.pages {
+            Some(CachePages::View(pages)) => Some(pages),
+            _ => None,
+        }
+    }
+
     /// The layout at the GPU's pitch of the block at `block`'s cache, where it lays its surface
     /// out so ([`Repitched`]).
     pub(crate) fn repitched(&self, block: u64) -> Option<Arc<Repitched>> {
@@ -3502,6 +3607,12 @@ impl<P: Platform> SurfaceCaches<P> {
             .is_some_and(|cache| exported::decodes_into(&cache.surface, decoded.is_some()))
     }
 
+    /// Whether the block at `block`'s cache's buffer lacks the pages ([`SurfaceCache::lacks`]): a
+    /// fill of its shapes, and a copy through it, copy the pages in staged pieces.
+    fn lacks(&self, block: u64) -> bool {
+        (self.by_block.get(&block)).is_some_and(|cache| cache.lacks)
+    }
+
     /// Whether a shape of the block at `block`'s cache owes a fill from the buffer that no fill
     /// asked and not made will make ([`shapes::Shape::owed`]): a fill of the cache refills every
     /// shape, and one of the shapes fills those that owe one as it is made.
@@ -3568,13 +3679,15 @@ impl<P: Platform> SurfaceCaches<P> {
     /// make ([`Self::take_decoded`]): the use reads nothing of the cache, which the picture
     /// lands over. Where the buffer's work is `video` alone, which reads and writes the buffer,
     /// not the shapes' images, a shape's write the buffer lacks is copied into it first, as a
-    /// shape's fill copies it ([`Self::writes_back_first`]).
+    /// shape's fill copies it ([`Self::writes_back_first`]). Where the buffer's video ops read or
+    /// write the cache's buffer (`named`, [`Reach::named`]) and it lacks the pages, it takes them
+    /// first, as a fill of the shapes makes it take them (the module doc, "Straight fills").
     fn before_one(
         &mut self,
         device: &P::Device,
         cb: &P::CommandBuffer,
         u: &RgfxOpSurfaceUse,
-        (decoded, video, decodes): (Option<&[PagesPlane; 2]>, bool, bool),
+        (decoded, video, decodes, named): (Option<&[PagesPlane; 2]>, bool, bool, bool),
     ) -> (Option<Count>, RaiseResult<(bool, Option<u64>)>) {
         let block = u.block_offset;
         if let Some(planes) = decoded {
@@ -3595,6 +3708,9 @@ impl<P: Platform> SurfaceCaches<P> {
             }
         }
         let waits = self.pending(block, false) > 0 || self.deferring(block);
+        // A fill asked and not made takes the pages into the buffer as it is made, its memory
+        // made now.
+        let takes_pages = named && self.lacks(block) && self.last_deferred_fill(block).is_none();
         let mut filled = Ok(());
         if older || host_wrote || refill == Refill::Fill {
             if !older && host_wrote {
@@ -3611,7 +3727,9 @@ impl<P: Platform> SurfaceCaches<P> {
             || (video
                 && !self.decodes_into_surface(block, decoded)
                 && self.writes_back_first(block))
+            || takes_pages
         {
+            self.counts.buffer_refills_named += u64::from(takes_pages);
             if waits {
                 self.defer_shapes_fill(device, block);
             } else {
@@ -4726,6 +4844,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// once the copy lands ([`Landing`]).
     fn early_copies(
         &mut self,
+        device: &P::Device,
         queue: u64,
         on: Option<&P::CommandQueue>,
         counts: &[Count],
@@ -4777,13 +4896,17 @@ impl<P: Platform> SurfaceCaches<P> {
             else {
                 continue;
             };
+            if let Some((writer, end)) = after {
+                cb.encode_wait(Some(EventRef::Event(writer)), end)?;
+            }
+            // A buffer that lacks the pages takes them first ("Straight fills"), through the
+            // view, which needs no piece.
+            let staging = (None, &self.spares, &mut Vec::new());
+            refill::<P>(device, &cb, cache, block, &mut self.counts, staging)?;
             let view = match &cache.pages {
                 Some(CachePages::View(pages)) => Some(pages),
                 _ => None,
             };
-            if let Some((writer, end)) = after {
-                cb.encode_wait(Some(EventRef::Event(writer)), end)?;
-            }
             // The dirty shapes first, the writer's (rule 3); made clean once the copy is
             // committed, so one not committed leaves them dirty.
             let back = shapes::write_back::<P>(&cb, &cache.device, &cache.shapes, |s| s.dirty)?;
@@ -4874,8 +4997,14 @@ impl<P: Platform> SurfaceCaches<P> {
         if cache.pages.is_none() && cache.carried.is_none() {
             return Ok(None);
         }
-        // The buffer's memory first, as for every copy through it ("Deferred memory").
+        // A buffer with no memory makes none for a fill its shapes take straight from the pages
+        // ("Straight fills"); else the buffer's memory first, as for every copy through it
+        // ("Deferred memory").
+        let straight = self.shaped && cache.fills_straight(self.spares.piece);
         let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
+            if straight {
+                return true;
+            }
             let made = cache.copy_through(MemoryFor::Fill);
             self.memory_refused |= !made;
             made
@@ -4887,11 +5016,12 @@ impl<P: Platform> SurfaceCaches<P> {
         let timed = self.staged.as_ref();
         let mut reserve = self.reserved.remove(&block).unwrap_or_default();
         reserve.extend(self.left_over.remove(&block).unwrap_or_default());
+        let every: &dyn Fn(&shapes::Shape<P::Texture>) -> bool = &|_| true;
         let staged = copy::<P>(
             device,
             &cb,
             cache,
-            (Way::In, block),
+            (Way::In, block, straight.then_some(every)),
             &mut self.counts,
             (timed, &self.spares, &mut reserve),
             None,
@@ -4904,9 +5034,14 @@ impl<P: Platform> SurfaceCaches<P> {
             cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| staged.done()))?;
         }
         // Every shape takes the CPU's bytes the buffer took, its own writes not copied out
-        // overwritten as the buffer's are (the module doc of `shapes`).
-        let (buffer, table) = (&cache.device, &mut cache.shapes);
-        shapes::fill::<P>(&cb, buffer, table, |_| true, &mut self.counts.shapes)?;
+        // overwritten as the buffer's are (the module doc of `shapes`); a straight fill gave
+        // them the pages' bytes already.
+        if straight {
+            self.counts.straight += 1;
+        } else {
+            let (buffer, table) = (&cache.device, &mut cache.shapes);
+            shapes::fill::<P>(&cb, buffer, table, |_| true, &mut self.counts.shapes)?;
+        }
         #[cfg(windows)]
         exported::planes_filled(&cache.surface);
         transfer.signalled += 1;
@@ -4967,8 +5102,16 @@ impl<P: Platform> SurfaceCaches<P> {
         else {
             return Ok(None);
         };
-        // The buffer's memory first, as for every copy through it ("Deferred memory").
+        // A cache whose buffer lacks the pages and holds no memory fills its new shapes straight
+        // from them, where no shape holds a write the buffer lacks ("Straight fills"); else the
+        // buffer's memory first, as for every copy through it ("Deferred memory").
+        let straight = cache.lacks
+            && cache.fills_straight(self.spares.piece)
+            && !cache.shapes.iter().any(|s| s.dirty && !s.owed);
         let Some(cb) = (transfer.queue.command_buffer(ON)?).filter(|_| {
+            if straight {
+                return true;
+            }
             let made = cache.copy_through(MemoryFor::FillShapes);
             self.memory_refused |= !made;
             made
@@ -4977,11 +5120,34 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         wait_before::<P>(&cb, signal.as_ref())?;
         wait_for_users::<P>(&cb, &self.ends, cache)?;
-        let (buffer, table) = (&cache.device, &mut cache.shapes);
-        let back = shapes::write_back::<P>(&cb, buffer, table, |s| s.dirty && !s.owed)?;
         #[cfg(windows)]
-        let planes = table.iter().any(|s| s.plane && s.owed);
-        shapes::fill::<P>(&cb, buffer, table, |s| s.owed, &mut self.counts.shapes)?;
+        let planes = cache.shapes.iter().any(|s| s.plane && s.owed);
+        let timed = self.staged.as_ref();
+        let mut reserve = self.reserved.remove(&block).unwrap_or_default();
+        reserve.extend(self.left_over.remove(&block).unwrap_or_default());
+        let owed: &dyn Fn(&shapes::Shape<P::Texture>) -> bool = &|s| s.owed;
+        let mut filled = || -> RaiseResult<Vec<u64>> {
+            let staging = (timed, &self.spares, &mut reserve);
+            if straight {
+                let way = (Way::In, block, Some(owed));
+                let staged = copy::<P>(device, &cb, cache, way, &mut self.counts, staging, None)?;
+                if let Some(staged) = staged {
+                    cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| staged.done()))?;
+                }
+                return Ok(Vec::new());
+            }
+            // A buffer that lacks the pages takes them first, the dirty shapes' writes over them.
+            refill::<P>(device, &cb, cache, block, &mut self.counts, staging)?;
+            let (buffer, table) = (&cache.device, &mut cache.shapes);
+            let back = shapes::write_back::<P>(&cb, buffer, table, |s| s.dirty && !s.owed)?;
+            shapes::fill::<P>(&cb, buffer, table, owed, &mut self.counts.shapes)?;
+            Ok(back)
+        };
+        let filled = filled();
+        if !reserve.is_empty() {
+            self.left_over.insert(block, reserve);
+        }
+        let back = filled?;
         #[cfg(windows)]
         if planes {
             exported::planes_filled(&cache.surface);
@@ -5012,6 +5178,34 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         self.counts.shapes.fills_made += 1;
         Ok(Some(value))
+    }
+
+    /// The block at `block`'s cache's buffer, where it lacks the pages ([`SurfaceCache::lacks`])
+    /// and no fill asked and not made will bring them, takes them for a texture about to be made
+    /// over it ([`Caches::texture_over`]), its memory made already: by a fill of its shapes,
+    /// which copies the dirty shapes into it after the pages, as every copy through it does, at
+    /// once where no command buffer begun and not finished uses the cache and no copy of it
+    /// waits, else in the finish of the last one ([`Self::defer_shapes_fill`]); the uses
+    /// counted after it wait for it on the GPU either way.
+    fn take_pages(&mut self, device: &P::Device, block: u64) -> RaiseResult<()> {
+        if !self.lacks(block) || self.last_deferred_fill(block).is_some() {
+            return Ok(());
+        }
+        self.counts.buffer_refills_named += 1;
+        if self.pending(block, false) > 0 || self.deferring(block) {
+            self.defer_shapes_fill(device, block);
+            return Ok(());
+        }
+        self.fill_shapes(device, block).map(|_| ())
+    }
+
+    /// Whether the block at `block`'s cache's buffer lacks the pages as a command names it, its
+    /// memory not made ([`Caches::memory_of`]): counted, for the make's zeros it reads
+    /// ([`shapes::LACKING_NAMED`]).
+    fn named_lacking(&mut self, block: u64) -> bool {
+        let lacking = self.lacks(block);
+        self.counts.lacking_named += u64::from(lacking);
+        lacking
     }
 
     /// The zeros of the block at `block`'s cache (the module doc of `shapes`, "Zeros"), looked at
@@ -5271,8 +5465,10 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The lengths of the pieces a staged copy `way` of the block at `block`'s cache lays all of
-    /// the bytes it may move in, and whether it is the cache's first staged copy; `None` where its
-    /// copies that way are not staged.
+    /// the bytes it may move in, a copy out's fill of a buffer that lacks the pages first
+    /// ([`refill`], none where the copy moves none, [`SurfaceCache::moves_none_out`]), and
+    /// whether it is the cache's first staged copy; `None` where its copies that way are not
+    /// staged.
     fn staged_lens(&self, block: u64, way: Way) -> Option<(Vec<u64>, bool)> {
         let cache = self.by_block.get(&block)?;
         self.staged.as_ref()?;
@@ -5292,6 +5488,16 @@ impl<P: Platform> SurfaceCaches<P> {
         let lens = match (&cache.pages, way) {
             (Some(CachePages::Copied(_)), Way::Out) if rounds && lens.len() > ROUND_PIECES => {
                 circulated(&lens)
+            }
+            _ => lens,
+        };
+        // A copy out of a buffer that lacks the pages fills it from them first, in pieces of its
+        // own ([`refill`]), but for one that moves none of its bytes.
+        let lens = match (&cache.pages, way) {
+            (Some(CachePages::Copied(_)), Way::Out) if cache.lacks && !cache.moves_none_out() => {
+                let mut both = pack(std::iter::once(0..cache.length), self.spares.piece).lens;
+                both.extend(lens);
+                both
             }
             _ => lens,
         };
@@ -5365,8 +5571,8 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// The staged copies the finish of a command buffer whose counts are `counts` may make: those
     /// deferred of their blocks' caches ([`Self::run_deferred`]), by block and way. A fill of the
-    /// shapes alone stages nothing, nor does a copy out of a cache that would copy nothing
-    /// ([`Self::release_may_copy`]).
+    /// shapes alone stages nothing but where the buffer lacks the pages ([`Self::lacks`]), nor
+    /// does a copy out of a cache that would copy nothing ([`Self::release_may_copy`]).
     fn deferred_ways(&self, counts: &[Count]) -> Vec<(u64, Way)> {
         let mut ways = Vec::new();
         let mut seen = HashSet::new();
@@ -5374,6 +5580,9 @@ impl<P: Platform> SurfaceCaches<P> {
             for deferred in self.deferred.get(&c.block).into_iter().flatten() {
                 match &deferred.copy {
                     Asked::Fill { shapes: false, .. } => ways.push((c.block, Way::In)),
+                    Asked::Fill { shapes: true, .. } if self.lacks(c.block) => {
+                        ways.push((c.block, Way::In));
+                    }
                     Asked::Fill { shapes: true, .. } => {}
                     Asked::Out(_) => {
                         if self.release_may_copy(c.block, false) {
@@ -5525,17 +5734,40 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         wait_before::<P>(&cb, signal.as_ref())?;
         let users = wait_for_users::<P>(&cb, &self.ends, cache)?;
-        // The dirty shapes go into the buffer first, which takes them on to the pages (rule 3).
-        let back = shapes::write_back::<P>(&cb, &cache.device, &cache.shapes, |s| s.dirty)?;
-        cache.wrote_shapes(&back);
         let timed = self.staged.as_ref();
         let mut reserve = self.reserved.remove(&block).unwrap_or_default();
         reserve.extend(self.left_over.remove(&block).unwrap_or_default());
+        // A buffer that lacks the pages takes them first ("Straight fills"), so the copy moves
+        // the pages' own bytes beside the shapes' writes; not for a copy that moves none.
+        let staging = (timed, &self.spares, &mut reserve);
+        let refilled = if cache.moves_none_out() {
+            Ok(())
+        } else {
+            refill::<P>(device, &cb, cache, block, &mut self.counts, staging)
+        };
+        if let Err(raise) = refilled {
+            if !reserve.is_empty() {
+                self.left_over.insert(block, reserve);
+            }
+            return Err(raise);
+        }
+        // The dirty shapes go into the buffer first, which takes them on to the pages (rule 3).
+        let back = shapes::write_back::<P>(&cb, &cache.device, &cache.shapes, |s| s.dirty);
+        let back = match back {
+            Ok(back) => back,
+            Err(raise) => {
+                if !reserve.is_empty() {
+                    self.left_over.insert(block, reserve);
+                }
+                return Err(raise);
+            }
+        };
+        cache.wrote_shapes(&back);
         let staged = copy::<P>(
             device,
             &cb,
             cache,
-            (Way::Out, block),
+            (Way::Out, block, None),
             &mut self.counts,
             (timed, &self.spares, &mut reserve),
             (transfer.rounds.as_ref()).map(|rounds| (&transfer.queue, rounds)),
@@ -6207,6 +6439,11 @@ pub(crate) struct Reach {
     /// with the two planes they write, its luma's and its chroma's, as laid out in the surface's
     /// bytes.
     pub(crate) decoded: Vec<(u64, [PagesPlane; 2])>,
+    /// The blocks whose caches' buffers its video ops name, each once: the surfaces its decodes
+    /// write and its encodes read, each with whether an encode reads it. Each buffer a video op
+    /// reads or writes holds its memory and the pages before the buffer runs (the module doc,
+    /// "Straight fills").
+    pub(crate) named: Vec<(u64, bool)>,
 }
 
 /// What a command buffer's begin readied of the caches ([`Caches::before_answering`]).
@@ -7186,10 +7423,37 @@ impl<P: Platform> Caches<P> {
             return Ok((reached, memory_refused, None));
         }
         let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
+        let decoded_of = |block: u64| {
+            (reach.decoded.iter())
+                .find(|(b, _)| *b == block)
+                .map(|(_, planes)| planes)
+        };
+        // The caches' buffers its video ops read or write, all but those of a decode that lands
+        // in its cache's surface, hold their memory before its uses' fills, made with the lock
+        // let go of, so none of those fills goes straight into the shapes alone, and a buffer
+        // that lacks the pages takes them (the module doc, "Straight fills").
+        let named: Vec<u64> = (reach.named.iter())
+            .filter(|&&(block, encoded)| {
+                encoded || !state.decodes_into_surface(block, decoded_of(block))
+            })
+            .map(|&(block, _)| block)
+            .collect();
+        let unmade: Vec<P::Buffer> = (named.iter())
+            .filter_map(|&block| {
+                state.deferred_buffer(block, MemoryFor::Command, |c| !c.device.memory_made())
+            })
+            .collect();
+        if !unmade.is_empty() {
+            state.unlocked(|| self.make_memory(unmade, MemoryFor::Command));
+        }
         // The pieces the uses' staged fills would make for want of a spare are made with the
         // lock let go of, once, and reserved for their blocks (the module doc, "Staged copies").
         let fills: Vec<(u64, Way)> = (picked.iter())
-            .filter(|u| state.fills(u))
+            .filter(|u| {
+                let block = u.block_offset;
+                let shapes = state.owes_shape_fill(block) || named.contains(&block);
+                state.fills(u) || (state.lacks(block) && shapes)
+            })
             .map(|u| (u.block_offset, Way::In))
             .collect();
         let lacking = state.reserve_spares(&fills);
@@ -7245,11 +7509,11 @@ impl<P: Platform> Caches<P> {
         let mut raised = None;
         state.memory_refused = false;
         for u in &picked {
-            let decoded = (reach.decoded.iter())
-                .find(|(block, _)| *block == u.block_offset)
-                .map(|(_, planes)| planes);
+            let decoded = decoded_of(u.block_offset);
             let video = reach.video && !reach.work;
-            let (count, follows) = state.before_one(device, cb, u, (decoded, video, reach.video));
+            let named = named.contains(&u.block_offset);
+            let reaches = (decoded, video, reach.video, named);
+            let (count, follows) = state.before_one(device, cb, u, reaches);
             // Counted at once, so a later copy of the block follows this buffer.
             held.blocks.extend(count);
             match follows {
@@ -7407,7 +7671,7 @@ impl<P: Platform> Caches<P> {
         let early = on.is_some() || state.all_made(&uses.follows);
         if done.is_ok()
             && early
-            && let Err(raise) = refusing(|| state.early_copies(queue, on, &uses.blocks))
+            && let Err(raise) = refusing(|| state.early_copies(device, queue, on, &uses.blocks))
         {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:% = raise;
@@ -7652,11 +7916,60 @@ impl<P: Platform> Caches<P> {
         self.moved.notify_all();
     }
 
-    /// Makes the memory of `buffer`, a cache's buffer itself that a command buffer's walk names
-    /// (`super::GraphicsDecoder::require_buffer`), where it is not made yet (the module doc,
-    /// "Deferred memory"): whether it holds its memory, `false` where the platform refused it.
-    pub(crate) fn memory_of(&self, buffer: &P::Buffer) -> bool {
+    /// Makes the memory of `buffer`, the buffer of the block at `block`'s cache itself, that a
+    /// command buffer's walk names (`super::GraphicsDecoder::require_buffer`), where it is not
+    /// made yet (the module doc, "Deferred memory"): whether it holds its memory, `false` where
+    /// the platform refused it.
+    ///
+    /// A buffer whose memory is not made may lack the pages, which a fill copied into its shapes
+    /// alone (the module doc, "Straight fills"), where no begin readied it: the begin of a buffer
+    /// whose video ops name it makes its memory and has it take the pages
+    /// ([`Reach::named`]), and a texture made over it has it take them as it is made
+    /// ([`Self::texture_over`]). The command then reads the zeros of the make, not the pages;
+    /// the buffer still lacks them, and the next copy through it takes them, over anything the
+    /// command wrote. Counted ([`shapes::LACKING_NAMED`], [`CacheCounts::lacking_named`]), its
+    /// first logged. The bundle never names such a buffer: its id goes out only in
+    /// `TEXTURE_FROM_IOSURFACE` creates, and `RgfxTexture.buffer` is nil for an IOSurface
+    /// texture, so no render, compute or blit op of the guest's names it.
+    pub(crate) fn memory_of(&self, block: Option<u64>, buffer: &P::Buffer) -> bool {
+        if !buffer.memory_made()
+            && let Some(block) = block
+            && self.lock().named_lacking(block)
+        {
+            reims_vgpu_vulkan::answer::count_kind(shapes::LACKING_NAMED);
+            if !LACKING_LOGGED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = shapes::LACKING_NAMED;
+                    "a command names the buffer of the IOSurface block at {block:#x}'s device \
+                     cache, which lacks the pages its shapes took, and reads the zeros of its \
+                     memory's make ({}; the rest are counted)",
+                    shapes::LACKING_NAMED
+                );
+            }
+        }
         memory_of::<P>(buffer, MemoryFor::Command)
+    }
+
+    /// A texture is about to be made over the buffer of the block at `block`'s cache itself: a
+    /// buffer that lacks the pages its shapes took (the module doc, "Straight fills") has its
+    /// memory made, and the pieces of its fill, with the caches' lock let go of, and takes the
+    /// pages and the dirty shapes' writes on the transfer queue ([`SurfaceCaches::take_pages`]),
+    /// so the texture reads the surface and not the make's zeros; the uses of the block counted
+    /// after it wait for it on the GPU. Nothing for any other buffer.
+    pub(crate) fn texture_over(&self, device: &P::Device, block: u64) -> RaiseResult<()> {
+        let buffer = self
+            .lock()
+            .deferred_buffer(block, MemoryFor::Texture, |c| c.lacks);
+        let Some(buffer) = buffer else {
+            return Ok(());
+        };
+        self.make_memory(vec![buffer], MemoryFor::Texture);
+        let mut state = self.lock();
+        reserve_ahead(&mut state, device, &[(block, Way::In)]);
+        let taken = state.take_pages(device, block);
+        drop(state);
+        self.moved.notify_all();
+        taken
     }
 
     /// Makes the memory of `buffers`, caches' buffers in the per-shape form
@@ -9412,6 +9725,11 @@ impl StagedCodes {
 /// its own bytes of the cache, the rest left as it is; nothing is copied out of such a cache.
 /// Where no view or piece can be made, nothing is copied, as where no encoder is.
 ///
+/// A fill given `straight` copies the pages into the shapes it picks instead, from the view or
+/// the pieces, with nothing copied into the buffer ([`shapes::fill_from`], the module doc,
+/// "Straight fills"): the buffer then lacks the pages ([`SurfaceCache::lacks`]), as a fill into
+/// it ends that.
+///
 /// A staged copy out moves only the bytes the cache's record holds may differ from the pages
 /// ([`SurfaceCache::changed`], the module doc, "Written ranges"), and none, with no piece
 /// taken, where it holds none. A copy encoded between the cache and its named pages leaves the
@@ -9428,7 +9746,7 @@ fn copy<P: Platform>(
     device: &P::Device,
     cb: &P::CommandBuffer,
     cache: &mut SurfaceCache<P>,
-    (way, block): (Way, u64),
+    (way, block, straight): (Way, u64, Straight<'_, P>),
     counts: &mut CacheCounts,
     (timed, spares, reserve): (Option<&Now>, &Arc<Spares<P>>, &mut Vec<Piece<P>>),
     rounds_on: Option<(&P::CommandQueue, &P::CommandQueue)>,
@@ -9472,10 +9790,17 @@ fn copy<P: Platform>(
             match way {
                 // A fill copies all of the surface's bytes the cache holds: those beside its
                 // texels are the cache's own to change.
-                Way::In => {
-                    let parts = cache.moves([(0..cache.length, 0)]);
-                    between::<P>(&blit, (&cache.device, pages), &parts, Way::In)?;
-                }
+                Way::In => match straight {
+                    Some(pick) => {
+                        let sources = [(pages, 0..cache.length, 0)];
+                        let table = &mut cache.shapes;
+                        shapes::fill_from::<P>(&blit, &sources, table, pick, &mut counts.shapes)?;
+                    }
+                    None => {
+                        let parts = cache.moves([(0..cache.length, 0)]);
+                        between::<P>(&blit, (&cache.device, pages), &parts, Way::In)?;
+                    }
+                },
                 Way::Out => {
                     encode_out::<P>(&blit, cache, Some(pages))?;
                 }
@@ -9543,13 +9868,22 @@ fn copy<P: Platform>(
                 // uses yet; the pages are named, so wired.
                 unsafe { copied.copy(&spans, false) };
             }
+            // A straight fill's shapes take their bytes from the pieces, the buffer none.
+            let into_shapes = straight.filter(|_| way == Way::In);
+            if let Some(pick) = into_shapes {
+                let sources: Vec<shapes::Source<'_, P::Buffer>> = (packed.places.iter())
+                    .map(|p| (&*pieces[p.piece], p.bytes.clone(), p.at))
+                    .collect();
+                let table = &mut cache.shapes;
+                shapes::fill_from::<P>(&blit, &sources, table, pick, &mut counts.shapes)?;
+            }
             // The GPU's copy moves each place's bytes the cache holds between its piece and the
             // cache, the CPU's the surface's between it and the pages; a copy out's CPU copy
             // takes the texels of those bytes. A circulating copy's round `k` goes into piece
             // `k % ROUND_PIECES`: its second on the second round's command buffer, each later
             // one kept for its own.
             let mut later = vec![Vec::new(); packed.lens.len().saturating_sub(ROUND_PIECES)];
-            for place in &packed.places {
+            for place in (packed.places.iter()).filter(|_| into_shapes.is_none()) {
                 let parts = cache.moves([(place.bytes.clone(), place.at)]);
                 match (&rounds, place.piece) {
                     (Some(_), round) if round >= ROUND_PIECES => {
@@ -9659,9 +9993,51 @@ fn copy<P: Platform>(
     blit.encode(ON, BlitCmd::EndEncoding)?;
     if moved && cache.pages.is_some() {
         cache.changed = Changed::none();
+        if way == Way::In {
+            cache.lacks = straight.is_some();
+        }
     }
     Ok(staged)
 }
+
+/// Where `cache`'s buffer lacks the pages' bytes its shapes took ([`SurfaceCache::lacks`]),
+/// encodes on `cb` its fill from them, before a copy through it in `cb` reads it (the module doc,
+/// "Straight fills"): of the block at `block`, as [`copy`] fills it, through `staging`, its
+/// pieces kept until `cb` completes; counted in `counts`. The buffer then holds the pages as they
+/// are now, not as the straight fill read them. Its memory is made already. Nothing where it
+/// lacks none; where nothing was copied, it lacks them still.
+fn refill<P: Platform>(
+    device: &P::Device,
+    cb: &P::CommandBuffer,
+    cache: &mut SurfaceCache<P>,
+    block: u64,
+    counts: &mut CacheCounts,
+    staging: (Option<&Now>, &Arc<Spares<P>>, &mut Vec<Piece<P>>),
+) -> RaiseResult<()> {
+    if !cache.lacks {
+        return Ok(());
+    }
+    let staged = copy::<P>(
+        device,
+        cb,
+        cache,
+        (Way::In, block, None),
+        counts,
+        staging,
+        None,
+    )?;
+    if let Some(staged) = staged {
+        cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| staged.done()))?;
+    }
+    if !cache.lacks {
+        counts.buffer_refills += 1;
+        counts.buffer_refilled_bytes += cache.moved(Way::In);
+    }
+    Ok(())
+}
+
+/// Where a fill goes straight from the pages into the shapes ([`copy`]), the shapes it fills.
+type Straight<'a, P> = Option<&'a dyn Fn(&shapes::Shape<<P as Platform>::Texture>) -> bool>;
 
 #[cfg(test)]
 mod costs;
@@ -9703,6 +10079,7 @@ pub(super) mod tests {
         work: false,
         video: false,
         decoded: Vec::new(),
+        named: Vec::new(),
     };
 
     /// A rig whose block at [`BLOCK`] is two pages of a surface, marked cached, with command
@@ -9833,6 +10210,13 @@ pub(super) mod tests {
         let caches = r.dec.caches();
         let cache = caches.buffer(BLOCK).unwrap();
         Arg::obj(cache).as_obj().unwrap().0
+    }
+
+    /// The id of the view of the block's pages that its cache copies from.
+    pub(crate) fn pages_id(r: &Rig) -> u64 {
+        let caches = r.dec.caches();
+        let pages = caches.pages_view(BLOCK).unwrap();
+        Arg::obj(pages).as_obj().unwrap().0
     }
 
     /// A block marked cached gets a device cache, which each of its buffers is, on a GPU of its
@@ -16564,7 +16948,7 @@ pub(super) mod tests {
     }
 
     /// How many of the kind of code `code` the process counted ([`reims_vgpu_vulkan::answer`]).
-    fn counted(code: &str) -> u64 {
+    pub(crate) fn counted(code: &str) -> u64 {
         (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
             .find(|(c, _)| *c == code)
             .map_or(0, |(_, n)| n)

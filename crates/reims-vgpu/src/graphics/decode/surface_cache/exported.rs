@@ -1329,6 +1329,7 @@ mod drawn_tests {
             work: false,
             video: true,
             decoded: vec![(BLOCK, PLANES)],
+            named: vec![(BLOCK, false)],
         }
     }
 
