@@ -563,7 +563,11 @@ fn the_walk_makes_the_shapes_no_thread_took_at_its_first_dispatch() {
     ring.send(&device, command_buffer_of(100, &ops));
     assert!(gate.reached(), "the walk did not start");
     std::thread::sleep(Duration::from_millis(20));
-    assert_eq!(made(&platform), vec![], "made before the walk's first dispatch");
+    assert_eq!(
+        made(&platform),
+        vec![],
+        "made before the walk's first dispatch"
+    );
     gate.open();
     assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
     let mut expected = vec![
