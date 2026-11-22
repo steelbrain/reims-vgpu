@@ -35,7 +35,8 @@
 //! bytes ([`State::empties`]). An empty piece above them that stays empty for [`RELEASE_DELAY`]
 //! goes back to the source ([`BlockSource::release_block`]), as the release below says, and the
 //! source keeps the block ready or frees it. The delay rides out churn, where a guest empties and
-//! fills a piece again within seconds.
+//! fills a piece again within seconds. Where the trace is on, each piece that goes back is an
+//! event of it, `poolback`, with its length and how long it stood empty.
 //!
 //! # Release
 //!
@@ -99,6 +100,7 @@ use reims_vgpu_vulkan::answer::count_kind;
 use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
+use reims_vgpu_vulkan::core::trace;
 use reims_vgpu_vulkan::os::OsVm;
 
 pub(crate) use addresses::HostAddresses;
@@ -1197,9 +1199,19 @@ impl Shared {
             let now = (self.now)();
             let (due, next) = self.due(&st, now);
             if let Some(at) = due {
+                let piece = (st.pieces.get(&at)).map(|p| (p.block.len, p.empty_since));
                 st.send_back(at, now);
                 MutexGuard::unlocked(&mut st, || {
                     log::info!("pool: the empty piece at {at:#x} goes back to the source");
+                    if let Some((len, since)) = piece {
+                        let empty = since.map_or(Duration::ZERO, |since| {
+                            now.saturating_duration_since(since)
+                        });
+                        let empty = u64::try_from(empty.as_nanos()).unwrap_or(u64::MAX);
+                        // poolback: the piece's address and length, and the nanoseconds it
+                        // stood empty
+                        trace::event("poolback", &[at, len, empty]);
+                    }
                 });
                 continue;
             }
