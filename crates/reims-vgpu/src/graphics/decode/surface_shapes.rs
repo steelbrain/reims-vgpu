@@ -2490,11 +2490,7 @@ mod tests {
             ),
             (0, 0, 0)
         );
-        assert_eq!(
-            (counts.surfaces, counts.surfaces_declined),
-            (1, 0),
-            "a surface in place is kept"
-        );
+        assert_eq!(counts.surfaces, 1, "a surface in place is kept");
         let mark = r.p.call_log().mark();
         let chroma = plane_texture(&mut r, 22, 1);
         assert_ne!(chroma, luma, "the chroma plane's image");
@@ -2557,75 +2553,13 @@ mod tests {
     }
 
     /// A video cache's surface the platform made in its copy form (`surface_cache::exported`),
-    /// each plane its copy that it moves the bytes into and back, is declined as the first
-    /// texture over a plane is made: let go of, counted, and that texture's shape made as any
-    /// other cache's, of the platform's own image. The cache asks for no surface again, and a
-    /// decode into its planes is given none, so the host's video writes the cache's buffer
+    /// each plane its copy over a buffer of an exported block, is kept as one in place is: its
+    /// planes are the cache's plane shapes, made of no image of the decoder's own, and a decode
+    /// into them is given them, so the host's video writes the block. A second cache of the same
+    /// description asks for a surface of its own
     #[cfg(unix)]
     #[test]
-    fn a_video_caches_surface_in_the_copy_form_is_declined() {
-        use reims_vgpu_vulkan::core::testkit::impls::device::EXPORTED_SURFACE_PLANE;
-        let (mut r, made) = video_shaped_made();
-        let world = Arc::clone(r.p.world());
-        world.copy_exported_surfaces(true);
-        let surface_planes = |calls: &[Call]| {
-            (calls.iter())
-                .filter(|c| c.sel == EXPORTED_SURFACE_PLANE)
-                .count()
-        };
-        let live = || {
-            let live = world.live("MTLTexture").into_iter();
-            live.map(|t| t.0).collect::<Vec<u64>>()
-        };
-        let before = live();
-        let mark = r.p.call_log().mark();
-        let luma = plane_texture(&mut r, 21, 0);
-        let calls = r.p.call_log().since(mark);
-        assert_eq!(surface_planes(&calls), 2, "the surface was made");
-        assert_eq!(made.lock().len(), 1, "luma's own image");
-        let new: Vec<u64> = (live().into_iter())
-            .filter(|t| !before.contains(t))
-            .collect();
-        assert_eq!(
-            new.len(),
-            2,
-            "the shape's image and the texture's view, the planes let go of: {new:?}"
-        );
-        assert!(new.contains(&luma), "{new:?}");
-        let counts = r.dec.caches().counts().shapes;
-        assert_eq!(
-            (
-                counts.surfaces,
-                counts.surfaces_declined,
-                counts.surfaces_refused
-            ),
-            (0, 1, 0)
-        );
-        assert_eq!(counts.planes_made, 0);
-        assert!(
-            r.dec.surface_caches.surface_targets(BLOCK).is_none(),
-            "a decode lands in the cache's buffer"
-        );
-
-        let mark = r.p.call_log().mark();
-        let chroma = plane_texture(&mut r, 22, 1);
-        assert_eq!(
-            surface_planes(&r.p.call_log().since(mark)),
-            0,
-            "asked once a cache"
-        );
-        assert_ne!(chroma, luma);
-        assert_eq!(made.lock().len(), 2, "chroma's own image");
-        assert_eq!(r.dec.caches().counts().shapes.surfaces_declined, 1);
-    }
-
-    /// A video cache whose surface would be made of a description the platform made in its copy
-    /// form before (`surface_cache::exported`) asks for none: declined unmade, counted, its
-    /// textures' shapes made as a declined cache's are, of the platform's own images, and a
-    /// decode into its planes given none
-    #[cfg(unix)]
-    #[test]
-    fn a_video_cache_asks_no_surface_of_a_description_made_in_the_copy_form() {
+    fn a_video_caches_surface_in_the_copy_form_is_kept() {
         use reims_vgpu_vulkan::core::testkit::impls::device::EXPORTED_SURFACE_PLANE;
         const OTHER: u64 = BLOCK + 0x4000;
         let (mut r, made) = video_shaped_made();
@@ -2636,36 +2570,35 @@ mod tests {
                 .count()
         };
         let mark = r.p.call_log().mark();
-        plane_texture(&mut r, 21, 0);
-        let calls = r.p.call_log().since(mark);
+        let luma = plane_texture(&mut r, 21, 0);
+        let chroma = plane_texture(&mut r, 22, 1);
         assert_eq!(
-            surface_planes(&calls),
+            surface_planes(&r.p.call_log().since(mark)),
             2,
-            "the first cache's surface was made"
+            "the surface was made once"
         );
-        other_video_cache(&mut r, OTHER, 11);
-
-        let mark = r.p.call_log().mark();
-        let luma = plane_texture_over(&mut r, 23, 11, 0);
-        let chroma = plane_texture_over(&mut r, 24, 11, 1);
-        assert_eq!(surface_planes(&r.p.call_log().since(mark)), 0, "none asked");
         assert_ne!(chroma, luma);
-        assert_eq!(made.lock().len(), 3, "the shapes' own images");
+        assert!(made.lock().is_empty(), "no image of the decoder's own");
+        assert!(
+            r.dec.surface_caches.surface_targets(BLOCK).is_some(),
+            "a decode lands in the surface's planes"
+        );
+
+        other_video_cache(&mut r, OTHER, 11);
+        let mark = r.p.call_log().mark();
+        plane_texture_over(&mut r, 23, 11, 0);
+        assert_eq!(
+            surface_planes(&r.p.call_log().since(mark)),
+            2,
+            "the second cache's surface was made"
+        );
+        assert!(made.lock().is_empty(), "no image of the decoder's own");
         let counts = r.dec.caches().counts().shapes;
         assert_eq!(
-            (
-                counts.surfaces,
-                counts.surfaces_declined,
-                counts.surfaces_unasked,
-                counts.surfaces_refused
-            ),
-            (0, 1, 1, 0),
-            "asked once a cache"
+            (counts.surfaces, counts.planes_made, counts.surfaces_refused),
+            (2, 4, 0)
         );
-        assert!(
-            r.dec.surface_caches.surface_targets(OTHER).is_none(),
-            "a decode lands in the cache's buffer"
-        );
+        assert!(r.dec.surface_caches.surface_targets(OTHER).is_some());
     }
 
     /// A decode over a new video cache's planes waits for no fill of them: the decode takes the

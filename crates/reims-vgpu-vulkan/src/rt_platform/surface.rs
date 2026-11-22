@@ -11,7 +11,9 @@
 //!
 //! **The forms.** rt decides at the make: in place, each plane a linear image in the shared
 //! memory, or the copy form, each plane rt's texture over a buffer of an exported block, which
-//! rt's submissions copy into and back. Each make is counted by its form
+//! rt's submissions copy into and back: in once a change of the block's bytes (its acquire
+//! among them), for the next submission that uses the texture, and not for one that only reads
+//! it again. Each make is counted by its form
 //! ([`SURFACES_IN_PLACE_CODE`], [`SURFACES_COPIED_CODE`]); the process's first copy form writes a
 //! line naming rt's reason and the spec.
 //!

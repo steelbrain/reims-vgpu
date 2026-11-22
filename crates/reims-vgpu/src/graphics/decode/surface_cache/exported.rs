@@ -47,25 +47,15 @@
 //!
 //! A platform that makes no such surface (the default, and one that exports no such memory)
 //! answers `None`, counted, and the cache's shapes are made as any other's. A surface it makes in
-//! its copy form (`SurfaceMemory::in_place` false), each plane its copy that it moves the bytes
-//! into and back, is declined: let go of at once, counted (`surfaces_declined`,
-//! `video-surface-copy-form-declined`), and the cache's shapes are made as any other's, so the
-//! host's video writes the cache's buffer and the shapes take a fill a picture written. Kept,
-//! such a surface's planes are copied in for every command buffer that samples them, written or
-//! not. **Measured** (2026-11-21, an RX 550, whose driver holds no dma-buf surface in place):
-//! before the decline, a macOS guest's walk (m3-max-63386) had rt copy such planes 15,602
-//! times, 107.15 GB (rt's over-copies of cause `dedicated`), 2 a present on a scrolling desktop,
-//! of 12.44 MB each, a 3840 by 2160 10-bit picture's two planes' sizes; with it (m3-max-63574),
-//! the walk declined 137 surfaces and rt made no such copy.
-//!
-//! The platform decides a surface's form from the device's answers for its description and the
-//! images it makes of it, so the description of each surface declined is kept (`CopyForms`, on
-//! Unix), and a later cache whose surface would be made of the same one asks for none: it is
-//! declined unmade, counted (`surfaces_unasked`, `video-surface-copy-form-unasked`), and its
-//! shapes are made as a declined cache's are. Each new video cache otherwise made a surface
-//! for the platform to let go of at once: 128 to 137 a walk on the RX 550 (m3-max-63574,
-//! m3-max-63824), each an exported block of a picture's planes, about 25 MB at 3840 by 2160
-//! 10-bit.
+//! its copy form (`SurfaceMemory::in_place` false), each plane its copy over a buffer of an
+//! exported block, is kept as one in place is: the host's video writes the block, and its
+//! acquire (`SurfaceMemory::external_writes_done`) is the change the platform copies each
+//! plane in at, once, for the next command buffer that reads it; a command buffer that only
+//! reads the planes copies nothing in. **Measured** (2026-11-21, an RX 550, whose driver holds no
+//! dma-buf surface in place): with rt copying such planes in for every command buffer that
+//! sampled them, a macOS guest's walk (m3-max-63386) copied them 15,602 times, 107.15 GB, 2 a
+//! present on a scrolling desktop; declining such surfaces instead sent every picture through
+//! the cache's buffer and a fill of its shapes, 2,756 fills of 9,750 MiB a walk (m3-max-66326).
 //!
 //! On Windows the surface's planes lie over two Direct3D 11 textures that the host's video draws
 //! its pictures into (`graphics::drawn`), made at the ask and imported by the platform
@@ -359,50 +349,8 @@ pub(super) struct SurfaceAsk {
     keys: [ShapeKey; 2],
 }
 
-/// What a surface's description is made of ([`SurfaceAsk::desc`]): its handle's kind, which
-/// decides its pitch's and starts' multiples, and each plane's description.
-#[cfg(unix)]
-type SurfaceShape = (SurfaceHandle, [SurfacePlaneDesc; 2]);
-
-/// The most descriptions [`CopyForms`] keeps: more than the picture sizes a few players decode
-/// at once.
-#[cfg(unix)]
-const COPY_FORMS_KEPT: usize = 16;
-
-/// The descriptions of the surfaces the platform made in its copy form (the module doc), the
-/// latest [`COPY_FORMS_KEPT`]: a cache whose surface would be made of one of them asks for none
-/// ([`Caches::plane_shape`]).
-#[cfg(unix)]
-#[derive(Default)]
-pub(super) struct CopyForms(std::collections::VecDeque<SurfaceShape>);
-
-#[cfg(unix)]
-impl CopyForms {
-    /// Whether the platform made a surface of `ask`'s description in its copy form.
-    fn holds(&self, ask: &SurfaceAsk) -> bool {
-        self.0.contains(&ask.shape())
-    }
-
-    /// The platform made a surface of `ask`'s description in its copy form: kept, the oldest
-    /// let go of past [`COPY_FORMS_KEPT`].
-    fn note(&mut self, ask: &SurfaceAsk) {
-        if self.holds(ask) {
-            return;
-        }
-        if self.0.len() >= COPY_FORMS_KEPT {
-            self.0.pop_front();
-        }
-        self.0.push_back(ask.shape());
-    }
-}
-
 #[cfg(unix)]
 impl SurfaceAsk {
-    /// What the description [`Self::desc`] is made of.
-    fn shape(&self) -> SurfaceShape {
-        (self.handle, self.planes)
-    }
-
     /// The description the platform makes the surface of: a dma-buf's pitch on
     /// [`PLANE_ALIGNMENT`], an exportable surface's on its texels alone.
     fn desc(&self) -> SurfaceDesc<'_> {
@@ -517,7 +465,7 @@ pub(super) fn decodes_into<P: Platform>(surface: &CacheSurface<P>, decoded: bool
 /// counts `sh`, and the plane shapes' fills taken as met where any were ([`take_plane_fills`]);
 /// `None` where nothing of either was counted.
 pub(crate) fn planes_line(sh: &ShapeCounts) -> Option<String> {
-    let asked = sh.surfaces + sh.surfaces_refused + sh.surfaces_declined + sh.surfaces_unasked;
+    let asked = sh.surfaces + sh.surfaces_refused;
     let any = asked + sh.planes_landed + sh.video_fills > 0;
     any.then(|| {
         let taken = match sh.plane_fills_taken {
@@ -526,16 +474,13 @@ pub(crate) fn planes_line(sh: &ShapeCounts) -> Option<String> {
         };
         format!(
             "IOSurface device caches' video planes: {} surfaces made ({} plane shapes), {} the \
-             platform made none of, {} it made in its copy form declined, {} declined unmade as \
-             it made their description so before, {} caches holding one at once at most; {} \
+             platform made none of, {} caches holding one at once at most; {} \
              video command buffers landed in them; of the fills, {} owed by a video write ({} \
              MiB); plane shapes filled {} times; {} video ops waited on the CPU for a cache's \
              fill not done, the longest {} us{taken}",
             sh.surfaces,
             sh.planes_made,
             sh.surfaces_refused,
-            sh.surfaces_declined,
-            sh.surfaces_unasked,
             sh.surfaces_live_most,
             sh.planes_landed,
             sh.video_fills,
@@ -653,65 +598,6 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 }
 
-/// The counts' code of a surface the platform made in its copy form that a cache declined
-/// ([`decline`]): in the process's counts line, which the boot reads at its end.
-#[cfg(unix)]
-const SURFACE_DECLINED: &str = "video-surface-copy-form-declined";
-
-/// Whether the process has logged a declined surface ([`decline`]).
-#[cfg(unix)]
-static DECLINED_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Lets go of `made`, a surface the platform made for the block at `block`'s cache in its copy
-/// form (the module doc), with no lock held: counted ([`SURFACE_DECLINED`]), the process's first
-/// logged, and a refusal of a release logged.
-#[cfg(unix)]
-fn decline<P: Platform>(block: u64, made: ExportedSurface<P>) {
-    reims_vgpu_vulkan::answer::count_kind(SURFACE_DECLINED);
-    if !DECLINED_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::info!(
-            target: "reims_vgpu::graphics", kind:% = SURFACE_DECLINED;
-            "the IOSurface block at {block:#x}: the platform made its video planes' surface in its \
-             copy form, each plane its copy that it moves the bytes into and back; let go of, \
-             the cache's shapes are made as any other's and the host's video writes its buffer \
-             ({SURFACE_DECLINED}; the rest are counted)"
-        );
-    }
-    if let Err(refusal) = refusals::refusing(move || drop(made)) {
-        log::warn!(
-            target: "reims_vgpu::graphics", kind:% = refusal;
-            "the IOSurface block at {block:#x}'s video planes' surface in the copy form was let \
-             go of, and a release was refused: {refusal}"
-        );
-    }
-}
-
-/// The counts' code of a cache whose surface was declined unmade, the platform having made its
-/// description in the copy form before ([`CopyForms`]).
-#[cfg(unix)]
-const SURFACE_UNASKED: &str = "video-surface-copy-form-unasked";
-
-/// Whether the process has logged a surface declined unmade ([`unasked`]).
-#[cfg(unix)]
-static UNASKED_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The block at `block`'s cache asks for no surface, the platform having made its description in
-/// the copy form before ([`CopyForms`]): counted ([`SURFACE_UNASKED`]), the process's first
-/// logged.
-#[cfg(unix)]
-fn unasked(block: u64) {
-    reims_vgpu_vulkan::answer::count_kind(SURFACE_UNASKED);
-    if !UNASKED_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log::info!(
-            target: "reims_vgpu::graphics", kind:% = SURFACE_UNASKED;
-            "the IOSurface block at {block:#x}: the platform made its video planes' surface's \
-             description in its copy form before; none asked, the cache's shapes are made as \
-             any other's and the host's video writes its buffer ({SURFACE_UNASKED}; the rest are \
-             counted)"
-        );
-    }
-}
-
 /// Each of `planes`' clear to zeros ([`PlaneSurface::clears`]), the surface's that the block at
 /// `block`'s cache takes; `None`, logged, where `platform` raised at one.
 #[cfg(unix)]
@@ -751,10 +637,9 @@ impl<P: Platform> Caches<P> {
     /// (module doc): the surface made of both planes with the lock let go of, its planes added as
     /// the cache's plane shapes ([`SurfaceCaches::add_planes`]), and a reference to `key`'s and
     /// its image. `None` where the cache takes no surface for `key`, or the platform made none
-    /// (counted) or made it in its copy form, declined (counted, [`decline`]), or made its
-    /// description so before, declined unmade (counted, [`unasked`]), for the caller to make the
-    /// shape's image of its own. The planes owe their fill (module doc); each takes its clear
-    /// to zeros, a render pass of `platform`'s ([`PlaneSurface::clears`]).
+    /// (counted), for the caller to make the shape's image of its own. A surface in the copy form
+    /// is kept as one in place is (module doc). The planes owe their fill (module doc); each
+    /// takes its clear to zeros, a render pass of `platform`'s ([`PlaneSurface::clears`]).
     pub(super) fn plane_shape(
         &self,
         platform: &P,
@@ -762,17 +647,7 @@ impl<P: Platform> Caches<P> {
         block: u64,
         key: &ShapeKey,
     ) -> Option<Held<P::Texture>> {
-        let ask = {
-            let mut state = self.state.lock();
-            let ask = state.surface_ask(block, key)?;
-            if state.copy_forms.holds(&ask) {
-                state.counts.shapes.surfaces_unasked += 1;
-                drop(state);
-                unasked(block);
-                return None;
-            }
-            ask
-        };
+        let ask = self.state.lock().surface_ask(block, key)?;
         let made = match device.new_exported_surface(ON, &ask.desc()) {
             Ok(made) => made.filter(|m| m.planes.len() == 2),
             Err(raise) => {
@@ -788,13 +663,6 @@ impl<P: Platform> Caches<P> {
             self.state.lock().counts.shapes.surfaces_refused += 1;
             return None;
         };
-        if !made.memory.in_place() {
-            decline(block, made);
-            let mut state = self.state.lock();
-            state.counts.shapes.surfaces_declined += 1;
-            state.copy_forms.note(&ask);
-            return None;
-        }
         let clears = plane_clears(platform, block, &made.planes);
         let (found, gone) = self.lock().add_planes(block, key, &ask, made, clears);
         if let Err(refusal) = refusals::refusing(move || drop(gone)) {
