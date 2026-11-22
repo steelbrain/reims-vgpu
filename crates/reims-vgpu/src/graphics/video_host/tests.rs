@@ -544,11 +544,17 @@ fn a_picture_the_gpu_copied_from_a_scratch_counts_as_staged_by_the_hardware() {
         .unwrap();
     assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
     assert!(decoded.landed.as_deref().is_some_and(|l| !l.failed()));
-    assert!(p.call_log().calls_to(COPY).is_empty(), "no copy of the session's");
+    assert!(
+        p.call_log().calls_to(COPY).is_empty(),
+        "no copy of the session's"
+    );
     let at = |way: Way| Way::ALL.iter().position(|w| *w == way).unwrap();
     let counts = s.counts.lock();
     assert_eq!(
-        (counts.landed[at(Way::Staged)], counts.landed[at(Way::Cache)]),
+        (
+            counts.landed[at(Way::Staged)],
+            counts.landed[at(Way::Cache)]
+        ),
         (1, 0)
     );
 }
@@ -635,7 +641,11 @@ fn a_failed_landing_in_a_cache_says_it_written_before_its_signal_once_stopped() 
     let stopped = into();
     assert_eq!(stopped.value, 1);
     assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
-    assert_eq!(*memory.seen.lock(), [0], "said written once, before the signal");
+    assert_eq!(
+        *memory.seen.lock(),
+        [0],
+        "said written once, before the signal"
+    );
     assert!(stopped.landed.as_deref().is_some_and(Landed::failed));
 
     let stalled = into();

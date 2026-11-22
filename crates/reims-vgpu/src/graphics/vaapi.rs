@@ -137,12 +137,12 @@ use super::decode::{
 };
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
 
+#[cfg(unix)]
+use super::video_host::failed_in_caches;
 use super::video_host::{
     BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
     HostVideoSession, Landing, OutputPlane, picture_error,
 };
-#[cfg(unix)]
-use super::video_host::failed_in_caches;
 
 mod encode;
 #[cfg(unix)]
