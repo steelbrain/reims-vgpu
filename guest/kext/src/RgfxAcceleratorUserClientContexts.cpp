@@ -1055,6 +1055,14 @@ bool RgfxAcceleratorUserClient::beginAsk(UInt32 *ctx)
 	return begun;
 }
 
+OSObject *RgfxAcceleratorUserClient::lookupSurfaceOfProcess(uint32_t surfaceId, bool *asked)
+{
+	UInt32 ctx = 0;
+	Ask ask = {this, beginAsk(&ctx)};
+	*asked = ask.begun && owner;
+	return *asked ? rgfxSurfaceLocksLookup(owner, task, surfaceId) : nullptr;
+}
+
 void RgfxAcceleratorUserClient::endAsk()
 {
 	IOLockLock(listLock);

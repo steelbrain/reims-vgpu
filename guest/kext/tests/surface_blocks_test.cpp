@@ -1,17 +1,18 @@
 // The native test of RgfxSurfaceBlocks.hpp: a plane's block is found by its pages and its mode
 // alone, each client holds it once however often it asks, the hold ends with the client's last
 // let-go, the block with its last holder's, and only a holder's span is named. A dormant block is
-// held again only by its own device cache, live, and the dormant blocks past their caps go
-// oldest first. A deferred block is found by its surface alone, never by pages, counts against
+// held again only by its own device cache, live, and the dormant blocks past their caps go oldest
+// first, and each once it has slept the age, timed from its sleep, a pending one not until it is no
+// longer pending. A deferred block is found by its surface alone, never by pages, counts against
 // the device's budget while it lives and while dormant against the smaller of half of it and the
 // dormant bytes' cap, an eighth of the guest's memory, and keeps room for one run a page of its
-// whole allocation, every plane's. A cached block in place is found by its
-// surface too, laid out as the ask, by an ask that maps the surface where it asks, and by no
-// other; a surface's memory is its block's runs only page for page. Pages a SURFACE_PAGES named
-// and the host never answered for stay wired. A client's new hold makes its other asks wait until
-// its share is posted. A let-go's unshare, posted out of the lock, holds back every ask of the
-// block and the block's release until it is posted, so the device never ends a hold the kext
-// gave after it. Each reason a copy block is refused has its own name, logged once.
+// whole allocation, every plane's. A cached block in place is found by its surface too, laid out as
+// the ask, by an ask that maps the surface where it asks, and by no other; a surface's memory is
+// its block's runs only page for page. Pages a SURFACE_PAGES named and the host never answered for
+// stay wired. A client's new hold makes its other asks wait until its share is posted. A let-go's
+// unshare, posted out of the lock, holds back every ask of the block and the block's release until
+// it is posted, so the device never ends a hold the kext gave after it. Each reason a copy block is
+// refused has its own name, logged once.
 #include "RgfxSurfaceBlocks.hpp"
 
 #include <cstdio>
@@ -67,9 +68,9 @@ void dormancy()
 	check(rgfxSurfaceOldestDormant(t) == -1, "no dormant block yet");
 
 	// The last let-go keeps each dormant, in order, counted with its pages' bytes.
-	rgfxSurfaceSleep(t, e);
-	rgfxSurfaceSleep(t, f);
-	rgfxSurfaceSleep(t, e);
+	rgfxSurfaceSleep(t, e, 1);
+	rgfxSurfaceSleep(t, f, 1);
+	rgfxSurfaceSleep(t, e, 1);
 	check(t.dormantCount == 2 && t.dormantBytes == 0xc000, "two dormant, counted once each");
 	check(rgfxSurfaceOldestDormant(t) == 0, "the first slept is the oldest");
 	bool differs = false;
@@ -87,7 +88,7 @@ void dormancy()
 	check(!rgfxSurfaceRevives(e, &cacheA, true), "nor one of a block held");
 	check(t.dormantCount == 1 && t.dormantBytes == 0x8000 && rgfxSurfaceOldestDormant(t) == 1,
 	      "held again: the other is the oldest");
-	rgfxSurfaceSleep(t, e);
+	rgfxSurfaceSleep(t, e, 1);
 	check(rgfxSurfaceOldestDormant(t) == 1 && e.dormantSeq > f.dormantSeq,
 	      "dormant again, it is the newest");
 
@@ -114,7 +115,8 @@ void dormancy()
 	RgfxSurfaceTable m = {many, kRgfxDormantMaxBlocks + 2};
 	RgfxDormantCause why = kRgfxDormantCauses;
 	for (uint32_t i = 0; i < 3; i++)
-		rgfxSurfaceSleep(m, cachedEntry(m, i, &manyRuns[i], 0x100000 * (i + 1), 0x1000, &cacheA));
+		rgfxSurfaceSleep(m, cachedEntry(m, i, &manyRuns[i], 0x100000 * (i + 1), 0x1000, &cacheA),
+		                 1);
 	check(rgfxSurfaceOverCaps(m, 0x3000, &why) == -1, "within the caps");
 	check(rgfxSurfaceOverCaps(m, 0x2fff, &why) == 0 && why == kRgfxDormantBytes,
 	      "past the bytes: the oldest");
@@ -122,7 +124,8 @@ void dormancy()
 	check(rgfxSurfaceOverCaps(m, 0x1fff, &why) == 1 && why == kRgfxDormantBytes,
 	      "then the next oldest");
 	for (uint32_t i = 3; i < kRgfxDormantMaxBlocks + 2; i++)
-		rgfxSurfaceSleep(m, cachedEntry(m, i, &manyRuns[i], 0x100000 * (i + 1), 0x1000, &cacheA));
+		rgfxSurfaceSleep(m, cachedEntry(m, i, &manyRuns[i], 0x100000 * (i + 1), 0x1000, &cacheA),
+		                 1);
 	check(m.dormantCount == kRgfxDormantMaxBlocks + 1, "one past the count");
 	check(rgfxSurfaceOverCaps(m, ~0ull, &why) == 1 && why == kRgfxDormantCount,
 	      "past the count: the oldest");
@@ -197,7 +200,7 @@ void deferred()
 
 	// Dormant: counted against the deferred cap, not the wired pages' bytes.
 	d.pending = false;
-	rgfxSurfaceSleep(t, d);
+	rgfxSurfaceSleep(t, d, 1);
 	check(t.dormantCount == 1 && t.dormantBytes == 0 && t.dormantDeferredBytes == kTwoPlanes,
 	      "a dormant deferred block's bytes are not wired");
 	RgfxDormantCause why = kRgfxDormantCauses;
@@ -207,7 +210,7 @@ void deferred()
 	// An older dormant block not deferred, and a newer deferred one: past the deferred cap the
 	// oldest deferred goes, never the other.
 	RgfxSurfaceEntry &old = cachedEntry(t, 1, &runs[0], 0x10000, 0x4000, &cacheA);
-	rgfxSurfaceSleep(t, old);
+	rgfxSurfaceSleep(t, old, 1);
 	old.dormantSeq = 0;
 	RgfxSurfaceEntry &e = entries[2];
 	e = d;
@@ -216,7 +219,7 @@ void deferred()
 	e.surface = &surfaceB;
 	e.deferred = e.dormant = false;
 	rgfxSurfaceDefer(t, e);
-	rgfxSurfaceSleep(t, e);
+	rgfxSurfaceSleep(t, e, 1);
 	check(t.deferredBytes == kTwoPlanes + kBgra4k &&
 	          t.dormantDeferredBytes == kTwoPlanes + kBgra4k && t.dormantBytes == 0x4000,
 	      "each counted where it belongs");
@@ -294,7 +297,7 @@ void dormantDeferredCap()
 		e.length = kLength;
 		e.surface = &surfaces[i];
 		rgfxSurfaceDefer(t, e);
-		rgfxSurfaceSleep(t, e);
+		rgfxSurfaceSleep(t, e, 1);
 	}
 	check(t.dormantDeferredBytes == 3 * kLength && t.dormantBytes == 0,
 	      "three dormant deferred blocks");
@@ -310,6 +313,52 @@ void dormantDeferredCap()
 
 // A SURFACE_PAGES naming a block's pages: named, refused, or never answered, where the host may
 // yet take them and they stay wired.
+// A dormant block ages from its sleep: it goes once it has slept the age, and the next to age is
+// the earliest of those not yet aged and not pending; a block held again ages from its next sleep.
+void aging()
+{
+	RgfxSurfaceEntry entries[3] = {};
+	RgfxSurfaceTable t = {entries, 3};
+	RgfxPageRun runs[3];
+	const uint64_t age = 1000;
+	RgfxSurfaceEntry &e = cachedEntry(t, 0, &runs[0], 0x10000, 0x4000, &cacheA);
+	RgfxSurfaceEntry &f = cachedEntry(t, 1, &runs[1], 0x20000, 0x8000, &cacheB);
+	RgfxSurfaceEntry &g = cachedEntry(t, 2, &runs[2], 0x30000, 0x1000, &cacheB);
+	uint64_t at = 0;
+	check(!rgfxSurfaceNextAge(t, 0, age, &at), "nothing dormant, nothing ages");
+	check(!rgfxSurfaceAged(e, 5000, age), "a held block never ages");
+	rgfxSurfaceSleep(t, e, 100);
+	rgfxSurfaceSleep(t, f, 300);
+	check(e.sleptAt == 100 && f.sleptAt == 300, "each timed from its sleep");
+	check(!rgfxSurfaceAged(e, 1099, age) && rgfxSurfaceAged(e, 1100, age),
+	      "a block goes once it has slept the age");
+	check(rgfxSurfaceNextAge(t, 1050, age, &at) && at == 1100, "the first to age is the oldest");
+	check(rgfxSurfaceNextAge(t, 1100, age, &at) && at == 1300,
+	      "past it, the next not yet aged: an aged one waits on no timer");
+	check(!rgfxSurfaceNextAge(t, 1300, age, &at), "both aged: none is next");
+	// One pending (its last holder's BLOCK_UNSHARE not yet posted) neither ages nor is next.
+	rgfxSurfaceSleep(t, g, 200);
+	g.pending = true;
+	check(!rgfxSurfaceAged(g, 5000, age), "a pending block does not age");
+	check(rgfxSurfaceNextAge(t, 1050, age, &at) && at == 1100, "nor is it next");
+	g.pending = false;
+	check(rgfxSurfaceNextAge(t, 1150, age, &at) && at == 1200, "it is once posted");
+	// Held again, and asleep again later: timed from the new sleep.
+	rgfxSurfaceWake(t, e);
+	check(e.sleptAt == 0 && !rgfxSurfaceAged(e, 5000, age), "held again, it does not age");
+	rgfxSurfaceSleep(t, e, 2000);
+	check(!rgfxSurfaceAged(e, 2999, age) && rgfxSurfaceAged(e, 3000, age),
+	      "asleep again, it ages from its new sleep");
+	// Before the clock reaches the age, nothing has slept that long, a sleep at 0 included.
+	rgfxSurfaceClear(t, f);
+	check(t.dormantCount == 2, "a let-go entry is dormant no more");
+	RgfxSurfaceEntry &h = cachedEntry(t, 1, &runs[1], 0x20000, 0x8000, &cacheB);
+	rgfxSurfaceSleep(t, h, 0);
+	check(!rgfxSurfaceAged(h, 999, age) && rgfxSurfaceAged(h, 1000, age),
+	      "a sleep at the clock's 0 ages at the age");
+	check(kRgfxDormantAged < kRgfxDormantCauses, "the age is a cause of its own");
+}
+
 void naming()
 {
 	check(rgfxPagesNaming(true, true) == kRgfxPagesNamed && rgfxPagesNamingWired(kRgfxPagesNamed),
@@ -532,7 +581,7 @@ void cachedBySurface()
 	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == 0,
 	      "pending too: the ask waits for it");
 	e.pending = false;
-	rgfxSurfaceSleep(t, e);
+	rgfxSurfaceSleep(t, e, 1);
 	check(rgfxSurfaceFindCached(t, &surfaceA, kLength, e.size, true) == 0, "and dormant");
 	check(rgfxSurfaceFindCached(t, &surfaceB, kLength, e.size, true) == -1 &&
 	          rgfxSurfaceFindCached(t, nullptr, kLength, e.size, true) == -1,
@@ -583,7 +632,7 @@ void askNotMapping()
 	e.surfaceStart = true;
 	check(rgfxSurfaceFindCached(t, &surface, kLength, e.size, false) == -1,
 	      "a cached one: an ask not mapping the surface where it asks finds it not");
-	rgfxSurfaceSleep(t, e);
+	rgfxSurfaceSleep(t, e, 1);
 	check(rgfxSurfaceFindCached(t, &surface, kLength, e.size, false) == -1,
 	      "nor dormant: no revive by a surface the ask does not show it maps");
 	check(rgfxSurfaceFindCached(t, &surface, kLength, e.size, true) == 0,
@@ -618,6 +667,7 @@ void runsWalk()
 int main()
 {
 	naming();
+	aging();
 	deferred();
 	dormantDeferredCap();
 	cachedBySurface();

@@ -71,6 +71,7 @@
 #include "RgfxQueueWakes.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOKitKeys.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOMultiMemoryDescriptor.h>
@@ -348,6 +349,9 @@ struct DormantStats {
 	UInt64 purgedWritten;
 	// Let go past a cap, a table entry or the region's room, of a surface made volatile.
 	UInt64 volatileFirst;
+	// Let go for their age (kRgfxDormantAged) with a cache the GPU wrote since its last copy, whose
+	// releases copied it into the pages one at a time (agePace).
+	UInt64 agedWritten;
 	// Blocks of cached surfaces released with no client of the surface left
 	// (RGFX_BLOCK_RELEASE_NO_CLIENT), and of them those with GPU writes named that no lock's
 	// download copied: the host copies the cache into the pages all the same where it holds a
@@ -573,7 +577,8 @@ void queueFilterHook(OSObject *target)
 	static_cast<RgfxAccelerator *>(target)->queueFilter();
 }
 
-bool reapDormant();
+bool reapDormant(bool aging = false);
+void nameAgedClients(RgfxAccelerator *accel);
 void noteDormant();
 void noteReserve();
 void noteReleases();
@@ -590,6 +595,32 @@ RgfxReleaseTable releaseTable = {nullptr, 0, 0};
 thread_call_t releaseTimer = nullptr;
 // The thread call that names deferred blocks' pages before their releases (nameReleases).
 thread_call_t namingCall = nullptr;
+// The dormant blocks' age (kRgfxDormantAgeMs) in mach_absolute_time's units, set at the first
+// context's open. Under contextLock: the timer that runs the release worker at the next dormant
+// block's age, armed for `ageArmedAt` (0 where it waits for none, or its time passed: armAge), and
+// the block let go for its age whose release copies its cache into its pages, by its offset, while
+// its release is in flight (`agePace`, 0 while none is): the next such let-go waits for its answer
+// (finishRelease), so the copies a close's dormant blocks owe come one after another, not as one
+// burst beside the frames.
+UInt64 dormantAge = 0;
+thread_call_t ageTimer = nullptr;
+UInt64 ageArmedAt = 0;
+UInt64 agePace = 0;
+// A diagnostic, under contextLock: the dormant blocks let go for their age with clients of their
+// surfaces left, kAgedNamed a kDormantLogMs at most, each surface retained (the release worker's
+// sample of them, ageDormant), whose processes the worker names (nameAgedClients).
+struct AgedClient {
+	OSObject *surface;
+	uint32_t surfaceId;
+	UInt64 bytes;
+	bool deferred;
+	bool written;
+};
+constexpr UInt32 kAgedNamed = 8;
+AgedClient agedClients[kAgedNamed] = {};
+UInt32 agedClientCount = 0;
+UInt32 agedNamedCount = 0;
+UInt64 agedNamedAt = 0;
 bool releaseHooked = false;
 
 // The closes in flight (RgfxCloseTable.hpp), under releaseLock: their answers come through the
@@ -635,6 +666,16 @@ void releaseTimerFired(thread_call_param_t, thread_call_param_t)
 	thread_call_enter(releaseCall);
 }
 
+// The age timer's call: the time it was armed for came, so the worker's run lets go of the
+// blocks aged and arms it again (armAge), for the next.
+void ageTimerFired(thread_call_param_t, thread_call_param_t)
+{
+	IOLockLock(contextLock);
+	ageArmedAt = 0;
+	IOLockUnlock(contextLock);
+	thread_call_enter(releaseCall);
+}
+
 // A release done with: answered OK, the block goes out again; refused, or never posted, it is
 // kept until a context close posts it again (rgfxBlockReleased). A release not answered in time
 // never comes here before its answer (retireReleases).
@@ -666,9 +707,16 @@ void finishRelease(const RgfxReleaseEntry &e, bool answered)
 	rgfxBlockReleased(blockTable, e.offset, e.serial, ok, &wired);
 	rgfxLatencyAdd(releaseStats.latency, nanosSince(e.freedAt, mach_absolute_time()));
 	releaseStats.kept += !ok;
+	// The release of a block let go for its age that copies is done with, answered or not: the
+	// next such let-go may go, on the worker's next run.
+	const bool paced = agePace && agePace == e.offset;
+	if (paced)
+		agePace = 0;
 	// A new block waiting for the region's room looks again.
 	IOLockWakeup(contextLock, &surfaceTable, false);
 	IOLockUnlock(contextLock);
+	if (paced)
+		thread_call_enter(releaseCall);
 	// The device no longer maps an in-place block's pages once it has answered OK: unwire them,
 	// and let go of its surface, out of the lock.
 	rgfxSurfaceCacheLetGo(gone);
@@ -778,23 +826,26 @@ void nameReleases(thread_call_param_t accelerator, thread_call_param_t)
 }
 
 // The release thread call, the guest's one (THREAD_CALL_OPTIONS_ONCE): lets go of the dormant
-// blocks their surfaces asked to go (reapDormant); retires the releases answered; then posts
-// each freed block's BLOCK_RELEASE on ring 0, kReleaseBatch at a time with one doorbell at most,
-// as many as the release table holds, and returns without waiting for any answer. The work loop
-// hands each answer to its entry, in whatever order the contexts' command buffers finish, and
-// runs the worker again to retire it; so releases posted together wait for their contexts'
-// drains at once, and a slow context holds back only its own blocks. A deferred block whose
-// pages are named first goes to the naming worker (nameReleases), which waits for the host's
-// answers, and is posted once named. Never on the freeing thread.
+// blocks their surfaces asked to go, and of those aged (reapDormant), for which the age timer runs
+// it; retires the releases answered; then posts each freed block's BLOCK_RELEASE on ring 0,
+// kReleaseBatch at a time with one doorbell at most, as many as the release table holds, and
+// returns without waiting for any answer. The work loop hands each answer to its entry, in whatever
+// order the contexts' command buffers finish, and runs the worker again to retire it; so releases
+// posted together wait for their contexts' drains at once, and a slow context holds back only its
+// own blocks. A deferred block whose pages are named first goes to the naming worker
+// (nameReleases), which waits for the host's answers, and is posted once named. Never on the
+// freeing thread.
 void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 {
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
 	IOLockLock(contextLock);
 	if (const UInt64 asked = __atomic_exchange_n(&releaseStats.reapAskedAt, 0, __ATOMIC_RELAXED))
 		rgfxLatencyAdd(releaseStats.reapWait, nanosSince(asked, mach_absolute_time()));
-	reapDormant();
+	reapDormant(true);
 	IOLockUnlock(contextLock);
 	releaseLetGo();
+	// Before any release is posted, so the sample's own retains of surfaces are gone by then.
+	nameAgedClients(accel);
 	noteDormant();
 	// The answers come through the framebuffer's work loop: name this worker's hook there
 	// before the first release is posted.
@@ -988,6 +1039,8 @@ bool RgfxAccelerator::startContexts()
 	RgfxReleaseEntry *releases =
 	    static_cast<RgfxReleaseEntry *>(IOMalloc(sizeof(RgfxReleaseEntry) * kMaxReleases));
 	thread_call_t timer = thread_call_allocate(releaseTimerFired, nullptr);
+	// The timer for the next dormant block's age, which runs the worker.
+	thread_call_t aging = thread_call_allocate(ageTimerFired, nullptr);
 	// The region's bytes again for the write-combined spans (copyWriteCombinedRegion), with no
 	// effect on the region's own descriptor; a context goes on without it. None where the region's
 	// write-combined mappings are not ordinary memory (RgfxRegionMapping.hpp): every span is then
@@ -999,6 +1052,7 @@ bool RgfxAccelerator::startContexts()
 	        : nullptr;
 	RgfxBlock *expected = nullptr;
 	if (lock && wlock && flock && table && rings && call && naming && rlock && releases && timer &&
+	    aging &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
 	                                __ATOMIC_ACQUIRE)) {
 		bzero(table, sizeof(RgfxBlock) * kMaxBlocks);
@@ -1011,6 +1065,7 @@ bool RgfxAccelerator::startContexts()
 		namingCall = naming;
 		releaseTable = {releases, kMaxReleases, 0};
 		releaseTimer = timer;
+		ageTimer = aging;
 		state.combinedRegion = combined;
 		__atomic_store_n(&releaseLock, rlock, __ATOMIC_RELEASE);
 		const UInt32 features = readRegister(RGFX_REG_FEATURES_LO);
@@ -1057,6 +1112,8 @@ bool RgfxAccelerator::startContexts()
 		if (sysctlbyname("hw.memsize", &memory, &length, nullptr, 0) != 0 || !memory)
 			memory = kDormantMemoryUnknown;
 		dormantMaxBytes = memory / 8;
+		nanoseconds_to_absolutetime(static_cast<uint64_t>(kRgfxDormantAgeMs) * 1000000ull,
+		                            &dormantAge);
 		// A context's units hold twice the device's largest buffer (RgfxContextSlots.hpp).
 		UInt64 maxBufferLength = 0;
 		const void *info = nullptr;
@@ -1117,6 +1174,8 @@ bool RgfxAccelerator::startContexts()
 		IOFree(releases, sizeof(RgfxReleaseEntry) * kMaxReleases);
 	if (timer)
 		thread_call_free(timer);
+	if (aging)
+		thread_call_free(aging);
 	OSSafeReleaseNULL(combined);
 	// Another opener is making it: wait for it to publish.
 	while (expected && !__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
@@ -2137,12 +2196,62 @@ bool trimDormant()
 	return release;
 }
 
+// Arms the age timer for the next dormant block to age (rgfxSurfaceNextAge), where it is not
+// armed for a later time: a block that sleeps later ages later, and a block held again or let go
+// before its age leaves the timer as it was, whose run finds none aged and arms it for the next
+// (ageTimerFired). Where none waits to age, nothing is armed. Under contextLock.
+void armAge(UInt64 now)
+{
+	if (ageArmedAt > now)
+		return;
+	UInt64 at = 0;
+	ageArmedAt = rgfxSurfaceNextAge(surfaceTable, now, dormantAge, &at) ? at : 0;
+	if (ageArmedAt)
+		thread_call_enter_delayed(ageTimer, ageArmedAt);
+}
+
+// The dormant entry `i` goes for its age. One whose release copies its cache into its pages
+// (`written`: the GPU wrote it since its last copy, a deferred one's pages named first for it) is
+// the one such in flight (agePace) until its answer. Where clients of its surface are left, the
+// release worker's sample of them takes it. Under contextLock, on the release worker; whether a
+// release is to be posted.
+bool ageDormant(UInt32 i, bool written, UInt64 now)
+{
+	RgfxSurfaceEntry &e = surfaceTable.entries[i];
+	const UInt64 offset = e.offset;
+	uint64_t window = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(kDormantLogMs) * 1000000ull, &window);
+	if (now - agedNamedAt >= window) {
+		agedNamedAt = now;
+		agedNamedCount = 0;
+	}
+	// IOSurface's client count loads a field and takes no lock (rgfxSurfaceLocksFresh); the
+	// surface is retained, the sample's own, only where clients are left, so the retain changes
+	// no release's flags (rgfxSurfaceCacheReleaseFlags), and it is released before any release
+	// is posted.
+	OSObject *surface = static_cast<OSObject *>(e.surface);
+	if (surface && e.surfaceId && agedNamedCount < kAgedNamed && agedClientCount < kAgedNamed &&
+	    rgfxIOSurfaceClientCount(surface) > 0) {
+		surface->retain();
+		agedClients[agedClientCount++] = {surface, e.surfaceId, e.length, e.deferred, written};
+		agedNamedCount++;
+	}
+	const bool release = letGoDormant(i, kRgfxDormantAged, written);
+	if (release && written) {
+		agePace = offset;
+		dormantStats.agedWritten++;
+	}
+	return release;
+}
+
 // The dormant blocks their surfaces asked to go (rgfxSurfaceCacheLetGoOf) go, and the others
-// take whether their surfaces are volatile. Under contextLock; whether a release is to be
-// posted.
-bool reapDormant()
+// take whether their surfaces are volatile; on the release worker (`aging`), those that slept
+// kRgfxDormantAgeMs go too (ageDormant), those whose releases copy one at a time. Then the age
+// timer is armed for the next to age. Under contextLock; whether a release is to be posted.
+bool reapDormant(bool aging)
 {
 	bool release = false;
+	const UInt64 now = mach_absolute_time();
 	for (UInt32 i = 0; surfaceTable.dormantCount && i < surfaceTable.capacity; i++) {
 		RgfxSurfaceEntry &e = surfaceTable.entries[i];
 		if (!e.used || !e.dormant || e.pending)
@@ -2152,8 +2261,70 @@ bool reapDormant()
 		e.purgeable = purgeable;
 		if (why < kRgfxDormantCauses)
 			release |= letGoDormant(i, static_cast<RgfxDormantCause>(why), written);
+		else if (aging && rgfxSurfaceAged(e, now, dormantAge) && !(written && agePace))
+			release |= ageDormant(i, written, now);
 	}
+	armAge(now);
 	return release;
+}
+
+// A diagnostic: logs, for each dormant block let go for its age with clients of its surface left
+// that the release worker sampled (ageDormant), which processes with a context of the accelerator
+// open find its surface by its ID, and releases the sample's retain of it. A process with no
+// context open is not looked in, so it may name fewer processes than the surface has clients. Out
+// of every lock, on the release worker.
+void nameAgedClients(RgfxAccelerator *accel)
+{
+	AgedClient aged[kAgedNamed];
+	IOLockLock(contextLock);
+	const UInt32 n = agedClientCount;
+	for (UInt32 i = 0; i < n; i++)
+		aged[i] = agedClients[i];
+	agedClientCount = 0;
+	IOLockUnlock(contextLock);
+	if (!n)
+		return;
+	// The accelerator's clients, gathered (retained) first, so none goes while they are walked.
+	OSArray *clients = OSArray::withCapacity(16);
+	OSIterator *it = clients ? accel->getClientIterator() : nullptr;
+	if (it) {
+		do {
+			it->reset();
+			clients->flushCollection();
+			while (OSObject *o = it->getNextObject())
+				if (OSDynamicCast(RgfxAcceleratorUserClient, o))
+					clients->setObject(o);
+		} while (!it->isValid());
+		it->release();
+	}
+	const unsigned count = clients ? clients->getCount() : 0;
+	for (UInt32 i = 0; i < n; i++) {
+		char names[384] = "";
+		UInt32 looked = 0, found = 0;
+		for (unsigned c = 0; c < count; c++) {
+			auto *client = static_cast<RgfxAcceleratorUserClient *>(clients->getObject(c));
+			bool asked = false;
+			OSObject *surface = client->lookupSurfaceOfProcess(aged[i].surfaceId, &asked);
+			looked += asked;
+			if (surface == aged[i].surface) {
+				const OSString *who =
+				    OSDynamicCast(OSString, client->getProperty(kIOUserClientCreatorKey));
+				if (found++)
+					strlcat(names, "; ", sizeof(names));
+				strlcat(names, who ? who->getCStringNoCopy() : "?", sizeof(names));
+			}
+			OSSafeReleaseNULL(surface);
+		}
+		IOLog("RgfxAccelerator: a dormant block let go for its age: IOSurface %u, %llu KiB, %s%s, "
+		      "%d clients, %d retains (this line's own among them); its ID finds it in %u of the "
+		      "%u contexts open: %s\n",
+		      aged[i].surfaceId, aged[i].bytes >> 10, aged[i].deferred ? "deferred" : "wired",
+		      aged[i].written ? ", the GPU's writes copied" : "",
+		      rgfxIOSurfaceClientCount(aged[i].surface), aged[i].surface->getRetainCount(), found,
+		      looked, found ? names : "none");
+		aged[i].surface->release();
+	}
+	OSSafeReleaseNULL(clients);
 }
 
 // Logs what the releases took (ReleaseStats), where more were answered and kReleaseLogMs passed
@@ -2346,7 +2517,8 @@ void noteDormant()
 		      "%llu revived; let go: %llu purged (%llu with a cache written), %llu made "
 		      "empty, %llu with no client at sleep, %llu past the count, %llu past the "
 		      "bytes, %llu for a table entry, %llu for the region's room (%llu of these "
-		      "volatile), %llu asked otherwise, %llu past the deferred bytes; %llu released with "
+		      "volatile), %llu asked otherwise, %llu past the deferred bytes, %llu for their age "
+		      "(%llu with GPU writes no download copied, one at a time); %llu released with "
 		      "no client left (%llu with GPU writes no download copied), %llu of them held by "
 		      "the kext alone, as the host counts them (%llu with GPU writes no download copied; "
 		      "%llu taken again before the answer); %llu not cached: no room; %llu deferred "
@@ -2357,7 +2529,8 @@ void noteDormant()
 		      d.letGo[kRgfxDormantNoClients],
 		      d.letGo[kRgfxDormantCount], d.letGo[kRgfxDormantBytes],
 		      d.letGo[kRgfxDormantTableFull], d.letGo[kRgfxDormantNoSpace], d.volatileFirst,
-		      d.letGo[kRgfxDormantStale], d.letGo[kRgfxDormantDeferredBytes], d.unread,
+		      d.letGo[kRgfxDormantStale], d.letGo[kRgfxDormantDeferredBytes],
+		      d.letGo[kRgfxDormantAged], d.agedWritten, d.unread,
 		      d.unreadWritten, d.unheld, d.unheldWritten, retaken, noRoom, d.deferred,
 		      d.deferredRefused, d.deferredUnattached, d.foundBySurface);
 	// How the deferrals of surfaces whose asks listed resident pages ended (RgfxDeferCarry.hpp).
@@ -2384,7 +2557,7 @@ bool sleepBlock(RgfxSurfaceEntry &e, UInt32 context, OSObject **surface)
 	    !rgfxSurfaceCacheSleep(e.cache, &purgeable))
 		return false;
 	rgfxBlockSetContext(blockTable, e.offset, context);
-	rgfxSurfaceSleep(surfaceTable, e);
+	rgfxSurfaceSleep(surfaceTable, e, mach_absolute_time());
 	e.purgeable = purgeable;
 	e.pending = true;
 	*surface = static_cast<OSObject *>(e.surface);
@@ -2394,12 +2567,12 @@ bool sleepBlock(RgfxSurfaceEntry &e, UInt32 context, OSObject **surface)
 	return true;
 }
 
-// The BLOCK_UNSHARE of the block at `offset` (serial `serial`) that slept is posted: the entry
-// is no longer pending, and the dormant blocks past their caps, or asked to go meanwhile, go.
-// Its surface, `surface` (sleepBlock), is read for its clients once, out of the contexts' lock,
-// then released: one with none left, its last gone while the block was held, its op 5 then
-// letting nothing go, asks the block to go. Takes contextLock; whether a release is to be
-// posted.
+// The BLOCK_UNSHARE of the block at `offset` (serial `serial`) that slept is posted: the entry is
+// no longer pending, so it ages (armAge), and the dormant blocks past their caps, or asked to go
+// meanwhile, go. Its surface, `surface` (sleepBlock), is read for its clients once, out of the
+// contexts' lock, then released: one with none left, its last gone while the block was held, its
+// op 5 then letting nothing go, asks the block to go. Takes contextLock; whether a release is to
+// be posted.
 bool wakeSlept(UInt64 offset, UInt64 serial, OSObject *surface)
 {
 	if (surface && rgfxIOSurfaceClientCount(surface) == 0)

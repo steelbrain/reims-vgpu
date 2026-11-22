@@ -27,7 +27,11 @@
 // the cache's copy in the GPU's memory is used again rather than made and filled anew, as a GPU
 // of its own memory keeps a surface's copy past the textures over it. The dormant blocks are
 // let go past kRgfxDormantMaxBlocks of them or a byte cap the caller sets (rgfxSurfaceOverCaps),
-// those of volatile surfaces first, then the oldest, and for the causes RgfxDormantCause names.
+// those of volatile surfaces first, then the oldest, and for the causes RgfxDormantCause names;
+// and each once it has slept kRgfxDormantAgeMs (rgfxSurfaceAged), the host's age for a shape no
+// texture references, so a cache no process asked for that long goes, with its wired pages, as
+// the host's images of a cache whose textures went do. A revive after that makes a new block,
+// which the host fills from the pages.
 //
 // A cached block in place may be deferred (RGFX_SURFACE_PAGES_DEFERRED): its surface had no
 // pages at its first ask, a fresh surface only the GPU has touched, and the host's device cache
@@ -128,6 +132,9 @@ struct RgfxSurfaceEntry {
 	// lowest.
 	bool dormant;
 	uint64_t dormantSeq;
+	// The caller's clock at its sleep (rgfxSurfaceSleep), from which it ages (rgfxSurfaceAged);
+	// 0 while it is not dormant.
+	uint64_t sleptAt;
 	// A dormant block whose surface was made volatile (RgfxSurfaceCaches.hpp): the first of
 	// them to go.
 	bool purgeable;
@@ -238,8 +245,16 @@ enum RgfxDormantCause : uint32_t {
 	kRgfxDormantStale,
 	// A deferred one, past the dormant deferred cap (rgfxSurfaceDormantDeferredCap), the oldest.
 	kRgfxDormantDeferredBytes,
+	// Slept kRgfxDormantAgeMs or more (rgfxSurfaceAged).
+	kRgfxDormantAged,
 	kRgfxDormantCauses,
 };
+
+// How long a dormant block sleeps before it goes for its age (kRgfxDormantAged): the host's age
+// for a shape no texture references (UNREFERENCED_FOR, crates/reims-vgpu's
+// graphics/decode/surface_cache/shapes.rs), which lets the shapes' images of a cache whose
+// textures went go after as long.
+constexpr uint32_t kRgfxDormantAgeMs = 10000;
 
 // The guest's page, by which the two modes' keys of one surface meet: a copy's starts at plane
 // 0's first byte, which may lie past the start of the surface's first page (CoreVideo places a
@@ -514,13 +529,15 @@ inline bool rgfxSurfaceHeldBy(const RgfxSurfaceTable &t, const void *client, uin
 	return false;
 }
 
-// The entry's last holder let it go, and its block stays for its surface: dormant, the newest.
-inline void rgfxSurfaceSleep(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
+// The entry's last holder let it go at `now`, the caller's clock, and its block stays for its
+// surface: dormant, the newest.
+inline void rgfxSurfaceSleep(RgfxSurfaceTable &t, RgfxSurfaceEntry &e, uint64_t now)
 {
 	if (e.dormant)
 		return;
 	e.dormant = true;
 	e.dormantSeq = ++t.dormantSeq;
+	e.sleptAt = now;
 	t.dormantCount++;
 	(e.deferred ? t.dormantDeferredBytes : t.dormantBytes) += e.length;
 }
@@ -532,6 +549,7 @@ inline void rgfxSurfaceWake(RgfxSurfaceTable &t, RgfxSurfaceEntry &e)
 		return;
 	e.dormant = false;
 	e.dormantSeq = 0;
+	e.sleptAt = 0;
 	e.purgeable = false;
 	t.dormantCount--;
 	(e.deferred ? t.dormantDeferredBytes : t.dormantBytes) -= e.length;
@@ -664,6 +682,32 @@ inline int32_t rgfxSurfaceOverCaps(const RgfxSurfaceTable &t, uint64_t maxBytes,
 		return -1;
 	*why = kRgfxDormantBytes;
 	return rgfxSurfaceOldestDormant(t, kRgfxDormantWiredOnly);
+}
+
+// Whether the entry is dormant and slept `age` or more before `now`, both on the caller's clock
+// (kRgfxDormantAgeMs in its units), so it goes for its age. One still pending, its last holder's
+// BLOCK_UNSHARE not yet posted, does not, as rgfxSurfaceOldestDormant's does not.
+inline bool rgfxSurfaceAged(const RgfxSurfaceEntry &e, uint64_t now, uint64_t age)
+{
+	return e.used && e.dormant && !e.pending && now >= age && e.sleptAt <= now - age;
+}
+
+// When the next dormant entry not yet aged at `now` ages (rgfxSurfaceAged): its sleep plus `age`,
+// the earliest of those not pending, in `*at`; false where there is none.
+inline bool rgfxSurfaceNextAge(const RgfxSurfaceTable &t, uint64_t now, uint64_t age,
+                               uint64_t *at)
+{
+	bool any = false;
+	for (uint32_t i = 0; t.dormantCount && i < t.capacity; i++) {
+		const RgfxSurfaceEntry &e = t.entries[i];
+		if (!e.used || !e.dormant || e.pending || rgfxSurfaceAged(e, now, age))
+			continue;
+		const uint64_t due = e.sleptAt + age;
+		if (!any || due < *at)
+			*at = due;
+		any = true;
+	}
+	return any;
 }
 
 // The dormant deferred blocks' cap: the smaller of half the device's budget for deferred blocks'

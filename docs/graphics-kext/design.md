@@ -790,12 +790,21 @@ Stages:
         1024 dormant blocks or an eighth of the guest's memory in their
         surfaces' wired bytes, and where the table or the region has no room
         for a new block, those of surfaces made volatile first (IOSurfaceRef.h
-        lets a volatile surface's contents go), then the oldest; and where an
-        ask of the pages names another cache or the other mode. Made
+        lets a volatile surface's contents go), then the oldest; where an
+        ask of the pages names another cache or the other mode; and once it
+        has slept 10 s (`kRgfxDormantAgeMs`), the host's age for a shape no
+        texture references, on a timer armed for the next block's age, and
+        for none while no block sleeps. Made
         nonvolatile again (op 6, or op 7), a surface is neither volatile nor
         empty for this. A let-go block's `BLOCK_RELEASE` copies the cache
         into the pages where a buffer wrote it since the last copy, and a
-        lock waits for the answer. The host makes the releases' copies one at
+        lock waits for the answer. Of the blocks let go for their age, one
+        whose release copies is in flight at a time, the next let go at its
+        answer, so the dormant blocks a close leaves, which age together,
+        copy one after another rather than as one burst of releases beside
+        the frames; one that copies nothing goes at once. The surface's next
+        ask then takes a new block over its pages, which hold its bytes. The
+        host makes the releases' copies one at
         a time, each once the last has landed and as long again as it held
         the GPU has passed, or 2 s after its ask at most, so a burst of
         let-gos leaves the GPU to other work, the host's NVDEC among it,
@@ -809,7 +818,9 @@ Stages:
         pages (a Dock icon showed another app's icon, the bytes its pages
         held before the GPU drew it, while the host dropped such a cache
         uncopied). The kext logs the dormant
-        blocks' count and the let-gos by cause. Op 6, which IOSurface calls
+        blocks' count and the let-gos by cause, and, for eight a minute at
+        most of those let go for their age with clients of the surface left,
+        which processes with a context open find the surface by its ID. Op 6, which IOSurface calls
         as a surface turns nonvolatile again, is answered as the AMD's driver
         does (a byte set to 0xff), so IOSurface answers the old state
         volatile, after volatile and after empty alike, the contents kept,
@@ -899,9 +910,10 @@ Stages:
         and dormant, and dormant ones are let go past the smaller of half of
         it and an eighth of the guest's memory, the cap of the other dormant
         blocks' wired bytes, the oldest first
-        (`guest/kext/src/RgfxSurfaceBlocks.hpp`). Only the host's cache
-        holds a dormant deferred block's bytes, so the guest's cap bounds
-        what the host keeps for surfaces no process holds. Half the budget
+        (`guest/kext/src/RgfxSurfaceBlocks.hpp`), and once they have slept
+        10 s, as every dormant block is. Only the host's cache holds a
+        dormant deferred block's bytes, so the guest's cap and the age bound
+        what the host keeps for surfaces no process holds, and how long. Half the budget
         alone is sized by the host GPU's memory and left the count of 1024
         to bind: after the browser closed, the dormant blocks' caches held
         3,862 MiB of images on the host, on an 8 GiB arm64 guest

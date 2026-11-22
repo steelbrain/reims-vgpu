@@ -95,6 +95,12 @@ public:
 	// caller (measured on the 5300M and the 630, oracle_events connect). Connects nothing.
 	IOReturn connectClient(IOUserClient *client) override;
 
+	// A diagnostic's (RgfxAcceleratorContexts.cpp, nameAgedClients): the IOSurface of ID
+	// `surfaceId` as this client's process finds it (rgfxSurfaceLocksLookup), retained, or null.
+	// Inside an ask (beginAsk), which the close waits out, so the process's task outlives the
+	// lookup; null, `*asked` false, where the context is not open or its close has begun.
+	OSObject *lookupSurfaceOfProcess(uint32_t surfaceId, bool *asked);
+
 	// Dispatch our selectors (the doorbell).
 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
 	                        IOExternalMethodDispatch *dispatch, OSObject *target,
