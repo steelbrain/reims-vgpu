@@ -14,10 +14,16 @@
 //!   the ask, or ended inside the answer, among them. rt tells of a make only once it ended, so a
 //!   make still running when the answer is read is not among them.
 //! - **The first-use waits of compute pipelines.** rt keeps its last 256 ended makes of a compute
-//!   kernel's `VkPipeline` for a dispatch's variant, with when each began and ended, how many
-//!   dispatches waited for it (its first-use waits, rt's `Metrics::first_use_variant_waits`) and
-//!   when the earliest of them began (rt's `Counters::variant_makes`). [`first_use_waits_met`]
-//!   reads them, only for a slow answer, and counts each make's waits once.
+//!   kernel's `VkPipeline` for a dispatch's variant, whoever started it (a state's create, its
+//!   finish, a make ahead or a dispatch's first use), with when each began and ended, how many
+//!   dispatches waited for it (its first-use waits) and when the earliest of them began (rt's
+//!   `Counters::variant_makes`). A compute state's main pipeline is one of those variants: the
+//!   dispatches that waited for it, for the make its finish started or for one of their own, are
+//!   among rt's `Metrics::first_use_unfinished_waits`, and those that waited for any other variant
+//!   are its `Metrics::first_use_variant_waits`. [`first_use_waits_met`] reads them, only for a
+//!   slow answer, and counts each make's waits once: the compute dispatches' share of the two.
+//!   A draw that waits for a render state's main pipeline waits for no variant make, and is not
+//!   among them.
 
 use std::collections::VecDeque;
 use std::thread::Thread;
@@ -84,10 +90,13 @@ pub fn pool_makes_met(start: u64, end: u64) -> Vec<PoolMake> {
     met
 }
 
-/// The first-use waits of compute pipelines (rt's variant makes that dispatches waited for) that
-/// met `start..=end` of rt's host clock, from the earliest wait's start to the make's end, of the
-/// process's device, and that no call before counted: their waits. 0 before the device is made.
-/// A make still running at `end` has not ended, and is not among them.
+/// The first-use waits of compute pipelines (rt's variant makes that dispatches waited for,
+/// whoever started each) that met `start..=end` of rt's host clock, from the earliest wait's start
+/// to the make's end, of the process's device, and that no call before counted: their waits. A
+/// state's main pipeline is among the variants, so its makes count with the rest: those a
+/// dispatch made at its first use, and those a finish, a make ahead or the state's create started
+/// that a dispatch found in flight. 0 before the device is made. A make still running at `end` has
+/// not ended, and is not among them.
 pub fn first_use_waits_met(start: u64, end: u64) -> u64 {
     let Some(makes) = super::device::variant_makes() else {
         return 0;

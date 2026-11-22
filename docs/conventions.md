@@ -209,7 +209,8 @@ repeats the ones code cites.
     16.7 ms, or more after the device read its command, during which a make
     of rt's pool ran, and `slow-answer-over-make-max-ns` the longest;
     `slow-answer-first-use-waits`, the compute dispatches' first-use waits,
-    `rt-first-use-variant-waits`, that met any such answer: no degradation,
+    `rt-first-use-variant-waits` and their share of
+    `rt-first-use-unfinished-waits`, that met any such answer: no degradation,
     `graphics/slow_answers.rs`), and the guest's pipeline creates' waits for
     their replies (`pipeline-create-replies`, the replies posted;
     `pipeline-create-reply-ns` and `pipeline-create-reply-max-ns`, each

@@ -16,10 +16,13 @@
 //!   is given is not.
 //! - **A split over no make.** The first slow release-class answer of each command type during
 //!   which no make ran is logged at info too, of a kind of its own, with its split.
-//! - **Over compute dispatches' first-use waits.** The first-use waits of compute pipelines (rt's
-//!   `Metrics::first_use_variant_waits`, on the counts line as `rt-first-use-variant-waits`) that
+//! - **Over compute dispatches' first-use waits.** The first-use waits of compute pipelines that
 //!   met any slow answer, from the earliest wait's start to its make's end, are counted, each once,
-//!   [`FIRST_USE_WAITS_CODE`].
+//!   [`FIRST_USE_WAITS_CODE`]: the waits for a dispatch's variant (rt's
+//!   `Metrics::first_use_variant_waits`, on the counts line as `rt-first-use-variant-waits`) and
+//!   the compute dispatches' waits for a state's main pipeline, for the make its finish started or
+//!   for one of their own (their share of rt's `Metrics::first_use_unfinished_waits`,
+//!   `rt-first-use-unfinished-waits`, which counts draws' too).
 //! - **The split.** A release-class answer marks its waits and its frees on rt's host clock as
 //!   they end, apart, so a line tells an answer that waited for the guest's command buffers, for
 //!   our own settles, or for a call of rt's that releases or frees memory (its name, its ms, the
@@ -79,7 +82,8 @@ pub(crate) const OVER_MAKE_CODE: &str = "slow-answer-over-make";
 /// The code of the longest of them, in nanoseconds, which its count rises to.
 pub(crate) const OVER_MAKE_MAX_NS_CODE: &str = "slow-answer-over-make-max-ns";
 
-/// The code of the compute dispatches' first-use waits that met a slow answer.
+/// The code of the compute dispatches' first-use waits that met a slow answer: their waits for a
+/// variant and for a state's main pipeline (`reims_vgpu_vulkan`'s `rt_platform::overlap`).
 pub(crate) const FIRST_USE_WAITS_CODE: &str = "slow-answer-first-use-waits";
 
 /// The longest slow answer over a make so far, which [`OVER_MAKE_MAX_NS_CODE`] rises to.

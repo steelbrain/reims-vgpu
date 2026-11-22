@@ -99,7 +99,8 @@
 //! counts line carries the waits, [`FIRST_USE_WAITS_CODE`], and their nanoseconds,
 //! [`FIRST_USE_WAIT_NS_CODE`], as amounts, and the longest, [`FIRST_USE_WAIT_MAX_NS_CODE`], as an
 //! amount risen to it over the process's devices ([`note_highest_metrics`]); reims-vgpu's slow
-//! answers count those that met a guest answer of a frame or more (`super::overlap`).
+//! answers count those that met a guest answer of a frame or more, with the compute dispatches'
+//! waits for an unfinished main pipeline below (`super::overlap`).
 //!
 //! **Its states' finishes.** rt's creators answer before the driver's create of a state's main
 //! pipeline, which the state's finish then makes on the device's compile thread, after the
