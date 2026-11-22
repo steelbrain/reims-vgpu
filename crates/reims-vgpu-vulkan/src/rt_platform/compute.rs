@@ -17,6 +17,14 @@
 //! - **Nothing to record**: `setImageblockWidth:height:` (rt makes no kernel that reads an
 //!   imageblock), `insertCompressedTextureReinterpretationFlush` (rt keeps no lossless
 //!   compression), and a nil visible function table (rt binds none).
+//! - **Each dispatch rt encodes is counted by its form**, with one relaxed add, for the counts
+//!   line, where rt counts none: direct (`dispatchThreads:threadsPerThreadgroup:` and
+//!   `dispatchThreadgroups:threadsPerThreadgroup:`, [`DISPATCHES_DIRECT_CODE`]) and indirect
+//!   (`dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:`,
+//!   [`DISPATCHES_INDIRECT_CODE`]), amounts on the line ([`fold_dispatches`]). A dispatch counts
+//!   once, however many threads or threadgroups it runs, as rt records it, after any wait for its
+//!   stage's fill; one that records nothing (a refusal, a skip, a form rt has not built) counts
+//!   none.
 //! - **Unbuilt**: an indirect `dispatchThreads` and an indirect stage-in region
 //!   ([`Unbuilt::ComputeCommand`]), and command predication (`encodeStart*`, `encodeEnd*`,
 //!   [`Unbuilt::Predication`]): each encodes nothing, counted, and an `encodeEnd*` answers NO, as
@@ -47,6 +55,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use metal2vulkan_runtime as rt;
 
@@ -69,6 +78,32 @@ use super::{RtObj, RtPlatform};
 
 /// An index, a length or a size past rt's 32 bits.
 const WIDE: Stop = Stop::Metal("an index, a length or a size past 32 bits");
+
+/// The code of the direct dispatches rt encoded, `dispatchThreads:threadsPerThreadgroup:` and
+/// `dispatchThreadgroups:threadsPerThreadgroup:`, an amount on the counts line
+/// ([`fold_dispatches`]).
+pub const DISPATCHES_DIRECT_CODE: &str = "rt-dispatches-direct";
+
+/// The code of the indirect dispatches rt encoded,
+/// `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:`, an amount
+/// on the counts line ([`fold_dispatches`]).
+pub const DISPATCHES_INDIRECT_CODE: &str = "rt-dispatches-indirect";
+
+/// The direct dispatches rt encoded since the last fold ([`fold_dispatches`]).
+static DIRECT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// The indirect dispatches rt encoded since the last fold ([`fold_dispatches`]).
+static INDIRECT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Counts by code (`crate::answer::count_kind_by`) the dispatches rt encoded since the last fold,
+/// direct ([`DISPATCHES_DIRECT_CODE`]) and indirect ([`DISPATCHES_INDIRECT_CODE`]), so the counts
+/// line carries their totals; `super::device::fold_metrics` folds them.
+pub(super) fn fold_dispatches() {
+    let direct = DIRECT_DISPATCHES.swap(0, Ordering::Relaxed);
+    let indirect = INDIRECT_DISPATCHES.swap(0, Ordering::Relaxed);
+    crate::answer::count_kind_by(DISPATCHES_DIRECT_CODE, direct);
+    crate::answer::count_kind_by(DISPATCHES_INDIRECT_CODE, indirect);
+}
 
 /// `id<MTLComputeCommandEncoder>` on metal2vulkan-runtime.
 pub struct RtComputeEncoder {
@@ -155,6 +190,7 @@ impl RtComputeEncoder {
                 let dispatch = || e.dispatch_threadgroups(groups, threads);
                 held(&self.fills, dispatch, unfilled_at_dispatch)
                     .map_err(|refused| self.unmade(sel, refused))?;
+                DIRECT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
             }
             ComputeCmd::DispatchThreadgroupsIndirect {
                 indirect_buffer,
@@ -169,6 +205,7 @@ impl RtComputeEncoder {
                     || e.dispatch_threadgroups_with_indirect_buffer(buffer.rt(), offset, threads);
                 held(&self.fills, dispatch, unfilled_at_dispatch)
                     .map_err(|refused| self.unmade(sel, refused))?;
+                INDIRECT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
             }
             ComputeCmd::DispatchThreads {
                 threads_per_grid,
@@ -180,6 +217,7 @@ impl RtComputeEncoder {
                 let dispatch = || e.dispatch_threads(grid, threads);
                 held(&self.fills, dispatch, unfilled_at_dispatch)
                     .map_err(|refused| self.unmade(sel, refused))?;
+                DIRECT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
             }
             ComputeCmd::DispatchThreadsIndirect { .. }
             | ComputeCmd::SetStageInRegionIndirect { .. } => {
@@ -910,6 +948,77 @@ mod tests {
         assert!(matches!(made.compute_encoder_for_pass(&unknown), Ok(None)));
         assert_eq!(counted(metal), before + 2);
         drop(made);
+    }
+
+    /// Each dispatch rt encodes moves its form's count on the counts line by one, as
+    /// `fold_metrics` folds them: a direct `dispatchThreads` ([`DISPATCHES_DIRECT_CODE`]) and an
+    /// indirect `dispatchThreadgroups` ([`DISPATCHES_INDIRECT_CODE`]), each running its grid; a
+    /// dispatch with no pipeline state set, Metal's refusal, moves neither.
+    #[test]
+    fn each_dispatch_rt_encodes_counts_by_its_form_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let done = CommandBufferStatus::COMPLETED;
+        let holding = |values: &[u32]| {
+            let length = 4 * values.len().to_u64();
+            let made = device.new_buffer_of_length(on, length, 0);
+            let made = made.expect("never a raise").expect("a buffer");
+            // SAFETY: the Shared buffer's contents are mapped, `values` long.
+            unsafe {
+                let at = made.contents().as_ptr::<u32>();
+                at.copy_from_nonoverlapping(values.as_ptr(), values.len());
+            }
+            made
+        };
+        let library = device.new_library(ADD).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let kernel = library.new_function(on, "add_one");
+        let kernel = kernel.expect("never a raise").expect("the kernel");
+        let made = device.new_compute_pipeline_state_for_function(Some(&kernel));
+        let add = made.expect("a compute state").expect("a compute state");
+        let counts = || {
+            crate::rt_platform::device::fold_metrics();
+            [
+                counted(DISPATCHES_DIRECT_CODE),
+                counted(DISPATCHES_INDIRECT_CODE),
+            ]
+        };
+        let (input, groups) = (holding(&[7, 8, 9, 10]), holding(&[2, 1, 1]));
+        let (direct, indirect) = (holding(&[0; 4]), holding(&[0; 4]));
+        let [direct_before, indirect_before] = counts();
+
+        let status = run(
+            &queue,
+            None,
+            vec![
+                threads(4),
+                ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                bind(&[Some(&direct), Some(&input)]),
+                threads(4),
+            ],
+        );
+        assert_eq!(status, done);
+        assert_eq!(words(&direct, 4), [8, 9, 10, 11]);
+        assert_eq!(counts(), [direct_before + 1, indirect_before]);
+
+        let status = run(
+            &queue,
+            None,
+            vec![
+                ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                bind(&[Some(&indirect), Some(&input)]),
+                ComputeCmd::DispatchThreadgroupsIndirect {
+                    indirect_buffer: Some(&groups),
+                    indirect_buffer_offset: 0,
+                    threads_per_threadgroup: MtlSize::new(2, 1, 1),
+                },
+            ],
+        );
+        assert_eq!(status, done);
+        assert_eq!(words(&indirect, 4), [8, 9, 10, 11]);
+        assert_eq!(counts(), [direct_before + 1, indirect_before + 1]);
     }
 
     /// A declaration of no usage (`useResources:count:usage:` of 0) declares nothing and is no

@@ -151,6 +151,15 @@
 //! [`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`], so a boot's line says how often its whole grids took the
 //! variant.
 //!
+//! **Its compute dispatches.** rt counts no dispatch, so the rt platform's compute encoders count
+//! those they encode, by form, one relaxed add each (`super::compute`): the direct ones
+//! (`dispatchThreads`, `dispatchThreadgroups`) and the indirect ones
+//! (`dispatchThreadgroupsWithIndirectBuffer`). [`fold_metrics`] folds them onto the counts line as
+//! amounts, `rt-dispatches-direct` and `rt-dispatches-indirect`
+//! (`super::compute::DISPATCHES_DIRECT_CODE`, `super::compute::DISPATCHES_INDIRECT_CODE`), so a
+//! boot's line says what share of its direct dispatches ran whole grids on a
+//! partial-threadgroups variant.
+//!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
@@ -421,8 +430,10 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// fold
 /// ([`folded_counts`]), so the counts line carries their totals, then its maxima
 /// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
-/// docs). Nothing before the device is made.
+/// docs). Nothing of rt's before the device is made. First it counts the dispatches the rt
+/// platform's compute encoders encoded since the last fold (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
+    super::compute::fold_dispatches();
     let (metrics, gauges) = {
         let mut latest = COUNTERS.lock();
         let Some((counters, folded)) = latest.as_mut() else {
