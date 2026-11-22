@@ -40,8 +40,9 @@ constexpr uint64_t kMiB = 1ull << 20;
 // Memory of the test's own, handed out first fit in units of `unitBytes` (16 KiB, as the region's),
 // every byte 0xee as it first comes, with a log of what the allocator asked of it, in order. Its
 // Shared classes are heaped where `heapedClasses`, as the region's are. A give waits while the
-// gate is shut (shut()), as a block's release waits for the host, and `held` counts the gives
-// that came to it.
+// gate is shut (shut()), as a block's release waits for the host, but for one let through
+// (letOneThrough()) and those of the thread passThread() names; `held` counts the gives that
+// waited at it, and `passed` that thread's.
 struct Source : RgfxSlabSource {
 	std::vector<uint8_t> raw;
 	uint8_t *base; // raw's first byte at a 16 KiB boundary
@@ -60,6 +61,9 @@ struct Source : RgfxSlabSource {
 	std::condition_variable gateMoved;
 	bool gateShut = false;
 	int held = 0;
+	std::thread::id passer; // whose gives the shut gate lets through
+	int letThrough = 0;     // other gives the shut gate lets through
+	int passed = 0;         // the passer's gives
 
 	explicit Source(uint64_t size, uint64_t unit = 0x4000)
 	    : raw(size + 0x4000, 0xee), bytes(size), free(size), unitBytes(unit)
@@ -96,9 +100,15 @@ struct Source : RgfxSlabSource {
 	{
 		{
 			std::unique_lock<std::mutex> gate(gateLock);
-			held++;
-			gateMoved.notify_all();
-			gateMoved.wait(gate, [this] { return !gateShut; });
+			if (gateShut && std::this_thread::get_id() == passer) {
+				passed++;
+			} else {
+				held++;
+				gateMoved.notify_all();
+				gateMoved.wait(gate, [this] { return !gateShut || letThrough > 0; });
+				if (gateShut)
+					letThrough--;
+			}
 		}
 		std::lock_guard<std::mutex> hold(lock);
 		gives++;
@@ -144,6 +154,26 @@ struct Source : RgfxSlabSource {
 			gateShut = false;
 		}
 		gateMoved.notify_all();
+	}
+	// Lets one give the shut gate holds, or the next to come, through.
+	void letOneThrough()
+	{
+		{
+			std::lock_guard<std::mutex> gate(gateLock);
+			letThrough++;
+		}
+		gateMoved.notify_all();
+	}
+	// The shut gate lets `thread`'s gives through.
+	void passThread(std::thread::id thread)
+	{
+		std::lock_guard<std::mutex> gate(gateLock);
+		passer = thread;
+	}
+	int passes()
+	{
+		std::lock_guard<std::mutex> gate(gateLock);
+		return passed;
 	}
 	// Waits until `n` gives came to the gate.
 	void waitHeld(int n)
@@ -774,6 +804,55 @@ void test_slab_take_waits_for_slabs_given_back()
 	CHECK(source.gives == 1 && source.used() == 3 * kMiB);
 	slabs.give(second);
 	CHECK(source.used() == 0 && slabs.stats().slabs == 0);
+}
+
+// A create that waited for a slab on its way back gives back, before it asks again, the slabs let
+// go while it waited (THE FALLBACKS), which the background thread, behind on its drops as under
+// CPU load, leaves doomed with their memory out of the source: a 1.25 MiB slab and two of 3 MiB
+// fill the source, and the first is let go, its release on the background held at the source,
+// while another thread asks for 3 MiB; the two others are let go as it waits, and once the first
+// is back, 1.25 MiB short of the create's 3, the background's release of the next is held too.
+void test_slab_take_gives_back_slabs_let_go_while_it_waited()
+{
+	Source source(7 * kMiB + (256 << 10));
+	RgfxSlabs slabs(source);
+	CHECK(slabs.start());
+	RgfxSlabs::Range first, second, third;
+	CHECK(slabs.take(kMiB + (256 << 10), kShared, 0, &first));
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &second) && slabs.take(3 * kMiB, kShared, 0, &third));
+	CHECK(source.used() == source.bytes);
+	// Past the cache's cap (a sixteenth of the source), each slab goes as its buffer does.
+	source.shut();
+	slabs.give(first);
+	source.waitHeld(1);
+	std::atomic<int> answer{-1};
+	RgfxSlabs::Range got;
+	std::thread taker([&] { answer = slabs.take(3 * kMiB, kShared, 0, &got) ? 1 : 0; });
+	source.passThread(taker.get_id()); // the create's own releases go through
+	// It found no room, and waits for the slab on its way back.
+	while (source.refusals() == 0)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	CHECK(answer == -1);
+	slabs.give(second);
+	slabs.give(third);
+	source.letOneThrough();
+	// It gives back what is still let go itself, waits for the one the background holds, and
+	// takes the room: without that, it is nil here. (Should it have come to wait for all three,
+	// the gate opens after 2 s.)
+	for (int i = 0; i < 2000 && answer == -1 && source.passes() == 0; i++)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	source.open();
+	taker.join();
+	CHECK(answer == 1 && got.size == 3 * kMiB);
+	slabs.give(got);
+	bool settled = false;
+	for (int i = 0; i < 2000 && !settled; i++) {
+		settled = slabs.stats().slabs == 0 && slabs.stats().dooming == 0;
+		if (!settled)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	CHECK(settled && source.used() == 0);
 }
 
 // Over the region: a Shared slab is a Placement heap over host memory at its block, each buffer a
@@ -2010,6 +2089,7 @@ void rgfxSlabTests()
 	test_slab_first_source();
 	test_slab_thread();
 	test_slab_take_waits_for_slabs_given_back();
+	test_slab_take_gives_back_slabs_let_go_while_it_waited();
 	test_region_slab_source();
 	test_region_slab_source_zeroed_blocks();
 	test_region_reclaims_slabs();

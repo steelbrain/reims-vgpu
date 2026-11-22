@@ -689,9 +689,13 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 			return fromOwn();
 		};
 		Slab *made = fromEither();
-		if (made == nullptr && !refused) {
-			dropDoomed(true);
-			waitForDrops();
+		// The process's own room given back (reclaim) and the slab asked again, and again after each
+		// later round that gave some back: a round waits only for the slabs on their way back as
+		// it began, and those let go while it waited, which a background thread behind on its
+		// drops leaves doomed with their memory out of the sources, go in the next.
+		for (bool first = true; made == nullptr && !refused; first = false) {
+			if (!reclaim() && !first)
+				break;
 			made = fromEither();
 		}
 		bool halved = false;

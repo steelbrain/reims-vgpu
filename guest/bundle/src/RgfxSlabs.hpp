@@ -90,15 +90,22 @@
  * process's own pages (RgfxPagesSlabSource) are the first where the kext makes pages blocks.
  *
  * THE FALLBACKS, in order, where a buffer finds no room in its class's slabs: a new slab; then,
- * once the sources had no memory for one, the process's own empty and cached slabs let go, the
- * slabs other threads (the background's among them) were giving back at that moment waited for,
- * and a new slab asked again; then, for a small buffer, slabs of the own source half as large
- * down to the buffer's own rounded size. Only where no source has memory even for that is the
- * answer nil: the region, or the pool, is full. A slab being given back is out of the slabs' books and not yet back in its
- * source's, for as long as its block's release takes, a host round trip: without the wait, one
- * thread's let-go of a batch of slabs makes another's create nil while the memory is on its way
- * back (measured on the M3 Max: test_slab_thread's 3 MiB takes refused in 8 of 1,000 runs under
+ * once the sources had no memory for one, the process's own empty, cached and doomed slabs let go,
+ * the slabs other threads (the background's among them) were giving back at that moment waited
+ * for, and a new slab asked again, round after round while a round gave some memory back; then,
+ * for a small buffer, slabs of the own source half as large down to the buffer's own rounded
+ * size. Only where no source has memory even for that is the answer nil: the region, or the pool,
+ * is full. A slab being given back is out of the slabs' books and not yet back in its source's,
+ * for as long as its block's release takes, a host round trip: without the wait, one thread's
+ * let-go of a batch of slabs makes another's create nil while the memory is on its way back
+ * (measured on the M3 Max: test_slab_thread's 3 MiB takes refused in 8 of 1,000 runs under
  * Rosetta, with 237 to 253 MiB of its 256 MiB source taken while the slabs held 61 to 150 MiB).
+ * Without the rounds after the first, what other threads let go while the wait lasted stays
+ * doomed, its memory out of the sources, where the background thread is behind on its drops, as
+ * under CPU load it is: test_slab_thread's 3 MiB takes refused in 1 of 1,000 runs under Rosetta
+ * beside 16 busy loops on the M3 Max's 16 CPUs, and in 6 of 3,828 beside 48 busy loops and 8 dd
+ * copies, the source refusing with 240 to 253 MiB of its 256 MiB taken while 26 to 52 slabs let
+ * go were not yet back in it.
  * (Where the kext's block source places blocks, WindowServer's asks may take its
  * reserve.) A slab whose heap the device never got (the kext's submit refused it) is nil at once.
  *
@@ -551,9 +558,9 @@ public:
 	void give(const Range &range);
 
 	/// Lets every empty and cached slab go, with the doomed ones, where the source had no room
-	/// for another block of the process's (RgfxRegion::setReclaim), and waits for the slabs other
-	/// threads were giving back as it was called (waitForDrops): true where one went or came
-	/// back. Called without the lock.
+	/// for another block of the process's (RgfxRegion::setReclaim, and each round of a take's
+	/// fallbacks), and waits for the slabs other threads were giving back as it was called
+	/// (waitForDrops): true where one went or came back. Called without the lock.
 	bool reclaim();
 
 	/// Does one piece of the background's work (a drop, a piece zeroed, an idle cached slab let
