@@ -773,12 +773,10 @@ fn a_stalled_landing_whose_kept_work_is_not_let_go_ends_the_process() {
     );
     let since = KeptMark::here();
     let elsewhere = Arc::new(AtomicBool::new(false));
-    let kept = Arc::clone(&elsewhere);
-    std::thread::spawn(move || {
-        lingering.keep("a test's work kept elsewhere", Box::new(Stuck(kept)));
-    })
-    .join()
-    .unwrap();
+    std::thread::scope(|scope| {
+        let kept = Box::new(Stuck(Arc::clone(&elsewhere)));
+        scope.spawn(|| lingering.keep("a test's work kept elsewhere", kept));
+    });
     let within = Duration::from_millis(300);
     assert_eq!(
         catch_death(|| hold_while_kept(&*runtime, since, within, &error)),
