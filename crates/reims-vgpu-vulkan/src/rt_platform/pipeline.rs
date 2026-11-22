@@ -46,11 +46,16 @@
 //!   making waits for that call alone, and gets every result and error of its own. The pre-pass
 //!   makes each pipeline once by rt's key of it (`dispatch_variant`), of the compiled content:
 //!   the states of one content share its `VkPipeline`s, and answer one key for one dispatch. rt
-//!   answers with the key whether its `VkPipeline` is made, so the pre-pass hands none made at
-//!   the state's make (rt makes a tiling kernel's tiles, an image-only kernel's square
-//!   workgroups, and an observing kernel's whole and ragged grids at its
+//!   answers with the key whether its `VkPipeline` is made, so the pre-pass hands none made by
+//!   an earlier make.
+//! - **Its main pipeline.** rt's make of the state makes everything up to the driver's create of
+//!   the state's main `VkPipeline` (a tiling kernel's tiles', an image-only kernel's square
+//!   workgroups', or an observing kernel's whole and ragged grids' at its
 //!   `requiredThreadsPerThreadgroup`, or at `[N, 1, 1]` for the bound `N` of threads its state
-//!   declares) or by an earlier make.
+//!   declares), and answers. rt's `finish_pipeline` makes that pipeline, and the state's finish
+//!   does not call it yet ([`ComputePipeline::finish`]): the state's first dispatch, or a make
+//!   ahead of it, makes it, the dispatch waiting for the make (rt's
+//!   `Metrics::first_use_unfinished_waits`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -604,11 +609,12 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
             .dispatch_variant(args.dispatch, args.threads, &args.lengths)
     }
 
-    /// Nothing, and never `Err`: rt's make of the state (`make`) leaves nothing to a step of its
-    /// own.
+    /// Nothing, and never `Err`: rt's make of the state (`make`) leaves its main pipeline's
+    /// driver create to `ComputePipelineState::finish_pipeline`, which is not called here yet, so
+    /// the state's first dispatch, or a make ahead of it, makes the pipeline (the module's docs,
+    /// "Its main pipeline").
     ///
-    /// RT FINISH: where rt's make leaves its main pipeline's driver create to a step of its own
-    /// (`ComputePipelineState::finish_pipeline`), that step is called here, on this thread,
+    /// RT FINISH: that step is called here, on this thread,
     /// `self.rt.finish_pipeline().map_err(|error| error.to_string())`: its one error, a Vulkan
     /// one, keeps nothing, and the state's first dispatch makes the pipeline again.
     fn finish(&self) -> Result<(), String> {

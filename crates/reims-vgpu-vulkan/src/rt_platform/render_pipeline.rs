@@ -514,11 +514,13 @@ impl RenderPipeline for RtObj<RtRenderPipeline> {
         Some(writes(written, index))
     }
 
-    /// Nothing, and never `Err`: rt's make of the state (`make`) leaves nothing to a step of its
-    /// own.
+    /// Nothing, and never `Err`: rt's make of the state (`make`) leaves the driver's creates of
+    /// its main pipelines (its content's triangle or patch class, and the line or point class its
+    /// `inputPrimitiveTopology` names) to `RenderPipelineState::finish_pipeline`, which is not
+    /// called here yet, so the state's first draw of each class makes its pipeline, the draw
+    /// waiting for the make (rt's `Metrics::first_use_unfinished_waits`).
     ///
-    /// RT FINISH: where rt's make leaves its main pipelines' driver creates to a step of its own
-    /// (`RenderPipelineState::finish_pipeline`), that step is called here, on this thread,
+    /// RT FINISH: that step is called here, on this thread,
     /// `self.rt.finish_pipeline().map_err(|error| error.to_string())`: its one error, a Vulkan
     /// one, keeps nothing, and the state's first draw makes the pipelines again.
     fn finish(&self) -> Result<(), String> {

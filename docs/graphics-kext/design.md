@@ -4746,8 +4746,9 @@ its queue's lane, and an `ICB_WRITE`, `ICB_SLOTS` or `ICB_SLOTS_IN_PAGES` that
 sets it, or a function handle or table create that names it, on its context's
 lane. A destroy, a context's close or the device's reset between the reply and
 the store cancels it as before the reply (`crates/reims-vgpu/src/graphics/compile.rs`,
-"Order"). On today's platform the make leaves nothing to that last step, so
-the make is whole before the reply. A failure of the last step is a known
+"Order"). On today's platform that last step does nothing yet: the platform's
+make leaves the driver's pipeline to it, and the pipeline's first draw or
+dispatch makes it, on its lane. A failure of the last step is a known
 gap: the create was answered made, and the failure reaches the guest only in
 the pipeline's draws and dispatches, which the platform answers as encodes it
 refuses, while a Mac's synchronous create answers it as the create's error.

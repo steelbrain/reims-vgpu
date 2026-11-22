@@ -38,12 +38,12 @@
 //! where the platform makes what it left of the state (the driver's pipeline, where it defers
 //! that create), so no draw or dispatch of the guest's makes it on its lane; then a keyed
 //! create's answer is kept where the make finished, and the pipeline is stored. On today's
-//! platform the make leaves nothing to the finish, which does nothing: the reply comes before
-//! the store, and the make is whole before both. A finish that fails is the create's late
-//! failure (`decode::FINISH_FAILED`): counted, the first of the process logged at warn, no answer
-//! kept, and the pipeline stored as made, each of its draws and dispatches meeting the failure
-//! at its encode, which the platform answers as an encode it refuses; the VM goes on. So the
-//! guest meets that failure in its command buffers, not as its create's error, where a Mac's
+//! platform the finish does nothing yet: the make leaves the driver's pipeline to it, and the
+//! pipeline's first draw or dispatch makes it, on its lane. A finish that fails is the create's
+//! late failure (`decode::FINISH_FAILED`): counted, the first of the process logged at warn, no
+//! answer kept, and the pipeline stored as made, each of its draws and dispatches meeting the
+//! failure at its encode, which the platform answers as an encode it refuses; the VM goes on. So
+//! the guest meets that failure in its command buffers, not as its create's error, where a Mac's
 //! synchronous creator answers it.
 //!
 //! From its dispatch until it is stored, the pipeline is pending, the window between its reply
