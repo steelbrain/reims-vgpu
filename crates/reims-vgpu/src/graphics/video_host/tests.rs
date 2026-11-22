@@ -721,6 +721,20 @@ fn a_failed_landing_in_a_cache_says_it_written_before_its_signal() {
     assert_eq!(c.s.counts.lock().failed, 2);
 }
 
+/// Whether `s`'s event reaches `value` within `within` of real time, the landing's clock (the
+/// fake event's own waits are on the fake world's virtual clock), asked every 10 ms.
+#[cfg(unix)]
+fn signalled_within(s: &HostVideoSession<P>, value: u64, within: Duration) -> bool {
+    let pause = Duration::from_millis(10);
+    for _ in 0..=within.as_millis() / pause.as_millis() {
+        if event_of(s).signaled_value() >= value {
+            return true;
+        }
+        std::thread::sleep(pause);
+    }
+    event_of(s).signaled_value() >= value
+}
+
 /// A picture whose landing in its output's device cache ran past the hardware's deadline (a
 /// stall), with work kept that may still write the cache, has the cache said written only once
 /// that work is let go, its device done with it, and then before the session signals its value
@@ -741,12 +755,12 @@ fn a_stalled_landing_in_a_cache_says_it_written_once_its_kept_work_is_let_go() {
     let next = c.decode();
     assert_eq!((stalled.value, next.value), (1, 2));
     assert!(
-        !event_of(&c.s).wait_until_signaled_value(1, 500),
+        !signalled_within(&c.s, 1, Duration::from_millis(500)),
         "no signal while the work is kept"
     );
     assert!(c.memory.seen.lock().is_empty(), "nothing said while kept");
     done.store(true, Ordering::SeqCst);
-    assert!(event_of(&c.s).wait_until_signaled_value(2, 10_000));
+    assert!(signalled_within(&c.s, 2, Duration::from_secs(10)));
     assert_eq!(
         *c.memory.seen.lock(),
         [0, 1],
