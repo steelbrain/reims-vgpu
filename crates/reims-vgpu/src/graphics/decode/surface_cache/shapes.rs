@@ -166,8 +166,13 @@
 //! within [`UNREFERENCED_FOR`]: each new shape, of any entry, and the first use of any shape a
 //! period after the rule's last pass take out every entry's unreferenced shapes unused for longer
 //! ([`ShapeTable::age_out`]; `SurfaceCaches`'s `tick_shapes`), so a cache whose textures all
-//! went gives its images back while the guest goes on using other shapes, with no timer and no
-//! thread of its own. In the per-shape form the shapes' clock is the platform's, in nanoseconds.
+//! went gives its images back while the guest goes on using other shapes. The device runs the
+//! same pass on a timer too (`AgeTimer`, `SurfaceCaches`'s `age_on_timer`), on a thread of its
+//! own, once the oldest shape that waits for the rule has aged, so they go back while the guest
+//! uses no surface as well: a shape comes to wait as its last reference goes or, unreferenced,
+//! as it is made clean ([`Shape::clean`]), and tells the timer so ([`Idle`]), which wakes once
+//! at each age and never while no shape waits. In the per-shape form the shapes' clock is the
+//! platform's, in nanoseconds.
 //! A shape is used at its make, at a texture made of it, and at each use of its surface while a
 //! texture references it ([`ShapeTable::touch`]); a copy into or out of the cache is no use of an
 //! unreferenced shape. The shapes' bytes count in the caches' budget
@@ -197,6 +202,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -343,19 +349,50 @@ impl ShapeKey {
     }
 }
 
+/// What a shape's table calls as one of its shapes comes to wait for the age rule (the module
+/// doc, "The bound"): its last reference let go of, or, unreferenced, its write copied into the
+/// buffer. Called with any lock held, the caches' among them, so it only notes it.
+pub(crate) type Idle = Arc<dyn Fn() + Send + Sync>;
+
+/// A shape's identity and its guest textures' references to it: the table holds it, and each
+/// [`ShapeRef`] too.
+struct Tag {
+    /// The live [`ShapeRef`]s.
+    refs: AtomicUsize,
+    /// What the last one's drop calls ([`ShapeTable::with_idle`]).
+    idle: Option<Idle>,
+}
+
 /// A guest texture's reference to the shape it is a view of (the module doc, "References"):
-/// taken again with [`ShapeRef::clone_ref`], and let go of by its drop, which takes no lock.
-pub(crate) struct ShapeRef(Arc<()>);
+/// taken again with [`ShapeRef::clone_ref`], and let go of by its drop, which takes no lock: the
+/// last one's tells the table's [`Idle`].
+pub(crate) struct ShapeRef(Arc<Tag>);
 
 impl ShapeRef {
+    /// A new reference to the shape of `tag`.
+    fn of(tag: &Arc<Tag>) -> ShapeRef {
+        tag.refs.fetch_add(1, Ordering::Relaxed);
+        ShapeRef(Arc::clone(tag))
+    }
+
     /// Another reference to the same shape.
     pub(crate) fn clone_ref(&self) -> ShapeRef {
-        ShapeRef(Arc::clone(&self.0))
+        ShapeRef::of(&self.0)
     }
 
     /// The shape's identity, as long as it lives: equal for every reference to it.
     pub(crate) fn id(&self) -> u64 {
         Arc::as_ptr(&self.0).addr() as u64
+    }
+}
+
+impl Drop for ShapeRef {
+    fn drop(&mut self) {
+        if self.0.refs.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(idle) = &self.0.idle
+        {
+            idle();
+        }
     }
 }
 
@@ -578,8 +615,8 @@ pub(crate) struct Shape<T> {
     pub(crate) image: T,
     /// The bytes it counts in the caches' budget ([`ShapeKey::bytes`]).
     pub(crate) bytes: u64,
-    /// The table's own reference: the others are the guest textures'.
-    tag: ShapeRef,
+    /// Its identity and its guest textures' references ([`ShapeRef`]).
+    tag: Arc<Tag>,
     /// Written since it was last copied into the buffer (rule 3).
     pub(crate) dirty: bool,
     /// Owes a fill from the buffer before anything reads it (a new shape, rule 2; or the buffer
@@ -603,7 +640,7 @@ pub(crate) struct Shape<T> {
 impl<T> Shape<T> {
     /// How many guest textures reference it.
     pub(crate) fn references(&self) -> usize {
-        Arc::strong_count(&self.tag.0).saturating_sub(1)
+        self.tag.refs.load(Ordering::Acquire)
     }
 
     /// Whether a live guest texture references it.
@@ -613,7 +650,19 @@ impl<T> Shape<T> {
 
     /// Its identity, as its references name it ([`ShapeRef::id`]).
     pub(crate) fn id(&self) -> u64 {
-        self.tag.id()
+        Arc::as_ptr(&self.tag).addr() as u64
+    }
+
+    /// It holds no write the buffer lacks: a copy into the buffer, a fill from it, or a loss of
+    /// its image took what it held. Unreferenced, it then waits for the age rule, which its
+    /// table's [`Idle`] is told.
+    pub(crate) fn clean(&mut self) {
+        if std::mem::take(&mut self.dirty)
+            && !self.referenced()
+            && let Some(idle) = &self.tag.idle
+        {
+            idle();
+        }
     }
 }
 
@@ -634,18 +683,28 @@ pub(crate) struct ShapeTable<T> {
     /// The keys of the shapes dropped last, most recent at the back, at most
     /// [`DROPPED_REMEMBERED`], and whether the age rule took each out.
     dropped: VecDeque<(ShapeKey, bool)>,
+    /// What each of its shapes tells as it comes to wait for the age rule ([`Idle`]).
+    idle: Option<Idle>,
 }
 
 impl<T> Default for ShapeTable<T> {
     fn default() -> Self {
-        ShapeTable {
-            shapes: Vec::new(),
-            dropped: VecDeque::new(),
-        }
+        ShapeTable::with_idle(None)
     }
 }
 
 impl<T> ShapeTable<T> {
+    /// No shapes, each made from now on telling `idle` as it comes to wait for the age rule: its
+    /// last reference let go of ([`ShapeRef`]'s drop), or, unreferenced, made clean
+    /// ([`Shape::clean`]).
+    pub(crate) fn with_idle(idle: Option<Idle>) -> Self {
+        ShapeTable {
+            shapes: Vec::new(),
+            dropped: VecDeque::new(),
+            idle,
+        }
+    }
+
     /// A reference to the shape `key` takes, used now (`now`, the caches' clock), where the table
     /// holds one: the storage shape of its extent where the table holds one, which serves every
     /// texture; else, for a texture that takes no storage, its plain shape (the module doc).
@@ -655,7 +714,7 @@ impl<T> ShapeTable<T> {
             .or_else(|| self.shapes.iter().position(|s| s.key == *key))?;
         let shape = &mut self.shapes[at];
         shape.used = now;
-        Some((shape.tag.clone_ref(), shape))
+        Some((ShapeRef::of(&shape.tag), shape))
     }
 
     /// The plane of the cache's surface whose image the shape `id` names is, where it is a plane
@@ -693,8 +752,11 @@ impl<T> ShapeTable<T> {
             },
             None => Again::No,
         };
-        let tag = ShapeRef(Arc::new(()));
-        let reference = tag.clone_ref();
+        let tag = Arc::new(Tag {
+            refs: AtomicUsize::new(0),
+            idle: self.idle.clone(),
+        });
+        let reference = ShapeRef::of(&tag);
         self.shapes.push(Shape {
             key,
             image,
@@ -813,7 +875,7 @@ impl<T> ShapeTable<T> {
         for shape in &mut self.shapes {
             shape.owed = true;
             shape.video = true;
-            shape.dirty = false;
+            shape.clean();
             counts.video_owed += 1;
         }
     }
@@ -834,7 +896,7 @@ impl<T> ShapeTable<T> {
             }
             shape.owed = true;
             shape.video = true;
-            shape.dirty = false;
+            shape.clean();
             counts.video_owed += 1;
         }
     }
@@ -858,7 +920,7 @@ impl<T> ShapeTable<T> {
     /// committed: they hold no write the buffer lacks; counted in `counts`.
     pub(crate) fn written_back(&mut self, ids: &[u64], counts: &mut ShapeCounts) {
         for shape in (self.shapes.iter_mut()).filter(|s| s.dirty && ids.contains(&s.id())) {
-            shape.dirty = false;
+            shape.clean();
             counts.written_back += 1;
             counts.written_back_bytes += shape.bytes;
         }
@@ -1073,7 +1135,7 @@ pub(crate) fn zeros_pass<P: Platform>(
 /// write the buffer lacks; counted in `counts`.
 fn filled<T>(shape: &mut Shape<T>, counts: &mut ShapeCounts) {
     shape.owed = false;
-    shape.dirty = false;
+    shape.clean();
     counts.fills += 1;
     counts.filled_bytes += shape.bytes;
     counts.plane_fills += u64::from(shape.plane);
@@ -1412,6 +1474,39 @@ mod tests {
             table.find(&key(101, 4), 3).is_none(),
             "another width, another shape"
         );
+    }
+
+    /// A shape tells its table's [`Idle`] as it comes to wait for the age rule: at its last
+    /// reference's drop, and, unreferenced, as it is made clean; not at a drop that leaves a
+    /// reference, nor as a referenced shape or one that was not dirty is made clean.
+    #[test]
+    fn a_shape_tells_its_tables_idle_as_it_comes_to_wait() {
+        let told = Arc::new(AtomicUsize::new(0));
+        let idle: Idle = {
+            let told = Arc::clone(&told);
+            Arc::new(move || {
+                told.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let told = || told.load(Ordering::Relaxed);
+        let mut table = ShapeTable::<u32>::with_idle(Some(idle));
+        let (first, _) = table.insert(key(100, 4), 7, true, 1);
+        let view = first.clone_ref();
+        drop(first);
+        assert_eq!(told(), 0, "a reference left");
+        assert!(table.mark_dirty(view.id()));
+        table.iter_mut().for_each(Shape::clean);
+        assert_eq!(told(), 0, "referenced");
+        assert!(table.mark_dirty(view.id()));
+        drop(view);
+        assert_eq!(told(), 1, "its last reference");
+        table.iter_mut().for_each(Shape::clean);
+        assert_eq!(told(), 2, "unreferenced, made clean");
+        table.iter_mut().for_each(Shape::clean);
+        assert_eq!(told(), 2, "not dirty");
+        let mut untold = ShapeTable::<u32>::default();
+        drop(untold.insert(key(101, 4), 8, true, 2));
+        assert_eq!(told(), 2, "another table's");
     }
 
     /// Every referenced shape is kept, and of the unreferenced the four most recently used; a

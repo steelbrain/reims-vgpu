@@ -1307,6 +1307,127 @@ fn after_landings(mut landings: Vec<Arc<Landing>>, done: Answer) {
     }
 }
 
+/// The name of the shapes' age rule's timer's thread ([`AgeTimer`]).
+const SHAPE_AGE_THREAD: &str = "reims-vgpu.graphics-shape-age";
+
+/// How much later than its shape's age a deadline the timer sets as a shape comes to wait is
+/// ([`AgeTimer::idle`]): the shapes' clock, which the age is of, steps a tick past the platform's
+/// at each use where the platform's has not moved ([`tick`]).
+pub(super) const AGE_SLACK: u64 = 1_000_000;
+
+/// The age rule's timer, in the per-shape form (`shapes`' module doc, "The bound"): a thread of
+/// its own runs the rule's pass once the least recently used shape that waits for the rule, an
+/// unreferenced one that is not dirty, has aged ([`SurfaceCaches::age_on_timer`]), so a guest
+/// that uses no surface still gives back the shapes no texture references. While no shape waits
+/// it waits with no deadline; the first shape to come to wait tells it ([`shapes::Idle`]), and
+/// its deadline is a period on ([`Self::idle`]), no earlier than that shape's age; each pass
+/// sets the next, the age of the oldest shape left waiting. So it wakes once at each such age,
+/// and never while no shape waits. A shape that comes to wait while a deadline is set leaves it,
+/// as that shape ages no earlier than the shapes already waiting unless it went unused while a
+/// texture referenced it: it then goes at the next pass, a period late at most. Times are the
+/// platform's monotonic clock's, in nanoseconds.
+struct AgeTimer {
+    state: Mutex<AgeState>,
+    /// `state`'s deadline is set: a shape that comes to wait leaves it ([`Self::idle`]).
+    armed: AtomicBool,
+    moved: Condvar,
+    /// The platform's clock, for a deadline set as a shape comes to wait.
+    now: Now,
+    /// The passes the timer ran ([`SurfaceCaches::age_on_timer`]).
+    passes: AtomicU64,
+}
+
+/// [`AgeTimer`]'s state.
+struct AgeState {
+    /// When the next pass runs, where a shape waits for one.
+    due: Option<u64>,
+    /// The caches went ([`AgeStop`]): the timer's thread ends.
+    stopped: bool,
+}
+
+/// Stops the age rule's timer as the caches go ([`Caches::start_age_timer`]): its thread ends
+/// at its next look, which this wakes it for.
+struct AgeStop(Arc<AgeTimer>);
+
+impl Drop for AgeStop {
+    fn drop(&mut self) {
+        self.0.state.lock().stopped = true;
+        self.0.moved.notify_all();
+    }
+}
+
+impl AgeTimer {
+    fn new(now: Now) -> AgeTimer {
+        AgeTimer {
+            state: Mutex::new(AgeState {
+                due: None,
+                stopped: false,
+            }),
+            armed: AtomicBool::new(false),
+            moved: Condvar::new(),
+            now,
+            passes: AtomicU64::new(0),
+        }
+    }
+
+    /// A shape came to wait for the age rule ([`shapes::Idle`]): where no deadline is set, one a
+    /// period on, with [`AGE_SLACK`], by when that shape has aged if nothing used it, its thread
+    /// told. Called with any lock held, the caches' among them: it takes the timer's alone.
+    fn idle(&self) {
+        if self.armed.load(Ordering::Acquire) {
+            return;
+        }
+        let at = (self.now)().as_nanos();
+        let mut state = self.state.lock();
+        if state.due.is_some() || state.stopped {
+            return;
+        }
+        state.due = Some(at.saturating_add(AGE_PERIOD).saturating_add(AGE_SLACK));
+        self.armed.store(true, Ordering::Release);
+        drop(state);
+        self.moved.notify_all();
+    }
+
+    /// The timer's thread: waits for each deadline on `platform`'s clock and runs the rule's pass
+    /// on `caches` then, while they live, its next deadline the one the pass gives; ends once
+    /// they went ([`AgeStop`]).
+    fn run<P: Platform>(&self, caches: &Weak<Caches<P>>, platform: &P) {
+        use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline};
+        let clock = platform.clock();
+        let mut state = self.state.lock();
+        loop {
+            if state.stopped {
+                return;
+            }
+            let Some(due) = state.due else {
+                clock.wait(&self.moved, &mut state);
+                continue;
+            };
+            if clock.now_mono().as_nanos() < due {
+                let deadline = Deadline::Mono(MonoTime::from_nanos(due));
+                let _ = clock.wait_until(&self.moved, &mut state, deadline);
+                continue;
+            }
+            state.due = None;
+            self.armed.store(false, Ordering::Release);
+            let next = MutexGuard::unlocked(&mut state, || {
+                crate::entry::run(|_| {
+                    let caches = caches.upgrade()?;
+                    self.passes.fetch_add(1, Ordering::Relaxed);
+                    let next = caches.lock().age_on_timer();
+                    drop(caches);
+                    next
+                })
+            });
+            if let Some(next) = next {
+                let at = state.due.map_or(next, |due| due.min(next));
+                state.due = Some(at);
+                self.armed.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// The longest a release waits for its turn ([`ReleasePace`]), from its ask: past it, its copy is
 /// made at once, beside any other. The kext waits for a release's answer with no deadline, at a
 /// lock of its surface and at a new block over its pages, so a release's turn holds those up; the
@@ -2347,6 +2468,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The platform's clock, which the shapes' clock follows in the per-shape form, for the age
     /// rule ([`shapes::UNREFERENCED_FOR`]; [`Caches::set_shapes`]).
     shape_now: Option<Now>,
+    /// What each new cache's shapes tell as one comes to wait for the age rule: its timer's nudge
+    /// ([`Caches::start_age_timer`]), where it runs.
+    shape_idle: Option<shapes::Idle>,
     /// The shapes' clock at the last pass of the age rule ([`Self::age_shapes`]), and the images
     /// a pass at a use took out, let go of once the lock is let go of ([`Locked`]).
     aged_at: u64,
@@ -2631,6 +2755,7 @@ impl<P: Platform> SurfaceCaches<P> {
             shaped: false,
             shape_clock: 0,
             shape_now: None,
+            shape_idle: None,
             aged_at: 0,
             aged: Vec::new(),
             staged: None,
@@ -2700,7 +2825,7 @@ impl<P: Platform> SurfaceCaches<P> {
         // platform's clear lost with it.
         for shape in self.by_block.values_mut().flat_map(|c| c.shapes.iter_mut()) {
             shape.owed = true;
-            shape.dirty = false;
+            shape.clean();
             shape.cleared = false;
         }
         // The lost device's buffers hold nothing known; a fill made again empties a record.
@@ -2942,7 +3067,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 out: None,
                 life,
                 wide: None,
-                shapes: ShapeTable::default(),
+                shapes: ShapeTable::with_idle(self.shape_idle.clone()),
                 shadow: ShapeTable::default(),
                 memory,
                 lacks: false,
@@ -3209,7 +3334,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 out: None,
                 life,
                 wide: None,
-                shapes: ShapeTable::default(),
+                shapes: ShapeTable::with_idle(self.shape_idle.clone()),
                 shadow: ShapeTable::default(),
                 memory,
                 lacks: false,
@@ -3517,14 +3642,21 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// The shapes' clock at a use ([`tick`]). In the per-shape form, a period after the age
     /// rule's last pass, the rule takes out every cache's unreferenced shapes unused for the
-    /// period ([`Self::age_shapes`]), so a guest that makes no new shape gives them back at its
-    /// next use of any (`shapes`' module doc, "The bound"); their images are let go of once the
-    /// lock is let go of.
+    /// period ([`Self::take_aged`]), so a guest that makes no new shape gives them back at its
+    /// next use of any (`shapes`' module doc, "The bound"), as the rule's timer does while it
+    /// uses none ([`Self::age_on_timer`]).
     fn tick_shapes(&mut self) -> u64 {
         let now = tick(&mut self.shape_clock, self.shape_now.as_ref());
         if self.shape_now.is_none() || now.saturating_sub(self.aged_at) < AGE_PERIOD {
             return now;
         }
+        self.take_aged();
+        now
+    }
+
+    /// The age rule's pass ([`Self::age_shapes`]): the shapes taken out leave the caches' bytes,
+    /// counted, and their images are let go of once the lock is let go of ([`Locked`]).
+    fn take_aged(&mut self) {
         let aged = self.age_shapes();
         let bytes: u64 = aged.iter().map(|shape| shape.bytes).sum();
         self.cache_bytes = self.cache_bytes.saturating_sub(bytes);
@@ -3532,7 +3664,34 @@ impl<P: Platform> SurfaceCaches<P> {
         counts.dropped += aged.len() as u64;
         counts.dropped_bytes += bytes;
         self.aged.extend(aged.into_iter().map(|shape| shape.image));
-        now
+    }
+
+    /// The age rule's run on its timer ([`AgeTimer`]), in the per-shape form: where an
+    /// unreferenced shape that is not dirty was unused for [`shapes::UNREFERENCED_FOR`], the
+    /// rule's pass ([`Self::take_aged`]). When the next such shape ages, on the shapes' clock,
+    /// the platform's in nanoseconds, where one waits to; `None` where none does, and in the
+    /// default form.
+    fn age_on_timer(&mut self) -> Option<u64> {
+        self.shape_now.as_ref()?;
+        let now = tick(&mut self.shape_clock, self.shape_now.as_ref());
+        if self
+            .oldest_unused()
+            .is_some_and(|used| used < now.saturating_sub(AGE_PERIOD))
+        {
+            self.take_aged();
+        }
+        let next = self.oldest_unused()?;
+        Some(next.saturating_add(AGE_PERIOD).saturating_add(1))
+    }
+
+    /// The shapes' clock at the last use of the least recently used unreferenced shape that is
+    /// not dirty, of any cache ([`ShapeTable::oldest_unreferenced`]): the next the age rule
+    /// takes out.
+    fn oldest_unused(&self) -> Option<u64> {
+        (self.by_block.values())
+            .filter_map(|cache| cache.shapes.oldest_unreferenced())
+            .map(|(used, _)| used)
+            .min()
     }
 
     /// Every cache's unreferenced shapes unused for [`shapes::UNREFERENCED_FOR`], taken out in
@@ -6278,6 +6437,8 @@ pub(crate) struct Caches<P: Platform> {
     shape_maker: OnceLock<ShapeMaker<P>>,
     /// The shape maker places images ([`Self::set_shapes`], [`shapes`]'s "Placed images").
     shapes_placed: AtomicBool,
+    /// The age rule's timer, where it runs ([`Self::start_age_timer`]), stopped as the caches go.
+    age_timer: OnceLock<AgeStop>,
     /// Every cache's copies are staged ([`Self::set_staged`]).
     staged: AtomicBool,
     /// The spare surfaces over Direct3D 11 textures made ahead ([`Self::set_drawn`], `exported`).
@@ -6891,6 +7052,7 @@ impl<P: Platform> Caches<P> {
             homes: AtomicBool::new(false),
             shape_maker: OnceLock::new(),
             shapes_placed: AtomicBool::new(false),
+            age_timer: OnceLock::new(),
             staged: AtomicBool::new(false),
             #[cfg(windows)]
             drawn_spares: OnceLock::new(),
@@ -6913,6 +7075,51 @@ impl<P: Platform> Caches<P> {
     /// Whether the caches take the per-shape form ([`Self::set_shapes`]).
     pub(crate) fn shaped(&self) -> bool {
         self.shape_maker.get().is_some()
+    }
+
+    /// Runs the age rule on its timer from now on ([`AgeTimer`]), on a thread of its own that
+    /// waits on `platform`'s clock, beside its pass at a use: in the per-shape form, set once,
+    /// after [`Self::set_shapes`] and before any cache, whose shapes alone tell the timer as they
+    /// come to wait; a second is ignored. Where the thread cannot be made the rule runs at the
+    /// uses alone, logged.
+    pub(crate) fn start_age_timer(self: &Arc<Self>, platform: Arc<P>) {
+        let Some(now) = self.lock().shape_now.clone() else {
+            return;
+        };
+        let timer = Arc::new(AgeTimer::new(now));
+        if self.age_timer.set(AgeStop(Arc::clone(&timer))).is_err() {
+            return;
+        }
+        let spawned = {
+            let caches = Arc::downgrade(self);
+            let timer = Arc::clone(&timer);
+            std::thread::Builder::new()
+                .name(SHAPE_AGE_THREAD.into())
+                .spawn(move || timer.run(&caches, &platform))
+        };
+        if let Err(error) = spawned {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = "shape-age";
+                "the shapes' age rule has no timer ({error}): it runs at the surfaces' uses alone"
+            );
+            return;
+        }
+        let timer = Arc::downgrade(&timer);
+        let idle: shapes::Idle = Arc::new(move || {
+            if let Some(timer) = timer.upgrade() {
+                timer.idle();
+            }
+        });
+        self.lock().shape_idle = Some(idle);
+    }
+
+    /// The age rule's timer's deadline, and the passes it ran, where it runs
+    /// ([`Self::start_age_timer`]).
+    #[cfg(test)]
+    pub(crate) fn age_timer(&self) -> Option<(Option<u64>, u64)> {
+        let timer = &self.age_timer.get()?.0;
+        let due = timer.state.lock().due;
+        Some((due, timer.passes.load(Ordering::Relaxed)))
     }
 
     /// Stages every cache's copies from now on (the module doc, "Staged copies"), the host's

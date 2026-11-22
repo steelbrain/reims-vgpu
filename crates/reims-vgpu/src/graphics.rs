@@ -835,6 +835,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     ),
                     P::PLACED_SHAPE_IMAGES,
                 );
+                // Their age rule runs on a timer too, so the shapes no texture references go
+                // while the guest uses no surface (`decode::surface_cache::shapes`, "The bound").
+                decoder.start_shape_age_timer();
             }
             // The reset gate ([`GraphicsControl::reset_gate`]), which the video caches' spare
             // surfaces' makes hold shared too.

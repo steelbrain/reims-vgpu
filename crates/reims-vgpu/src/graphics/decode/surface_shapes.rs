@@ -97,6 +97,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.surface_caches.set_shapes(maker, places, now);
     }
 
+    /// Runs the shapes' age rule on a timer of its own from now on, the platform's clock its
+    /// time (`surface_cache::shapes`, "The bound"), so a guest that uses no surface gives back
+    /// the shapes no texture references: set once, at the device's make, after
+    /// [`Self::set_surface_shapes`] and before any surface is named.
+    pub(crate) fn start_shape_age_timer(&self) {
+        let platform = std::sync::Arc::clone(&self.platform);
+        self.surface_caches.start_age_timer(platform);
+    }
+
     /// Refuses the block at `block` as uncached in the per-shape form (module doc): any device
     /// cache it had goes, as at a release, and so does any view of its pages, the refusal counted
     /// ([`UNCACHED_COPIED`]). [`RGFX_STATUS_REFUSED`].
@@ -1175,6 +1184,60 @@ mod tests {
         assert_eq!((counts.aged, counts.dropped), (1, 1));
         assert_eq!(counts.aged_bytes, 4 * row);
         assert_eq!(r.dec.caches().live().cache_bytes, 32 * row);
+    }
+
+    /// The age rule on its timer: a shape no texture references goes a period after its last
+    /// texture went, with no use of any surface between, counted as the rule's and its bytes given
+    /// back; the timer had no deadline while no shape waited, set one as the shape came to wait,
+    /// ran one pass, at that age, and has none once no shape waits
+    #[test]
+    fn the_age_timer_takes_out_a_shape_a_period_on_with_no_use() {
+        use std::time::Duration;
+        let timer = |r: &Rig| r.dec.surface_caches.age_timer();
+        // [`shaped`]'s rig, the timer started before its cache, as at the device's make.
+        let mut r = rig(8);
+        let page = r.page;
+        take_shapes(&r);
+        r.dec.start_shape_age_timer();
+        r.dec.hold_resource_ids(0, 1);
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        texture(&mut r, 20, 80, (32, 8));
+        texture(&mut r, 21, 80, (4, 8));
+        assert_eq!(timer(&r), Some((None, 0)), "no shape waits");
+        let p = Arc::clone(&r.p);
+        let clock = p.virtual_clock();
+        let period = shapes::UNREFERENCED_FOR;
+        let slack = super::super::surface_cache::AGE_SLACK;
+        let due = clock.elapsed_nanos() + period.as_nanos() as u64 + slack;
+        destroy(&mut r, 21);
+        assert_eq!(
+            timer(&r),
+            Some((Some(due), 0)),
+            "a period on, as width 4 waits"
+        );
+        clock.advance(period / 2);
+        texture(&mut r, 22, 80, (32, 8));
+        destroy(&mut r, 22);
+        assert_eq!(timer(&r), Some((Some(due), 0)), "the deadline stays");
+        clock.advance(period / 2 + Duration::from_millis(2));
+        let row = 8 * 4;
+        let mut looks = 0;
+        while r.dec.caches().counts().shapes.aged == 0 {
+            looks += 1;
+            assert!(looks < 20_000, "the timer's pass ran within 20 s");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.made, counts.found), (2, 1), "no new shape");
+        assert_eq!((counts.aged, counts.dropped), (1, 1));
+        assert_eq!(counts.aged_bytes, 4 * row);
+        assert_eq!(r.dec.caches().live().cache_bytes, 32 * row);
+        assert_eq!(timer(&r), Some((None, 1)), "one pass; no shape waits");
     }
 
     /// Past the caches' budget the shapes no texture references are trimmed least recently used
