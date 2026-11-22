@@ -625,6 +625,10 @@ pub struct SurfaceTarget<P: Platform> {
     pub bytes_per_row: u64,
     /// The rows it holds from its first: its own and the room below them, for a coded picture's.
     pub rows: u64,
+    /// Its clear to zeros: a render pass whose one colour attachment is `texture`, loaded by a
+    /// clear and stored, for a picture shorter than the plane (`video_host`'s
+    /// `Landing::writes_only`); `None` where the platform raised at its make.
+    pub clear: Option<P::RenderPassDescriptor>,
 }
 
 #[cfg(unix)]
@@ -638,6 +642,7 @@ impl<P: Platform> SurfaceTarget<P> {
             offset: self.offset,
             bytes_per_row: self.bytes_per_row,
             rows: self.rows,
+            clear: self.clear.as_ref().map(|clear| clear.clone_ref()),
         }
     }
 }

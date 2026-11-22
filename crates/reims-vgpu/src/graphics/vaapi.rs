@@ -138,7 +138,7 @@ use super::decode::{
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
 
 use super::video_host::{
-    BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
+    BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
     HostVideoSession, Landing, OutputPlane, picture_error,
 };
 
@@ -903,18 +903,11 @@ impl<P: Platform> CacheTargets<P> {
                 shape.format
             )
         })?;
-        let (width, height) = shape.coded;
-        let row = u64::from(width) * shape.format.bytes_per_sample();
-        let rows = [u64::from(height), u64::from(height.div_ceil(2))];
-        for (n, ((room, _, rows_held), needed)) in planes.iter().zip(rows).enumerate() {
-            if *rows_held < needed || room.bytes_per_row < row {
-                return Err(format!(
-                    "plane {n} holds {rows_held} rows of {} bytes, not the coded {width}x{height} \
-                     picture's {needed} of {row}",
-                    room.bytes_per_row
-                ));
-            }
-        }
+        takes_coded(
+            planes.map(|(room, _, rows_held)| (room, rows_held)),
+            shape.coded,
+            shape.format.bytes_per_sample(),
+        )?;
         let memory = self.memory(cache, buffer)?;
         let laid = planes.map(|(room, offset, _)| TargetPlane {
             offset: memory.offset + offset,
@@ -1491,6 +1484,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             Some(targets) if to.luma.cached || to.chroma.cached => {
                 match targets.in_cache(to.luma, to.chroma, bit_depth) {
                     Ok((layout, bytes)) => {
+                        to.writes_only(processed(&self.frame, &layout, bit_depth))?;
                         match self.write_in_place(&layout, &bytes, &mut || to.decode_done())? {
                             None => {
                                 to.luma.external_write_done()?;
@@ -1504,6 +1498,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             }
             _ => match in_place(to.luma, to.chroma, bit_depth) {
                 Ok((layout, pages)) => {
+                    to.writes_only(processed(&self.frame, &layout, bit_depth))?;
                     match self.write_in_place(&layout, &*pages.memory, &mut || {})? {
                         None => return Ok(()),
                         Some(why) => why,
@@ -1524,6 +1519,9 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
                 format!("{declined}; and no GPU copy into a cache's surface")
             }
             Ok(copier) => {
+                if short_of(&self.frame, to.luma) {
+                    to.writes_only([Extent::NONE; 2])?;
+                }
                 let copied = (copier.lock()).copy(&self.frame, &self.imports, to.luma, to.chroma);
                 match copied? {
                     DeviceWrite::Written => return Ok(()),
@@ -1535,6 +1533,10 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
         self.copied_because(declined);
         let back = self.frame.read_back()?;
         let planes = to.host_for_cpu()?;
+        // The copy writes the crop alone: a crop short of the planes lands over their zeros.
+        if short_of(&self.frame, to.luma) {
+            to.writes_only([Extent::NONE; 2])?;
+        }
         let rows = |plane: &HostPlane<P>| -> Result<PlaneRows<'_>, BackendError> {
             let len = usize::try_from(plane.len()).map_err(|_| "a plane past the address space")?;
             let (Ok(bytes_per_row), Ok(rows), Ok(row_bytes)) = (
@@ -1618,21 +1620,77 @@ pub(crate) trait GpuCopier<P: Platform>: Send {
     ) -> Result<DeviceWrite, BackendError>;
 }
 
-/// What one output plane holds of a picture: the bytes from one row to the next.
+/// What one output plane holds of a picture: the bytes from one row to the next, and its crop,
+/// the rows and the bytes of each that a picture decoded into it is to cover.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Room {
     pub(crate) bytes_per_row: u64,
+    pub(crate) row_bytes: u64,
+    pub(crate) height: u64,
 }
 
 #[cfg(unix)]
 impl Room {
-    /// What `plane` holds: its rows' pitch.
+    /// What `plane` holds: its rows' pitch, and its crop.
     pub(crate) fn of<P: Platform>(plane: &OutputPlane<P>) -> Room {
         Room {
             bytes_per_row: plane.bytes_per_row,
+            row_bytes: plane.row_bytes,
+            height: plane.height,
         }
     }
+}
+
+/// Whether a coded picture of `width` by `height` luma samples of `sample` bytes decodes straight
+/// into planes of `planes` (each its room and the rows it holds), the luma's then the chroma's:
+/// each holds the coded picture's rows, and the picture covers each one's crop, so that no texel
+/// of the crop keeps what it held (`video_host`'s module docs, "A short picture"): a picture
+/// short of its planes decodes elsewhere, and lands with zeros past it. `Err` says why not.
+#[cfg(unix)]
+fn takes_coded(
+    planes: [(Room, u64); 2],
+    (width, height): (u32, u32),
+    sample: u64,
+) -> Result<(), String> {
+    let row = u64::from(width) * sample;
+    let rows = [u64::from(height), u64::from(height.div_ceil(2))];
+    for (n, ((room, rows_held), needed)) in planes.iter().zip(rows).enumerate() {
+        if *rows_held < needed || room.bytes_per_row < row {
+            return Err(format!(
+                "plane {n} holds {rows_held} rows of {} bytes, not the coded {width}x{height} \
+                 picture's {needed} of {row}",
+                room.bytes_per_row
+            ));
+        }
+        if needed < room.height || row < room.row_bytes {
+            return Err(format!(
+                "the coded {width}x{height} picture's {needed} rows of {row} bytes, short of plane \
+                 {n}'s {} of {}",
+                room.height, room.row_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What the driver's video processing writes of `frame`, of `bit_depth`, into planes laid out as
+/// `layout` (the VA crate's `Frame::write_to_guest_telling`): from the crop's first sample, the
+/// layout's width and height as far as the coded picture holds them.
+fn processed(frame: &Frame, layout: &SurfaceLayout, bit_depth: u32) -> [Extent; 2] {
+    let (coded_width, coded_height) = frame.coded_size();
+    let (x, y) = frame.crop_origin();
+    let width = layout.width.min(coded_width.saturating_sub(x));
+    let height = layout.height.min(coded_height.saturating_sub(y));
+    let sample = if bit_depth > 8 { 2 } else { 1 };
+    Extent::of_420(u64::from(width), u64::from(height), sample)
+}
+
+/// Whether `frame`'s crop is short of the output's luma plane `luma`, of its rows or its columns:
+/// the CPU's copy, and a GPU copy, write the crop alone, so the planes take zeros first
+/// ([`Landing::writes_only`]).
+fn short_of<P: Platform>(frame: &Frame, luma: &OutputPlane<P>) -> bool {
+    u64::from(frame.width()) < luma.width || u64::from(frame.height()) < luma.height
 }
 
 /// The layout of a frame of `bit_depth` written in place in the planes `luma` and `chroma`, and

@@ -1039,15 +1039,7 @@ pub(crate) fn fill_clears<P: Platform>(
 ) -> RaiseResult<()> {
     const ON: OnFault = OnFault::Return;
     for shape in (table.iter_mut()).filter(|s| pick(s) && takes_clear::<P>(s)) {
-        let pass = platform.render_pass_descriptor();
-        let attachment = ColorAttachmentSet {
-            texture: Some(Some(&shape.image)),
-            load_action: Some(LOAD_ACTION_CLEAR),
-            store_action: Some(STORE_ACTION_STORE),
-            clear_color: Some(ClearColor::default()),
-            ..ColorAttachmentSet::default()
-        };
-        pass.set_color_attachment(ON, 0, &attachment)?;
+        let pass = zeros_pass(platform, &shape.image)?;
         let Some(encoder) = cb.render_encoder(ON, &pass)? else {
             continue;
         };
@@ -1057,6 +1049,26 @@ pub(crate) fn fill_clears<P: Platform>(
         filled(shape, counts);
     }
     Ok(())
+}
+
+/// A render pass of `platform`'s whose one colour attachment is `image`, loaded by a clear to
+/// 0.0 and stored: with no draw, it writes the image's zeros, with no copy and no source
+/// ([`fill_clears`]; a video plane's clear before a short picture lands, `video_host`'s
+/// `Landing::writes_only`). `image` is a plane shape's image that takes a clear ([`takes_clear`]).
+pub(crate) fn zeros_pass<P: Platform>(
+    platform: &P,
+    image: &P::Texture,
+) -> RaiseResult<P::RenderPassDescriptor> {
+    let pass = platform.render_pass_descriptor();
+    let attachment = ColorAttachmentSet {
+        texture: Some(Some(image)),
+        load_action: Some(LOAD_ACTION_CLEAR),
+        store_action: Some(STORE_ACTION_STORE),
+        clear_color: Some(ClearColor::default()),
+        ..ColorAttachmentSet::default()
+    };
+    pass.set_color_attachment(OnFault::Return, 0, &attachment)?;
+    Ok(pass)
 }
 
 /// `shape` took its fill ([`fill`], [`fill_from`], [`fill_clears`]): it owes none and holds no

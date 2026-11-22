@@ -193,6 +193,35 @@ fn place(
     }
 }
 
+/// A coded picture decodes straight into planes that hold its rows and that it covers: a 1080p
+/// stream's 1920x1088 picture into 1080p planes holding 1088 rows; not a 720p stream's, short of
+/// them, which decodes elsewhere and lands with zeros past it, nor one the planes hold too few
+/// rows or bytes of.
+#[test]
+fn a_coded_picture_decodes_into_planes_it_covers_alone() {
+    let room = |row_bytes, height| Room {
+        bytes_per_row: 2048,
+        row_bytes,
+        height,
+    };
+    let planes = [(room(1920, 1080), 1088), (room(1920, 540), 544)];
+    assert_eq!(takes_coded(planes, (1920, 1088), 1), Ok(()));
+    assert_eq!(takes_coded(planes, (1920, 1080), 1), Ok(()));
+    let short = takes_coded(planes, (1280, 720), 1).unwrap_err();
+    assert!(short.contains("short of plane 0"), "{short}");
+    let low = takes_coded(planes, (1920, 1064), 1).unwrap_err();
+    assert!(low.contains("short of plane 0"), "{low}");
+    let held = takes_coded(planes, (1920, 1096), 1).unwrap_err();
+    assert!(held.contains("holds 1088 rows"), "{held}");
+    // 10-bit samples: a row of twice the bytes, past the pitch.
+    let wide = takes_coded(planes, (1920, 1088), 2).unwrap_err();
+    assert!(wide.contains("of 2048 bytes"), "{wide}");
+    // The chroma's rows alone short: an odd crop's half row.
+    let chroma = [(room(1920, 1080), 1088), (room(1920, 541), 544)];
+    let half = takes_coded(chroma, (1920, 1080), 1).unwrap_err();
+    assert!(half.contains("short of plane 1"), "{half}");
+}
+
 /// A frame lands in place at the planes' own rows and starts, its crop's width and height each
 /// rounded up to even as far as the planes hold them, `420v` or `x420` by its depth
 #[test]

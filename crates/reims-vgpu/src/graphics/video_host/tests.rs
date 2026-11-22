@@ -18,6 +18,20 @@ const PRIVATE: u64 = 2 << 4;
 /// What the output's bytes hold before a picture lands.
 const UNTOUCHED: u8 = 0xee;
 const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
+const FILL: &str = "fillBuffer:range:value:";
+const RENDER: &str = "renderCommandEncoderWithDescriptor:";
+/// What a short picture of the tests' covers of the planes of [`planes`]: its luma's 64 bytes of
+/// its first 40 rows, and its chroma's of its first 20.
+const SHORT: [Extent; 2] = [
+    Extent {
+        row_bytes: 64,
+        rows: 40,
+    },
+    Extent {
+        row_bytes: 64,
+        rows: 20,
+    },
+];
 
 fn buffer(p: &FakePlatform, len: u64, options: u64) -> FakeBuffer {
     let b = (p
@@ -70,6 +84,17 @@ enum Picture {
     DoneGated(u8, Log, mpsc::Sender<()>, mpsc::Receiver<()>),
     /// As `Fill`, of a decode the hardware answered failed.
     FailedFill(u8, Log),
+    /// `fill` by `Landing::copy_rows` from sources of what `only` covers of each plane.
+    CpuOnly(u8, [Extent; 2]),
+    /// `fill` in what `only` covers of each plane's host bytes, said once they are asked
+    /// (`Landing::writes_only`), as the VA-API arm's CPU copy says it.
+    HostOnly(u8, [Extent; 2]),
+    /// As `CpuOnly`, said first, before the planes' host bytes are asked, as the NVDEC arm says
+    /// it.
+    SaidCpuOnly(u8, [Extent; 2]),
+    /// What the hardware writes into the planes where they lie, saying first that it covers
+    /// `only` of them; the planes' bytes here are left alone.
+    InPlaceOnly([Extent; 2]),
 }
 
 impl HostPicture<P> for Picture {
@@ -131,6 +156,38 @@ impl HostPicture<P> for Picture {
                 to.hardware_failed("status 8".to_owned());
                 fill(to, n, &log)
             }
+            Picture::CpuOnly(n, only) => {
+                let rows = vec![n; 4096 * 128];
+                let source = |extent: Extent| SourcePlane {
+                    at: rows.as_ptr(),
+                    bytes_per_row: 4096,
+                    row_bytes: extent.row_bytes as usize,
+                    rows: extent.rows as usize,
+                };
+                // SAFETY: `rows` holds 128 rows of 4096 bytes, apart from the output.
+                unsafe { to.copy_rows(source(only[0]), source(only[1])) }
+            }
+            Picture::HostOnly(n, only) => {
+                let planes = to.host()?;
+                to.writes_only(only)?;
+                for (plane, extent) in [(&planes.luma, only[0]), (&planes.chroma, only[1])] {
+                    for row in 0..extent.rows {
+                        let at = plane.at.wrapping_add(row * plane.bytes_per_row);
+                        // SAFETY: the extent lies in the plane's rows, in its host bytes
+                        // (`Landing::host`'s word).
+                        unsafe {
+                            let len = extent.row_bytes as usize;
+                            std::ptr::write_bytes(at.as_ptr::<u8>(), n, len);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Picture::SaidCpuOnly(n, only) => {
+                to.writes_only(only)?;
+                Box::new(Picture::CpuOnly(n, only)).land(to)
+            }
+            Picture::InPlaceOnly(only) => to.writes_only(only),
         }
     }
 }
@@ -258,6 +315,39 @@ fn holds(b: &[u8], offset: usize, rows: usize, row_bytes: usize, fill: u8) -> bo
         b[at..at + row_bytes].iter().all(|&x| x == fill)
             && b[at + row_bytes..at + 128].iter().all(|&x| x == UNTOUCHED)
     })
+}
+
+/// Whether `b`'s rows of a plane at `offset`, `rows` of them 128 apart, each of `row_bytes`, hold
+/// `fill` in what `kept` covers of them, zeros in the rest of their `row_bytes`, and nothing past
+/// those in each row.
+fn holds_over_zeros(
+    b: &[u8],
+    offset: usize,
+    (rows, row_bytes): (usize, usize),
+    fill: u8,
+    kept: Extent,
+) -> bool {
+    let (kept_rows, kept_bytes) = (kept.rows as usize, kept.row_bytes as usize);
+    (0..rows).all(|row| {
+        let at = offset + row * 128;
+        let filled = if row < kept_rows { kept_bytes } else { 0 };
+        b[at..at + filled].iter().all(|&x| x == fill)
+            && b[at + filled..at + row_bytes].iter().all(|&x| x == 0)
+            && b[at + row_bytes..at + 128].iter().all(|&x| x == UNTOUCHED)
+    })
+}
+
+/// Lands `picture` in `output` on `stage` as the landing thread does, its command buffers
+/// completed by their waits.
+fn land_in(
+    picture: Picture,
+    output: &DecodeOutput<P>,
+    stage: &mut Stage<P>,
+) -> Result<Way, BackendError> {
+    let clock = StdRuntime::shared();
+    let landed = Arc::new(Landed::default());
+    let (way, _, _) = land(Box::new(picture), output, stage, &*clock, &landed)?;
+    Ok(way)
 }
 
 /// A decode hands the decoder its parameter sets, then its access unit in place in the
@@ -859,4 +949,266 @@ fn a_staged_plane_copies_whole_or_by_rows() {
         [(256, 4096, 100), (384, 4224, 100)]
     );
     assert!(plane_copies(256, &plane(128, 0)).is_empty());
+}
+
+/// A picture short of its planes lands with zeros in the rest of each plane's crop, in the
+/// surface's pages, by the CPU's copy and by the hardware's write, which says first what it
+/// covers: no texel past it keeps the plane's earlier bytes. The bytes past each row's crop, and
+/// past the plane's rows, stay as they were.
+#[test]
+fn a_short_picture_lands_over_zeros_in_the_pages() {
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let answers = vec![
+        Ok(Some(Picture::CpuOnly(9, SHORT))),
+        Ok(Some(Picture::HostOnly(7, SHORT))),
+        Ok(Some(Picture::InPlaceOnly(SHORT))),
+    ];
+    let s = session(&p, answers, &log);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let outputs = [
+        buffer(&p, 16384, STORAGE_SHARED),
+        buffer(&p, 16384, STORAGE_SHARED),
+        buffer(&p, 16384, STORAGE_SHARED),
+    ];
+    for output in &outputs {
+        s.decode(&decode(&bitstream, &[], planes(output, output, 96)))
+            .unwrap();
+    }
+    drop(s);
+    // The hardware's own write leaves its extent as it was, here the untouched bytes.
+    for (output, fill) in outputs.iter().zip([9, 7, UNTOUCHED]) {
+        let b = bytes(output);
+        assert!(holds_over_zeros(&b, 0, (64, 96), fill, SHORT[0]));
+        assert!(holds_over_zeros(&b, 8192, (32, 96), fill, SHORT[1]));
+        assert!(b[64 * 128..8192].iter().all(|&x| x == UNTOUCHED));
+        assert!(b[8192 + 32 * 128..].iter().all(|&x| x == UNTOUCHED));
+    }
+    assert_eq!(
+        p.call_log().calls_to(FILL).len(),
+        0,
+        "no GPU clear of pages"
+    );
+}
+
+/// A picture short of its planes in a device cache, staged in the session's staging buffer, is
+/// staged with zeros in the rest of each plane's crop, by the CPU's copy and by the hardware's
+/// write that says what it covers, after a whole picture left the buffer full of its bytes: the
+/// copy into the cache then writes the zeros. A picture said to cover its planes is staged as it
+/// writes them.
+#[test]
+fn a_short_picture_staged_for_a_cache_lands_over_zeros() {
+    let p = FakePlatform::new();
+    p.world().set_auto_complete(Some(CompleteOn::Caller));
+    let mut stage = Stage {
+        device: p.device(),
+        queue: None,
+        buffer: None,
+    };
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    let output = DecodeOutput::of(&decode(&bitstream, &[], planes(&cache, &cache, 128))).unwrap();
+    let log = Log::default();
+    let cases = [
+        (9, SHORT, Picture::CpuOnly as fn(u8, [Extent; 2]) -> Picture),
+        (7, SHORT, Picture::HostOnly),
+        (5, [Extent::NONE, SHORT[1]], Picture::HostOnly),
+    ];
+    for (fill, only, picture) in cases {
+        assert_eq!(
+            land_in(Picture::Fill(1, Arc::clone(&log)), &output, &mut stage).unwrap(),
+            Way::Staged
+        );
+        land_in(picture(fill, only), &output, &mut stage).unwrap();
+        let staged = bytes(stage.buffer.as_ref().unwrap());
+        // The staged planes' rows fill their pitch: nothing lies past their row bytes.
+        let whole = |b: &[u8], at: usize, rows: usize, extent: Extent| {
+            (0..rows).all(|row| {
+                let at = at + row * 128;
+                let filled = if row < extent.rows as usize {
+                    extent.row_bytes as usize
+                } else {
+                    0
+                };
+                b[at..at + filled].iter().all(|&x| x == fill)
+                    && b[at + filled..at + 128].iter().all(|&x| x == 0)
+            })
+        };
+        assert!(whole(&staged, 0, 64, only[0]), "the luma plane, {fill}");
+        assert!(
+            whole(&staged, 8192, 32, only[1]),
+            "the chroma plane, {fill}"
+        );
+    }
+    // Covering its planes, a picture's said extent zeros nothing.
+    let covers = [
+        Extent {
+            row_bytes: 128,
+            rows: 64,
+        },
+        Extent {
+            row_bytes: 128,
+            rows: 32,
+        },
+    ];
+    land_in(Picture::HostOnly(3, covers), &output, &mut stage).unwrap();
+    let staged = bytes(stage.buffer.as_ref().unwrap());
+    assert!(staged[..8192 + 4096].iter().all(|&x| x == 3));
+    assert_eq!(
+        p.call_log().calls_to(FILL).len(),
+        0,
+        "no GPU clear of staged planes"
+    );
+
+    // Said before the planes are staged, the short picture has the cache's planes cleared, and
+    // then staged with zeros past it, which the copy writes over the clear.
+    land_in(Picture::SaidCpuOnly(4, SHORT), &output, &mut stage).unwrap();
+    assert_eq!(p.call_log().calls_to(FILL).len(), 2);
+    let staged = bytes(stage.buffer.as_ref().unwrap());
+    let at = |row: usize| row * 128;
+    assert!(staged[at(0)..at(0) + 64].iter().all(|&x| x == 4));
+    assert!(staged[at(0) + 64..at(1)].iter().all(|&x| x == 0));
+    assert!(staged[at(40)..8192].iter().all(|&x| x == 0));
+    assert!(staged[8192 + at(20)..8192 + 4096].iter().all(|&x| x == 0));
+}
+
+/// A picture short of its planes in a device cache that the hardware writes where they lie has
+/// the session clear each plane whole first, on its queue, waited for: a fill of the plane's
+/// bytes in the cache's buffer, from its first row's first byte to its last row's last, before
+/// the hardware's write. A picture that covers its planes, or a plane it covers, takes none.
+#[test]
+fn a_short_picture_the_hardware_writes_in_a_cache_has_the_plane_cleared_first() {
+    let p = FakePlatform::new();
+    p.world().set_auto_complete(Some(CompleteOn::Caller));
+    let mut stage = Stage {
+        device: p.device(),
+        queue: None,
+        buffer: None,
+    };
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    let output = DecodeOutput::of(&decode(&bitstream, &[], planes(&cache, &cache, 96))).unwrap();
+    assert_eq!(
+        land_in(Picture::InPlaceOnly(SHORT), &output, &mut stage).unwrap(),
+        Way::Cache
+    );
+    let fills = p.call_log().calls_to(FILL);
+    let fill = |at, len| {
+        vec![
+            Arg::obj(&cache),
+            Arg::val(&NsRange::new(at, len)),
+            Arg::U8(0),
+        ]
+    };
+    assert_eq!(fills.len(), 2);
+    assert_eq!(fills[0].args, fill(0, 63 * 128 + 96));
+    assert_eq!(fills[1].args, fill(8192, 31 * 128 + 96));
+    assert!(stage.buffer.is_none(), "nothing staged");
+
+    // The luma covered, the chroma short: the chroma's plane alone.
+    let luma = Extent {
+        row_bytes: 96,
+        rows: 64,
+    };
+    land_in(Picture::InPlaceOnly([luma, SHORT[1]]), &output, &mut stage).unwrap();
+    let fills = &p.call_log().calls_to(FILL)[2..];
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].args, fill(8192, 31 * 128 + 96));
+
+    // Both covered: no clear.
+    let chroma = Extent {
+        row_bytes: 96,
+        rows: 32,
+    };
+    land_in(Picture::InPlaceOnly([luma, chroma]), &output, &mut stage).unwrap();
+    assert_eq!(p.call_log().calls_to(FILL).len(), 3);
+}
+
+/// A picture short of its planes in their cache's surface that the hardware writes there has
+/// each plane's image cleared first by its clear pass, a render pass of the image alone, on the
+/// session's queue, waited for; the cache's buffer takes no fill.
+#[cfg(unix)]
+#[test]
+fn a_short_picture_in_a_cache_s_surface_has_its_images_cleared_first() {
+    use reims_vgpu_vulkan::core::platform::resource::{
+        SurfaceDesc, SurfaceHandle, SurfacePlaneDesc,
+    };
+    let p = FakePlatform::new();
+    p.world().set_auto_complete(Some(CompleteOn::Caller));
+    p.world().give_exported_surfaces(true);
+    let plane = |pixel_format, width, height| SurfacePlaneDesc {
+        pixel_format,
+        width,
+        height,
+        usage: 0x15,
+        rows_below: 0,
+    };
+    let descs = [plane(10, 96, 64), plane(30, 48, 32)];
+    let desc = SurfaceDesc {
+        handle: SurfaceHandle::DmaBuf,
+        pitch_multiple: 128,
+        start_multiple: 256,
+        planes: &descs,
+    };
+    let made = (p.device().new_exported_surface(OnFault::Return, &desc))
+        .unwrap()
+        .unwrap();
+    let laid = made.memory.layout().to_vec();
+    let life = MemoryLife::new();
+    let clears = [p.render_pass_descriptor(), p.render_pass_descriptor()];
+    let target = |n: usize| SurfaceTarget {
+        memory: Arc::clone(&made.memory),
+        identity: life.identity(),
+        texture: made.planes[n].clone_ref(),
+        offset: laid[n].offset,
+        bytes_per_row: laid[n].row_pitch,
+        rows: descs[n].height,
+        clear: Some(clears[n].clone_ref()),
+    };
+    let mut stage = Stage {
+        device: p.device(),
+        queue: None,
+        buffer: None,
+    };
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let cache = buffer(&p, 16384, PRIVATE);
+    let (luma, chroma) = planes(&cache, &cache, 96);
+    let (luma, chroma) = (
+        VideoPlane {
+            surface: Some(target(0)),
+            ..luma
+        },
+        VideoPlane {
+            surface: Some(target(1)),
+            ..chroma
+        },
+    );
+    let output = DecodeOutput::of(&decode(&bitstream, &[], (luma, chroma))).unwrap();
+    land_in(Picture::InPlaceOnly(SHORT), &output, &mut stage).unwrap();
+    let passes = p.call_log().calls_to(RENDER);
+    assert_eq!(passes.len(), 2);
+    assert_eq!(passes[0].args, [Arg::obj(&clears[0])]);
+    assert_eq!(passes[1].args, [Arg::obj(&clears[1])]);
+    assert!(p.call_log().calls_to(FILL).is_empty());
+}
+
+/// A 4:2:0 picture's extent: the luma's samples and rows, the chroma's pairs and rows, each half
+/// as many rounded up.
+#[test]
+fn a_4_2_0_picture_covers_half_its_rows_and_columns_of_chroma_rounded_up() {
+    assert_eq!(
+        Extent::of_420(1279, 719, 2),
+        [
+            Extent {
+                row_bytes: 2558,
+                rows: 719
+            },
+            Extent {
+                row_bytes: 2560,
+                rows: 360
+            },
+        ]
+    );
+    assert!(Extent::of_420(96, 64, 1)[1].covers(96, 32));
+    assert!(!Extent::NONE.covers(1, 1));
 }

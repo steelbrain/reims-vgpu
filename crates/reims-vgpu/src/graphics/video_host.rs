@@ -37,6 +37,16 @@
 //!   picture lands with the caches as they were, and is not counted as a failure to land
 //!   (`Stage::copy_with_caches`).
 //!
+//!   **A short picture**, one whose write covers less of a plane than its crop (each plane's
+//!   `width` by `height` from its first byte: a stream smaller than the guest's surfaces), lands
+//!   with zeros in the rest of the crop, on every way it lands: no texel past it keeps what the
+//!   plane held, another picture's or the staging buffer's earlier bytes. The CPU's copy zeros
+//!   past what it copies ([`Landing::copy_rows`]); a backend whose hardware writes the picture
+//!   says first what it covers ([`Landing::writes_only`]), and the session zeros the rest of each
+//!   plane in host bytes by the CPU, and clears a plane in a device cache whole on its queue,
+//!   before the write. The rows past the crop that a plane holds for a coded picture
+//!   ([`OutputPlane::rows_held`]) are no texels of it, and keep what they held.
+//!
 //!   A picture holds the hardware's surface until it has landed, so the session holds no more
 //!   pictures unlanded than the decoder spares ([`HostDecoder::most_unlanded`]): a decode past
 //!   them waits, once its picture is decoded, for the oldest to land. The landing waits only
@@ -80,11 +90,13 @@ use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
+#[cfg(unix)]
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::resource::ExportedMemory;
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
-use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
+use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize, NsRange};
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
 
@@ -289,6 +301,44 @@ pub(crate) struct SourcePlane {
     pub(crate) rows: usize,
 }
 
+/// What a picture's write covers of one plane, from its first byte ([`Landing::writes_only`]):
+/// the bytes of each row from its first, and the rows from its first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Extent {
+    pub(crate) row_bytes: u64,
+    pub(crate) rows: u64,
+}
+
+impl Extent {
+    /// Nothing of the plane: a write that covers none of it, whose plane is zeros whole.
+    pub(crate) const NONE: Extent = Extent {
+        row_bytes: 0,
+        rows: 0,
+    };
+
+    /// What a 4:2:0 picture of `width` by `height` luma samples of `sample` bytes covers of its
+    /// planes from their first byte, the luma's then the chroma's: the chroma's rows half as
+    /// many, rounded up, and its rows a pair of samples for every two columns, the last one too
+    /// where the width is odd.
+    pub(crate) fn of_420(width: u64, height: u64, sample: u64) -> [Extent; 2] {
+        [
+            Extent {
+                row_bytes: width.saturating_mul(sample),
+                rows: height,
+            },
+            Extent {
+                row_bytes: width.div_ceil(2).saturating_mul(sample.saturating_mul(2)),
+                rows: height.div_ceil(2),
+            },
+        ]
+    }
+
+    /// Whether it covers a plane's crop of `rows` rows of `row_bytes` each.
+    fn covers(self, row_bytes: u64, rows: u64) -> bool {
+        self.row_bytes >= row_bytes && self.rows >= rows
+    }
+}
+
 /// A picture's landing in its decode's output ([`HostPicture::land`]).
 pub(crate) struct Landing<'a, P: Platform> {
     /// The output's luma plane.
@@ -300,6 +350,9 @@ pub(crate) struct Landing<'a, P: Platform> {
     clock: &'a dyn Runtime,
     /// Where each plane in a device cache is staged in `stage`'s buffer, once asked.
     staged: Option<Staged>,
+    /// What the backend's write covers of each plane, luma's then chroma's, once it said so
+    /// ([`Landing::writes_only`]): the planes staged after are zeroed past it.
+    only: Option<[Extent; 2]>,
     /// Whether the CPU copied the picture.
     by_cpu: bool,
     /// Whether the hardware decoded the picture straight into the output's planes
@@ -374,6 +427,9 @@ impl<P: Platform> Landing<'_, P> {
                 }
                 let staged = Staged { luma, chroma };
                 self.staged = Some(staged);
+                if let Some(only) = self.only {
+                    self.zero_staged(staged, only)?;
+                }
                 staged
             }
         };
@@ -420,8 +476,9 @@ impl<P: Platform> Landing<'_, P> {
 
     /// Copies the picture's planes, `luma` and `chroma`, into the planes' host bytes
     /// ([`Self::host`]) by the CPU: each plane's rows of the picture's crop, the fewer of its
-    /// source's and its own, each the fewer of their bytes, leaving the bytes past each row as
-    /// they were.
+    /// source's and its own, each the fewer of their bytes, and zeros in the rest of the plane's
+    /// crop where the source is the shorter or the narrower (the module docs, "A short
+    /// picture"), leaving the bytes past each row's `row_bytes`, and past its rows, as they were.
     ///
     /// # Safety
     ///
@@ -437,6 +494,10 @@ impl<P: Platform> Landing<'_, P> {
         for (from, to) in [(luma, &planes.luma), (chroma, &planes.chroma)] {
             let rows = u64::try_from(from.rows).map_or(to.rows, |rows| rows.min(to.rows));
             let bytes = u64::try_from(from.row_bytes).map_or(to.row_bytes, |b| b.min(to.row_bytes));
+            let copied = Extent {
+                row_bytes: bytes,
+                rows,
+            };
             let (Ok(rows), Ok(bytes), Ok(pitch)) = (
                 usize::try_from(rows),
                 usize::try_from(bytes),
@@ -457,11 +518,121 @@ impl<P: Platform> Landing<'_, P> {
                     );
                 }
             }
+            // SAFETY: as the copy's: the plane's crop lies in the host bytes the landing holds.
+            unsafe { zero_past(to.at, to.bytes_per_row, to.row_bytes, to.rows, copied)? };
         }
         self.cpu_took = Some(self.clock.elapsed_since(started));
         self.by_cpu = true;
         Ok(())
     }
+}
+
+impl<P: Platform> Landing<'_, P> {
+    /// Says that the backend's write of the picture covers `only` of the planes, the luma's then
+    /// the chroma's, from each one's first byte, and no more of them, and zeros the rest of each
+    /// plane's crop the write leaves, before the write (the module docs, "A short picture"): in
+    /// its host bytes by the CPU (the surface's pages, or the staging buffer, now or as
+    /// [`Self::host`] stages the plane), and in a device cache the hardware writes by a clear of
+    /// the whole plane on the session's queue, waited for. A plane `only` covers is left as it
+    /// is. Said before the write, which the clear would overwrite; a backend that writes the
+    /// planes whole need not say it.
+    pub(crate) fn writes_only(&mut self, only: [Extent; 2]) -> Result<(), BackendError> {
+        self.only = Some(only);
+        if let Some(staged) = self.staged {
+            self.zero_staged(staged, only)?;
+        }
+        let staged = self.staged.unwrap_or_default();
+        let mut clears = Vec::new();
+        for (plane, at, extent) in [
+            (self.luma, staged.luma, only[0]),
+            (self.chroma, staged.chroma, only[1]),
+        ] {
+            if at.is_some() || extent.covers(plane.row_bytes, plane.height) {
+                continue;
+            }
+            match plane.host {
+                // SAFETY: the plane's crop lies in its pages' host bytes (the output's check at
+                // the decode), which the decode holds through the landing.
+                Some(host) => unsafe {
+                    zero_past(
+                        host,
+                        plane.bytes_per_row,
+                        plane.row_bytes,
+                        plane.height,
+                        extent,
+                    )?
+                },
+                None => clears.push(plane),
+            }
+        }
+        if clears.is_empty() {
+            return Ok(());
+        }
+        self.stage.clear_planes(&clears)
+    }
+
+    /// Zeros past `only` each plane staged at `staged` ([`Self::writes_only`]).
+    fn zero_staged(&self, staged: Staged, only: [Extent; 2]) -> Result<(), BackendError> {
+        for (plane, at, extent) in [
+            (self.luma, staged.luma, only[0]),
+            (self.chroma, staged.chroma, only[1]),
+        ] {
+            let Some(at) = at else { continue };
+            let buffer = self.stage.buffer.as_ref().ok_or("no staging buffer")?;
+            // SAFETY: the staging buffer holds the plane's crop rows at the plane's pitch from
+            // `at` (`staged_len`, at its make), and the landing thread alone writes it.
+            unsafe {
+                zero_past(
+                    buffer.contents().wrapping_add(at),
+                    plane.bytes_per_row,
+                    plane.row_bytes,
+                    plane.height,
+                    extent,
+                )?
+            };
+        }
+        Ok(())
+    }
+}
+
+/// Zeros the bytes of a plane's crop, `rows` rows of `row_bytes`, `bytes_per_row` apart from
+/// `at`, that `extent` leaves: those past its bytes in each of its rows, and its rows past its
+/// own. The bytes past each row's `row_bytes` stay as they were.
+///
+/// # Safety
+///
+/// The crop's rows lie in host bytes from `at` that nothing else reads or writes meanwhile.
+unsafe fn zero_past(
+    at: HostPtr,
+    bytes_per_row: u64,
+    row_bytes: u64,
+    rows: u64,
+    extent: Extent,
+) -> Result<(), BackendError> {
+    if extent.covers(row_bytes, rows) {
+        return Ok(());
+    }
+    let (Ok(pitch), Ok(row_bytes), Ok(rows)) = (
+        usize::try_from(bytes_per_row),
+        usize::try_from(row_bytes),
+        usize::try_from(rows),
+    ) else {
+        return Err("a plane past the host's address space".into());
+    };
+    let kept = usize::try_from(extent.row_bytes).map_or(row_bytes, |b| b.min(row_bytes));
+    let full = usize::try_from(extent.rows).map_or(rows, |r| r.min(rows));
+    for row in 0..rows {
+        let from = if row < full { kept } else { 0 };
+        // SAFETY: the row's `row_bytes` lie in the crop, in the host bytes the caller holds.
+        unsafe {
+            std::ptr::write_bytes(
+                at.as_ptr::<u8>().add(row * pitch + from),
+                0,
+                row_bytes - from,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The bytes a plane in a device cache takes staged: its crop's rows at its pitch.
@@ -478,6 +649,79 @@ struct Stage<P: Platform> {
 }
 
 impl<P: Platform> Stage<P> {
+    /// The session's queue for its GPU work into device caches, made at its first.
+    fn queue(&mut self) -> Result<&P::CommandQueue, &'static str> {
+        if self.queue.is_none() {
+            let queue = (self.device.new_command_queue()).ok_or("no command queue")?;
+            queue.set_label("reims-vgpu.graphics-video-copy");
+            self.queue = Some(queue);
+        }
+        self.queue.as_ref().ok_or("no command queue")
+    }
+
+    /// Clears each of `planes`, each in a device cache, to zeros whole, its crop's rows, on the
+    /// session's queue, and waits for the clear ([`Landing::writes_only`]): a plane in its
+    /// cache's surface by a render pass that clears its image (`SurfaceTarget::clear`), else
+    /// by a fill of its bytes in the cache's buffer, from its first row's first byte to its last
+    /// row's last. A plane drawn over Direct3D 11 textures takes no clear here: its draw clears
+    /// the textures where the picture is short (`super::drawn`).
+    fn clear_planes(&mut self, planes: &[&OutputPlane<P>]) -> Result<(), BackendError> {
+        let fault = |what: &str, raise: Raise| format!("a plane's clear: {what}: {raise}");
+        let queue = (self.queue())
+            .map_err(|why| format!("a plane's clear: {why}"))?
+            .clone_ref();
+        let cb = (queue.command_buffer(OnFault::Return))
+            .map_err(|r| fault("its command buffer", r))?
+            .ok_or("a plane's clear: no command buffer")?;
+        let mut fills = Vec::new();
+        for plane in planes {
+            #[cfg(unix)]
+            if let Some(target) = &plane.surface {
+                let clear = target
+                    .clear
+                    .as_ref()
+                    .ok_or("a plane's clear: no clear pass")?;
+                let encoder = (cb.render_encoder(OnFault::Return, clear))
+                    .map_err(|r| fault("its render encoder", r))?
+                    .ok_or("a plane's clear: no render encoder")?;
+                (encoder.encode(OnFault::Return, RenderCmd::EndEncoding))
+                    .map_err(|r| fault("its end", r))?;
+                continue;
+            }
+            #[cfg(windows)]
+            if plane.drawn.is_some() {
+                return Err("a plane's clear: a plane drawn over Direct3D 11 textures".into());
+            }
+            if let Some(len) = plane_end(0, plane.bytes_per_row, plane.height, plane.row_bytes) {
+                fills.push((&plane.buffer, NsRange::new(plane.offset, len)));
+            }
+        }
+        if !fills.is_empty() {
+            let blit = (cb.blit_encoder(OnFault::Return))
+                .map_err(|r| fault("its blit encoder", r))?
+                .ok_or("a plane's clear: no blit encoder")?;
+            for (buffer, range) in fills {
+                let fill = BlitCmd::FillBuffer {
+                    buffer,
+                    range,
+                    value: 0,
+                };
+                blit.encode(OnFault::Return, fill)
+                    .map_err(|r| fault("a fill", r))?;
+            }
+            (blit.encode(OnFault::Return, BlitCmd::EndEncoding))
+                .map_err(|r| fault("its end", r))?;
+        }
+        cb.commit(OnFault::Return)
+            .map_err(|r| fault("its commit", r))?;
+        (cb.wait_until_completed(OnFault::Return)).map_err(|r| fault("its wait", r))?;
+        if cb.status() != CommandBufferStatus::COMPLETED {
+            let error = cb.error().map(|e| format!("{e:?}")).unwrap_or_default();
+            return Err(format!("a plane's clear failed {error}").into());
+        }
+        Ok(())
+    }
+
     /// The staging buffer, of at least `len` bytes: the last one where it is that long, else a
     /// new one.
     fn buffer_of(&mut self, len: u64) -> Result<&P::Buffer, BackendError> {
@@ -526,17 +770,11 @@ impl<P: Platform> Stage<P> {
         let way = if into { "into" } else { "out of" };
         let fault =
             |what: &str, raise: Raise| format!("the copy {way} a device cache: {what}: {raise}");
+        let queue = (self.queue())
+            .map_err(|why| format!("the copy {way} a device cache: {why}"))?
+            .clone_ref();
         let Some(buffer) = self.buffer.as_ref() else {
             return Err(format!("the copy {way} a device cache: no staging buffer").into());
-        };
-        if self.queue.is_none() {
-            let queue = (self.device.new_command_queue())
-                .ok_or_else(|| format!("the copy {way} a device cache: no command queue"))?;
-            queue.set_label("reims-vgpu.graphics-video-copy");
-            self.queue = Some(queue);
-        }
-        let Some(queue) = self.queue.as_ref() else {
-            return Err(format!("the copy {way} a device cache: no command queue").into());
         };
         let cb = (queue.command_buffer(OnFault::Return))
             .map_err(|r| fault("its command buffer", r))?
@@ -1222,6 +1460,7 @@ fn land<P: Platform>(
         stage,
         clock,
         staged: None,
+        only: None,
         by_cpu: false,
         decoded: false,
         hardware_failed: None,

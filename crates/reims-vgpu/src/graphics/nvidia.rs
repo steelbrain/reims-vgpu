@@ -93,8 +93,8 @@ use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
 };
 use super::video_host::{
-    BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostVideoSession,
-    Landing, OutputPlane, SourcePlane, picture_error,
+    BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture,
+    HostVideoSession, Landing, OutputPlane, SourcePlane, picture_error,
 };
 
 mod encode;
@@ -598,6 +598,14 @@ impl<P: Platform> NvdecPicture<P> {
         else {
             return Err("a plane past 2^32 pixels".into());
         };
+        // Each way writes the crop's `width` by `height` at most: a crop short of the planes
+        // lands with zeros past it (`video_host`'s module docs, "A short picture").
+        let (_, _, crop_width, crop_height) = self.picture.crop();
+        to.writes_only(Extent::of_420(
+            u64::from(crop_width.min(width)),
+            u64::from(crop_height.min(height)),
+            sample,
+        ))?;
         if self.write_in_cache((width, height), luma, chroma)? {
             return Ok(());
         }

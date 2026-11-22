@@ -24,7 +24,9 @@
 //! `PlaneTargets::owe_zeros`). Where no picture is drawn, they are cleared alone
 //! ([`DrawnPlanes::unwritten`]): a draw that fails, before the CPU's copy, and a command buffer
 //! whose decode answered nothing, at its finish. A fill of the shapes from the buffer since
-//! leaves them owing nothing ([`DrawnPlanes::filled`]).
+//! leaves them owing nothing ([`DrawnPlanes::filled`]). A picture smaller than the planes owes
+//! the zeros whatever the textures held, another picture's: its draw clears them first, so that
+//! no texel past it keeps what it held (`video_host`'s module docs, "A short picture").
 //!
 //! Each draw is counted by picture ([`DRAWN_CODE`]) and by the KiB of its planes' crop
 //! ([`DRAWN_KIB_CODE`]). A real Mac decodes straight into the surface the guest reads, so the
@@ -73,7 +75,8 @@ impl DrawnPlanes {
     }
 
     /// Draws `frame`'s crop into the textures once its decode is done, telling `decoded` between
-    /// the two (the module doc), and counts it. `Err` says why it was not drawn, the textures
+    /// the two (the module doc), over zeros where the crop is smaller than them, and counts it.
+    /// `Err` says why it was not drawn, the textures
     /// cleared to the zeros they owe first ([`Self::unwritten`]); `decoded` is told only of a
     /// decode that is done.
     pub(crate) fn draw(&self, frame: &Frame, decoded: &mut dyn FnMut()) -> Result<(), String> {
@@ -84,6 +87,10 @@ impl DrawnPlanes {
                 decoded();
                 let texture = (frame.texture()).ok_or("the picture lies in no shared texture")?;
                 let extent = (frame.width(), frame.height());
+                let size = self.targets.size();
+                if extent.0 < size.0 || extent.1 < size.1 {
+                    self.targets.owe_zeros();
+                }
                 self.draw
                     .draw(&texture, frame.crop_origin(), &self.targets, extent)
             });

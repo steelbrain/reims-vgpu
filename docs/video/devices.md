@@ -146,6 +146,15 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   are handed to the decoder before the access unit.
 - **The picture lands** in the output surface's planes, cropped: in the surface's pages, or in
   its device cache where the kext keeps the surface in one. The arms' ways differ (below).
+  A picture short of the planes (a stream smaller than the guest's surfaces) lands with zeros in
+  the rest of each plane's crop, on every way: the CPU's copy zeros past what it copies, the
+  session zeros the rest of a plane in host bytes before the hardware's write, and clears a plane
+  in a device cache whole first on its queue (a render pass of the plane's image in a cache's
+  surface, a fill of its bytes in a cache's buffer), and on Windows the draw into a cache's
+  surface over Direct3D 11 textures clears them first. No texel past the picture keeps the
+  plane's earlier bytes, another picture's or a staging buffer's. A VA-API decode straight into
+  the output's cache takes only a coded picture that covers the planes; a shorter one is decoded
+  elsewhere and lands as above (reims-vgpu's `graphics/video_host.rs`, "A short picture").
 - **The command buffer's later work, and its completion, wait** for the session's event to
   reach the value the decode signals once its picture has landed. So a CPU lock of the output
   waits for the picture, as for any GPU write.

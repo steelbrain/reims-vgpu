@@ -310,6 +310,11 @@ pub(super) struct PlaneSurface<P: Platform> {
     life: MemoryLife,
     /// The rows each plane holds, its own and the room below them.
     rows: [u64; 2],
+    /// Each plane's clear to zeros, a render pass of its image alone
+    /// ([`shapes::zeros_pass`](super::shapes::zeros_pass)), for the host's video to clear a
+    /// plane a short picture lands in (`video_host`'s `Landing::writes_only`); `None` where the
+    /// platform raised at one.
+    clears: Option<[P::RenderPassDescriptor; 2]>,
 }
 
 /// What a surface is asked of ([`CacheSurface::ask`]): its handle, each plane's description,
@@ -423,6 +428,7 @@ impl<P: Platform> CacheSurface<P> {
                 offset: laid.offset,
                 bytes_per_row: laid.row_pitch,
                 rows: made.rows[n],
+                clear: (made.clears.as_ref()).map(|clears| clears[n].clone_ref()),
             })
         };
         let targets = [target(0)?, target(1)?];
@@ -548,8 +554,8 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// Adds `made`, the surface `ask` asked, to the block at `block`'s cache, its planes its
-    /// plane shapes, each owing a fill from the buffer: a reference to the shape `key` and its
-    /// image. Where the cache went, or holds a shape of either plane, since the ask, `made` is
+    /// plane shapes, each owing a fill from the buffer, and `clears` each plane's clear: a
+    /// reference to the shape `key` and its image. Where the cache went, or holds a shape of either plane, since the ask, `made` is
     /// not taken. What goes (`made`'s where not taken, and the shapes past the bound), for the
     /// caller to let go of with the lock let go of.
     fn add_planes(
@@ -558,6 +564,7 @@ impl<P: Platform> SurfaceCaches<P> {
         key: &ShapeKey,
         ask: &SurfaceAsk,
         made: ExportedSurface<P>,
+        clears: Option<[P::RenderPassDescriptor; 2]>,
     ) -> (Option<Held<P::Texture>>, Gone<P>) {
         let ExportedSurface { planes, memory } = made;
         let unplaced = |planes: Vec<P::Texture>, memory| (None, (planes, Some(memory)));
@@ -590,6 +597,7 @@ impl<P: Platform> SurfaceCaches<P> {
             memory,
             life: MemoryLife::new(),
             rows,
+            clears,
         });
         let counts = &mut self.counts.shapes;
         counts.made += 2;
@@ -697,6 +705,32 @@ fn unasked(block: u64) {
     }
 }
 
+/// Each of `planes`' clear to zeros ([`PlaneSurface::clears`]), the surface's that the block at
+/// `block`'s cache takes; `None`, logged, where `platform` raised at one.
+#[cfg(unix)]
+fn plane_clears<P: Platform>(
+    platform: &P,
+    block: u64,
+    planes: &[P::Texture],
+) -> Option<[P::RenderPassDescriptor; 2]> {
+    let [luma, chroma] = planes else {
+        return None;
+    };
+    let made = super::shapes::zeros_pass(platform, luma)
+        .and_then(|luma| Ok([luma, super::shapes::zeros_pass(platform, chroma)?]));
+    match made {
+        Ok(clears) => Some(clears),
+        Err(raise) => {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "the IOSurface block at {block:#x}: the platform raised at its video planes' \
+                 clears ({raise:?}); a short picture there fails to land"
+            );
+            None
+        }
+    }
+}
+
 /// What [`SurfaceCaches::add_planes`] lets go of: images, and a surface's memory not taken.
 #[cfg(unix)]
 type Gone<P> = (
@@ -755,10 +789,11 @@ impl<P: Platform> Caches<P> {
             state.copy_forms.note(&ask);
             return None;
         }
+        let clears = plane_clears(platform, block, &made.planes);
         // The caches' lock, whose let-go commits the planes' fill (`Locked`).
         let (found, gone) = {
             let mut state = self.lock();
-            let added = state.add_planes(block, key, &ask, made);
+            let added = state.add_planes(block, key, &ask, made, clears);
             if added.0.is_some() {
                 state.fill_planes_at_make(platform, device, block);
             }
