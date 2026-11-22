@@ -2018,3 +2018,39 @@ fn a_piece_is_its_block_s_length_on_a_source_of_64_kib_blocks() {
     // The headroom's asks, of a unit each, follow the take's.
     assert_eq!(source.asked.lock()[..3], [1, BLOCK_LEN + 1, long]);
 }
+
+/// A take's zeros of [`takes::ZERO_SPLIT_MIN`] bytes or more are written in parts of
+/// [`takes::ZERO_PART`] by as many threads as [`takes::zero_hands`] answers, at most one a part,
+/// and fewer bytes on the calling thread alone; either way over its ranges and no other byte.
+#[test]
+fn a_long_takes_zeros_are_written_in_parts_over_its_ranges_alone() {
+    const PAGE: usize = 4096;
+    let part = takes::ZERO_PART;
+    let split = usize::try_from(takes::ZERO_SPLIT_MIN).unwrap();
+    // A range past a part's end, then a gap of untouched bytes, then a range of one part.
+    let first = PAGE..PAGE + split + 3 * part + PAGE;
+    let second = first.end + 3 * PAGE..first.end + 3 * PAGE + part;
+    let mut bytes = vec![0xa5u8; second.end + part];
+    let wide = |r: &std::ops::Range<usize>| r.start as u64..r.end as u64;
+    let host = NonNull::new(bytes.as_mut_ptr()).unwrap();
+    // SAFETY: both ranges lie in `bytes`, which nothing else touches meanwhile.
+    let hands = unsafe { takes::write_zeros(host, &[wide(&first), wide(&second)]) };
+    let parts = first.len().div_ceil(part) + second.len().div_ceil(part);
+    assert_eq!(parts, 13);
+    assert_eq!(hands, takes::zero_hands().min(parts));
+    let is = |bytes: &[u8], r: std::ops::Range<usize>, v: u8| bytes[r].iter().all(|&b| b == v);
+    assert!(is(&bytes, 0..first.start, 0xa5));
+    assert!(is(&bytes, first.clone(), 0));
+    assert!(is(&bytes, first.end..second.start, 0xa5));
+    assert!(is(&bytes, second.clone(), 0));
+    assert!(is(&bytes, second.end..bytes.len(), 0xa5));
+    // One byte short of the split: this thread alone.
+    bytes.fill(0xa5);
+    let short = PAGE..PAGE + split - 1;
+    let host = NonNull::new(bytes.as_mut_ptr()).unwrap();
+    // SAFETY: the range lies in `bytes`, which nothing else touches meanwhile.
+    assert_eq!(unsafe { takes::write_zeros(host, &[wide(&short)]) }, 1);
+    assert!(is(&bytes, 0..short.start, 0xa5));
+    assert!(is(&bytes, short.clone(), 0));
+    assert!(is(&bytes, short.end..bytes.len(), 0xa5));
+}

@@ -10,15 +10,16 @@
 //! that fits, first fit), on the thread that carries the take out, with the pool's lock held and
 //! nothing else done: it never allocates and never zeroes. The take then goes to its context's
 //! worker (`reims-vgpu.graphics-pool-take`), which zeroes the block through the piece's host
-//! mapping and answers. Where nothing fits, the worker takes a block of the take's length from the
-//! source with the pool's lock let go of, so only this take waits for its allocation, and hands it
-//! to the pool's thread, which places it ahead of the headroom's blocks and carves the take at its
-//! piece's first byte before it asks the host to map the piece; the worker zeroes the carve while
-//! the host maps the piece, and answers once it did. A context's takes are answered in its own
-//! order, one worker a context with a take in flight, so a take waits only behind its own
-//! context's earlier ones, never behind another's growth or zeroing, nor behind the headroom's
-//! blocks or the pieces going back. A worker goes
-//! after [`WORKER_IDLE`] with no take. Every block reads zero at its answer: its worker zeroes
+//! mapping, with threads made for the write beside it where the zeros hold [`ZERO_SPLIT_MIN`]
+//! bytes or more ([`write_zeros`]), and answers. Where nothing fits, the worker takes a block of
+//! the take's length from the source with the pool's lock let go of, so only this take waits for
+//! its allocation, and hands it to the pool's thread, which places it ahead of the headroom's
+//! blocks and carves the take at its piece's first byte before it asks the host to map the piece;
+//! the worker zeroes the carve while the host maps the piece, and answers once it did. A
+//! context's takes are answered in its own order, one worker a context with a take in flight, so
+//! a take waits only behind its own context's earlier ones, never behind another's growth or
+//! zeroing, nor behind the headroom's blocks or the pieces going back. A worker goes after
+//! [`WORKER_IDLE`] with no take. Every block reads zero at its answer: its worker zeroes
 //! it at its take, off the thread that carried the take out, its bytes counted
 //! ([`super::TAKE_ZEROED_BYTES_CODE`]), but for those the pool's zeroer zeroed ahead of it
 //! (below, "Zeros ahead"). A piece's source says nothing of its block's bytes as it hands it
@@ -102,11 +103,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use parking_lot::MutexGuard;
+use parking_lot::{Mutex, MutexGuard};
 use reims_vgpu_vulkan::answer::count_kind_by;
 use reims_vgpu_vulkan::core::trace;
 
@@ -132,6 +133,20 @@ const WORKER_IDLE: Duration = Duration::from_secs(2);
 /// The most bytes the zeroer zeroes at once (the module doc's "Zeros ahead"): 64 KiB, a carve's
 /// granule, so its claim keeps a carve off one granule at most.
 pub(super) const ZERO_CHUNK: u64 = TAKE_ALIGN;
+
+/// The fewest bytes of a take's zeros that several threads write at once ([`write_zeros`]):
+/// 16 MiB, a headroom piece's length. On a Ryzen 9 8745H one worker wrote a take's 547 MiB of
+/// zeros in 21.8 ms, 26 GB/s, and a compute benchmark's takes on an RTX 3090 spent 256 ms of
+/// their 1.31 s wait zeroing, almost all of it over takes longer than 16 MiB, each a piece of its
+/// own that no zeroer reaches before it (**measured**, 11-21).
+pub(super) const ZERO_SPLIT_MIN: u64 = 16 << 20;
+
+/// The most threads that write one take's zeros at once, its worker among them.
+const ZERO_HANDS_MOST: usize = 4;
+
+/// The length of each part of a take's zeros that one thread writes at a time ([`write_zeros`]),
+/// the last part of a range shorter: 2 MiB.
+pub(super) const ZERO_PART: usize = 2 << 20;
 
 /// Byte ranges of a piece's block, by offset: each range's first byte to its end, none touching
 /// another.
@@ -1205,16 +1220,12 @@ impl Shared {
             let Some(host) = host else {
                 return;
             };
-            for r in &zero {
-                let first = usize::try_from(r.start);
-                let bytes = usize::try_from(r.end.saturating_sub(r.start));
-                if let (Ok(first), Ok(bytes)) = (first, bytes) {
-                    // SAFETY: the carve lies in its piece's block's mapping, and the piece's
-                    // block stays the pool's while the carve does, which only this worker frees
-                    // until it is answered; `r` lies in its `len` bytes.
-                    unsafe { std::ptr::write_bytes(host.as_ptr().add(first), 0, bytes) };
-                }
-            }
+            // SAFETY: the carve lies in its piece's block's mapping, and the piece's block stays
+            // the pool's while the carve does, which only this worker frees until it is
+            // answered; each range of `zero` lies in its `len` bytes, which nothing else touches
+            // before the answer: the zeroer claims none of a carve's bytes, and the guest maps
+            // them only once answered.
+            unsafe { write_zeros(host, &zero) };
             let zeroes = total(&zero);
             if zeroes > 0 {
                 count_kind_by(TAKE_ZEROED_BYTES_CODE, zeroes);
@@ -1364,6 +1375,75 @@ pub(super) fn spawn_zeroer(shared: &Arc<Shared>) {
 fn zeroes_ahead(at: u64, p: &Piece, top: Option<u64>) -> bool {
     let headroom = p.empty_since.is_some() && top.is_some_and(|top| at <= top);
     p.usable() && p.block.contents.is_some() && (p.carves > 0 || headroom)
+}
+
+/// Writes zeros over the ranges `zero` names of the mapping at `host`, by offset from it: on this
+/// thread where they hold fewer than [`ZERO_SPLIT_MIN`] bytes, else in parts of [`ZERO_PART`],
+/// which this thread and up to [`zero_hands`] less one more, made for the write and gone by its
+/// end (`reims-vgpu.graphics-pool-zero-hand`), take in turn until none is left, so it returns once
+/// every byte is written. A thread the host does not make leaves its parts to the others. The
+/// threads that wrote: this one, and each one made.
+///
+/// # Safety
+///
+/// Every range lies in the mapping at `host`, which nothing else reads or writes meanwhile.
+pub(super) unsafe fn write_zeros(host: NonNull<u8>, zero: &[Range<u64>]) -> usize {
+    let mut parts: Vec<&mut [u8]> = Vec::new();
+    for r in zero {
+        let first = usize::try_from(r.start);
+        let bytes = usize::try_from(r.end.saturating_sub(r.start));
+        if let (Ok(first), Ok(bytes)) = (first, bytes) {
+            // SAFETY: the caller's: the range lies in the mapping, and nothing else touches it.
+            let span = unsafe { std::slice::from_raw_parts_mut(host.as_ptr().add(first), bytes) };
+            parts.extend(span.chunks_mut(ZERO_PART));
+        }
+    }
+    let hands = if total(zero) < ZERO_SPLIT_MIN {
+        1
+    } else {
+        zero_hands().min(parts.len())
+    };
+    if hands <= 1 {
+        for part in parts {
+            part.fill(0);
+        }
+        return 1;
+    }
+    let parts = Mutex::new(parts);
+    let write = || {
+        loop {
+            // The lock is let go of before the part is written.
+            let part = parts.lock().pop();
+            let Some(part) = part else {
+                break;
+            };
+            part.fill(0);
+        }
+    };
+    std::thread::scope(|scope| {
+        let mut made = 1;
+        while made < hands {
+            let spawned = std::thread::Builder::new()
+                .name("reims-vgpu.graphics-pool-zero-hand".into())
+                .spawn_scoped(scope, write);
+            if spawned.is_err() {
+                break;
+            }
+            made = made.saturating_add(1);
+        }
+        write();
+        made
+    })
+}
+
+/// How many threads write a long take's zeros at once ([`write_zeros`]): a quarter of the threads
+/// the host runs the process's at once, at least one and at most [`ZERO_HANDS_MOST`], read once.
+pub(super) fn zero_hands() -> usize {
+    static HANDS: OnceLock<usize> = OnceLock::new();
+    *HANDS.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        threads.checked_div(4).unwrap_or(1).clamp(1, ZERO_HANDS_MOST)
+    })
 }
 
 /// The bytes of `parts`.
