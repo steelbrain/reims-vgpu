@@ -347,7 +347,12 @@ fn a_destroy_between_a_create_s_reply_and_its_store_cancels_it() {
         eventually(|| world.find(state).is_none()),
         "the destroyed pipeline was kept"
     );
-    assert!(!pending(&device, id));
+    // The store lets the pipeline go, then ends its pending entry (`store_made`): the entry can
+    // outlive the pipeline for a moment.
+    assert!(
+        eventually(|| !pending(&device, id)),
+        "the destroyed pipeline's finish never ended"
+    );
     // The queue and the library.
     assert_eq!(device.decoder_object_count(), 2);
 }
@@ -406,7 +411,12 @@ fn a_close_between_a_create_s_reply_and_its_store_cancels_it() {
         eventually(|| world.find(state).is_none()),
         "the closed context's pipeline was kept"
     );
-    assert!(!pending(&device, id));
+    // The store lets the pipeline go, then ends its pending entry (`store_made`): the entry can
+    // outlive the pipeline for a moment.
+    assert!(
+        eventually(|| !pending(&device, id)),
+        "the closed context's pipeline's finish never ended"
+    );
     assert_eq!(device.decoder_object_count(), 0);
 }
 
