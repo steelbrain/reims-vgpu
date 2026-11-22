@@ -2290,7 +2290,11 @@ mod tests {
             let made = r.p.call_log().since(mark);
             let made = made.iter().filter(|c| c.sel == MAKE_MEMORY).count();
             assert_eq!(made, usize::from(!apart), "{case}: the buffer's memory");
-            let memory = r.dec.caches().buffer(BLOCK).is_some_and(|b| b.memory_made());
+            let memory = r
+                .dec
+                .caches()
+                .buffer(BLOCK)
+                .is_some_and(|b| b.memory_made());
             assert_eq!(memory, !apart, "{case}: made");
         }
     }
