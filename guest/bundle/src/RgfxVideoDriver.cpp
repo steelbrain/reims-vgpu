@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "RgfxLog.hpp"
+#include "RgfxLogOnce.hpp"
 #include "RgfxVideoChannel.hpp"
 #include "RgfxVideoH264.hpp"
 #include "RgfxVideoH265.hpp"
@@ -532,6 +533,8 @@ struct Context {
 	// since its last schedule, which fails its next (RgfxVideoStatus.hpp).
 	uint64_t frames = 0;
 	std::atomic<bool> encode_failed{false};
+	// Whether its first output surface's layout was logged (outputSaid).
+	std::atomic<bool> output_said{false};
 };
 
 // The live sessions, whose output textures go when AppleGVA frees its frames' pool.
@@ -861,6 +864,69 @@ void clipToSurface(Place place, size_t surfaceWidth, size_t surfaceHeight, uint3
 	clip(place.y, surfaceHeight, height);
 }
 
+// The four characters of `fourcc`, as a string.
+struct FourCc {
+	char text[5];
+};
+FourCc fourCcText(uint32_t fourcc)
+{
+	FourCc f = {};
+	for (int i = 0; i < 4; i++) {
+		const char c = (char)(fourcc >> (24 - 8 * i));
+		f.text[i] = c >= 0x20 && c < 0x7f ? c : '?';
+	}
+	return f;
+}
+
+// Logs, once a context, how its first output surface lies, as AppleGVA's pool made it: its size
+// and format, and each plane's bytes per row, first byte (from the surface's) and rows.
+void outputSaid(const Context *context, IOSurfaceRef s)
+{
+	const size_t planes = IOSurfaceGetPlaneCount(s);
+	const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(s);
+	size_t rowBytes[2] = {}, offsets[2] = {}, heights[2] = {};
+	for (size_t p = 0; p < 2 && p < planes; p++) {
+		rowBytes[p] = IOSurfaceGetBytesPerRowOfPlane(s, p);
+		heights[p] = IOSurfaceGetHeightOfPlane(s, p);
+		const uint8_t *at = (const uint8_t *)IOSurfaceGetBaseAddressOfPlane(s, p);
+		offsets[p] = base && at >= base ? (size_t)(at - base) : 0;
+	}
+	os_log(rgfxLog(),
+	       "RGFX: video: a context's first output surface: sub-ID 0x%llx, %zux%zu %{public}s, "
+	       "%zu planes: rows of %zu and %zu bytes, at bytes %zu and %zu, %zu and %zu rows; %zu "
+	       "bytes",
+	       (unsigned long long)context->sub_id, IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
+	       fourCcText(IOSurfaceGetPixelFormat(s)).text, planes, rowBytes[0], rowBytes[1],
+	       offsets[0], offsets[1], heights[0], heights[1], IOSurfaceGetAllocSize(s));
+}
+
+// Logs, once a process for each request of its fields and answer, what AppleGVA asked
+// GetPixelBufferInfo (the function and sub-ID it names, the frame's size and format) and what the
+// driver answered: its status, the codec and host layout it took the request for, and on kOk each
+// plane's size, pitch and alignment. Returns `status`.
+uint32_t pixelInfoSaid(const PixelRequirement &r, uint32_t status, uint32_t codec,
+                       const RgfxVideoOutputLayout &layout)
+{
+	static char site;
+	uint64_t kind = 0xcbf29ce484222325ull;
+	for (size_t i = 0; i < offsetof(PixelRequirement, widths); i++)
+		kind = (kind ^ ((const uint8_t *)&r)[i]) * 0x100000001b3ull;
+	kind = (kind ^ status) * 0x100000001b3ull;
+	if (!rgfxLogFirst(&site, kind))
+		return status;
+	const bool ok = status == 0;
+	os_log(rgfxLog(),
+	       "RGFX: video: GetPixelBufferInfo: function 0x%x, sub-ID 0x%x (+0x08 0x%x, +0x0c 0x%x, "
+	       "+0x1c 0x%x, +0x24 0x%x), %ux%u %{public}s, %u planes: status %u, codec %u, layout "
+	       "[%u, %u] at %u; planes %ux%u and %ux%u, pitches %u and %u, alignments %u and %u",
+	       r.function_id, r.sub_id, r.field_08, r.field_0c, r.field_1c, r.field_24, r.width,
+	       r.height, fourCcText(r.fourcc).text, r.planes, status, codec, layout.granularity[0],
+	       layout.granularity[1], layout.alignment, ok ? r.widths[0] : 0, ok ? r.heights[0] : 0,
+	       ok ? r.widths[1] : 0, ok ? r.heights[1] : 0, ok ? r.pitches[0] : 0,
+	       ok ? r.pitches[1] : 0, ok ? r.alignments[0] : 0, ok ? r.alignments[1] : 0);
+	return status;
+}
+
 // Commits `sets` and the access unit at `bytes` on `context`'s session, into `output` at `place`
 // (`width` by `height` of it there; RgfxVideoChannel.hpp), the sets sent only where they changed
 // since the session's last: the work on the host, or null.
@@ -868,6 +934,8 @@ void *commitPicture(Context *context, std::vector<uint8_t> &sets, const uint8_t 
                     size_t size, IOSurfaceRef output, Place place = {0, 0}, uint32_t width = 0,
                     uint32_t height = 0)
 {
+	if (!context->output_said.exchange(true))
+		outputSaid(context, output);
 	const bool changed = sets != context->sent;
 	rgfx::video::Decode d = {};
 	d.bytes = bytes;
@@ -1474,6 +1542,16 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		PixelRequirement *r = (PixelRequirement *)a1;
 		if (!r || !r->widths || !r->heights || !r->pitches || !r->alignments)
 			return kBadArgument;
+		// Where the host decodes the codec in place (outputLayout), what the decode writes: the
+		// coded picture's whole rows and columns, in the host's units, at its planes' alignment,
+		// as AMD's driver on a Mac answers (rows of whole macroblocks, at 256 bytes): the planes'
+		// rows those, the frame's width as it is, and AppleGVA extends the planes below the
+		// frame by the rows past it.
+		const uint32_t codec = r->function_id == kFunctionEncode ? 0
+		                       : r->sub_id == kCodecHevc         ? RGFX_VIDEO_CODEC_HEVC
+		                       : r->sub_id == kCodecH264         ? RGFX_VIDEO_CODEC_H264
+		                                                         : 0;
+		const RgfxVideoOutputLayout layout = rgfx::video::outputLayout(codec);
 		// Two planes, of a byte a sample (NV12) or two (P010).
 		uint32_t sampleBytes;
 		switch (r->fourcc) {
@@ -1487,29 +1565,19 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			sampleBytes = 2;
 			break;
 		default:
-			return kUnsupportedFormat;
+			return pixelInfoSaid(*r, kUnsupportedFormat, codec, layout);
 		}
 		if (r->planes != 2)
-			return kUnsupportedFormat;
+			return pixelInfoSaid(*r, kUnsupportedFormat, codec, layout);
 		if (r->width == 0 || r->height == 0 || r->width > kMaxFrameSide || r->height > kMaxFrameSide)
-			return kBadArgument;
+			return pixelInfoSaid(*r, kBadArgument, codec, layout);
 		// What the host's copy writes, a picture's crop at each plane's origin (a frame's; a tile
 		// in a canvas lands at its place, hevcTilePlace): luma of the frame's size, chroma of
 		// half, in whole pairs; each plane's first byte and pitch at the alignment its texture and
 		// the copy take, one pitch for both planes.
 		uint32_t alignment = rgfx::video::outputPlaneAlignment(sampleBytes);
 		if (alignment == 0)
-			return kUnsupported;
-		// Where the host decodes the codec in place (outputLayout), what the decode writes: the
-		// coded picture's whole rows and columns, in the host's units, at its planes' alignment,
-		// as AMD's driver on a Mac answers (rows of whole macroblocks, at 256 bytes): the planes'
-		// rows those, the frame's width as it is, and AppleGVA extends the planes below the
-		// frame by the rows past it.
-		const uint32_t codec = r->function_id == kFunctionEncode ? 0
-		                       : r->sub_id == kCodecHevc         ? RGFX_VIDEO_CODEC_HEVC
-		                       : r->sub_id == kCodecH264         ? RGFX_VIDEO_CODEC_H264
-		                                                         : 0;
-		const RgfxVideoOutputLayout layout = rgfx::video::outputLayout(codec);
+			return pixelInfoSaid(*r, kUnsupported, codec, layout);
 		uint32_t codedWidth = r->width, codedHeight = r->height;
 		if (layout.granularity[0] != 0 && layout.granularity[1] != 0 && layout.alignment != 0) {
 			const auto roundUp = [](uint32_t v, uint32_t unit) { return (v + unit - 1) / unit * unit; };
@@ -1538,7 +1606,7 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			r->pitches[p] = pitch;
 			r->alignments[p] = alignment;
 		}
-		return kOk;
+		return pixelInfoSaid(*r, kOk, codec, layout);
 	}
 	case 9: { // FreePixelBufferPool: the frames go, so do the textures over them
 		{
