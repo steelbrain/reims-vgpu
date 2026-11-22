@@ -113,7 +113,7 @@
 //! over one in.
 //!
 //! **Its pipeline cache past its bound.** rt's reaper replaces the device's `VkPipelineCache` with
-//! a fresh, empty one at a look that finds it past its bound of 32 MiB, and the pipelines the old
+//! a fresh, empty one at a look that finds it past its bound of 128 MiB, and the pipelines the old
 //! one held compile again where made again (rt's `Metrics::pipeline_caches_replaced`); and rt skips
 //! a write of the cache's data over the device's blob where the data is past that bound, as at the
 //! device's teardown where the cache grew past it after the reaper's last look, so the blob keeps
@@ -183,7 +183,7 @@
 //! not given back (`private_take_bytes`). A fifth is the size of the data in the device's
 //! `VkPipelineCache` (`pipeline_cache_bytes`), which rt measures at its seed and when its reaper
 //! last looked, once creation was quiet, and which falls when the reaper replaces a cache past
-//! 32 MiB with a fresh one. Two more are the resolve images a device holds (`resolve_images`) and
+//! 128 MiB with a fresh one. Two more are the resolve images a device holds (`resolve_images`) and
 //! the bytes of their memory (`resolve_image_bytes`). The last two are the compiled kernels alive
 //! (`kernels`), each the translation of one compute pipeline content with its shader modules and
 //! their `VkPipeline`s, which lives while a state or the device's map of compiled contents holds
@@ -328,13 +328,13 @@ pub const FIRST_USE_WAIT_MAX_NS_CODE: &str = "rt-first-use-variant-wait-max-ns";
 pub const EXPORTED_BLOCKS_ADDRESSED_CODE: &str = "rt-exported-blocks-addressed";
 
 /// The code of the replacements of the device's `VkPipelineCache` by a fresh, empty one past its
-/// bound of 32 MiB (`Metrics::pipeline_caches_replaced`), an amount on the counts line
+/// bound of 128 MiB (`Metrics::pipeline_caches_replaced`), an amount on the counts line
 /// ([`fold_metrics`]).
 pub const PIPELINE_CACHES_REPLACED_CODE: &str = "rt-pipeline-caches-replaced";
 
 /// The code of the writes of the pipeline cache's data over the device's blob that rt skipped
-/// because the data was past the bound of 32 MiB (`Metrics::pipeline_cache_writes_skipped`), an
-/// amount on the counts line ([`fold_metrics`]).
+/// because the data was past the bound of 128 MiB (`Metrics::pipeline_cache_writes_skipped`),
+/// an amount on the counts line ([`fold_metrics`]).
 pub const PIPELINE_CACHE_WRITES_SKIPPED_CODE: &str = "rt-pipeline-cache-writes-skipped";
 
 /// The code of the reaper's looks at the pipeline cache that rt skipped because a creation began
