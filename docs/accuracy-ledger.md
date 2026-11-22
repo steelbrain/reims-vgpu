@@ -104,7 +104,24 @@ into ordered slabs, or between two textures whose memory meets where one is plac
 is a gap too: nil and an `NSError`. The device answers `maxVertexAmplificationCount` 1
 (`rt_platform::answers::VERTEX_AMPLIFICATION_COUNT`; Metal answers 2 on the M3 Max), so
 `supportsVertexAmplificationCount:` answers no above one, and a guest that asks first reaches no
-create. The boot diagnostics (`rt_platform/diag.rs`, lines that start
+create. A render pass that resolves into a texture made without
+`RenderTarget` usage that rt can resolve into neither in place nor through a resolve image is
+refused (`Gap::RenderPass`, `ResolveUsage`) and skipped whole (below), where Metal resolves into a
+texture of any usage: a depth or stencil texture, a colour texture of a type other than 2D, 2D
+array, cube and cube array or of a format the device's optimal image does not render, a texture
+in place over a dma-buf's import, and a view of another pixel format of a texture in place over a
+buffer whose linear image takes no attachment usage. A resolve into a texture in place over a
+buffer whose linear image takes no attachment usage (every format on the RTX 3090 and on the
+Mac's KosmicKrisp, and on every device a buffer that ends at the texture's last texel with its
+rows padded, measured by metal2vulkan), or into a view of the texture's own format, is made: the
+pass resolves into the texture's resolve image, a one-sample image rt makes at the first such
+pass and frees with the texture, and the pass's end copies the render area's texels into the
+buffer at the texture's pitch, leaving the bytes past each row's texels as they were. That is a
+copy Metal does not make, one a pass (1,440,000 bytes for a 600 x 600 `BGRA8Unorm_sRGB` pass),
+counted `rt-resolve-copies` and `rt-resolve-copy-bytes`, with the images at their highest,
+`rt-resolve-images-most` and `rt-resolve-image-bytes-most` (`rt_platform/device.rs`, "Its
+resolve copies"). It is a copy, not a value difference: the buffer's bytes after the pass are the
+resolve's, as in place. The boot diagnostics (`rt_platform/diag.rs`, lines that start
 `reims-vgpu: rt-diag`) add what the call asked of rt where its site names it. Their refusals
 line counts the translator's refusals by the feature each refused, `Translation-<feature>`
 (metal2vulkan's `Feature`'s variant, as `Translation-DivergentInterpolation`), or by its
