@@ -48,7 +48,9 @@
 //! 1. The live objects of the decoders' tables whose GPU range is known, walked at the loss
 //!    ([`LiveObjects`], `reims_vgpu`'s `graphics::fault_walk`): buffers, heaps, textures over a
 //!    buffer, and the `Shared` buffers over two-copy `Managed` textures' CPU copies, each removed
-//!    entry kept for an open view among them. A deferred buffer rt has not made yet has no range.
+//!    entry kept for an open view among them. A deferred buffer rt has not made yet has no range,
+//!    nor has a buffer in an exported block of its own (`super::export`), whose address the
+//!    placement never asks of rt (`RtBuffer::fault_address`), nor a texture over such a buffer.
 //!    A texture rt made as an image of its own, in a heap or not, has no GPU range the platform
 //!    knows: one in a heap lies in its heap's range; any other's memory is rt's alone.
 //! 2. The blocks still mapped that the host sees ([`MappedBlock`]): rt's pool allocations
@@ -68,7 +70,8 @@
 //! counted. An object's range is recorded as its platform object goes (the guest released it and
 //! the host let go of it): a buffer rt made, a heap, a two-copy `Managed` texture's CPU-copy
 //! buffer, and a texture over a buffer while that buffer is there (one whose buffer went first is
-//! not recorded: the buffer's range, recorded as it went, holds its bytes). Each entry
+//! not recorded: the buffer's range, recorded as it went, holds its bytes); not a buffer in an
+//! exported block, nor a texture over one, which have no range (above). Each entry
 //! ([`Release`]) holds the object's kind, its guest object id, whose bits from 40 are its context
 //! ([`Named`]: told as a decoder's table stores the object, `reims_vgpu`'s
 //! `graphics::fault_walk::name`), its storage mode, its range's first byte's GPU address and
@@ -1213,7 +1216,7 @@ pub fn texture_parts(context: u32, id: u64, gone: bool, texture: &RtObj<RtTextur
 
 /// What a live heap of the tables adds: its range, and its block.
 pub fn heap_parts(context: u32, id: u64, gone: bool, heap: &RtObj<RtHeap>) -> Parts {
-    let (block, offset, size) = heap.fault_span();
+    let (block, block_address, offset, size) = heap.fault_span();
     Parts {
         object: Some(LiveObject {
             context,
@@ -1232,7 +1235,7 @@ pub fn heap_parts(context: u32, id: u64, gone: bool, heap: &RtObj<RtHeap>) -> Pa
             ),
             class: block.class,
             import: import_kind(heap.device_known(), block.id),
-            gpu_address: block.gpu_address,
+            gpu_address: block_address,
             len: block.len,
         }),
     }
@@ -1392,7 +1395,7 @@ impl FaultWatch {
             Some(known) => format!("{} known blocks", known.len()),
             None => "no known blocks (their lock was not had in time)".to_owned(),
         };
-        for info in known.unwrap_or_default() {
+        for (gpu_address, info) in known.unwrap_or_default() {
             ids.insert(info.id);
             blocks.push(MappedBlock {
                 what: format!(
@@ -1402,7 +1405,7 @@ impl FaultWatch {
                 ),
                 class: info.class,
                 import: import_kind(&self.known, info.id),
-                gpu_address: info.gpu_address,
+                gpu_address,
                 len: info.len,
             });
         }

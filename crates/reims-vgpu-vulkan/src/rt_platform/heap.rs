@@ -112,6 +112,9 @@ const MODES: u64 = 0xff;
 pub struct RtHeap {
     /// The block it is a range of, held.
     block: rt::Block,
+    /// The GPU address of the block's first byte, which rt states for every block a heap lies in
+    /// (a taken or imported one), read once at the make.
+    block_address: u64,
     /// Its first byte in the block.
     offset: u64,
     /// Its size: the descriptor's, rounded up to [`HEAP_PAGE`].
@@ -147,7 +150,7 @@ impl Drop for RtHeap {
         if id != 0 {
             let kind = self.named.kind(super::fault::ObjectKind::Heap);
             let storage = (self.options >> 4) & 0xf;
-            let gpu_address = self.block.gpu_address + self.offset;
+            let gpu_address = self.block_address + self.offset;
             let releases = self.device.releases();
             releases.push(kind, id, storage, (gpu_address, self.size));
         }
@@ -168,10 +171,10 @@ impl RtHeap {
         self.block.id
     }
 
-    /// The block it is a range of, its first byte's offset there and its size, for a lost
-    /// device's fault (`super::fault`).
-    pub(super) fn fault_span(&self) -> (&rt::Block, u64, u64) {
-        (&self.block, self.offset, self.size)
+    /// The block it is a range of, the GPU address of the block's first byte, the heap's first
+    /// byte's offset there and its size, for a lost device's fault (`super::fault`).
+    pub(super) fn fault_span(&self) -> (&rt::Block, u64, u64, u64) {
+        (&self.block, self.block_address, self.offset, self.size)
     }
 
     /// The blocks its device knows (`super::fault`).
@@ -245,19 +248,23 @@ pub fn of_desc(device: &RtObj<RtDevice>, desc: &HeapDesc, held: u64) -> Option<R
     };
     let pin = desc.pinned_gpu_address;
     let at = |pin| known_at(device, pin, size, class, None);
-    let (block, offset) = match pin.and_then(at) {
-        Some(known) => known,
+    let known = pin.and_then(|pin| at(pin).map(|known| (known, pin)));
+    let (block, offset, block_address) = match known {
+        Some(((block, offset), pin)) => (block, offset, pin - offset),
         None => {
             if let Some(pin) = pin {
                 unpinned(SEL, pin);
             }
-            (zeroed(device, SEL, class, size)?, 0)
+            let block = zeroed(device, SEL, class, size)?;
+            let address = address_of(&block, SEL)?;
+            (block, 0, address)
         }
     };
     if read_only && !super::copied::drops(block.id) {
         buffer::read_only(SEL);
     }
-    Some(heap(device, block, offset, size, placement, options, None))
+    let placed = (block, block_address, offset);
+    Some(heap(device, placed, size, placement, options, None))
 }
 
 /// A block of `class` of the `size` bytes of a heap of its own, for `sel`, zeroed: a Shared one
@@ -315,8 +322,9 @@ pub fn over_host_memory(
     let first = bytes.ptr();
     let pin = desc.pinned_gpu_address;
     let at = |pin| known_at(device, pin, size, class, Some(first));
-    let (block, offset, deallocator) = match pin.and_then(at) {
-        Some((block, offset)) => (block, offset, deallocator),
+    let known = pin.and_then(|pin| at(pin).map(|known| (known, pin)));
+    let (block, offset, block_address, deallocator) = match known {
+        Some(((block, offset), pin)) => (block, offset, pin - offset, deallocator),
         None => {
             if let Some(pin) = pin {
                 unpinned(SEL, pin);
@@ -332,7 +340,8 @@ pub fn over_host_memory(
                 }
             };
             let (block, offset) = buffer::import_pages(device, SEL, first, size, access, then)?;
-            (block, offset, None)
+            let address = address_of(&block, SEL)?;
+            (block, offset, address, None)
         }
     };
     // A copy just made is the heap's to hold from here (`super::copied::Fresh`).
@@ -340,23 +349,27 @@ pub fn over_host_memory(
     if read_only && !super::copied::drops(block.id) {
         buffer::read_only(SEL);
     }
-    Some(heap(
-        device,
-        block,
-        offset,
-        size,
-        placement,
-        options,
-        deallocator,
-    ))
+    let placed = (block, block_address, offset);
+    Some(heap(device, placed, size, placement, options, deallocator))
 }
 
-/// The heap's handle: `size` bytes at `offset` in `block`, answering `options`, running
-/// `deallocator` as it goes where given.
+/// The GPU address of the first byte of `block`, which rt took or imported for a heap of `sel`
+/// (`BlockInfo::gpu_address`); `None` where rt states none, logged ([`buffer::unaddressed`]),
+/// the heap then nil. A block that the device knows is known at its address, which a heap pinned
+/// in it reads from its pin instead.
+fn address_of(block: &rt::Block, sel: &'static str) -> Option<u64> {
+    let address = block.gpu_address;
+    if address.is_none() {
+        buffer::unaddressed(sel, block.id);
+    }
+    address
+}
+
+/// The heap's handle: `size` bytes at `offset` in `block`, whose first byte's GPU address is
+/// `block_address`, answering `options`, running `deallocator` as it goes where given.
 fn heap(
     device: &RtObj<RtDevice>,
-    block: rt::Block,
-    offset: u64,
+    (block, block_address, offset): (rt::Block, u64, u64),
     size: u64,
     placement: bool,
     options: u64,
@@ -364,6 +377,7 @@ fn heap(
 ) -> RtObj<RtHeap> {
     RtObj::new(RtHeap {
         named: super::fault::Named::default(),
+        block_address,
         offset,
         size,
         placement,
@@ -407,7 +421,7 @@ impl RtObj<RtHeap> {
 impl Heap<RtPlatform> for RtObj<RtHeap> {
     /// Its first byte's: Vulkan's device address in its block.
     fn gpu_address(&self) -> u64 {
-        self.block.gpu_address + self.offset
+        self.block_address + self.offset
     }
 
     /// rt's buffer of the heap's range at `offset`, its bytes as they are, tracked as the heap and
@@ -645,9 +659,10 @@ mod tests {
         // Pinned heaps.
         let block = (device.rt()).take_block(rt::MemoryClass::Shared, size);
         let block = block.expect("a Shared block");
-        device.known_blocks().know(block.clone());
+        let block_at = device.known_blocks().know(block.clone());
+        let block_at = block_at.expect("a taken block's address");
         let unpinned = counted(UNPINNED_CODE);
-        let pin = block.gpu_address + 0x4000;
+        let pin = block_at + 0x4000;
         let known = heap(&placement(0x4000, 0, Some(pin))).expect("a heap in the block");
         assert_eq!(known.gpu_address(), pin);
         let other = heap(&placement(0x4000, 0x20, Some(pin))).expect("a Private heap");
@@ -681,7 +696,7 @@ mod tests {
         let first = HostPtr::from_ptr(mapping.wrapping_add(0x8000));
         // SAFETY: the block's mapping lives while the test holds the block.
         let bytes = unsafe { HostRange::new(first, 0x4000) };
-        let pin = block.gpu_address + 0x8000;
+        let pin = block_at + 0x8000;
         let made = device.new_heap_over_host_memory(bytes, &placement(0x4000, 0, Some(pin)), None);
         let over_block = made
             .expect("never a raise")
@@ -904,18 +919,19 @@ mod tests {
                 "a block of {len:#x} bytes at {:#x} in its allocation",
                 block.offset
             );
-            device.known_blocks().know(block.clone());
+            let block_at = device.known_blocks().know(block.clone());
+            let block_at = block_at.expect("a taken block's address");
             let what = format!("a {size:#x}-byte heap's texture at {align:#x}");
 
-            let off = heap(&placement(size, 0x20, Some(block.gpu_address + 0x8000)));
+            let off = heap(&placement(size, 0x20, Some(block_at + 0x8000)));
             let off = off.expect("a heap in the block");
             let placed = off.new_texture(&texture, 0).expect("never a raise");
             assert_eq!(placed.is_some(), align <= 0x8000, "{what}, 32 KiB in");
             refused += u64::from(align > 0x8000);
 
-            let at = heap(&placement(size, 0x20, Some(block.gpu_address + pinned)));
+            let at = heap(&placement(size, 0x20, Some(block_at + pinned)));
             let at = at.expect("a heap in the block");
-            assert_eq!(at.gpu_address(), block.gpu_address + pinned);
+            assert_eq!(at.gpu_address(), block_at + pinned);
             let own = heap(&placement(size, 0x20, None)).expect("a heap of its own");
             for (placed_in, offset) in [(&at, 0), (&at, align), (&own, 0), (&own, align)] {
                 let placed = placed_in

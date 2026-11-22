@@ -516,14 +516,18 @@ impl RtBuffer {
     }
 
     /// The device address of its first byte where rt made it, for the device's history of
-    /// released ranges and a lost device's walk (`super::fault`): an exportable buffer's from its
-    /// export's record of the block (`super::export`), any other's rt's `gpuAddress`. So these
-    /// diagnostics hand out no address of an exported block, which rt's `gpuAddress` would.
+    /// released ranges and a lost device's walk (`super::fault`): rt's `gpuAddress`; `None` for
+    /// an exportable buffer, in an exported block of its own (`super::export`), whose address
+    /// these diagnostics never ask. rt's `gpuAddress` of a buffer in an exported block hands out
+    /// an address in it (rt's `Metrics::exported_blocks_addressed`), after which a submission
+    /// that writes through an address copies the textures over the block in; the block's handle
+    /// states none (`BlockInfo::gpu_address`). So such a buffer is in neither the placement nor
+    /// the history.
     pub(super) fn fault_address(&self) -> Option<u64> {
         let made = self.rt.get()?;
         #[cfg(unix)]
-        if let Some(exported) = self.exported.get() {
-            return Some(exported.address());
+        if self.exported.get().is_some() {
+            return None;
         }
         Some(made.gpu_address())
     }
@@ -800,16 +804,20 @@ impl HostMappings {
 
 impl KnownBlocks {
     /// Knows `block` by its GPU address, in place of a block known there before, holding the
-    /// copy it is, where it is one.
-    pub fn know(&self, block: rt::Block) {
+    /// copy it is, where it is one: the address, which rt states for every block it takes or
+    /// imports (`BlockInfo::gpu_address`). A block that states none, an exported one alone, which
+    /// no caller hands it, is not known (no pin can lie in it): `None`.
+    pub fn know(&self, block: rt::Block) -> Option<u64> {
+        let at = block.gpu_address?;
         let copy = super::copied::of(block.id);
         let id = block.id;
-        let replaced = self.known.lock().insert(block.gpu_address, block);
+        let replaced = self.known.lock().insert(at, block);
         let mut copies = self.copies.lock();
         let gone = replaced.and_then(|old| copies.remove(&old.id));
         let held = copy.and_then(|copy| copies.insert(id, copy));
         drop(copies);
         drop((gone, held));
+        Some(at)
     }
 
     /// Forgets the block `id`, giving back the handle it held, and lets go of the copy it is,
@@ -891,11 +899,14 @@ impl KnownBlocks {
         self.mapped.0.lock().keys().copied().collect()
     }
 
-    /// Each block known now, for a lost device's fault (`super::fault`); `None` where the set's
-    /// lock was not had within `bound`.
-    pub(super) fn fault_blocks(&self, bound: std::time::Duration) -> Option<Vec<rt::BlockInfo>> {
+    /// Each block known now, with the GPU address it is known at, for a lost device's fault
+    /// (`super::fault`); `None` where the set's lock was not had within `bound`.
+    pub(super) fn fault_blocks(
+        &self,
+        bound: std::time::Duration,
+    ) -> Option<Vec<(u64, rt::BlockInfo)>> {
         let known = self.known.try_lock_for(bound)?;
-        Some(known.values().map(|block| **block).collect())
+        Some(known.iter().map(|(&at, block)| (at, **block)).collect())
     }
 }
 
@@ -1400,6 +1411,18 @@ fn in_known(
             Some(None)
         }
     }
+}
+
+/// Logs that rt states no GPU address of block `block`, which it took or imported for `sel`
+/// (`BlockInfo::gpu_address`): rt states one for every block it takes or imports, an exported
+/// block alone stating none, so the line marks a break of rt's contract, and the caller answers
+/// as where rt refuses the block. The logger writes the first such line and counts the rest.
+pub(super) fn unaddressed(sel: &'static str, block: rt::BlockId) {
+    log::error!(
+        target: TARGET,
+        "{sel}: rt's block {} states no GPU address, so the call answers as refused",
+        block.get()
+    );
 }
 
 /// A block of `class` for `length` bytes, for `sel`; `None` where rt refuses it, counted. A
@@ -2409,13 +2432,15 @@ fn pointer_refused() -> Option<rt::Error> {
 /// is made and counted ([`import_pages`]), as a copy that drops the GPU's writes where `access` is
 /// read-only (the module's docs, "Read-only memory"), read once where the pages never change
 /// (`PagesAccess::Unchanging`), known to `device` from now (`KnownBlocks::know`): the
-/// block and the bytes' offset in it. A no-copy buffer over the bytes pinned at the block's
-/// address plus their offset is then that range of the block ("A pinned address"), with no import
-/// of its own. The caller forgets the block (`KnownBlocks::forget`) as the last such buffer goes;
-/// rt frees the import once no buffer over it and no command buffer that used it lives, then
-/// runs `then`; a copy's release runs it as the copy goes, which the known block holds until
-/// forgotten (the module's docs, "A copy at the refusal point"). `None` where Metal or rt refuses
-/// it, counted, `then` dropped unrun.
+/// block, the bytes' offset in it and their GPU address, the block's plus the offset. A no-copy
+/// buffer over the bytes pinned at that address is then that range of the block ("A pinned
+/// address"), with no import of its own. The caller forgets the block (`KnownBlocks::forget`) as
+/// the last such buffer goes; rt frees the import once no buffer over it and no command buffer
+/// that used it lives, then runs `then`; a copy's release runs it as the copy goes, which the
+/// known block holds until forgotten (the module's docs, "A copy at the refusal point"). `None`
+/// where Metal or rt refuses it, counted, `then` dropped unrun; and where rt states no GPU
+/// address of the import, which it states for every import ([`unaddressed`]): the import is then
+/// not known, and rt runs `then` as it frees it.
 pub fn import_known(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -2423,11 +2448,14 @@ pub fn import_known(
     length: u64,
     access: PagesAccess,
     then: impl FnOnce() + Send + 'static,
-) -> Option<(rt::Block, u64)> {
+) -> Option<(rt::Block, u64, u64)> {
     let (block, offset) = import_pages(device, sel, first, length, access, then)?;
     let _fresh = super::copied::Fresh(block.id);
-    device.known_blocks().know(block.clone());
-    Some((block, offset))
+    let Some(at) = device.known_blocks().know(block.clone()) else {
+        unaddressed(sel, block.id);
+        return None;
+    };
+    Some((block, offset, at.saturating_add(offset)))
 }
 
 /// The imports of the host's memory live now.
@@ -3085,20 +3113,22 @@ mod tests {
             private.expect("a Private one"),
         );
         let known = device.known_blocks().clone();
-        known.know(shared.clone());
-        known.know(private.clone());
+        let shared_at = known.know(shared.clone()).expect("a taken block's address");
+        let private_at = known
+            .know(private.clone())
+            .expect("a taken block's address");
         let mapping = shared.contents.expect("a Shared block's mapping").as_ptr();
         let written = HostPtr::from_ptr(mapping.wrapping_add(0x100));
         // SAFETY: the block is mapped while it lives, and 0x100 + 64 bytes lie in it.
         unsafe { written.as_ptr::<u8>().write_bytes(0xab, 64) };
-        let pin = shared.gpu_address + 0x100;
+        let pin = shared_at + 0x100;
         let made = device
             .new_buffer(pinned(pin, 0, None))
             .expect("never a raise");
         let made = made.expect("a buffer in the known block");
         assert_eq!((made.gpu_address(), made.contents()), (pin, written));
         assert_eq!(read(made.contents(), 64), [0xab; 64]);
-        let pin = private.gpu_address + 0x200;
+        let pin = private_at + 0x200;
         let made = device
             .new_buffer(pinned(pin, 0x20, None))
             .expect("never a raise");
@@ -3106,7 +3136,7 @@ mod tests {
             made.expect("a Private buffer in its block").gpu_address(),
             pin
         );
-        let pin = shared.gpu_address + 0x100;
+        let pin = shared_at + 0x100;
         let made = device
             .new_buffer(pinned(pin, 0x20, None))
             .expect("never a raise");
@@ -3136,7 +3166,7 @@ mod tests {
         // the pin in the Private block where the GPU keeps one, else counted as not kept too.
         let unified = device.rt().has_unified_memory();
         let (unpinned, imports) = (counted(UNPINNED_CODE), counted(IMPORTS_CODE));
-        let pin = private.gpu_address + 0x800;
+        let pin = private_at + 0x800;
         for (options, kept) in [(0, false), (0x10, !unified)] {
             // SAFETY: the block's mapping lives while the test holds the block.
             let bytes = unsafe { HostRange::new(written, 64) };
@@ -3144,11 +3174,7 @@ mod tests {
             let made = made
                 .expect("never a raise")
                 .expect("a buffer over the block");
-            let at = if kept {
-                pin
-            } else {
-                shared.gpu_address + 0x100
-            };
+            let at = if kept { pin } else { shared_at + 0x100 };
             assert_eq!((made.gpu_address(), made.contents()), (at, written));
         }
         assert_eq!(counted(IMPORTS_CODE), imports);
@@ -3168,7 +3194,7 @@ mod tests {
         unsafe { at.as_ptr::<u8>().write_bytes(0xcd, 64) };
         let freed = Arc::new(AtomicBool::new(false));
         let done = Arc::clone(&freed);
-        let pin = private.gpu_address + 0x400;
+        let pin = private_at + 0x400;
         // SAFETY: the memory stays allocated until the deallocator ran (below).
         let bytes = unsafe { HostRange::new(at, 64) };
         let desc = BufferDesc {
@@ -3638,18 +3664,18 @@ mod tests {
         let block = (device.rt()).take_block(rt::MemoryClass::Private, 0x10000);
         let block = block.expect("a Private block");
         let known = device.known_blocks().clone();
-        known.know(block.clone());
+        let block_at = known.know(block.clone()).expect("a taken block's address");
         let queue = device.new_command_queue().expect("a command queue");
         let out = device
             .new_buffer_of_length(on, 64, 0)
             .expect("never a raise");
         let out = out.expect("a Shared buffer");
         let private = |at: u64| {
-            let made = device.new_buffer(pinned(block.gpu_address + at, 0x20, None));
+            let made = device.new_buffer(pinned(block_at + at, 0x20, None));
             let made = made
                 .expect("never a raise")
                 .expect("a Private buffer in its block");
-            assert_eq!(made.gpu_address(), block.gpu_address + at);
+            assert_eq!(made.gpu_address(), block_at + at);
             made
         };
         let read_back = |buffer: &RtObj<RtBuffer>| {
@@ -4161,11 +4187,13 @@ mod tests {
             PagesAccess::Writable,
             then,
         );
-        let (block, offset) = known.expect("a known import, as the buffer's above");
+        let (block, offset, pin) = known.expect("a known import, as the buffer's above");
         let mapped = device.known_blocks().contents_of(&block);
         assert_eq!(block.contents, None);
         assert_eq!(mapped.map(|first| first + offset), Some(at.addr().to_u64()));
-        let (pin, imports) = (block.gpu_address + offset, counted(IMPORTS_CODE));
+        let address = block.gpu_address.expect("an import's address");
+        assert_eq!(pin, address + offset);
+        let imports = counted(IMPORTS_CODE);
         // SAFETY: the pages are the test's own, never freed.
         let bytes = unsafe { HostRange::new(at, 64) };
         let made = device.new_buffer(pinned(pin, 0, Some(bytes)));
@@ -4869,10 +4897,12 @@ mod tests {
             PagesAccess::Writable,
             then,
         );
-        let (block, offset) = known.expect("a known import over a copy");
+        let (block, offset, pin) = known.expect("a known import over a copy");
         let home = device.known_blocks().contents_of(&block);
         assert_eq!(home.map(|home| home + offset), Some(first.addr().to_u64()));
-        let (pin, imports) = (block.gpu_address + offset, counted(IMPORTS_CODE));
+        let address = block.gpu_address.expect("a copy's address");
+        assert_eq!(pin, address + offset);
+        let imports = counted(IMPORTS_CODE);
         // SAFETY: the memory is never freed.
         let bytes = unsafe { HostRange::new(first, 64) };
         let made = device.new_buffer(pinned(pin, 0, Some(bytes)));

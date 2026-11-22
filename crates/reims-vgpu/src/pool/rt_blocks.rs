@@ -77,7 +77,8 @@ pub(crate) trait Knowing: Send + Sync {
 
 impl Knowing for reims_vgpu_vulkan::rt_platform::KnownBlocks {
     fn know(&self, block: rt::Block) {
-        reims_vgpu_vulkan::rt_platform::KnownBlocks::know(self, block);
+        // The take reads the block's address before it knows it.
+        let _ = reims_vgpu_vulkan::rt_platform::KnownBlocks::know(self, block);
     }
 
     fn forget(&self, id: rt::BlockId) {
@@ -90,7 +91,9 @@ impl Knowing for reims_vgpu_vulkan::rt_platform::KnownBlocks {
 impl BlockSource for RtBlocks {
     /// rt's block of `class` at least `len` long, known from now. Err: [`BlockError::Length`] past
     /// the device's largest block (rt's `Limit::BlockLen`); [`BlockError::OutOfMemory`] for rt's
-    /// every other answer: its other limits, a device out of memory or lost, or one quiesced.
+    /// every other answer: its other limits, a device out of memory or lost, or one quiesced; and
+    /// for a block that states no GPU address (rt's `BlockInfo::gpu_address`), which rt states for
+    /// every block it takes, logged, the block given back.
     fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
         let rt_class = match class {
             MemoryClass::Private => rt::MemoryClass::Private,
@@ -111,11 +114,19 @@ impl BlockSource for RtBlocks {
             rt::Error::Limit(rt::Limit::BlockLen { .. }) => BlockError::Length,
             _ => BlockError::OutOfMemory,
         })?;
+        let Some(gpu_address) = block.gpu_address else {
+            log::error!(
+                "pool: rt's block {} of {len} bytes states no GPU address: the take is refused",
+                block.id.get()
+            );
+            let _ = self.device.rt().release_block(block);
+            return Err(BlockError::OutOfMemory);
+        };
         let info = BlockInfo {
             id: BlockId(block.id.get()),
             class,
             len: block.len,
-            gpu_address: block.gpu_address,
+            gpu_address,
             contents: block.contents,
         };
         self.known.know(block.clone());
@@ -165,9 +176,8 @@ mod tests {
 
     impl Knowing for Known {
         fn know(&self, block: rt::Block) {
-            self.0
-                .lock()
-                .insert(block.id.get(), (block.gpu_address, block.len));
+            let at = block.gpu_address.expect("a taken block's address");
+            self.0.lock().insert(block.id.get(), (at, block.len));
         }
 
         fn forget(&self, id: rt::BlockId) {

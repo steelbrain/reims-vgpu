@@ -143,10 +143,10 @@ fn import_view(
 ) -> Option<(u64, Box<dyn FnOnce() + Send>)> {
     let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
     let imported = rt_platform::import_known(device, sel, first, length, access, then);
-    let (block, offset) = imported?;
+    let (block, _, at) = imported?;
     let (known, id) = (device.known_blocks().clone(), block.id);
     let forget: Box<dyn FnOnce() + Send> = Box::new(move || drop(known.forget(id)));
-    Some((block.gpu_address.saturating_add(offset), forget))
+    Some((at, forget))
 }
 
 /// The files behind `map`'s ranges, registered while what this returns lives

@@ -750,7 +750,8 @@ pub fn copy_made(block: rt::BlockId) {
 }
 
 /// Notes block `block`, imported now for `sel` (`super::buffer::import_pages`): a copy of the
-/// pages where [`copy_made`] noted it, else the pages themselves.
+/// pages where [`copy_made`] noted it, else the pages themselves. Its range is kept where it
+/// states its GPU address, which rt states for every import (`BlockInfo::gpu_address`).
 pub fn imported(block: &rt::BlockInfo, sel: &'static str) {
     let origin = Origin {
         sel,
@@ -758,13 +759,15 @@ pub fn imported(block: &rt::BlockInfo, sel: &'static str) {
         thread: thread_class(),
         copy: COPIES.lock().remove(&block.id),
     };
-    let imported = Imported {
-        origin,
-        gpu_address: block.gpu_address,
-        len: block.len,
-        class: block.class,
-    };
-    IMPORTED.lock().insert(block.id, imported);
+    if let Some(gpu_address) = block.gpu_address {
+        let imported = Imported {
+            origin,
+            gpu_address,
+            len: block.len,
+            class: block.class,
+        };
+        IMPORTED.lock().insert(block.id, imported);
+    }
     *IMPORTS.lock().entry(origin).or_insert(0) += 1;
 }
 
