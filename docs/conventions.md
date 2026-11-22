@@ -196,7 +196,7 @@ repeats the ones code cites.
     "The display's view"), and the guest's slow answers'
     (`slow-answer-over-make`, a ring-0 answer that went on its ring a frame,
     16.7 ms, or more after the device read its command, during which a make
-    of rt's pool ended, and `slow-answer-over-make-max-ns` the longest;
+    of rt's pool ran, and `slow-answer-over-make-max-ns` the longest;
     `slow-answer-first-use-waits`, the compute dispatches' first-use waits,
     `rt-first-use-variant-waits`, that met any such answer: no degradation,
     `graphics/slow_answers.rs`); a boot's degradations are

@@ -4,17 +4,18 @@
 //! set against what rt did meanwhile (`reims_vgpu_vulkan::rt_platform::overlap`). A diagnostic:
 //! which lines the host writes is free under the contract, and nothing the guest sees changes.
 //!
-//! - **Over a make of rt's pool.** A slow answer during which a make of rt's pool ended is
-//!   counted, [`OVER_MAKE_CODE`], with the longest, [`OVER_MAKE_MAX_NS_CODE`], and the first of
-//!   each command type logged at info, the logger's once per kind, with the thread that gave it,
-//!   how many makes ended during it and how long before the answer the last did, each make by its
-//!   end after the ask with its allocation's length, storage mode and thread (`overlap::PoolMake`),
-//!   and, for a release-class answer, its split ([`Split`]). rt tells nothing as a make begins (its
-//!   `AllocationInfo` carries no start and no duration), so an answer that ended inside a make is
-//!   not counted, and a make's share of an answer cannot be read: every answer that waited for a
-//!   make to end is.
+//! - **Over a make of rt's pool.** A slow answer during which a make of rt's pool ran is counted,
+//!   [`OVER_MAKE_CODE`], with the longest, [`OVER_MAKE_MAX_NS_CODE`], and the first of each
+//!   command type logged at info, the logger's once per kind, with the thread that gave it, how
+//!   many makes ran during it and how long before the answer the last of them ended, each make by
+//!   its start and its end after the ask (a start before the ask negative), its length in ms, its
+//!   allocation's length and storage mode and its thread (`overlap::PoolMake`), and, for a
+//!   release-class answer, its split ([`Split`]). rt tells of a make once it ended, with when it
+//!   began and how long it took (its `AllocationInfo`'s `make_start` and `make_nanos`), so a make
+//!   that began before the ask is among an answer's makes, and one still running when the answer
+//!   is given is not.
 //! - **A split over no make.** The first slow release-class answer of each command type during
-//!   which no make ended is logged at info too, of a kind of its own, with its split.
+//!   which no make ran is logged at info too, of a kind of its own, with its split.
 //! - **Over compute dispatches' first-use waits.** The first-use waits of compute pipelines (rt's
 //!   `Metrics::first_use_variant_waits`, on the counts line as `rt-first-use-variant-waits`) that
 //!   met any slow answer, from the earliest wait's start to its make's end, are counted, each once,
@@ -54,9 +55,9 @@
 //!   thread-local writes; a `PRIVATE_GIVE` five clock reads and two thread-local writes; a
 //!   `CONTEXT_CLOSE` an `Arc` of its marks, nine clock reads, its let-go's thread's handle and a
 //!   copy of its name under an uncontended lock, and two thread-local writes. A make of rt's pool
-//!   adds one clock read, a clone of its thread's handle and an uncontended lock
-//!   (`overlap::pool_made`). Only a slow answer reads more: the last 16 makes under that lock, its
-//!   thread's handle, and rt's last 256 compute variant makes under its lock
+//!   adds a clone of its thread's handle and an uncontended lock (`overlap::pool_made`): its
+//!   start and its length come from rt. Only a slow answer reads more: the last 16 makes under
+//!   that lock, its thread's handle, and rt's last 256 compute variant makes under its lock
 //!   (`Counters::variant_makes`).
 
 use std::cell::Cell;
@@ -72,7 +73,7 @@ use reims_vgpu_vulkan::answer::{count_kind, count_kind_by};
 use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::rt_platform::overlap::{self, PoolMake};
 
-/// The code of the slow answers during which a make of rt's pool ended.
+/// The code of the slow answers during which a make of rt's pool ran.
 pub(crate) const OVER_MAKE_CODE: &str = "slow-answer-over-make";
 
 /// The code of the longest of them, in nanoseconds, which its count rises to.
@@ -177,6 +178,11 @@ pub(crate) enum Split {
 /// Milliseconds from `from` to `to` of rt's host clock, 0 where `to` is not after it.
 fn ms(from: u64, to: u64) -> f64 {
     to.saturating_sub(from) as f64 / 1e6
+}
+
+/// Milliseconds from `from` to `to` of rt's host clock, negative where `to` is before it.
+fn ms_signed(from: u64, to: u64) -> f64 {
+    (i128::from(to) - i128::from(from)) as f64 / 1e6
 }
 
 /// `bytes` in MiB.
@@ -515,7 +521,7 @@ pub(crate) fn slow(kind: u32, took_ns: u64) {
     let end = rt::host_time();
     let start = end.saturating_sub(took_ns);
     let waits = overlap::first_use_waits_met(start, end);
-    let makes = overlap::pool_makes_ended(start, end);
+    let makes = overlap::pool_makes_met(start, end);
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or(UNNAMED);
     // A split over no make is a kind of its own: the first over a make is logged as before it.
@@ -529,7 +535,7 @@ pub(crate) fn slow(kind: u32, took_ns: u64) {
     }
 }
 
-/// The words of `makes`, the makes of rt's pool that ended during an answer asked at `start`.
+/// The words of `makes`, the makes of rt's pool that ran during an answer asked at `start`.
 fn makes_words(makes: &[PoolMake], start: u64) -> String {
     let each: Vec<String> = (makes.iter())
         .map(|make| {
@@ -538,18 +544,20 @@ fn makes_words(makes: &[PoolMake], start: u64) -> String {
                 rt::MemoryClass::Shared => "Shared",
             };
             format!(
-                "{:.3} ms a {class} {:.3} MiB on {}",
-                ms(start, make.ended),
+                "{:.3} to {:.3} ms, {:.3} ms, a {class} {:.3} MiB on {}",
+                ms_signed(start, make.began),
+                ms_signed(start, make.ended),
+                ms(make.began, make.ended),
                 mib(make.len),
                 make.thread.name().unwrap_or(UNNAMED)
             )
         })
         .collect();
-    each.join(", ")
+    each.join("; ")
 }
 
 /// Counts a slow answer to a command of type `kind`, `took_ns` long and given at `end` on the
-/// thread named `thread`, during which `makes` of rt's pool ended, and which met `waits`
+/// thread named `thread`, during which `makes` of rt's pool ran, and which met `waits`
 /// first-use waits not counted before; its line where it is over a make or has a split, with its
 /// split where it has one.
 fn counted(
@@ -571,13 +579,14 @@ fn counted(
     }
     let name = name(kind);
     let start = end.saturating_sub(took_ns);
-    let over = match makes.last() {
+    let over = match makes.iter().map(|make| make.ended).max() {
         None => "over no make of rt's pool".to_owned(),
         Some(last) => format!(
-            "over {} makes of rt's pool that ended during it, the last {:.3} ms before the \
-             answer (each by its end after the ask, as rt tells no make's start: {})",
+            "over {} makes of rt's pool that ran during it, the last ending {:.3} ms before the \
+             answer (each from its start to its end after the ask, a start before it negative: \
+             {})",
             makes.len(),
-            ms(last.ended, end),
+            ms(last, end),
             makes_words(makes, start)
         ),
     };
@@ -610,12 +619,13 @@ mod tests {
             .map_or(0, |&(_, n)| n)
     }
 
-    /// A make of rt's pool of `len` bytes of `class` that ended at `ended`, made on a thread named
-    /// `reims-vgpu.test-maker`.
-    fn make(ended: u64, len: u64, class: rt::MemoryClass) -> PoolMake {
+    /// A make of rt's pool of `len` bytes of `class` that began at `began` and ended at `ended`,
+    /// made on a thread named `reims-vgpu.test-maker`.
+    fn make(began: u64, ended: u64, len: u64, class: rt::MemoryClass) -> PoolMake {
         let maker = std::thread::Builder::new().name("reims-vgpu.test-maker".into());
         let thread = maker.spawn(std::thread::current).unwrap().join().unwrap();
         PoolMake {
+            began,
             ended,
             len,
             class,
@@ -623,7 +633,7 @@ mod tests {
         }
     }
 
-    /// A slow answer during which no make of rt's pool ended, and with no split, is not counted
+    /// A slow answer during which no make of rt's pool ran, and with no split, is not counted
     /// over a make and writes no line, but the first-use waits it met are counted
     #[test]
     fn a_slow_answer_over_no_make_counts_only_its_first_use_waits() {
@@ -635,10 +645,10 @@ mod tests {
     }
 
     /// A slow `BLOCK_RELEASE` over a make is counted, and its line gives its thread, the makes by
-    /// their ends after the ask with their lengths, storage modes and threads, the first-use waits
-    /// and its split: its settle apart from the release's call, the drain's end told as the
-    /// write-back's where the drain answered inside it, and the release's call ending at the
-    /// drain where the drain answered inside it
+    /// their starts and ends after the ask, one that began before it negative, with their ms,
+    /// lengths, storage modes and threads, the first-use waits and its split: its settle apart
+    /// from the release's call, the drain's end told as the write-back's where the drain answered
+    /// inside it, and the release's call ending at the drain where the drain answered inside it
     #[test]
     fn a_slow_release_over_a_make_counts_and_gives_its_makes_and_its_split() {
         let over = count(OVER_MAKE_CODE);
@@ -653,8 +663,8 @@ mod tests {
             write_back_last: true,
         };
         let makes = [
-            make(110 * MS, 16 << 20, rt::MemoryClass::Private),
-            make(115 * MS, 32 << 20, rt::MemoryClass::Shared),
+            make(96 * MS, 110 * MS, 16 << 20, rt::MemoryClass::Private),
+            make(112 * MS, 115 * MS, 32 << 20, rt::MemoryClass::Shared),
         ];
         let line = counted(
             RGFX_CMD_BLOCK_RELEASE,
@@ -670,11 +680,12 @@ mod tests {
             line.as_deref(),
             Some(
                 "a BLOCK_RELEASE (type 0x2f2) answered 20.000 ms after it was asked, on \
-                 reims-vgpu.graphics-control, over 2 makes of rt's pool that ended during it, \
-                 the last 5.000 ms before the answer (each by its end after the ask, as rt tells \
-                 no make's start: 10.000 ms a Private 16.000 MiB on reims-vgpu.test-maker, \
-                 15.000 ms a Shared 32.000 MiB on reims-vgpu.test-maker), over 1 first-use waits \
-                 of compute pipelines: 1 the no-copy buffers 1.000 ms, 2 the SURFACE_PAGES \
+                 reims-vgpu.graphics-control, over 2 makes of rt's pool that ran during it, the \
+                 last ending 5.000 ms before the answer (each from its start to its end after the \
+                 ask, a start before it negative: -4.000 to 10.000 ms, 14.000 ms, a Private \
+                 16.000 MiB on reims-vgpu.test-maker; 12.000 to 15.000 ms, 3.000 ms, a Shared \
+                 32.000 MiB on reims-vgpu.test-maker), over 1 first-use waits of compute \
+                 pipelines: 1 the no-copy buffers 1.000 ms, 2 the SURFACE_PAGES \
                  settle 4.000 ms, the release's call 5.000 ms, then 0.000 ms until 5 the device \
                  cache's write-back ended, the write-back ended 0.000 ms after it, the unshares \
                  1.000 ms, 4 no display showing it 9.000 ms"
@@ -707,7 +718,7 @@ mod tests {
         );
     }
 
-    /// A slow release-class answer during which no make ended is not counted over a make, but its
+    /// A slow release-class answer during which no make ran is not counted over a make, but its
     /// line gives its split: a `PRIVATE_GIVE`'s ledger's free apart from rt's release of its
     /// block, with its bytes
     #[test]
@@ -863,7 +874,7 @@ mod tests {
         let base = OVER_MAKE_MOST.load(Ordering::Relaxed);
         let before = count(OVER_MAKE_MAX_NS_CODE);
         let end = base + 9_000;
-        let made = [make(base, 16 << 20, rt::MemoryClass::Shared)];
+        let made = [make(base, base, 16 << 20, rt::MemoryClass::Shared)];
         let _ = counted(RGFX_CMD_POOL_GIVE, base + 3_000, end, &made, 0, None, "t");
         assert_eq!(count(OVER_MAKE_MAX_NS_CODE), before + 3_000);
         let _ = counted(RGFX_CMD_POOL_GIVE, base + 1_000, end, &made, 0, None, "t");
