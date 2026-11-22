@@ -9,7 +9,8 @@
 //! - **Presents**: the presents answered, and how many a second. Then the time from each one's
 //!   take to its show, from its show to its answer, and from its take to its answer, at the 50th,
 //!   90th and 99th percentiles by nearest rank ([`answered`], which `present`'s
-//!   `PresentAnswers::refreshed` calls).
+//!   `PresentAnswers::refreshed` calls, and `PresentAnswers::answered_at_show` for a display with
+//!   no window to draw it).
 //! - **Window**: the window's own times (`reims_vgpu_vulkan::rt_platform::window_times`): the CPU
 //!   time inside its swapchain's `vkAcquireNextImageKHR` and `vkQueuePresentKHR` calls, its
 //!   presents' waits for rt's lock of the presenting queue, its frames' command buffers' GPU
@@ -77,6 +78,19 @@ pub(crate) fn answered(taken: MonoTime, shown: MonoTime, answered: MonoTime) {
         answered.saturating_duration_since(shown),
         answered.saturating_duration_since(taken),
     ]);
+}
+
+/// Turns the summary's count of presents on, with no thread to write its lines (for the tests,
+/// each in a process of its own under nextest).
+#[cfg(test)]
+pub(crate) fn count_presents() {
+    ON.store(true, Ordering::Relaxed);
+}
+
+/// The presents counted since the last take (for the tests).
+#[cfg(test)]
+pub(crate) fn take_presents() -> Vec<[Duration; 3]> {
+    std::mem::take(&mut *PRESENTS.lock())
 }
 
 /// Turns the summary on and starts the thread that writes its lines (the module docs), once,

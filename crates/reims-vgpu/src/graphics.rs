@@ -1758,8 +1758,10 @@ impl<P: Platform> Presented<P> {
     /// Shows `texture` (the surface `id`'s), or the scanout for `None`, or keeps what the display
     /// shows where `shows` is [`Shows::Kept`], with the colour stages `color` sets
     /// ([`DisplayColor::apply`]), and asks the window for a frame; `answer` is given at the vblank
-    /// the display first shows it ([`PresentAnswers`]), or at once without a window, and the
-    /// present's timing, from when it was `taken`, logged there at debug. The hold of
+    /// the display first shows it ([`PresentAnswers`]), or at once without a window to draw it (a
+    /// headless device, or a window with no sink: [`PresentAnswers::answered_at_show`]), and the
+    /// present's timing, from when it was `taken`, logged there at debug and counted in the host's
+    /// summary. The hold of
     /// the texture shown before is returned, for the caller to let go of with no lock held: a
     /// release waiting for it may be answered there.
     #[must_use]
@@ -1799,7 +1801,7 @@ impl<P: Platform> Presented<P> {
                 self.answers.shown(answer, taken);
                 window.new_frame();
             }
-            None => answer.answer(RGFX_STATUS_OK),
+            None => self.answers.answered_at_show(answer, taken),
         }
         hold
     }

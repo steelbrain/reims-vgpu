@@ -87,7 +87,11 @@
 //! let go of the answers it held, as it was scheduled or as it finished ([`LetGo`]), and at
 //! which refresh it was answered. It tells a present the host answers a refresh late (its show
 //! or its draw's let-go past the first refresh after its take) from one the guest's compositor
-//! sent late in the refresh, which a guest's present latency alone does not.
+//! sent late in the refresh, which a guest's present latency alone does not. A display with no
+//! window to draw it (a headless device, or a window with no sink) answers each present at its
+//! show, and logs its line there, naming the last refresh before its show as the one that
+//! answered it ([`PresentAnswers::answered_at_show`]); the host's summary counts those answers
+//! too.
 //!
 //! [`RgfxSurfaceWriters`]: reims_vgpu_graphics::wire::RgfxSurfaceWriters
 
@@ -529,14 +533,18 @@ pub(crate) struct Taken {
     since_refresh: Option<Duration>,
 }
 
-/// What an answer's timing line says ([`PresentAnswers::refreshed`]).
+/// What an answer's timing line says ([`PresentAnswers::refreshed`],
+/// [`PresentAnswers::answered_at_show`]).
 struct Timing {
     taken: Taken,
     shown: MonoTime,
-    /// Whether a window draw had taken it by its answer, and when and how that draw let go.
+    /// Whether its display has a window to draw it; where it has, whether a window draw had taken
+    /// it by its answer, and when and how that draw let go.
+    window: bool,
     taken_by_draw: bool,
     drawn: Option<(MonoTime, LetGo)>,
-    /// The refresh that answered it, and when.
+    /// The refresh that answered it, and when: where its display has no window, the last refresh
+    /// before its show, which it was answered at.
     refresh: u64,
     at: MonoTime,
 }
@@ -551,6 +559,7 @@ impl Timing {
             None => "before the first refresh".to_owned(),
         };
         let drawn = match (self.drawn, self.taken_by_draw) {
+            _ if !self.window => "no window to draw it".to_owned(),
             (Some((drawn, how)), _) => {
                 let how = match how {
                     LetGo::Scheduled => "scheduled",
@@ -640,6 +649,29 @@ impl<A: Answer> PresentAnswers<A> {
         });
     }
 
+    /// A present `taken` then is shown on a display with no window to draw it (a headless
+    /// device, or a window with no sink), which answers it at once, at its show: its timing line
+    /// is logged as a refresh's are, naming the last refresh before its show as the one that
+    /// answered it, and the host's summary counts it.
+    pub(crate) fn answered_at_show(&self, answer: A, taken: Taken) {
+        let at = (self.now)();
+        answer.answer_ok();
+        if log::log_enabled!(target: TIMING, log::Level::Debug) {
+            let refresh = self.state.lock().refreshes;
+            let timing = Timing {
+                taken,
+                shown: at,
+                window: false,
+                taken_by_draw: false,
+                drawn: None,
+                refresh,
+                at,
+            };
+            timing.log();
+        }
+        super::summary::answered(taken.at, at, at);
+    }
+
     /// The window draws the latest present: it takes every present shown so far that no draw
     /// took, and, until it hands its [`Drawing`] back to [`Self::let_go`], holds the answer of
     /// every present shown after the latest one now, whose surface it may read.
@@ -719,6 +751,7 @@ impl<A: Answer> PresentAnswers<A> {
                         timings.push(Timing {
                             taken: owed.taken,
                             shown: owed.shown,
+                            window: true,
                             taken_by_draw: owed.taken_by_draw,
                             drawn: owed.drawn,
                             refresh: now,
@@ -749,6 +782,7 @@ mod tests {
     use std::sync::Arc;
 
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
     use reims_vgpu_vulkan::core::sync::Mutex;
@@ -1141,5 +1175,56 @@ mod tests {
         );
         drop(logs);
         assert_eq!(log.lock().len(), 4, "all answered");
+    }
+
+    /// A display with no window to draw its presents (a headless device, or a window with no
+    /// sink) answers each at its show, logs its timing line there at debug, naming the last
+    /// refresh before its show as the one that answered it, and counts it in the host's summary
+    #[test]
+    fn a_present_with_no_window_is_answered_timed_and_counted_at_its_show() {
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        super::super::summary::count_presents();
+        drop(super::super::summary::take_presents());
+        // A clock 100 us on at each read.
+        let clock = AtomicU64::new(0);
+        let answers = PresentAnswers::<Recorded>::new(Box::new(move || {
+            MonoTime::from_nanos(clock.fetch_add(100_000, Ordering::Relaxed))
+        }));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let refresh = Arc::new(Mutex::new(0u64));
+        let rec = |frame| Recorded {
+            frame,
+            log: Arc::clone(&log),
+            refresh: Arc::clone(&refresh),
+        };
+        // Taken before any refresh: answered at its show.
+        answers.answered_at_show(rec(0), answers.taken());
+        assert_eq!(*log.lock(), [(0, 0)]);
+        // Taken after refresh 1, shown after refresh 2: answered at its show, no refresh later.
+        *refresh.lock() = 1;
+        answers.refreshed();
+        let taken = answers.taken();
+        *refresh.lock() = 2;
+        answers.refreshed();
+        answers.answered_at_show(rec(1), taken);
+        assert_eq!(*log.lock(), [(0, 0), (1, 2)]);
+        let lines: Vec<String> = (logs.take().into_iter())
+            .filter(|(level, target, _)| *level == log::Level::Debug && target == TIMING)
+            .map(|(_, _, line)| line)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "a present taken before the first refresh: shown 100 us after its take, no window \
+                 to draw it, answered at refresh 0 (0 after its take), 100 us after its take",
+                "a present taken 100 us after refresh 1: shown 200 us after its take, no window to \
+                 draw it, answered at refresh 2 (1 after its take), 200 us after its take",
+            ]
+        );
+        let us = Duration::from_micros;
+        assert_eq!(
+            super::super::summary::take_presents(),
+            [[us(100), us(0), us(100)], [us(200), us(0), us(200)]]
+        );
     }
 }

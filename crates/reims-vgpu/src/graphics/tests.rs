@@ -3229,6 +3229,41 @@ fn a_present_needs_the_surface_s_texture() {
     }
 }
 
+/// A headless device, with no window to draw its presents, answers each at its show and logs its
+/// timing line there, at debug, as a window's device logs it at a refresh
+#[test]
+fn a_headless_device_logs_each_present_s_timing_at_its_show() {
+    let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+    let raised = Arc::new(AtomicU32::new(0));
+    let device = headless(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        answered(&device, &mut guest, present_surface(0)),
+        RGFX_STATUS_OK
+    );
+    // The line follows the answer, on the thread that gave it.
+    let mut timed = Vec::new();
+    let logged = eventually(|| {
+        timed.extend(
+            (logs.take().into_iter())
+                .filter(|(level, target, _)| {
+                    *level == log::Level::Debug && target == present::TIMING
+                })
+                .map(|(_, _, line)| line),
+        );
+        !timed.is_empty()
+    });
+    assert!(logged, "no present_timing line");
+    assert_eq!(timed.len(), 1, "{timed:?}");
+    assert!(
+        timed[0].contains(": shown ")
+            && timed[0].contains(", no window to draw it, answered at refresh "),
+        "{}",
+        timed[0]
+    );
+}
+
 /// A `DISPLAY_COLOR` part of display 0's transaction 1: `stage`'s `count` entries, `part` of them
 /// from `first` on, entry `k`'s red `k`.
 fn display_color(stage: u32, count: u32, first: u32, part: u32) -> Vec<u8> {
