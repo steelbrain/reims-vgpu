@@ -5,12 +5,23 @@
 //   purgeable     a buffer and a texture set purgeable Empty, then used by a command buffer
 //   creates       oversized creates: a buffer past maxBufferLength, a 32768 x 32768 texture, a
 //                 heap past the working set
+//   bounds [STEP] each create of a length or size Metal bounds, at its bound and past it, each
+//                 step in a child of its own (L is maxBufferLength, P the page size): a buffer
+//                 of a length (len.L, len.L+1, len.L+P), of bytes (bytes.L, bytes.L+P), over the
+//                 caller's bytes (nocopy.L, nocopy.L+P, nocopy.L+1, and nocopy.P+1, a length
+//                 off the page); a Private heap (heap.L, heap.L+1, heap.L+P); a buffer and a
+//                 texture of a 1 MiB Private Placement heap at its end and past it
+//                 (place.buf.end, place.buf.past, place.buf.long, place.tex.end, place.tex.past);
+//                 the tiled texture SPI over the caller's bytes (tiled.1M, tiled.L, tiled.L+P).
+//                 Each line says made or nil, and the parent says how a step's process ended.
 //   residency GIB GIB 1 GiB Private buffers made and all filled in one command buffer
 //   timeout SEC   one kernel that runs about SEC seconds (the GPU's watchdog may end it); run it
 //                 only on a GPU that does not drive a display
 // Build: see README.md.
 #import "oracle_common.h"
+#include <objc/message.h>
 #include <spawn.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -19,6 +30,7 @@ extern char **environ;
 static id<MTLDevice> D;
 static id<MTLCommandQueue> Q;
 static const char *gArgv0;
+static const char *gDeviceArg;
 
 static void print_error(const char *indent, NSError *e)
 {
@@ -135,6 +147,174 @@ static void case_creates(void)
 	printf("%s\n", t ? "made" : "nil");
 }
 
+static const char *const kBoundsSteps[] = {
+    "len.L",          "len.L+1",        "len.L+P",        "bytes.L",       "bytes.L+P",
+    "nocopy.L",       "nocopy.L+P",     "nocopy.L+1",     "nocopy.P+1",    "heap.L",
+    "heap.L+1",       "heap.L+P",       "place.buf.end",  "place.buf.past", "place.buf.long",
+    "place.tex.end",  "place.tex.past", "tiled.1M",       "tiled.L",       "tiled.L+P",
+};
+
+// The length a step's suffix names: L, L+1, L+P, P+1 or 1M.
+static uint64_t bounds_length(const char *suffix, uint64_t L, uint64_t P)
+{
+	if (!strcmp(suffix, "L"))
+		return L;
+	if (!strcmp(suffix, "L+1"))
+		return L + 1;
+	if (!strcmp(suffix, "L+P"))
+		return L + P;
+	if (!strcmp(suffix, "P+1"))
+		return P + 1;
+	if (!strcmp(suffix, "1M"))
+		return 1 << 20;
+	fprintf(stderr, "no length %s\n", suffix);
+	exit(2);
+}
+
+// `length` bytes of fresh anonymous memory, whole pages, untouched (they read zero).
+static void *bounds_bytes(uint64_t length, uint64_t P)
+{
+	void *p = mmap(NULL, (length + P - 1) & ~(P - 1), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE,
+	               -1, 0);
+	if (p == MAP_FAILED) {
+		printf("  mmap of %llu bytes failed\n", (unsigned long long)length);
+		exit(1);
+	}
+	return p;
+}
+
+static void bounds_say(const char *step, uint64_t length, id object, double t0)
+{
+	printf("  %s (%llu): %s", step, (unsigned long long)length, object ? "made" : "nil");
+	if ([object conformsToProtocol:@protocol(MTLBuffer)])
+		printf(", length %lu", (unsigned long)[(id<MTLBuffer>)object length]);
+	else if ([object conformsToProtocol:@protocol(MTLHeap)])
+		printf(", size %lu", (unsigned long)[(id<MTLHeap>)object size]);
+	printf(" (%.1f ms)\n", oracle_now_ms() - t0);
+}
+
+// A Private Placement heap of 1 MiB.
+static id<MTLHeap> bounds_placement_heap(void)
+{
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	hd.size = 1 << 20;
+	hd.storageMode = MTLStorageModePrivate;
+	hd.type = MTLHeapTypePlacement;
+	id<MTLHeap> h = [D newHeapWithDescriptor:hd];
+	if (!h) {
+		printf("  no Placement heap of 1 MiB\n");
+		exit(1);
+	}
+	return h;
+}
+
+static void case_bounds(const char *step)
+{
+	const uint64_t L = D.maxBufferLength, P = (uint64_t)getpagesize();
+	if (step == NULL) {
+		const char *layer = getenv("MTL_DEBUG_LAYER");
+		printf("case bounds (maxBufferLength %llu, page %llu, MTL_DEBUG_LAYER %s)\n",
+		       (unsigned long long)L, (unsigned long long)P, layer ? layer : "unset");
+		for (size_t i = 0; i < sizeof kBoundsSteps / sizeof kBoundsSteps[0]; i++) {
+			char *args[] = {(char *)gArgv0,          (char *)gDeviceArg, "--case", "bounds",
+			                (char *)kBoundsSteps[i], NULL};
+			pid_t pid;
+			if (posix_spawn(&pid, gArgv0, NULL, NULL, args, environ))
+				exit(1);
+			int st;
+			waitpid(pid, &st, 0);
+			if (WIFSIGNALED(st))
+				printf("  => step %s died on signal %d\n", kBoundsSteps[i], WTERMSIG(st));
+			else if (WEXITSTATUS(st))
+				printf("  => step %s exited %d\n", kBoundsSteps[i], WEXITSTATUS(st));
+		}
+		return;
+	}
+	printf("  step %s\n", step);
+	fflush(stdout);
+	const double t0 = oracle_now_ms();
+	if (!strncmp(step, "len.", 4)) {
+		const uint64_t length = bounds_length(step + 4, L, P);
+		bounds_say(step, length,
+		           [D newBufferWithLength:length options:MTLResourceStorageModePrivate], t0);
+	} else if (!strncmp(step, "bytes.", 6)) {
+		const uint64_t length = bounds_length(step + 6, L, P);
+		void *bytes = bounds_bytes(length, P);
+		bounds_say(step, length,
+		           [D newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared],
+		           t0);
+	} else if (!strncmp(step, "nocopy.", 7)) {
+		const uint64_t length = bounds_length(step + 7, L, P);
+		void *bytes = bounds_bytes(length, P);
+		bounds_say(step, length,
+		           [D newBufferWithBytesNoCopy:bytes
+		                                length:length
+		                               options:MTLResourceStorageModeShared
+		                           deallocator:nil],
+		           t0);
+	} else if (!strncmp(step, "heap.", 5)) {
+		const uint64_t size = bounds_length(step + 5, L, P);
+		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+		hd.size = size;
+		hd.storageMode = MTLStorageModePrivate;
+		bounds_say(step, size, [D newHeapWithDescriptor:hd], t0);
+	} else if (!strncmp(step, "place.buf.", 10)) {
+		// At the heap's last 64 KiB (end), 128 KiB there (past), and 1 MiB + 64 KiB at 0 (long).
+		id<MTLHeap> h = bounds_placement_heap();
+		const uint64_t H = h.size, K = 64 << 10;
+		const char *how = step + 10;
+		const uint64_t offset = !strcmp(how, "long") ? 0 : H - K;
+		const uint64_t length = !strcmp(how, "end") ? K : !strcmp(how, "past") ? 2 * K : H + K;
+		printf("  heap of %llu, a buffer of %llu at %llu\n", (unsigned long long)H,
+		       (unsigned long long)length, (unsigned long long)offset);
+		bounds_say(step, length,
+		           [h newBufferWithLength:length
+		                          options:MTLResourceStorageModePrivate
+		                           offset:offset],
+		           t0);
+	} else if (!strncmp(step, "place.tex.", 10)) {
+		// A 128 x 128 RGBA8 texture at the last offset of its alignment that holds it (end), and
+		// one alignment on (past).
+		id<MTLHeap> h = bounds_placement_heap();
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:128
+		                                                      height:128
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		const MTLSizeAndAlign sa = [D heapTextureSizeAndAlignWithDescriptor:td];
+		const uint64_t H = h.size, align = sa.align ? sa.align : 1;
+		uint64_t offset = (H - sa.size) / align * align;
+		if (!strcmp(step + 10, "past"))
+			offset += align;
+		printf("  heap of %llu, a texture of %lu (align %lu) at %llu\n", (unsigned long long)H,
+		       (unsigned long)sa.size, (unsigned long)sa.align, (unsigned long long)offset);
+		bounds_say(step, sa.size, [h newTextureWithDescriptor:td offset:offset], t0);
+	} else if (!strncmp(step, "tiled.", 6)) {
+		const SEL sel =
+		    NSSelectorFromString(@"newTiledTextureWithBytesNoCopy:length:deallocator:descriptor:"
+		                         @"offset:bytesPerRow:");
+		if (![D respondsToSelector:sel]) {
+			printf("  %s: the device does not respond\n", step);
+			return;
+		}
+		const uint64_t length = bounds_length(step + 6, L, P);
+		void *bytes = bounds_bytes(length, P);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModeShared;
+		id t = ((id(*)(id, SEL, void *, NSUInteger, id, MTLTextureDescriptor *, NSUInteger,
+		               NSUInteger))objc_msgSend)(D, sel, bytes, (NSUInteger)length, nil, td, 0, 256);
+		bounds_say(step, length, t, t0);
+	} else {
+		fprintf(stderr, "no step %s\n", step);
+		exit(2);
+	}
+}
+
 static void case_residency(int gib)
 {
 	printf("case residency: %d x 1 GiB Private buffers, all filled in one command buffer\n", gib);
@@ -211,6 +391,7 @@ int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	gArgv0 = argv[0];
+	gDeviceArg = argc > 1 ? argv[1] : NULL;
 	if (argc < 2) {
 		fprintf(stderr, "usage: %s DEVICE [CASE [ARG]]\n", argv[0]);
 		return 2;
@@ -223,6 +404,8 @@ int main(int argc, char **argv)
 			case_purgeable();
 		else if (!strcmp(c, "creates"))
 			case_creates();
+		else if (!strcmp(c, "bounds"))
+			case_bounds(argc > 4 ? argv[4] : NULL);
 		else if (!strcmp(c, "residency"))
 			case_residency(argc > 4 && argv[4] ? atoi(argv[4]) : 6);
 		else if (!strcmp(c, "timeout"))
@@ -234,7 +417,8 @@ int main(int argc, char **argv)
 	oracle_header("oracle_errors", D);
 	D = nil;
 	static const char *const all[][2] = {
-	    {"purgeable", NULL}, {"creates", NULL}, {"residency", "6"}, {"timeout", "10"},
+	    {"purgeable", NULL}, {"creates", NULL}, {"bounds", NULL}, {"residency", "6"},
+	    {"timeout", "10"},
 	};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 ? strcmp(argv[2], all[i][0]) : !strcmp(all[i][0], "timeout"))
