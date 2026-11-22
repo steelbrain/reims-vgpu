@@ -3659,6 +3659,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let dropped =
                         marks.skips() || (marks.drops_draws() && compute::dispatches(tag));
                     if !dropped {
+                        if compute::dispatches(tag) {
+                            self.first_dispatch();
+                        }
                         match compute::decode_op(tag, body, self, enc, marks, ON) {
                             Ok(true) => {}
                             Ok(false) => return Err(unknown_op(tag)),

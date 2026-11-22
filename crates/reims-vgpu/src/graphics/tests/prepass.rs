@@ -1,8 +1,8 @@
 //! A command buffer's dispatch pre-pass (`decode::prepass`): each pipeline its dispatches run,
 //! by the platform's key of it, made ahead once for the device, on the compile threads, with the
 //! arguments of the first dispatch of it; a dispatch with no key, or of a key made, made ahead
-//! never; the walk waiting for none of it; and nothing of it outliving the buffer's views of the
-//! table, nor its device.
+//! never; the walk waiting for none of it, and making at its first dispatch those no thread took;
+//! and nothing of it outliving the buffer's views of the table, nor its device.
 
 use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
@@ -540,12 +540,17 @@ fn a_made_key_takes_no_place_and_no_compile() {
     assert_eq!(widths(&platform), (made_keys + 1..=n).collect::<Vec<_>>());
 }
 
-/// A command buffer whose makes ahead wait for a compile thread is walked and completes without
-/// them; once the threads go on, they make none: the walk's end dropped them
+/// A command buffer whose makes ahead wait for a compile thread is walked and completes, its walk
+/// making them on its own thread at its first dispatch, and not before it: while the walk waits at
+/// its first op none is made, then both are, each once, counted; once the threads go on, they
+/// make none again
 #[test]
-fn a_walk_waits_for_no_make_ahead_still_queued() {
+fn the_walk_makes_the_shapes_no_thread_took_at_its_first_dispatch() {
     let (device, platform, _guest, mut ring) = with_states(&[11]);
+    let state = platform.world().live(CLASS);
+    assert_eq!(state.len(), 1);
     device.control.pool.hold();
+    let on_walk = counted("dispatch-prepass-made-on-walk");
     let ops = [
         begin(),
         set_state(11),
@@ -553,15 +558,67 @@ fn a_walk_waits_for_no_make_ahead_still_queued() {
         groups([4, 2, 1], [8, 8, 1]),
         end(),
     ];
+    let gate = WalkGate::on(&device);
     ring.send(&device, command_buffer_of(100, &ops));
+    assert!(gate.reached(), "the walk did not start");
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(made(&platform), vec![], "made before the walk's first dispatch");
+    gate.open();
     assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+    let mut expected = vec![
+        Prepared {
+            state: state[0],
+            dispatch: PreparedGrid::Threads(64, 1, 1),
+            threads: (32, 1, 1),
+            lengths: vec![],
+        },
+        Prepared {
+            state: state[0],
+            dispatch: PreparedGrid::Threadgroups(4, 2, 1),
+            threads: (8, 8, 1),
+            lengths: vec![],
+        },
+    ];
+    expected.sort();
+    assert_eq!(made(&platform), expected);
+    assert_eq!(counted("dispatch-prepass-made-on-walk") - on_walk, 2);
+    device.control.pool.release();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(made(&platform), expected, "a make ahead ran after its walk");
+}
+
+/// A command buffer whose makes ahead wait for a compile thread and whose walk ends before its
+/// first dispatch (it faults at an op before it) makes none of them: its end drops them, counted,
+/// and once the threads go on, they make none
+#[test]
+fn a_walk_ended_before_its_first_dispatch_drops_the_shapes_no_thread_took() {
+    let (device, platform, _guest, mut ring) = with_states(&[11]);
+    device.control.pool.hold();
+    let (dropped, on_walk) = (
+        counted("dispatch-prepass-dropped"),
+        counted("dispatch-prepass-made-on-walk"),
+    );
+    // An op no decoder knows: the walk faults the buffer there, before its dispatch.
+    let unknown = op(0x20ff, &[]);
+    let ops = [
+        begin(),
+        unknown,
+        set_state(11),
+        threads([64, 1, 1], [32, 1, 1]),
+        end(),
+    ];
+    ring.send(&device, command_buffer_of(100, &ops));
+    assert_ne!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+    assert_eq!(counted("dispatch-prepass-dropped") - dropped, 1);
+    assert_eq!(counted("dispatch-prepass-made-on-walk"), on_walk);
     device.control.pool.release();
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(made(&platform), vec![], "a make ahead ran after its walk");
 }
 
 /// A device released while its command buffer's makes ahead still wait for a compile thread ends
-/// clean: no compute state outlives it, and none is made ahead once the threads go on
+/// clean: its walk made the one at its first dispatch, no compute state outlives the device, and
+/// none is made ahead again once the threads go on
 #[test]
 fn a_device_released_with_makes_ahead_queued_ends_clean() {
     let (device, platform, _guest, mut ring) = with_states(&[11]);
@@ -575,6 +632,8 @@ fn a_device_released_with_makes_ahead_queued_ends_clean() {
     ];
     ring.send(&device, command_buffer_of(100, &ops));
     assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
+    let walked = made(&platform);
+    assert_eq!(walked.len(), 1, "its walk made: {walked:?}");
     drop(device);
     let world = platform.world();
     assert!(
@@ -584,7 +643,7 @@ fn a_device_released_with_makes_ahead_queued_ends_clean() {
     );
     open();
     std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(made(&platform), vec![], "a make ahead ran after its device");
+    assert_eq!(made(&platform), walked, "a make ahead ran after its device");
 }
 
 /// A make ahead of a dispatch the walk never reaches (the walk faults at an op before it) that

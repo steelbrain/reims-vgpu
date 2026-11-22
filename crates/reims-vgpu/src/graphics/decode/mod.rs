@@ -1391,6 +1391,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The first compute and the first render pipeline state the walk set, 0 for none, since its
     /// begin or, in a dealt walk, its chunk's start ([`Self::pipeline_set`]).
     firsts: Cell<(u64, u64)>,
+    /// The shapes of its command buffer's pre-pass that no compile thread took, which the walk
+    /// makes at its first dispatch ([`prepass`], "The walk makes the rest").
+    untaken: RefCell<Option<prepass::Untaken<P>>>,
 }
 
 impl<P: Platform> Drop for GraphicsDecoder<P> {
@@ -1582,6 +1585,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             laid_blit: Cell::new(false),
             work_names: RefCell::new(None),
             firsts: Cell::new((0, 0)),
+            untaken: RefCell::new(None),
         }
     }
 
@@ -1627,6 +1631,23 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.drain.get_mut().take();
         self.order_waits.get_mut().clear();
         self.work_names.get_mut().take();
+        self.untaken.get_mut().take();
+    }
+
+    /// The walk about to run makes `untaken`, its pre-pass's shapes no compile thread took, at
+    /// its first dispatch ([`prepass`], "The walk makes the rest"); `None` makes none.
+    pub(crate) fn make_at_first_dispatch(&self, untaken: Option<prepass::Untaken<P>>) {
+        *self.untaken.borrow_mut() = untaken;
+    }
+
+    /// At a dispatch of the walk: the first makes the shapes its pre-pass's compile threads did
+    /// not take ([`Self::make_at_first_dispatch`]).
+    fn first_dispatch(&self) {
+        let untaken = self.untaken.borrow_mut().take();
+        if let Some(untaken) = untaken {
+            let clock = self.shared.platform.clock();
+            untaken.make(|| clock.now_mono());
+        }
     }
 
     /// The message's command buffer took its place among the commit order's tickets, or got as

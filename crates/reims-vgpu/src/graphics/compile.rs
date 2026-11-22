@@ -23,8 +23,10 @@
 //! has then always been taken by a thread already. A command buffer's dispatches made ahead of its
 //! walk ([`super::decode::prepass`]) go after both, one make a compile, on every thread of the
 //! pool's but one at once (one at the least), so one thread is left to the creates where the pool
-//! has two or more; they do not count among a context's compiles running. Each compile's wait and
-//! run time is logged at debug (`reims_vgpu::graphics::compile`), and, in the profiling trace
+//! has two or more; they do not count among a context's compiles running, and those no thread
+//! took by the walk's first dispatch are made on the walk's thread (`decode::prepass`, "The walk
+//! makes the rest"). Each compile's wait and run time is logged at debug
+//! (`reims_vgpu::graphics::compile`), and, in the profiling trace
 //! ([`reims_vgpu_vulkan::core::trace`]), its hand-over, start and end as `cmphand`, `cmpstart`
 //! and `cmpend` events, each with the object's id.
 //!

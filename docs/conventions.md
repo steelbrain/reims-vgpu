@@ -56,9 +56,10 @@ repeats the ones code cites.
     sees where they wait. Compiles run concurrently only inside the synchronous wait
     that needs them, which joins every one before it returns, with one
     exception: a command buffer's dispatch pre-pass makes its dispatches'
-    pipelines on the compile threads while its walk goes on, and the walk's
-    end drops those no thread took and joins those being made, before the
-    message lets go of anything
+    pipelines on the compile threads while its walk goes on, the walk's
+    thread makes those no compile thread took at its first dispatch, and the
+    walk's end drops those no thread took and joins those being made, before
+    the message lets go of anything
     (`crates/reims-vgpu/src/graphics/decode/prepass.rs`). Otherwise nothing
     compiles in the background, and nothing is deferred or released early.
     Nothing the guest sees (IDs, addresses, stamps, reflection order, shared

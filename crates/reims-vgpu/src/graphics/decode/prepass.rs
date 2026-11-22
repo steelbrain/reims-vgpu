@@ -39,8 +39,22 @@
 //!   key first: a key of a pipeline gone stays until then, and a key forgotten and met again is
 //!   handed once more, where the platform finds it made and returns.
 //! - **The walk waits for none of it.** Each shape is one compile of the pool's, taken in the
-//!   order handed by the first free thread; where no thread is free the walk makes the shape as
-//!   before, and a thread that takes it later finds it made.
+//!   order handed by the first free thread. The walk waits for no thread to take one: it makes
+//!   those no thread took by its first dispatch itself (below), and a thread that takes one later
+//!   finds it made.
+//! - **The walk makes the rest.** At its first dispatch, the walk's thread makes the shapes no
+//!   compile thread took yet, one after another in the order handed ([`Untaken`]), beside the
+//!   compile threads making those they took; then it dispatches, finding each shape made or
+//!   waiting for the thread making it. Each shape handed is of one of the buffer's dispatches,
+//!   whose commit waits for it in any case, so its makes run on one thread more, instead of the
+//!   walk waiting at each dispatch whose shape is still queued. The makes it ran are counted
+//!   (`dispatch-prepass-made-on-walk`), and a walk that ran any logs them at debug. Without it,
+//!   a cold boot's dispatches waited 1044.5 ms in 31 waits for their pipelines before the
+//!   desktop came up: 659.9 ms in 16 waits at makes running on a compile thread, which took the
+//!   boot's 52 makes ahead three at a time, after 4265.6 ms of queueing in all, and 384.6 ms in
+//!   15 at makes the walk ran itself, one at each dispatch, while the compile threads were idle,
+//!   those of the 15 shapes past [`MOST`] of one buffer of 452 dispatches with 47 new shapes
+//!   (um790's RTX 2080, m3-max-65818; measured).
 //! - **Closed at the walk's end.** Right after the buffer's walk and commit, before the message's
 //!   views of the table close, the pre-pass is closed ([`Prepass::close`]): the shapes no thread
 //!   took are dropped (`dispatch-prepass-dropped`), and the walk's thread waits for those being
@@ -110,6 +124,7 @@ const HANDED: &str = "dispatch-prepass-handed";
 const NO_VARIANT: &str = "dispatch-prepass-no-variant";
 const PAST_MOST: &str = "dispatch-prepass-past-most";
 const DROPPED: &str = "dispatch-prepass-dropped";
+const MADE_ON_WALK: &str = "dispatch-prepass-made-on-walk";
 const WAITED: &str = "dispatch-prepass-waited";
 const WAIT_NS: &str = "dispatch-prepass-wait-ns";
 const WAIT_MAX_NS: &str = "dispatch-prepass-wait-max-ns";
@@ -256,7 +271,18 @@ impl<P: Platform> Prepass<P> {
     /// or nothing, where none is left or the pre-pass is closed.
     pub(crate) fn job(&self) -> Box<dyn FnOnce() + Send> {
         let shared = Arc::clone(&self.shared);
-        Box::new(move || make_next(&shared))
+        Box::new(move || {
+            make_next(&shared);
+        })
+    }
+
+    /// The shapes no thread took yet, for the walk to make at its first dispatch (the module
+    /// doc, "The walk makes the rest").
+    pub(crate) fn untaken(&self) -> Untaken<P> {
+        Untaken {
+            shared: Arc::clone(&self.shared),
+            cb_obj_id: self.cb_obj_id,
+        }
     }
 
     /// The walk's end, `end`: the shapes no thread took are dropped, and the calling thread waits
@@ -316,15 +342,48 @@ impl<P: Platform> Drop for Prepass<P> {
     }
 }
 
-/// A compile of the pool's ([`Prepass::job`]): the next shape no thread took, made here, and let go
-/// of before it counts as ended, so a close that waited for it holds none of it.
-fn make_next<P: Platform>(shared: &Shared<P>) {
+/// What a command buffer's walk makes of its pre-pass at its first dispatch ([`Prepass::untaken`]):
+/// the shapes no thread took yet. It holds the pre-pass's queue, whose shapes its close takes
+/// from it, so nothing of them outlives the close however long it is kept.
+pub(crate) struct Untaken<P: Platform> {
+    shared: Arc<Shared<P>>,
+    cb_obj_id: u64,
+}
+
+impl<P: Platform> Untaken<P> {
+    /// Makes each shape no thread took yet on the calling thread, the walk's, in the order handed,
+    /// until none is left or the pre-pass is closed; the makes are counted, and logged at debug
+    /// with their time, read with `now`.
+    pub(crate) fn make(self, now: impl Fn() -> MonoTime) {
+        let began = now();
+        let mut made = 0u64;
+        while make_next(&self.shared) {
+            made += 1;
+        }
+        if made == 0 {
+            return;
+        }
+        reims_vgpu_vulkan::answer::count_kind_by(MADE_ON_WALK, made);
+        log::debug!(
+            target: LOG_TARGET,
+            "command buffer {:#x}'s walk made {made} of its dispatches' pipelines no compile \
+             thread took, in {:.1} ms",
+            self.cb_obj_id,
+            now().saturating_duration_since(began).as_secs_f64() * 1e3,
+        );
+    }
+}
+
+/// A compile of the pool's ([`Prepass::job`]), or one of the walk's ([`Untaken::make`]): the next
+/// shape no thread took, made here, and let go of before it counts as ended, so a close that
+/// waited for it holds none of it; whether there was one.
+fn make_next<P: Platform>(shared: &Shared<P>) -> bool {
     let mut state = shared.state.lock();
     if state.closed {
-        return;
+        return false;
     }
     let Some(item) = state.items.pop_front() else {
-        return;
+        return false;
     };
     let running = Running {
         obj_id: item.obj_id,
@@ -347,6 +406,7 @@ fn make_next<P: Platform>(shared: &Shared<P>) {
     if state.closed && state.running.is_empty() {
         shared.ended.notify_all();
     }
+    true
 }
 
 /// A command buffer's dispatches as its pre-pass read them ([`GraphicsDecoder::prepass`]).

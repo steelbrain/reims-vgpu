@@ -2985,6 +2985,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     }
                     decoder.see_stored(&awaited);
                 }
+                // Its walk makes, at its first dispatch, the shapes no compile thread took.
+                decoder.make_at_first_dispatch(prepass.as_ref().map(Prepass::untaken));
                 let outcome = match begun {
                     Ok(Ok(begun)) => {
                         refusing(|| decoder.finish_command_buffer(&control.device, &message, begun))
@@ -2992,6 +2994,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     Ok(Err(e)) => Ok(Err(e)),
                     Err(raise) => Err(raise),
                 };
+                decoder.make_at_first_dispatch(None);
                 // Nothing of its pre-pass outlives the views of the table its message holds.
                 if let Some(prepass) = prepass {
                     prepass.close(WalkEnd::of(&outcome), || control.pool.now());
