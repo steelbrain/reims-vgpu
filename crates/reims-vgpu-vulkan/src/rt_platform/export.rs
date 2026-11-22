@@ -256,6 +256,13 @@ impl Exported {
         })
     }
 
+    /// The device address of the buffer's first byte, from the block's record rt gave at its make
+    /// (`BlockInfo::gpu_address`), with no ask of rt's `gpuAddress`, which hands out an address
+    /// of the block.
+    pub(super) fn address(&self) -> u64 {
+        self.block.gpu_address.saturating_add(self.offset)
+    }
+
     /// rt's acquire of what the other API wrote into the block (the module's docs, "The
     /// acquire"); `Err` says why rt refused it.
     pub(super) fn acquire(&self) -> Result<(), String> {
@@ -292,9 +299,10 @@ mod tests {
     /// Exportable buffers on the GPU the test holds, where its device exports an opaque fd: a
     /// Private buffer of the asked length at a GPU address, its byte 32 on a multiple of 256
     /// bytes of its memory where asked; each export a new fd of the dedicated allocation, which
-    /// holds the buffer, none as a dma-buf; the acquire taken. A plain buffer exports nothing and
-    /// takes no acquire, and options of other storage are declined uncounted. Where the device
-    /// exports no opaque fd, the refusal is counted and the make answers `None`.
+    /// holds the buffer, none as a dma-buf; the acquire taken; the address the fault history
+    /// takes from the export's record its `gpuAddress`. A plain buffer exports nothing and takes
+    /// no acquire, and options of other storage are declined uncounted. Where the device exports
+    /// no opaque fd, the refusal is counted and the make answers `None`.
     #[test]
     fn exportable_buffers_on_vulkan() {
         use std::os::fd::AsRawFd as _;
@@ -313,6 +321,7 @@ mod tests {
         assert_eq!((buffer.length(), buffer.storage_mode()), (length, 2));
         assert_eq!(buffer.resource_options(), 0x220);
         assert_ne!(buffer.gpu_address(), 0);
+        assert_eq!(buffer.fault_address(), Some(buffer.gpu_address()));
         let first = buffer.export_memory().expect("an export");
         let second = buffer.export_memory().expect("another");
         assert_ne!(first.fd.as_raw_fd(), second.fd.as_raw_fd());
@@ -331,12 +340,14 @@ mod tests {
             .expect("never a raise")
             .expect("an exportable buffer");
         assert_eq!(unaligned.export_memory().expect("an export").offset, 0);
+        assert_eq!(unaligned.fault_address(), Some(unaligned.gpu_address()));
 
         let plain = (device.new_buffer_of_length(on, 4096, 0x20))
             .expect("never a raise")
             .expect("a Private buffer");
         assert!(plain.export_memory().is_err());
         assert!(plain.external_write_done().is_err());
+        assert_eq!(plain.fault_address(), Some(plain.gpu_address()));
         let shared = device.new_exportable_buffer_of_length(on, 4096, 0, None);
         assert!(shared.expect("never a raise").is_none());
         assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
@@ -346,9 +357,10 @@ mod tests {
     /// Dma-buf buffers on the GPU the test holds, where its device exports a dma-buf: a Private
     /// buffer of the asked length at a GPU address, as far into its block as puts its byte 32 on
     /// a multiple of 256 bytes of the memory; each export a new dma-buf of the dedicated
-    /// allocation, none as an opaque fd; the acquire taken. With no byte named, the buffer lies
-    /// at its block's first byte. Options of other storage are declined uncounted. Where the
-    /// device exports no dma-buf, the refusal is counted and the make answers `None`.
+    /// allocation, none as an opaque fd; the acquire taken; the address the fault history takes
+    /// from the export's record its `gpuAddress`. With no byte named, the buffer lies at its
+    /// block's first byte. Options of other storage are declined uncounted. Where the device
+    /// exports no dma-buf, the refusal is counted and the make answers `None`.
     #[test]
     fn dma_buf_buffers_on_vulkan() {
         use std::os::fd::AsRawFd as _;
@@ -367,6 +379,7 @@ mod tests {
         assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
         assert_eq!((buffer.length(), buffer.storage_mode()), (length, 2));
         assert_ne!(buffer.gpu_address(), 0);
+        assert_eq!(buffer.fault_address(), Some(buffer.gpu_address()));
         let first = buffer.export_dma_buf().expect("an export");
         let second = buffer.export_dma_buf().expect("another");
         assert_ne!(first.fd.as_raw_fd(), second.fd.as_raw_fd());
@@ -384,6 +397,7 @@ mod tests {
             device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0x20, None);
         let unaligned = unaligned.expect("never a raise").expect("a dma-buf buffer");
         assert_eq!(unaligned.export_dma_buf().expect("an export").offset, 0);
+        assert_eq!(unaligned.fault_address(), Some(unaligned.gpu_address()));
         let shared = device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0, None);
         assert!(shared.expect("never a raise").is_none());
         assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
@@ -393,7 +407,8 @@ mod tests {
     /// docs, "Deferred exports"): a Private buffer of the asked length that holds no memory, at
     /// GPU address 0, until its first use; an export is such a use, and makes the memory exported
     /// as the eager make's is, its byte 32 on a multiple of 256 bytes, each export a new handle
-    /// of the dedicated allocation, the other handle's export refused, the acquire taken; a use
+    /// of the dedicated allocation, the other handle's export refused, the acquire taken, the
+    /// address the fault history takes from the export's record its `gpuAddress`; a use
     /// that is no export makes it so too. Where the device exports no such handle, the memory is
     /// made as any deferred buffer's, the refusal counted, and the export is refused. Options of
     /// other storage make the eager make's buffer, or none, as it does.
@@ -426,6 +441,7 @@ mod tests {
                 "{handle:?}: no memory before its first use"
             );
             assert_eq!(buffer.gpu_address(), 0);
+            assert_eq!(buffer.fault_address(), None, "{handle:?}: no address unmade");
             assert_eq!(
                 counted(EXPORT_REFUSED_CODE),
                 refusals,
@@ -444,6 +460,7 @@ mod tests {
             };
             assert!(buffer.memory_made(), "{handle:?}: the export made it");
             assert_ne!(buffer.gpu_address(), 0);
+            assert_eq!(buffer.fault_address(), Some(buffer.gpu_address()));
             assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
             let second = export(&buffer, handle).expect("another");
             assert_ne!(first.fd.as_raw_fd(), second.fd.as_raw_fd());

@@ -1151,7 +1151,7 @@ fn import_kind(known: &KnownBlocks, id: rt::BlockId) -> Option<&'static str> {
 /// one (its block, which the host sees no other way). A deferred buffer rt has not made yet adds
 /// nothing.
 pub fn buffer_parts(context: u32, id: u64, gone: bool, buffer: &RtObj<RtBuffer>) -> Parts {
-    let Some(made) = buffer.made_rt() else {
+    let (Some(made), Some(gpu_address)) = (buffer.made_rt(), buffer.fault_address()) else {
         return Parts {
             object: None,
             block: None,
@@ -1162,7 +1162,7 @@ pub fn buffer_parts(context: u32, id: u64, gone: bool, buffer: &RtObj<RtBuffer>)
         id,
         kind: ObjectKind::Buffer,
         storage: buffer.storage_mode(),
-        gpu_address: made.gpu_address(),
+        gpu_address,
         len: made.length(),
         gone,
     };
@@ -1194,9 +1194,8 @@ pub fn managed_copy_parts(context: u32, id: u64, gone: bool, buffer: &RtObj<RtBu
 pub fn texture_parts(context: u32, id: u64, gone: bool, texture: &RtObj<RtTexture>) -> Parts {
     let range = texture.over().and_then(|(buffer, bytes)| {
         let buffer = buffer.upgrade()?;
-        let made = buffer.made_rt()?;
         let len = bytes.end.checked_sub(bytes.start)?;
-        Some((made.gpu_address().checked_add(bytes.start)?, len))
+        Some((buffer.fault_address()?.checked_add(bytes.start)?, len))
     });
     Parts {
         object: range.map(|(gpu_address, len)| LiveObject {

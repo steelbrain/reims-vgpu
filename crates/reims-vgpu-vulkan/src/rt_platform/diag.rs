@@ -202,14 +202,25 @@ impl Call {
     }
 }
 
+/// What a texture's image is, by which two textures share one ([`Made::shared_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Image {
+    /// An image of its own, by the number of the texture that made it.
+    Own(u64),
+    /// A buffer's bytes, as rt keys the hazards of a texture over a buffer in place by its
+    /// buffer: by the buffer's block and its first byte's offset in the block, which name the
+    /// bytes its address would without asking rt for one (`gpuAddress`, which hands out an
+    /// address of the block, an exported one's among them).
+    Buffer { block: u32, offset: u64 },
+}
+
 /// What a texture is, kept as it is made (the module's docs).
 pub struct Made {
     /// The process's number of it, from 1.
     id: u64,
-    /// Its image's number: its own; a view's, its texture's image's; a texture over a buffer's,
-    /// the buffer's GPU address with the top bit set, as rt keys the hazards of one in place by its
-    /// buffer.
-    image: u64,
+    /// Its image: its own; a view's, its texture's image; a texture over a buffer's, the
+    /// buffer's bytes.
+    image: Image,
     call: Call,
     /// Its image is a surface's shape image.
     surface: bool,
@@ -258,7 +269,7 @@ impl Made {
         let id = NEXT.fetch_add(1, Relaxed);
         Made::of(
             id,
-            id,
+            Image::Own(id),
             call,
             call == Call::SurfaceImage,
             shape,
@@ -311,7 +322,10 @@ impl Made {
         bytes_per_row: u64,
     ) -> Arc<Made> {
         let id = NEXT.fetch_add(1, Relaxed);
-        let image = buffer.gpu_address() | (1 << 63);
+        let image = Image::Buffer {
+            block: buffer.block().get(),
+            offset: buffer.offset(),
+        };
         let over = Over::of(buffer, shape, offset, bytes_per_row);
         let block = Some(buffer.block());
         Made::of(
@@ -327,7 +341,7 @@ impl Made {
 
     fn of(
         id: u64,
-        image: u64,
+        image: Image,
         call: Call,
         surface: bool,
         shape: &Shape,
@@ -378,10 +392,11 @@ impl Made {
         let plane = |m: &Made| m.on_plane.get().map(|on| on.plane);
         if self.id == other.id {
             "one texture"
-        } else if self.image == other.image && self.image >> 63 == 0 {
-            "one image"
         } else if self.image == other.image {
-            "one buffer"
+            match self.image {
+                Image::Own(_) => "one image",
+                Image::Buffer { .. } => "one buffer",
+            }
         } else if plane(self).is_some() && plane(self) == plane(other) {
             "one surface plane"
         } else {
@@ -2588,8 +2603,9 @@ mod tests {
     }
 
     /// Two textures one call names say what they share, by their makes: one texture, one image (a
-    /// texture and a view of it, two views of one texture), one buffer, one surface plane, or no
-    /// image; and each says how it was made.
+    /// texture and a view of it, two views of one texture), one buffer (by its block and its place
+    /// in the block, not its address), one surface plane, or no image; and each says how it was
+    /// made.
     #[test]
     fn two_textures_say_what_they_share() {
         let shape = Shape {
@@ -2607,9 +2623,9 @@ mod tests {
         assert_eq!(texture.shared_with(&view), "one image");
         assert_eq!(view.shared_with(&other_view), "one image");
         assert_eq!(texture.shared_with(&apart), "no image");
-        let over = || {
+        let over_at = |block, offset| {
             let id = NEXT.fetch_add(1, Relaxed);
-            let image = 0x4000 | (1 << 63);
+            let image = Image::Buffer { block, offset };
             Made::of(
                 id,
                 image,
@@ -2620,7 +2636,10 @@ mod tests {
                 (None, None),
             )
         };
+        let over = || over_at(7, 0x4000);
         assert_eq!(over().shared_with(&over()), "one buffer");
+        assert_eq!(over().shared_with(&over_at(7, 0x8000)), "no image");
+        assert_eq!(over().shared_with(&over_at(8, 0x4000)), "no image");
         let (s, t) = (Made::new(Call::View, &shape), Made::new(Call::View, &shape));
         on_plane(&s, (0x5d5d_0000, 0), 0x5, 64);
         on_plane(&t, (0x5d5d_0000, 0), 0x5, 64);

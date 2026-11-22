@@ -515,6 +515,19 @@ impl RtBuffer {
         self.rt.get()
     }
 
+    /// The device address of its first byte where rt made it, for the device's history of
+    /// released ranges and a lost device's walk (`super::fault`): an exportable buffer's from its
+    /// export's record of the block (`super::export`), any other's rt's `gpuAddress`. So these
+    /// diagnostics hand out no address of an exported block, which rt's `gpuAddress` would.
+    pub(super) fn fault_address(&self) -> Option<u64> {
+        let made = self.rt.get()?;
+        #[cfg(unix)]
+        if let Some(exported) = self.exported.get() {
+            return Some(exported.address());
+        }
+        Some(made.gpu_address())
+    }
+
     /// The blocks its device knows (`super::fault`).
     pub(super) fn device_known(&self) -> &KnownBlocks {
         self.device.known_blocks()
@@ -726,11 +739,12 @@ impl Drop for RtBuffer {
         let id = self.named.id();
         if id != 0
             && let Some(made) = self.rt.get()
+            && let Some(at) = self.fault_address()
         {
             let kind = self.named.kind(super::fault::ObjectKind::Buffer);
             let storage = (self.options >> 4) & 0xf;
             let releases = self.device.releases();
-            releases.push(kind, id, storage, (made.gpu_address(), made.length()));
+            releases.push(kind, id, storage, (at, made.length()));
         }
         if let Some(slot) = self.deallocator.take() {
             run(&slot);

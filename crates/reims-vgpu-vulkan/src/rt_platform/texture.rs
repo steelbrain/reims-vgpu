@@ -304,8 +304,8 @@ impl Drop for RtTexture {
         if id != 0
             && let Some((buffer, bytes)) = self.over.get()
             && let Some(buffer) = buffer.upgrade()
-            && let Some(made) = buffer.made_rt()
-            && let Some(gpu_address) = made.gpu_address().checked_add(bytes.start)
+            && let Some(at) = buffer.fault_address()
+            && let Some(gpu_address) = at.checked_add(bytes.start)
         {
             let kind = self.named.kind(super::fault::ObjectKind::Texture);
             let storage = (self.options >> 4) & 0xf;

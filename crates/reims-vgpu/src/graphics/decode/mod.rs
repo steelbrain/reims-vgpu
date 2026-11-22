@@ -5409,7 +5409,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Whether a buffer or heap the decoder holds starts in the `length` bytes of GPU addresses at
     /// `gpu_address`: the Private block they make, in which the guest places each object whole
     /// (`PRIVATE_TAKE`), is not to be given out again while one does. It looks at every object of
-    /// every context, as a block is given back seldom.
+    /// every context, as a block is given back seldom. It asks no device cache's buffer its
+    /// address ([`Entry::over_cache`]): the host makes it in a block of its own, never in a
+    /// guest's, and a video cache's lies in an exported block, whose `gpuAddress` would hand out
+    /// an address of it.
     pub(crate) fn addresses_in_use(&self, gpu_address: u64, length: u64) -> bool {
         let end = gpu_address.saturating_add(length);
         let contexts: Vec<Arc<Context<P>>> =
@@ -5418,6 +5421,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             let mut found = false;
             c.for_each_live(|_, entry| {
                 let at = match &entry.handle {
+                    ObjHandle::Buffer(_) if entry.over_cache => return,
                     ObjHandle::Buffer(buffer) => buffer.gpu_address(),
                     ObjHandle::Heap(heap) => heap.gpu_address(),
                     _ => return,
@@ -14477,5 +14481,25 @@ lacks {part}"
         assert_eq!(on, Ok(Some(TABLES_LET_GO.to_owned())));
         assert_eq!(spawned(&p), 1);
         assert!(!walk.is_live());
+    }
+
+    /// A Private block's give-back asks no device cache's buffer its address
+    /// (`addresses_in_use`), so a cache whose address lies in the block given back does not keep
+    /// it; a buffer the guest placed there does.
+    #[test]
+    fn a_private_give_asks_no_cache_buffer_its_address() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let buffer = || (device.new_buffer_of_length(OnFault::Return, 0x100, 0)).unwrap();
+        let (cache, placed) = (buffer().unwrap(), buffer().unwrap());
+        let (cache_at, placed_at) = (cache.gpu_address(), placed.gpu_address());
+        dec.store(1, Entry::of(ObjHandle::Buffer(cache)).over_cache(true));
+        assert!(!dec.addresses_in_use(cache_at, 0x100), "the cache's buffer");
+        dec.store(2, Entry::of(ObjHandle::Buffer(placed)));
+        assert!(dec.addresses_in_use(placed_at, 0x100), "the guest's buffer");
     }
 }
