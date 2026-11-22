@@ -61,7 +61,10 @@
 //! as amounts: rt counts the writes it kept by their bytes alone.
 //!
 //! **Its translations.** Beside the cache's bytes the counts line carries, as amounts, the
-//! functions rt's translator lowered, [`TRANSLATIONS_CODE`] (`Metrics::translations`), and the
+//! modules rt's translator lowered, [`TRANSLATIONS_CODE`] (`Metrics::translations`: of a compute
+//! content, its partial-threadgroups variant, the plain module of a kernel that observes its
+//! threadgroup partition where its state keeps one beside the variant, and an emulated-SIMD-group
+//! variant; of a render content, each function the cache directory did not hold), and the
 //! lowered kernels pipeline states took from the cache directory in their stead,
 //! [`TRANSLATIONS_LOADED_CODE`] (`Metrics::translations_loaded`), the render contents' records
 //! pipeline states read from the directory, [`RENDER_RECORDS_READ_CODE`]
@@ -265,8 +268,9 @@ pub const CACHE_WRITES_DROPPED_CODE: &str = "rt-cache-writes-dropped";
 /// amount on the counts line ([`fold_metrics`]).
 pub const CACHE_BYTES_WRITTEN_CODE: &str = "rt-cache-bytes-written";
 
-/// The code of the functions rt's translator lowered (`Metrics::translations`), an amount on the
-/// counts line ([`fold_metrics`]).
+/// The code of the modules rt's translator lowered (`Metrics::translations`, one for each module a
+/// pipeline state lowers: the module docs, "Its translations"), an amount on the counts line
+/// ([`fold_metrics`]).
 pub const TRANSLATIONS_CODE: &str = "rt-translations";
 
 /// The code of the lowered kernels pipeline states took from rt's cache directory in place of a
