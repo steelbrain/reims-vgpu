@@ -88,7 +88,11 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   a copy of its crop answers zero, and every entry's is zero where the flag is set, since a
   picture lands in place only in a surface's pages. For an encode entry it would say how a
   source is laid out to be read in place; both arms read every source by a copy, and answer
-  zero.
+  zero. The guest's video driver answers it in AppleGVA's GetPixelBufferInfo, which does not
+  lay out the surfaces AppleGVA decodes into: their rows and plane offsets are CoreVideo's own
+  (a 1080p output's rows are 1920 bytes, its first plane 32 bytes in, whatever the answer), and
+  AppleGVA's HEVC decoders do not ask (measured on an x86-64 macOS 26.7.2 guest, 2026-11-21:
+  `guest/bundle/src/RgfxVideoDriver.cpp`, `PixelRequirement`).
 - **What an encode entry takes**: an `RgfxVideoEncodeCaps` per entry (`encode`): the rate
   controls (a bit each of CQP, CBR and VBR, as the arm's API lists them for the codec's
   profiles) and the most consecutive B pictures, 0 on both arms, whose encoders keep frames in

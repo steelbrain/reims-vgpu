@@ -290,9 +290,14 @@ struct BitstreamPool {
 static_assert(offsetof(BitstreamPool, addresses) == 0x18, "bitstream pool layout");
 
 // GetPixelBufferInfo: the driver answers each plane's size, row pitch and alignment, as the host
-// lands a picture, and AppleGVA makes its frames' IOSurfaces so. Each answer is whole, none 0, as
-// AppleGVA may divide by any of them; a request the driver does not answer whole is refused, its
-// record untouched.
+// lands a picture. Each answer is whole, none 0, as AppleGVA may divide by any of them; a request
+// the driver does not answer whole is refused, its record untouched. The answer does not lay out
+// the IOSurfaces AppleGVA decodes into: CoreVideo lays them out itself, rows on 32 bytes and the
+// first plane 32 bytes in. Measured on an x86-64 macOS 26.7.2 guest over an RX 550 (2026-11-21,
+// walk m3-max-65786, `pixelInfoSaid` and `outputSaid`, the host answering its cached layout at
+// 256): an H.264 decoder's request (function 1, sub-ID 0x8, 1920x1088 NV12, 2 planes) was answered
+// pitches of 2048 bytes at an alignment of 256, and its outputs' rows were 1920 bytes, its planes
+// at bytes 32 and 2088992; HEVC decoders made no request, and their 1080p outputs lay alike.
 struct PixelRequirement {
 	uint32_t function_id;
 	uint32_t sub_id;
