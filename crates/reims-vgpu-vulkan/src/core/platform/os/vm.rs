@@ -134,69 +134,6 @@ pub trait HostVm: Send + Sync {
         let _ = (at, len);
         None
     }
-    /// No Mach counterpart: where the devices of the process import each view of guest pages a
-    /// no-copy buffer lies over as a file of its own, and every file imported costs every
-    /// submission (RADV's dma-bufs, `os::linux::dma_buf`), the most one shared file may hold of
-    /// the views [`HostVm::group_views`] puts in it; `None`, the default, where a view's import
-    /// is made otherwise, and sharing a file gains nothing.
-    fn view_groups(&self) -> Option<GroupLimits> {
-        None
-    }
-    /// No Mach counterpart: puts the views `views`, each its first byte and bytes (whole host
-    /// pages of the library's own views, mapped), into shared files, in order, each file as many
-    /// of them as fit [`HostVm::view_groups`]: while a view's membership lives, the import the
-    /// runtime makes of its pages is a piece of its file, and a device that lists every import in
-    /// every submission lists the file once. A view left out stays alone (`None`), its import made
-    /// as before. The answer's hold keeps the files until the caller has made each member's
-    /// import; a membership drops before its view is unmapped. The default groups none.
-    fn group_views(&self, views: &[(HostAddr, u64)]) -> ViewGroups {
-        ViewGroups {
-            making: None,
-            members: views.iter().map(|_| None).collect(),
-        }
-    }
-    /// No Metal counterpart: where the devices of the process import a view of guest pages as
-    /// one file while it fits these limits, and every file imported costs every submission
-    /// (RADV's views through their sources' dma-bufs, ANV's views one dma-buf holds,
-    /// `os::linux::import`), the most runs and bytes such a view holds: the most a regroup of
-    /// lone views into one view of all their pages takes (the graphics lane's
-    /// `decode::surface_pages`, "Regroups"). `None`, the default, where a view's import is made
-    /// otherwise, and one view of many gains nothing.
-    fn regroup_limits(&self) -> Option<GroupLimits> {
-        None
-    }
-}
-
-/// What one shared file of views takes at most ([`HostVm::view_groups`]): runs of pages, and bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GroupLimits {
-    /// Runs of pages, each a run of one file's pages that follow on.
-    pub runs: u64,
-    /// Bytes.
-    pub bytes: u64,
-}
-
-/// A hold of [`HostVm::group_views`]': what it holds goes as it drops.
-pub type GroupHold = Box<dyn std::any::Any + Send + Sync>;
-
-/// What [`HostVm::group_views`] made of a list of views.
-pub struct ViewGroups {
-    /// The shared files, held until the caller has made each member's import: from then on the
-    /// imports hold them.
-    pub making: Option<GroupHold>,
-    /// Each view's membership of its file, in the order given, which keeps its import a piece of
-    /// that file until it drops; `None` for a view left alone.
-    pub members: Vec<Option<GroupHold>>,
-}
-
-impl std::fmt::Debug for ViewGroups {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let grouped = self.members.iter().filter(|m| m.is_some()).count();
-        f.debug_struct("ViewGroups")
-            .field("views", &self.members.len())
-            .field("grouped", &grouped)
-            .finish()
-    }
 }
 
 #[cfg(test)]

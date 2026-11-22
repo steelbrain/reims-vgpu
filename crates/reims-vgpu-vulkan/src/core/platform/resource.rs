@@ -117,28 +117,6 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     fn external_write_done(&self) -> Result<(), String> {
         Ok(())
     }
-    /// No Metal counterpart (Metal's own is `replaceBackingWithRanges:`, which no guest message
-    /// asks): the no-copy buffer lies over `bytes` from now on, the same length, its object,
-    /// GPU address and options as they were: the graphics lane moves a buffer over a view of
-    /// guest pages into a view of more pages so, the bytes the same guest pages, so that one
-    /// import holds many such buffers (`decode::surface_pages`, "Regroups"). `deallocator` runs
-    /// once the platform let go of `bytes`; the buffer's deallocator before it runs once it let
-    /// go of the old bytes. `Err` says why not, the buffer then over its old bytes and
-    /// `deallocator` dropped unrun: the default, a buffer that is not a no-copy buffer, one a
-    /// command buffer not yet committed has used, and one a committed command buffer still holds
-    /// (one whose encoder the platform cannot encode again, until its submission; one with a
-    /// dispatch left to the host's step, a GPU-written indirect one among them, from the
-    /// dispatch's call until it completed). Commands that use the buffer may be encoded and
-    /// committed on other threads meanwhile, and none of them fails for the move; no other call
-    /// moves it or lets go of its bytes, and no texture is made over its bytes, while this runs.
-    fn rebind_no_copy(
-        &self,
-        bytes: HostRange<'_>,
-        deallocator: Option<super::device::NoCopyDeallocator>,
-    ) -> Result<(), String> {
-        let _ = (bytes, deallocator);
-        Err("the platform rebinds no buffer".to_owned())
-    }
     /// No Metal counterpart: makes the memory of a buffer made deferred
     /// ([`GpuDevice::new_deferred_buffer_of_length`](super::device::GpuDevice::new_deferred_buffer_of_length))
     /// where it is not made yet, once, as zeros: whether the buffer holds its memory, `false`

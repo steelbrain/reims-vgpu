@@ -29,9 +29,7 @@ use super::script::Script;
 use crate::core::host::HostPtr;
 use crate::core::num::{self, ToU64, ToUsize};
 use crate::core::platform::ObjId;
-use crate::core::platform::os::vm::{
-    GroupHold, GroupLimits, HostAddr, HostVm, KernReturn, ViewGroups, VmProt,
-};
+use crate::core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
 use crate::core::raise::death::DeathKind;
 use crate::core::raise::death::DeathSite;
 use crate::core::raise::death::fatal;
@@ -150,16 +148,6 @@ struct VmState {
     /// What [`HostVm::view_mappings`] answers for the view at each first byte, in place of its
     /// remaps ([`FakeVm::set_view_mappings`]).
     view_mappings: std::collections::BTreeMap<u64, u64>,
-    /// What [`HostVm::view_groups`] answers ([`FakeVm::set_view_groups`]).
-    view_groups: Option<GroupLimits>,
-    /// [`HostVm::group_views`] leaves every view alone ([`FakeVm::refuse_view_groups`]).
-    groups_refused: bool,
-    /// What [`HostVm::regroup_limits`] answers ([`FakeVm::set_regroup_limits`]).
-    regroup_limits: Option<GroupLimits>,
-    /// The groups made so far.
-    groups_made: u64,
-    /// Each grouped view whose membership lives, by first byte: its group and its offset there.
-    grouped: std::collections::BTreeMap<u64, (u64, u64)>,
 }
 
 impl VmState {
@@ -220,34 +208,6 @@ impl FakeVm {
             Some(n) => g.view_mappings.insert(key, n),
             None => g.view_mappings.remove(&key),
         };
-    }
-
-    /// Has [`HostVm::view_groups`] answer `limits` from now on (`None` at first, as Mach's), and
-    /// [`HostVm::group_views`] group views within them.
-    pub fn set_view_groups(&self, limits: Option<GroupLimits>) {
-        self.state.lock().view_groups = limits;
-    }
-
-    /// Has [`HostVm::regroup_limits`] answer `limits` from now on (`None` at first, as Mach's).
-    pub fn set_regroup_limits(&self, limits: Option<GroupLimits>) {
-        self.state.lock().regroup_limits = limits;
-    }
-
-    /// Has [`HostVm::group_views`] leave every view alone from now on, as a host that makes no
-    /// shared file of their pages does (`refused`), or group them again.
-    pub fn refuse_view_groups(&self, refused: bool) {
-        self.state.lock().groups_refused = refused;
-    }
-
-    /// The group of the view whose first byte is `at`, and its offset there, while its
-    /// membership lives ([`HostVm::group_views`]).
-    pub fn view_group(&self, at: HostPtr) -> Option<(u64, u64)> {
-        self.state.lock().grouped.get(&at.addr().to_u64()).copied()
-    }
-
-    /// How many groups [`HostVm::group_views`] made.
-    pub fn groups_made(&self) -> u64 {
-        self.state.lock().groups_made
     }
 
     /// The same address space with its own, discarded log and an empty script: the host's (QEMU's)
@@ -548,87 +508,6 @@ impl HostVm for FakeVm {
                 && off < a.dst_off.saturating_add(a.len())
         };
         Some(g.aliases.iter().filter(meets).count().to_u64())
-    }
-
-    /// As set ([`FakeVm::set_view_groups`]); unlogged, as no Mach call answers it.
-    fn view_groups(&self) -> Option<GroupLimits> {
-        self.state.lock().view_groups
-    }
-
-    /// As set ([`FakeVm::set_regroup_limits`]); unlogged, as no Mach call answers it.
-    fn regroup_limits(&self) -> Option<GroupLimits> {
-        self.state.lock().regroup_limits
-    }
-
-    /// Where views are grouped ([`FakeVm::set_view_groups`]) and not refused
-    /// ([`FakeVm::refuse_view_groups`]): the views in order, each group as many as fit its limits,
-    /// a view one run of its bytes, each member at the page after the one before ends; a group
-    /// that would hold one view leaves it alone, as Linux's does. Unlogged, as no Mach call
-    /// answers it.
-    fn group_views(&self, views: &[(HostAddr, u64)]) -> ViewGroups {
-        let mut members: Vec<Option<GroupHold>> = views.iter().map(|_| None).collect();
-        let mut g = self.state.lock();
-        let Some(limits) = g.view_groups.filter(|_| !g.groups_refused) else {
-            return ViewGroups {
-                making: None,
-                members,
-            };
-        };
-        // Each group's views, by index, and their offsets.
-        let mut groups: Vec<Vec<(usize, u64)>> = Vec::new();
-        let mut open: Vec<(usize, u64)> = Vec::new();
-        let mut bytes = 0;
-        for (i, &(_, length)) in views.iter().enumerate() {
-            let length = num::align_up_wrapping(length, PAGE_SIZE);
-            if !open.is_empty()
-                && (open.len().to_u64() + 1 > limits.runs || bytes + length > limits.bytes)
-            {
-                groups.push(std::mem::take(&mut open));
-                bytes = 0;
-            }
-            open.push((i, bytes));
-            bytes += length;
-        }
-        groups.push(open);
-        for group in groups.into_iter().filter(|g| g.len() > 1) {
-            g.groups_made += 1;
-            let id = g.groups_made;
-            for (i, offset) in group {
-                let (Some(&(at, _)), Some(member)) = (views.get(i), members.get_mut(i)) else {
-                    continue;
-                };
-                let first = at.addr().to_u64();
-                g.grouped.insert(first, (id, offset));
-                *member = Some(Box::new(FakeMembership {
-                    state: Arc::clone(&self.state),
-                    first,
-                    group: id,
-                }));
-            }
-        }
-        ViewGroups {
-            making: Some(Box::new(())),
-            members,
-        }
-    }
-}
-
-/// A view's membership of a group of [`FakeVm`]'s: forgotten as it drops.
-struct FakeMembership {
-    state: Arc<Mutex<VmState>>,
-    first: u64,
-    group: u64,
-}
-
-impl Drop for FakeMembership {
-    fn drop(&mut self) {
-        let mut g = self.state.lock();
-        if g.grouped
-            .get(&self.first)
-            .is_some_and(|&(id, _)| id == self.group)
-        {
-            g.grouped.remove(&self.first);
-        }
     }
 }
 

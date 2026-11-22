@@ -3318,28 +3318,6 @@ mod tests {
         }
     }
 
-    /// A rebind on the GPU the test holds, which the platform refuses (core's default), drops the
-    /// new bytes' deallocator unrun before it returns, on the caller's thread, the buffer over its
-    /// old bytes.
-    #[test]
-    fn a_refused_rebind_drops_its_deallocator_unrun_on_vulkan() {
-        let platform = RtPlatform::new();
-        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
-        let made = device.new_buffer_of_length(OnFault::Return, 64, 0);
-        let buffer = made.expect("never a raise").expect("a buffer");
-        let contents = buffer.contents();
-        let memory = vec![0_u8; 64];
-        let watch = DeallocatorWatch::new();
-        let bytes = HostRange::of_slice(&memory);
-        assert!(
-            buffer
-                .rebind_no_copy(bytes, Some(watch.deallocator()))
-                .is_err()
-        );
-        assert!(watch.dropped_unrun_here());
-        assert_eq!(buffer.contents(), contents);
-    }
-
     /// On the GPU the test holds, kept busy: a no-copy buffer of 17 MiB over memory of the host's
     /// own, rt's import of its pages, released while command buffers are in flight, has its
     /// deallocator run while that load still runs, once rt freed the import (the module's docs,

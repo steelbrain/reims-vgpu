@@ -2864,10 +2864,7 @@ for each other: a `BUFFER_OVER_PAGES` waits only for its own block's
 build checks. What the guest can tell apart from one thread: two
 `BUFFER_OVER_PAGES` of one process on different blocks are made in either
 order, which no answer orders, and the process's later messages wait for
-both. Where the host groups the pages blocks' views (below, "Group dma-bufs of
-the pages blocks' views"), a group's seal is a job under its process's key,
-which waits at most for the group's 1 ms window, never for another key's job,
-and then carries out its members' messages. Tested by
+both. Tested by
 `a_key_whose_job_hangs_holds_no_other_keys_jobs`,
 `a_key_waits_for_a_free_thread_once_every_thread_is_busy`,
 `each_keys_jobs_run_one_at_a_time_in_handed_order`,
@@ -5627,60 +5624,21 @@ buffer begun of a process that holds one (`escaped-copy-commits`). A test holds
 the runtime's copy in: a kernel that reads such a copy only through its address,
 made resident, reads the CPU's new bytes.
 
-**Group dma-bufs of the pages blocks' views.** The host imports each pages
-block's view once, as a buffer over the whole view that the block's
-`BUFFER_OVER_PAGES` buffers lie in. Where the Vulkan platform imports a view as
-a dma-buf of its own and the driver lists every import in every submission
-(RADV), each live view is one more buffer object every `vkQueueSubmit` lists, at
-about 0.5 us each. Measured on the Radeon 780M (Geekbench 7.1 Metal in a macOS
-26.7.2 guest): at Super Resolution's midpoint about 580 such imports were live,
-under about 1,573 no-copy objects, of the 945 buffer objects the process held
-(about 605 of them the runtime's own memory, by its gauges), and a submission
-took about 494 us; grouping is projected to bring a submission to about 250 us
-or less. In Feature Matching, Particle Physics and Fluid Simulation other buffer
-objects of the process (2,000 to 8,700) outnumber the imports, and grouping cuts
-less there. There the surface worker gathers a process's views for a window: the
-`BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` that makes a block's view maps it and
-joins its process's open group, which stays open 1 ms from its first member, or
-until its members reach one dma-buf's limits: udmabuf's `list_limit` runs and
-`size_limit_mb` bytes, as the host has them (the host sets neither), and at most
-64 MiB, whatever udmabuf takes (below). It closes sooner once nothing more can
-join it: a later message of the process on the control ring waits for the views,
-which holds the process's messages behind it, and every view posted before that
-message has joined. The group is then sealed: the views' pages go into shared
-dma-bufs back to back, and each view's import is a piece of its group's file, so
-the driver lists one import for the group. Only then are the members' messages
-carried out, and the process's and the blocks' later messages wait for that, so
-each sees its buffer as right after its create. A `BUFFER_OVER_PAGES` has no
-answer, so the window delays only the process's messages that wait for the views.
-A Geekbench 7.1 Metal walk on the Radeon 780M (2026-11-15) put 3,665 of its 4,686
-views in 930 groups. A walk of a macOS 26.7.2 desktop on the same GPU, Finder
-then Launchpad, made 559 groups of one view each and a view took 1.25 ms at the
-median from its begin on the host to its make, nearly all of it the window; with
-the early close, 537 of its 553 groups closed as a message of the process waited
-for them, and a view took 0.20 ms.
-
-Some views take no group: a view over 16 MiB, one past a group's limits alone,
-a view the host's cache of views holds, a heap over the guest's RAM, a block of
-pages its process maps read-only and a read-only buffer (both made over a copy
-of the pages), and a texture's import. A view whose group the host refuses is
-imported alone, as before. A process's close and the device's reset drop its
-groups being formed, which make nothing. What the guest sees does not change
-beyond timing: object ids, GPU addresses, refusals, and the order of events and
-interrupts are as before.
-
-A member whose buffers went keeps its pages pinned (udmabuf holds them) and
-mapped in the GPU's address space inside its group's import until the group's
-last member goes, though no object covers them: in each group, at most the
-group's bytes, 64 MiB. That cap is the host's own: udmabuf's default
-`size_limit_mb` is 64, but CachyOS's 7.3 kernels boot with it at 2147483647,
-where `list_limit` alone would let a group of large views pin gigabytes. With
-the cap, a simulation over the creates and frees of Geekbench's Super
-Resolution on the Radeon 780M holds 26 to 182 MiB of such pages at once, in all
-groups, by the runs' sizes (4 KiB to 64 KiB), on every host alike. They are the
-guest's RAM, resident anyway, and only a stale GPU address would reach them, as
-it would reach any freed memory; the guest reuses them once the kext unwires
-them.
+**Each pages block's view is one import.** The host imports each pages block's
+view once, as a buffer over the whole view that the block's `BUFFER_OVER_PAGES`
+buffers lie in. On metal2vulkan-runtime's device, where the guest took
+`IMPORT_ADDRESSES`, that import is made at the block's `SURFACE_PAGES`, before
+its answer ("Import addresses"); else at the block's first message that needs
+it. On RADV the import is one dma-buf a view, or several where its pages pass
+udmabuf's limits (the Vulkan crate's `rt_platform/buffer.rs`, "Dma-bufs of the
+pages"), and the driver lists every import in every submission, so each live
+view is one more buffer object every `vkQueueSubmit` lists, at about 0.5 us
+each. Measured on the Radeon 780M (Geekbench 7.1 Metal in a macOS 26.7.2 guest,
+2026-11-14), and again at 0.49 to 0.50 us an import by metal2vulkan's own
+control on 2026-11-22: at Super Resolution's midpoint about 580 such imports
+were live, under about 1,573 no-copy objects, of the 945 buffer objects the
+process held (about 605 of them the runtime's own memory), and a submission took
+about 494 us.
 
 **Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is
 memory of its process's, which the guest maps: a buffer's a Shared buffer of

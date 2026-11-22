@@ -546,32 +546,4 @@ mod tests {
         assert!(made.unwrap().heap.is_none());
         assert!(watch.dropped_unrun_here());
     }
-
-    /// A rebind the buffer refuses, scripted or of bytes of another length, drops the new bytes'
-    /// deallocator unrun before it returns, on the caller's thread, as the Vulkan platform's
-    /// refusal does, the buffer over its old bytes.
-    #[test]
-    fn a_refused_rebind_drops_its_deallocator_unrun() {
-        let p = FakePlatform::new();
-        let d = p.device();
-        let (old, new) = (vec![0_u8; 64], vec![0_u8; 64]);
-        let made = d.new_buffer_over_host_memory(OnFault::Die, HostRange::of_slice(&old), 0, None);
-        let buffer = made.unwrap().expect("a no-copy buffer");
-        let raise = Step::Raise {
-            name: "NSInvalidArgumentException".to_owned(),
-            reason: "a scripted refusal".to_owned(),
-        };
-        p.script().push("rebindNoCopy", raise);
-        for bytes in [&new[..], &new[..32]] {
-            let watch = DeallocatorWatch::new();
-            let rebound =
-                buffer.rebind_no_copy(HostRange::of_slice(bytes), Some(watch.deallocator()));
-            assert!(rebound.is_err(), "{} bytes", bytes.len());
-            assert!(watch.dropped_unrun_here(), "{} bytes", bytes.len());
-            assert_eq!(
-                buffer.contents(),
-                HostPtr::from_ptr(old.as_ptr().cast_mut())
-            );
-        }
-    }
 }

@@ -142,9 +142,9 @@ use crate::graphics::decode::shares::ListenSink;
 use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
     AheadSinks, Begun, CompiledPipeline, CompletionSink, DecodeError, Decoders, DrainAnswer,
-    FinishedSink, GraphicsDecoder, Joined, LibraryJob, LibraryStart, MadeLibrary, PipelineJob,
-    PipelineKey, PipelineReply, ReflectionSink, ScheduledSink, SignalSink, Sinks, SubmittedSink,
-    SurfacePresent, Then, compile_refusing, complete, make_library, refused_reply, refusing,
+    FinishedSink, GraphicsDecoder, LibraryJob, LibraryStart, MadeLibrary, PipelineJob, PipelineKey,
+    PipelineReply, ReflectionSink, ScheduledSink, SignalSink, Sinks, SubmittedSink, SurfacePresent,
+    Then, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, LetGo, PresentAnswers, PresentQueue};
@@ -2096,10 +2096,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn close_context(&self, context: u32, answer: CompleteAnswer) {
         // Its waits' ends and its frees, for a slow answer's line (`slow_answers`).
         let marks = Arc::new(CloseMarks::asked());
-        // Its groups of views being formed make nothing (`decode::surface_pages`, "Group
-        // dma-bufs"); then after its no-copy buffers being made, so none lands in the table its
-        // close empties.
-        self.decoder().drop_groups(context);
+        // After its no-copy buffers being made, so none lands in the table its close empties.
         self.pages_buffers.wait(pages_context(context));
         marks.pages();
         entry::run(|_| {
@@ -2637,9 +2634,6 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         // A message of a context whose no-copy buffer is being made on the surface worker, which
         // it may name, is carried out after it.
         self.wait_for_pages_buffers(poster, message);
-        if poster.queue_obj_id().is_none() {
-            self.regroup_step(poster, message);
-        }
         match r#type {
             RGFX_CMD_RENDER_PIPELINE_CREATE
             | RGFX_CMD_MESH_RENDER_PIPELINE_CREATE
@@ -3722,12 +3716,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     }
 
     /// Waits for the no-copy buffers and heaps of `message`'s context being made on the surface
-    /// worker ([`Self::start_over_pages`]), which it may name. A ring-0 message waits on its
-    /// context's lane, which hands no later message over meanwhile, so no view behind it can
-    /// join the context's group being formed: the group closes once the views handed over before
-    /// it have joined, rather than at its window's end (`decode::surface_pages`, "Group
-    /// dma-bufs"). A message of a queue's ring leaves the group its window, as a later view of the
-    /// context may still come on ring 0.
+    /// worker ([`Self::start_over_pages`]), which it may name.
     fn wait_for_pages_buffers(&self, poster: &CompletionPoster, message: &[u8]) {
         let context = sender_context(poster, message);
         let key = pages_context(context);
@@ -3736,9 +3725,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
         let begun = self.pool.now();
         let ring_0 = poster.queue_obj_id().is_none();
-        let waits = ring_0.then(|| self.decoder().wait_for_views(context));
         self.pages_buffers.wait(key);
-        drop(waits);
         let (ty, seqno, _) = message_identity(message);
         log::debug!(
             target: "reims_vgpu::graphics::surface_pages",
@@ -3779,90 +3766,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             self.pages_buffers.begin(context, 0, begun),
             self.pages_buffers.begin(block, 0, begun),
         );
-        // Counted until its job has joined its context's group or gone on alone, so a message of
-        // the context that waits behind it on its lane leaves the group open for it.
-        let handed = decoder.hand_over_pages(sender_context(poster, message));
-        let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
-        decoder.on_surface_worker(
-            block,
-            Box::new(move || {
-                let context = sender_context(&poster, &message);
-                // Where the platform groups views, the block's view is mapped here and joins its
-                // context's group, and the rest waits for the group's seal
-                // (`decode::surface_pages`, "Group dma-bufs").
-                let joined = {
-                    let _carried = me.reset_gate.read_recursive();
-                    if poster.stale() {
-                        return;
-                    }
-                    let carry = (poster.clone(), message.clone(), name, block, settles);
-                    let then = Arc::clone(&me).over_pages_job(carry);
-                    let decoder = (me.decoders).sender(Some(context), Sinks::default());
-                    decoder.join_group(&message, then)
-                };
-                drop(handed);
-                match joined {
-                    Joined::Now(then) => then(),
-                    Joined::Waits => {}
-                    Joined::Opened(number) => {
-                        let sealer = Arc::clone(&me);
-                        let seal = Box::new(move || sealer.seal_group(number));
-                        me.decoder().on_surface_worker(group_key(context), seal);
-                    }
-                }
-            }),
-        );
+        let carry = (poster.clone(), message.to_vec(), name, block, settles);
+        decoder.on_surface_worker(block, Arc::clone(self).over_pages_job(carry));
         true
-    }
-
-    /// At a ring-0 message, before it is carried out (`decode::surface_pages`, "Regroups"): the
-    /// regroups of its context made ready, their members' buffers moved into their views here, on
-    /// the context's lane, as many as the message's budget takes, what that did logged and traced
-    /// (`regroup`: the context, the microseconds, the moves asked, the members taken up and those
-    /// left for its next messages); and where a pass is due, the pass handed to the surface
-    /// worker, under the reset gate, held shared recursively, as its other jobs are, where the
-    /// regroups' views are mapped and their imports made, off the lanes.
-    fn regroup_step(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
-        let context = sender_context(poster, message);
-        let decoder = self.decoder();
-        let (ready, due) = decoder.regroup_step(context, self.pool.now());
-        if ready {
-            let mover = (self.decoders).sender(Some(context), Sinks::default());
-            if let Some(moves) = mover.move_regroups() {
-                let us = u64::try_from(moves.took.as_micros()).unwrap_or(u64::MAX);
-                reims_vgpu_vulkan::core::trace::event(
-                    "regroup",
-                    &[
-                        u64::from(context),
-                        us,
-                        moves.rebinds,
-                        moves.handled,
-                        moves.left,
-                    ],
-                );
-                log::debug!(
-                    target: "reims_vgpu::graphics::surface_pages",
-                    "context {context}'s regroups: {} moves asked on its lane in {us} us, {} \
-                     members taken up, {} left for its next messages",
-                    moves.rebinds, moves.handled, moves.left
-                );
-            }
-        }
-        if due {
-            let me = Arc::clone(self);
-            decoder.on_surface_worker(
-                REGROUP_KEY,
-                Box::new(move || {
-                    let _carried = me.reset_gate.read_recursive();
-                    if let Err(raise) = me.decoder().regroup_pass(&me.device) {
-                        log::debug!(
-                            target: "reims_vgpu::graphics::surface_pages",
-                            "a regroups' pass ended at a raise: {raise:?}"
-                        );
-                    }
-                }),
-            );
-        }
     }
 
     /// The carrying out of a `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` handed to the surface
@@ -3898,29 +3804,6 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             );
             drop(settles);
         })
-    }
-
-    /// The seal of the group of pages blocks' views numbered `number` (`decode::surface_pages`,
-    /// "Group dma-bufs"), on the surface worker, under its context's key ([`group_key`]): waits
-    /// for its window to close, makes the members' imports under the reset gate, held shared
-    /// recursively, as the worker's other jobs are, then carries out the messages that waited
-    /// for them, in their order, each as [`Self::over_pages_job`] does. Where the group went (its
-    /// context's close, the device's reset), nothing.
-    fn seal_group(&self, number: u64) {
-        let decoder = self.decoder();
-        let Some(sealing) = decoder.group_closed(number) else {
-            return;
-        };
-        {
-            let _carried = self.reset_gate.read_recursive();
-            decoder.seal_group(&self.device, sealing);
-        }
-        // The members' messages, and those that join a member while they are carried out.
-        while let Some(jobs) = decoder.group_jobs(number) {
-            for job in jobs {
-                job();
-            }
-        }
     }
 
     /// An `ICB_CREATE` from ring 0: unsettled here, in ring order, and made on the ICB worker,
@@ -5431,17 +5314,6 @@ fn sender_context(poster: &CompletionPoster, message: &[u8]) -> u32 {
 fn pages_context(context: u32) -> u64 {
     1 << 63 | u64::from(context)
 }
-
-/// The surface worker's key the seals of context `context`'s groups of views run under
-/// (`GraphicsControl::seal_group`), apart from its blocks' offsets, which lie below 2^63, and the
-/// views' teardowns' key (`u64::MAX`).
-fn group_key(context: u32) -> u64 {
-    0xffff_fffe_0000_0000 | u64::from(context)
-}
-
-/// The surface worker's key of the regroups' passes (`decode::surface_pages`, "Regroups"): one at
-/// a time, apart from every block's and group's jobs.
-const REGROUP_KEY: u64 = 0xffff_fffd_0000_0000;
 
 /// The name of the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message`, and its pages block's
 /// offset; `None` for any other message.

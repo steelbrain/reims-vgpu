@@ -12,7 +12,6 @@ use super::super::objects::{
 use super::super::platform::FakePlatform;
 use super::{Backing, fatal, new_buffer, new_texture};
 use crate::core::host::HostPtr;
-use crate::core::num::ToU64 as _;
 use crate::core::platform::compute::Dispatch;
 use crate::core::platform::resource::*;
 use crate::core::platform::stage::Site;
@@ -241,46 +240,6 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
             ],
             |w| Some(new_texture(w, desc, Some(parent), false)),
         )
-    }
-
-    /// Logged with the new bytes' pointer and length (`rebindNoCopy`); a scripted raise refuses
-    /// it, as does a buffer of no contents or of another length, and a refusal drops `deallocator`
-    /// unrun as it returns, with no lock held. Otherwise `contents` answers the new pointer, the
-    /// buffer's deallocator runs at once, as the fake holds no import of the old bytes, and
-    /// `deallocator` takes its place.
-    fn rebind_no_copy(
-        &self,
-        bytes: HostRange<'_>,
-        deallocator: Option<crate::core::platform::device::NoCopyDeallocator>,
-    ) -> Result<(), String> {
-        let (ptr, len) = (bytes.ptr(), bytes.len());
-        self.act(
-            Policy::Caught,
-            "rebindNoCopy",
-            vec![Arg::U64(ptr.addr().to_u64()), Arg::U64(len)],
-        )
-        .map_err(|_| "a scripted refusal".to_owned())?;
-        let (old, old_desc) = {
-            let mut state = self.state();
-            let Model::Buffer(m) = &mut state.model else {
-                return Err("no buffer model".to_owned());
-            };
-            if m.contents.is_null() || m.length != len {
-                return Err("no contents, or another length".to_owned());
-            }
-            let old_ptr = m.contents;
-            m.contents = ptr;
-            let old = std::mem::replace(&mut m.deallocator, deallocator);
-            let old_desc = m.desc_deallocator.take().map(|d| (d, old_ptr, m.length));
-            (old, old_desc)
-        };
-        if let Some(d) = old {
-            d();
-        }
-        if let Some((d, at, length)) = old_desc {
-            (d.0)(at, length);
-        }
-        Ok(())
     }
 }
 
