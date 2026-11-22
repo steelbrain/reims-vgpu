@@ -87,10 +87,14 @@ static COPIED_LOGGED: AtomicBool = AtomicBool::new(false);
 impl<P: Platform> GraphicsDecoder<P> {
     /// Takes the per-shape form from now on (module doc), each shape's image made by `maker`,
     /// placed where `places` and its first fill is made with its make
-    /// (`surface_cache::shapes`, "Placed images"): set once, at the device's make, before any
-    /// surface is named.
+    /// (`surface_cache::shapes`, "Placed images"), the shapes' clock the platform's, for their
+    /// age rule (`surface_cache::shapes`, "The bound"): set once, at the device's make, before
+    /// any surface is named.
     pub(crate) fn set_surface_shapes(&self, maker: ShapeMaker<P>, places: bool) {
-        self.surface_caches.set_shapes(maker, places);
+        use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+        let platform = std::sync::Arc::clone(&self.platform);
+        let now = std::sync::Arc::new(move || platform.clock().now_mono());
+        self.surface_caches.set_shapes(maker, places, now);
     }
 
     /// Refuses the block at `block` as uncached in the per-shape form (module doc): any device
@@ -1108,6 +1112,61 @@ mod tests {
         assert_eq!(counts.dropped, 2, "the referenced one kept");
         assert_eq!(counts.dropped_bytes, (1 + 2) * 8 * 4);
         assert!(r.dec.entry(20).unwrap().shape.is_some());
+    }
+
+    /// The age rule: a shape no texture references, unused for [`shapes::UNREFERENCED_FOR`], goes
+    /// at the next new shape of any block's cache, though the bound would keep it, counted with
+    /// its bytes; one used within the period and a referenced one stay, and a texture of the
+    /// shape that went makes it again, counted
+    #[test]
+    fn unreferenced_shapes_unused_for_the_period_go_at_any_new_shape() {
+        let mut r = shaped();
+        let page = r.page;
+        texture(&mut r, 20, 80, (32, 8));
+        texture(&mut r, 21, 80, (4, 8));
+        destroy(&mut r, 21);
+        let other = BLOCK + 0x10000;
+        assert_eq!(r.pages_cached(other, &[(4, 1)], page, true), RGFX_STATUS_OK);
+        assert_eq!(r.buffer(11, other, page), Ok(()));
+        let half = shapes::UNREFERENCED_FOR / 2;
+        r.p.virtual_clock().advance(half);
+        texture(&mut r, 22, 80, (5, 8));
+        destroy(&mut r, 22);
+        r.p.virtual_clock().advance(half + std::time::Duration::from_millis(1));
+        assert_eq!(r.dec.caches().counts().shapes.dropped, 0);
+        let message = surface_texture(30, 11, 80, (8, 8));
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.dropped, counts.aged), (1, 1), "width 4's, at the other's make");
+        assert_eq!((counts.dropped_bytes, counts.aged_bytes), (4 * 8 * 4, 4 * 8 * 4));
+        texture(&mut r, 31, 80, (5, 8));
+        texture(&mut r, 32, 80, (4, 8));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.found, counts.again, counts.aged_again), (1, 1, 1));
+        assert!(r.dec.entry(20).unwrap().shape.is_some());
+    }
+
+    /// The age rule at a use: with no new shape made, the first use of any shape a period after
+    /// the rule's last pass takes out the shapes unused for the period, their bytes given back; a
+    /// use within the period takes none out
+    #[test]
+    fn a_use_a_period_on_takes_out_the_aged_shapes() {
+        let mut r = shaped();
+        texture(&mut r, 20, 80, (32, 8));
+        texture(&mut r, 21, 80, (4, 8));
+        destroy(&mut r, 21);
+        let row = 8 * 4;
+        assert_eq!(r.dec.caches().live().cache_bytes, (32 + 4) * row);
+        r.p.virtual_clock().advance(shapes::UNREFERENCED_FOR / 2);
+        texture(&mut r, 22, 80, (32, 8));
+        assert_eq!(r.dec.caches().counts().shapes.aged, 0, "within the period");
+        r.p.virtual_clock().advance(shapes::UNREFERENCED_FOR);
+        texture(&mut r, 23, 80, (32, 8));
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.made, counts.found), (2, 2), "no new shape");
+        assert_eq!((counts.aged, counts.dropped), (1, 1));
+        assert_eq!(counts.aged_bytes, 4 * row);
+        assert_eq!(r.dec.caches().live().cache_bytes, 32 * row);
     }
 
     /// Past the caches' budget the shapes no texture references are trimmed least recently used

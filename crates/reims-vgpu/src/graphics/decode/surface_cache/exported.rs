@@ -572,8 +572,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let Ok(images) = <[P::Texture; 2]>::try_from(planes) else {
             return (None, (Vec::new(), Some(memory)));
         };
-        self.shape_clock += 1;
-        let now = self.shape_clock;
+        let now = super::tick(&mut self.shape_clock, self.shape_now.as_ref());
         let mut found = None;
         let mut bytes = 0;
         for (plane, image) in ask.keys.iter().zip(&images) {
@@ -1001,8 +1000,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let Ok(images) = <[P::Texture; 2]>::try_from(planes) else {
             return (None, (Vec::new(), Some((memory, drawn))));
         };
-        self.shape_clock += 1;
-        let now = self.shape_clock;
+        let now = super::tick(&mut self.shape_clock, self.shape_now.as_ref());
         let mut found = None;
         let mut bytes = 0;
         for (plane, image) in ask.keys.iter().zip(&images) {

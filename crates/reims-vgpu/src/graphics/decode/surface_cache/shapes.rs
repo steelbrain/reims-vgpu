@@ -164,11 +164,30 @@
 //! drops a reference with no lock and no message. The guest's release of a texture moves no byte.
 //!
 //! **The bound.** An entry keeps every referenced shape and, of its unreferenced ones, the
-//! [`UNREFERENCED_KEPT`] most recently used ([`ShapeTable::sweep`]); the shapes' bytes count in
-//! the caches' budget ([`super::SurfaceCaches::set_cache_budget`]), which trims unreferenced
-//! shapes, least recently used first, and never a referenced one. The same shape made again finds
-//! its image and costs nothing; one made again after its image was dropped is counted
-//! ([`ShapeTable::insert`]), which is what a change of [`UNREFERENCED_KEPT`] would move.
+//! [`UNREFERENCED_KEPT`] most recently used ([`ShapeTable::sweep`]), as long as each was used
+//! within [`UNREFERENCED_FOR`]: each new shape, of any entry, and the first use of any shape a
+//! period after the rule's last pass take out every entry's unreferenced shapes unused for longer
+//! ([`ShapeTable::age_out`]; `SurfaceCaches`'s `tick_shapes`), so a cache whose textures all
+//! went gives its images back while the guest goes on using other shapes, with no timer and no
+//! thread of its own. In the per-shape form the shapes' clock is the platform's, in nanoseconds.
+//! A shape is used at its make, at a texture made of it, and at each use of its surface while a
+//! texture references it ([`ShapeTable::touch`]); a copy into or out of the cache is no use of an
+//! unreferenced shape. The shapes' bytes count in the caches' budget
+//! ([`super::SurfaceCaches::set_cache_budget`]), which trims unreferenced shapes, least recently
+//! used first, and never a referenced one. The same shape made again finds its image and costs
+//! nothing; one made again after its image was dropped is counted ([`ShapeTable::insert`]), and
+//! of those the ones the age rule took out: what a change of [`UNREFERENCED_KEPT`] or
+//! [`UNREFERENCED_FOR`] would move. Such a make costs a new image, placed or the platform's own
+//! ("Placed images"), and its fill, a GPU copy of its texels from the cache's buffer, or from
+//! the pages where the buffer holds no memory, or none where it would copy zeros ("Zeros").
+//!
+//! The period is measured. On rt on an M3 Max, an arm64 macOS 27 guest's walk through the
+//! desktop, a browser and ten apps (11-21, 7.5 minutes) referenced an unreferenced shape again
+//! 2312 times, at gaps since its last use of 18 ms at the median, 57 ms at the 90th percentile
+//! and 1.1 s at the 99th. Of the unreferenced shapes that reached an age of 1 s, 1 in 86 was
+//! referenced again; of 2 s, 1 in 142; of 10 s, 1 in 364. The period is the first of those ages
+//! past 1 in 100: 16 of the walk's re-uses came later, which the rule makes again, 121 MiB of
+//! fills, and at the walk's end every one of its 458 unreferenced shapes (2106 MiB) was older.
 //!
 //! **Formats.** A shape is made for a texture of an ordinary colour format ([`texel_bytes`]). A
 //! compressed or 4:2:2 texture reads blocks of texels, a two-plane YCbCr one both of its surface's
@@ -190,8 +209,14 @@ use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 use reims_vgpu_vulkan::gpu::no_texture::no_view;
 
 /// How many unreferenced shapes an entry keeps, the most recently used (the planner's ruling of
-/// 2026-11-19: referenced shapes and 4 more).
+/// 2026-11-19: referenced shapes and 4 more). It bounds what the age rule cannot: the
+/// unreferenced shapes one entry gathers inside one period ([`UNREFERENCED_FOR`]), where each
+/// texture over the surface at another offset, pitch, extent or texel size is a shape of its own.
 pub(crate) const UNREFERENCED_KEPT: usize = 4;
+
+/// How long an unreferenced shape is kept unused (the module doc, "The bound"), one period on
+/// every host and GPU.
+pub(crate) const UNREFERENCED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The counts' code of a texture over a plain shape in a format that is neither the shape's nor
 /// its sRGB sibling, a view of the plain image rt refuses, as Metal's validation refuses a view in
@@ -383,8 +408,10 @@ pub(crate) struct ShapeCounts {
     pub(crate) made_bytes: u64,
     /// Textures made of a shape the entry held.
     pub(crate) found: u64,
-    /// Shapes made again after their image was dropped ([`ShapeTable::insert`]).
+    /// Shapes made again after their image was dropped ([`ShapeTable::insert`]), and of those
+    /// the ones the age rule took out ([`ShapeTable::age_out`]).
     pub(crate) again: u64,
+    pub(crate) aged_again: u64,
     /// Textures over a cache made over the buffer as in the default form, their format no
     /// shape's ([`texel_bytes`]) or their shape's image or view refused.
     pub(crate) unshaped: u64,
@@ -407,9 +434,12 @@ pub(crate) struct ShapeCounts {
     /// finished.
     pub(crate) fills_made: u64,
     pub(crate) fills_deferred: u64,
-    /// Unreferenced shapes dropped, past the bound or the caches' budget.
+    /// Unreferenced shapes dropped, past the bound or the caches' budget, and their bytes; and of
+    /// those the ones unused for [`UNREFERENCED_FOR`] ([`ShapeTable::age_out`]).
     pub(crate) dropped: u64,
     pub(crate) dropped_bytes: u64,
+    pub(crate) aged: u64,
+    pub(crate) aged_bytes: u64,
     /// Dirty unreferenced shapes the bound kept past it, at each sweep, until a copy out of the
     /// cache writes them back ([`ShapeTable::sweep`]).
     pub(crate) kept_dirty: u64,
@@ -593,12 +623,23 @@ impl<T> Shape<T> {
     }
 }
 
+/// Whether a shape made was made before and dropped ([`ShapeTable::insert`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Again {
+    /// It was not, or not among the last [`DROPPED_REMEMBERED`] dropped.
+    No,
+    /// It was, past the bound or the caches' budget.
+    Dropped,
+    /// It was, unused for [`UNREFERENCED_FOR`] ([`ShapeTable::age_out`]).
+    Aged,
+}
+
 /// One entry's shapes (the module doc).
 pub(crate) struct ShapeTable<T> {
     shapes: Vec<Shape<T>>,
     /// The keys of the shapes dropped last, most recent at the back, at most
-    /// [`DROPPED_REMEMBERED`].
-    dropped: VecDeque<ShapeKey>,
+    /// [`DROPPED_REMEMBERED`], and whether the age rule took each out.
+    dropped: VecDeque<(ShapeKey, bool)>,
 }
 
 impl<T> Default for ShapeTable<T> {
@@ -643,20 +684,20 @@ impl<T> ShapeTable<T> {
 
     /// Adds the shape of `key`, its image `image`, owing a fill from the buffer where `owed`,
     /// used now (`now`): a reference to it, and whether a shape of the same key was dropped
-    /// before (one of the last [`DROPPED_REMEMBERED`] dropped), which the caches count.
+    /// before (one of the last [`DROPPED_REMEMBERED`] dropped), and why, which the caches count.
     pub(crate) fn insert(
         &mut self,
         key: ShapeKey,
         image: T,
         owed: bool,
         now: u64,
-    ) -> (ShapeRef, bool) {
-        let again = match self.dropped.iter().position(|k| *k == key) {
-            Some(at) => {
-                self.dropped.remove(at);
-                true
-            }
-            None => false,
+    ) -> (ShapeRef, Again) {
+        let again = match self.dropped.iter().position(|(k, _)| *k == key) {
+            Some(at) => match self.dropped.remove(at) {
+                Some((_, true)) => Again::Aged,
+                _ => Again::Dropped,
+            },
+            None => Again::No,
         };
         let tag = ShapeRef(Arc::new(()));
         let reference = tag.clone_ref();
@@ -683,7 +724,7 @@ impl<T> ShapeTable<T> {
         image: T,
         owed: bool,
         now: u64,
-    ) -> (ShapeRef, bool) {
+    ) -> (ShapeRef, Again) {
         let made = self.insert(key, image, owed, now);
         if let Some(shape) = self.shapes.last_mut() {
             shape.cleared = true;
@@ -700,7 +741,7 @@ impl<T> ShapeTable<T> {
         image: T,
         owed: bool,
         now: u64,
-    ) -> (ShapeRef, bool) {
+    ) -> (ShapeRef, Again) {
         let made = self.insert(key, image, owed, now);
         if let Some(shape) = self.shapes.last_mut() {
             shape.plane = true;
@@ -867,7 +908,22 @@ impl<T> ShapeTable<T> {
             .filter(|&&(_, _, dirty)| !dirty)
             .map(|&(_, id, _)| id)
             .collect();
-        self.take(|s| going.contains(&s.id()))
+        self.take(|s| going.contains(&s.id()), false)
+    }
+
+    /// The unreferenced shapes last used before `before`, the caches' clock less
+    /// [`UNREFERENCED_FOR`], taken out (the module doc, "The bound"), counted in `counts`: never
+    /// a dirty one, which stays until a copy out of the cache writes it back (rule 3), nor a
+    /// plane shape.
+    pub(crate) fn age_out(&mut self, before: u64, counts: &mut ShapeCounts) -> Vec<Shape<T>> {
+        let aged = |s: &Shape<T>| !s.referenced() && !s.dirty && s.used < before;
+        if !self.shapes.iter().any(|s| !s.plane && aged(s)) {
+            return Vec::new();
+        }
+        let gone = self.take(aged, true);
+        counts.aged += gone.len() as u64;
+        counts.aged_bytes += gone.iter().map(|s| s.bytes).sum::<u64>();
+        gone
     }
 
     /// The least recently used unreferenced shape that is not dirty, with its clock, where one is
@@ -881,12 +937,12 @@ impl<T> ShapeTable<T> {
 
     /// The shape `id`, taken out.
     pub(crate) fn take_id(&mut self, id: u64) -> Option<Shape<T>> {
-        self.take(|s| s.id() == id).pop()
+        self.take(|s| s.id() == id, false).pop()
     }
 
-    /// The shapes `going` picks, taken out, their keys remembered as dropped: never a plane shape
-    /// (the module doc, "Plane shapes").
-    fn take(&mut self, going: impl Fn(&Shape<T>) -> bool) -> Vec<Shape<T>> {
+    /// The shapes `going` picks, taken out, their keys remembered as dropped, by the age rule
+    /// where `aged`: never a plane shape (the module doc, "Plane shapes").
+    fn take(&mut self, going: impl Fn(&Shape<T>) -> bool, aged: bool) -> Vec<Shape<T>> {
         let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shapes)
             .into_iter()
             .partition(|s| !s.plane && going(s));
@@ -895,7 +951,7 @@ impl<T> ShapeTable<T> {
             if self.dropped.len() == DROPPED_REMEMBERED {
                 self.dropped.pop_front();
             }
-            self.dropped.push_back(shape.key);
+            self.dropped.push_back((shape.key, aged));
         }
         gone
     }
@@ -1324,7 +1380,7 @@ mod tests {
     fn references_count_while_their_textures_live() {
         let mut table = ShapeTable::<u32>::default();
         let (first, again) = table.insert(key(100, 4), 7, true, 1);
-        assert!(!again);
+        assert_eq!(again, Again::No);
         let shape = table.iter().next().unwrap();
         assert_eq!(
             (shape.references(), shape.owed, shape.dirty),
@@ -1367,9 +1423,9 @@ mod tests {
             "within the bound"
         );
         let (_, again) = table.insert(key(13, 4), 3, true, 20);
-        assert!(again, "made again after its drop");
+        assert_eq!(again, Again::Dropped, "made again after its drop");
         let (_, again) = table.insert(key(50, 4), 50, true, 21);
-        assert!(!again);
+        assert_eq!(again, Again::No);
         drop(held);
     }
 
@@ -1554,6 +1610,41 @@ mod tests {
         let gone: Vec<u64> = table.sweep(&mut counts).iter().map(|s| s.image).collect();
         assert_eq!(gone, vec![0]);
         assert_eq!(counts.kept_dirty, 1);
+    }
+
+    /// The age rule takes out each unreferenced shape last used before its cut, though the bound
+    /// would keep it, counted with its bytes, and a shape made again after it is told so; a
+    /// shape used since, a referenced one, a dirty one and a plane shape stay
+    #[test]
+    fn unreferenced_shapes_unused_for_the_period_go() {
+        let period = u64::try_from(UNREFERENCED_FOR.as_nanos()).unwrap();
+        let mut table = ShapeTable::<u64>::default();
+        let held = table.insert(key(10, 4), 10, false, 0).0;
+        drop(table.insert(key(11, 4), 11, false, 0));
+        let dirty = table.insert(key(12, 4), 12, false, 0).0;
+        assert!(table.mark_dirty(dirty.id()));
+        drop(dirty);
+        let plane = ShapeKey {
+            plane: 1,
+            offset: 64 * 4096,
+            ..key(13, 4)
+        };
+        drop(table.insert_plane(plane, 13, false, 0));
+        drop(table.insert(key(14, 4), 14, false, 0));
+        drop(table.find(&key(14, 4), period / 2));
+        let mut counts = ShapeCounts::default();
+        assert!(table.sweep(&mut counts).is_empty(), "within the bound");
+        let now = period + 1;
+        let gone: Vec<u64> = (table.age_out(now - period, &mut counts).iter())
+            .map(|s| s.image)
+            .collect();
+        assert_eq!(gone, vec![11], "unused since 0; 14 was used at half the period");
+        assert_eq!((counts.aged, counts.aged_bytes), (1, key(11, 4).bytes()));
+        assert_eq!(table.iter().count(), 4);
+        assert!(table.age_out(now - period, &mut counts).is_empty());
+        let (_, again) = table.insert(key(11, 4), 11, true, now);
+        assert_eq!(again, Again::Aged, "made again after its age");
+        drop(held);
     }
 
     /// A decode drawn over a new cache's zeros takes as met the fills its plane shapes owe, and

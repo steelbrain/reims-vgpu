@@ -841,6 +841,18 @@ impl Changed {
     }
 }
 
+/// [`shapes::UNREFERENCED_FOR`] in nanoseconds, the shapes' clock's unit in the per-shape form.
+const AGE_PERIOD: u64 = shapes::UNREFERENCED_FOR.as_nanos() as u64;
+
+/// The shapes' clock `clock` at a use, a tick past its last: where the platform's clock `now` is
+/// given, in the per-shape form, at least it in nanoseconds, which the age rule reads
+/// ([`shapes::UNREFERENCED_FOR`]).
+fn tick(clock: &mut u64, now: Option<&Now>) -> u64 {
+    let now = now.map_or(0, |now| now().as_nanos());
+    *clock = now.max(clock.saturating_add(1));
+    *clock
+}
+
 /// Of `bytes`, the parts that lie in `spans`, sorted and apart: each of `bytes` cut to them, in
 /// `bytes`' order.
 fn clip(spans: &[Range<u64>], bytes: &[Range<u64>]) -> Vec<Range<u64>> {
@@ -2331,8 +2343,16 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The per-shape form ([`shapes`]; [`Caches::set_shapes`]): no cache is laid out at the
     /// GPU's pitch, and none is refused past the caches' budget, which trims unreferenced shapes.
     shaped: bool,
-    /// The shapes' clock, a tick a use: what orders their last uses ([`ShapeTable::sweep`]).
+    /// The shapes' clock, a tick a use: what orders their last uses ([`ShapeTable::sweep`]); in
+    /// the per-shape form at least the platform's clock in nanoseconds ([`Self::tick_shapes`]).
     shape_clock: u64,
+    /// The platform's clock, which the shapes' clock follows in the per-shape form, for the age
+    /// rule ([`shapes::UNREFERENCED_FOR`]; [`Caches::set_shapes`]).
+    shape_now: Option<Now>,
+    /// The shapes' clock at the last pass of the age rule ([`Self::age_shapes`]), and the images
+    /// a pass at a use took out, let go of once the lock is let go of ([`Locked`]).
+    aged_at: u64,
+    aged: Vec<P::Texture>,
     /// Where every cache's copies are staged (the module doc, "Staged copies";
     /// [`Caches::set_staged`]), the platform's clock, which times the host's CPU's part of each.
     staged: Option<Now>,
@@ -2614,6 +2634,9 @@ impl<P: Platform> SurfaceCaches<P> {
             release_copy: None,
             shaped: false,
             shape_clock: 0,
+            shape_now: None,
+            aged_at: 0,
+            aged: Vec::new(),
             staged: None,
             spares: Arc::new(Spares::new(SPARE_BYTES, PIECE)),
             reserved: HashMap::new(),
@@ -3488,12 +3511,47 @@ impl<P: Platform> SurfaceCaches<P> {
     /// The block at `block`'s surface was used: its cache's referenced shapes, and in the default
     /// form its shadow's, count as used now ([`ShapeTable::touch`]).
     fn touch_shapes(&mut self, block: u64) {
+        let now = self.tick_shapes();
         let Some(cache) = self.by_block.get_mut(&block) else {
             return;
         };
-        self.shape_clock += 1;
-        cache.shapes.touch(self.shape_clock);
-        cache.shadow.touch(self.shape_clock);
+        cache.shapes.touch(now);
+        cache.shadow.touch(now);
+    }
+
+    /// The shapes' clock at a use ([`tick`]). In the per-shape form, a period after the age
+    /// rule's last pass, the rule takes out every cache's unreferenced shapes unused for the
+    /// period ([`Self::age_shapes`]), so a guest that makes no new shape gives them back at its
+    /// next use of any (`shapes`' module doc, "The bound"); their images are let go of once the
+    /// lock is let go of.
+    fn tick_shapes(&mut self) -> u64 {
+        let now = tick(&mut self.shape_clock, self.shape_now.as_ref());
+        if self.shape_now.is_none() || now.saturating_sub(self.aged_at) < AGE_PERIOD {
+            return now;
+        }
+        let aged = self.age_shapes();
+        let bytes: u64 = aged.iter().map(|shape| shape.bytes).sum();
+        self.cache_bytes = self.cache_bytes.saturating_sub(bytes);
+        let counts = &mut self.counts.shapes;
+        counts.dropped += aged.len() as u64;
+        counts.dropped_bytes += bytes;
+        self.aged.extend(aged.into_iter().map(|shape| shape.image));
+        now
+    }
+
+    /// Every cache's unreferenced shapes unused for [`shapes::UNREFERENCED_FOR`], taken out in
+    /// the per-shape form ([`ShapeTable::age_out`]), the pass's time noted: none in the default
+    /// form, whose clock is ticks alone.
+    fn age_shapes(&mut self) -> Vec<shapes::Shape<P::Texture>> {
+        if self.shape_now.is_none() {
+            return Vec::new();
+        }
+        self.aged_at = self.shape_clock;
+        let before = self.shape_clock.saturating_sub(AGE_PERIOD);
+        let counts = &mut self.counts.shapes;
+        (self.by_block.values_mut())
+            .flat_map(|cache| cache.shapes.age_out(before, counts))
+            .collect()
     }
 
     /// In the default form, a reference to the shape `key` the per-shape form would make over
@@ -3505,12 +3563,12 @@ impl<P: Platform> SurfaceCaches<P> {
         if self.shaped {
             return None;
         }
+        let now = self.tick_shapes();
         let cache = self.by_block.get_mut(&block).filter(|c| c.life.is_none())?;
-        self.shape_clock += 1;
-        if let Some((reference, _)) = cache.shadow.find(key, self.shape_clock) {
+        if let Some((reference, _)) = cache.shadow.find(key, now) {
             return Some(reference);
         }
-        let (reference, _) = cache.shadow.insert(*key, (), false, self.shape_clock);
+        let (reference, _) = cache.shadow.insert(*key, (), false, now);
         drop(cache.shadow.sweep(&mut ShapeCounts::default()));
         self.note_shape_bound();
         Some(reference)
@@ -4100,9 +4158,9 @@ impl<P: Platform> SurfaceCaches<P> {
     /// it and its image. `None` where the block has no cache; `Some(None)` where it holds no such
     /// shape.
     fn find_shape(&mut self, block: u64, key: &ShapeKey) -> Option<Option<Held<P::Texture>>> {
+        let now = self.tick_shapes();
         let cache = self.by_block.get_mut(&block)?;
-        self.shape_clock += 1;
-        let found = cache.shapes.find(key, self.shape_clock);
+        let found = cache.shapes.find(key, now);
         if found.is_some() {
             self.counts.shapes.found += 1;
         }
@@ -4143,9 +4201,8 @@ impl<P: Platform> SurfaceCaches<P> {
         let bytes = key.bytes();
         self.counts.shapes.made += 1;
         self.counts.shapes.made_bytes += bytes;
-        if again {
-            self.counts.shapes.again += 1;
-        }
+        self.counts.shapes.again += u64::from(again != shapes::Again::No);
+        self.counts.shapes.aged_again += u64::from(again == shapes::Again::Aged);
         if order_case {
             self.counts.shapes.order_case += 1;
             reims_vgpu_vulkan::answer::count_kind(shapes::ORDER_CASE);
@@ -4186,15 +4243,19 @@ impl<P: Platform> SurfaceCaches<P> {
         Some(shape.image)
     }
 
-    /// The shapes that go: the block at `block`'s unreferenced ones past the bound
-    /// ([`ShapeTable::sweep`]), then, past the caches' budget, the unreferenced ones of any block
-    /// least recently used first, until the caches hold no more than the budget or no
-    /// unreferenced shape is left. A dirty one stays until a copy out of its cache writes it back
-    /// (rule 3). Their images, for the caller to let go of with the lock let go of.
+    /// The shapes that go: in the per-shape form every block's unreferenced ones unused for
+    /// [`shapes::UNREFERENCED_FOR`] ([`Self::age_shapes`]), then the block at `block`'s past the
+    /// bound ([`ShapeTable::sweep`]), then, past the caches' budget, the unreferenced ones of any
+    /// block least recently used first, until the caches hold no more than the budget or no
+    /// unreferenced shape is left. A dirty one stays until a copy out of
+    /// its cache writes it back (rule 3). Their images, for the caller to let go of with the lock
+    /// let go of.
     fn sweep_shapes(&mut self, block: u64) -> Vec<P::Texture> {
+        let mut gone = self.age_shapes();
         let counts = &mut self.counts.shapes;
-        let mut gone =
-            (self.by_block.get_mut(&block)).map_or_else(Vec::new, |c| c.shapes.sweep(counts));
+        if let Some(cache) = self.by_block.get_mut(&block) {
+            gone.extend(cache.shapes.sweep(counts));
+        }
         let swept: u64 = gone.iter().map(|shape| shape.bytes).sum();
         self.cache_bytes = self.cache_bytes.saturating_sub(swept);
         // Each shape the budget trims gives its bytes back at once, so the trims stop as soon as
@@ -6765,12 +6826,13 @@ impl<P: Platform> DerefMut for Locked<'_, P> {
 impl<P: Platform> Locked<'_, P> {
     /// Hands over the command buffers owed their commits under the lock, and gives back the
     /// pieces left over ([`SurfaceCaches::left_over`]); whether any commits were owed, and the
-    /// scratch pieces to let go of once the lock is let go of.
-    fn hand_over(&mut self) -> (bool, Vec<P::Buffer>) {
+    /// scratch pieces and the aged shapes' images ([`SurfaceCaches::aged`]) to let go of once
+    /// the lock is let go of.
+    fn hand_over(&mut self) -> (bool, (Vec<P::Buffer>, Vec<P::Texture>)) {
         for (_, left) in std::mem::take(&mut self.left_over) {
             self.give_back(left);
         }
-        let gone = std::mem::take(&mut self.let_go);
+        let gone = (std::mem::take(&mut self.let_go), std::mem::take(&mut self.aged));
         let owed = std::mem::take(&mut self.owed_commits);
         let any = !owed.is_empty();
         self.commits.owe(owed);
@@ -6796,7 +6858,7 @@ impl<P: Platform> Locked<'_, P> {
     /// makes or lets go of them with the lock let go of instead, and returns.
     fn wait(&mut self, moved: &Condvar) {
         let (owed, gone) = self.hand_over();
-        if owed || !gone.is_empty() {
+        if owed || !gone.0.is_empty() || !gone.1.is_empty() {
             self.unlocked(|| drop(gone));
             return;
         }
@@ -6841,12 +6903,15 @@ impl<P: Platform> Caches<P> {
     }
 
     /// Takes the per-shape form from now on ([`shapes`]), each shape's image made by `maker`,
-    /// which places one where `places` ([`shapes`]'s "Placed images"): set once, at the device's
-    /// make, before any cache; a second is ignored.
-    pub(crate) fn set_shapes(&self, maker: ShapeMaker<P>, places: bool) {
+    /// which places one where `places` ([`shapes`]'s "Placed images"), the shapes' clock
+    /// following `now`, the platform's, for their age rule ([`shapes`]'s "The bound"): set once,
+    /// at the device's make, before any cache; a second is ignored.
+    pub(crate) fn set_shapes(&self, maker: ShapeMaker<P>, places: bool, now: Now) {
         if self.shape_maker.set(maker).is_ok() {
             self.shapes_placed.store(places, Ordering::Release);
-            self.lock().shaped = true;
+            let mut state = self.lock();
+            state.shaped = true;
+            state.shape_now = Some(now);
         }
     }
 

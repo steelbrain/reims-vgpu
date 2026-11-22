@@ -2147,23 +2147,25 @@ impl<P: Platform> GraphicsDecoder<P> {
                 log::info!(
                     target: "reims_vgpu::graphics",
                     "IOSurface device caches' shapes: {} made of {} MiB, {} textures of a shape \
-                     held, {} made again after their drop; {} filled from their buffers ({} MiB), \
-                     in {} fills of the shapes alone ({} behind command buffers); {} written \
-                     back ({} MiB), {} kept dirty past the bound; {} took another shape's write \
-                     ({} MiB), {} texels in part, {} dropped at one; {} encoders wrote two \
-                     shapes of a plane; {} writes no shape's; {} owed a fill after a video \
-                     write; {} unreferenced dropped ({} MiB); {} binds written as their usage \
-                     says, {} read as their slots say; {} textures over the buffer instead ({} \
+                     held, {} made again after their drop ({} after their age); {} filled from \
+                     their buffers ({} MiB), in {} fills of the shapes alone ({} behind command \
+                     buffers); {} written back ({} MiB), {} kept dirty past the bound; {} took \
+                     another shape's write ({} MiB), {} texels in part, {} dropped at one; {} \
+                     encoders wrote two shapes of a plane; {} writes no shape's; {} owed a fill \
+                     after a video write; {} unreferenced dropped ({} MiB), {} of them unused \
+                     for {} s ({} MiB); {} binds written as their usage says, {} read as their \
+                     slots say; {} textures over the buffer instead ({} \
                      images and {} views refused); {} caches kept past the budget; {} blocks \
                      refused uncached; {} made beside a shape of the other kind, {} copies \
                      between the kinds ({} MiB); {} textures over a plain shape in another format \
                      given the storage shape, {} over a plain shape asking PixelFormatView; {} blocks with no view \
                      of their pages cached with them copied",
-                    sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.fills,
+                    sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.aged_again, sh.fills,
                     sh.filled_bytes >> 20, sh.fills_made, sh.fills_deferred, sh.written_back,
                     sh.written_back_bytes >> 20, sh.kept_dirty, sh.overlap_copies,
                     sh.overlap_bytes >> 20, sh.straddled, sh.overlap_dropped, sh.unordered,
-                    sh.unseen, sh.video_owed, sh.dropped, sh.dropped_bytes >> 20,
+                    sh.unseen, sh.video_owed, sh.dropped, sh.dropped_bytes >> 20, sh.aged,
+                    surface_cache::shapes::UNREFERENCED_FOR.as_secs(), sh.aged_bytes >> 20,
                     sh.usage_writes, sh.slot_reads, sh.unshaped,
                     sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused,
                     sh.order_case, sh.order_copies, sh.order_bytes >> 20, sh.format_storage,
