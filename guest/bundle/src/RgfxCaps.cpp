@@ -5,6 +5,7 @@
 
 #include "RgfxCaps.hpp"
 
+#include "../../kext/src/RgfxDeviceName.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
 
 #include <algorithm>
@@ -324,11 +325,16 @@ std::string rgfxVendorNameOf(const char *name)
 	return "AMD";
 }
 
-std::string rgfxMetalNameOf(const char *hostName, bool integrated)
+std::string rgfxMetalNameOf(const char *hostName)
 {
-	std::string out = integrated ? "Intel - " : "AMD - ";
-	out += hostName[0] != '\0' ? hostName : "reims-graphics";
-	return out;
+	char out[kRgfxX86NameMax];
+	const size_t n = rgfxX86Name(reinterpret_cast<const uint8_t *>(hostName), strlen(hostName), out);
+	return std::string(out, n);
+}
+
+std::string rgfxMetalVendorNameOf(const char *hostName)
+{
+	return rgfxVendorNameOf(rgfxMetalNameOf(hostName).c_str());
 }
 
 uint64_t rgfxConcurrentCompilationTaskCount()

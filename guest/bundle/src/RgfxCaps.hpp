@@ -212,20 +212,27 @@ std::string rgfxFamilyNameOf(const char *name);
 std::string rgfxVendorNameOf(const char *name);
 
 /// The `name` an x86-64 guest's Metal device answers where the host names its GPU `hostName`
-/// (the device info's name, NUL-terminated) and says whether it is an integrated one
-/// (`integrated`, RgfxCaps::hostIntegrated): "Intel - " then the host's name where it is, and
-/// "AMD - " then the host's name for every other type of GPU (discrete, virtual, CPU, other).
-/// The host's name is kept whole, byte for byte: its leading and trailing spaces stay, after the
-/// prefix's own. Where the host gave no name (an empty one, or no caps), the prefix and
-/// "reims-graphics", the name the device answers with none. Nothing in the name is read: no
-/// vendor, driver or device name decides the prefix, so a GPU of any vendor gets one.
+/// (the device info's name, NUL-terminated): the kext's x86-64 name (rgfxX86Name,
+/// guest/kext/src/RgfxDeviceName.hpp), which the kext states as the GPU's `model` too. That is
+/// "AMD - " and the host's name with the vendor words "Intel" and "NVIDIA" taken out, in any
+/// case, each with a mark directly after it ("(R)", "(TM)", "®", "™") and then one space, on
+/// every type of GPU (integrated, discrete, virtual, CPU, other): "AMD - Iris(R) Xe Graphics
+/// (RPL-P)", "AMD - GeForce RTX 3090", "AMD - AMD Radeon 780M Graphics (RADV PHOENIX)". Every
+/// other byte of the host's name is kept, its spaces too. Where the host gave no name (an empty
+/// one, or no caps), or its name holds nothing else, "AMD - reims-graphics".
 ///
 /// Apps' rules for a GPU's vendor read the name: a 3D modelling app's (read from its source)
 /// looks for "Intel", then "AMD", then "Apple" anywhere in it, and with none of them found takes
 /// the GPU as unknown. Under the host's own name, an RTX 3090 host's guest passed that app's
-/// minimum requirements and still listed only the CPU (walk m3-max-61607). The prefix gives each
-/// GPU the vendor of the Mac GPU of its type: AMD's, discrete, or Intel's, integrated.
-std::string rgfxMetalNameOf(const char *hostName, bool integrated);
+/// minimum requirements and still listed only the CPU (walk m3-max-61607). The prefix gives every
+/// GPU the vendor of the x86 Macs' discrete GPUs, AMD's. Why no vendor word stays in the name
+/// (WindowServer's compositor and Intel's video pixel processor) is in RgfxDeviceName.hpp.
+std::string rgfxMetalNameOf(const char *hostName);
+
+/// The MTLDeviceSPI `vendorName` an x86-64 guest's Metal device answers where the host names its
+/// GPU `hostName`: the vendor of the name it answers (rgfxVendorNameOf of rgfxMetalNameOf), "AMD"
+/// on every host, so no answer of the device's names Intel or NVIDIA.
+std::string rgfxMetalVendorNameOf(const char *hostName);
 
 /// `maximumConcurrentCompilationTaskCount`: the guest's own logical processor count, its kernel's
 /// `hw.logicalcpu`, whatever `shouldMaximizeConcurrentCompilation` answers, in an x86-64 and an
@@ -323,7 +330,8 @@ public:
 	uint8_t featuresLo() const { return m_valid ? m_info.features_lo : 0; }
 	/// Whether the host's GPU is an integrated one (the device info's `integrated`: its Vulkan
 	/// driver reports the device type INTEGRATED_GPU), as the host wrote it; no from an older
-	/// host, which wrote it as zero, and with no caps.
+	/// host, which wrote it as zero, and with no caps. Nothing in the bundle reads it: the Metal
+	/// name is the same for every type (rgfxMetalNameOf).
 	bool hostIntegrated() const { return m_valid && m_info.integrated != 0; }
 	/// Takes the kext's answer to the features call (kRgfxAccelMethodFeatures): `kr` its return,
 	/// 0 for success, and the `count` words it gave: the device's feature word, the kext's own and

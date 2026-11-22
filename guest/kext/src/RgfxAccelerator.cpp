@@ -551,8 +551,8 @@ bool RgfxAccelerator::start(IOService *provider)
 		}
 	}
 	// The GPU's name, as a Mac's GPU states it (RgfxDeviceName.hpp): `model` on the PCI device,
-	// which System Information shows as its Chipset Model. A host that gave no name has none
-	// stated.
+	// which System Information shows as its Chipset Model. On an arm64 guest a host that gave no
+	// name has none stated.
 	{
 		uint8_t model[kRgfxDeviceModelMax];
 		const size_t length = readDeviceModel(model);

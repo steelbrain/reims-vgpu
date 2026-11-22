@@ -7078,11 +7078,16 @@ that holds none of "AMD", "ATI", "NVIDIA" and "Intel" and `supportsFamily:`
 of Apple5; "Apple" without Apple5 or Apple7 ends every process that makes a
 GL context.
 
-Our device answers `vendorName` with the host GPU's vendor, and "AMD" for any
-other (`rgfxVendorNameOf` in `guest/bundle/src/RgfxCaps.hpp`), and no Apple
-family short of Apple7 (`crates/reims-vgpu/src/graphics/device_info.rs`). So
-its guests get NVIDIA's settings, or Intel's on an Intel host, as the x86
-Macs' GPUs measured above would. An arm64 guest on the M3 Max gets NVIDIA's
+Our device answers `vendorName` "AMD" on an x86-64 guest, on every host, the
+vendor of the name it answers there, which holds neither "Intel" nor "NVIDIA"
+(`rgfxMetalVendorNameOf` and `rgfxMetalNameOf` in
+`guest/bundle/src/RgfxCaps.hpp`, and the reason in
+`guest/kext/src/RgfxDeviceName.hpp`). On an arm64 guest it answers the host
+GPU's vendor, and "AMD" for any other (`rgfxVendorNameOf`). It answers no
+Apple family short of Apple7 (`crates/reims-vgpu/src/graphics/device_info.rs`).
+So its x86-64 guests get NVIDIA's settings on every host, as the 5300M does,
+an Intel host's among them, and its arm64 guests NVIDIA's, or Intel's on an
+Intel host. An arm64 guest on the M3 Max gets NVIDIA's
 settings where the M3 Max's own renderer takes the Apple ones: GL lines under
 the last-vertex convention take their first vertex's flat value there (arm64
 macOS 27.0.1, a64walk2's walks), whatever the bundle and the host do with the

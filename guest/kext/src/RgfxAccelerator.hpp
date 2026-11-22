@@ -429,7 +429,7 @@ public:
 	// false where the region is not mapped.
 	bool readMemorySize(RgfxMemorySize *out) const;
 	// The GPU's `model` bytes, from the host's device name (RgfxDeviceName.hpp): how many, 0
-	// where the host gave no name or the region is not mapped.
+	// where the region is not mapped or, on an arm64 guest, the host gave no name.
 	size_t readDeviceModel(uint8_t (&out)[kRgfxDeviceModelMax]) const;
 
 	// Shared events' ports (RgfxSharedEventUserClient.hpp): the client of ours that holds context

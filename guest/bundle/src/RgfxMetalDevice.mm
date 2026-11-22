@@ -1504,8 +1504,8 @@ RGFX_LOG_UNRECOGNIZED
 // --- identity ----------------------------------------------------------------
 
 // The host's name of its GPU, as the device info carries it, or "reims-graphics" where it
-// carries none: the name an arm64 guest's device answers, and the one the kext states as the GPU's
-// `model`, which System Information shows (the kext's RgfxDeviceName.hpp), on either guest.
+// carries none: the name an arm64 guest's device answers, and the one the arm64e kext states as
+// the GPU's `model`, which System Information shows (the kext's RgfxDeviceName.hpp).
 static NSString *rgfxHostNameOf(const RgfxCaps &caps)
 {
 	if (caps.valid() && caps.name()[0] != '\0') {
@@ -1514,13 +1514,13 @@ static NSString *rgfxHostNameOf(const RgfxCaps &caps)
 	return @"reims-graphics";
 }
 
-// On an x86-64 guest the host's name after the prefix of the host GPU's type (rgfxMetalNameOf):
-// "AMD - NVIDIA GeForce RTX 3090" on a discrete GPU, "Intel - AMD Radeon 780M Graphics (RADV
-// PHOENIX)" on an integrated one. On an arm64 guest the host's name.
+// On an x86-64 guest the x86-64 name, the kext's `model` there (rgfxMetalNameOf): "AMD - " and the
+// host's name without "Intel" and "NVIDIA", on every type of GPU: "AMD - GeForce RTX 3090",
+// "AMD - Iris(R) Xe Graphics (RPL-P)". On an arm64 guest the host's name.
 - (NSString *)name
 {
 #if defined(__x86_64__)
-	const std::string name = rgfxMetalNameOf(_caps.name(), _caps.hostIntegrated());
+	const std::string name = rgfxMetalNameOf(_caps.name());
 	return [NSString stringWithUTF8String:name.c_str()];
 #else
 	return rgfxHostNameOf(_caps);
@@ -1537,12 +1537,17 @@ static NSString *rgfxHostNameOf(const RgfxCaps &caps)
 	return [NSString stringWithUTF8String:name.c_str()];
 }
 
-// The MTLDeviceSPI vendor name, the host GPU's vendor from the host's name (rgfxVendorNameOf), on
-// either guest: "NVIDIA" for "NVIDIA GeForce RTX 5080 Laptop GPU". The IOGPU base answered
-// "Apple", on which the system's GL renderer ends every process that makes a GL context.
+// The MTLDeviceSPI vendor name, the vendor of the name the device answers (rgfxVendorNameOf): on
+// an x86-64 guest "AMD" on every host, as its name says (rgfxMetalVendorNameOf); on an arm64 guest
+// the host GPU's vendor, "NVIDIA" for "NVIDIA GeForce RTX 5080 Laptop GPU". The IOGPU base
+// answered "Apple", on which the system's GL renderer ends every process that makes a GL context.
 - (NSString *)vendorName
 {
+#if defined(__x86_64__)
+	const std::string name = rgfxMetalVendorNameOf(_caps.name());
+#else
 	const std::string name = rgfxVendorNameOf(rgfxHostNameOf(_caps).UTF8String);
+#endif
 	return [NSString stringWithUTF8String:name.c_str()];
 }
 

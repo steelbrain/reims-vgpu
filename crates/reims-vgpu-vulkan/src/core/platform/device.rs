@@ -342,8 +342,8 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// No Metal counterpart: whether the host's GPU is an integrated one, as the platform
     /// answers: on the Vulkan platform, whether its driver reports the physical device's type as
     /// `INTEGRATED_GPU`, and no for every other type (discrete, virtual, CPU, other). The graphics
-    /// lane tells the guest in the device info (`integrated`), by which an x86-64 guest's Metal
-    /// device names its GPU. The default is no.
+    /// lane tells the guest in the device info (`integrated`), which nothing in the guest reads.
+    /// The default is no.
     fn is_integrated(&self) -> bool {
         false
     }

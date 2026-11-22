@@ -143,7 +143,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/surface_locks_test \
 	$(BUILD)/tests/bundle_paths_test $(BUILD)/tests/surface_caches_test \
 	$(BUILD)/tests/vblank_clock_test $(BUILD)/tests/submit_gate_test $(BUILD)/tests/memory_size_test \
-	$(BUILD)/tests/device_name_test \
+	$(BUILD)/tests/device_name_test $(BUILD)/tests/device_name_arm64_test \
 	$(BUILD)/tests/queue_limits_test $(BUILD)/tests/user_client_words_test \
 	$(BUILD)/tests/features_test $(BUILD)/tests/latency_test $(BUILD)/tests/release_table_test \
 	$(BUILD)/tests/answer_look_test $(BUILD)/tests/answer_wait_test \
@@ -182,6 +182,11 @@ $(BUILD)/tests/arm64_region_test: tests/arm64_region_test.cpp $(HEADERS) ../../c
 
 # Ring 0's writes as the arm64e kext makes them (RgfxControlRing.hpp): no write-combined part.
 $(BUILD)/tests/control_ring_arm64_test: tests/control_ring_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
+
+# The GPU's `model` as the arm64e kext states it (RgfxDeviceName.hpp): the host's name whole.
+$(BUILD)/tests/device_name_arm64_test: tests/device_name_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 

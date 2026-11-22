@@ -4917,7 +4917,8 @@ pub struct RgfxDeviceInfo {
     /// 1 where the host's GPU is an integrated one, as its platform answers: on the Vulkan
     /// platform, where its driver reports the physical device's type as `INTEGRATED_GPU`; 0 for
     /// every other type (discrete, virtual, CPU, other), and from a host older than the field,
-    /// which wrote it as zero. An x86-64 guest's Metal device names its GPU by it.
+    /// which wrote it as zero. Nothing in the guest reads it: an x86-64 guest's Metal device
+    /// gives every type of GPU the same name prefix.
     pub integrated: u8,
     /// The bytes the host's GPU aligns the offset and rows of a linear BGRA8 image to, to make
     /// one over a surface's bytes in place there, where the host offers the surfaces' pages

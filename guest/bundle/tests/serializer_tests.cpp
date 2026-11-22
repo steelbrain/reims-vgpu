@@ -1031,68 +1031,118 @@ void test_family_names()
 		CHECK(rgfxFamilyNameOf(name) == family);
 }
 
-// The SPI vendor name, from the device name's first word: the two x86 Macs' names give their
-// own answers (measured), the hosts' names their vendors' in those words, and a name of no vendor
-// the GL renderer knows the AMD's.
+// The SPI vendor name. On an arm64 guest, from the device name's first word: the two x86 Macs'
+// names give their own answers (measured), the hosts' names their vendors' in those words, and a
+// name of no vendor the GL renderer knows the AMD's. On an x86-64 guest "AMD" for every host's
+// name, the vendor of the name the device answers there.
+const std::pair<const char *, const char *> kVendorCases[] = {
+    {"AMD Radeon Pro 5300M", "AMD"},
+    {"Intel(R) UHD Graphics 630", "Intel(R)"},
+    {"NVIDIA GeForce RTX 5080 Laptop GPU", "NVIDIA"},
+    {"AMD Radeon 780M (RADV GFX1103_R1)", "AMD"},
+    {"Intel(R) Arc(tm) Graphics (MTL)", "Intel(R)"},
+    {"Intel Arc A770", "Intel(R)"},
+    {"Apple M3 Max", "AMD"},
+    {"llvmpipe (LLVM 20.1.8, 256 bits)", "AMD"},
+    {"reims-graphics", "AMD"},
+    {"", "AMD"},
+    {"NVIDIAX", "AMD"}, // a first word that only begins with a vendor's
+};
+
 void test_vendor_names()
 {
-	const std::pair<const char *, const char *> cases[] = {
-	    {"AMD Radeon Pro 5300M", "AMD"},
-	    {"Intel(R) UHD Graphics 630", "Intel(R)"},
-	    {"NVIDIA GeForce RTX 5080 Laptop GPU", "NVIDIA"},
-	    {"AMD Radeon 780M (RADV GFX1103_R1)", "AMD"},
-	    {"Intel(R) Arc(tm) Graphics (MTL)", "Intel(R)"},
-	    {"Intel Arc A770", "Intel(R)"},
-	    {"Apple M3 Max", "AMD"},
-	    {"llvmpipe (LLVM 20.1.8, 256 bits)", "AMD"},
-	    {"reims-graphics", "AMD"},
-	    {"", "AMD"},
-	    {"NVIDIAX", "AMD"}, // a first word that only begins with a vendor's
-	};
-	for (const auto &[name, vendor] : cases)
+	for (const auto &[name, vendor] : kVendorCases) {
 		CHECK(rgfxVendorNameOf(name) == vendor);
+		CHECK(rgfxMetalVendorNameOf(name) == "AMD");
+	}
 }
 
-// The x86-64 guest's Metal name: the host's name whole after "Intel - " where the host's GPU is
-// an integrated one and "AMD - " for every other type, whatever the name holds (the owner's
-// examples first); the host's spaces kept; "reims-graphics" after the prefix for no name.
+
+// The x86-64 guest's Metal name: "AMD - " and the host's name without "Intel" and "NVIDIA" on
+// every type of host GPU, integrated ones (the 780M, the Iris) among them (the owner's examples
+// first, then the hosts' names on Linux and Windows): each word in any case, with a mark directly
+// after it and one space; one taken out that leaves another, that one too; every other byte kept,
+// spaces too; "reims-graphics" after the prefix where nothing is left.
+const struct {
+	const char *host;
+	const char *metal;
+} kMetalNameCases[] = {
+    {"Intel(R) Iris(R) Xe Graphics (RPL-P)", "AMD - Iris(R) Xe Graphics (RPL-P)"},
+    {"Intel(R) UHD Graphics 630 (CFL GT2)", "AMD - UHD Graphics 630 (CFL GT2)"},
+    {"Intel(R) UHD Graphics 630", "AMD - UHD Graphics 630"},
+    {"Intel(R) Arc(tm) A770 Graphics (DG2)", "AMD - Arc(tm) A770 Graphics (DG2)"},
+    {"Intel(R) Arc(TM) A770 Graphics", "AMD - Arc(TM) A770 Graphics"},
+    {"NVIDIA GeForce RTX 3090", "AMD - GeForce RTX 3090"},
+    {"AMD Radeon 780M Graphics (RADV PHOENIX)", "AMD - AMD Radeon 780M Graphics (RADV PHOENIX)"},
+    {"AMD Radeon RX 7900 XTX (RADV NAVI31)", "AMD - AMD Radeon RX 7900 XTX (RADV NAVI31)"},
+    {"NVIDIA GeForce RTX 5080 Laptop GPU", "AMD - GeForce RTX 5080 Laptop GPU"},
+    {"llvmpipe (LLVM 20.1.8, 256 bits)", "AMD - llvmpipe (LLVM 20.1.8, 256 bits)"},
+    {"Apple M3 Max", "AMD - Apple M3 Max"},
+    {"Intel Arc A770", "AMD - Arc A770"},
+    {"intel(r) iris(r) xe", "AMD - iris(r) xe"},
+    {"INTEL(Tm) Arc", "AMD - Arc"},
+    {"Intel\xc2\xae UHD Graphics", "AMD - UHD Graphics"},
+    {"Intel\xe2\x84\xa2 Arc", "AMD - Arc"},
+    {"Mesa Intel(R) Graphics", "AMD - Mesa Graphics"},
+    {"Quadro nVidia", "AMD - Quadro "},
+    {"NVIDIAX", "AMD - X"},
+    {"InNVIDIAtel(R) X", "AMD - X"},
+    {"NVIDIA", "AMD - reims-graphics"},
+    {"Intel(R) ", "AMD - reims-graphics"},
+    {"reims-graphics", "AMD - reims-graphics"},
+    {"", "AMD - reims-graphics"},
+    {" GPU ", "AMD -  GPU "},
+    {"  ", "AMD -   "},
+};
+
 void test_metal_names()
 {
-	const struct {
-		const char *host;
-		bool integrated;
-		const char *metal;
-	} cases[] = {
-	    {"NVIDIA GeForce RTX 3090", false, "AMD - NVIDIA GeForce RTX 3090"},
-	    {"AMD Radeon 780M Graphics (RADV PHOENIX)", true,
-	     "Intel - AMD Radeon 780M Graphics (RADV PHOENIX)"},
-	    {"llvmpipe (LLVM 20.1.8, 256 bits)", false, "AMD - llvmpipe (LLVM 20.1.8, 256 bits)"},
-	    {"Intel(R) Iris(R) Xe Graphics (RPL-P)", true, "Intel - Intel(R) Iris(R) Xe Graphics (RPL-P)"},
-	    {"Intel(R) Arc(tm) A770 Graphics (DG2)", false, "AMD - Intel(R) Arc(tm) A770 Graphics (DG2)"},
-	    {"AMD Radeon RX 7900 XTX (RADV NAVI31)", false, "AMD - AMD Radeon RX 7900 XTX (RADV NAVI31)"},
-	    {"", false, "AMD - reims-graphics"},
-	    {"", true, "Intel - reims-graphics"},
-	    {" GPU ", false, "AMD -  GPU "},
-	    {"  ", true, "Intel -   "},
-	};
-	for (const auto &c : cases)
-		CHECK(rgfxMetalNameOf(c.host, c.integrated) == c.metal);
+	for (const auto &c : kMetalNameCases)
+		CHECK(rgfxMetalNameOf(c.host) == c.metal);
+	// A whole name field: all of it after the prefix.
+	const std::string full(RGFX_DEVICE_NAME_LEN, 'A');
+	CHECK(rgfxMetalNameOf(full.c_str()) == "AMD - " + full);
 
 	// The blob's byte: yes where the host wrote 1, no where it wrote 0 (an older host's), and no
-	// with no caps.
+	// with no caps. The name is the same either way.
 	RgfxCaps none;
 	CHECK(!none.hostIntegrated());
-	CHECK(rgfxMetalNameOf(none.name(), none.hostIntegrated()) == "AMD - reims-graphics");
+	CHECK(rgfxMetalNameOf(none.name()) == "AMD - reims-graphics");
 	RgfxDeviceInfo info = {};
 	info.version = RGFX_DEVICE_INFO_VERSION;
 	RgfxCaps older;
 	CHECK(older.load(info) && !older.hostIntegrated());
+	CHECK(rgfxMetalNameOf(older.name()) == "AMD - reims-graphics");
 	info.integrated = 1;
 	RgfxCaps integrated;
 	CHECK(integrated.load(info) && integrated.hostIntegrated());
+	CHECK(rgfxMetalNameOf(integrated.name()) == "AMD - reims-graphics");
 	info.version = RGFX_DEVICE_INFO_VERSION + 1;
 	RgfxCaps refused;
 	CHECK(!refused.load(info) && !refused.hostIntegrated());
+}
+
+// No answer of an x86-64 guest's device, its name or its vendor, holds "intel" or "nvidia" in any
+// case, for any host name of the name and vendor tables: WindowServer's compositor sends a
+// full-screen video to Intel's video pixel processor on a name holding "Intel", which asserts
+// (the kext's RgfxDeviceName.hpp).
+void test_metal_answers_hold_no_vendor_word()
+{
+	const auto holdsVendorWord = [](const std::string &answer) {
+		std::string lower = answer;
+		for (char &c : lower)
+			c = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+		return lower.find("intel") != std::string::npos || lower.find("nvidia") != std::string::npos;
+	};
+	std::vector<const char *> hosts;
+	for (const auto &c : kMetalNameCases)
+		hosts.push_back(c.host);
+	for (const auto &c : kVendorCases)
+		hosts.push_back(c.first);
+	for (const char *host : hosts) {
+		CHECK(!holdsVendorWord(rgfxMetalNameOf(host)));
+		CHECK(!holdsVendorWord(rgfxMetalVendorNameOf(host)));
+	}
 }
 
 // maximumConcurrentCompilationTaskCount is the logical processor count of the system the bundle
@@ -5608,6 +5658,7 @@ int main(int argc, char **argv)
 	test_family_names();
 	test_vendor_names();
 	test_metal_names();
+	test_metal_answers_hold_no_vendor_word();
 	test_concurrent_compilation_task_count();
 	test_host_resource_options();
 	test_buffer_over_pages_at_the_host_s_address();
