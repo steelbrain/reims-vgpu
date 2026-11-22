@@ -11,9 +11,15 @@
 //!   (`super::pipeline`) go back only once no work recorded with it can read them.
 //! - **Attribute strides** (`setBufferOffset:attributeStride:atIndex:`,
 //!   `setBuffers:offsets:attributeStrides:withRange:`) bind as the calls without them: only a
-//!   kernel's `[[stage_in]]` read through a layout of `MTLBufferLayoutStrideDynamic` takes a
-//!   stride from the encoder, and rt refuses such a kernel as its state is made (`Gap::StageIn`,
-//!   kind `DynamicStride`).
+//!   `[[stage_in]]` attribute a kernel reads by thread position through a layout of
+//!   `MTLBufferLayoutStrideDynamic` takes a stride from the encoder, and rt refuses such a kernel
+//!   as its state is made (`Gap::StageIn`, kind `DynamicStride`).
+//! - **The stage-in region**: `setStageInRegion:` is rt's, the region the encoder's later
+//!   dispatches fetch a kernel's `[[stage_in]]` attributes by.
+//!   `setStageInRegionWithIndirectBuffer:indirectBufferOffset:` is rt's call too, which refuses it
+//!   (`Gap::StageIn`, kind `IndirectRegion`; `StageIn-IndirectRegion` in the boot diagnostics),
+//!   counted (`rt-refused-gap`): it encodes nothing, and the encoder's region stays the one set
+//!   before it, or none.
 //! - **Barriers**: `memoryBarrierWithScope:` and `memoryBarrierWithResources:count:` are rt's one
 //!   global barrier, whatever the scope or the resources.
 //! - **Nothing to record**: `setImageblockWidth:height:` (rt makes no kernel that reads an
@@ -27,10 +33,9 @@
 //!   once, however many threads or threadgroups it runs, as rt records it, after any wait for its
 //!   stage's fill; one that records nothing (a refusal, a skip, a form rt has not built) counts
 //!   none.
-//! - **Unbuilt**: an indirect `dispatchThreads` and an indirect stage-in region
-//!   ([`Unbuilt::ComputeCommand`]), and command predication (`encodeStart*`, `encodeEnd*`,
-//!   [`Unbuilt::Predication`]): each encodes nothing, counted, and an `encodeEnd*` answers NO, as
-//!   Metal's answers with nothing open.
+//! - **Unbuilt**: an indirect `dispatchThreads` ([`Unbuilt::ComputeCommand`]), and command
+//!   predication (`encodeStart*`, `encodeEnd*`, [`Unbuilt::Predication`]): each encodes nothing,
+//!   counted, and an `encodeEnd*` answers NO, as Metal's answers with nothing open.
 //! - **No usage**: `useResources:count:usage:` of usage 0 declares nothing, and is no refusal: no
 //!   line, no count (a nil resource of a concurrent encoder's is still Metal's refusal, below).
 //!   Measured with `useResource:usage:` and the render encoder's `useResource:usage:stages:` on a
@@ -221,8 +226,7 @@ impl RtComputeEncoder {
                     .map_err(|refused| self.unmade(sel, refused))?;
                 DIRECT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
             }
-            ComputeCmd::DispatchThreadsIndirect { .. }
-            | ComputeCmd::SetStageInRegionIndirect { .. } => {
+            ComputeCmd::DispatchThreadsIndirect { .. } => {
                 return Err(Stop::Unbuilt(Unbuilt::ComputeCommand));
             }
             ComputeCmd::EncodeStartDoWhile
@@ -305,6 +309,15 @@ impl RtComputeEncoder {
                     origin: [small(o.x)?, small(o.y)?, small(o.z)?],
                     size: size(region.size)?,
                 });
+            }
+            ComputeCmd::SetStageInRegionIndirect {
+                indirect_buffer,
+                indirect_buffer_offset,
+            } => {
+                e.set_stage_in_region_with_indirect_buffer(
+                    indirect_buffer.rt(),
+                    indirect_buffer_offset,
+                )?;
             }
             ComputeCmd::SetTexture { texture, index } => {
                 e.set_texture(texture.map(|t| t.rt()), small(index)?)?;
@@ -594,6 +607,7 @@ mod tests {
     use crate::core::platform::values::{
         ComputePassDesc, HeapDesc, OptionSet, SamplerDesc, TextureDesc,
     };
+    use crate::rt_platform::diag::gaps_named;
     use crate::rt_platform::unbuilt::RtRefusal;
     use crate::rt_platform::{RtBuffer, RtComputePipeline, RtQueue};
 
@@ -662,8 +676,9 @@ mod tests {
     /// Compute encoders run rt's dispatches in their order, serial ones with the barriers their
     /// hazards need and concurrent ones at their barriers, over buffers, threadgroup memory,
     /// textures and sampler states; their command buffers keep the pipeline states they set
-    /// until they complete. What rt has no form of is counted as its piece, what Metal's
-    /// validation stops as Metal's refusal, and the command buffer still completes.
+    /// until they complete. What rt has no form of is counted as its piece, what rt refuses as
+    /// its gap by its kind, what Metal's validation stops as Metal's refusal, and the command
+    /// buffer still completes.
     #[test]
     fn compute_encoders_on_vulkan() {
         let platform = RtPlatform::new();
@@ -846,6 +861,9 @@ mod tests {
         let (before, unbuilt_before, predication_before) =
             (counted(metal), counted(unbuilt), counted(predication));
         let ours = (RtRefusal::Ours.code(), counted(RtRefusal::Ours.code()));
+        let gap = (RtRefusal::Gap.code(), counted(RtRefusal::Gap.code()));
+        let indirect_region = "StageIn-IndirectRegion";
+        let indirect_region_before = gaps_named(indirect_region);
         let made = queue.command_buffer(on).expect("never a raise");
         let made = made.expect("a command buffer");
         let encoder = made.compute_encoder(on).expect("never a raise");
@@ -927,7 +945,11 @@ mod tests {
         assert_eq!(made.commit(on), Ok(()));
         assert_eq!(made.wait_until_completed(on), Ok(()));
         assert_eq!(made.status(), done);
-        assert_eq!(counted(unbuilt), unbuilt_before + 2);
+        // The indirect dispatchThreads alone; the indirect stage-in region is rt's gap, by its
+        // kind.
+        assert_eq!(counted(unbuilt), unbuilt_before + 1);
+        assert_eq!(counted(gap.0), gap.1 + 1);
+        assert_eq!(gaps_named(indirect_region), indirect_region_before + 1);
         assert_eq!(counted(predication), predication_before + 5);
         // A dispatch with none set, a nil indirect buffer, a dispatch with nil set, lengths
         // apart, usage 8, an index past 32 bits, and a command after `endEncoding`; and rt's

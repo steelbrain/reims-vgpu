@@ -77,8 +77,8 @@ pub enum Unbuilt {
     /// resolve textures, the private settings of other than Metal's default rt has none of, and a
     /// line width other than 1, at which rt draws no line (`super::render`). Each encodes nothing.
     RenderCommand,
-    /// Compute commands rt has no form of: an indirect `dispatchThreads` and an indirect stage-in
-    /// region. Each encodes nothing.
+    /// Compute commands rt has no form of: an indirect `dispatchThreads`
+    /// (`dispatchThreadsWithIndirectBuffer:indirectBufferOffset:`). It encodes nothing.
     ComputeCommand,
     /// Command predication (`encodeStart*`, `encodeEnd*`): rt has none. A start encodes nothing,
     /// and an end answers NO.
@@ -177,7 +177,7 @@ impl Unbuilt {
             Unbuilt::MeshPipeline => "a mesh render pipeline state",
             Unbuilt::FunctionTable => "a function handle or a visible function table",
             Unbuilt::RenderCommand => "an indexed patch, mesh or tile draw, resolve or GL setting",
-            Unbuilt::ComputeCommand => "an indirect dispatchThreads or stage-in region",
+            Unbuilt::ComputeCommand => "an indirect dispatchThreads",
             Unbuilt::Predication => "command predication",
             Unbuilt::Protection => "a command buffer's protection options",
             Unbuilt::FillTexture => "a fill of a texture with bytes",

@@ -55,7 +55,7 @@ many times. The pieces, by code:
 | `rt-unbuilt-mesh-pipeline` | mesh render pipeline states: nil and an `NSError` |
 | `rt-unbuilt-function-table` | function handles and visible function tables: nil |
 | `rt-unbuilt-render-command` | indexed patch draws (direct and indirect), mesh draws, tile dispatches, resolve textures, and private settings other than Metal's default: nothing encoded, a line width other than 1 drawing later lines 1 pixel wide |
-| `rt-unbuilt-compute-command` | an indirect `dispatchThreads` and an indirect stage-in region: nothing encoded |
+| `rt-unbuilt-compute-command` | an indirect `dispatchThreads`: nothing encoded |
 | `rt-unbuilt-predication` | command predication: a start encodes nothing, an end answers NO |
 | `rt-unbuilt-protection` | protection options other than 0: the command buffer runs as one with none |
 | `rt-unbuilt-fill-texture` | `fillTexture:level:slice:region:bytes:length:`: nothing encoded |
@@ -100,7 +100,16 @@ nil. Among rt's gaps (`rt-refused-gap`),
 nothing encoded: a blit copy to or from a texture buffer (`Gap::TextureCopy`), and a copy
 between regions of two textures over one buffer whose bytes meet where rt cannot cut the copy
 into ordered slabs, or between two textures whose memory meets where one is placed in a heap
-(`Gap::OverlappingCopy`). A render pipeline of a maximum vertex amplification count above one
+(`Gap::OverlappingCopy`). Three forms of a kernel's `[[stage_in]]` are gaps too, each named by
+its form in the boot diagnostics' gaps line (`reims-vgpu: rt-diag gaps:`, written beside every
+counts line) and in its first refusal's line: a stage-in region read from a buffer
+(`setStageInRegionWithIndirectBuffer:indirectBufferOffset:`, `StageIn-IndirectRegion`), which
+encodes nothing and leaves the encoder's region the one set before it, or none; and, as the
+compute pipeline state is made, nil and an `NSError`, a `[[stage_in]]` attribute the kernel reads
+by thread position through a layout of `MTLBufferLayoutStrideDynamic` (`StageIn-DynamicStride`),
+and one it reads through an indexed step at a step rate past 1 (`StageIn-IndexedStepRate`),
+whose Metal answer is not measured (`rt_platform/compute.rs`, `rt_platform/diag.rs`,
+`refusal_name`). A render pipeline of a maximum vertex amplification count above one
 is a gap too: nil and an `NSError`. The device answers `maxVertexAmplificationCount` 1
 (`rt_platform::answers::VERTEX_AMPLIFICATION_COUNT`; Metal answers 2 on the M3 Max), so
 `supportsVertexAmplificationCount:` answers no above one, and a guest that asks first reaches no

@@ -2,8 +2,10 @@
 //! `reims-vgpu: rt-diag ...` on stderr, written with the process's counts ([`write()`], which
 //! `crate::answer::write_counts` runs). They hold:
 //!
-//! - **Gaps by kind.** Each refusal of rt's `Gap`, by the gap's kind, a draw's by its draw kind
-//!   and a linear plane pass's by its shape ([`refusal`]), which the counts line holds as one
+//! - **Gaps by kind.** Each refusal of rt's `Gap`, by the gap's kind, a draw's by its draw kind,
+//!   a linear plane pass's by its shape, an indirect command buffer's by its kind and a kernel's
+//!   stage input by its form (`StageIn-IndirectRegion`, `StageIn-DynamicStride`,
+//!   `StageIn-IndexedStepRate`) ([`refusal`]), which the counts line holds as one
 //!   `rt-refused-gap`.
 //! - **Refusals by variant.** Each refusal rt answers (`Error::Refused`) and each of its limits
 //!   (`Error::Limit`), by its variant, `Refused-<variant>` and `Limit-<variant>` ([`refusal`]),
@@ -1034,8 +1036,9 @@ pub fn refusal(error: &rt::Error) {
 
 /// The kind [`refusal`] counts rt's `error` under: a gap's kind, a kernel's past the stage bound
 /// that no helper has compiled `StageUnfilled`, a draw's `Draw-<kind>`, a linear plane pass's
-/// `LinearPlanePass-<kind>`, an indirect command buffer's
-/// `IndirectCommandBuffers-<kind>`, a refusal of Metal's `Refused-<variant>`, a limit
+/// `LinearPlanePass-<kind>`, an indirect command buffer's `IndirectCommandBuffers-<kind>`, a
+/// kernel's stage input's `StageIn-<kind>` (its form: a stage-in region read from a buffer, a
+/// dynamic stride, or an indexed step's rate), a refusal of Metal's `Refused-<variant>`, a limit
 /// `Limit-<variant>`, and the translator's `Translation-<feature>`, the variant of the feature it
 /// refused, or of its error where it refused no feature (`Translation-InvalidInput`); `None` for
 /// any other error. Each is a variant's name alone, no name of the guest's.
@@ -1049,6 +1052,7 @@ pub fn refusal_name(error: &rt::Error) -> Option<String> {
         rt::Error::Unsupported(rt::Gap::IndirectCommandBuffers { kind }) => {
             format!("IndirectCommandBuffers-{kind:?}")
         }
+        rt::Error::Unsupported(rt::Gap::StageIn { kind }) => format!("StageIn-{kind:?}"),
         rt::Error::Unsupported(gap) => variant(&format!("{gap:?}")).to_owned(),
         rt::Error::StageUnfilled(_) => "StageUnfilled".to_owned(),
         rt::Error::Refused(r) => format!("Refused-{}", variant(&format!("{r:?}"))),
@@ -2724,10 +2728,11 @@ mod tests {
         assert!(line.contains(shown), "{line}");
     }
 
-    /// A gap is counted by its kind, a draw's by its draw kind, a linear plane pass's by its shape
-    /// and an indirect command buffer's by its kind, a refusal of Metal's and a limit by their
-    /// variant, and the translator's by the feature it refused, else its error's variant, with no
-    /// name of the guest's; another error is not.
+    /// A gap is counted by its kind, a draw's by its draw kind, a linear plane pass's by its
+    /// shape, an indirect command buffer's by its kind and a stage input's by its form, each form
+    /// apart, a refusal of Metal's and a limit by their variant, and the translator's by the
+    /// feature it refused, else its error's variant, with no name of the guest's; another error is
+    /// not.
     #[test]
     fn refusals_count_by_kind() {
         use metal2vulkan::error::{
@@ -2743,6 +2748,27 @@ mod tests {
         refusal(&rt::Error::Unsupported(rt::Gap::IndirectCommandBuffers {
             kind: rt::IndirectCommandsKind::Tokens,
         }));
+        let forms = [
+            rt::StageInKind::IndirectRegion,
+            rt::StageInKind::DynamicStride,
+            rt::StageInKind::IndexedStepRate,
+        ];
+        let stage_in = |kind| rt::Error::Unsupported(rt::Gap::StageIn { kind });
+        let named = forms.map(|kind| refusal_name(&stage_in(kind)).expect("a gap's name"));
+        assert_eq!(
+            named,
+            [
+                "StageIn-IndirectRegion",
+                "StageIn-DynamicStride",
+                "StageIn-IndexedStepRate"
+            ]
+        );
+        let before = named.clone().map(|name| gaps_named(&name));
+        refusal(&stage_in(rt::StageInKind::IndirectRegion));
+        refusal(&stage_in(rt::StageInKind::IndirectRegion));
+        refusal(&stage_in(rt::StageInKind::IndexedStepRate));
+        let after = named.map(|name| gaps_named(&name));
+        assert_eq!(after, [before[0] + 2, before[1], before[2] + 1]);
         refusal(&rt::Error::Refused(rt::Refusal::BufferTooLong {
             length: 8,
             max: 4,
