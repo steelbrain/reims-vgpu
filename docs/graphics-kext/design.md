@@ -4725,6 +4725,24 @@ block for the reply, which carries the reflection the guest needs
 (`threadExecutionWidth`, max total threads per threadgroup, static threadgroup
 memory) — m2v's "take state answers from the created pipeline".
 
+**When a pipeline create's reply comes.** The host compiles a pipeline create
+off ring 0's threads and posts its reply as soon as the platform's make of
+the state has made every answer the reply carries. The make's last step, the
+platform's create of the driver's pipeline where it defers it, then runs on
+the same compile thread, and the pipeline is stored after it. Until the store,
+whatever names the pipeline waits for it: a command buffer that sets it, on
+its queue's lane, and an `ICB_WRITE`, `ICB_SLOTS` or `ICB_SLOTS_IN_PAGES` that
+sets it, or a function handle or table create that names it, on its context's
+lane. A destroy, a context's close or the device's reset between the reply and
+the store cancels it as before the reply (`crates/reims-vgpu/src/graphics/compile.rs`,
+"Order"). On today's platform the make leaves nothing to that last step, so
+the make is whole before the reply. A failure of the last step is a known
+gap: the create was answered made, and the failure reaches the guest only in
+the pipeline's draws and dispatches, which the platform answers as encodes it
+refuses, while a Mac's synchronous create answers it as the create's error.
+The host counts it (`pipeline-finish-failed`), logs the first of the process,
+keeps no answer of its key for the next runs, and the VM goes on.
+
 **Known pipeline creates.** A pipeline create whose message equals, in every
 byte but its header and object id, one the device accepted for the same
 process does not wait for its reply (the bundle's `RgfxKnownPipelines.hpp`).

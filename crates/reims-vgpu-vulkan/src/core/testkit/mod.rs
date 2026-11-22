@@ -32,7 +32,7 @@ pub use calllog::{Arg, Call, CallLog};
 pub use clock::VirtualClock;
 pub use guest_ram::GuestRam;
 pub use objects::{
-    CompleteOn, DeallocatorWatch, FakeVariant, Fk, Prepared, PreparedGrid, World, kind,
+    CompleteOn, DeallocatorWatch, FakeVariant, Finished, Fk, Prepared, PreparedGrid, World, kind,
 };
 pub use platform::FakePlatform;
 pub use script::{HeldCall, Policy, Script, Step};

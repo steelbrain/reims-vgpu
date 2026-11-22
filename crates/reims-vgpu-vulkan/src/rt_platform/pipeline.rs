@@ -603,6 +603,17 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         self.rt
             .dispatch_variant(args.dispatch, args.threads, &args.lengths)
     }
+
+    /// Nothing, and never `Err`: rt's make of the state (`make`) leaves nothing to a step of its
+    /// own.
+    ///
+    /// RT FINISH: where rt's make leaves its main pipeline's driver create to a step of its own
+    /// (`ComputePipelineState::finish_pipeline`), that step is called here, on this thread,
+    /// `self.rt.finish_pipeline().map_err(|error| error.to_string())`: its one error, a Vulkan
+    /// one, keeps nothing, and the state's first dispatch makes the pipeline again.
+    fn finish(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A dispatch's arguments as rt's make ahead and key take them.

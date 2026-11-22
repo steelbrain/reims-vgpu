@@ -1043,6 +1043,21 @@ pub struct World {
     variants: Mutex<Variants>,
     /// The platform's stage fills ([`World::stages`]).
     stages: FakeStages,
+    /// Each pipeline state's finish, in the order the calls came ([`World::finished`]).
+    finished: Mutex<Vec<Finished>>,
+}
+
+/// One call of a pipeline state's finish
+/// ([`ComputePipeline::finish`](crate::core::platform::resource::ComputePipeline::finish),
+/// [`RenderPipeline::finish`](crate::core::platform::resource::RenderPipeline::finish)): the
+/// state, and the name of the thread that made it. Kept beside the call log, not in it, as a
+/// make ahead is ([`Prepared`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Finished {
+    /// The pipeline state.
+    pub state: ObjId,
+    /// The name of the thread the call was made on, `None` for an unnamed one.
+    pub thread: Option<String>,
 }
 
 /// The fake's key of the pipeline a compute dispatch runs
@@ -1152,6 +1167,7 @@ impl World {
             prepare_holds: Mutex::new(std::collections::VecDeque::new()),
             variants: Mutex::new(Variants::default()),
             stages: FakeStages::new(),
+            finished: Mutex::new(Vec::new()),
         })
     }
 
@@ -1164,6 +1180,17 @@ impl World {
     /// The compute states' makes ahead so far, in the order the calls came ([`Prepared`]).
     pub fn prepared(&self) -> Vec<Prepared> {
         self.prepared.lock().clone()
+    }
+
+    /// The pipeline states' finishes so far, in the order the calls came ([`Finished`]).
+    pub fn finished(&self) -> Vec<Finished> {
+        self.finished.lock().clone()
+    }
+
+    /// Notes a finish of pipeline state `state`, on the calling thread.
+    pub(crate) fn note_finished(&self, state: ObjId) {
+        let thread = std::thread::current().name().map(str::to_owned);
+        self.finished.lock().push(Finished { state, thread });
     }
 
     /// Holds the next make ahead not held yet in `held`, after it is noted, until the test lets

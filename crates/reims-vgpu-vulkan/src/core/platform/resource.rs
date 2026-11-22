@@ -588,6 +588,17 @@ pub trait ComputePipeline<P: Platform>: Handle {
     ) -> Option<(P::DispatchVariant, bool)> {
         None
     }
+    /// No Metal counterpart: the second step of the state's make, run once on the thread that
+    /// made it (the device's [`new_compute_pipeline_state_full`], the first), before the state
+    /// is stored for the guest's dispatches. The first step made the state and every answer the
+    /// create's reply carries; this one makes what the platform left of it, the driver's
+    /// pipeline where the platform defers its create. `Err` is the driver's failure, for the
+    /// host's log: it changes no answer the state gave, and a dispatch of the state then makes
+    /// what is left again at its encode, failing as an encode the platform refuses fails. A
+    /// second call does nothing.
+    ///
+    /// [`new_compute_pipeline_state_full`]: super::device::GpuDevice::new_compute_pipeline_state_full
+    fn finish(&self) -> Result<(), String>;
 }
 
 /// The function of a render pipeline a texture slot is bound for, as the render encoder's
@@ -651,6 +662,12 @@ pub trait RenderPipeline: Handle {
     fn texture_slot_writes(&self, _function: RenderFunction, _index: u64) -> Option<bool> {
         None
     }
+    /// No Metal counterpart: the second step of the state's make, as
+    /// [`ComputePipeline::finish`] is a compute state's, run once on the thread that made it
+    /// before the state is stored for the guest's draws: `Err` is the driver's failure, for the
+    /// host's log, and a draw of the state then makes what is left again at its encode, failing
+    /// as an encode the platform refuses fails. A second call does nothing.
+    fn finish(&self) -> Result<(), String>;
 }
 
 /// One function-constant value, keyed by its index (`setConstantValue:type:atIndex:`).

@@ -6,7 +6,8 @@
 
 use super::super::calllog::Arg;
 use super::super::objects::{
-    FakeVariant, Fk, Model, Prepared, PreparedGrid, ResourceCommon, TexDesc, TextureModel, kind,
+    FakeVariant, Fk, Kind, Model, Prepared, PreparedGrid, ResourceCommon, TexDesc, TextureModel,
+    World, kind,
 };
 use super::super::platform::FakePlatform;
 use super::{Backing, fatal, new_buffer, new_texture};
@@ -17,9 +18,9 @@ use crate::core::platform::resource::*;
 use crate::core::platform::stage::Site;
 use crate::core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
 use crate::core::platform::values::SurfacePlane;
-use crate::core::platform::{Handle as _, HostRange, Platform};
+use crate::core::platform::{Handle as _, HostRange, ObjId, Platform};
 use crate::core::raise::{OnFault, RaiseResult};
-use crate::core::testkit::script::Policy;
+use crate::core::testkit::script::{Policy, Step};
 
 /// The name the fake logs and scripts [`Buffer::make_memory`] of a deferred buffer whose memory
 /// is not made under: no selector of Metal's names it.
@@ -735,6 +736,35 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
         self.world()
             .dispatch_variant(prepared(self, dispatch, threads, lengths))
     }
+
+    /// Noted beside the call log, then scripted as [`FINISH`] (this module's `finish`).
+    fn finish(&self) -> Result<(), String> {
+        finish(
+            self.world(),
+            self.id(),
+            <kind::ComputePipeline as Kind>::CLASS,
+        )
+    }
+}
+
+/// The fake's name for [`ComputePipeline::finish`] and [`RenderPipeline::finish`] in the script,
+/// which no selector of Metal's is. A finish is not in the call log: it reaches nothing the
+/// guest sees, and the device's compile threads make it at no fixed place among the logged
+/// calls.
+pub const FINISH: &str = "finishPipeline";
+
+/// A pipeline state's finish, `state`'s of class `class`: noted with its thread's name
+/// ([`World::finished`]), then the script's step for [`FINISH`]: a held step holds the thread
+/// until the test lets it go, an error is the finish's failure, its description, and a death
+/// dies here; else it succeeds.
+fn finish(world: &World, state: ObjId, class: &'static str) -> Result<(), String> {
+    world.note_finished(state);
+    let step = world.script.next_for(state, class, FINISH);
+    step.getter(FINISH);
+    match step {
+        Step::Error(error) | Step::Gap(error) => Err(error.description),
+        _ => Ok(()),
+    }
 }
 
 /// A dispatch of `state`, of `threads` threads a threadgroup with the threadgroup memory
@@ -834,6 +864,15 @@ impl RenderPipeline for Fk<kind::RenderPipeline> {
         };
         let args = vec![Arg::U64(function), Arg::U64(index)];
         self.get_logged(TEXTURE_SLOT_WRITES, args, || None)
+    }
+
+    /// Noted beside the call log, then scripted as [`FINISH`] (this module's `finish`).
+    fn finish(&self) -> Result<(), String> {
+        finish(
+            self.world(),
+            self.id(),
+            <kind::RenderPipeline as Kind>::CLASS,
+        )
     }
 }
 

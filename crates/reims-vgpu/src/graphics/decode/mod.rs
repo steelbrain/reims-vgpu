@@ -5517,9 +5517,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// `RENDER_PIPELINE_CREATE` and `COMPUTE_PIPELINE_CREATE`, carried out at once: the create is
-    /// prepared ([`Self::prepare_pipeline`]), compiled ([`compile_pipeline`]) and stored
-    /// ([`Self::finish_pipeline`]), and its reflection reply goes to the reflection sink. The
-    /// device's host runs the same three steps with the compile on a thread of its own.
+    /// prepared ([`Self::prepare_pipeline`]) and compiled ([`compile_pipeline`]), its reflection
+    /// reply goes to the reflection sink, and its make is finished ([`CompiledPipeline::finish`])
+    /// and the pipeline stored ([`Self::finish_pipeline`]). The device's host runs the same steps
+    /// with the compile and the finish on a thread of its own.
     fn decode_pipeline(
         &mut self,
         device: &P::Device,
@@ -5536,11 +5537,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return Ok(Err(e));
             }
         };
+        let seqno = job.seqno;
         let compiled = compile_refusing::<P>(device, job);
         let refused = compiled.is_refused();
         if let Some(sink) = self.sinks.reflection.clone() {
             sink(compiled.reply());
         }
+        compiled.finish(seqno);
         self.finish_pipeline(compiled);
         Ok(if refused {
             Err(DecodeError::Refused)
@@ -6339,7 +6342,40 @@ impl<P: Platform> CompiledPipeline<P> {
     pub(crate) fn refusal(&self) -> Option<&str> {
         self.refusal.as_deref()
     }
+
+    /// The second step of a made pipeline's make ([`ComputePipeline::finish`],
+    /// [`RenderPipeline::finish`]), on the thread that made it, in the lane's refusal scope
+    /// ([`refusing`]): whether it succeeded, as a refused create, which has nothing to finish,
+    /// does. Its failure, the driver's or a death in the platform's scope, is the create's late
+    /// failure ([`FINISH_FAILED`]): counted, the first of the process logged at warn, it changes
+    /// nothing the create answers, and the pipeline is stored as made, each of its draws and
+    /// dispatches meeting the failure at its encode, as one whose encode the platform refuses.
+    pub(crate) fn finish(&self, seqno: u64) -> bool {
+        let finished = match &self.handle {
+            Some(ObjHandle::RenderPipeline(pipeline)) => refusing(|| Ok(pipeline.finish())),
+            Some(ObjHandle::ComputePipeline(pipeline)) => refusing(|| Ok(pipeline.finish())),
+            _ => return true,
+        };
+        let Err(error) = finished.unwrap_or_else(|raise| Err(raise.to_string())) else {
+            return true;
+        };
+        reims_vgpu_vulkan::answer::count_kind(FINISH_FAILED);
+        log::warn!(
+            target: "reims_vgpu::graphics",
+            "a pipeline create (seqno {seqno}, object {:#x}) was answered made, and its make's \
+             finish failed: {error}; its draws and dispatches meet the failure at their encode",
+            self.obj_id
+        );
+        false
+    }
 }
+
+/// The degradation code of a pipeline create whose make's second step failed after its first
+/// made every answer of its reply ([`CompiledPipeline::finish`]): its draws and dispatches meet
+/// the failure at their encode, where the platform answers the encode as one it refuses. The
+/// create itself answers made, the failure on its command buffers, not on the create, where a
+/// Mac's synchronous create would answer it. Counted each time, the first logged.
+pub(crate) const FINISH_FAILED: &str = "pipeline-finish-failed";
 
 /// [`compile_pipeline`] in the lane's refusal scope ([`refusing`]): a platform refusing the
 /// compile refuses the create, and a refusal's reason gives the pipeline's functions by their

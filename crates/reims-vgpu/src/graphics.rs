@@ -1410,10 +1410,11 @@ struct GraphicsControl<P: ApiPlatform> {
     colors: Vec<Mutex<ColorStaging>>,
     /// The threads ring 0's pipeline and library creates compile on (`compile`, `make`).
     pool: CompilePool,
-    /// The pipelines being compiled, which a command buffer naming one waits for.
+    /// The pipelines being compiled, from their create's hand-over to the pool to their store,
+    /// which a command buffer naming one waits for.
     pending: Pending,
     /// The answers it gave keyed pipeline creates, kept from one run of the host to the next
-    /// (`answers`): learnt as each compile ends ([`Self::compile`]), handed to the kext on
+    /// (`answers`): learnt as each make finishes ([`Self::store_made`]), handed to the kext on
     /// `PIPELINE_ANSWERS` ([`Self::pipeline_answers`]).
     answers: PipelineAnswers,
     /// The device's region, where an `ICB_SLOTS` names the slots whose pipelines it waits for.
@@ -3187,7 +3188,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// A pipeline create from ring 0: prepared here, on its context's lane, with the decoder's
     /// table (a malformed create or one naming no library is refused here, unanswered, as the
     /// decoder refuses it), marked pending, and compiled on the compile pool, so ring 0 goes on
-    /// meanwhile; its reply goes through `poster` when the compile ends ([`Self::compile`]).
+    /// meanwhile; its reply goes through `poster` when the compile has made its answers, before
+    /// its store ([`Self::compile`], [`Self::settle`]).
     fn start_pipeline(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) {
         let prepared = entry::run(|_| {
             let decoder = self
@@ -3329,11 +3331,48 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
     }
 
-    /// Settles a pipeline create's compile, `compiled`, of the create `creating`: logs its
-    /// refusal, keeps a keyed create's answer for the next runs, stores the pipeline where no
-    /// destroy, close or reset cancelled it meanwhile, lets the command buffers that wait for it
-    /// go on, and posts its reply (its reflection, or a refusal) through `poster`.
+    /// Settles a pipeline create's compile, `compiled`, of the create `creating`, in two steps on
+    /// the calling thread, the compile's (the `compile` module's docs, "Order"). The
+    /// reply ([`Self::post_reply`]) logs its refusal and posts its reply (its reflection, or a
+    /// refusal) through `poster`, the pipeline still pending. The store ([`Self::store_made`])
+    /// then finishes its make, keeps a keyed create's answer for the next runs where the make
+    /// finished, stores the pipeline where no destroy, close or reset cancelled it meanwhile, and
+    /// lets what waits for it go on: the command buffers that name it, the `ICB_WRITE`s,
+    /// `ICB_SLOTS` and `ICB_SLOTS_IN_PAGES` that set it, and the `FUNCTION_HANDLE_CREATE`s and
+    /// `FUNCTION_TABLE_CREATE`s that name its state.
     fn settle(&self, compiled: CompiledPipeline<P>, creating: Creating, poster: &CompletionPoster) {
+        self.post_reply(&compiled, creating, poster);
+        self.store_made(compiled, creating);
+    }
+
+    /// The reply step of a create's settling ([`Self::settle`]): logs the refusal of `compiled`,
+    /// the create `creating`'s compile, and posts its reply through `poster`. Every answer the
+    /// reply carries was made by the make's first step; the pipeline stays pending, so whatever
+    /// names it from now on waits for its store.
+    fn post_reply(
+        &self,
+        compiled: &CompiledPipeline<P>,
+        creating: Creating,
+        poster: &CompletionPoster,
+    ) {
+        let Creating { obj_id, seqno, .. } = creating;
+        if let Some(reason) = compiled.refusal() {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = reason;
+                "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
+            );
+        }
+        poster.post(&compiled.reply().bytes());
+    }
+
+    /// The store step of a create's settling ([`Self::settle`]), after its reply: finishes the
+    /// make of `compiled`, the create `creating`'s compile, on this thread
+    /// ([`CompiledPipeline::finish`]); keeps a keyed create's answer for the next runs where it
+    /// was made and its make finished, or drops the kept one where it was refused, answered
+    /// otherwise, or its finish failed (the late failure, [`decode::FINISH_FAILED`]); and stores
+    /// the pipeline where no destroy, close or reset cancelled it since its compile began, as
+    /// made where its finish failed, its draws and dispatches meeting the failure at their encode.
+    fn store_made(&self, compiled: CompiledPipeline<P>, creating: Creating) {
         let Creating {
             obj_id,
             seqno,
@@ -3341,28 +3380,17 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             seen_from,
             began,
         } = creating;
-        if let Some(reason) = compiled.refusal() {
-            log::warn!(
-                target: "reims_vgpu::graphics", kind:% = reason;
-                "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
-            );
-        }
-        let reply = compiled.reply();
-        // A keyed create's answer is kept for the next runs, or drops the kept one where it was
-        // refused or answered otherwise, before the guest has it.
+        let finished = compiled.finish(seqno);
         if let Some(key) = key {
-            let made = (!compiled.is_refused()).then_some(&reply.reflection);
+            let made = (!compiled.is_refused() && finished).then_some(&compiled.reflection);
             self.answers.observe(&key, made);
         }
         // Stored where no destroy, close or reset cancelled it, under the lock of its table, which
         // its destroy removes from after cancelling it; a reset waits for the store.
-        {
-            let _carried = self.reset_gate.read();
-            let live = || self.pending.live(obj_id, began);
-            (self.decoder()).finish_pipeline_if(compiled, Some(seen_from), live);
-            self.pending.finish(obj_id, began);
-        }
-        poster.post(&reply.bytes());
+        let _carried = self.reset_gate.read();
+        let live = || self.pending.live(obj_id, began);
+        (self.decoder()).finish_pipeline_if(compiled, Some(seen_from), live);
+        self.pending.finish(obj_id, began);
     }
 
     /// A library lookup from ring 0, answered at once: a hit binds the library's new id to the

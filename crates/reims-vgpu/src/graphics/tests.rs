@@ -19,6 +19,7 @@ use super::*;
 mod displays;
 mod full_ring;
 mod prepass;
+mod settle;
 mod stage;
 
 /// A graphics device on the testkit's platform, with no window, raising through `raised`.
@@ -542,15 +543,23 @@ struct Guest {
     produced: u64,
     consumed: u64,
     seqno: u64,
+    /// Whether the device holds a pipeline pending under an id ([`Pending::is_pending`]): a
+    /// create's reply comes before its store (`compile`, "Order"), so [`Self::event`] waits for
+    /// the store after a reflection, as a test that reads the decoder after the reply expects.
+    pending: Box<dyn Fn(u64) -> bool>,
 }
 
 impl Guest {
     fn new<P: ApiPlatform>(device: &GraphicsDevice<P>) -> Guest {
+        let control = Arc::downgrade(&device.control);
         Guest {
             base: device.region_base(),
             produced: 0,
             consumed: 0,
             seqno: 0,
+            pending: Box::new(move |obj_id| {
+                (control.upgrade()).is_some_and(|control| control.pending.is_pending(obj_id))
+            }),
         }
     }
 
@@ -660,8 +669,25 @@ impl Guest {
     }
 
     /// The next completion-ring event, waiting for it [`PATIENCE`] polls at most; `None` where
-    /// none came.
+    /// none came. After a pipeline's reflection it waits, as long at most, for the pipeline's
+    /// store too, which comes after its reply: a test that holds the store reads the reflection
+    /// with [`Self::event_unstored`].
     fn event(&mut self) -> Option<Vec<u8>> {
+        let bytes = self.event_unstored()?;
+        if let Ok((reflection, _)) = RgfxPipelineReflection::read_from_prefix(&bytes)
+            && reflection.header.r#type == RGFX_EVT_PIPELINE_REFLECTION
+        {
+            let obj_id = reflection.obj_id;
+            assert!(
+                eventually(|| !(self.pending)(obj_id)),
+                "pipeline {obj_id:#x} was never stored after its reply"
+            );
+        }
+        Some(bytes)
+    }
+
+    /// [`Self::event`], waiting for no pipeline's store after its reflection.
+    fn event_unstored(&mut self) -> Option<Vec<u8>> {
         let at =
             |count: u64| RGFX_CONTROL_COMPLETE_OFFSET as usize + 256 + (count % RING_DATA) as usize;
         for _ in 0..PATIENCE {

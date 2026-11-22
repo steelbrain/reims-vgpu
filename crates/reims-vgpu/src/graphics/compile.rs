@@ -4,9 +4,10 @@
 //! A pipeline create on ring 0 is prepared on its context's lane (`reims-vgpu-graphics`' device, on one
 //! of ring 0's threads, `reims-vgpu.graphics-ring0-*`), which then goes on with the context's later
 //! messages, and is compiled on one of the pool's threads, `reims-vgpu.graphics-compile-*`; its
-//! reply goes on ring 0's completion ring when the compile ends, keyed to the create by its seqno.
-//! Its process waits for that reply, as Metal's synchronous creators wait for their compile;
-//! nothing else does. A library create is made there too.
+//! reply goes on ring 0's completion ring once the compile made its answers, keyed to the create
+//! by its seqno, and the pipeline is stored after it ("Order"). Its process waits for that reply,
+//! as Metal's synchronous creators wait for their compile; nothing else does. A library create is
+//! made there too.
 //!
 //! **Turns.** Metal compiles each process's pipelines in that process, so one process's burst of
 //! creates delays no other's. The pool's threads serve the processes (contexts) in turns: the
@@ -30,19 +31,40 @@
 //! ([`reims_vgpu_vulkan::core::trace`]), its hand-over, start and end as `cmphand`, `cmpstart`
 //! and `cmpend` events, each with the object's id.
 //!
-//! **Order.** From its dispatch until it is stored, the pipeline is pending. A command buffer
-//! that names a pending pipeline (`SET_RENDER_PIPELINE_STATE`, `SET_COMPUTE_PIPELINE_STATE`: the
-//! only ops that name one) is begun on its queue's service thread, which goes on to the queue's
-//! next buffers, and waits for it on its queue's lane before its walk ([`Pending::wait_on_lane`]),
-//! the lane walking its next buffers meanwhile; its view of the table then names the pipeline
-//! stored since, as one taken after the store would. One that names none is not held. An
-//! `OBJECT_DESTROY` of a pending pipeline, or its context's close, cancels it: the compile's
-//! pipeline is then not stored, so the destroy keeps its place in ring order: the compile's store
-//! asks the pending set under the lock of the table the pipeline goes in, and the destroy cancels
-//! it before it removes from that table; a buffer waits for no cancelled pipeline. A table's lock
-//! is taken before the pending set's wherever both are held, and a waiter holds only the pending
-//! set's. The device's reset ends every such wait as it begins ([`Pending::resetting`]).
+//! **Order.** A compile's thread settles it in two steps (`GraphicsControl::settle`). The
+//! reply: the platform's make of the state (the device's pipeline creator) made every answer the
+//! reply carries, and the reply is posted. The store, after it: the make's second step, the
+//! state's finish (`ComputePipeline::finish`, `RenderPipeline::finish`), runs on the same thread,
+//! where the platform makes what it left of the state (the driver's pipeline, where it defers
+//! that create), so no draw or dispatch of the guest's makes it on its lane; then a keyed
+//! create's answer is kept where the make finished, and the pipeline is stored. On today's
+//! platform the make leaves nothing to the finish, which does nothing: the reply comes before
+//! the store, and the make is whole before both. A finish that fails is the create's late
+//! failure (`decode::FINISH_FAILED`): counted, the first of the process logged at warn, no answer
+//! kept, and the pipeline stored as made, each of its draws and dispatches meeting the failure
+//! at its encode, which the platform answers as an encode it refuses; the VM goes on. So the
+//! guest meets that failure in its command buffers, not as its create's error, where a Mac's
+//! synchronous creator answers it.
 //!
+//! From its dispatch until it is stored, the pipeline is pending, the window between its reply
+//! and its store included. A command buffer that names a pending pipeline
+//! (`SET_RENDER_PIPELINE_STATE`, `SET_COMPUTE_PIPELINE_STATE`: the only ops that name one) is
+//! begun on its queue's service thread, which goes on to the queue's next buffers, and waits for
+//! it on its queue's lane before its walk ([`Pending::wait_on_lane`]), the lane walking its next
+//! buffers meanwhile; its view of the table then names the pipeline stored since, as one taken
+//! after the store would. One that names none is not held. An `ICB_WRITE`, `ICB_SLOTS` or
+//! `ICB_SLOTS_IN_PAGES` that sets a pending pipeline in an indirect command buffer, and a
+//! function handle or table create naming a pending compute state, wait on ring 0's thread for
+//! its store, a cancelled one's too, or the device's reset ([`Pending::wait_for_icb_write`],
+//! [`Pending::wait_for_icb_slots`], [`Pending::wait_for_ids`]). An `OBJECT_DESTROY` of a pending
+//! pipeline, or its context's close, cancels it, between its reply and its store as before its
+//! reply: its finish still runs, and its pipeline is then not stored, so the destroy keeps its
+//! place in ring order: the compile's store asks the pending set under the lock of the table the
+//! pipeline goes in, and the destroy cancels it before it removes from that table; a buffer
+//! waits for no cancelled pipeline. A table's lock is taken before the pending set's wherever
+//! both are held, and a waiter holds only the pending set's. The device's reset ends every
+//! buffer's wait as it begins ([`Pending::resetting`]), and no compile begun before it is stored.
+
 //! **A make held for its stage.** A compute pipeline whose make the platform refused for a stage
 //! whose compile runs outside the process
 //! ([`reims_vgpu_vulkan::core::platform::stage::making`]) stays pending, its compile's thread
@@ -610,6 +632,13 @@ impl Pending {
         self.resetting.store(false, Ordering::Release);
         drop(ids);
         self.done.notify_all();
+    }
+
+    /// Whether `obj_id` is pending, cancelled or not: its compile, begun since the device's last
+    /// reset, has not been stored or let go of.
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, obj_id: u64) -> bool {
+        self.ids.lock().contains_key(&obj_id)
     }
 
     /// Whether `obj_id`'s compiled pipeline, begun at reset count `began`, is to be stored: it is
