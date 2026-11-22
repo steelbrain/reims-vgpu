@@ -292,8 +292,11 @@ mod tests {
     /// and the room below them, at one pitch, on the multiples; each export a new fd of the whole
     /// allocation, dedicated but for an opaque fd in place; the acquire taken; each make counted
     /// by its form. Views of the planes in the unsigned format of the texel's size (R8Uint and
-    /// RG8Uint, R16Uint and RG16Uint) are made where the surface is in place. A handle the device
-    /// exports no buffer as is refused, counted, and answers `None`.
+    /// RG8Uint, R16Uint and RG16Uint) are made where the surface is in place. No address of the
+    /// surface's memory goes out, in either form: rt's count of the exported blocks whose address
+    /// a call handed out (`Metrics::exported_blocks_addressed`) does not rise from the make
+    /// through the views, the exports and the acquire to the drop. A handle the device exports no
+    /// buffer as is refused, counted, and answers `None`.
     #[test]
     fn exported_surfaces_on_vulkan() {
         use std::os::fd::AsRawFd as _;
@@ -310,9 +313,14 @@ mod tests {
             (SurfaceHandle::OpaqueFd, 1),
             (SurfaceHandle::DmaBuf, 256),
         ];
+        let addressed = || device.rt().counters().metrics().exported_blocks_addressed;
         for (handle, pitch_multiple) in asks {
             let exported = exports(&device, handle);
             for (formats, views, width, height, texel) in shapes {
+                // Counted past the probe (`exports`): a buffer rt makes in an exported block of
+                // its own, as a video cache's buffer is (`super::export`), counts at its make, by
+                // rt's rule that the block's handle states its address.
+                let before = addressed();
                 let planes = planes(formats, width, height);
                 let desc = SurfaceDesc {
                     handle,
@@ -391,10 +399,18 @@ mod tests {
                         views[1]
                     );
                 }
+                let in_place = memory.in_place();
+                drop(surface);
+                assert_eq!(
+                    addressed() - before,
+                    0,
+                    "{handle:?}, {width}x{height}, in place {in_place}: no address of the \
+                     surface's memory out"
+                );
                 println!(
                     "{handle:?} at a pitch multiple of {pitch_multiple}, {width}x{height}: in place \
-                     {}, pitch {pitch}",
-                    memory.in_place()
+                     {in_place}, pitch {pitch}, exported blocks addressed {}",
+                    addressed()
                 );
             }
         }
