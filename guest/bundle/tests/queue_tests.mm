@@ -159,6 +159,17 @@ RGFX_RESOURCE_SPI
 - (void)finish;
 @end
 
+// The command-queue SPI's priority members (MTLCommandQueueSPI), and the queue's GPUPriority.
+@protocol QueueTestPrioritySPI
+- (BOOL)setGPUPriority:(NSUInteger)priority;
+- (BOOL)setGPUPriority:(NSUInteger)priority offset:(unsigned short)offset;
+- (NSUInteger)GPUPriority;
+- (NSUInteger)getGPUPriority;
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority;
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority offset:(unsigned short)offset;
+- (NSUInteger)getBackgroundGPUPriority;
+@end
+
 // The setters of Metal's queue descriptor's internal subclass, which the Mac's descriptor is.
 @protocol QueueTestQueueDescriptorSPI
 - (void)setQosLevel:(NSUInteger)level;
@@ -2170,6 +2181,37 @@ void test_command_queue_spi_state()
 	}
 }
 
+// The priorities a new queue reads back, and what each setter leaves, as on the AMD 5300M and the
+// Intel 630 (measured, macOS 26.7.1, oracle_prio's readback, docs/graphics-kext/dgpu-oracle.md
+// Q50): GPU priority 1 and background priority 2; every setter answers YES; a GPU priority set
+// reads back, its offset form's too, and a background priority set of 2 leaves both as they were.
+void test_queue_priorities_read_back_as_metals()
+{
+	@autoreleasepool {
+		Queue a, b, c, d;
+		id<QueueTestPrioritySPI> first = (id<QueueTestPrioritySPI>)a.queue;
+		CHECK(first.getGPUPriority == 1 && first.GPUPriority == 1 &&
+		      first.getBackgroundGPUPriority == 2);
+		CHECK([first setBackgroundGPUPriority:2]);
+		CHECK(first.getGPUPriority == 1 && first.getBackgroundGPUPriority == 2);
+		CHECK([first setGPUPriority:2]);
+		CHECK(first.getGPUPriority == 2 && first.GPUPriority == 2 &&
+		      first.getBackgroundGPUPriority == 2);
+
+		id<QueueTestPrioritySPI> second = (id<QueueTestPrioritySPI>)b.queue;
+		CHECK([second setGPUPriority:0]);
+		CHECK(second.getGPUPriority == 0 && second.getBackgroundGPUPriority == 2);
+
+		id<QueueTestPrioritySPI> third = (id<QueueTestPrioritySPI>)c.queue;
+		CHECK([third setGPUPriority:2 offset:1]);
+		CHECK(third.getGPUPriority == 2 && third.getBackgroundGPUPriority == 2);
+
+		id<QueueTestPrioritySPI> fourth = (id<QueueTestPrioritySPI>)d.queue;
+		CHECK([fourth setBackgroundGPUPriority:2 offset:1]);
+		CHECK(fourth.getGPUPriority == 1 && fourth.getBackgroundGPUPriority == 2);
+	}
+}
+
 // What a descriptor names beyond the command buffer count the queue takes, as Metal's base queue
 // does: its quality of service, its commit queue and switches, and its completion queue, where
 // its buffers' handlers then run.
@@ -2778,6 +2820,7 @@ void rgfxQueueTests(const char *self)
 	test_async_waits_run_after_their_handlers();
 	test_command_buffer_spi_state();
 	test_command_queue_spi_state();
+	test_queue_priorities_read_back_as_metals();
 	test_queue_takes_its_descriptor();
 	test_finish_waits_for_committed_buffers();
 #if RgfxMakesResidencySets

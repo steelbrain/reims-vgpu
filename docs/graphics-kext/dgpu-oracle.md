@@ -2843,12 +2843,12 @@ every arm. How soon B runs differs *(class 2)*:
 
 What our stack does:
 - **The marks.** The bundle keeps each setter's value and answers it back from the getters
-  (`RgfxCommandObjects.mm`). A new queue there answers 0 from both getters, where both Macs answer
-  1 and 2. The bundle sends the host no priority: a `QUEUE_CREATE` carries 0 for every queue
-  (design.md, "Rings"). The wire's comment on that field, `RgfxQueueCreate.priority` in
-  `reims_graphics_wire.h`, reads "0 normal and higher higher". That is the opposite of the order
-  the 630 keeps, where a lower GPU priority value runs first and a new queue's value is 1. The
-  comment is named here as found, not changed.
+  (`RgfxCommandObjects.mm`). A new queue there reads GPU priority 1 and background priority 2, as
+  both Macs' do (`test_queue_priorities_read_back_as_metals`). The bundle sends the host no
+  priority: a `QUEUE_CREATE` carries 0 for every queue (design.md, "Rings"). The wire's comment on
+  that field, `RgfxQueueCreate.priority` in `reims_graphics_wire.h`, reads "0 normal and higher
+  higher". That is the opposite of the order the 630 keeps, where a lower GPU priority value runs
+  first and a new queue's value is 1. The comment is named here as found, not changed.
 - **The order.** The runtime runs every queue's work on one `VkQueue` in submission order
   (design.md, "A command buffer in parts"). So B would start only once L0 to L3 had all run, in
   every arm: the 630's answer for queues of one GPU priority. With the guest's marks, a

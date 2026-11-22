@@ -659,6 +659,12 @@ constexpr uint32_t kRgfxBarrierFences = 8;
 /// The quality of service of a queue no descriptor names (qosLevel).
 constexpr NSUInteger kRgfxDefaultQosLevel = 2;
 
+/// The GPU priority and the background GPU priority a new queue reads back (getGPUPriority,
+/// getBackgroundGPUPriority), as a new queue of the AMD 5300M's and the Intel 630's reads them
+/// (measured, macOS 26.7.1, docs/graphics-kext/dgpu-oracle.md Q50).
+constexpr NSUInteger kRgfxDefaultGpuPriority = 1;
+constexpr NSUInteger kRgfxDefaultBackgroundGpuPriority = 2;
+
 /// An encoder's place among its queue's barrier fences: the fences, the one it takes, and how
 /// many of them encoders before it took. All fences 0 where the queue has none (no route).
 struct RgfxBarrierSlot {
@@ -869,6 +875,10 @@ struct RgfxBarrierSlot {
 		// a queue no descriptor names, 2 (measured: the AMD 5300M's and the Intel 630's queues
 		// of newCommandQueue, macOS 26.7.1).
 		q->_qosLevel = kRgfxDefaultQosLevel;
+		// Its priorities as those Macs' new queues read them back (Q50). Their getters read no
+		// offset back, so what a new queue's offsets are is not measured: they start at 0.
+		q->_gpuPriority = kRgfxDefaultGpuPriority;
+		q->_backgroundGpuPriority = kRgfxDefaultBackgroundGpuPriority;
 		q->_backgroundTrackingPID = getpid();
 		q->_executionEnabled = YES;
 		q->_committedGroup = dispatch_group_create();
@@ -1355,7 +1365,10 @@ struct RgfxBarrierSlot {
 }
 
 // RenderBox reads the priority back as it sets up its queue (`Q16@0:8`), and the background
-// priority with it; the rest of the family is the runtime's too (MTLCommandQueueSPI).
+// priority with it; the rest of the family is the runtime's too (MTLCommandQueueSPI). A new queue
+// reads 1 and 2 (kRgfxDefaultGpuPriority), and a GPU priority set reads back, with no offset, as
+// on the AMD 5300M and the Intel 630 (measured, macOS 26.7.1, dgpu-oracle.md Q50). A background
+// priority set reads back here too; Q50 set only 2, a new queue's own.
 - (NSUInteger)getGPUPriority
 {
 	return _gpuPriority;
