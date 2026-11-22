@@ -2373,10 +2373,19 @@ mod tests {
         let gone_freed = Arc::new(AtomicBool::new(false));
         let gone = over(0x1_0000, &gone_freed);
         let gone_block = block_of(&gone);
-        assert!(import_range(gone_block).is_some(), "no record of the live import");
+        assert!(
+            import_range(gone_block).is_some(),
+            "no record of the live import"
+        );
         drop(gone);
-        assert!(waits_for(&|| gone_freed.load(Acquire)), "the deallocator never ran");
-        assert!(import_range(gone_block).is_none(), "the released import's record stayed");
+        assert!(
+            waits_for(&|| gone_freed.load(Acquire)),
+            "the deallocator never ran"
+        );
+        assert!(
+            import_range(gone_block).is_none(),
+            "the released import's record stayed"
+        );
 
         // The live one's, at the loss.
         let freed = Arc::new(AtomicBool::new(false));
@@ -2411,7 +2420,10 @@ mod tests {
         let access = access.expect("the access's line");
         assert!(access.contains(&placed), "{placed:?} not in {access}");
         drop(watch);
-        assert!(waits_for(&|| freed.load(Acquire)), "the deallocator never ran");
+        assert!(
+            waits_for(&|| freed.load(Acquire)),
+            "the deallocator never ran"
+        );
         // SAFETY: both deallocators ran: rt holds no import of the memory.
         unsafe { std::alloc::dealloc(memory, layout) };
     }

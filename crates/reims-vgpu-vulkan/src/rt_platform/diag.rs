@@ -3018,10 +3018,19 @@ mod tests {
         let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(deallocator));
         let buffer = made.expect("never a raise").expect("a no-copy buffer");
         let block = block_of(&buffer);
-        assert!(import_range(block).is_some(), "no record of the live import");
+        assert!(
+            import_range(block).is_some(),
+            "no record of the live import"
+        );
         drop(buffer);
-        assert!(waits_for(&|| freed.load(Acquire)), "the deallocator never ran");
-        assert!(import_range(block).is_none(), "the released import's record stayed");
+        assert!(
+            waits_for(&|| freed.load(Acquire)),
+            "the deallocator never ran"
+        );
+        assert!(
+            import_range(block).is_none(),
+            "the released import's record stayed"
+        );
 
         // A read-only one's copy.
         let given = Arc::new(AtomicBool::new(false));
@@ -3045,9 +3054,18 @@ mod tests {
         let copy = import_range(block).expect("no record of the live copy's import");
         assert!(copy.copy, "a read-only import is a copy");
         drop(buffer);
-        assert!(waits_for(&|| given.load(Acquire)), "the deallocator never ran");
-        assert!(import_range(block).is_none(), "the released copy's record stayed");
-        assert!(origins() >= counted + 2, "the imports by origin lost their count");
+        assert!(
+            waits_for(&|| given.load(Acquire)),
+            "the deallocator never ran"
+        );
+        assert!(
+            import_range(block).is_none(),
+            "the released copy's record stayed"
+        );
+        assert!(
+            origins() >= counted + 2,
+            "the imports by origin lost their count"
+        );
         // SAFETY: both deallocators ran: rt holds no import of the memory.
         unsafe { std::alloc::dealloc(memory, layout) };
     }
