@@ -52,6 +52,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+use metal2vulkan_runtime::host_time;
 use parking_lot::lock_api::ArcRwLockReadGuard;
 use parking_lot::{RawRwLock, RwLock};
 use reims_vgpu_graphics::ops::RgfxCommandBuffer;
@@ -148,6 +149,7 @@ use crate::graphics::decode::{
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, LetGo, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
+use crate::graphics::slow_answers::{ReleaseMarks, Split, answering, writing_back};
 use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
 use crate::pool::{
@@ -171,6 +173,7 @@ mod present;
 mod read;
 mod rt_window;
 mod sink;
+mod slow_answers;
 mod summary;
 #[cfg(any(target_os = "linux", windows))]
 mod vaapi;
@@ -2172,8 +2175,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// hands on as an unshare ([`Self::unshare_block`]), and once the display no longer shows
     /// or draws a surface's texture over the block ([`DisplayHold`]).
     fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
+        // Its waits' ends, for a slow answer's line (`slow_answers`).
+        let marks = Arc::new(ReleaseMarks::asked());
         // After the no-copy buffers being made over it, which keep it.
         self.pages_buffers.wait(release.offset);
+        marks.pages();
         let decoder = self.decoder();
         if decoder.span_in_use(release.offset, release.size) {
             drop(decoder);
@@ -2187,11 +2193,25 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             return;
         }
         // Once no display shows or draws a surface over the block.
-        let answer: DrainAnswer = Box::new(move || answer.answer(RGFX_STATUS_OK));
+        let m = Arc::clone(&marks);
+        let answer: DrainAnswer = Box::new(move || {
+            let split = m.split();
+            answering(split, || answer.answer(RGFX_STATUS_OK));
+        });
         let answer = (self.presented.iter()).fold(answer, |answer, presented| {
             presented.after_shown(release.offset, release.size, answer)
         });
+        let m = Arc::clone(&marks);
+        let answer: DrainAnswer = Box::new(move || {
+            m.unshared();
+            answer();
+        });
         let answer = decoder.after_unshares(release.offset, answer);
+        let m = Arc::clone(&marks);
+        let answer: DrainAnswer = Box::new(move || {
+            m.drained();
+            answer();
+        });
         let drain = decoder.drain_context(release.context, false, answer);
         // No buffer lies over the block's surface view any more: it goes with the block, and its
         // device cache once the surface's pages hold what was written of it, which the answer
@@ -2199,12 +2219,16 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         // have finished, on the last one's thread: the context's lane goes on.
         let held = Arc::clone(&drain);
         let (flags, offset) = (release.flags, release.offset);
+        let m = Arc::clone(&marks);
         entry::run(|_| {
             decoder.block_released(
                 &self.device,
                 offset,
                 flags,
-                Box::new(move || drop(held)),
+                Box::new(move || {
+                    m.written();
+                    writing_back(|| drop(held));
+                }),
                 Box::new(move |raise| {
                     log::warn!(
                         target: "reims_vgpu::graphics", kind:% = raise;
@@ -2214,6 +2238,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 }),
             );
         });
+        marks.released();
         drop(decoder);
         drop(drain);
     }
@@ -2259,6 +2284,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// answered, and the block freed, once every command buffer of the context the decoder
     /// committed has finished ([`PoolLedger::give`]).
     fn give_pool_block(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
+        // For a slow answer's line (`slow_answers`).
+        let asked = host_time();
         let Some(ledger) = &self.shared_pool else {
             answer.answer(RGFX_STATUS_NOT_FOUND);
             return;
@@ -2286,13 +2313,21 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 answer.answer(RGFX_STATUS_REFUSED);
             }
             Give::Given(carve) => {
+                let given = host_time();
                 let ledger = ledger.clone();
                 let drain = decoder.drain_context(
                     give.context,
                     false,
                     Box::new(move || {
+                        let drained = host_time();
                         ledger.free(&[carve]);
-                        answer.answer(RGFX_STATUS_OK);
+                        let split = Split::Give {
+                            asked,
+                            given,
+                            drained,
+                            freed: host_time(),
+                        };
+                        answering(split, || answer.answer(RGFX_STATUS_OK));
                     }),
                 );
                 drop(decoder);
@@ -4156,6 +4191,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn ring_degraded(&self, kind: RingDegradation) {
         reims_vgpu_vulkan::answer::count_kind(kind.code());
+    }
+
+    fn answer_slow(&self, kind: u32, took_ns: u64) {
+        slow_answers::slow(kind, took_ns);
     }
 
     fn present_surface(

@@ -54,6 +54,7 @@ pub mod handler_times;
 pub mod heap;
 pub mod icb;
 pub mod library;
+pub mod overlap;
 pub mod pipeline;
 pub mod queue;
 pub mod render;

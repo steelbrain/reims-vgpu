@@ -1243,14 +1243,15 @@ pub fn heap_parts(context: u32, id: u64, gone: bool, heap: &RtObj<RtHeap>) -> Pa
 /// and length. As rt's `BlockMappings`, the device's (`DeviceOptions::block_mappings`), it maps
 /// nothing and refuses nothing: it notes each allocation rt makes, which rt tells it of before it
 /// hands out a block of it, counting it on the thread rt made it on
-/// (`super::buffer`'s `pool_allocation_made_here`), and forgets each, which rt tells it of before
-/// it frees it.
+/// (`super::buffer`'s `pool_allocation_made_here`) and noting when its make ended
+/// (`super::overlap::pool_made`), and forgets each, which rt tells it of before it frees it.
 #[derive(Default)]
 pub struct Allocations(Mutex<BTreeMap<u32, (rt::MemoryClass, u64, u64)>>);
 
 impl rt::BlockMappings for Allocations {
     fn map(&self, allocation: &rt::AllocationInfo) -> bool {
         super::buffer::pool_allocation_made_here();
+        super::overlap::pool_made();
         let at = (allocation.class, allocation.gpu_address, allocation.len);
         self.0.lock().insert(allocation.id.get(), at);
         true

@@ -35,8 +35,8 @@ pub mod wire;
 
 pub use device::{
     CompleteAnswer, CompletionPoster, Device, DoorbellAt, Host, PointerLink, PoolAnswer,
-    PresentAnswer, PrivateAnswer, QueueClaim, REGION_SIZE, RingDegradation, Spot, Then, VtAnswer,
-    VtLink, VtMessage, VtSurface,
+    PresentAnswer, PrivateAnswer, QueueClaim, REGION_SIZE, RingDegradation, SLOW_ANSWER_NS, Spot,
+    Then, VtAnswer, VtLink, VtMessage, VtSurface,
 };
 pub use display::{CursorImage, FixedScreen, Mode, Scanout, Screen};
 pub use wake::RawDoorbell;

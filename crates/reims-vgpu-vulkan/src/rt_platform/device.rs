@@ -83,6 +83,15 @@
 //! made, not a total, so the counts line carries the highest over the process's devices, as an
 //! amount risen to it ([`note_highest_metrics`]), as it does the gauges' below.
 //!
+//! **Its compute dispatches' first-use waits.** rt makes a compute kernel's `VkPipeline` for each
+//! dispatch variant (threadgroup size, threadgroup memory lengths, tiles) at its first use where
+//! no make ahead made it, and the dispatch's encoding waits for that make, or for the one another
+//! thread is running (rt's `Metrics::first_use_variant_waits`), on every compute state. The
+//! counts line carries the waits, [`FIRST_USE_WAITS_CODE`], and their nanoseconds,
+//! [`FIRST_USE_WAIT_NS_CODE`], as amounts, and the longest, [`FIRST_USE_WAIT_MAX_NS_CODE`], as an
+//! amount risen to it over the process's devices ([`note_highest_metrics`]); reims-vgpu's slow
+//! answers count those that met a guest answer of a frame or more (`super::overlap`).
+//!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
@@ -192,6 +201,18 @@ pub const RENDER_MAKES_PAST_KERNEL_BOUND_CODE: &str = "rt-render-makes-past-kern
 pub const RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE: &str =
     "rt-render-weight-past-kernel-bound-most";
 
+/// The code of the dispatches whose encoding waited while rt made the `VkPipeline` of their
+/// compute kernel's variant, their first-use waits (`Metrics::first_use_variant_waits`), an
+/// amount on the counts line ([`fold_metrics`]).
+pub const FIRST_USE_WAITS_CODE: &str = "rt-first-use-variant-waits";
+
+/// The code of those waits' nanoseconds in all (`Metrics::first_use_variant_wait_nanos`).
+pub const FIRST_USE_WAIT_NS_CODE: &str = "rt-first-use-variant-wait-ns";
+
+/// The code of the longest of those waits, in nanoseconds
+/// (`Metrics::first_use_variant_wait_max_nanos`), an amount risen to it ([`note_highest_metrics`]).
+pub const FIRST_USE_WAIT_MAX_NS_CODE: &str = "rt-first-use-variant-wait-max-ns";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -227,13 +248,14 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 
 /// The metrics the counts line carries ([`folded_counts`]): the over-copy metrics, then the
 /// command buffers held for room, the cache writes dropped, the cache bytes written, the
-/// translations, the translations loaded, the render records read and stale, and the render
-/// pipelines made with a stage past the kernels' bound.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 8;
+/// translations, the translations loaded, the render records read and stale, the render
+/// pipelines made with a stage past the kernels' bound, and the compute dispatches' first-use
+/// waits and their nanoseconds.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 10;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
-const HIGHEST_METRICS: usize = 1;
+const HIGHEST_METRICS: usize = 2;
 
 /// The highest of each of [`highest_metrics`]'s metrics a fold saw, in its order, over the
 /// process's devices.
@@ -248,10 +270,11 @@ type Folding = Option<(rt::Counters, [u64; FOLDED_METRICS])>;
 static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::new(None);
 
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
-/// device, its command buffers held for room, its cache writes, its translations and its render
-/// makes past the kernels' bound rose by since the last fold ([`folded_counts`]), so the counts
-/// line carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
-/// ([`note_gauges`]) at their highest (the module's docs). Nothing before the device is made.
+/// device, its command buffers held for room, its cache writes, its translations, its render
+/// makes past the kernels' bound and its compute dispatches' first-use waits rose by since the
+/// last fold ([`folded_counts`]), so the counts line carries their totals, then its maxima
+/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
+/// docs). Nothing before the device is made.
 pub fn fold_metrics() {
     let (metrics, gauges) = {
         let mut latest = COUNTERS.lock();
@@ -275,10 +298,15 @@ fn note_highest_metrics(m: &rt::Metrics) {
 
 /// The metrics of `m` the counts line carries at their highest, each with its code: the heaviest
 /// stage's weight of the render makes past the kernels' bound
-/// ([`RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE`]).
+/// ([`RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE`]), and the longest first-use wait of a compute
+/// dispatch ([`FIRST_USE_WAIT_MAX_NS_CODE`]).
 fn highest_metrics(m: &rt::Metrics) -> [(&'static str, u64); HIGHEST_METRICS] {
     let weight = m.render_weight_past_kernel_bound_max;
-    [(RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE, weight)]
+    let wait = m.first_use_variant_wait_max_nanos;
+    [
+        (RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE, weight),
+        (FIRST_USE_WAIT_MAX_NS_CODE, wait),
+    ]
 }
 
 /// Looks at `g`, the gauges of the process's device now: counts each of [`highest_gauges`]'s by
@@ -334,8 +362,10 @@ fn follow(counters: rt::Counters) {
 /// cache writes dropped ([`CACHE_WRITES_DROPPED_CODE`]), the cache bytes written
 /// ([`CACHE_BYTES_WRITTEN_CODE`]), the translations ([`TRANSLATIONS_CODE`]), the translations
 /// loaded ([`TRANSLATIONS_LOADED_CODE`]), the render records read ([`RENDER_RECORDS_READ_CODE`])
-/// and stale ([`RENDER_RECORDS_STALE_CODE`]), and the render pipelines made with a stage past the
-/// kernels' bound ([`RENDER_MAKES_PAST_KERNEL_BOUND_CODE`]).
+/// and stale ([`RENDER_RECORDS_STALE_CODE`]), the render pipelines made with a stage past the
+/// kernels' bound ([`RENDER_MAKES_PAST_KERNEL_BOUND_CODE`]), and the compute dispatches'
+/// first-use waits ([`FIRST_USE_WAITS_CODE`]) and their nanoseconds
+/// ([`FIRST_USE_WAIT_NS_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -350,6 +380,8 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
             RENDER_MAKES_PAST_KERNEL_BOUND_CODE,
             m.render_makes_past_kernel_bound,
         ),
+        (FIRST_USE_WAITS_CODE, m.first_use_variant_waits),
+        (FIRST_USE_WAIT_NS_CODE, m.first_use_variant_wait_nanos),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -399,6 +431,13 @@ pub(super) fn metrics() -> Option<rt::Metrics> {
 /// rt's gauges of the process's device now (`super::diag`); `None` before it is made.
 pub(super) fn gauges() -> Option<rt::Gauges> {
     (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.gauges())
+}
+
+/// rt's last ended makes of compute kernels' pipelines for a dispatch's variant, of the process's
+/// device, oldest first (`rt::Counters::variant_makes`, `super::overlap`); `None` before it is
+/// made.
+pub(super) fn variant_makes() -> Option<Vec<rt::VariantMake>> {
+    (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.variant_makes(0))
 }
 
 /// Counts the rise of each metric of `now` ([`folded_counts`]) over `folded` under its code, and
@@ -1826,8 +1865,9 @@ mod tests {
     /// counts line carries the metrics' totals: the over-copies and their bytes, those over an
     /// imported block, and each cause's, by the cause's name; and after them the command buffers
     /// held for room, the cache writes dropped, the cache bytes written, the translations, the
-    /// translations loaded, the render records read and stale, and the render pipelines made with
-    /// a stage past the kernels' bound.
+    /// translations loaded, the render records read and stale, the render pipelines made with a
+    /// stage past the kernels' bound, and the compute dispatches' first-use waits and their
+    /// nanoseconds.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -1849,6 +1889,8 @@ mod tests {
             RENDER_RECORDS_READ_CODE,
             RENDER_RECORDS_STALE_CODE,
             RENDER_MAKES_PAST_KERNEL_BOUND_CODE,
+            FIRST_USE_WAITS_CODE,
+            FIRST_USE_WAIT_NS_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -1870,6 +1912,8 @@ mod tests {
         m.translations = 7;
         m.render_records_read = 2;
         m.render_makes_past_kernel_bound = 1;
+        m.first_use_variant_waits = 2;
+        m.first_use_variant_wait_nanos = 5_000;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -1884,6 +1928,8 @@ mod tests {
         m.render_records_read = 3;
         m.render_records_stale = 1;
         m.render_makes_past_kernel_bound = 2;
+        m.first_use_variant_waits = 3;
+        m.first_use_variant_wait_nanos = 9_000;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -1891,7 +1937,7 @@ mod tests {
         assert_eq!(
             rose,
             [
-                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 3, 1, 2
+                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 3, 1, 2, 3, 9_000
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
@@ -1901,6 +1947,28 @@ mod tests {
             named.iter().all(|code| code.starts_with("rt-over-cop")),
             "{named:?}"
         );
+    }
+
+    /// The longest first-use wait goes to the counts at its longest over the process's devices
+    /// ([`note_highest_metrics`]), as the heaviest render stage does: counted by its rise over the
+    /// longest counted, so a device whose longest is shorter leaves the count as it was.
+    #[test]
+    fn the_longest_first_use_wait_counts_its_rise_over_the_longest_counted() {
+        let count = || {
+            (crate::answer::degradation_counts().iter())
+                .find(|(c, _)| c == FIRST_USE_WAIT_MAX_NS_CODE)
+                .map_or(0, |&(_, n)| n)
+        };
+        let before = count();
+        let mut highest = [0; HIGHEST_METRICS];
+        let mut m = rt::Metrics::default();
+        m.first_use_variant_wait_max_nanos = 7_000;
+        raise_to(&mut highest, highest_metrics(&m));
+        assert_eq!(count() - before, 7_000);
+        m.first_use_variant_wait_max_nanos = 2_000;
+        raise_to(&mut highest, highest_metrics(&m));
+        assert_eq!(highest, [0, 7_000]);
+        assert_eq!(count() - before, 7_000);
     }
 
     /// Five of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by its
@@ -1965,7 +2033,7 @@ mod tests {
         raise_to(&mut highest, highest_metrics(&second));
         second.render_weight_past_kernel_bound_max = 61_500;
         raise_to(&mut highest, highest_metrics(&second));
-        assert_eq!(highest, [61_500]);
+        assert_eq!(highest, [61_500, 0]);
         assert_eq!(count() - before, 61_500);
     }
 

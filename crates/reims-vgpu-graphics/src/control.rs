@@ -132,7 +132,8 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         }
         RGFX_CMD_CONTEXT_CLOSE => match read::<RgfxContextClose>(message) {
             Some(command) => {
-                shared.close_context(command.context, shared.complete_answer(seqno, epoch));
+                let answer = shared.complete_answer(seqno, epoch, RGFX_CMD_CONTEXT_CLOSE);
+                shared.close_context(command.context, answer);
                 None
             }
             None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
@@ -198,9 +199,8 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         }
         RGFX_CMD_SURFACE_DOWNLOAD => match read::<RgfxSurfaceDownload>(message) {
             Some(download) => {
-                shared
-                    .host
-                    .surface_download(download.block_offset, shared.complete_answer(seqno, epoch));
+                let answer = shared.complete_answer(seqno, epoch, RGFX_CMD_SURFACE_DOWNLOAD);
+                shared.host.surface_download(download.block_offset, answer);
                 None
             }
             None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
@@ -219,9 +219,8 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         RGFX_CMD_POOL_GIVE if shared.driver_took(RGFX_FEATURE_POOL) => {
             match read::<RgfxPoolGive>(message) {
                 Some(give) => {
-                    shared
-                        .host
-                        .pool_give(&give, shared.complete_answer(seqno, epoch));
+                    let answer = shared.complete_answer(seqno, epoch, RGFX_CMD_POOL_GIVE);
+                    shared.host.pool_give(&give, answer);
                     None
                 }
                 None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
@@ -241,9 +240,8 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         RGFX_CMD_PRIVATE_GIVE if shared.driver_took(RGFX_FEATURE_PRIVATE_BLOCKS) => {
             match read::<RgfxPrivateGive>(message) {
                 Some(give) => {
-                    shared
-                        .host
-                        .private_give(&give, shared.complete_answer(seqno, epoch));
+                    let answer = shared.complete_answer(seqno, epoch, RGFX_CMD_PRIVATE_GIVE);
+                    shared.host.private_give(&give, answer);
                     None
                 }
                 None => Some(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT)),
@@ -274,9 +272,8 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
                             ..RgfxBlockGrant::default()
                         });
                     }
-                    shared
-                        .host
-                        .block_released(&release, shared.complete_answer(seqno, epoch));
+                    let answer = shared.complete_answer(seqno, epoch, RGFX_CMD_BLOCK_RELEASE);
+                    shared.host.block_released(&release, answer);
                     None
                 }
             }
@@ -606,9 +603,8 @@ fn present(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
                     command.transaction_id,
                     command.display
                 );
-                shared
-                    .host
-                    .present_keep(command.display, shared.complete_answer(seqno, epoch));
+                let answer = shared.complete_answer(seqno, epoch, RGFX_CMD_PRESENT_SURFACE);
+                shared.host.present_keep(command.display, answer);
                 return None;
             }
             let generation =
@@ -688,7 +684,7 @@ fn present_surface(
         command.display,
         command.iosurface_id,
         generation,
-        shared.complete_answer(seqno, epoch),
+        shared.complete_answer(seqno, epoch, RGFX_CMD_PRESENT_SURFACE),
     );
 }
 

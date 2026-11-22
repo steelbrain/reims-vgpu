@@ -951,6 +951,56 @@ pub trait Host: Send + Sync + 'static {
     fn ring_degraded(&self, kind: RingDegradation) {
         let _ = kind;
     }
+
+    /// A ring-0 command's answer given through a [`CompleteAnswer`], a [`PoolAnswer`] or a
+    /// [`PrivateAnswer`] went on the ring [`SLOW_ANSWER_NS`] or more after the answer was made for
+    /// it: `kind` the command's type (`RGFX_CMD_*`, never `PRESENT_SURFACE`, whose answer waits for
+    /// the display's refresh), `took_ns` the nanoseconds from the answer's make to its post. Called
+    /// on the thread that gave the answer, right after the post. A diagnostic; the default does
+    /// nothing.
+    fn answer_slow(&self, kind: u32, took_ns: u64) {
+        let _ = (kind, took_ns);
+    }
+}
+
+/// How long after its make a ring-0 answer given through a [`CompleteAnswer`], a [`PoolAnswer`] or
+/// a [`PrivateAnswer`] is told to the host ([`Host::answer_slow`]): a frame at 60 Hz, 16.7 ms.
+pub const SLOW_ANSWER_NS: u64 = 16_700_000;
+
+/// When a ring-0 answer given through a [`CompleteAnswer`], a [`PoolAnswer`] or a
+/// [`PrivateAnswer`] was made, and of which command type (`RGFX_CMD_*`): what
+/// [`Host::answer_slow`] is told where the answer is slow. One clock read
+/// at the make, and one at the post; a `PRESENT_SURFACE`'s answer reads none.
+#[derive(Clone, Copy, Debug)]
+struct Asked {
+    /// The command's type.
+    kind: u32,
+    /// The clock ([`now_ns`]) at the answer's make; 0 for an answer not timed.
+    at_ns: u64,
+}
+
+impl Asked {
+    /// An answer to a command of type `kind` made now.
+    fn now(kind: u32) -> Asked {
+        let at_ns = if kind == RGFX_CMD_PRESENT_SURFACE {
+            0
+        } else {
+            now_ns()
+        };
+        Asked { kind, at_ns }
+    }
+
+    /// The answer was posted onto `shared`'s ring: the host is told where it came
+    /// [`SLOW_ANSWER_NS`] or more after its make.
+    fn posted(self, shared: &Shared) {
+        if self.at_ns == 0 {
+            return;
+        }
+        let took_ns = now_ns().saturating_sub(self.at_ns);
+        if took_ns >= SLOW_ANSWER_NS {
+            shared.host.answer_slow(self.kind, took_ns);
+        }
+    }
 }
 
 /// Where the guest writes a command queue's doorbell, which the host routes there
@@ -2037,6 +2087,8 @@ pub struct CompleteAnswer {
     /// Such an answer of a guest that took `IMPORT_ADDRESSES_LATER` too: given before the block's
     /// view has its address, which it carries none of.
     later: bool,
+    /// Its command's type and its make's time, which a slow answer tells the host.
+    asked: Asked,
 }
 
 /// A `PRESENT_SURFACE`'s answer.
@@ -2053,6 +2105,8 @@ pub struct PoolAnswer {
     seqno: u64,
     /// The reset count the take was taken at.
     epoch: u64,
+    /// Its make's time, which a slow answer tells the host.
+    asked: Asked,
 }
 
 impl std::fmt::Debug for PoolAnswer {
@@ -2082,6 +2136,7 @@ impl PoolAnswer {
         let block =
             crate::control::pool_block(self.seqno, status, pool_offset, length, gpu_address);
         shared.post_unwaiting(&block, self.epoch);
+        self.asked.posted(&shared);
     }
 }
 
@@ -2096,6 +2151,8 @@ pub struct PrivateAnswer {
     seqno: u64,
     /// The reset count the take was taken at.
     epoch: u64,
+    /// Its make's time, which a slow answer tells the host.
+    asked: Asked,
 }
 
 impl std::fmt::Debug for PrivateAnswer {
@@ -2121,6 +2178,7 @@ impl PrivateAnswer {
         };
         let block = crate::control::private_block(self.seqno, status, gpu_address, length);
         shared.post_unwaiting(&block, self.epoch);
+        self.asked.posted(&shared);
     }
 }
 
@@ -2230,6 +2288,7 @@ impl CompleteAnswer {
                 crate::control::complete(self.seqno, status)
             };
             shared.post_unwaiting(&message, self.epoch);
+            self.asked.posted(&shared);
         }
     }
 }
@@ -3250,7 +3309,7 @@ impl Shared {
         let Ok((download, _)) = RgfxSurfaceDownload::read_from_prefix(&message.bytes) else {
             return Some(message);
         };
-        let answer = self.complete_answer(message.header.seqno, epoch);
+        let answer = self.complete_answer(message.header.seqno, epoch, message.header.r#type);
         match self
             .host
             .try_surface_download(download.block_offset, answer)
@@ -3543,7 +3602,7 @@ impl Shared {
             );
             return Some(RGFX_STATUS_INVALID_ARGUMENT);
         };
-        let mut answer = self.complete_answer(seqno, epoch);
+        let mut answer = self.complete_answer(seqno, epoch, RGFX_CMD_SURFACE_PAGES);
         answer.pages = flags & RGFX_SURFACE_PAGES_PRIVATE != 0
             && self.driver_took(RGFX_FEATURE_IMPORT_ADDRESSES);
         answer.later =
@@ -4192,14 +4251,16 @@ impl Shared {
         true
     }
 
-    /// The answer ring-0 command `seqno`, taken at reset count `epoch`, owes ([`CompleteAnswer`]).
-    pub(crate) fn complete_answer(&self, seqno: u64, epoch: u64) -> CompleteAnswer {
+    /// The answer ring-0 command `seqno` of type `kind`, taken at reset count `epoch`, owes
+    /// ([`CompleteAnswer`]).
+    pub(crate) fn complete_answer(&self, seqno: u64, epoch: u64, kind: u32) -> CompleteAnswer {
         CompleteAnswer {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             seqno,
             epoch,
             pages: false,
             later: false,
+            asked: Asked::now(kind),
         }
     }
 
@@ -4209,6 +4270,7 @@ impl Shared {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             seqno,
             epoch,
+            asked: Asked::now(RGFX_CMD_POOL_TAKE),
         }
     }
 
@@ -4218,6 +4280,7 @@ impl Shared {
             shared: self.weak_self.get().cloned().unwrap_or_else(Weak::new),
             seqno,
             epoch,
+            asked: Asked::now(RGFX_CMD_PRIVATE_TAKE),
         }
     }
 
