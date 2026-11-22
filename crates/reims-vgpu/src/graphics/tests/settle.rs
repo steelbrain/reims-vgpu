@@ -3,8 +3,10 @@
 //! (`ComputePipeline::finish`) on the same thread. A command buffer and an `ICB_WRITE` that name
 //! the pipeline wait for the store; a destroy, a close and a reset between the two cancel it, and
 //! a destroy before the finish begins skips it; a finish that fails is counted, its first line
-//! logged, keeps no answer and stores the pipeline as made; and a make held for its stage's fill
-//! answers after the fill, before its finish.
+//! logged, keeps no answer and stores the pipeline as made; a make held for its stage's fill
+//! answers after the fill, before its finish; and a store after a later create of its id (its
+//! context given its number again, or after the device's reset) stores nothing and ends no wait
+//! for that create.
 
 use std::time::Duration;
 
@@ -29,6 +31,19 @@ const THREADS: &str = "dispatchThreads:threadsPerThreadgroup:";
 /// The fake's selector of a compute state's make.
 const MAKE: &str = "newComputePipelineStateWithDescriptor:options:reflection:error:";
 
+/// The fake's selector of a compute encoder's state.
+const SET_STATE: &str = "setComputePipelineState:";
+
+/// The rings of queue 1 of a process given [`CONTEXT`]'s number again: blocks past the first
+/// queue's.
+const AGAIN_RINGS: (u64, u64) = (
+    RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000,
+    RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000,
+);
+
+/// The data bytes of each of [`AGAIN_RINGS`].
+const AGAIN_DATA: u32 = 0x1_0000;
+
 /// How long a test waits for a held finish to be reached.
 const REACHED: Duration = Duration::from_secs(60);
 
@@ -42,6 +57,18 @@ fn dispatching(state: u64, cb_obj_id: u64) -> Vec<u8> {
         end(),
     ];
     command_buffer_of(cb_obj_id, &ops)
+}
+
+/// [`dispatching`]'s buffer, on queue [`AGAIN_QUEUE`] of [`CONTEXT`].
+fn dispatching_again(state: u64, cb_obj_id: u64) -> Vec<u8> {
+    let mut bytes = dispatching(state, cb_obj_id);
+    let (cb, _) = RgfxCommandBuffer::read_from_prefix(&bytes).unwrap();
+    let on = RgfxCommandBuffer {
+        queue_obj_id: obj(CONTEXT, AGAIN_QUEUE),
+        ..cb
+    };
+    bytes[..size_of::<RgfxCommandBuffer>()].copy_from_slice(on.as_bytes());
+    bytes
 }
 
 /// Whether the buffers of `ring` stay uncompleted for a while, the platform's committed buffers
@@ -442,4 +469,135 @@ fn a_make_held_for_its_stage_answers_after_its_fill_before_its_finish() {
     assert_eq!(device.decoder_object_count(), 3);
     assert_eq!(world.finished().len(), 1);
     assert_eq!(world.log.count(MAKE), 2);
+}
+
+/// The queue of a process given [`CONTEXT`]'s number again: not queue 1, the closed process's.
+/// A closed queue's service thread hands the host its queue's destroy as it ends, at no fixed
+/// time after the close (`reims_vgpu_graphics`'s `queue_service`), so a queue 1 made again could
+/// be destroyed by it, a crossing these tests are not about.
+const AGAIN_QUEUE: u64 = 2;
+
+/// What a process given [`CONTEXT`]'s number makes first, as [`with_states`]'s does: queue
+/// [`AGAIN_QUEUE`] over [`AGAIN_RINGS`], then library 10. The queue's rings.
+fn opened_again(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest) -> QueueRing {
+    assert_eq!(
+        create_queue(
+            device,
+            guest,
+            CONTEXT,
+            AGAIN_QUEUE,
+            AGAIN_RINGS,
+            AGAIN_DATA,
+            0
+        ),
+        RGFX_STATUS_OK
+    );
+    make_library(device, guest, obj(CONTEXT, 10));
+    QueueRing::new(device, AGAIN_RINGS.0, AGAIN_RINGS.1, u64::from(AGAIN_DATA))
+}
+
+/// A crossing, once the old create of state 11 was cut off (its context closed, or the device
+/// reset) with its finish held at `first`: the process of `guest` that holds [`CONTEXT`]'s number
+/// now makes its queue ([`opened_again`]), library 10 and state 11 again, the new state's finish
+/// held at `second`, and posts a buffer that dispatches state 11; then the old finish goes on,
+/// then the new one. The old compile's store stores nothing and ends nothing of the new create's:
+/// the id stays pending, the buffer waits for the new create's store and dispatches with the new
+/// state, and the old state is let go of.
+fn an_old_store_crosses_no_new_create(
+    device: &GraphicsDevice<FakePlatform>,
+    platform: &FakePlatform,
+    guest: &mut Guest,
+    (first, second): (&HeldCall, &HeldCall),
+) {
+    let world = platform.world();
+    let id = obj(CONTEXT, 11);
+    let mut ring = opened_again(device, guest);
+    guest.send(device, compute_pipeline_create(id, obj(CONTEXT, 10)));
+    reply_unstored(guest, id, RGFX_PIPELINE_OK);
+    assert!(second.reached(REACHED), "the new make was never finished");
+    let finished = world.finished();
+    assert_eq!(finished.len(), 2, "{finished:?}");
+    let (old, new) = (finished[0].state, finished[1].state);
+    ring.send(device, dispatching_again(11, 100));
+
+    // The old compile's store, after the new create's begin.
+    first.open();
+    assert!(
+        eventually(|| world.find(old).is_none()),
+        "the old create's state was kept"
+    );
+    assert!(
+        pending(device, id),
+        "the old create's store ended the new create's pending"
+    );
+    assert!(
+        none_completes(platform, &mut ring),
+        "the buffer ran before the new create's store"
+    );
+    assert_eq!(world.log.count(THREADS), 0);
+    // The queue and the library.
+    assert_eq!(device.decoder_object_count(), 2);
+
+    second.open();
+    assert_eq!(completed(platform, &mut ring, 100), RGFX_CB_OK);
+    assert_eq!(world.log.count(THREADS), 1);
+    let set: Vec<Vec<Arg>> = (world.log.calls_to(SET_STATE).into_iter())
+        .map(|call| call.args)
+        .collect();
+    assert_eq!(
+        set,
+        [vec![Arg::Obj(Some(new))]],
+        "the states the buffer set"
+    );
+    assert!(!pending(device, id));
+    // The queue, the library and the new state.
+    assert_eq!(device.decoder_object_count(), 3);
+    assert!(world.find(new).is_some(), "the new state was let go of");
+}
+
+/// A compile whose context closed between its create's reply and its store, the context's number
+/// then given to a process that creates the same id, stores nothing under the id and ends no wait
+/// for the new create, however late its finish ([`an_old_store_crosses_no_new_create`])
+#[test]
+fn a_store_after_its_context_s_number_is_given_again_leaves_the_new_create() {
+    let (device, platform, mut guest, _ring) = with_states(&[]);
+    let world = platform.world();
+    let first = hold_finish(world);
+    let second = hold_finish(world);
+    let id = obj(CONTEXT, 11);
+    guest.send(&device, compute_pipeline_create(id, obj(CONTEXT, 10)));
+    reply_unstored(&mut guest, id, RGFX_PIPELINE_OK);
+    assert!(first.reached(REACHED), "the old make was never finished");
+    assert_eq!(
+        answered(&device, &mut guest, context_close(CONTEXT)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.decoder_object_count(), 0);
+    an_old_store_crosses_no_new_create(&device, &platform, &mut guest, (&first, &second));
+}
+
+/// A compile begun before the device's reset, between its create's reply and its store, the same
+/// id then created again by the rebooted guest's process of [`CONTEXT`], stores nothing under the
+/// id and ends no wait for the new create ([`an_old_store_crosses_no_new_create`])
+#[test]
+fn a_store_after_a_reset_and_a_create_of_its_id_again_leaves_the_new_create() {
+    let (device, platform, mut guest, _ring) = with_states(&[]);
+    let world = platform.world();
+    let first = hold_finish(world);
+    let second = hold_finish(world);
+    let id = obj(CONTEXT, 11);
+    guest.send(&device, compute_pipeline_create(id, obj(CONTEXT, 10)));
+    reply_unstored(&mut guest, id, RGFX_PIPELINE_OK);
+    assert!(first.reached(REACHED), "the old make was never finished");
+    // The guest reboots: the host hears of the reset on the device's control thread, then the
+    // rebooted guest's driver starts.
+    device.reset();
+    reset_done(&device);
+    assert!(
+        eventually(|| !pending(&device, id)),
+        "the reset kept the create pending"
+    );
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    an_old_store_crosses_no_new_create(&device, &platform, &mut guest, (&first, &second));
 }

@@ -135,7 +135,7 @@ use crate::entry::no_catch;
 use crate::error::Error;
 use crate::graphics::answers::PipelineAnswers;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
-use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
+use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending, Ticket};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::prepass::{Ahead, Prepass, WalkEnd};
 use crate::graphics::decode::shares::ListenSink;
@@ -1530,19 +1530,19 @@ struct Creating {
     key: Option<PipelineKey>,
     /// The clock of its table as the create was prepared ([`PipelineJob::seen_from`]).
     seen_from: u64,
-    /// The reset count its compile began at ([`Pending::begin`]).
-    began: u64,
+    /// Its ticket, taken as its compile began ([`Pending::begin`]).
+    ticket: Ticket,
 }
 
 impl Creating {
-    /// The create `job` is of, its compile begun at reset count `began`.
-    fn of<P: Platform>(job: &PipelineJob<P>, began: u64) -> Creating {
+    /// The create `job` is of, its compile begun with `ticket`.
+    fn of<P: Platform>(job: &PipelineJob<P>, ticket: Ticket) -> Creating {
         Creating {
             obj_id: job.obj_id,
             seqno: job.seqno,
             key: job.key(),
             seen_from: job.seen_from,
-            began,
+            ticket,
         }
     }
 }
@@ -3222,7 +3222,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             prepared
         });
-        let (began, job) = match prepared {
+        let (ticket, job) = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
                 let (ty, seqno, obj_id) = message_identity(message);
@@ -3247,13 +3247,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let poster = poster.clone();
         if let Err(compile) = self
             .pool
-            .submit(of, Box::new(move || me.compile(job, began, poster, false)))
+            .submit(of, Box::new(move || me.compile(job, ticket, poster, false)))
         {
             compile();
         }
     }
 
-    /// Compiles a prepared pipeline create, pending since reset count `began`, under a library
+    /// Compiles a prepared pipeline create, pending under `ticket`, under a library
     /// entry, with no lock held, and settles it ([`Self::settle`]).
     ///
     /// A compute create whose make the platform refused for a stage whose compile runs outside
@@ -3264,12 +3264,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn compile(
         self: &Arc<Self>,
         job: PipelineJob<P>,
-        began: u64,
+        ticket: Ticket,
         poster: CompletionPoster,
         remade: bool,
     ) {
         entry::run(|_| {
-            let creating = Creating::of(&job, began);
+            let creating = Creating::of(&job, ticket);
             let again = if remade { None } else { job.again() };
             let (compiled, fill) = stage::making(|| compile_refusing::<P>(&self.device, job));
             match (fill, again) {
@@ -3311,7 +3311,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ) {
         if end == FillEnd::Cancelled {
             entry::run(|_| {
-                self.pending.finish(creating.obj_id, creating.began);
+                self.pending.finish(creating.ticket);
                 if !poster.try_post(&first.reply().bytes()) {
                     log::debug!(
                         target: "reims_vgpu::graphics",
@@ -3331,9 +3331,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
         let me = Arc::clone(self);
         let settle = move || {
-            if end == FillEnd::Filled && me.pending.live(creating.obj_id, creating.began) {
+            if end == FillEnd::Filled && me.pending.live(creating.ticket) {
                 drop(first);
-                me.compile(again, creating.began, poster, true);
+                me.compile(again, creating.ticket, poster, true);
             } else {
                 entry::run(|_| {
                     drop(again);
@@ -3389,31 +3389,33 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// The store step of a create's settling ([`Self::settle`]), after its reply: finishes the
     /// make of `compiled`, the create `creating`'s compile, on this thread
     /// ([`CompiledPipeline::finish`]), where no destroy, close or reset cancelled it since its
-    /// compile began; keeps a keyed create's answer for the next runs where it was made and its
-    /// make finished, or drops the kept one where it was refused, answered otherwise, or its
-    /// finish failed (the late failure, [`decode::FINISH_FAILED`]); and stores the pipeline where
-    /// it is still not cancelled, as made where its finish failed, its draws and dispatches making
-    /// what the finish left again at their encode. A cancelled create's finish is skipped, its
-    /// pipeline never stored, and a keyed one's answer kept as its make answered it.
+    /// compile began and no later create of its id took the id's entry ([`Pending::live`]); keeps
+    /// a keyed create's answer for the next runs where it was made and its make finished, or drops
+    /// the kept one where it was refused, answered otherwise, or its finish failed (the late
+    /// failure, [`decode::FINISH_FAILED`]); and stores the pipeline where it is still live, as made
+    /// where its finish failed, its draws and dispatches making what the finish left again at their
+    /// encode. A create no longer live has its finish skipped, its pipeline never stored, and a
+    /// keyed one's answer kept as its make answered it.
     fn store_made(&self, compiled: CompiledPipeline<P>, creating: Creating) {
         let Creating {
-            obj_id,
             seqno,
             key,
             seen_from,
-            began,
+            ticket,
+            ..
         } = creating;
-        let live = || self.pending.live(obj_id, began);
+        let live = || self.pending.live(ticket);
         let failed = live() && !compiled.finish(seqno);
         if let Some(key) = key {
             let made = (!compiled.is_refused() && !failed).then_some(&compiled.reflection);
             self.answers.observe(&key, made);
         }
-        // Stored where no destroy, close or reset cancelled it, under the lock of its table, which
-        // its destroy removes from after cancelling it; a reset waits for the store.
+        // Stored where no destroy, close or reset cancelled it and its ticket is its id's newest,
+        // under the lock of its table, which its destroy removes from after cancelling it; a reset
+        // waits for the store.
         let _carried = self.reset_gate.read();
         (self.decoder()).finish_pipeline_if(compiled, Some(seen_from), live);
-        self.pending.finish(obj_id, began);
+        self.pending.finish(ticket);
     }
 
     /// A library lookup from ring 0, answered at once: a hit binds the library's new id to the

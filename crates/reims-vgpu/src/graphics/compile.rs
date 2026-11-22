@@ -66,6 +66,15 @@
 //! pending set's wherever both are held, and a waiter holds only the pending set's. The device's
 //! reset ends every buffer's wait as it begins ([`Pending::resetting`]), and no compile begun
 //! before it is stored, nor finished where its finish had not begun.
+//!
+//! Each create's begin takes a ticket ([`Ticket`]), a number no other create of the device's life
+//! takes, and its store asks for that ticket: an id's pending entry is its newest create's. So a
+//! compile whose pipeline was destroyed or whose context closed, and whose id a later create
+//! took meanwhile (a process given the closed context's number again makes the same ids), stores
+//! nothing under the id and ends no wait for the later create, however long its finish takes:
+//! what names the id waits for the later create's store, and then runs with its pipeline. A
+//! compile begun before the device's reset finds its ticket gone too. Neither a close nor a reset
+//! waits for a compile's make or finish.
 
 //! **A make held for its stage.** A compute pipeline whose make the platform refused for a stage
 //! whose compile runs outside the process
@@ -570,14 +579,31 @@ impl Gate {
     }
 }
 
-/// The pipelines being compiled, by id: whether a destroy or a close cancelled each, and the
-/// device's resets, which forget them all.
+/// A pipeline create's ticket ([`Pending::begin`]): its pipeline's id, and a number no other
+/// create of the device's life takes, across destroys, closes, contexts given their number again
+/// and resets. Its compile's [`Pending::live`] and [`Pending::finish`] name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ticket {
+    /// The pipeline's id.
+    obj_id: u64,
+    /// The create's number, from 0 in the order the device's creates began.
+    n: u64,
+}
+
+/// The pipelines being compiled, by id: each id's newest create, by its ticket ([`Ticket`]), and
+/// whether a destroy or a close cancelled it; the device's reset forgets them all.
+///
+/// A create begun under an id whose older create is still compiling takes the id's entry: a
+/// context given its number again after its close, whose process makes the same ids, or a
+/// destroy and a create again. The older compile's ticket is then gone: its store stores
+/// nothing ([`Self::live`]) and removes nothing ([`Self::finish`]), and what names the id waits
+/// for the newest create's store, as the guest's order of the creates has it.
 #[derive(Default)]
 pub(crate) struct Pending {
-    /// Pending ids, each with whether it was cancelled and the reset count its compile began at.
+    /// Each pending id's newest create: whether it was cancelled, and its ticket's number.
     ids: Mutex<HashMap<u64, (bool, u64)>>,
-    /// The device's resets so far ([`Self::reset`]).
-    resets: AtomicU64,
+    /// The creates begun so far: the next create's ticket's number.
+    tickets: AtomicU64,
     /// A reset begun ([`Self::resetting`]) and not yet carried out ([`Self::reset`]).
     resetting: AtomicBool,
     /// Notified as each pending pipeline is done or cancelled, and at a reset.
@@ -585,17 +611,17 @@ pub(crate) struct Pending {
 }
 
 impl Pending {
-    /// `obj_id` is being compiled: the reset count its compile begins at, which its
-    /// [`Self::live`] and [`Self::finish`] name.
-    pub(crate) fn begin(&self, obj_id: u64) -> u64 {
+    /// `obj_id` is being compiled: its create's ticket, which its [`Self::live`] and
+    /// [`Self::finish`] name. The create takes the id's entry from any older one still compiling.
+    pub(crate) fn begin(&self, obj_id: u64) -> Ticket {
         let mut ids = self.ids.lock();
-        let began = self.resets.load(Ordering::Acquire);
-        ids.insert(obj_id, (false, began));
-        began
+        let n = self.tickets.fetch_add(1, Ordering::Relaxed);
+        ids.insert(obj_id, (false, n));
+        Ticket { obj_id, n }
     }
 
-    /// An `OBJECT_DESTROY` of `obj_id`: a pending pipeline is not stored when its compile ends,
-    /// and no command buffer waits for it.
+    /// An `OBJECT_DESTROY` of `obj_id`: the id's newest create's pipeline is not stored when its
+    /// compile ends, and no command buffer waits for it.
     pub(crate) fn cancel(&self, obj_id: u64) {
         if let Some((cancelled, _)) = self.ids.lock().get_mut(&obj_id) {
             *cancelled = true;
@@ -625,36 +651,35 @@ impl Pending {
     }
 
     /// The device's reset: no pipeline pending is stored, a command buffer waiting on one goes on,
-    /// and a compile begun before it neither stores its pipeline nor ends the wait of one begun
-    /// after it under the same id.
+    /// and a compile begun before it, its ticket gone, neither stores its pipeline nor ends the
+    /// wait of one begun after it under the same id.
     pub(crate) fn reset(&self) {
         let mut ids = self.ids.lock();
-        self.resets.fetch_add(1, Ordering::AcqRel);
         ids.clear();
         self.resetting.store(false, Ordering::Release);
         drop(ids);
         self.done.notify_all();
     }
 
-    /// Whether `obj_id` is pending, cancelled or not: its compile, begun since the device's last
-    /// reset, has not been stored or let go of.
+    /// Whether `obj_id` is pending, cancelled or not: its newest create's compile, begun since the
+    /// device's last reset, has not been stored or let go of.
     #[cfg(test)]
     pub(crate) fn is_pending(&self, obj_id: u64) -> bool {
         self.ids.lock().contains_key(&obj_id)
     }
 
-    /// Whether `obj_id`'s compiled pipeline, begun at reset count `began`, is to be stored: it is
-    /// pending since then and not cancelled.
-    pub(crate) fn live(&self, obj_id: u64, began: u64) -> bool {
-        self.ids.lock().get(&obj_id) == Some(&(false, began))
+    /// Whether the compiled pipeline of the create `ticket` is to be stored: the create is its
+    /// id's newest, pending, and not cancelled.
+    pub(crate) fn live(&self, ticket: Ticket) -> bool {
+        self.ids.lock().get(&ticket.obj_id) == Some(&(false, ticket.n))
     }
 
-    /// `obj_id`'s compile, begun at reset count `began`, is done (and its pipeline stored, where
-    /// it is live): its waiters go on.
-    pub(crate) fn finish(&self, obj_id: u64, began: u64) {
+    /// The compile of the create `ticket` is done (and its pipeline stored, where it is live):
+    /// its id's entry goes where the create is still its id's newest, and its waiters go on.
+    pub(crate) fn finish(&self, ticket: Ticket) {
         let mut ids = self.ids.lock();
-        if ids.get(&obj_id).is_some_and(|&(_, at)| at == began) {
-            ids.remove(&obj_id);
+        if ids.get(&ticket.obj_id).is_some_and(|&(_, n)| n == ticket.n) {
+            ids.remove(&ticket.obj_id);
         }
         drop(ids);
         self.done.notify_all();
