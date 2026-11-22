@@ -2661,6 +2661,83 @@ adopt. A writer committed by a plain `commit` is named before its `commit` retur
 stricter than the 5300M, which left 1 of 3 such reads unordered, and kept as it is, since the wait
 is on the GPU and holds back no record (Q16, "A divergence the lane does not use").
 
+## Q49: how many command buffers a queue keeps in flight, and how many Apple's GL renderer does
+
+Probes, 11-21, off screen:
+- `oracle_depth DEVICE 10 48` on the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 under
+  macOS 26.7.1 (25G241), run twice on the 5300M and once on the 630 (m3-max-65538), and twice on
+  the M3 (m3-max-65551). It makes a queue and makes and commits busy compute buffers back to back
+  from one thread: 48 on a queue made with `newCommandQueueWithMaxCommandBufferCount:32`, by
+  `commitAndWaitUntilSubmitted` and by `commit`, and 80 on a queue of `newCommandQueue`'s default
+  count, each way. Each buffer's spin is calibrated to about 10 ms of GPU time, and a fifth arm
+  repeats the first with buffers of about 2 ms. Each arm's span, first commit to last
+  completion, came within 2.1% of the buffers' GPU times added up, so the GPU ran them one after
+  another, with the queue full. Counts are of buffers made and not completed when a creation
+  starts.
+- `oracle_gldepth 5 120` and `oracle_gldepth 10 80` on the M3 (m3-max-65545). It hooks the Metal
+  device's queue creators, and each queue's command-buffer creators, before it makes a CGL context.
+  Then it draws into an FBO, calibrated to about 5 or 10 ms of the GPU's wall time a flush:
+  - one draw a `glFlush`;
+  - eight draws a `glFlush`, each after a `glBufferSubData` of the quad's vertex buffer.
+
+`oracle_depth`, times in ms from each buffer's commit:
+
+| what | AMD 5300M | Intel 630 | M3 |
+|---|---|---|---|
+| `maxCommandBufferCount` a queue answers (SPI), asked 32; default | 32; 64 | 34; 64 | 32; 64 |
+| the first `-commandBuffer` that blocks over 1 ms, asked 32 | the 33rd buffer's (the 34th in one arm), with 32 uncompleted | the 35th to 38th buffer's, with 34 uncompleted | the 33rd buffer's, with 32 uncompleted |
+| the same on the default queue | the 65th buffer's, with 64 uncompleted | the 65th to 69th buffer's, with 64 uncompleted | by `commit`, the 65th buffer's, with 64 uncompleted; by `commitAndWaitUntilSubmitted`, none (the call blocks first, below) |
+| `commit` or `commitAndWaitUntilSubmitted` blocking over 1 ms | never, 64 deep included | never, 64 deep included | never at 32; on the default queue `commitAndWaitUntilSubmitted` blocks from the 37th buffer on, with 36 uncompleted, for about one buffer's GPU time each (p50 5.2 and 9.6 ms in the two runs) |
+| commit to its scheduled handler, asked 32 | p50 0.05 to 0.22, max 0.35 | p50 0.04 to 0.24, max 0.79 | p50 0.02 to 0.08, max 0.26 |
+| the same on the default queue | p50 0.13 to 0.22, max 0.39 | p50 0.06 to 0.12, max 0.81 | by `commit`, p50 32 and 54 and max 159 and 281: a buffer past the 36th uncompleted is scheduled only once one ahead of it completes |
+| `commitAndWaitUntilSubmitted`'s call, asked 32 | p50 0.04 to 0.15, max 0.24 | p50 0.03 to 0.23, max 0.66 | p50 0.01 to 0.07, max 0.33 |
+
+The GL renderer over Metal on the M3 (`GL_RENDERER` "Apple M3 Max", `GL_VERSION` "2.1 Metal -
+91.7"):
+- **Its queues.** It makes two queues at context creation:
+  - one by `newCommandQueueWithDescriptor:` with `maxCommandBufferCount` 32, which answers 32. It
+    draws on this one.
+  - one by `newCommandQueue`, of the default 64. No arm made a buffer on it.
+- **One draw a flush.** It makes one buffer per `glFlush`, and after each `glFlush` 32 buffers
+  are uncompleted (p50 32, max 32, in both runs).
+  - Its command-buffer creation blocks at the cap, and returns with 31 others uncompleted: 88 of
+    120 creations at 5 ms, 48 of 80 at 10 ms.
+  - `glFlush` itself returns in p50 0.05 to 0.07 ms, max 0.17.
+  - The arm's wall time is the GPU's: 5.02 and 9.87 ms a flush.
+- **Eight draws a flush, each after an upload.** It makes 16 buffers per `glFlush`, two for each
+  draw. After each `glFlush` 31 are uncompleted (p50 and max). At 10 ms, 618 of its 1280 creations
+  blocked, each returning with 31 others uncompleted.
+
+So on all three GPUs, a queue keeps its `maxCommandBufferCount` of buffers uncompleted. Its
+`-commandBuffer` blocks there until the oldest completes, and at 32 neither `commit` nor
+`commitAndWaitUntilSubmitted` blocks before it. Each buffer is scheduled within 0.8 ms of its
+commit *(class 3)*. What differs *(class 2)*:
+- **The 630 holds 34 for an ask of 32.**
+- **The M3 schedules at most 36 buffers of a queue ahead of the GPU.** Past that, its
+  `commitAndWaitUntilSubmitted` waits, and a plain `commit`'s scheduled handler waits, for one to
+  complete. 36 is above the 32 the GL renderer asks for.
+
+Apple's GL renderer over Metal asks for 32. When the GPU is the slower side, it keeps 32 buffers
+in flight, so its depth in frames is 32 over the buffers it makes a frame. Each upload in a frame
+adds one.
+
+What our stack does:
+- **The queue's slots.** The bundle gives a queue the slots it asks for (64 for 0), takes one at
+  each buffer's creation and gives it back at `CB_COMPLETE`, which the host posts once the
+  buffer's work is done (`RgfxCommandObjects.mm`, `completion.rs`). The bundle keeps the 5300M's
+  answer, the count asked, not the 630's.
+- **Submitted and scheduled.** The host posts `CB_SUBMITTED` and `CB_SCHEDULED` at the buffer's
+  take. The backlog does not hold them back, as on the x86 GPUs. The bundle does not take the M3's
+  36-buffer scheduling limit: no x86 GPU has it, and the GL renderer's 32 stays under it.
+- **The guest's GL renderer.** The x86-64 guest's GL is the same renderer, and a guest's GL
+  thread blocks in its command-buffer getters, in the bundle's slot take. Lane glblock's walk of
+  the GPU benchmark scene on the Iris Xe (m3-max-63902) measured the renderer's queue at 32
+  uncompleted, at most, for a third of the scene. That is the M3's depth, about 3.8 frames at that
+  scene's 8.4 buffers a frame.
+- **What a Mac's own GL drivers show.** The x86 Macs' own GL drivers do not run over Metal. The
+  frames a GL app keeps in flight on them (about 1.7 on the 5300M's driver, lane mbpscene) belong
+  to that driver, and are no reference for the guest's GL.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,

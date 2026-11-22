@@ -65,6 +65,12 @@ xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework 
 cp "$here/oracle_surfresolve.sh" "$out/"
 xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
 	-framework IOSurface -framework Foundation "$here/oracle_allocsize.m" -o "$out/oracle_allocsize"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework Foundation "$here/oracle_depth.m" -o "$out/oracle_depth"
+# oracle_gldepth measures Apple's GL renderer over Metal: it runs where GL is over Metal (an
+# Apple-silicon Mac), and sees no Metal on an Intel Mac's own GL drivers.
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework OpenGL -framework Foundation "$here/oracle_gldepth.m" -o "$out/oracle_gldepth"
 # oracle_fnreflect runs on every release the guests run (macOS 11 on), and its library is built for
 # macOS 26 and for macOS 11.
 xcrun clang -arch "$arch" -mmacosx-version-min=11.0 -fobjc-arc -Wall -framework Metal \
