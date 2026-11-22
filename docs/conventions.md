@@ -164,10 +164,15 @@ repeats the ones code cites.
     for them, with `video-drawn-spares-wait-ns` their nanoseconds waited and
     `video-drawn-spares-wait-max-ns` the longest wait, and
     `video-drawn-spares-made` and `video-drawn-spares-dropped`, the spares
-    made and those dropped untaken: no degradation) and its decodes'
-    (`video-landing-failure-carried`, a picture whose copy or draw into its
-    output's caches failed after its command buffer completed at its
-    decode, the session's next decode failing in its stead), the rt
+    made and those dropped untaken: no degradation), its VA-API video's
+    on the rt platform on Linux (`video-pictures-gpu-copied`, a picture
+    the GPU copied into its output's device caches from a scratch the
+    driver's video processing wrote, and `video-gpu-copied-kib`, the KiB of
+    their crops: one GPU pass a picture that a Mac does not make) and its
+    decodes' (`video-landing-failure-carried`, a picture whose copy or
+    draw into its output's caches failed after its command buffer
+    completed at its decode, the session's next decode failing in its
+    stead), the rt
     platform's on Windows (`rt-d3d11-surfaces`, the surfaces over Direct3D
     11 textures it made, and `rt-refused-d3d11-surface`, those it refused),
     and the contexts' Private

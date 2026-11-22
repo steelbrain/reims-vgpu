@@ -365,7 +365,9 @@ takes the runtime device's GPU copy, and the CPU's where that declines too
 planes at the check's alignment ([devices.md](devices.md), "How each arm
 lands a picture"), but the frames VideoToolbox hands the guest's decoder
 have CoreVideo's own layout, each plane 32 bytes into its page, which
-neither driver's processing writes and the GPU's copy does.
+neither driver's processing writes: in a device cache the GPU's copy
+writes them from a scratch the driver wrote, and in pages the CPU's
+copy.
 
 **What udmabuf takes.** The kernel's `udmabuf` puts at most `list_limit`
 runs of pages and `size_limit_mb` MiB in one dma-buf: 1,024 and 64 at its
@@ -466,11 +468,25 @@ answers for its device, `rt_platform::HostGpu`). The arm
      memory's first byte and its chroma plane whole rows after it, and
      declines a cache's buffer, whose luma plane lies off its dma-buf's
      first byte (U26);
-  2. by the device's GPU, into the buffer each plane lies in, the
-     surface's pages or its device cache, at the plane's offset and rows,
-     the crop alone as the CPU's copy writes it, where the open made a
-     copier (reims-vgpu's `src/graphics/vaapi.rs`,
-     `GpuCopies`). On Linux the open makes none. On Windows the platform's
+  2. by the device's GPU, into the buffer each plane lies in, at the
+     plane's offset and rows, the crop alone as the CPU's copy writes it,
+     where the open made a copier (reims-vgpu's `src/graphics/vaapi.rs`,
+     `GpuCopies`). On Linux the copier (`src/graphics/vaapi/gpu_copy.rs`)
+     takes planes in a device cache outside its surface: the driver's
+     video processing writes the picture into a scratch of the session's,
+     a dma-buf of the runtime's whose planes lie at its first byte and
+     whole rows after it, at a pitch on 256 bytes, as the driver's imports
+     must; the runtime acquires it, and the fill kernel (`fill`'s
+     `videoEncodeFill`) copies each plane's crop from it into the cache,
+     and nothing else of the cache, and the copy is waited for. So a cache
+     whose layout the driver's import refuses, CoreVideo's 32 bytes into
+     its memory or rows narrower than the driver's pitch, as radeonsi's
+     (an RX 550's below 2048 bytes, a 780M's off a multiple of 256), is
+     still written on the GPU, with the bytes the CPU's copy writes. It
+     declines a plane in the guest's pages, and a crop that does not fill
+     the planes' rows in whole 32-bit words. Each picture copied so counts
+     `video-pictures-gpu-copied`, and its crop's KiB
+     `video-gpu-copied-kib`. On Windows the platform's
      copier declines every picture, each counted as
      `rt-video-gpu-copy-declined` (reims-vgpu's
      `src/graphics/vaapi/rt_windows.rs`): rt imports no image of the shared
@@ -494,8 +510,10 @@ answers for its device, `rt_platform::HostGpu`). The arm
   `a picture copied by the CPU: rows of 1920 bytes: the driver imports
   rows of a multiple of 256 bytes alone; and the GPU's copy: …` (`; and
   no GPU copy: …` where the device made the session no copier), its GPU
-  copies at its end, as `a session's pictures copied by the GPU into their
-  outputs: 300, 0.812 ms of GPU time each, 1.204 ms at most (300 timed)`,
+  copies at its end, as `a decode session's pictures copied by the GPU
+  into their device caches from a scratch the driver's video processing
+  wrote: 300, … ms each from the driver's write to the copy's end, … ms
+  at most`,
   and its counts, as `a session ended after 300 decodes: landed 300 in the
   surface's pages, by the hardware; 0 skipped, 0 failed`, followed by how
   many surfaces' memory its outputs lay in and the most of it live at once
@@ -550,14 +568,19 @@ guest's textures over the planes are as they were either way: about 11 M
 texels copied in a frame of one clip on the 780M, 0.3 M on the Iris.
 
 **The GPU's copy against the CPU's**: the ignored test
-`a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte` (reims-vgpu's
-`src/graphics/vaapi/tests.rs`) decodes the conformance scripts' Annex B
-streams (`RVG_VA_STREAMS`, their `build/h264-check` and `build/hevc-check`,
-`:`-separated), lands each picture both ways into CoreVideo's layout, 32
-bytes into host pages a no-copy buffer lies over, at two pitches, and
-compares every byte, the padding included. `RVG_VAAPI_NODE` names the GPU
-the runtime's default device must be on. **Measured** (2026-11-08): 4849
-pictures of 79 streams equal on the Radeon 780M, 4951 on the Iris Xe.
+`a_picture_copied_by_the_gpu_from_its_scratch_is_the_cpus_copy`
+(reims-vgpu's `src/graphics/vaapi/gpu_copy/tests.rs`) decodes the H.264
+and HEVC Annex B streams in `RVG_VA_STREAMS`'s directories, 8 and 10 bits,
+copies the first pictures of each into a dma-buf device cache in
+CoreVideo's layout by the session's copier (the driver's processing into
+its scratch, then the kernel), and compares every byte of the cache, read
+back by a blit, with the CPU's copy of the same picture, the bytes outside
+the crop included. `RVG_VAAPI_NODE` names the GPU the runtime's default
+device must be on. **Measured** (2026-11-21): 32 pictures of 8 streams,
+H.264, HEVC and HEVC Main10 at 640x360 to 3840x2160, equal on the
+Radeon RX 550 and on the Radeon 780M (radeonsi and RADV, Mesa 26.2.6);
+the copier declined the pictures of a 1366x768 and a 642x362 stream,
+whose rows are not whole words.
 
 ## Waiting for the GPU
 

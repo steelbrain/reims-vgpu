@@ -261,17 +261,15 @@ fn a_planes_arguments_are_the_kernels_and_its_grid_covers_its_words() {
     assert_eq!(plane.threadgroups(), MtlSize::new(3, 7, 1));
 }
 
-/// The device's GPU copies make no copier, so a decode's pictures land as with none, its reason
-/// the same; and a filler each encode session.
+/// The device's GPU copies make a copier each decode session (`gpu_copy`), and a filler each
+/// encode session.
 #[test]
-fn the_devices_fills_make_no_copier_and_a_filler_each_session() {
+fn the_devices_fills_make_a_copier_and_a_filler_each_session() {
     let platform = FakePlatform::new();
     let runtime: Arc<dyn Runtime> = Arc::new(reims_vgpu_video::core::runtime::StdRuntime);
     let fills = DeviceFills::<FakePlatform>::new(&platform.device(), &runtime);
-    match fills.copier() {
-        Ok(_) => panic!("a copier"),
-        Err(why) => assert_eq!(why, "the platform makes no GPU copies"),
-    }
+    assert!(fills.copier().is_ok());
+    assert!(fills.copier().is_ok());
     assert!(fills.filler().is_ok());
     assert!(fills.filler().is_ok());
 }
@@ -369,7 +367,7 @@ fn on_rt_the_kernel_writes_a_frame_as_the_upload_writes_it() {
             let planes = Planes::<RtPlatform> {
                 pipeline: &pipeline,
                 arguments: &arguments,
-                destination: &input,
+                destinations: [&input, &input],
                 sources: [&source_buffer, &source_buffer],
             };
             assert_eq!(

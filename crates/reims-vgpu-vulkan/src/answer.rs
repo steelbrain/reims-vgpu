@@ -172,7 +172,9 @@ pub fn out_of_host_memory_count() -> u64 {
 /// spare being made for it (`video-drawn-spares-waited`, its nanoseconds waited,
 /// `video-drawn-spares-wait-ns`, and the longest wait, `video-drawn-spares-wait-max-ns`), with
 /// the spares made (`video-drawn-spares-made`) and dropped untaken (`video-drawn-spares-dropped`),
-/// and as
+/// and as its VA-API video on the rt platform on Linux copies a picture on the GPU into its
+/// output's device caches from a scratch the driver's video processing wrote
+/// (`video-pictures-gpu-copied`, and their crops' KiB, `video-gpu-copied-kib`), and as
 /// its video session's picture does not land after its command buffer
 /// completed at its decode, the session's next decode failing in its stead
 /// (`video-landing-failure-carried`); the rt platform's surfaces over Direct3D 11 textures on

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use reims_vgpu_video::core::backend::DeviceWrite;
-use reims_vgpu_video::vaapi::{Frame, PlaneDraw};
+use reims_vgpu_video::vaapi::{Frame, GuestWrites, PlaneDraw};
 use reims_vgpu_vulkan::RtPlatform;
 
 use super::super::video_host::{BackendError, OutputPlane};
@@ -79,6 +79,7 @@ impl GpuCopier<RtPlatform> for RtCopier {
     fn copy(
         &mut self,
         _frame: &Frame,
+        _imports: &GuestWrites,
         _luma: &OutputPlane<RtPlatform>,
         _chroma: &OutputPlane<RtPlatform>,
     ) -> Result<DeviceWrite, BackendError> {

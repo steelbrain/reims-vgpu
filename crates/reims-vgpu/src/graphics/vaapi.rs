@@ -61,11 +61,15 @@
 //!      chroma plane whole rows of a pitch on 256 bytes after it, which iHD writes; a cache's
 //!      buffer keeps CoreVideo's layout, its luma plane off its dma-buf's first byte, which iHD's
 //!      run declines.
-//!   2. **By the device's GPU** ([`GpuCopies`]): each plane copied into the plane's buffer, the
-//!      guest's pages or the surface's device cache, at its own rows and offset, the crop alone as
-//!      the CPU's copy writes it, where the open made a copier. On Linux the rt platform's
-//!      copies make none, only encode sessions' fillers (`fill`); on Windows the rt platform's
-//!      copier declines each picture, counted, so that each lands by the CPU (`rt_windows`).
+//!   2. **By the device's GPU** ([`GpuCopies`]): each plane copied into the plane's buffer at its
+//!      own rows and offset, the crop alone as the CPU's copy writes it, where the open made a
+//!      copier. On Linux the rt platform's copier (`gpu_copy`) takes planes in device caches
+//!      outside their surfaces: the driver's video processing writes the picture into a scratch
+//!      of the session's that lies as its imports must, and the GPU copies the crop from it into
+//!      the cache, so that a cache whose layout the driver's import refuses (CoreVideo's planes
+//!      32 bytes into their memory, rows narrower than the driver's pitch) is still written on
+//!      the GPU; it declines a plane in the guest's pages. On Windows the rt platform's copier
+//!      declines each picture, counted, so that each lands by the CPU (`rt_windows`).
 //!   3. **By the CPU**: the frame read back (staged, or `vaGetImage`, the VA crate's way back),
 //!      and copied into the planes' host bytes, or into the session's staging for a plane in a
 //!      device cache.
@@ -141,6 +145,8 @@ use super::video_host::{
 mod encode;
 #[cfg(unix)]
 mod fill;
+#[cfg(unix)]
+mod gpu_copy;
 #[cfg(windows)]
 mod rt_windows;
 
@@ -226,8 +232,9 @@ impl std::fmt::Display for DisplayAt<'_> {
 
 /// The VA-API video of the rt platform's `device`, on its GPU's render node
 /// (`host_gpus::render_node_at`), as [`open`] opens it; `None`, logged, where its GPU has none.
-/// Its pictures land by the driver's video processing or the CPU's copy, as its GPU copies
-/// ([`fill::DeviceFills`]) make no copier; a reference picture is not decoded into its cache
+/// Its pictures land by the driver's video processing, then by the GPU's copy from a scratch the
+/// driver wrote, for a plane in a device cache (`gpu_copy`, the copier of [`fill::DeviceFills`]),
+/// then by the CPU's copy; a reference picture is not decoded into its cache
 /// ([`CachedReferences::Apart`]); and the driver's encoders are answered, their sessions' frames
 /// written into the encoders' inputs by the GPU (`fill`), else uploaded by the CPU.
 #[cfg(unix)]
@@ -1516,10 +1523,13 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
             _ if to.luma.in_surface() || to.chroma.in_surface() => {
                 format!("{declined}; and no GPU copy into a cache's surface")
             }
-            Ok(copier) => match copier.lock().copy(&self.frame, to.luma, to.chroma)? {
-                DeviceWrite::Written => return Ok(()),
-                DeviceWrite::Declined(why) => format!("{declined}; and the GPU's copy: {why}"),
-            },
+            Ok(copier) => {
+                let copied = (copier.lock()).copy(&self.frame, &self.imports, to.luma, to.chroma);
+                match copied? {
+                    DeviceWrite::Written => return Ok(()),
+                    DeviceWrite::Declined(why) => format!("{declined}; and the GPU's copy: {why}"),
+                }
+            }
             Err(why) => format!("{declined}; and no GPU copy: {why}"),
         };
         self.copied_because(declined);
@@ -1595,12 +1605,14 @@ pub(crate) enum Filled {
 /// One session's GPU copies of its pictures into their outputs.
 pub(crate) trait GpuCopier<P: Platform>: Send {
     /// Writes `frame` into `luma` and `chroma` where they lie, its crop as the CPU's copy writes
-    /// it, once its decode is done, and returns once the GPU wrote it;
-    /// [`DeviceWrite::Declined`] with why, nothing written, where it cannot. `Err` where the
-    /// decode failed, or the copy failed once on the GPU, which may write the planes still.
+    /// it, once its decode is done, and returns once the GPU wrote it, the driver's writes of the
+    /// video's memory through `imports`; [`DeviceWrite::Declined`] with why, nothing written into
+    /// the planes, where it cannot. `Err` where the decode failed, or the copy failed once on the
+    /// GPU, which may write the planes still.
     fn copy(
         &mut self,
         frame: &Frame,
+        imports: &GuestWrites,
         luma: &OutputPlane<P>,
         chroma: &OutputPlane<P>,
     ) -> Result<DeviceWrite, BackendError>;

@@ -735,11 +735,11 @@ fn a_picture_written_into_a_dma_buf_caches_surface_by_video_processing_is_the_cp
 }
 
 /// The pictures of each stream the tests of writes into caches write.
-const PICTURES: usize = 4;
+pub(super) const PICTURES: usize = 4;
 
 /// The H.264 and HEVC streams in `RVG_VA_STREAMS`'s directories, the conformance suite's: their
 /// Annex B forms but the parts a run left.
-fn va_streams() -> Vec<std::path::PathBuf> {
+pub(super) fn va_streams() -> Vec<std::path::PathBuf> {
     let dirs = std::env::var("RVG_VA_STREAMS").expect("RVG_VA_STREAMS: the streams' directories");
     let mut streams: Vec<std::path::PathBuf> = (dirs.split(':'))
         .flat_map(|dir| std::fs::read_dir(dir).expect("a streams directory"))
@@ -758,7 +758,7 @@ fn va_streams() -> Vec<std::path::PathBuf> {
 /// its stream and its access unit's id, until `each` answered `true` (written) for `most` of the
 /// stream's frames or the stream ends. A stream the decoder refuses is left at its refusal, which
 /// is answered.
-fn each_picture(
+pub(super) fn each_picture(
     display: &Display,
     streams: &[std::path::PathBuf],
     most: usize,
@@ -806,15 +806,16 @@ fn each_picture(
     refused
 }
 
-/// What the GPU's copies leave as it was: every byte past the planes' rows.
-const UNTOUCHED: u8 = 0xee;
+/// What the GPU's copies leave as it was: every byte past the planes' rows (`gpu_copy`'s tests
+/// too).
+pub(super) const UNTOUCHED: u8 = 0xee;
 
-fn usize_of(n: u64) -> usize {
+pub(super) fn usize_of(n: u64) -> usize {
     usize::try_from(n).expect("a size")
 }
 
 /// `rows` rows of `row_bytes` in `bytes`, `pitch` apart, for the CPU's copy.
-fn plane_rows(bytes: &mut [u8], pitch: u64, rows: u64, row_bytes: u64) -> PlaneRows<'_> {
+pub(super) fn plane_rows(bytes: &mut [u8], pitch: u64, rows: u64, row_bytes: u64) -> PlaneRows<'_> {
     PlaneRows {
         bytes,
         bytes_per_row: usize_of(pitch),

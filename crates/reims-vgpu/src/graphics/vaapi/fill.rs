@@ -39,6 +39,10 @@
 //!   write it still.
 //!
 //! Each session logs at its end how many frames went this way, and the fills' times.
+//!
+//! The same kernel copies a decode session's pictures into their device caches from a scratch
+//! the driver's video processing wrote (`gpu_copy`, the copier [`DeviceFills`] makes), each word
+//! a plain copy of the scratch's.
 
 use std::os::fd::AsFd as _;
 use std::sync::{Arc, OnceLock};
@@ -59,6 +63,7 @@ use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlSize, NsR
 use reims_vgpu_vulkan::core::raise::OnFault;
 
 use super::super::video_host::{BackendError, OutputPlane};
+use super::gpu_copy::ScratchCopier;
 use super::{Filled, GpuCopier, GpuCopies, GpuFiller, NAME, STORAGE_PRIVATE};
 
 /// The platform library's kernel that writes a plane of the encoder's input (`shaders.metal`).
@@ -73,27 +78,27 @@ const BINDING_ALIGNMENT: u64 = 256;
 
 /// The bytes between the chroma plane's arguments and the luma's in the arguments' buffer: a
 /// constant buffer's binding offset is a multiple of 256 on any device.
-const ARGUMENTS_APART: u64 = 256;
+pub(super) const ARGUMENTS_APART: u64 = 256;
 
 /// What `videoEncodeFill` takes of a plane (`shaders.metal`'s `VideoFillPlane`): where the plane
 /// lies in its source buffer as bound, its rows and the bytes its margin repeats, the input's
 /// words a row, its rows and its words from one row to the next, and how the input lays its words
 /// out ([`TILING_LINEAR`] or [`TILING_INTEL_Y`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FillPlane {
-    first: u32,
-    source_pitch: u32,
-    row_bytes: u32,
-    rows: u32,
-    unit: u32,
-    coded_words: u32,
-    coded_rows: u32,
-    pitch_words: u32,
-    tiling: u32,
+pub(super) struct FillPlane {
+    pub(super) first: u32,
+    pub(super) source_pitch: u32,
+    pub(super) row_bytes: u32,
+    pub(super) rows: u32,
+    pub(super) unit: u32,
+    pub(super) coded_words: u32,
+    pub(super) coded_rows: u32,
+    pub(super) pitch_words: u32,
+    pub(super) tiling: u32,
 }
 
 /// `VideoFillPlane`'s `tiling` of a linear input.
-const TILING_LINEAR: u32 = 0;
+pub(super) const TILING_LINEAR: u32 = 0;
 /// `VideoFillPlane`'s `tiling` of an input in Intel's Y tiles.
 const TILING_INTEL_Y: u32 = 1;
 
@@ -128,16 +133,16 @@ impl FillPlane {
 /// Where a source plane lies: its buffer's bytes, its first byte, the bytes from one of its rows
 /// to the next, the bytes of a row, and the rows it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Source {
-    length: u64,
-    offset: u64,
-    bytes_per_row: u64,
-    row_bytes: u64,
-    height: u64,
+pub(super) struct Source {
+    pub(super) length: u64,
+    pub(super) offset: u64,
+    pub(super) bytes_per_row: u64,
+    pub(super) row_bytes: u64,
+    pub(super) height: u64,
 }
 
 impl Source {
-    fn of<P: Platform>(plane: &OutputPlane<P>) -> Self {
+    pub(super) fn of<P: Platform>(plane: &OutputPlane<P>) -> Self {
         Self {
             length: plane.buffer.length(),
             offset: plane.offset,
@@ -151,10 +156,10 @@ impl Source {
 /// One plane's dispatch: its source bound from byte `bound`, the input's bytes from `at`, and
 /// what the kernel takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PlaneFill {
-    bound: u64,
-    at: u64,
-    plane: FillPlane,
+pub(super) struct PlaneFill {
+    pub(super) bound: u64,
+    pub(super) at: u64,
+    pub(super) plane: FillPlane,
 }
 
 /// The rows of a Y tile: an input plane's rows in Intel's Y tiles take whole rows of tiles.
@@ -280,16 +285,24 @@ fn plane_fills(
     ])
 }
 
-/// The kernel's pipeline on a device, made at a session's first fill and kept for the device's
-/// sessions.
-struct Pipeline<P: Platform> {
-    device: P::Device,
+/// The kernel's pipeline on a device, made at a session's first fill or copy (`gpu_copy`) and
+/// kept for the device's sessions.
+pub(super) struct Pipeline<P: Platform> {
+    pub(super) device: P::Device,
     made: OnceLock<Result<P::ComputePipeline, String>>,
 }
 
 impl<P: Platform> Pipeline<P> {
+    /// The kernel's pipeline on `device`, made at its first use.
+    pub(super) fn new(device: &P::Device) -> Self {
+        Self {
+            device: device.clone_ref(),
+            made: OnceLock::new(),
+        }
+    }
+
     /// The pipeline; `Err` says why the device makes none.
-    fn get(&self) -> Result<P::ComputePipeline, String> {
+    pub(super) fn get(&self) -> Result<P::ComputePipeline, String> {
         let made = self.made.get_or_init(|| {
             let library = match self.device.new_shader_library() {
                 Ok(Some(library)) => library,
@@ -314,9 +327,9 @@ impl<P: Platform> Pipeline<P> {
     }
 }
 
-/// The GPU fills of a device's encode sessions (module doc), and no GPU copies of decoded
-/// pictures: a decode's picture lands by the driver's video processing or the CPU's copy, as it
-/// does with no `GpuCopies` at all.
+/// The GPU fills of a device's encode sessions (module doc), and the GPU copies of its decode
+/// sessions' pictures into their outputs' device caches, by the same kernel, where the driver's
+/// video processing declined to write them there in place (`gpu_copy`).
 pub(super) struct DeviceFills<P: Platform> {
     pipeline: Arc<Pipeline<P>>,
     runtime: Arc<dyn Runtime>,
@@ -326,10 +339,7 @@ impl<P: Platform> DeviceFills<P> {
     /// The fills of `device`'s sessions, timed on `runtime`'s clock.
     pub(super) fn new(device: &P::Device, runtime: &Arc<dyn Runtime>) -> Self {
         Self {
-            pipeline: Arc::new(Pipeline {
-                device: device.clone_ref(),
-                made: OnceLock::new(),
-            }),
+            pipeline: Arc::new(Pipeline::new(device)),
             runtime: Arc::clone(runtime),
         }
     }
@@ -337,7 +347,10 @@ impl<P: Platform> DeviceFills<P> {
 
 impl<P: Platform> GpuCopies<P> for DeviceFills<P> {
     fn copier(&self) -> Result<Box<dyn GpuCopier<P>>, String> {
-        Err("the platform makes no GPU copies".to_owned())
+        Ok(Box::new(ScratchCopier::new(
+            Arc::clone(&self.pipeline),
+            Arc::clone(&self.runtime),
+        )))
     }
 
     fn filler(&self) -> Result<Box<dyn GpuFiller<P>>, String> {
@@ -570,7 +583,7 @@ impl<P: Platform> DeviceFiller<P> {
         let planes = Planes {
             pipeline,
             arguments,
-            destination,
+            destinations: [destination, destination],
             sources,
         };
         if let Some(why) = encode_planes::<P>(&cb, &planes, fills) {
@@ -607,19 +620,20 @@ impl<P: Platform> DeviceFiller<P> {
     }
 }
 
-/// What a fill's dispatches bind: the kernel's pipeline, the buffer of its arguments, the input
-/// they write, and the luma plane's buffer and the chroma's they read.
-struct Planes<'a, P: Platform> {
-    pipeline: &'a P::ComputePipeline,
-    arguments: &'a P::Buffer,
-    destination: &'a P::Buffer,
-    sources: [&'a P::Buffer; 2],
+/// What a fill's dispatches bind: the kernel's pipeline, the buffer of its arguments, the
+/// buffers they write, the luma plane's and the chroma's (an encoder's input for both, a decode's
+/// output's planes for a copy), and the luma plane's buffer and the chroma's they read.
+pub(super) struct Planes<'a, P: Platform> {
+    pub(super) pipeline: &'a P::ComputePipeline,
+    pub(super) arguments: &'a P::Buffer,
+    pub(super) destinations: [&'a P::Buffer; 2],
+    pub(super) sources: [&'a P::Buffer; 2],
 }
 
 /// Writes each of `fills`' arguments into `planes.arguments`, 256 bytes apart, and encodes into
 /// `cb` the pass that writes them (module doc): one dispatch a plane. `Some` says why it could
 /// not, with nothing committed.
-fn encode_planes<P: Platform>(
+pub(super) fn encode_planes<P: Platform>(
     cb: &P::CommandBuffer,
     planes: &Planes<'_, P>,
     fills: &[PlaneFill; 2],
@@ -652,14 +666,11 @@ fn encode_planes<P: Platform>(
     if let Err(raise) = compute.encode(OnFault::Return, state) {
         return Some(format!("its pipeline: {raise}"));
     }
-    for ((n, fill), source) in fills.iter().enumerate().zip(planes.sources) {
+    let bound = planes.sources.into_iter().zip(planes.destinations);
+    for ((n, fill), (source, destination)) in fills.iter().enumerate().zip(bound) {
         let commands = [
             ComputeCmd::SetBuffers {
-                buffers: &[
-                    Some(source),
-                    Some(planes.destination),
-                    Some(planes.arguments),
-                ],
+                buffers: &[Some(source), Some(destination), Some(planes.arguments)],
                 offsets: &[fill.bound, fill.at, n as u64 * ARGUMENTS_APART],
                 range: NsRange {
                     location: 0,
