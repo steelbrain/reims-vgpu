@@ -137,7 +137,10 @@
 //! count in `bytes_copied` too). The counts line carries both as amounts, [`RESOLVE_COPIES_CODE`]
 //! and [`RESOLVE_COPY_BYTES_CODE`], so a boot's line says whether its resolves into textures over
 //! buffers went in place or through a resolve image, and the images go to it at their highest
-//! (below).
+//! (below). rt also counts every resolve of a pass's multisample attachment, one per attachment a
+//! pass resolves as its encoder ends (`Metrics::resolves`), an amount on the counts line,
+//! [`RESOLVES_CODE`]: on a device that resolves in place, where the copies and the images stay 0,
+//! it is what shows that a boot's resolves ran.
 //!
 //! **Its partial-threadgroups variant's whole grids.** A kernel that observes its threadgroup
 //! partition runs every direct dispatch on its partial-threadgroups variant, whole grids
@@ -313,6 +316,11 @@ pub const EMULATED_SIMDGROUP_DISPATCHES_CODE: &str = "rt-emulated-simdgroup-disp
 /// ([`fold_metrics`]).
 pub const KERNEL_MAKES_DROPPED_CODE: &str = "rt-kernel-makes-dropped";
 
+/// The code of the resolves of passes' multisample attachments, one per attachment a pass
+/// resolves, counted as its encoder ends (`Metrics::resolves`), an amount on the counts line
+/// ([`fold_metrics`]).
+pub const RESOLVES_CODE: &str = "rt-resolves";
+
 /// The code of the copies of what a pass resolved into a texture's resolve image into the bytes
 /// of the buffer the texture is in place over (`Metrics::resolve_copies`), an amount on the counts
 /// line ([`fold_metrics`]).
@@ -383,9 +391,10 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// pipelines made with a stage past the kernels' bound, the compute dispatches' first-use waits
 /// and their nanoseconds, the exported blocks whose address went out, the pipeline caches
 /// replaced and the cache's writes skipped past its bound, the dispatches that ran an
-/// emulated-SIMD-group module, the compiled contents a state's make dropped, the copies out of
-/// resolve images and their bytes, and the whole grids that ran a partial-threadgroups variant.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 21;
+/// emulated-SIMD-group module, the compiled contents a state's make dropped, the resolves of
+/// multisample attachments, the copies out of resolve images and their bytes, and the whole grids
+/// that ran a partial-threadgroups variant.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 22;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -407,8 +416,9 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// device, its command buffers held for room, its cache writes, its translations, its pipelines'
 /// makes and their time, its render makes past the kernels' bound, its compute dispatches'
 /// first-use waits, its exported blocks addressed, its pipeline caches replaced and cache writes
-/// skipped past their bound, its emulated-SIMD-group dispatches, its dropped makes, its resolve
-/// copies and its whole grids on a partial-threadgroups variant rose by since the last fold
+/// skipped past their bound, its emulated-SIMD-group dispatches, its dropped makes, its resolves,
+/// its resolve copies and its whole grids on a partial-threadgroups variant rose by since the last
+/// fold
 /// ([`folded_counts`]), so the counts line carries their totals, then its maxima
 /// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
 /// docs). Nothing before the device is made.
@@ -515,9 +525,10 @@ fn follow(counters: rt::Counters) {
 /// caches replaced ([`PIPELINE_CACHES_REPLACED_CODE`]) and the cache's writes skipped
 /// ([`PIPELINE_CACHE_WRITES_SKIPPED_CODE`]) past its bound, the dispatches that ran an
 /// emulated-SIMD-group module ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), the compiled contents a
-/// state's make dropped ([`KERNEL_MAKES_DROPPED_CODE`]), the copies out of resolve images
-/// ([`RESOLVE_COPIES_CODE`]) and their bytes ([`RESOLVE_COPY_BYTES_CODE`]), and the whole grids
-/// that ran a partial-threadgroups variant ([`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`]).
+/// state's make dropped ([`KERNEL_MAKES_DROPPED_CODE`]), the resolves of multisample attachments
+/// ([`RESOLVES_CODE`]), the copies out of resolve images ([`RESOLVE_COPIES_CODE`]) and their bytes
+/// ([`RESOLVE_COPY_BYTES_CODE`]), and the whole grids that ran a partial-threadgroups variant
+/// ([`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -548,6 +559,7 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
             m.emulated_simdgroup_dispatches,
         ),
         (KERNEL_MAKES_DROPPED_CODE, m.kernel_makes_dropped),
+        (RESOLVES_CODE, m.resolves),
         (RESOLVE_COPIES_CODE, m.resolve_copies),
         (RESOLVE_COPY_BYTES_CODE, m.resolve_copy_bytes),
         (
@@ -2042,8 +2054,9 @@ mod tests {
     /// a stage past the kernels' bound, the compute dispatches' first-use waits and their
     /// nanoseconds, the exported blocks whose address went out, the pipeline caches replaced and
     /// the cache's writes skipped past its bound, the dispatches that ran an emulated-SIMD-group
-    /// module, the compiled contents a state's make dropped, the copies out of resolve images and
-    /// their bytes, and the whole grids that ran a partial-threadgroups variant.
+    /// module, the compiled contents a state's make dropped, the resolves of multisample
+    /// attachments, the copies out of resolve images and their bytes, and the whole grids that ran
+    /// a partial-threadgroups variant.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2075,6 +2088,7 @@ mod tests {
             PIPELINE_CACHE_WRITES_SKIPPED_CODE,
             EMULATED_SIMDGROUP_DISPATCHES_CODE,
             KERNEL_MAKES_DROPPED_CODE,
+            RESOLVES_CODE,
             RESOLVE_COPIES_CODE,
             RESOLVE_COPY_BYTES_CODE,
             PARTIAL_VARIANT_WHOLE_GRIDS_CODE,
@@ -2107,6 +2121,7 @@ mod tests {
         m.exported_blocks_addressed = 1;
         m.pipeline_caches_replaced = 1;
         m.emulated_simdgroup_dispatches = 4;
+        m.resolves = 3;
         m.resolve_copies = 1;
         m.resolve_copy_bytes = 3_686_400;
         m.partial_variant_whole_grids = 6;
@@ -2134,6 +2149,7 @@ mod tests {
         m.pipeline_cache_writes_skipped = 1;
         m.emulated_simdgroup_dispatches = 11;
         m.kernel_makes_dropped = 2;
+        m.resolves = 10;
         m.resolve_copies = 4;
         m.resolve_copy_bytes = 4 * 3_686_400;
         m.partial_variant_whole_grids = 13;
@@ -2145,7 +2161,7 @@ mod tests {
             rose,
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
-                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 11, 2, 4, 14_745_600, 13
+                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 11, 2, 10, 4, 14_745_600, 13
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
