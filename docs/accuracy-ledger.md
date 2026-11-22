@@ -163,6 +163,17 @@ Metal runs them, and is refused elsewhere (`Translation-SubgroupOperations`): me
 measured KosmicKrisp on the M3 Max and the UHD 630's Windows driver without it, and RADV, ANV,
 NVIDIA and lavapipe with it.
 
+A pipeline create whose driver's create fails after its reply is answered made, where Metal's
+synchronous creator answers the failure as the create's error. rt's creators answer before the
+driver's create of the state's main pipelines, which the state's finish (rt's `finish_pipeline`)
+then makes on the device's compile thread, before the pipeline is stored
+(`crates/reims-vgpu/src/graphics/compile.rs`, "Order"); Vulkan lets that create fail only for
+exhausted host or device memory, or with `VK_ERROR_UNKNOWN` or `VK_ERROR_VALIDATION_FAILED`. The
+failure is counted, `pipeline-finish-failed`, the process's first with a line at warn, and no
+answer of the create's key is kept for the next runs; the pipeline is stored as made, a draw or
+dispatch that needs the failed pipeline makes it again at its encode, and where that make fails
+too the platform answers the encode as one it refuses.
+
 ## Memory whose GPU writes Metal drops
 
 | Entry | What runs instead of Metal's answer |

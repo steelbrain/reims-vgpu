@@ -37,14 +37,15 @@
 //! state's finish (`ComputePipeline::finish`, `RenderPipeline::finish`), runs on the same thread,
 //! where the platform makes what it left of the state (the driver's pipeline, where it defers
 //! that create), so no draw or dispatch of the guest's makes it on its lane; then a keyed
-//! create's answer is kept where the make finished, and the pipeline is stored. On today's
-//! platform the finish does nothing yet: the make leaves the driver's pipeline to it, and the
-//! pipeline's first draw or dispatch makes it, on its lane. A finish that fails is the create's
-//! late failure (`decode::FINISH_FAILED`): counted, the first of the process logged at warn, no
-//! answer kept, and the pipeline stored as made, each of its draws and dispatches meeting the
-//! failure at its encode, which the platform answers as an encode it refuses; the VM goes on. So
-//! the guest meets that failure in its command buffers, not as its create's error, where a Mac's
-//! synchronous creator answers it.
+//! create's answer is kept where the make finished, and the pipeline is stored. On the rt
+//! platform the finish is the driver's create of the state's main pipelines (rt's
+//! `finish_pipeline`), so the reply no longer waits for it; the store, and the command buffers
+//! that name the pipeline, still do. A finish that fails is the create's late failure
+//! (`decode::FINISH_FAILED`): counted, the first of the process logged at warn, no answer kept,
+//! and the pipeline stored as made, its draws and dispatches making what the finish left again
+//! at their encode and, where that make fails too, failing as an encode the platform refuses;
+//! the VM goes on. So the guest meets that failure, if at all, in its command buffers, not as its
+//! create's error, where a Mac's synchronous creator answers it.
 //!
 //! From its dispatch until it is stored, the pipeline is pending, the window between its reply
 //! and its store included. A command buffer that names a pending pipeline
@@ -58,12 +59,13 @@
 //! its store, a cancelled one's too, or the device's reset ([`Pending::wait_for_icb_write`],
 //! [`Pending::wait_for_icb_slots`], [`Pending::wait_for_ids`]). An `OBJECT_DESTROY` of a pending
 //! pipeline, or its context's close, cancels it, between its reply and its store as before its
-//! reply: its finish still runs, and its pipeline is then not stored, so the destroy keeps its
-//! place in ring order: the compile's store asks the pending set under the lock of the table the
-//! pipeline goes in, and the destroy cancels it before it removes from that table; a buffer
-//! waits for no cancelled pipeline. A table's lock is taken before the pending set's wherever
-//! both are held, and a waiter holds only the pending set's. The device's reset ends every
-//! buffer's wait as it begins ([`Pending::resetting`]), and no compile begun before it is stored.
+//! reply: its finish runs only where it began before the cancel, and its pipeline is then not
+//! stored, so the destroy keeps its place in ring order: the compile's store asks the pending set
+//! under the lock of the table the pipeline goes in, and the destroy cancels it before it removes
+//! from that table; a buffer waits for no cancelled pipeline. A table's lock is taken before the
+//! pending set's wherever both are held, and a waiter holds only the pending set's. The device's
+//! reset ends every buffer's wait as it begins ([`Pending::resetting`]), and no compile begun
+//! before it is stored, nor finished where its finish had not begun.
 
 //! **A make held for its stage.** A compute pipeline whose make the platform refused for a stage
 //! whose compile runs outside the process

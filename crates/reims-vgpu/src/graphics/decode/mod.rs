@@ -6348,8 +6348,9 @@ impl<P: Platform> CompiledPipeline<P> {
     /// ([`refusing`]): whether it succeeded, as a refused create, which has nothing to finish,
     /// does. Its failure, the driver's or a death in the platform's scope, is the create's late
     /// failure ([`FINISH_FAILED`]): counted, the first of the process logged at warn, it changes
-    /// nothing the create answers, and the pipeline is stored as made, each of its draws and
-    /// dispatches meeting the failure at its encode, as one whose encode the platform refuses.
+    /// nothing the create answers, and the pipeline is stored as made, its draws and dispatches
+    /// making what the finish left again at their encode and, where that make fails too, failing
+    /// as an encode the platform refuses.
     pub(crate) fn finish(&self, seqno: u64) -> bool {
         let finished = match &self.handle {
             Some(ObjHandle::RenderPipeline(pipeline)) => refusing(|| Ok(pipeline.finish())),
@@ -6363,7 +6364,8 @@ impl<P: Platform> CompiledPipeline<P> {
         log::warn!(
             target: "reims_vgpu::graphics",
             "a pipeline create (seqno {seqno}, object {:#x}) was answered made, and its make's \
-             finish failed: {error}; its draws and dispatches meet the failure at their encode",
+             finish failed: {error}; its draws and dispatches make what it left again at their \
+             encode",
             self.obj_id
         );
         false
@@ -6371,8 +6373,9 @@ impl<P: Platform> CompiledPipeline<P> {
 }
 
 /// The degradation code of a pipeline create whose make's second step failed after its first
-/// made every answer of its reply ([`CompiledPipeline::finish`]): its draws and dispatches meet
-/// the failure at their encode, where the platform answers the encode as one it refuses. The
+/// made every answer of its reply ([`CompiledPipeline::finish`]): its draws and dispatches make
+/// what the finish left again at their encode, and where that make fails too the platform
+/// answers the encode as one it refuses. The
 /// create itself answers made, the failure on its command buffers, not on the create, where a
 /// Mac's synchronous create would answer it. Counted each time, the first logged.
 pub(crate) const FINISH_FAILED: &str = "pipeline-finish-failed";

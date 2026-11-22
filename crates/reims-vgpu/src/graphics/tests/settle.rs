@@ -1,9 +1,10 @@
 //! A pipeline create's two steps on its compile's thread (`compile`, "Order"): its reply, posted
 //! once the platform's make made every answer it carries, then its store, after the make's finish
 //! (`ComputePipeline::finish`) on the same thread. A command buffer and an `ICB_WRITE` that name
-//! the pipeline wait for the store; a destroy, a close and a reset between the two cancel it; a
-//! finish that fails is counted, its first line logged, keeps no answer and stores the pipeline
-//! as made; and a make held for its stage's fill answers after the fill, before its finish.
+//! the pipeline wait for the store; a destroy, a close and a reset between the two cancel it, and
+//! a destroy before the finish begins skips it; a finish that fails is counted, its first line
+//! logged, keeps no answer and stores the pipeline as made; and a make held for its stage's fill
+//! answers after the fill, before its finish.
 
 use std::time::Duration;
 
@@ -320,6 +321,32 @@ fn a_destroy_between_a_create_s_reply_and_its_store_cancels_it() {
         "the destroyed pipeline was kept"
     );
     assert!(!pending(&device, id));
+    // The queue and the library.
+    assert_eq!(device.decoder_object_count(), 2);
+}
+
+/// An `OBJECT_DESTROY` carried out before a create's compile ends cancels it before its finish
+/// begins: the create is still answered, its finish is skipped, and its pipeline is not stored
+#[test]
+fn a_create_destroyed_before_its_finish_begins_is_not_finished() {
+    let (device, platform, mut guest, _ring) = with_states(&[]);
+    let world = platform.world();
+    let id = obj(CONTEXT, 11);
+    device.control.pool.hold();
+    guest.send(&device, compute_pipeline_create(id, obj(CONTEXT, 10)));
+    guest.send(&device, object_destroy(id));
+    // The destroy is carried out before a lookup of its context's after it is answered.
+    carried_out_of(&device, &mut guest, CONTEXT);
+    device.control.pool.release();
+    let bytes = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    let (reflection, _) = RgfxPipelineReflection::read_from_prefix(&bytes).unwrap();
+    assert_eq!(
+        (reflection.obj_id, reflection.status),
+        (id, RGFX_PIPELINE_OK)
+    );
+    assert!(eventually(|| !pending(&device, id)), "the create never settled");
+    let finished = world.finished();
+    assert!(finished.is_empty(), "a cancelled create was finished: {finished:?}");
     // The queue and the library.
     assert_eq!(device.decoder_object_count(), 2);
 }

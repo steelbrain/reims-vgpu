@@ -514,17 +514,17 @@ impl RenderPipeline for RtObj<RtRenderPipeline> {
         Some(writes(written, index))
     }
 
-    /// Nothing, and never `Err`: rt's make of the state (`make`) leaves the driver's creates of
-    /// its main pipelines (its content's triangle or patch class, and the line or point class its
-    /// `inputPrimitiveTopology` names) to `RenderPipelineState::finish_pipeline`, which is not
-    /// called here yet, so the state's first draw of each class makes its pipeline, the draw
-    /// waiting for the make (rt's `Metrics::first_use_unfinished_waits`).
-    ///
-    /// RT FINISH: that step is called here, on this thread,
-    /// `self.rt.finish_pipeline().map_err(|error| error.to_string())`: its one error, a Vulkan
-    /// one, keeps nothing, and the state's first draw makes the pipelines again.
+    /// The driver's creates of the state's main pipelines (its content's triangle or patch
+    /// class, and the line or point class its `inputPrimitiveTopology` names), which rt's make of
+    /// the state (`make`) leaves to `RenderPipelineState::finish_pipeline`, on this thread, as a
+    /// compute state's finish (`super::pipeline`, "Its main pipeline"); nothing where they are
+    /// made. `Err` is rt's one error here, a Vulkan one, as its text
+    /// (`super::pipeline::finished`): rt keeps nothing of the failed pipeline, makes the other
+    /// still, and the state's first draw of the failed one's class makes it again, waiting for
+    /// the make (rt's `Metrics::first_use_unfinished_waits`), failing as a draw rt refuses where
+    /// that make fails too.
     fn finish(&self) -> Result<(), String> {
-        Ok(())
+        super::pipeline::finished(self.rt.finish_pipeline())
     }
 }
 
@@ -921,5 +921,47 @@ mod tests {
         };
         assert!(device.new_mesh_render_pipeline_state_full(&desc).is_err());
         assert_eq!(counted(mesh), before + 1);
+    }
+
+    /// A render state's finish, on the GPU the test holds, is the driver's create of its main
+    /// pipeline (rt's `finish_pipeline`): rt's make of a state whose descriptor names no
+    /// primitive class makes no `VkPipeline`, its finish makes its triangle class's, counted as
+    /// finished, and a second finish makes nothing
+    #[test]
+    fn a_finish_makes_the_render_state_s_main_pipeline_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let counters = device.rt().counters();
+        let library = device.new_library(NUMBERED).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let function = |name: &str| {
+            let made = library.new_function(OnFault::Return, name);
+            made.expect("never a raise").expect("a function of the table")
+        };
+        let (vertex, fragment) = (
+            function("numbered_vertex"),
+            function("numbered_fragment_read"),
+        );
+        let mut desc = FullRenderPipelineDesc::new(&vertex, Some(&fragment));
+        desc.colors = vec![(
+            0,
+            ColorAttachmentDesc {
+                pixel_format: 70,
+                ..ColorAttachmentDesc::default()
+            },
+        )];
+        // The pipelines made, and those the finishes made.
+        let made = || {
+            let m = counters.metrics();
+            (m.pipelines_created, m.finished_pipelines)
+        };
+        let before = made();
+        let state = device.new_render_pipeline_state_full(&desc);
+        let state = state.expect("a render state").expect("a render state");
+        assert_eq!(made(), before, "the state's make made a VkPipeline");
+        assert_eq!(state.finish(), Ok(()));
+        assert_eq!(made(), (before.0 + 1, before.1 + 1));
+        assert_eq!(state.finish(), Ok(()));
+        assert_eq!(made(), (before.0 + 1, before.1 + 1));
     }
 }

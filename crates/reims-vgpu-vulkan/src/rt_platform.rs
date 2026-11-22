@@ -762,7 +762,7 @@ mod tests {
         }
         let metrics = lines("rtmetrics");
         assert!(!metrics.is_empty(), "{text}");
-        assert!(metrics.iter().all(|f| f.len() == 14), "{text}");
+        assert!(metrics.iter().all(|f| f.len() == 19), "{text}");
         let counts = lines("rtcounts");
         assert_eq!(counts.len(), metrics.len(), "{text}");
         assert!(

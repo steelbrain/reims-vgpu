@@ -54,14 +54,21 @@ repeats the ones code cites.
     sharing, making ahead), never by making core or the device's lanes
     non-blocking, or by deferring or reordering their waits, since the guest
     sees where they wait. Compiles run concurrently only inside the synchronous wait
-    that needs them, which joins every one before it returns, with one
-    exception: a command buffer's dispatch pre-pass makes its dispatches'
+    that needs them, which joins every one before it returns, with two
+    exceptions. A command buffer's dispatch pre-pass makes its dispatches'
     pipelines on the compile threads while its walk goes on, the walk's
     thread makes those no compile thread took at its first dispatch, and the
     walk's end drops those no thread took and joins those being made, before
     the message lets go of anything
-    (`crates/reims-vgpu/src/graphics/decode/prepass.rs`). Otherwise nothing
-    compiles in the background, and nothing is deferred or released early.
+    (`crates/reims-vgpu/src/graphics/decode/prepass.rs`). And a pipeline
+    create's reply is posted once the platform's make has made every answer
+    it carries, ahead of the driver's create of the state's main pipelines,
+    which the state's finish then makes on the same compile thread before
+    the pipeline is stored; until the store, the command buffers, indirect
+    command buffer writes and function handle and table creates that name
+    the pipeline wait for it (`crates/reims-vgpu/src/graphics/compile.rs`,
+    "Order"). Otherwise nothing compiles in the background, and nothing is
+    deferred or released early.
     Nothing the guest sees (IDs, addresses, stamps, reflection order, shared
     state) is decided inside a concurrent section; it is assigned in order,
     before or after. Each concurrency change is a small commit of its own.

@@ -3388,11 +3388,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
     /// The store step of a create's settling ([`Self::settle`]), after its reply: finishes the
     /// make of `compiled`, the create `creating`'s compile, on this thread
-    /// ([`CompiledPipeline::finish`]); keeps a keyed create's answer for the next runs where it
-    /// was made and its make finished, or drops the kept one where it was refused, answered
-    /// otherwise, or its finish failed (the late failure, [`decode::FINISH_FAILED`]); and stores
-    /// the pipeline where no destroy, close or reset cancelled it since its compile began, as
-    /// made where its finish failed, its draws and dispatches meeting the failure at their encode.
+    /// ([`CompiledPipeline::finish`]), where no destroy, close or reset cancelled it since its
+    /// compile began; keeps a keyed create's answer for the next runs where it was made and its
+    /// make finished, or drops the kept one where it was refused, answered otherwise, or its
+    /// finish failed (the late failure, [`decode::FINISH_FAILED`]); and stores the pipeline where
+    /// it is still not cancelled, as made where its finish failed, its draws and dispatches making
+    /// what the finish left again at their encode. A cancelled create's finish is skipped, its
+    /// pipeline never stored, and a keyed one's answer kept as its make answered it.
     fn store_made(&self, compiled: CompiledPipeline<P>, creating: Creating) {
         let Creating {
             obj_id,
@@ -3401,15 +3403,15 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             seen_from,
             began,
         } = creating;
-        let finished = compiled.finish(seqno);
+        let live = || self.pending.live(obj_id, began);
+        let failed = live() && !compiled.finish(seqno);
         if let Some(key) = key {
-            let made = (!compiled.is_refused() && finished).then_some(&compiled.reflection);
+            let made = (!compiled.is_refused() && !failed).then_some(&compiled.reflection);
             self.answers.observe(&key, made);
         }
         // Stored where no destroy, close or reset cancelled it, under the lock of its table, which
         // its destroy removes from after cancelling it; a reset waits for the store.
         let _carried = self.reset_gate.read();
-        let live = || self.pending.live(obj_id, began);
         (self.decoder()).finish_pipeline_if(compiled, Some(seen_from), live);
         self.pending.finish(obj_id, began);
     }

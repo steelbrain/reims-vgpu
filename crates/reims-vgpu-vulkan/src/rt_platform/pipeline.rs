@@ -47,15 +47,19 @@
 //!   makes each pipeline once by rt's key of it (`dispatch_variant`), of the compiled content:
 //!   the states of one content share its `VkPipeline`s, and answer one key for one dispatch. rt
 //!   answers with the key whether its `VkPipeline` is made, so the pre-pass hands none made by
-//!   an earlier make.
+//!   the state's finish or by an earlier make.
 //! - **Its main pipeline.** rt's make of the state makes everything up to the driver's create of
 //!   the state's main `VkPipeline` (a tiling kernel's tiles', an image-only kernel's square
 //!   workgroups', or an observing kernel's whole and ragged grids' at its
 //!   `requiredThreadsPerThreadgroup`, or at `[N, 1, 1]` for the bound `N` of threads its state
-//!   declares), and answers. rt's `finish_pipeline` makes that pipeline, and the state's finish
-//!   does not call it yet ([`ComputePipeline::finish`]): the state's first dispatch, or a make
-//!   ahead of it, makes it, the dispatch waiting for the make (rt's
-//!   `Metrics::first_use_unfinished_waits`).
+//!   declares), and answers. The state's finish ([`ComputePipeline::finish`]) makes that
+//!   pipeline, rt's `finish_pipeline`, on the thread that made the state: the device's compile
+//!   thread, after the create's reply and before its store (reims-vgpu's `graphics::compile`,
+//!   "Order"). rt counts what the finishes made and their time (`Metrics::finished_pipelines`,
+//!   `finished_pipeline_nanos`). A finish rt fails, the driver's create, keeps nothing: the
+//!   state's first dispatch, or a make ahead of it, makes the pipeline again, the dispatch
+//!   waiting for the make (`Metrics::first_use_unfinished_waits`), and fails as a dispatch rt
+//!   refuses where that make fails too.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -609,17 +613,22 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
             .dispatch_variant(args.dispatch, args.threads, &args.lengths)
     }
 
-    /// Nothing, and never `Err`: rt's make of the state (`make`) leaves its main pipeline's
-    /// driver create to `ComputePipelineState::finish_pipeline`, which is not called here yet, so
-    /// the state's first dispatch, or a make ahead of it, makes the pipeline (the module's docs,
-    /// "Its main pipeline").
-    ///
-    /// RT FINISH: that step is called here, on this thread,
-    /// `self.rt.finish_pipeline().map_err(|error| error.to_string())`: its one error, a Vulkan
-    /// one, keeps nothing, and the state's first dispatch makes the pipeline again.
+    /// The driver's create of the state's main pipeline, which rt's make of the state (`make`)
+    /// leaves to `ComputePipelineState::finish_pipeline`, on this thread (the module's docs, "Its
+    /// main pipeline"); nothing where the state has none or it is made. `Err` is rt's one error
+    /// here, a Vulkan one, as its text ([`finished`]): rt keeps nothing, and the state's first
+    /// dispatch makes the pipeline again.
     fn finish(&self) -> Result<(), String> {
-        Ok(())
+        finished(self.rt.finish_pipeline())
     }
+}
+
+/// rt's answer `finish` of a state's `finish_pipeline`, compute or render, as the platform's
+/// finish answers it: `Err` is rt's error's text, for the host's log, where the device counts the
+/// create's late failure (reims-vgpu's `pipeline-finish-failed`). Nothing more is counted here:
+/// rt counts the failure as its own `Metrics::failed_finishes`.
+pub(super) fn finished(finish: Result<(), rt::Error>) -> Result<(), String> {
+    finish.map_err(|error| error.to_string())
 }
 
 /// A dispatch's arguments as rt's make ahead and key take them.
@@ -995,5 +1004,66 @@ mod tests {
         assert_eq!(key(&first, 0, 32, &[]), None);
         assert_eq!(key(&first, 1 << 32, 32, &[]), None);
         assert_eq!(key(&first, 2, 32, &[(1 << 32, 16)]), None);
+    }
+
+    /// A state's finish, on the GPU the test holds, is the driver's create of its main pipeline
+    /// (rt's `finish_pipeline`): rt's make of a tiling kernel's state makes no `VkPipeline`, its
+    /// finish makes one, counted as finished, and a second finish makes nothing; the finish of a
+    /// state with no main pipeline, of a kernel that observes its threadgroups and declares no
+    /// size, makes nothing either
+    #[test]
+    fn a_finish_makes_the_state_s_main_pipeline_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let counters = device.rt().counters();
+        let on = OnFault::Return;
+        let function = |metallib: &[u8], name: &str| {
+            let library = device.new_library(metallib).expect("never a raise");
+            let library = library.expect("a metallib").expect("a library");
+            let made = library.new_function(on, name).expect("never a raise");
+            made.expect("a function of the table")
+        };
+        let state = |f: &RtObj<RtFunction>| {
+            let made = device.new_compute_pipeline_state_for_function(Some(f));
+            made.expect("a compute state").expect("a compute state")
+        };
+        // The pipelines made, and those the finishes made.
+        let made = || {
+            let m = counters.metrics();
+            (m.pipelines_created, m.finished_pipelines)
+        };
+
+        // `numbered_read` reads its position in the grid alone: a kernel of tiles.
+        let read = function(NUMBERED, "numbered_read");
+        let before = made();
+        let tiles = state(&read);
+        assert_eq!(made(), before, "the state's make made a VkPipeline");
+        assert_eq!(tiles.finish(), Ok(()));
+        assert_eq!(made(), (before.0 + 1, before.1 + 1));
+        assert_eq!(tiles.finish(), Ok(()));
+        assert_eq!(made(), (before.0 + 1, before.1 + 1));
+
+        let observing = state(&function(TGSTATIC, "tg_static"));
+        let before = made();
+        assert_eq!(observing.finish(), Ok(()));
+        assert_eq!(made(), before, "a state with no main pipeline made one");
+    }
+
+    /// A finish rt fails, the driver's create after the state answered (`Error::Vulkan`), is the
+    /// finish's `Err` with rt's text, which the device takes as the create's late failure; one
+    /// that made the pipeline is `Ok`
+    #[test]
+    fn a_failed_finish_answers_rt_s_error_as_its_text() {
+        let failure = || rt::Error::Vulkan {
+            call: "vkCreateComputePipelines",
+            result: ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        };
+        let text = failure().to_string();
+        assert!(
+            text.starts_with("vkCreateComputePipelines failed: "),
+            "{text}"
+        );
+        assert_eq!(finished(Err(failure())), Err(text));
+        assert_eq!(finished(Ok(())), Ok(()));
     }
 }

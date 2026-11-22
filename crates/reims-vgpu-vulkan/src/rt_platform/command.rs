@@ -257,7 +257,10 @@ fn trace_metrics(now: u64) {
     // `VkSubmitInfo2`s and `vkQueueSubmit2` calls; `VkPipeline`s created; lowerings made and
     // lowerings read from the cache directory; submissions made while rt's block-maker thread was
     // inside a `vkFreeMemory`; that thread's `vkAllocateMemory` and `vkFreeMemory` calls, and those
-    // of them that waited first for a `vkQueueSubmit2` call inside the driver
+    // of them that waited first for a `vkQueueSubmit2` call inside the driver; the states' main
+    // pipelines their finishes made and the finishes' nanoseconds; and the first-use waits for a
+    // main pipeline no finish had made, their nanoseconds and the longest. A value added goes at
+    // the end, after those a reader of an older trace knows.
     trace::event_at(
         now,
         "rtmetrics",
@@ -275,6 +278,11 @@ fn trace_metrics(now: u64) {
             m.submissions_during_frees,
             m.maker_memory_calls,
             m.maker_yields,
+            m.finished_pipelines,
+            m.finished_pipeline_nanos,
+            m.first_use_unfinished_waits,
+            m.first_use_unfinished_wait_nanos,
+            m.first_use_unfinished_wait_max_nanos,
         ],
     );
     trace::event_at(now, "rtcounts", &counts(&m));

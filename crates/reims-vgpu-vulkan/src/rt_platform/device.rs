@@ -101,6 +101,22 @@
 //! amount risen to it over the process's devices ([`note_highest_metrics`]); reims-vgpu's slow
 //! answers count those that met a guest answer of a frame or more (`super::overlap`).
 //!
+//! **Its states' finishes.** rt's creators answer before the driver's create of a state's main
+//! pipeline, which the state's finish then makes on the device's compile thread, after the
+//! create's reply and before its store (`finish_pipeline`, `super::pipeline`, "Its main
+//! pipeline"); a dispatch or draw that needs the main pipeline before a finish made it waits for
+//! the finish in flight, or makes it itself (rt's `Metrics::first_use_unfinished_waits`, a share
+//! of its first-use waits apart from the variants'). The counts line carries the main pipelines
+//! the finishes made, [`FINISHED_PIPELINES_CODE`], and their nanoseconds,
+//! [`FINISHED_PIPELINE_NS_CODE`], as amounts; the waits on an unfinished main pipeline,
+//! [`UNFINISHED_WAITS_CODE`], and their nanoseconds, [`UNFINISHED_WAIT_NS_CODE`], as amounts; and
+//! the longest, [`UNFINISHED_WAIT_MAX_NS_CODE`], as an amount risen to it over the process's
+//! devices ([`note_highest_metrics`]). rt's finishes that failed (`Metrics::failed_finishes`) are
+//! not folded: the device counts each as the create's late failure, reims-vgpu's
+//! `pipeline-finish-failed`, at the platform's seam, where every platform's finish answers, a
+//! raise or death in the platform's refusal scope among them, which rt never sees, and where the
+//! failure's guest-visible effect is decided, so the counts line carries each failure once.
+//!
 //! **Its exported blocks whose address went out.** At a submission that writes through a device
 //! address, rt owes the textures over an exported block their copy in only once a public call
 //! handed out an address in that block: a buffer's `gpu_address` in it, or a texture buffer's
@@ -322,6 +338,26 @@ pub const FIRST_USE_WAIT_NS_CODE: &str = "rt-first-use-variant-wait-ns";
 /// (`Metrics::first_use_variant_wait_max_nanos`), an amount risen to it ([`note_highest_metrics`]).
 pub const FIRST_USE_WAIT_MAX_NS_CODE: &str = "rt-first-use-variant-wait-max-ns";
 
+/// The code of the states' main pipelines that their finishes made, after the state's creation
+/// answered (`Metrics::finished_pipelines`), an amount on the counts line ([`fold_metrics`]).
+pub const FINISHED_PIPELINES_CODE: &str = "rt-finished-pipelines";
+
+/// The code of those finishes' nanoseconds in all (`Metrics::finished_pipeline_nanos`).
+pub const FINISHED_PIPELINE_NS_CODE: &str = "rt-finished-pipeline-ns";
+
+/// The code of the dispatches and draws whose encoding waited for a state's main pipeline that no
+/// finish had made yet, for the finish in flight or for their own make of it
+/// (`Metrics::first_use_unfinished_waits`), an amount on the counts line ([`fold_metrics`]).
+pub const UNFINISHED_WAITS_CODE: &str = "rt-first-use-unfinished-waits";
+
+/// The code of those waits' nanoseconds in all (`Metrics::first_use_unfinished_wait_nanos`).
+pub const UNFINISHED_WAIT_NS_CODE: &str = "rt-first-use-unfinished-wait-ns";
+
+/// The code of the longest of those waits, in nanoseconds
+/// (`Metrics::first_use_unfinished_wait_max_nanos`), an amount risen to it
+/// ([`note_highest_metrics`]).
+pub const UNFINISHED_WAIT_MAX_NS_CODE: &str = "rt-first-use-unfinished-wait-max-ns";
+
 /// The code of the exported blocks a public call handed out a device address in, each counted at
 /// the first, which a block's make never is (`Metrics::exported_blocks_addressed`), an amount on
 /// the counts line ([`fold_metrics`]).
@@ -429,12 +465,14 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// replaced, the cache's writes skipped past its bound and the reaper's looks at it skipped, the
 /// dispatches that ran an emulated-SIMD-group module, the compiled contents a state's make
 /// dropped, the resolves of multisample attachments, the copies out of resolve images and their
-/// bytes, and the whole grids that ran a partial-threadgroups variant.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 23;
+/// bytes, the whole grids that ran a partial-threadgroups variant, the main pipelines the states'
+/// finishes made and their nanoseconds, and the first-use waits for an unfinished main pipeline
+/// and their nanoseconds.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 27;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
-const HIGHEST_METRICS: usize = 2;
+const HIGHEST_METRICS: usize = 3;
 
 /// The highest of each of [`highest_metrics`]'s metrics a fold saw, in its order, over the
 /// process's devices.
@@ -453,8 +491,8 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// makes and their time, its render makes past the kernels' bound, its compute dispatches'
 /// first-use waits, its exported blocks addressed, its pipeline caches replaced and cache writes
 /// skipped past their bound, its reaper's looks at the cache skipped, its emulated-SIMD-group
-/// dispatches, its dropped makes, its resolves, its resolve copies and its whole grids on a
-/// partial-threadgroups variant rose by since the last fold
+/// dispatches, its dropped makes, its resolves, its resolve copies, its whole grids on a
+/// partial-threadgroups variant, its states' finishes and their waits rose by since the last fold
 /// ([`folded_counts`]), so the counts line carries their totals, then its maxima
 /// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
 /// docs). Nothing of rt's before the device is made. First it counts the dispatches the rt
@@ -483,14 +521,17 @@ fn note_highest_metrics(m: &rt::Metrics) {
 
 /// The metrics of `m` the counts line carries at their highest, each with its code: the heaviest
 /// stage's weight of the render makes past the kernels' bound
-/// ([`RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE`]), and the longest first-use wait of a compute
-/// dispatch ([`FIRST_USE_WAIT_MAX_NS_CODE`]).
+/// ([`RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE`]), the longest first-use wait of a compute
+/// dispatch ([`FIRST_USE_WAIT_MAX_NS_CODE`]), and the longest wait for an unfinished main
+/// pipeline ([`UNFINISHED_WAIT_MAX_NS_CODE`]).
 fn highest_metrics(m: &rt::Metrics) -> [(&'static str, u64); HIGHEST_METRICS] {
     let weight = m.render_weight_past_kernel_bound_max;
     let wait = m.first_use_variant_wait_max_nanos;
+    let unfinished = m.first_use_unfinished_wait_max_nanos;
     [
         (RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE, weight),
         (FIRST_USE_WAIT_MAX_NS_CODE, wait),
+        (UNFINISHED_WAIT_MAX_NS_CODE, unfinished),
     ]
 }
 
@@ -569,8 +610,11 @@ fn follow(counters: rt::Counters) {
 /// emulated-SIMD-group module ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), the compiled contents a
 /// state's make dropped ([`KERNEL_MAKES_DROPPED_CODE`]), the resolves of multisample attachments
 /// ([`RESOLVES_CODE`]), the copies out of resolve images ([`RESOLVE_COPIES_CODE`]) and their bytes
-/// ([`RESOLVE_COPY_BYTES_CODE`]), and the whole grids that ran a partial-threadgroups variant
-/// ([`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`]).
+/// ([`RESOLVE_COPY_BYTES_CODE`]), the whole grids that ran a partial-threadgroups variant
+/// ([`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`]), the main pipelines the states' finishes made
+/// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), and the
+/// first-use waits for an unfinished main pipeline ([`UNFINISHED_WAITS_CODE`]) and their
+/// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -612,6 +656,10 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
             PARTIAL_VARIANT_WHOLE_GRIDS_CODE,
             m.partial_variant_whole_grids,
         ),
+        (FINISHED_PIPELINES_CODE, m.finished_pipelines),
+        (FINISHED_PIPELINE_NS_CODE, m.finished_pipeline_nanos),
+        (UNFINISHED_WAITS_CODE, m.first_use_unfinished_waits),
+        (UNFINISHED_WAIT_NS_CODE, m.first_use_unfinished_wait_nanos),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -2101,8 +2149,10 @@ mod tests {
     /// nanoseconds, the exported blocks whose address went out, the pipeline caches replaced, the
     /// cache's writes skipped past its bound and the reaper's looks at it skipped, the dispatches
     /// that ran an emulated-SIMD-group module, the compiled contents a state's make dropped, the
-    /// resolves of multisample attachments, the copies out of resolve images and their bytes, and
-    /// the whole grids that ran a partial-threadgroups variant.
+    /// resolves of multisample attachments, the copies out of resolve images and their bytes, the
+    /// whole grids that ran a partial-threadgroups variant, the main pipelines the states'
+    /// finishes made and their nanoseconds, and the first-use waits for an unfinished main
+    /// pipeline and their nanoseconds.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2139,6 +2189,10 @@ mod tests {
             RESOLVE_COPIES_CODE,
             RESOLVE_COPY_BYTES_CODE,
             PARTIAL_VARIANT_WHOLE_GRIDS_CODE,
+            FINISHED_PIPELINES_CODE,
+            FINISHED_PIPELINE_NS_CODE,
+            UNFINISHED_WAITS_CODE,
+            UNFINISHED_WAIT_NS_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -2173,6 +2227,10 @@ mod tests {
         m.resolve_copies = 1;
         m.resolve_copy_bytes = 3_686_400;
         m.partial_variant_whole_grids = 6;
+        m.finished_pipelines = 2;
+        m.finished_pipeline_nanos = 12_000_000;
+        m.first_use_unfinished_waits = 1;
+        m.first_use_unfinished_wait_nanos = 400_000;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -2202,6 +2260,10 @@ mod tests {
         m.resolve_copies = 4;
         m.resolve_copy_bytes = 4 * 3_686_400;
         m.partial_variant_whole_grids = 13;
+        m.finished_pipelines = 5;
+        m.finished_pipeline_nanos = 12_000_000 + 6_750_000;
+        m.first_use_unfinished_waits = 3;
+        m.first_use_unfinished_wait_nanos = 400_000 + 900_000;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -2210,7 +2272,8 @@ mod tests {
             rose,
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
-                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 11, 2, 10, 4, 14_745_600, 13
+                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 11, 2, 10, 4, 14_745_600, 13, 5,
+                18_750_000, 3, 1_300_000
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
@@ -2240,8 +2303,34 @@ mod tests {
         assert_eq!(count() - before, 7_000);
         m.first_use_variant_wait_max_nanos = 2_000;
         raise_to(&mut highest, highest_metrics(&m));
-        assert_eq!(highest, [0, 7_000]);
+        assert_eq!(highest, [0, 7_000, 0]);
         assert_eq!(count() - before, 7_000);
+    }
+
+    /// The longest wait for an unfinished main pipeline goes to the counts at its longest over
+    /// the process's devices ([`note_highest_metrics`]), apart from the variants' longest: counted
+    /// by its rise over the longest counted, so a device whose longest is shorter leaves the count
+    /// as it was.
+    #[test]
+    fn the_longest_unfinished_wait_counts_its_rise_over_the_longest_counted() {
+        let count = || {
+            (crate::answer::degradation_counts().iter())
+                .find(|(c, _)| c == UNFINISHED_WAIT_MAX_NS_CODE)
+                .map_or(0, |&(_, n)| n)
+        };
+        let before = count();
+        let mut highest = [0; HIGHEST_METRICS];
+        let mut m = rt::Metrics::default();
+        m.first_use_unfinished_wait_max_nanos = 3_500_000;
+        raise_to(&mut highest, highest_metrics(&m));
+        assert_eq!(count() - before, 3_500_000);
+        let mut second = rt::Metrics::default();
+        second.first_use_unfinished_wait_max_nanos = 1_000_000;
+        raise_to(&mut highest, highest_metrics(&second));
+        second.first_use_unfinished_wait_max_nanos = 5_000_000;
+        raise_to(&mut highest, highest_metrics(&second));
+        assert_eq!(highest, [0, 0, 5_000_000]);
+        assert_eq!(count() - before, 5_000_000);
     }
 
     /// Nine of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by
@@ -2334,7 +2423,7 @@ mod tests {
         raise_to(&mut highest, highest_metrics(&second));
         second.render_weight_past_kernel_bound_max = 61_500;
         raise_to(&mut highest, highest_metrics(&second));
-        assert_eq!(highest, [61_500, 0]);
+        assert_eq!(highest, [61_500, 0, 0]);
         assert_eq!(count() - before, 61_500);
     }
 

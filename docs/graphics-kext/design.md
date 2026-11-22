@@ -4745,13 +4745,15 @@ whatever names the pipeline waits for it: a command buffer that sets it, on
 its queue's lane, and an `ICB_WRITE`, `ICB_SLOTS` or `ICB_SLOTS_IN_PAGES` that
 sets it, or a function handle or table create that names it, on its context's
 lane. A destroy, a context's close or the device's reset between the reply and
-the store cancels it as before the reply (`crates/reims-vgpu/src/graphics/compile.rs`,
-"Order"). On today's platform that last step does nothing yet: the platform's
-make leaves the driver's pipeline to it, and the pipeline's first draw or
-dispatch makes it, on its lane. A failure of the last step is a known
-gap: the create was answered made, and the failure reaches the guest only in
-the pipeline's draws and dispatches, which the platform answers as encodes it
-refuses, while a Mac's synchronous create answers it as the create's error.
+the store cancels it as before the reply, and a create cancelled before its
+last step begins skips that step (`crates/reims-vgpu/src/graphics/compile.rs`,
+"Order"). On the rt platform the last step is the driver's create of the
+state's main pipelines, so the reply no longer waits for it; the store, and the
+command buffers that name the pipeline, still do. A failure of the last step
+is a known gap: the create was answered made, and the failure reaches the guest
+only in the pipeline's draws and dispatches, which make the pipeline again and,
+where that make fails too, the platform answers as encodes it refuses, while a
+Mac's synchronous create answers it as the create's error.
 The host counts it (`pipeline-finish-failed`), logs the first of the process,
 keeps no answer of its key for the next runs, and the VM goes on.
 
