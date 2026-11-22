@@ -3149,7 +3149,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// A compute create whose make the platform refused for a stage whose compile runs outside
     /// the process, naming the stage's fill ([`stage::making`]), is held instead: it stays
     /// pending, the pool's thread let go, until that fill ends ([`Self::held_end`]), and is then
-    /// made again, `remade`, once. A remade create settles whatever its make answers.
+    /// made again, `remade`, once. A remade create settles whatever its make answers, a refusal
+    /// counted ([`compile::HELD_CREATE_REFUSED`]).
     fn compile(
         self: &Arc<Self>,
         job: PipelineJob<P>,
@@ -3172,7 +3173,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     let me = Arc::clone(self);
                     fill.on_end(move |end| me.held_end(end, again, creating, poster, compiled));
                 }
-                _ => self.settle(compiled, creating, &poster),
+                _ => {
+                    if remade && compiled.is_refused() {
+                        reims_vgpu_vulkan::answer::count_kind(compile::HELD_CREATE_REFUSED);
+                    }
+                    self.settle(compiled, creating, &poster)
+                }
             }
         });
     }
@@ -3181,7 +3187,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// that ends it, or at once where it had ended. Where it filled the store and no destroy,
     /// close or reset cancelled the create, its make, `again`, is made again on the pool; after a
     /// breach or a failed fill, or the create's cancel, the make's first refusal, `first`,
-    /// settles it there ([`Self::settle`]); and after a cancelled fill (the device's reset, the
+    /// settles it there ([`Self::settle`]), counted after a breach or a failed fill
+    /// ([`compile::HELD_CREATE_REFUSED`]); and after a cancelled fill (the device's reset, the
     /// process's exit) the create is let go of here, unstored and its answer not kept, its
     /// reply posted where the ring has room, waiting for nothing.
     fn held_end(
@@ -3217,6 +3224,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             } else {
                 entry::run(|_| {
                     drop(again);
+                    if end != FillEnd::Filled {
+                        reims_vgpu_vulkan::answer::count_kind(compile::HELD_CREATE_REFUSED);
+                    }
                     me.settle(first, creating, &poster);
                 });
             }

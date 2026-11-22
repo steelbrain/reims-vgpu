@@ -50,7 +50,11 @@
 //! cancelled fill (the device's reset, the process's exit) the pipeline is let go of unstored, on
 //! the thread that cancelled it, and its reply posted where the ring has room, waiting for
 //! nothing. A command buffer that names it waits for it on its lane meanwhile, minutes where its
-//! stage's compile takes them.
+//! stage's compile takes them. Each such create answered refused after its fill breached or
+//! failed, or whose make again refused after a fill that filled the store, is counted
+//! ([`HELD_CREATE_REFUSED`]): the creates its stages' fills left refused for good. One let go of
+//! at a cancelled fill, or answered its first refusal after its destroy or its context's close
+//! at a fill that filled the store, is not.
 //!
 //! **At the exit.** Each compile a thread runs is a making of the exit gate's
 //! ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for those in progress, and a
@@ -95,6 +99,14 @@ const MAX_THREADS: usize = 4;
 
 /// The target of each compile's line.
 const LOG_TARGET: &str = "reims_vgpu::graphics::compile";
+
+/// The degradation code of a compute pipeline create held for its stage's fill that is answered
+/// refused: after the fill breached or failed, its make's first refusal, or after a fill that
+/// filled the store, its make's refusal again. Counted once a create, so a run's count is how
+/// many creates its stages' fills left refused for good: the make's own codes count each create
+/// refused for its stage at its first make (`stage-unfilled-make`, and rt's refusal's kind),
+/// whatever its fill's end.
+pub(crate) const HELD_CREATE_REFUSED: &str = "stage-create-refused";
 
 /// A compile, run on one of the pool's threads.
 pub(crate) type CompileJob = Box<dyn FnOnce() + Send>;

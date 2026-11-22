@@ -12,7 +12,8 @@
 //! the make is then made once more after a fill that filled the store, and its first refusal
 //! stands after one that failed or breached, or after the create's destroy. A command buffer
 //! that names the state meanwhile waits for it on its queue's lane. The reset and the quiesce let
-//! go of a held create, unstored.
+//! go of a held create, unstored. Each held create the fills leave refused for good is counted,
+//! once: after a fill that breached or failed, or a make refused again after one that filled.
 
 use reims_vgpu_vulkan::core::platform::stage::{FillEnd, Site};
 use reims_vgpu_vulkan::core::testkit::Step;
@@ -22,7 +23,8 @@ use super::prepass::{
     with_states_over,
 };
 use super::*;
-use crate::platform::ApiPlatform;
+use crate::graphics::compile::HELD_CREATE_REFUSED;
+use crate::platform::{ApiPlatform, counted};
 
 /// The fake's selector of a [`threads`] dispatch.
 const THREADS: &str = "dispatchThreads:threadsPerThreadgroup:";
@@ -391,6 +393,7 @@ fn a_make_whose_stage_failed_is_answered_its_refusal() {
 fn a_destroy_of_a_make_held_for_its_stage_is_not_made_again() {
     let (device, platform, mut guest, _ring) = with_states(&[]);
     let world = platform.world();
+    let before = counted(HELD_CREATE_REFUSED);
     create_refused_for_stage_7(&device, &platform, &mut guest);
     guest.send(&device, object_destroy(obj(CONTEXT, 11)));
     // The destroy is carried out before a lookup of its context's after it is answered.
@@ -405,6 +408,73 @@ fn a_destroy_of_a_make_held_for_its_stage_is_not_made_again() {
     assert_eq!(world.log.count(MAKE), 1);
     // The queue and the library.
     assert_eq!(device.decoder_object_count(), 2);
+    // The guest let go of it: its fill left nothing refused.
+    assert_eq!(counted(HELD_CREATE_REFUSED) - before, 0);
+}
+
+/// How many held creates the fills left refused for good ([`HELD_CREATE_REFUSED`]) as the creates
+/// of compute states 11 on, each refused at its make for a stage of its own, 7 on, were each held
+/// for its stage's fill, which ended with its `ends`, in turn. Each create is answered made after
+/// a fill that filled the store, and refused after one that breached or failed.
+fn held_creates_refused(ends: &[FillEnd]) -> u64 {
+    let (device, platform, mut guest, _ring) = with_states(&[]);
+    let world = platform.world();
+    let before = counted(HELD_CREATE_REFUSED);
+    for (at, &end) in (0u64..).zip(ends) {
+        let (state, stage) = (11 + at, 7 + at);
+        world.script.push(MAKE, Step::Stage(stage));
+        guest.send(
+            &device,
+            compute_pipeline_create(obj(CONTEXT, state), obj(CONTEXT, 10)),
+        );
+        assert!(
+            eventually(|| world.stages().started().last() == Some(&stage)),
+            "no fill started for state {state}"
+        );
+        assert!(world.stages().end(stage, end));
+        let status = match end {
+            FillEnd::Filled => RGFX_PIPELINE_OK,
+            _ => RGFX_PIPELINE_REFUSED,
+        };
+        expect_reflection(&mut guest, obj(CONTEXT, state), status);
+    }
+    // Each create's make, and once more where its fill filled the store.
+    let filled = ends.iter().filter(|&&end| end == FillEnd::Filled).count();
+    assert_eq!(world.log.count(MAKE), ends.len() + filled);
+    counted(HELD_CREATE_REFUSED) - before
+}
+
+/// Of 8 held creates, the 6 whose stages' fills breached or failed are counted refused for good,
+/// one each, and the 2 made after fills that filled the store are not
+#[test]
+fn the_held_creates_left_refused_are_counted_one_each() {
+    use FillEnd::{Breached, Failed, Filled};
+    let ends = [
+        Breached, Filled, Failed, Breached, Filled, Breached, Failed, Breached,
+    ];
+    assert_eq!(held_creates_refused(&ends), 6);
+}
+
+/// 8 held creates all made after fills that filled the store count none refused
+#[test]
+fn held_creates_all_made_count_none_refused() {
+    assert_eq!(held_creates_refused(&[FillEnd::Filled; 8]), 0);
+}
+
+/// A held create whose make refuses again after a fill that filled the store is answered refused,
+/// and counted refused for good, once
+#[test]
+fn a_held_create_refused_again_after_its_fill_is_counted() {
+    let (device, platform, mut guest, _ring) = with_states(&[]);
+    let world = platform.world();
+    let before = counted(HELD_CREATE_REFUSED);
+    create_refused_for_stage_7(&device, &platform, &mut guest);
+    world.script.push(MAKE, Step::Nil);
+    assert!(world.stages().end(7, FillEnd::Filled));
+    expect_reflection(&mut guest, obj(CONTEXT, 11), RGFX_PIPELINE_REFUSED);
+    assert_eq!(world.log.count(MAKE), 2);
+    assert!(!state_11_pending(&device));
+    assert_eq!(counted(HELD_CREATE_REFUSED) - before, 1);
 }
 
 /// A device's reset while a compute state's make waits for its stage's fill, and a command buffer
