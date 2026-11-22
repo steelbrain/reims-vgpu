@@ -161,9 +161,12 @@ struct LockState {
 	// leave a surface uncached; under `lock`, how many times it grew.
 	bool grows;
 	uint64_t grown;
+	// Under `lock`: the CPU locks that slept for their block's release, and the longest wait
+	// (rgfxSurfaceLocksReleaseWaits).
+	RgfxReleaseLockWaits releaseWaits;
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kRetireWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0, {}, false, 0};
+                   kRetireWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0, {}, false, 0, {0, 0}};
 
 // Under state.lock: where the table of cached surfaces grows and is full, it doubles
 // (rgfxCacheGrow). Where the memory is not there, it stays as it is, and the add finds no room,
@@ -541,7 +544,7 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 	// A cached surface: the pages take what the GPU wrote, one lock asking at a time, and a
 	// read-write lock moves its CPU generation.
 	uint32_t attachTries = 0;
-	uint64_t attachUntil = 0;
+	uint64_t attachUntil = 0, releaseSince = 0;
 	if (const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
 		if (!surfaceId)
 			surfaceId = c->surfaceId;
@@ -593,6 +596,7 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 			continue;
 		}
 		// Another lock's download, attach or deferral, or the block's release, with no deadline.
+		rgfxReleaseWaitSleeps(state.caches, key, mach_absolute_time(), &releaseSince);
 		const Slept slept = sleepForHost(accel);
 		if (slept != Slept::kWoken) {
 			gaveUp = true;
@@ -608,6 +612,7 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 			break;
 		}
 	}
+	rgfxReleaseWaitEnds(state.releaseWaits, releaseSince, mach_absolute_time());
 	if (a == 0) {
 		if (RgfxCachedSurface *c = rgfxCacheFind(state.caches, key)) {
 			// The unlock seed before this lock's: the generation's refill record is owed until
@@ -1351,6 +1356,21 @@ bool rgfxSurfaceCacheWritingBack(OSObject *surface)
 	const bool writing = rgfxCacheWritingBack(state.caches, surface);
 	IOLockUnlock(state.lock);
 	return writing;
+}
+
+void rgfxSurfaceLocksReleaseWaits(uint64_t *count, uint64_t *mostUs)
+{
+	*count = 0;
+	*mostUs = 0;
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLockLock(state.lock);
+	const RgfxReleaseLockWaits waits = state.releaseWaits;
+	IOLockUnlock(state.lock);
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(waits.most, &ns);
+	*count = waits.count;
+	*mostUs = ns / 1000ull;
 }
 
 bool rgfxSurfaceCacheAwaitWriteBack(RgfxAccelerator *accel, OSObject *surface)

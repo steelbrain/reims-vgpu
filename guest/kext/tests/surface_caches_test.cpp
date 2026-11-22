@@ -28,7 +28,9 @@
 // deferral refused, and goes with the entry wherever it goes. A block's SURFACE_PAGES carries its
 // surface's layout where it asks, and where it is cached on a device that asks nothing. A
 // generation's refill record is written as the block is cached and at each read-write lock, and
-// asks one refill once the lock that moved the generation is let go (RgfxSurfaceRefill.hpp).
+// asks one refill once the lock that moved the generation is let go (RgfxSurfaceRefill.hpp). A
+// CPU lock that sleeps for its block's release counts one lock wait on a release, the longest
+// kept, and a lock that sleeps for anything else counts none.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -1173,8 +1175,72 @@ void unheldReleases()
 	      "a held release taken again: nothing for the host to read, nothing counted");
 }
 
+// A CPU lock that sleeps for its block's release counts one lock wait on a release, from its
+// first sleep for it to its going on, however that ended, and the longest such wait is kept; a
+// lock that sleeps for another lock's download, or for none, counts nothing.
+void releaseLockWaits()
+{
+	RgfxCachedSurface entries[2] = {};
+	RgfxCacheTable t = {entries, 0, 2};
+	uint64_t offset = 0, mark = 0;
+	int surfaceObject = 0;
+	void *map = nullptr, *wire = nullptr;
+	RgfxReleaseLockWaits w = {};
+
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	check(rgfxCacheAdd(t, kOther, kOtherBlock, kOtherId) != nullptr, "another surface");
+	uint64_t since = 0;
+	rgfxReleaseWaitSleeps(t, kSurface, 100, &since);
+	rgfxReleaseWaitEnds(w, since, 150);
+	check(since == 0 && w.count == 0 && w.most == 0, "a held block's lock waits for no release");
+
+	// Another lock's download: a wait, not for a release.
+	check(rgfxCacheNoteWrite(t, kOther) &&
+	          rgfxCacheNext(t, kOther, &offset, &mark) == kRgfxCacheDownload &&
+	          rgfxCacheNext(t, kOther, &offset, &mark) == kRgfxCacheWait,
+	      "a second lock waits for the first one's download");
+	rgfxReleaseWaitSleeps(t, kOther, 200, &since);
+	rgfxReleaseWaitEnds(w, since, 900);
+	check(since == 0 && w.count == 0, "a wait for a download counts no release wait");
+	rgfxReleaseWaitSleeps(t, kNotCached, 200, &since);
+	check(since == 0, "a surface not cached waits for no release");
+
+	// Its block goes: a lock of it sleeps for the release's answer, maybe more than once, and
+	// counts one wait from its first sleep.
+	check(!rgfxCacheBlockLetGo(t, kSurface, kBlock, true, &surfaceObject, &map, &wire, true) &&
+	          c->releasing && rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheWait,
+	      "a lock of a surface whose block's release is unanswered waits");
+	rgfxReleaseWaitSleeps(t, kSurface, 1000, &since);
+	rgfxReleaseWaitSleeps(t, kSurface, 1500, &since);
+	check(since == 1000, "the wait starts at its first sleep");
+	void *gotMap = nullptr, *gotWire = nullptr, *gotSurface = nullptr;
+	check(rgfxCacheReleased(t, kBlock, &gotMap, &gotWire, &gotSurface) == kSurface &&
+	          rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheGoOn,
+	      "the answer: the lock goes on");
+	rgfxReleaseWaitEnds(w, since, 21000);
+	check(w.count == 1 && w.most == 20000, "one wait on a release, 20000 long");
+
+	// A shorter one counts and leaves the longest; one that ends as the device stops counts too.
+	rgfxReleaseWaitEnds(w, 5000, 6000);
+	check(w.count == 2 && w.most == 20000, "a shorter wait keeps the longest");
+	rgfxReleaseWaitEnds(w, 7000, 40000);
+	check(w.count == 3 && w.most == 33000, "a longer one, however it ended, is the longest");
+	rgfxReleaseWaitEnds(w, 9000, 8000);
+	check(w.count == 4 && w.most == 33000, "a clock that went back counts a wait of 0");
+	since = 0;
+	RgfxCachedSurface entries2[1] = {};
+	RgfxCacheTable z = {entries2, 0, 1};
+	RgfxCachedSurface *d = rgfxCacheAdd(z, kSurface, kBlock, kId);
+	check(!rgfxCacheBlockLetGo(z, kSurface, kBlock, true, &surfaceObject, &map, &wire, true) &&
+	          d->releasing,
+	      "a block released");
+	rgfxReleaseWaitSleeps(z, kSurface, 0, &since);
+	check(since != 0, "a wait that starts at time 0 is still a wait");
+}
+
 int main()
 {
+	releaseLockWaits();
 	layoutCarried();
 	askNaming();
 	unheldReleases();

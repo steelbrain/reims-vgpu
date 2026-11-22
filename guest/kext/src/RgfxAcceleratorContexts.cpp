@@ -2363,13 +2363,18 @@ void noteReleases()
 		releaseStats.loggedAt = now;
 	}
 	IOLockUnlock(contextLock);
-	if (log)
-		IOLog("RgfxAccelerator: releases: %llu answered (%llu kept, %llu late), %u in flight at "
-		      "most; freed to answered p50 %llu us, p99 %llu us, max %llu us; dormant reaps %llu, "
-		      "waited p50 %llu us, p99 %llu us, max %llu us; room waits %llu (%llu found none); "
-		      "write-back waits %llu (%llu late)\n",
-		      count, kept, late, inFlight, p50 / 1000, p99 / 1000, most / 1000, reaps,
-		      r50 / 1000, r99 / 1000, rmost / 1000, waits, failed, writeBacks, writeBacksLate);
+	if (!log)
+		return;
+	// The CPU locks that slept for a release's answer (RgfxReleaseLockWaits), out of contextLock.
+	uint64_t lockWaits = 0, lockMostUs = 0;
+	rgfxSurfaceLocksReleaseWaits(&lockWaits, &lockMostUs);
+	IOLog("RgfxAccelerator: releases: %llu answered (%llu kept, %llu late), %u in flight at most; "
+	      "freed to answered p50 %llu us, p99 %llu us, max %llu us; dormant reaps %llu, waited "
+	      "p50 %llu us, p99 %llu us, max %llu us; room waits %llu (%llu found none); write-back "
+	      "waits %llu (%llu late); lock waits on a release %llu (longest %llu.%03llu ms)\n",
+	      count, kept, late, inFlight, p50 / 1000, p99 / 1000, most / 1000, reaps, r50 / 1000,
+	      r99 / 1000, rmost / 1000, waits, failed, writeBacks, writeBacksLate, lockWaits,
+	      lockMostUs / 1000, lockMostUs % 1000);
 }
 
 // Logs what zeroing new blocks took (zeroStats), by kind: how many, their KiB, and the time each

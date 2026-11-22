@@ -498,6 +498,37 @@ inline RgfxCacheStep rgfxCacheNext(RgfxCacheTable &t, uint64_t key, uint64_t *of
 	return kRgfxCacheDownload;
 }
 
+// The CPU locks that slept for a block's release's answer, a process taking the surface again
+// after its block was let go, and the longest of those waits, in mach_absolute_time's units: the
+// releases line's "lock waits on a release". The answer comes once the host's copy into the pages
+// is made, behind the buffers of the context that used the cache.
+struct RgfxReleaseLockWaits {
+	uint64_t count;
+	uint64_t most;
+};
+
+// A lock of surface `key` about to sleep at `now` (rgfxCacheNext's kRgfxCacheWait): where its
+// block's release is unanswered, its wait for the release starts at `now`, kept in `*since`,
+// unless it started already. `*since` is 0 until then.
+inline void rgfxReleaseWaitSleeps(RgfxCacheTable &t, uint64_t key, uint64_t now, uint64_t *since)
+{
+	const RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c != nullptr && c->releasing && *since == 0)
+		*since = now != 0 ? now : 1;
+}
+
+// The lock went on at `now`, `since` where it slept for a release (rgfxReleaseWaitSleeps): one wait
+// more, however it ended. Nothing where it slept for none.
+inline void rgfxReleaseWaitEnds(RgfxReleaseLockWaits &w, uint64_t since, uint64_t now)
+{
+	if (since == 0)
+		return;
+	w.count++;
+	const uint64_t waited = now > since ? now - since : 0;
+	if (waited > w.most)
+		w.most = waited;
+}
+
 // The download asked at `mark` was answered, OK where `ok`: the pages hold the writes named up to
 // it. Writes named since are still to copy. A download not answered OK copies nothing.
 inline void rgfxCacheDownloaded(RgfxCacheTable &t, uint64_t key, uint64_t mark, bool ok)

@@ -162,6 +162,9 @@ bool rgfxSurfaceCacheAdd(RgfxAccelerator *accel, void *cache, void *surface, UIn
 // went, and the host copies its cache into them before it answers the block's release
 // (rgfxCacheWritingBack). Takes the locks' lock alone, which may be under the contexts' lock.
 bool rgfxSurfaceCacheWritingBack(OSObject *surface);
+// The CPU locks so far that slept for their surface's block's release to be answered, and the
+// longest of those waits in microseconds (RgfxReleaseLockWaits). Takes the locks' lock alone.
+void rgfxSurfaceLocksReleaseWaits(uint64_t *count, uint64_t *mostUs);
 // Waits, holding no lock of the kext's, until the pages of IOSurface `surface` took their
 // write-back, with no deadline: the host answers the release once the buffers that used the
 // cache have finished, behind its other work, a pipeline's compile among it. False where the
