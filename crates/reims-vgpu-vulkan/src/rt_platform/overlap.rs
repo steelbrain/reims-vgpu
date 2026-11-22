@@ -127,7 +127,10 @@ mod tests {
         assert_eq!(make.class, rt::MemoryClass::Private, "{make:?}");
         assert_eq!(make.thread.name(), Some("reims-vgpu.test-maker"));
         let earlier = pool_makes_ended(0, before.saturating_sub(1));
-        assert!(earlier.iter().all(|make| make.ended < before), "{earlier:?}");
+        assert!(
+            earlier.iter().all(|make| make.ended < before),
+            "{earlier:?}"
+        );
     }
 
     /// Of more makes than [`KEPT`], the last [`KEPT`] are kept, in the order they ended

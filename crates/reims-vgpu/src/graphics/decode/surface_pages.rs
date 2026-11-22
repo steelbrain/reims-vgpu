@@ -4045,8 +4045,14 @@ pub(super) mod tests {
             assert_eq!(r.pages(BLOCK, &[(10 + i, 1)], page), RGFX_STATUS_OK);
         }
         assert_eq!(r.dec.views_of_surfaces().len().1, CACHED_VIEWS);
-        r.dec
-            .block_released(&r.device, BLOCK + 0x8000, 0, || (), Box::new(|| ()), no_raise());
+        r.dec.block_released(
+            &r.device,
+            BLOCK + 0x8000,
+            0,
+            || (),
+            Box::new(|| ()),
+            no_raise(),
+        );
         // The block's hold goes on the surface worker.
         r.dec.surface_worker().flush();
         assert_eq!(
