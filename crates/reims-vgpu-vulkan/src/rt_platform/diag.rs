@@ -103,13 +103,15 @@
 //!   `take_lock_waits`, `take_makes`, `take_maps`, `maker_makes`, `zero_writes`,
 //!   `long_take_zero_writes`): for each, its calls, those over 5 ms, and its longest call with
 //!   that call's bytes and whether it made an allocation of its own.
-//! - **rt's pipeline makes.** rt's `VkPipeline`s created; its first-use waits (encoding calls that
-//!   waited while the pipeline they needed was made), with their milliseconds and the longest, and
-//!   of them those for a compute kernel's pipeline at a threadgroup size, threadgroup memory
-//!   lengths or grid tiles none of its states had run with, and those for a render content's first
-//!   draw of lines; and the compute pipelines made ahead of their dispatches by the device's
-//!   pre-pass (rt's `prepare_dispatch`, reims-vgpu's `graphics::decode::prepass`), with their
-//!   milliseconds ([`pipelines_line`]).
+//! - **rt's pipeline makes.** rt's `VkPipeline`s created, and the main pipelines its states'
+//!   finishes made (rt's `finish_pipeline`, `super::pipeline`), with their milliseconds; its
+//!   first-use waits (encoding calls that waited while the pipeline they needed was made), with
+//!   their milliseconds and the longest, and of them those for a compute kernel's pipeline at a
+//!   threadgroup size, threadgroup memory lengths or grid tiles none of its states had run with,
+//!   those for a render content's first draw of lines, and those for a state's main pipeline that
+//!   no finish had made yet, made in flight by its finish or by the call itself; and the compute
+//!   pipelines made ahead of their dispatches by the device's pre-pass (rt's `prepare_dispatch`,
+//!   reims-vgpu's `graphics::decode::prepass`), with their milliseconds ([`pipelines_line`]).
 //! - **Own indices taken again.** The platform's own texture and sampler indices
 //!   (`super::texture::OwnIndices`) taken again after they were given back
 //!   ([`own_index_taken_again`]), and those given back ([`own_index_given_back`]), each class's
@@ -1440,10 +1442,13 @@ fn timed_parts_line(m: &rt::Metrics) -> String {
 fn pipelines_line(m: &rt::Metrics) -> String {
     let ms = |nanos: u64| nanos as f64 / 1e6;
     format!(
-        "reims-vgpu: rt-diag pipelines: {} created; first-use waits {} ({:.1} ms, longest {:.1} \
-         ms), of a compute variant {} ({:.1} ms, longest {:.1} ms), of lines {} ({:.1} ms, \
+        "reims-vgpu: rt-diag pipelines: {} created; finished {} ({:.1} ms); first-use waits {} \
+         ({:.1} ms, longest {:.1} ms), of a compute variant {} ({:.1} ms, longest {:.1} ms), of \
+         lines {} ({:.1} ms, longest {:.1} ms), of an unfinished main pipeline {} ({:.1} ms, \
          longest {:.1} ms); made ahead {} ({:.1} ms)",
         m.pipelines_created,
+        m.finished_pipelines,
+        ms(m.finished_pipeline_nanos),
         m.first_use_waits,
         ms(m.first_use_wait_nanos),
         ms(m.first_use_wait_max_nanos),
@@ -1453,6 +1458,9 @@ fn pipelines_line(m: &rt::Metrics) -> String {
         m.first_use_line_waits,
         ms(m.first_use_line_wait_nanos),
         ms(m.first_use_line_wait_max_nanos),
+        m.first_use_unfinished_waits,
+        ms(m.first_use_unfinished_wait_nanos),
+        ms(m.first_use_unfinished_wait_max_nanos),
         m.made_ahead_variants,
         ms(m.made_ahead_variant_nanos),
     )
@@ -2912,14 +2920,16 @@ mod tests {
         );
     }
 
-    /// rt's pipeline makes' line gives its first-use waits by kind and its makes ahead, each
-    /// with its milliseconds.
+    /// rt's pipeline makes' line gives its finishes, its first-use waits by kind, those on an
+    /// unfinished main pipeline among them, and its makes ahead, each with its milliseconds.
     #[test]
     fn the_pipelines_line_gives_first_use_waits_and_makes_ahead() {
         let mut m = rt::Metrics::default();
         m.pipelines_created = 40;
-        m.first_use_waits = 5;
-        m.first_use_wait_nanos = 250_000_000;
+        m.finished_pipelines = 30;
+        m.finished_pipeline_nanos = 75_400_000;
+        m.first_use_waits = 7;
+        m.first_use_wait_nanos = 280_000_000;
         m.first_use_wait_max_nanos = 120_500_000;
         m.first_use_variant_waits = 4;
         m.first_use_variant_wait_nanos = 240_000_000;
@@ -2927,13 +2937,17 @@ mod tests {
         m.first_use_line_waits = 1;
         m.first_use_line_wait_nanos = 10_000_000;
         m.first_use_line_wait_max_nanos = 10_000_000;
+        m.first_use_unfinished_waits = 2;
+        m.first_use_unfinished_wait_nanos = 30_000_000;
+        m.first_use_unfinished_wait_max_nanos = 20_000_000;
         m.made_ahead_variants = 13;
         m.made_ahead_variant_nanos = 1_052_340_000;
         assert_eq!(
             pipelines_line(&m),
-            "reims-vgpu: rt-diag pipelines: 40 created; first-use waits 5 (250.0 ms, longest \
-             120.5 ms), of a compute variant 4 (240.0 ms, longest 120.5 ms), of lines 1 (10.0 ms, \
-             longest 10.0 ms); made ahead 13 (1052.3 ms)"
+            "reims-vgpu: rt-diag pipelines: 40 created; finished 30 (75.4 ms); first-use waits 7 \
+             (280.0 ms, longest 120.5 ms), of a compute variant 4 (240.0 ms, longest 120.5 ms), of \
+             lines 1 (10.0 ms, longest 10.0 ms), of an unfinished main pipeline 2 (30.0 ms, \
+             longest 20.0 ms); made ahead 13 (1052.3 ms)"
         );
     }
 
