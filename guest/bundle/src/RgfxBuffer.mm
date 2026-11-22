@@ -381,11 +381,14 @@ void rgfxOwesEscapeNote(RgfxBuffer *buffer, MTLResourceOptions options, RgfxSeri
                                length:(NSUInteger)length
                               options:(MTLResourceOptions)options
                           deallocator:(void (^)(void *, NSUInteger))deallocator
+                            maxLength:(NSUInteger)maxLength
                                region:(RgfxRegion *)region
                                 slabs:(RgfxSlabs *)slabs
                                device:(id<MTLDevice>)device
                            serializer:(RgfxSerializer *)serializer
 {
+	if (maxLength != 0 && length > maxLength)
+		return nil;
 	RgfxBuffer *buffer = [RgfxBuffer bufferOverBytes:pointer
 	                                          length:length
 	                                         options:options

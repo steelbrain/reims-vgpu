@@ -1632,6 +1632,7 @@ void test_no_copy_write_backs_land_at_the_take()
 		                                           length:0x4000
 		                                          options:MTLResourceStorageModeShared
 		                                      deallocator:nil
+		                                        maxLength:0
 		                                           region:&region
 		                                            slabs:&slabs
 		                                           device:nil

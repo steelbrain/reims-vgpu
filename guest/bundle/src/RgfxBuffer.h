@@ -133,10 +133,17 @@ static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
 /// vm_allocate'd, read-only, or a shared or private file mapping, and two buffers over the same
 /// or overlapping bytes. Nil for a length of 0 and for a range not wholly mapped; Private
 /// storage fails an assertion, where this answers nil. Nil also where no slab has room.
+///
+/// Nil for a length past `maxLength` (the device's maxBufferLength; 0 holds none back), sending
+/// nothing, as the Intel 630 under macOS 26.7.1 answers: made at its maxBufferLength, nil one byte
+/// and one page past it, its process going on (oracle_errors bounds, nocopy.L+1 and nocopy.L+P;
+/// the AMD 5300M makes both). The host refuses such a buffer (BUFFER_OVER_PAGES), so the app
+/// would hold one whose command buffers' uses the host drops.
 + (nullable instancetype)bufferWithBytesNoCopy:(nullable void *)pointer
                                         length:(NSUInteger)length
                                        options:(MTLResourceOptions)options
                                    deallocator:(nullable void (^)(void *_Nullable, NSUInteger))deallocator
+                                     maxLength:(NSUInteger)maxLength
                                         region:(nullable RgfxRegion *)region
                                          slabs:(nullable RgfxSlabs *)slabs
                                         device:(nullable id<MTLDevice>)device

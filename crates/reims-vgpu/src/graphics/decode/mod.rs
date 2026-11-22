@@ -1762,19 +1762,19 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Whether the buffer of `length` bytes the message `name` makes is longer than the device's
     /// `maxBufferLength` ([`Self::set_max_buffer_length`]), which refuses it; a refusal is logged.
     ///
-    /// The guest's bundle makes no buffer, heap or texture longer than `maxBufferLength` from a
-    /// length alone, but its `newBufferWithBytesNoCopy:` makes one over the app's bytes of any
-    /// length, a `BUFFER_OVER_PAGES` of the app's own pages or of the pages of a slab range that
-    /// shadows them. The host refuses such a buffer past the length, which is at most what the
-    /// Vulkan platform's shaders address of a buffer in their direct form (`device_info`'s
-    /// `BUFFER_LENGTH_CAP`, 2 GiB); today's runtime lands a shader's access 4 GiB or more past a
-    /// buffer's bound address 4 GiB lower in it, with no fault. Its create is posted, so the
-    /// refusal takes the path of any refused posted create ([`Self::decode_refusing`],
-    /// [`refused`]): its id stands for a refused object, bound as nil, an op that uses it dropped,
-    /// and its command buffers go on. What Metal does with a no-copy buffer past `maxBufferLength`
-    /// is unmeasured on the oracles (the AMD Radeon Pro 5300M and the Intel UHD 630). A
-    /// `BUFFER_OVER_HOST_MEMORY` needs no such refusal: it lies in one block of the region,
-    /// whose 1 GiB ([`reims_vgpu_graphics::REGION_SIZE`]) the platform's shaders address whole.
+    /// The guest's bundle makes no buffer, heap or texture longer than `maxBufferLength`, a no-copy
+    /// buffer over the app's bytes included, which the Intel UHD 630 answers nil for and the AMD
+    /// Radeon Pro 5300M makes (the oracles' `oracle_errors bounds`), but the length of a
+    /// `BUFFER_OVER_PAGES`, of the app's own pages or of the pages of a slab range that shadows
+    /// them, is the guest's to write. The host refuses such a buffer past the length, which is at
+    /// most what the Vulkan platform's shaders address of a buffer in their direct form
+    /// (`device_info`'s `BUFFER_LENGTH_CAP`, 2 GiB); today's runtime lands a shader's access 4 GiB
+    /// or more past a buffer's bound address 4 GiB lower in it, with no fault. Its create is
+    /// posted, so the refusal takes the path of any refused posted create
+    /// ([`Self::decode_refusing`], [`refused`]): its id stands for a refused object, bound as nil,
+    /// an op that uses it dropped, and its command buffers go on. A `BUFFER_OVER_HOST_MEMORY` needs
+    /// no such refusal: it lies in one block of the region, whose 1 GiB
+    /// ([`reims_vgpu_graphics::REGION_SIZE`]) the platform's shaders address whole.
     fn past_max_buffer_length(&self, name: &str, length: u64) -> bool {
         let most = (self.shared.max_buffer_length).load(Ordering::Acquire);
         let past = most != 0 && length > most;

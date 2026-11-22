@@ -3729,6 +3729,7 @@ void test_apple_textures_past_a_buffers_allocation_answer_nil()
 			                                                length:length
 			                                               options:MTLResourceStorageModeShared
 			                                           deallocator:nil
+			                                             maxLength:0
 			                                                region:&region
 			                                                 slabs:&slabs
 			                                                device:(id<MTLDevice>)apple
@@ -3877,6 +3878,7 @@ void test_buffer_texture_copies_past_the_length_reach_the_tail()
 		                                                length:length
 		                                               options:MTLResourceStorageModeShared
 		                                           deallocator:nil
+		                                             maxLength:0
 		                                                region:&region
 		                                                 slabs:&slabs
 		                                                device:(id<MTLDevice>)device
@@ -13993,6 +13995,7 @@ void test_buffer_texture_replace_region_tells_the_host()
 		                                                length:length
 		                                               options:MTLResourceStorageModeManaged
 		                                           deallocator:nil
+		                                             maxLength:0
 		                                                region:&region
 		                                                 slabs:&slabs
 		                                                device:nil
@@ -14385,6 +14388,7 @@ void test_buffer_texture_did_modify_data_tells_the_host()
 		                                                length:length
 		                                               options:MTLResourceStorageModeManaged
 		                                           deallocator:nil
+		                                             maxLength:0
 		                                                region:&region
 		                                                 slabs:&slabs
 		                                                device:nil
@@ -14758,6 +14762,7 @@ void test_no_copy_buffers()
 			                                      freedLog->length = l;
 			                                      freedLog->count++;
 		                                      }
+		                                        maxLength:0
 		                                           region:&region
 		                                            slabs:&slabs
 		                                           device:nil
@@ -14855,6 +14860,7 @@ void test_no_copy_buffers()
 		                                  length:length
 		                                 options:options
 		                             deallocator:nil
+		                               maxLength:0
 		                                  region:&region
 		                                   slabs:&slabs
 		                                  device:nil
@@ -14898,6 +14904,7 @@ void test_no_copy_buffers()
 			                                        deallocator:^(void *q, NSUInteger) {
 				                                        nullFreed->store(q);
 			                                        }
+			                                          maxLength:0
 			                                             region:&region
 			                                              slabs:&slabs
 			                                             device:nil
@@ -14918,6 +14925,60 @@ void test_no_copy_buffers()
 	drainRing(f.control);
 	vm_deallocate(mach_task_self(), holed, 0x8000);
 	vm_deallocate(mach_task_self(), app, 0x40000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
+// newBufferWithBytesNoCopy: makes no buffer of more bytes than maxBufferLength, as the Intel 630
+// under macOS 26.7.1 answers (oracle_errors bounds, nocopy.L+1 and nocopy.L+P: made at its
+// maxBufferLength, nil one byte and one page past it, its process going on; the AMD 5300M makes
+// both). Nil posts nothing, wherever the bytes lie: the app's, the region's, or none given. The
+// host refuses such a buffer, so the app would otherwise hold one its command buffers cannot use.
+// A limit of 0 holds none back.
+void test_no_copy_buffers_past_max_buffer_length_are_nil()
+{
+	@autoreleasepool {
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource source(region, fx.ser);
+	RgfxSlabs slabs(source);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	auto make = [&](void *pointer, NSUInteger length, NSUInteger maxLength) {
+		return [RgfxBuffer bufferWithBytesNoCopy:pointer
+		                                  length:length
+		                                 options:MTLResourceStorageModeShared
+		                             deallocator:nil
+		                               maxLength:maxLength
+		                                  region:&region
+		                                   slabs:&slabs
+		                                  device:nil
+		                              serializer:&fx.ser];
+	};
+	@autoreleasepool {
+		RgfxRegion::Block inRegion = region.allocate(0x10000);
+		CHECK(inRegion.ok);
+		void *own = const_cast<uint8_t *>(inRegion.ptr);
+		void *appBytes = reinterpret_cast<void *>(app);
+		// At the limit, and past none.
+		RgfxBuffer *atMax = make(own, 0x8000, 0x8000);
+		CHECK(atMax != nil && atMax.length == 0x8000 && [atMax contents] == own);
+		RgfxBuffer *ofItsOwn = make(nullptr, 0x8000, 0x8000);
+		CHECK(ofItsOwn != nil && ofItsOwn.length == 0x8000);
+		RgfxBuffer *unlimited = make(nullptr, 0x10000, 0);
+		CHECK(unlimited != nil && unlimited.length == 0x10000);
+		drainRing(fx.ring);
+		// A byte and a page past it.
+		void *const pointers[] = { appBytes, own, nullptr };
+		for (void *pointer : pointers) {
+			CHECK(make(pointer, 0x8001, 0x8000) == nil);
+			CHECK(make(pointer, 0x9000, 0x8000) == nil);
+		}
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+	vm_deallocate(mach_task_self(), app, 0x10000);
 	}
 	CHECK(!RgfxMemoryShadow::anyLive());
 }
@@ -14984,6 +15045,7 @@ void test_no_copy_buffers_in_place()
 		                                      deallocator:^(void *, NSUInteger) {
 			                                      freed->fetch_add(1);
 		                                      }
+		                                        maxLength:0
 		                                           region:&region
 		                                            slabs:&slabs
 		                                           device:nil
@@ -15014,6 +15076,7 @@ void test_no_copy_buffers_in_place()
 		                                  length:length
 		                                 options:options
 		                             deallocator:nil
+		                               maxLength:0
 		                                  region:&region
 		                                   slabs:&slabs
 		                                  device:nil
@@ -15138,6 +15201,7 @@ void test_no_copy_buffers_in_place()
 			                                      deallocator:^(void *, NSUInteger) {
 				                                      gone->fetch_add(1);
 			                                      }
+			                                        maxLength:0
 			                                           region:&region
 			                                            slabs:&slabs
 			                                           device:nil
@@ -15167,6 +15231,7 @@ void test_no_copy_buffers_in_place()
 			                                           length:0x1000
 			                                          options:MTLResourceStorageModeManaged
 			                                      deallocator:nil
+			                                        maxLength:0
 			                                           region:&region
 			                                            slabs:&slabs
 			                                           device:nil
@@ -15193,6 +15258,7 @@ void test_no_copy_buffers_in_place()
 			                                                  length:0x1000
 			                                                 options:MTLResourceStorageModeManaged
 			                                             deallocator:nil
+			                                               maxLength:0
 			                                                  region:&region
 			                                                   slabs:&plainSlabs
 			                                                  device:nil
@@ -15306,6 +15372,7 @@ void test_no_copy_buffers_over_the_same_bytes_share_a_block()
 		                                  length:length
 		                                 options:options
 		                             deallocator:nil
+		                               maxLength:0
 		                                  region:&region
 		                                   slabs:&slabs
 		                                  device:nil
@@ -15418,6 +15485,7 @@ void test_no_copy_buffers_lie_at_the_host_s_address()
 		                                  length:length
 		                                 options:options
 		                             deallocator:nil
+		                               maxLength:0
 		                                  region:&region
 		                                   slabs:&slabs
 		                                  device:nil
@@ -15533,6 +15601,7 @@ void test_no_copy_buffers_ask_the_host_s_address_where_their_block_is_answered_f
 		                                  length:length
 		                                 options:options
 		                             deallocator:nil
+		                               maxLength:0
 		                                  region:&region
 		                                   slabs:&slabs
 		                                  device:nil
@@ -15705,6 +15774,7 @@ void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
 		                                  length:length
 		                                 options:MTLResourceStorageModeShared
 		                             deallocator:nil
+		                               maxLength:0
 		                                  region:&region
 		                                   slabs:&slabs
 		                                  device:nil
@@ -15804,6 +15874,7 @@ void test_no_copy_buffer_escape_notes()
 		                                           length:length
 		                                          options:options
 		                                      deallocator:nil
+		                                        maxLength:0
 		                                           region:&region
 		                                            slabs:&slabs
 		                                           device:nil
@@ -16048,6 +16119,7 @@ void test_slab_buffers_over_pages_escape_notes()
 	                                                  length:big
 	                                                 options:MTLResourceStorageModeShared
 	                                             deallocator:nil
+	                                               maxLength:0
 	                                                  region:&region
 	                                                   slabs:&slabs
 	                                                  device:nil
@@ -16136,6 +16208,7 @@ void test_no_copy_shadows_lie_in_slabs()
 		                                  length:length
 		                                 options:options
 		                             deallocator:nil
+		                               maxLength:0
 		                                  region:&region
 		                                   slabs:&slabs
 		                                  device:nil
@@ -16212,6 +16285,7 @@ void test_binds_note_shadow_writes()
 		                                           length:0x10000
 		                                          options:shared
 		                                      deallocator:nil
+		                                        maxLength:0
 		                                           region:&region
 		                                            slabs:&slabs
 		                                           device:nil
@@ -22750,6 +22824,7 @@ int main(int argc, char **argv)
 		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		test_no_copy_buffers();
+		test_no_copy_buffers_past_max_buffer_length_are_nil();
 		test_no_copy_buffers_in_place();
 		test_no_copy_buffers_over_the_same_bytes_share_a_block();
 		test_no_copy_buffers_lie_at_the_host_s_address();

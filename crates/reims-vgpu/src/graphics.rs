@@ -606,7 +606,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 decoder.set_pool(ledger.clone());
             }
             // The guest's `maxBufferLength`, past which the decoder refuses a buffer over a
-            // process's own pages, which the bundle's no-copy buffers make at any length.
+            // process's own pages, whose length the guest writes.
             decoder.set_max_buffer_length(info.sizes[RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH]);
             // The platform's lease on the guest's RAM, held by the views of the surfaces' pages
             // made through the map and by the deallocators of the platform's imports of its

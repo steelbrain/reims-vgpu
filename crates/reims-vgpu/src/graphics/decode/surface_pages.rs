@@ -5385,11 +5385,10 @@ pub(super) mod tests {
         );
     }
 
-    /// A `BUFFER_OVER_PAGES` longer than the device's `maxBufferLength`, as the bundle's
-    /// `newBufferWithBytesNoCopy:` makes one over the app's pages at any length, is refused though
-    /// its view holds it, and its id stands for a refused object, as any refused posted create's
-    /// does; one of exactly the length is made, and with no length set none is refused for its
-    /// length
+    /// A `BUFFER_OVER_PAGES` longer than the device's `maxBufferLength`, which the bundle's
+    /// `newBufferWithBytesNoCopy:` posts none of but a guest may write, is refused though its view
+    /// holds it, and its id stands for a refused object, as any refused posted create's does; one
+    /// of exactly the length is made, and with no length set none is refused for its length
     #[test]
     fn a_pages_buffer_past_max_buffer_length_is_refused() {
         let mut r = rig(8);

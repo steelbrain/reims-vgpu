@@ -92,6 +92,17 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 	return "no room in the slabs, or the device never got the create";
 }
 
+// Why the device's no-copy buffer factory answered nil for `length` (RgfxBuffer's
+// bufferWithBytesNoCopy:..., which says no more).
+const char *noCopyCause(NSUInteger length, NSUInteger maxLength)
+{
+	if (length == 0)
+		return "no bytes";
+	if (maxLength != 0 && length > maxLength)
+		return "more bytes than maxBufferLength";
+	return "the buffer's factory made none";
+}
+
 } // namespace
 
 @implementation RgfxMetalDevice (Resources)
@@ -149,18 +160,20 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
                               deallocator:(void (^)(void *, NSUInteger))deallocator
 {
 	// Over the caller's bytes in place where they lie in a block of ours or the kext wires their
-	// pages, else over a range of a slab synced with them (RgfxBuffer.h).
+	// pages, else over a range of a slab synced with them; none past maxBufferLength, as the Intel
+	// 630 makes none (RgfxBuffer.h).
 	id<MTLBuffer> buffer = [RgfxBuffer bufferWithBytesNoCopy:pointer
 	                                                  length:length
 	                                                 options:options
 	                                             deallocator:deallocator
+	                                               maxLength:[self maxBufferLength]
 	                                                  region:[self region]
 	                                                   slabs:[self slabs]
 	                                                  device:self
 	                                              serializer:[self serializer]];
 	if (buffer == nil)
 		noteNil("newBufferWithBytesNoCopy:length:options:deallocator:",
-		        "the buffer's factory made none", bufferAsked(length, options));
+		        noCopyCause(length, [self maxBufferLength]), bufferAsked(length, options));
 	return RgfxCounted(self, buffer);
 }
 
@@ -260,7 +273,10 @@ const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUIntege
 // for the texture (newTiledTextureWithDescriptor:offset:bytesPerRow:). Ours is the same over the
 // device's no-copy buffer: a Shared one, as a tiled texture needs (RgfxBuffer.mm), with the
 // descriptor's other resource options. The deallocator goes to that buffer, which calls it with
-// the bytes and their length; one whose own signature takes other arguments is refused.
+// the bytes and their length; one whose own signature takes other arguments is refused. So it is
+// nil for bytes past maxBufferLength, as the buffer is, as the Intel 630 under macOS 26.7.1
+// answers: made over bytes of its maxBufferLength, nil over a page more (oracle_errors bounds,
+// tiled.L and tiled.L+P; the AMD 5300M makes both).
 - (id<MTLTexture>)newTiledTextureWithBytesNoCopy:(void *)bytes
                                           length:(NSUInteger)length
                                      deallocator:(id)deallocator
