@@ -351,10 +351,16 @@ mod tests {
         assert!(line.contains("a BLOCK_RELEASE (type 0x"), "{line}");
         assert!(line.contains("answered 20.000 ms"), "{line}");
         assert!(line.contains("over 2 makes"), "{line}");
-        assert!(line.contains("the last 5.000 ms before the answer"), "{line}");
+        assert!(
+            line.contains("the last 5.000 ms before the answer"),
+            "{line}"
+        );
         assert!(line.contains("over 1 first-use waits"), "{line}");
         assert!(line.contains("1 the no-copy buffers 1.000 ms"), "{line}");
-        assert!(line.contains("call 9.000 ms, then 0.000 ms until 5 the"), "{line}");
+        assert!(
+            line.contains("call 9.000 ms, then 0.000 ms until 5 the"),
+            "{line}"
+        );
         assert!(
             line.contains("the unshares 1.000 ms, 4 no display showing it 9.000 ms"),
             "{line}"
