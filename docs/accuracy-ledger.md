@@ -100,7 +100,11 @@ nil. Among rt's gaps (`rt-refused-gap`),
 nothing encoded: a blit copy to or from a texture buffer (`Gap::TextureCopy`), and a copy
 between regions of two textures over one buffer whose bytes meet where rt cannot cut the copy
 into ordered slabs, or between two textures whose memory meets where one is placed in a heap
-(`Gap::OverlappingCopy`). The boot diagnostics (`rt_platform/diag.rs`, lines that start
+(`Gap::OverlappingCopy`). A render pipeline of a maximum vertex amplification count above one
+is a gap too: nil and an `NSError`. The device answers `maxVertexAmplificationCount` 1
+(`rt_platform::answers::VERTEX_AMPLIFICATION_COUNT`; Metal answers 2 on the M3 Max), so
+`supportsVertexAmplificationCount:` answers no above one, and a guest that asks first reaches no
+create. The boot diagnostics (`rt_platform/diag.rs`, lines that start
 `reims-vgpu: rt-diag`) add what the call asked of rt where its site names it. Their refusals
 line counts the translator's refusals by the feature each refused, `Translation-<feature>`
 (metal2vulkan's `Feature`'s variant, as `Translation-DivergentInterpolation`), or by its

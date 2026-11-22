@@ -29,6 +29,7 @@
 //!   `newRasterizationRateMapWithDescriptor:` refuses, `Unbuilt::RateMap`), so the guest's
 //!   `supportsRasterizationRateMapWithLayerCount:` answers no for every count, as a device that
 //!   supports none does, and never yes to a map that then comes back nil;
+//! - a vertex amplification count of one ([`VERTEX_AMPLIFICATION_COUNT`]).
 //! - `maxBufferLength` is rt's [`MAX_BUFFER_LENGTH`](metal2vulkan_runtime::MAX_BUFFER_LENGTH), and
 //!   `maxArgumentBufferSamplerCount` the indices of rt's sampler class;
 //! - the linear texture alignments (the device's, an IOSurface's, a linear texture's) are the
@@ -64,8 +65,6 @@ pub mod metal {
 
     /// `maxThreadsPerThreadgroup`, each dimension.
     pub const MAX_THREADS_PER_THREADGROUP: u64 = 1024;
-    /// `maxVertexAmplificationCount`.
-    pub const MAX_VERTEX_AMPLIFICATION_COUNT: u64 = 2;
     /// `supportsPrimitiveType:` of the raw values 0 to 4, the public ones.
     pub const PUBLIC_PRIMITIVE_TYPES: u64 = 5;
 
@@ -202,6 +201,14 @@ fn sampler_count() -> u64 {
     u64::from(range.end.saturating_sub(range.start))
 }
 
+/// `maxVertexAmplificationCount`, and so the identity's `largest_vertex_amplification_count`:
+/// one. rt draws one view (a pipeline of a larger maximum count is its refusal,
+/// `rt-refused-gap`, and an encoder's `setVertexAmplificationCount:viewMappings:` of more than
+/// one mapping `Unbuilt`), so the guest's `supportsVertexAmplificationCount:` answers no above
+/// one, as a device that amplifies nothing does, and never yes to a count whose pipeline then
+/// comes back nil. Metal answers 2 on the M3 Max.
+pub const VERTEX_AMPLIFICATION_COUNT: u64 = 1;
+
 /// `x` at most `bound`, a Vulkan limit.
 fn held(x: u64, bound: u32) -> u64 {
     x.min(u64::from(bound))
@@ -290,7 +297,7 @@ pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
         registry_id: facts.registry_id,
         gpu_core_count: None,
         max_threads_per_threadgroup: MtlSize::new(width, height, depth),
-        max_vertex_amplification_count: metal::MAX_VERTEX_AMPLIFICATION_COUNT,
+        max_vertex_amplification_count: VERTEX_AMPLIFICATION_COUNT,
         limits,
         flags,
         sample_counts: facts.sample_counts.map(Ok),
@@ -582,6 +589,17 @@ pub(crate) mod tests {
             id.architecture_name.as_deref(),
             Some("vulkan_1002_15bf_abababababababababababababababab")
         );
+    }
+
+    /// The device amplifies one view, as rt draws: `maxVertexAmplificationCount` and the identity's
+    /// largest count `supportsVertexAmplificationCount:` takes are one, below Metal's 2.
+    #[test]
+    fn vertex_amplification_answers_one_view() {
+        let facts = roomy();
+        let caps = caps(&facts);
+        assert_eq!(caps.max_vertex_amplification_count, 1);
+        let id = identity(&facts, &caps, |_| None, |_| None);
+        assert_eq!(id.sizes.largest_vertex_amplification_count, Some(1));
     }
 
     /// A texture-buffer format answers rt's texture-buffer alignment of it; one rt makes textures
