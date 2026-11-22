@@ -4,6 +4,7 @@
  */
 
 #include "RgfxLog.hpp"
+#include "RgfxLogOnce.hpp"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,4 +23,13 @@ bool rgfxLogToStderr()
 		return false;
 	const mode_t type = st.st_mode & S_IFMT;
 	return type == S_IFREG || type == S_IFSOCK || type == S_IFIFO || isatty(STDERR_FILENO);
+}
+
+void rgfxNoteNil(const char *creator, const char *cause, const char *asked)
+{
+	static char site;
+	if (!rgfxLogFirst(&site, rgfxLogKindOf(creator) ^ (rgfxLogKindOf(cause) * 31)))
+		return;
+	os_log_info(rgfxLog(), "RGFX: the device answers nil at %{public}s (%{public}s): %{public}s",
+	            creator, cause, asked);
 }

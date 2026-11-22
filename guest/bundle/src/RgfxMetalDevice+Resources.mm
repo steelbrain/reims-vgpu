@@ -6,7 +6,6 @@
 
 #import "RgfxMetalDevice+Resources.h"
 #include "RgfxLog.hpp"
-#include "RgfxLogOnce.hpp"
 
 #import "RgfxBlockCall.h"
 #import "RgfxBuffer.h"
@@ -33,19 +32,10 @@
 
 namespace {
 
-// A nil the device's creator `creator` answers for `cause`, asked for `asked`: logged at the info
-// level (`log show --info`) once per creator and cause in the process (docs/conventions.md), what
-// was asked the first time named, so a process that ends at a nil it was given (14.6.1's
-// WindowServer ends at a texture's, in SkyLight's MetalBacking::AbortWithTextureInfo) has the
-// device's answer named beside it. A creator asked every frame, the same or not, logs once.
+// A nil the device's creator `creator` answers for `cause`, asked for `asked` (rgfxNoteNil).
 void noteNil(const char *creator, const char *cause, const std::string &asked)
 {
-	static char site;
-	if (!rgfxLogFirst(&site, rgfxLogKindOf(creator) ^ (rgfxLogKindOf(cause) * 31)))
-		return;
-	os_log_info(rgfxLog(),
-	            "RGFX: the device answers nil at %{public}s (%{public}s): %{public}s", creator,
-	            cause, asked.c_str());
+	rgfxNoteNil(creator, cause, asked.c_str());
 }
 
 // What a texture's descriptor asks, its protection options among it where the descriptor has

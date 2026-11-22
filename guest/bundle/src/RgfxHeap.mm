@@ -11,6 +11,7 @@
 #import "RgfxUnsupported.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
 #include <memory>
@@ -18,6 +19,7 @@
 
 #include "RgfxHeapRanges.hpp"
 #include "RgfxHeapSizes.hpp"
+#include "RgfxLog.hpp" // rgfxNoteNil
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp" // RgfxSerializer
 #include "RgfxSlabs.hpp"      // RgfxPoolSlabSource
@@ -375,6 +377,28 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 // --- sub-allocation (Placement: the guest names the offset) -------------------
 // Only a Placement heap places at an offset: of a heap of another type, Metal's validation
 // fails the call, and these answer nil, as the host refuses such a placement.
+//
+// Neither places a resource that runs past the heap's size: nil, sending nothing, with the
+// device's note of a nil (rgfxNoteNil), as the AMD 5300M and the Intel 630 under macOS 26.7.1
+// answer, their processes going on (oracle_errors bounds, in a 1 MiB Private heap: a buffer of
+// 64 KiB at its last 64 KiB made, of 128 KiB there and of 1 MiB + 64 KiB at 0 nil; a texture at
+// the last offset of its alignment that holds it made, one alignment on nil). The host refuses
+// such a placement, so the app would otherwise hold a resource its command buffers cannot use.
+
+// Whether `size` bytes at `offset` run past a heap of `heapSize` bytes, noted as a nil of
+// `creator`'s where they do.
+static bool rgfxPlacedPastHeap(const char *creator, uint64_t offset, uint64_t size,
+                               uint64_t heapSize)
+{
+	if (offset <= heapSize && size <= heapSize - offset)
+		return false;
+	char asked[128];
+	snprintf(asked, sizeof(asked), "%llu bytes at offset %llu of a heap of %llu",
+	         static_cast<unsigned long long>(size), static_cast<unsigned long long>(offset),
+	         static_cast<unsigned long long>(heapSize));
+	rgfxNoteNil(creator, "past the heap's size", asked);
+	return true;
+}
 
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length
                              options:(MTLResourceOptions)options
@@ -383,6 +407,8 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	if (_type != MTLHeapTypePlacement) {
 		return nil;
 	}
+	if (rgfxPlacedPastHeap("MTLHeap newBufferWithLength:options:offset:", offset, length, _size))
+		return nil;
 	RgfxBuffer *buffer = [self rgfxBufferAt:offset length:length options:options];
 	[buffer rgfxSetHeapOffset:offset];
 	return buffer;
@@ -440,6 +466,15 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	rgfxEndAtInvalidTextureDescriptor(descriptor, self.device);
 	rgfxEndAtHeapStorageMismatch(descriptor, self.storageMode, self.device);
 	if (rgfxDeviceMakesNoTextureOf(descriptor, self.device))
+		return nil;
+	// Its bytes, as heapTextureSizeAndAlignWithDescriptor: answers them: the host's answer, which
+	// the serialiser keeps per descriptor, so a texture placed at an offset the app worked out from
+	// that answer asks nothing more. With no answer the host's own refusal stands, as before.
+	RgfxSerializer *ser = [self serializer];
+	uint64_t bytes = 0, align = 0;
+	if (ser != nullptr &&
+	    ser->heapTextureSizeAndAlign(rgfxTextureDescriptorFromMTL(descriptor), &bytes, &align) &&
+	    rgfxPlacedPastHeap("MTLHeap newTextureWithDescriptor:offset:", offset, bytes, _size))
 		return nil;
 	RgfxTexture *texture = [RgfxTexture textureWithDescriptor:descriptor
 	                                                     heap:[self rgfxObjId]

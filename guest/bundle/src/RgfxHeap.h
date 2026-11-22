@@ -14,7 +14,8 @@
  * each wrapped as an RgfxBuffer / RgfxTexture whose `heap` is this one. A placed
  * buffer's GPU address is the heap's plus its offset, and a Shared heap's placed
  * buffer's contents are the heap's bytes there, so placed resources alias the
- * heap's memory as Metal's do.
+ * heap's memory as Metal's do. One that runs past the heap's size is nil, sending
+ * nothing, as both x86 Macs answer (RgfxHeap.mm).
  *
  * An Automatic heap places what `newBufferWithLength:options:` and
  * `newTextureWithDescriptor:` make itself, as Metal's does (RgfxHeapRanges.hpp): a

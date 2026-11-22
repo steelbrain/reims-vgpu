@@ -16651,6 +16651,58 @@ bool askTextureSize(void *, const void *, uint32_t, void *reply, uint32_t capaci
 	return true;
 }
 
+// A Placement heap places no buffer or texture that runs past its size: nil, posting nothing, as
+// the AMD 5300M and the Intel 630 under macOS 26.7.1 answer (oracle_errors bounds, in a 1 MiB
+// Private heap: a buffer of 64 KiB at its last 64 KiB made, of 128 KiB there and of 1 MiB + 64 KiB
+// at 0 nil; a texture at the last offset of its alignment that holds it made, one alignment on
+// nil). The host refuses such a placement, so the app would otherwise hold a resource its command
+// buffers cannot use. A texture's bytes are the host's answer to its size.
+void test_placed_resources_past_their_heap_are_nil()
+{
+	Fixture fx;
+	fx.ser.setAsker(&askTextureSize, nullptr);
+	MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+	d.size = 0x100000;
+	d.storageMode = MTLStorageModePrivate;
+	d.type = MTLHeapTypePlacement;
+	@autoreleasepool {
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:d device:nil serializer:&fx.ser];
+		CHECK(heap != nil && heap.size == 0x100000);
+		(void)expectMessage<RgfxHeapCreate>(fx.ring, RGFX_CMD_HEAP_CREATE);
+		auto buffer = [&](NSUInteger length, NSUInteger offset) {
+			return [heap newBufferWithLength:length
+			                         options:MTLResourceStorageModePrivate
+			                          offset:offset];
+		};
+		id<MTLBuffer> atEnd = buffer(0x10000, 0xf0000);
+		CHECK(atEnd != nil && atEnd.heapOffset == 0xf0000);
+		auto placed = expectMessage<RgfxBufferAtOffset>(fx.ring, RGFX_CMD_BUFFER_AT_OFFSET);
+		CHECK(placed.offset == 0xf0000 && placed.length == 0x10000);
+		CHECK(buffer(0x20000, 0xf0000) == nil);
+		CHECK(buffer(0x110000, 0) == nil);
+		CHECK(buffer(1, 0x100000) == nil);
+		CHECK(buffer(1, 0x100001) == nil);
+		CHECK(ringEmpty(fx.ring));
+
+		// askTextureSize's 264192 bytes at 128: the last offset that holds it, and one on.
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:256
+		                                                      height:256
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		const NSUInteger last = (0x100000 - 264192) / 128 * 128;
+		id<MTLTexture> fits = [heap newTextureWithDescriptor:td offset:last];
+		CHECK(fits != nil && fits.heapOffset == last);
+		auto made = expectMessage<RgfxTextureCreate>(fx.ring, RGFX_CMD_TEXTURE_CREATE);
+		CHECK(made.heap_obj_id == heap.rgfxObjId && made.heap_offset == last);
+		CHECK([heap newTextureWithDescriptor:td offset:last + 128] == nil);
+		CHECK([heap newTextureWithDescriptor:td offset:0x100000] == nil);
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
 // The device's answers to the function pointer creates, and what it was last asked.
 struct FunctionPointerDevice {
 	uint32_t calls = 0;
@@ -22817,6 +22869,7 @@ int main(int argc, char **argv)
 		test_heaps_with_no_bytes_or_address_are_nil();
 		test_queue_ring_carries_only_command_buffers();
 		test_shared_heap_buffers_alias_its_bytes();
+		test_placed_resources_past_their_heap_are_nil();
 		test_automatic_heap_places_as_metal();
 		test_rasterization_rate_map();
 		test_function_pointers();

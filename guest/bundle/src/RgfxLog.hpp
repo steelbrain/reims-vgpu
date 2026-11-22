@@ -22,6 +22,14 @@ os_log_t rgfxLog();
 // socket, a pipe or a terminal, not /dev/null or nothing.
 bool rgfxLogToStderr();
 
+// A nil a creator of the device's or of its heaps' (`creator`) answers for `cause`, asked for
+// `asked`: logged at the info level (`log show --info`) once per creator and cause in the process
+// (docs/conventions.md), what was asked the first time named, so a process that ends at a nil it
+// was given (14.6.1's WindowServer ends at a texture's, in SkyLight's
+// MetalBacking::AbortWithTextureInfo) has the device's answer named beside it. A creator asked
+// every frame, the same or not, logs once.
+void rgfxNoteNil(const char *creator, const char *cause, const char *asked);
+
 #ifdef __OBJC__
 #import <Foundation/Foundation.h>
 
