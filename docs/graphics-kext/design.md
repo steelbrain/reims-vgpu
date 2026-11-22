@@ -112,7 +112,10 @@ Stages:
      That memory is the runtime's Shared blocks: host-cached system memory
      the host's driver allocates, which QEMU maps into the device's pool
      range a block at a time (`crates/reims-vgpu/src/pool.rs`), and which the
-     host GPU reads in place. The staging rings live there too.
+     host GPU reads in place. The queues' rings, command buffers' bodies and
+     libraries' staging chunks lie in the device's region (BAR 2) instead.
+     Where the device offers no pool, Shared buffers and heaps lie in the
+     region or in the process's own pages ("The Shared pool").
    - Under KVM that needs Linux 6.13 or later. Before 6.13, KVM maps a page
      of a driver's mapping only where it can take a reference on the page,
      and the drivers on TTM (amdgpu among them) allocate higher-order pages
@@ -133,8 +136,13 @@ Stages:
      against about 10 GiB/s for writes. It returns only if a measured frame
      shows the GPU's reads of Shared memory across PCIe costing.
    - The BAR is one host memory region that the device reserves at start and
-     registers with KVM once. Blocks are ranges inside it, so making or
-     freeing a block never changes the VM's memory map. It is ordinary
+     registers with KVM once. Its blocks are ranges inside it, so making or
+     freeing one never changes the VM's memory map. The pool's blocks do not
+     lie in it: each piece of the pool is a RAM region of its own, which QEMU
+     adds to the VM's memory map on its main loop as the pool grows and
+     removes as the pool gives the piece back (`crates/reims-vgpu/src/pool.rs`,
+     "The Shared pool"), and a block carved from a piece already mapped
+     changes nothing. The BAR is ordinary
      cached memory on the host, and the guest maps it write-back where the
      kext asks for write-back. xnu's x86-64 pmap gives every page it does
      not manage, and the region is no RAM of the guest's, PAT entry 2 for
@@ -158,10 +166,12 @@ Stages:
      source: vm_fault's `pmap_map_block_addr`). With entry 2 UC-, measured
      on the Radeon 780M host, the guest's stores there ran at 13 MB/s and
      its loads at 8 to 180 MB/s, against 5.6 to 123 GB/s in its own RAM, and
-     uncached loads cost 79-138 ns against 2-4 ns cached. So what
-     the CPU touches most lies in the process's own pages instead (its Shared
-     and Managed buffers' slabs and its upload chunks, "Managed storage", and
-     its indirect command buffers' slots, `ICB_SLOTS_IN_PAGES`),
+     uncached loads cost 79-138 ns against 2-4 ns cached. So what a
+     process's CPU touches most lies out of the region: its Shared and
+     Managed buffers' slabs and its upload chunks in the pool's blocks, or in
+     the process's own pages where the device offers no pool ("Managed
+     storage"), and its indirect command buffers' slots in the process's own
+     pages (`ICB_SLOTS_IN_PAGES`);
      and what the process only writes takes a write-combined part of its
      block, which the kext maps so (a submission ring's data, command
      buffers' bodies and a library's staging chunks; the bundle's
@@ -2517,7 +2527,7 @@ at 0x4000_0000. The device stays on `pcie.0`: a root port does not help.
 | 0x10000 | 64 KiB | control completion ring (host to kext), MSI-X vector 0; the device info at 0x18100 |
 | 0x20000 | 2 MiB + 256 | the VideoToolbox ring (host to the arm64e kext, `VT_RING`), never armed |
 | 0x400000 | 128 MiB | the framebuffer's scanout (`RGFX_SCANOUT_SPAN`) |
-| 0x8400000 | to the cursor | the accelerator kext's blocks: every process's queue rings, Shared buffers and heaps, surfaces |
+| 0x8400000 | to the cursor | the accelerator kext's blocks: every process's queue rings, command buffers' bodies and libraries' staging chunks, surfaces' blocks, and Shared buffers and heaps where the device offers no Shared pool |
 | end − 256 KiB | 256 KiB | the framebuffer's cursor image |
 
 The control ring is the kexts' alone: the framebuffer's display commands, and
