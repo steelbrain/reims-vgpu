@@ -5470,7 +5470,10 @@ RGFX_LOG_UNRECOGNIZED
 	_enc->renderSetProvokingVertexMode(mode);
 }
 
-// A tile dispatch over part of the tiles: none on the wire (nor any tile pipeline to run).
+// A tile dispatch over part of the tiles. The wire has its op
+// (DISPATCH_THREADS_PER_TILE_IN_REGION), but the bundle makes no tile pipeline to run one (a tile
+// pipeline create is refused: the wire has none), and the host's runtime has no tile dispatch, so
+// the bundle refuses it and sends nothing.
 - (void)dispatchThreadsPerTile:(MTLSize)threadsPerTile inRegion:(MTLRegion)region
 {
 	(void)threadsPerTile;
@@ -5975,8 +5978,10 @@ RGFX_LOG_UNRECOGNIZED
 #endif
 }
 
-// A loop the GPU runs while a value in `buffer` compares true: none on the wire, so it is
-// refused, and the encoder's work after it runs once.
+// A loop the GPU runs while a value in `buffer` compares true. The wire has its op
+// (ENCODE_START_WHILE), but the host's runtime has no command predication (the Vulkan platform
+// encodes none of the ENCODE_START_* ops), so the bundle refuses it and sends nothing, and the
+// encoder's work after it runs once.
 - (void)encodeStartWhile:(id<MTLBuffer>)buffer
                   offset:(NSUInteger)offset
               comparison:(MTLCompareFunction)comparison
@@ -5986,7 +5991,7 @@ RGFX_LOG_UNRECOGNIZED
 	(void)offset;
 	(void)comparison;
 	(void)referenceValue;
-	RGFX_UNSUPPORTED("GPU-side loops (none on the wire)");
+	RGFX_UNSUPPORTED("GPU-side loops (the host's runtime has no command predication)");
 }
 
 // Metal answers YES closing a loop encodeStartWhile: opened, and NO with none open; no loop is
@@ -6001,8 +6006,10 @@ RGFX_LOG_UNRECOGNIZED
 // both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
 
 // A conditional the GPU evaluates on a value in `buffer`, and a loop that runs again while one
-// compares true: none on the wire, so they are refused, as encodeStartWhile: is; the work of both
-// branches runs, and a loop's once.
+// compares true: the bundle refuses them and sends nothing, as for encodeStartWhile:, since the
+// host's runtime has no command predication. The wire has ENCODE_START_IF, ENCODE_START_ELSE and
+// ENCODE_START_DO_WHILE, and no op for a conditional's or a loop's end. The work of both branches
+// runs, and a loop's once.
 - (void)encodeStartIf:(id<MTLBuffer>)buffer
                 offset:(NSUInteger)offset
             comparison:(MTLCompareFunction)comparison
@@ -6012,15 +6019,15 @@ RGFX_LOG_UNRECOGNIZED
 	(void)offset;
 	(void)comparison;
 	(void)referenceValue;
-	RGFX_UNSUPPORTED("GPU-side conditionals (none on the wire)");
+	RGFX_UNSUPPORTED("GPU-side conditionals (the host's runtime has no command predication)");
 }
 - (void)encodeStartElse
 {
-	RGFX_UNSUPPORTED("GPU-side conditionals (none on the wire)");
+	RGFX_UNSUPPORTED("GPU-side conditionals (the host's runtime has no command predication)");
 }
 - (void)encodeStartDoWhile
 {
-	RGFX_UNSUPPORTED("GPU-side loops (none on the wire)");
+	RGFX_UNSUPPORTED("GPU-side loops (the host's runtime has no command predication)");
 }
 - (BOOL)encodeEndDoWhile:(id<MTLBuffer>)buffer
                   offset:(NSUInteger)offset
@@ -6031,7 +6038,7 @@ RGFX_LOG_UNRECOGNIZED
 	(void)offset;
 	(void)comparison;
 	(void)referenceValue;
-	RGFX_UNSUPPORTED("GPU-side loops (none on the wire)");
+	RGFX_UNSUPPORTED("GPU-side loops (the host's runtime has no command predication)");
 	return NO;
 }
 // NO, as for encodeEndWhile: no conditional is ever open here.

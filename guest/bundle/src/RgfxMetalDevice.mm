@@ -2531,14 +2531,14 @@ static NSString *rgfxHostNameOf(const RgfxCaps &caps)
 - (id)newIndirectComputeCommandEncoderWithBuffer:(id<MTLBuffer>)buffer
 {
 	(void)buffer;
-	RGFX_UNSUPPORTED("indirect command encoders (none on the wire)");
+	RGFX_UNSUPPORTED("indirect command encoders (the bundle answers nil, as Metal's device does)");
 	return nil;
 }
 
 - (id)newIndirectRenderCommandEncoderWithBuffer:(id<MTLBuffer>)buffer
 {
 	(void)buffer;
-	RGFX_UNSUPPORTED("indirect command encoders (none on the wire)");
+	RGFX_UNSUPPORTED("indirect command encoders (the bundle answers nil, as Metal's device does)");
 	return nil;
 }
 

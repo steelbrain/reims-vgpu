@@ -665,8 +665,8 @@ newIndirectArgumentEncoderWithArguments: absent %absent-as-metal
 newIndirectArgumentEncoderWithLayout: unsupported argument buffers of a layout object
 newIndirectCommandBufferWithDescriptor:maxCommandCount:options: partial indirect command buffers where the host offers none (INDIRECT_COMMAND_BUFFERS)
 newIndirectCommandBufferWithDescriptor:maxCount:options: implemented
-newIndirectComputeCommandEncoderWithBuffer: unsupported indirect command encoders (none on the wire)
-newIndirectRenderCommandEncoderWithBuffer: unsupported indirect command encoders (none on the wire)
+newIndirectComputeCommandEncoderWithBuffer: unsupported indirect command encoders (the bundle answers nil, as Metal's device does)
+newIndirectRenderCommandEncoderWithBuffer: unsupported indirect command encoders (the bundle answers nil, as Metal's device does)
 newIntersectionFunctionTableWithDescriptor: unsupported ray tracing
 newLateEvalEvent unsupported late-evaluated events (none on the wire)
 newLibraryWithCIFilters:imageFilterFunctionInfo:error: implemented
@@ -687,7 +687,7 @@ newLibraryWithStitchedDescriptor:completionHandler: implemented
 newLibraryWithStitchedDescriptor:error: implemented
 newLibraryWithStitchedDescriptorSPI:error: implemented
 newLibraryWithURL:error: implemented
-newLogStateWithDescriptor:error: unsupported shader log states (none on the wire)
+newLogStateWithDescriptor:error: unsupported shader log states (none on the wire or in the host's runtime)
 newMTL4CommandQueue unsupported the Metal 4 API
 newMTL4CommandQueueWithDescriptor:error: unsupported the Metal 4 API
 newMotionEstimationPipelineWithDescriptor: absent motion estimation pipelines: of the oracles only the AMD device answers it; the M3 and Intel ones do not (measured, respondsToSelector:)
@@ -1513,13 +1513,13 @@ subdivideCounterList: implemented
 beginVirtualSubstream absent %spi-neither
 dispatchThreadsWithIndirectBuffer:indirectBufferOffset: absent %spi-neither
 enableNullBufferBinds: absent %spi-neither
-encodeEndDoWhile:offset:comparison:referenceValue: unsupported GPU-side loops (none on the wire)
+encodeEndDoWhile:offset:comparison:referenceValue: unsupported GPU-side loops (the host's runtime has no command predication)
 encodeEndIf metal NO, as encodeEndWhile answers with no loop open: no conditional is ever open here (encodeStartIf:offset:comparison:referenceValue: is unsupported)
 encodeEndWhile metal NO: Metal answers NO with no loop open, and no loop is ever open here (encodeStartWhile: is unsupported)
-encodeStartDoWhile unsupported GPU-side loops (none on the wire)
-encodeStartElse unsupported GPU-side conditionals (none on the wire)
-encodeStartIf:offset:comparison:referenceValue: unsupported GPU-side conditionals (none on the wire)
-encodeStartWhile:offset:comparison:referenceValue: unsupported  GPU-side loops (none on the wire)
+encodeStartDoWhile unsupported GPU-side loops (the host's runtime has no command predication)
+encodeStartElse unsupported GPU-side conditionals (the host's runtime has no command predication)
+encodeStartIf:offset:comparison:referenceValue: unsupported GPU-side conditionals (the host's runtime has no command predication)
+encodeStartWhile:offset:comparison:referenceValue: unsupported GPU-side loops (the host's runtime has no command predication)
 endEncodingAndRetrieveProgramAddressTable implemented
 endVirtualSubstream absent %spi-neither
 insertCompressedTextureReinterpretationFlush absent %spi-neither

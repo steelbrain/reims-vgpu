@@ -689,7 +689,8 @@ NSError *RgfxComputeProgressError(BOOL hasProgress, NSInteger progress, BOOL has
 		_textureWriteRoundingMode = ((NSInteger (*)(id, SEL))objc_msgSend)(descriptor, rounding);
 	if (_textureWriteRoundingMode != 0)
 		RgfxLogUnsupported([self class], rounding,
-		                   "a texture write rounding mode other than the default (none on the wire)");
+		                   "a texture write rounding mode other than the default (the bundle sends "
+		                   "none: the host's pipeline rounds as its default)");
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId

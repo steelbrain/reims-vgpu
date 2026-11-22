@@ -133,7 +133,7 @@ NSError *metal4Refusal()
 - (id<MTLLogState>)newLogStateWithDescriptor:(MTLLogStateDescriptor *)descriptor
                                        error:(NSError **)error
 {
-	RGFX_UNSUPPORTED_ERROR_IN(error, "shader log states (none on the wire)",
+	RGFX_UNSUPPORTED_ERROR_IN(error, "shader log states (none on the wire or in the host's runtime)",
 	                          MTLLogStateErrorDomain, MTLLogStateErrorInvalid);
 	return nil;
 }
