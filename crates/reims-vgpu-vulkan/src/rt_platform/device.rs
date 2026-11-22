@@ -72,6 +72,17 @@
 //! directory, which lowers what a warm one loads, and set the bytes it wrote beside its blob's
 //! size. The counts line carries only the codes counted above zero, so an absent code reads as 0.
 //!
+//! **Its render stages past the kernels' bound.** rt compiles a kernel whose stage weighs more
+//! than the kernels' stage bound only in the compile helper, and a render stage that heavy in the
+//! process, up to the render stages' own bound, past which it refuses the state (rt's README,
+//! "Kernels past the stage bound"). The counts line carries, as an amount, the render pipelines rt
+//! translated with a stage past the kernels' bound, the refused among them,
+//! [`RENDER_MAKES_PAST_KERNEL_BOUND_CODE`] (`Metrics::render_makes_past_kernel_bound`), and the
+//! heaviest such stage's weight, [`RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE`]
+//! (`Metrics::render_weight_past_kernel_bound_max`). The weight is a maximum since the device was
+//! made, not a total, so the counts line carries the highest over the process's devices, as an
+//! amount risen to it ([`note_highest_metrics`]), as it does the gauges' below.
+//!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
@@ -171,6 +182,16 @@ pub const RENDER_RECORDS_READ_CODE: &str = "rt-render-records-read";
 /// counts line ([`fold_metrics`]).
 pub const RENDER_RECORDS_STALE_CODE: &str = "rt-render-records-stale";
 
+/// The code of the render pipelines rt translated with a stage heavier than the kernels' stage
+/// bound, those it refused past the render stages' own bound among them
+/// (`Metrics::render_makes_past_kernel_bound`), an amount on the counts line ([`fold_metrics`]).
+pub const RENDER_MAKES_PAST_KERNEL_BOUND_CODE: &str = "rt-render-makes-past-kernel-bound";
+
+/// The code of the heaviest stage's weight among those render pipelines, the highest over the
+/// process's devices (`Metrics::render_weight_past_kernel_bound_max`, [`note_highest_metrics`]).
+pub const RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE: &str =
+    "rt-render-weight-past-kernel-bound-most";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -206,8 +227,18 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 
 /// The metrics the counts line carries ([`folded_counts`]): the over-copy metrics, then the
 /// command buffers held for room, the cache writes dropped, the cache bytes written, the
-/// translations, the translations loaded, and the render records read and stale.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 7;
+/// translations, the translations loaded, the render records read and stale, and the render
+/// pipelines made with a stage past the kernels' bound.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 8;
+
+/// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
+/// a device was made.
+const HIGHEST_METRICS: usize = 1;
+
+/// The highest of each of [`highest_metrics`]'s metrics a fold saw, in its order, over the
+/// process's devices.
+static METRICS_HIGHEST: crate::core::sync::Mutex<[u64; HIGHEST_METRICS]> =
+    crate::core::sync::Mutex::new([0; HIGHEST_METRICS]);
 
 /// The counters of the device the process made last ([`open`]), which [`fold_metrics`] reads,
 /// with what it folded so far of each of their metrics, in [`folded_counts`]'s order.
@@ -217,19 +248,37 @@ type Folding = Option<(rt::Counters, [u64; FOLDED_METRICS])>;
 static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::new(None);
 
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
-/// device, its command buffers held for room, its cache writes and its translations rose by since
-/// the last fold ([`folded_counts`]), so the counts line carries their totals, then looks at its
-/// gauges ([`note_gauges`]) (the module's docs). Nothing before the device is made.
+/// device, its command buffers held for room, its cache writes, its translations and its render
+/// makes past the kernels' bound rose by since the last fold ([`folded_counts`]), so the counts
+/// line carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
+/// ([`note_gauges`]) at their highest (the module's docs). Nothing before the device is made.
 pub fn fold_metrics() {
-    let gauges = {
+    let (metrics, gauges) = {
         let mut latest = COUNTERS.lock();
         let Some((counters, folded)) = latest.as_mut() else {
             return;
         };
-        fold(folded, folded_counts(&counters.metrics()));
-        counters.gauges()
+        let metrics = counters.metrics();
+        fold(folded, folded_counts(&metrics));
+        (metrics, counters.gauges())
     };
+    note_highest_metrics(&metrics);
     note_gauges(&gauges);
+}
+
+/// Looks at `m`, the metrics of the process's device now: counts each of [`highest_metrics`]'s by
+/// its rise over the highest a fold saw before, so that the counts line carries the highest (the
+/// module's docs).
+fn note_highest_metrics(m: &rt::Metrics) {
+    raise_to(&mut METRICS_HIGHEST.lock(), highest_metrics(m));
+}
+
+/// The metrics of `m` the counts line carries at their highest, each with its code: the heaviest
+/// stage's weight of the render makes past the kernels' bound
+/// ([`RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE`]).
+fn highest_metrics(m: &rt::Metrics) -> [(&'static str, u64); HIGHEST_METRICS] {
+    let weight = m.render_weight_past_kernel_bound_max;
+    [(RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE, weight)]
 }
 
 /// Looks at `g`, the gauges of the process's device now: counts each of [`highest_gauges`]'s by
@@ -254,9 +303,9 @@ fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
     ]
 }
 
-/// Counts the rise of each gauge of `now` over its highest in `highest` under its code, where it
-/// is higher, and keeps it as the highest.
-fn raise_to(highest: &mut [u64; HIGHEST_GAUGES], now: [(&'static str, u64); HIGHEST_GAUGES]) {
+/// Counts the rise of each gauge or maximum of `now` over its highest in `highest` under its
+/// code, where it is higher, and keeps it as the highest.
+fn raise_to<const N: usize>(highest: &mut [u64; N], now: [(&'static str, u64); N]) {
     for ((code, now), most) in now.into_iter().zip(highest.iter_mut()) {
         if now > *most {
             crate::answer::count_kind_by(code, now - *most);
@@ -266,13 +315,15 @@ fn raise_to(highest: &mut [u64; HIGHEST_GAUGES], now: [(&'static str, u64); HIGH
 }
 
 /// Makes `counters`, those of a device just made, the ones [`fold_metrics`] reads. What the
-/// device before it rose by since the last fold is folded first, and its gauges looked at
-/// ([`note_gauges`]), so that the counts line keeps its totals after a let-go
-/// (`RtPlatform::let_go_of_device`) and adds the new device's.
+/// device before it rose by since the last fold is folded first, and its maxima and gauges looked
+/// at ([`note_highest_metrics`], [`note_gauges`]), so that the counts line keeps its totals after
+/// a let-go (`RtPlatform::let_go_of_device`) and adds the new device's.
 fn follow(counters: rt::Counters) {
     let mut latest = COUNTERS.lock();
     if let Some((before, folded)) = latest.as_mut() {
-        fold(folded, folded_counts(&before.metrics()));
+        let metrics = before.metrics();
+        fold(folded, folded_counts(&metrics));
+        note_highest_metrics(&metrics);
         note_gauges(&before.gauges());
     }
     *latest = Some((counters, [0; FOLDED_METRICS]));
@@ -282,8 +333,9 @@ fn follow(counters: rt::Counters) {
 /// ([`over_copy_counts`]), then the command buffers held for room ([`HELD_FOR_ROOM_CODE`]), the
 /// cache writes dropped ([`CACHE_WRITES_DROPPED_CODE`]), the cache bytes written
 /// ([`CACHE_BYTES_WRITTEN_CODE`]), the translations ([`TRANSLATIONS_CODE`]), the translations
-/// loaded ([`TRANSLATIONS_LOADED_CODE`]), and the render records read
-/// ([`RENDER_RECORDS_READ_CODE`]) and stale ([`RENDER_RECORDS_STALE_CODE`]).
+/// loaded ([`TRANSLATIONS_LOADED_CODE`]), the render records read ([`RENDER_RECORDS_READ_CODE`])
+/// and stale ([`RENDER_RECORDS_STALE_CODE`]), and the render pipelines made with a stage past the
+/// kernels' bound ([`RENDER_MAKES_PAST_KERNEL_BOUND_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -294,6 +346,10 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (TRANSLATIONS_LOADED_CODE, m.translations_loaded),
         (RENDER_RECORDS_READ_CODE, m.render_records_read),
         (RENDER_RECORDS_STALE_CODE, m.render_records_stale),
+        (
+            RENDER_MAKES_PAST_KERNEL_BOUND_CODE,
+            m.render_makes_past_kernel_bound,
+        ),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -1770,7 +1826,8 @@ mod tests {
     /// counts line carries the metrics' totals: the over-copies and their bytes, those over an
     /// imported block, and each cause's, by the cause's name; and after them the command buffers
     /// held for room, the cache writes dropped, the cache bytes written, the translations, the
-    /// translations loaded, and the render records read and stale.
+    /// translations loaded, the render records read and stale, and the render pipelines made with
+    /// a stage past the kernels' bound.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -1791,6 +1848,7 @@ mod tests {
             TRANSLATIONS_LOADED_CODE,
             RENDER_RECORDS_READ_CODE,
             RENDER_RECORDS_STALE_CODE,
+            RENDER_MAKES_PAST_KERNEL_BOUND_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -1811,6 +1869,7 @@ mod tests {
         m.cache_bytes_written = 65_536;
         m.translations = 7;
         m.render_records_read = 2;
+        m.render_makes_past_kernel_bound = 1;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -1824,6 +1883,7 @@ mod tests {
         m.translations_loaded = 4;
         m.render_records_read = 3;
         m.render_records_stale = 1;
+        m.render_makes_past_kernel_bound = 2;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -1831,7 +1891,7 @@ mod tests {
         assert_eq!(
             rose,
             [
-                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 3, 1
+                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 3, 1, 2
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
@@ -1880,6 +1940,33 @@ mod tests {
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
         assert_eq!(rose, highest);
+    }
+
+    /// The heaviest render stage past the kernels' bound goes to the counts at its highest
+    /// ([`note_highest_metrics`]), as the gauges do: rt's maximum since a device was made, so a
+    /// second device's smaller maximum leaves the count as it was and a larger one raises it to
+    /// itself, never by the sum.
+    #[test]
+    fn the_heaviest_render_stage_past_the_bound_counts_at_its_highest() {
+        let count = || {
+            let all = crate::answer::degradation_counts();
+            (all.iter())
+                .find(|(c, _)| *c == RENDER_WEIGHT_PAST_KERNEL_BOUND_MOST_CODE)
+                .map_or(0, |&(_, n)| n)
+        };
+        let before = count();
+        let mut highest = [0; HIGHEST_METRICS];
+        let mut first = rt::Metrics::default();
+        first.render_weight_past_kernel_bound_max = 52_000;
+        raise_to(&mut highest, highest_metrics(&first));
+        raise_to(&mut highest, highest_metrics(&first));
+        let mut second = rt::Metrics::default();
+        second.render_weight_past_kernel_bound_max = 41_000;
+        raise_to(&mut highest, highest_metrics(&second));
+        second.render_weight_past_kernel_bound_max = 61_500;
+        raise_to(&mut highest, highest_metrics(&second));
+        assert_eq!(highest, [61_500]);
+        assert_eq!(count() - before, 61_500);
     }
 
     /// The counts read the device the process made last ([`follow`]), on the GPU the test holds:

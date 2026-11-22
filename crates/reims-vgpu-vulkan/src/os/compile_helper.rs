@@ -1,16 +1,19 @@
 //! Pipeline compiles in a helper process: the library's side of starting one, capping it and
 //! ending it.
 //!
-//! rt refuses, in the VM's process, a pipeline whose stage weighs past its stage bound and whose
-//! compile is not in its store yet, and its refusal carries an opaque request. The library then
-//! starts the helper, a process that opens a runtime device of its own on the same card and
-//! compiles the stage, and hands the compile's cache back to rt in the VM's process, which keeps it
-//! in its store for the VM's later creates. The helper's memory and time are capped ([`Limits`]),
-//! its memory at most at the ceiling, [`Limits::memory`], and lower where the host's room at its
-//! seat is less ([`seat_cap`]). Past the ceiling or its time cap it is killed, and the caller
-//! records the breach with rt, so later creates refuse without starting a helper again. Past a
-//! cap the room set below the ceiling it is killed too, [`HelperEnd::OverRoom`], and nothing is
-//! recorded: the same stage fits on a host with room.
+//! rt refuses, in the VM's process, a compute pipeline whose kernel weighs past the kernels' stage
+//! bound and whose compile is not in its store yet, and its refusal carries an opaque request (a
+//! render stage compiles in the process up to the render stages' own bound, and is refused past it,
+//! as no helper compiles one: the counts line (`crate::rt_platform::device`) carries the render
+//! makes past the kernels' bound). The library then starts the helper, a process that opens a
+//! runtime device of its own on the same card and compiles the stage, and hands the compile's cache
+//! back to rt in the VM's process, which keeps it in its store for the VM's later creates. The
+//! helper's memory and time are capped ([`Limits`]), its memory at most at the ceiling,
+//! [`Limits::memory`], and lower where the host's room at its seat is less ([`seat_cap`]). Past the
+//! ceiling or its time cap it is killed, and the caller records the breach with rt, so later
+//! creates refuse without starting a helper again. Past a cap the room set below the ceiling it is
+//! killed too, [`HelperEnd::OverRoom`], and nothing is recorded: the same stage fits on a host with
+//! room.
 //!
 //! **Side by side, as the host's memory allows.** The host's helpers share its seats ([`Seats`]),
 //! one lock file per logical CPU of the host ([`host_cpus`]) that all its processes share
