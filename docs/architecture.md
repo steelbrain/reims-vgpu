@@ -962,7 +962,10 @@ The source is rt's blocks (`pool::RtBlocks`, the platform's `ApiPlatform::block_
 to its device while handed out; where a platform gives none (the testkit's), it is `HostBlocks`, the
 process's own memory, in the same shape (`take_block`, `release_block`). A piece the pool asks for
 itself is one of metal2vulkan-runtime's units, 16 MiB (`BLOCK_LEN`, read from rt), and a take longer
-than a unit has a piece of its own length. The pool keeps 64 MiB of empty pieces as headroom
+than a unit has a piece of its own length. A piece's length is its block's, the source's rounding of
+the length asked (rt's 64 KiB, or the GPU's `bufferImageGranularity` where larger; `HostBlocks`'
+unit, or 2 MiB past one), and need not be whole 2 MiB: pieces start 2 MiB-aligned (`PIECE_ALIGN`),
+and carves stay on 64 KiB. The pool keeps 64 MiB of empty pieces as headroom
 (`HEADROOM`), from the guest driver's take of `POOL` on (`Host::pool_taken`), so the guest's first
 takes find them, and gives a piece above them that stays empty past `RELEASE_DELAY` back to the
 source, which keeps it ready or frees it. Before a block goes back the pool takes its piece out of

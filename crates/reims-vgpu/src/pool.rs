@@ -11,14 +11,15 @@
 //! own length on its context's worker (`takes`), so only that take waits for the source's
 //! allocation. The pool's thread, `reims-vgpu.graphics-pool`, places each block taken, the takes'
 //! before the taker's, at the lowest free address of the range that holds it, 2 MiB aligned, so
-//! pieces go out in ascending addresses, carves a take's block for it at its piece's first byte,
-//! and asks the host to map it there ([`PoolHost::add`]) with no lock of the pool's held: it waits
-//! for no source, so neither another context's take nor the headroom waits behind a take's
-//! allocation, nor a take behind the headroom's. The host maps it (QEMU: a RAM region of its own
-//! over the block, added on its main loop) and says so ([`Pool::added`], the C API's "range
-//! added"); only then does [`Pool::find`] find it. A block the source hands out again after the
-//! pool gave it back is placed and mapped anew, as any block is: its piece went before it went
-//! back.
+//! pieces go out in ascending addresses, each its block's length, the source's rounding of the
+//! length asked, which need not be whole 2 MiB ([`PIECE_ALIGN`]), carves a take's block for it at
+//! its piece's first byte, and asks the host to map it there ([`PoolHost::add`]) with no lock of
+//! the pool's held: it waits for no source, so neither another context's take nor the headroom
+//! waits behind a take's allocation, nor a take behind the headroom's. The host maps it (QEMU: a
+//! RAM region of its own over the block, added on its main loop) and says so ([`Pool::added`], the
+//! C API's "range added"); only then does [`Pool::find`] find it. A block the source hands out
+//! again after the pool gave it back is placed and mapped anew, as any block is: its piece went
+//! before it went back.
 //!
 //! # Headroom and giving blocks back
 //!
@@ -204,7 +205,7 @@ pub const TAKE_WAIT_CODES: [(&str, &str); 4] = [
 /// for the whole of an allocation's or a free's call, longer the longer it is (rt's
 /// `ALLOCATION_LEN`: on an RTX 3090 a 16 MiB Shared allocation held one for 3.3 ms at the median,
 /// one of 256 MiB for 51 ms, **measured**). So a piece is one unit, and a take longer than a piece
-/// has a piece of its own length, its allocation made in its growth.
+/// has a piece of its own length, rounded up to 64 KiB, its allocation made in its growth.
 ///
 /// On a Radeon 780M a growth of 256 MiB (rt's take, the host's add and its populate) took at
 /// most 10.5, 2.3 and 76.0 ms, and a boot with a desktop, a browser, video and two 3D benchmarks
@@ -221,8 +222,11 @@ pub const BLOCK_LEN: u64 = metal2vulkan_runtime::MemoryClass::Shared.block_len()
 /// no take waited on a growth, with one 64 MiB piece kept (**measured**, 11-19).
 pub const HEADROOM: u64 = 64 << 20;
 
-/// The alignment of a piece's guest physical address and of a pool's range: 2 MiB, a large page
-/// of the guest's and of the hypervisors' second-level tables.
+/// The alignment of a piece's guest physical address and of a pool's range: 2 MiB, a large page of
+/// the guest's and of the hypervisors' second-level tables. A piece's length need not be a multiple
+/// of it: it is its block's, the length asked rounded up to the source's granule (rt's 64 KiB, or
+/// the GPU's `bufferImageGranularity` where that is larger; [`HostBlocks`]' unit, or 2 MiB past
+/// one), and the next piece starts at the first multiple of it past the piece ([`first_fit`]).
 pub const PIECE_ALIGN: u64 = 2 << 20;
 
 /// How long a piece stays empty, with a lower piece empty too, before its block goes back to the
@@ -1253,11 +1257,13 @@ impl Shared {
         (None, next)
     }
 
-    /// Places `block` at the lowest free address that holds it and asks the host to map it, with
-    /// the lock `st` holds let go of for the add. Where `take` still waits on it, the take is
-    /// carved at the piece's first byte, and learns where it went before the add, so its worker
-    /// zeroes the carve while the host maps the piece (`takes`). No piece comes of it, and it goes
-    /// back, where the range is full or the block is not whole host pages ([`UNALIGNED_CODE`]).
+    /// Places `block` at the lowest free address that holds it, a multiple of [`PIECE_ALIGN`], as a
+    /// piece of `block`'s length, whatever multiple of its source's granule that is, and asks the
+    /// host to map it, with the lock `st` holds let go of for the add. Where `take` still waits on
+    /// it, the take is carved at the piece's first byte, and learns where it went before the add,
+    /// so its worker zeroes the carve while the host maps the piece (`takes`). No piece comes of
+    /// it, and it goes back, where the range is full or the block is not whole host pages
+    /// ([`UNALIGNED_CODE`]).
     fn place(
         self: &Arc<Self>,
         st: &mut MutexGuard<'_, State>,

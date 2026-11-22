@@ -1951,3 +1951,62 @@ fn a_block_off_the_host_s_pages_goes_back_unmapped() {
         assert!(host.calls().is_empty());
     }
 }
+
+/// A source whose blocks are the length asked rounded up to 64 KiB, as rt's are: [`HostBlocks`]'
+/// blocks, each handed out at that length, with the lengths asked.
+struct Granular {
+    blocks: HostBlocks,
+    asked: Mutex<Vec<u64>>,
+}
+
+impl BlockSource for Granular {
+    fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
+        self.asked.lock().push(len);
+        let mut block = self.blocks.take_block(class, len)?;
+        block.len = (len.checked_next_multiple_of(TAKE_ALIGN)).ok_or(BlockError::Length)?;
+        Ok(block)
+    }
+
+    fn release_block(&self, block: BlockId) -> Result<(), BlockError> {
+        self.blocks.release_block(block)
+    }
+}
+
+/// On a source whose blocks are the length asked rounded up to 64 KiB, as rt's are, a piece is its
+/// block's length, which need not be whole 2 MiB, as the host's `pool_add` is told: the host's
+/// grows of a byte and of a unit and a byte, and a take that fits no piece, each have a piece of
+/// their length on 64 KiB, each starting at the first 2 MiB boundary past the piece before, and
+/// takes are carved on 64 KiB, at the first byte of the take's own piece and in a piece of 64 KiB
+#[test]
+fn a_piece_is_its_block_s_length_on_a_source_of_64_kib_blocks() {
+    let host = Arc::new(Host::default());
+    let source = Arc::new(Granular {
+        blocks: HostBlocks::new(),
+        asked: Mutex::default(),
+    });
+    let given: Arc<dyn BlockSource> = Arc::clone(&source) as _;
+    let pool = Pool::with_delay(range(64), host.pool_host(), LONG, now(), given).unwrap();
+    pool.grow(1);
+    pool.grow(BLOCK_LEN + 1);
+    let grown = BLOCK_LEN + TAKE_ALIGN;
+    assert_eq!(
+        host.wait_for(2),
+        [
+            Call::Add(BASE, TAKE_ALIGN),
+            Call::Add(BASE + 2 * MIB, grown),
+        ]
+    );
+    pool.added(BASE).unwrap();
+    pool.added(BASE + 2 * MIB).unwrap();
+    let ledger = pool.ledger();
+    let long = 2 * BLOCK_LEN + TAKE_ALIGN;
+    let rx = take(&ledger, 1, long);
+    // The first 2 MiB boundary past the second piece's end.
+    let at = BASE + 2 * MIB + BLOCK_LEN + 2 * MIB;
+    assert_eq!(host.wait_for(3)[2], Call::Add(at, long));
+    pool.added(at).unwrap();
+    assert_eq!(answer(&rx), Some((at - BASE, long)));
+    assert_eq!(answer(&take(&ledger, 2, TAKE_ALIGN)), Some((0, TAKE_ALIGN)));
+    // The headroom's asks, of a unit each, follow the take's.
+    assert_eq!(source.asked.lock()[..3], [1, BLOCK_LEN + 1, long]);
+}

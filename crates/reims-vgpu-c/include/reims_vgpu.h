@@ -332,7 +332,10 @@ typedef void (*RvgCursorMoveAtFn)(void *ctx, uint32_t display);
 // address space has it (QEMU: a RAM region over the memory, added on its main loop, unmergeable
 // with its neighbours). The memory stays mapped, and the device asks no other piece over its
 // addresses, until the host has said the piece is removed (rvg_graphics_device_pool_removed).
-// `physical_address`, `host_address` and `length` are multiples of 2 MiB, 4 KiB and 2 MiB.
+// `physical_address`, `host_address` and `length` are multiples of 2 MiB, 4 KiB and 64 KiB: a
+// piece's length is its block's, the length the device asked for rounded up to 64 KiB (or to the
+// GPU's `bufferImageGranularity` where that is larger), so a piece can end short of a 2 MiB
+// boundary, and the next piece starts at the first 2 MiB boundary past it.
 //
 // Thread: the device's pool thread (`reims-vgpu.graphics-pool`), never inside a call of the
 // host's, with no lock of the library's held. It must not wait for a lock the host holds while
