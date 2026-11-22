@@ -441,7 +441,11 @@ mod tests {
                 "{handle:?}: no memory before its first use"
             );
             assert_eq!(buffer.gpu_address(), 0);
-            assert_eq!(buffer.fault_address(), None, "{handle:?}: no address unmade");
+            assert_eq!(
+                buffer.fault_address(),
+                None,
+                "{handle:?}: no address unmade"
+            );
             assert_eq!(
                 counted(EXPORT_REFUSED_CODE),
                 refusals,
