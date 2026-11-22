@@ -1214,9 +1214,20 @@ mod tests {
         assert_eq!(live.buffer_made_bytes, 2 * page, "the fill made it");
         assert_eq!(live.cache_bytes, 2 * page + shape);
         let largest = live.largest[0];
-        assert_eq!((largest.held, largest.buffer_made_bytes), (2 * page + shape, 2 * page));
-        let once = (live.once_fill_bytes, live.once_download_bytes, live.once_other_bytes);
-        assert_eq!(once, (2 * page, 0, 0), "copied through once, made by its fill");
+        assert_eq!(
+            (largest.held, largest.buffer_made_bytes),
+            (2 * page + shape, 2 * page)
+        );
+        let once = (
+            live.once_fill_bytes,
+            live.once_download_bytes,
+            live.once_other_bytes,
+        );
+        assert_eq!(
+            once,
+            (2 * page, 0, 0),
+            "copied through once, made by its fill"
+        );
         assert_eq!(r.dec.caches().counts().held_most, 2 * page + shape);
 
         use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 3, false)]);
@@ -1246,10 +1257,18 @@ mod tests {
         let downloaded = download(&r, BLOCK);
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(downloaded.load(Ordering::SeqCst));
-        assert_eq!(written_back(&r.p.call_log().since(mark)).len(), 1, "its write");
+        assert_eq!(
+            written_back(&r.p.call_log().since(mark)).len(),
+            1,
+            "its write"
+        );
         let live = r.dec.caches().live();
         assert_eq!(live.buffer_made_bytes, 2 * page);
-        let once = (live.once_fill_bytes, live.once_download_bytes, live.once_other_bytes);
+        let once = (
+            live.once_fill_bytes,
+            live.once_download_bytes,
+            live.once_other_bytes,
+        );
         assert_eq!(once, (0, 2 * page, 0), "the download's");
 
         let mut r = shaped();
@@ -1258,7 +1277,11 @@ mod tests {
         r.p.world().complete_all(CompleteOn::Caller);
         let live = r.dec.caches().live();
         assert_eq!(live.buffer_made_bytes, 2 * r.page);
-        let once = (live.once_fill_bytes, live.once_download_bytes, live.once_other_bytes);
+        let once = (
+            live.once_fill_bytes,
+            live.once_download_bytes,
+            live.once_other_bytes,
+        );
         assert_eq!(once, (0, 0, 0), "named by the guest's blit");
     }
 

@@ -7289,7 +7289,7 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The entry of the buffer `id` names, and the buffer, neither noted nor its memory made
     /// ([`Self::require_buffer`] does both); an exec fault when `id` is 0 or names no buffer.
-    pub(super) fn buffer_entry(&self, id: u64) -> RaiseResult<(&Entry<P>, &P::Buffer)> {
+    fn buffer_entry(&self, id: u64) -> RaiseResult<(&Entry<P>, &P::Buffer)> {
         match self.entry(id) {
             Some(
                 entry @ Entry {
@@ -7310,12 +7310,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// cache's module doc, "Deferred memory"): where the platform refuses it, the raise is
     /// [`refused::out_of_memory`]'s, which drops the op, and the command buffer fails
     /// ([`Self::out_of_memory`]).
-    pub(super) fn cache_memory(
-        &self,
-        id: u64,
-        entry: &Entry<P>,
-        buffer: &P::Buffer,
-    ) -> RaiseResult<()> {
+    fn cache_memory(&self, id: u64, entry: &Entry<P>, buffer: &P::Buffer) -> RaiseResult<()> {
         if !entry.over_cache || self.surface_caches.memory_of(buffer) {
             return Ok(());
         }

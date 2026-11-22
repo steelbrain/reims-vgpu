@@ -1444,8 +1444,16 @@ mod drawn_tests {
             drop((luma, chroma));
             let calls = r.p.call_log().since(mark);
             let made = calls.iter().filter(|c| c.sel == MAKE_MEMORY).count();
-            assert_eq!(made, usize::from(!whole), "whole {whole}: the buffer's memory");
-            let memory = r.dec.caches().buffer(BLOCK).is_some_and(|b| b.memory_made());
+            assert_eq!(
+                made,
+                usize::from(!whole),
+                "whole {whole}: the buffer's memory"
+            );
+            let memory = r
+                .dec
+                .caches()
+                .buffer(BLOCK)
+                .is_some_and(|b| b.memory_made());
             assert_eq!(memory, !whole, "whole {whole}: made");
         }
     }

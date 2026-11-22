@@ -5515,9 +5515,11 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(());
         };
         // The buffer's memory first, as for every copy through it ("Deferred memory").
-        let Some(cb) = transfer.queue.command_buffer(ON)?.filter(|_| {
-            cache.pages.is_some() && cache.copy_through(MemoryFor::WriteBack)
-        }) else {
+        let Some(cb) = transfer
+            .queue
+            .command_buffer(ON)?
+            .filter(|_| cache.pages.is_some() && cache.copy_through(MemoryFor::WriteBack))
+        else {
             done();
             return Ok(());
         };
@@ -7473,7 +7475,9 @@ impl<P: Platform> Caches<P> {
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
         // A written cache's copy goes through its buffer.
-        let buffer = self.lock().deferred_buffer(block, MemoryFor::Download, |c| c.written);
+        let buffer = self
+            .lock()
+            .deferred_buffer(block, MemoryFor::Download, |c| c.written);
         self.make_memory(buffer.into_iter().collect(), MemoryFor::Download);
         let mut state = self.lock();
         // The pieces a staged copy of its cache, and a recovery's refills, would make for want of
