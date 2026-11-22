@@ -1,17 +1,15 @@
 //! [`Region`]: the device's BAR 2, host memory the guest maps write-back, with the control rings
 //! at fixed offsets and the guest's allocations after them (`wire`).
 //!
-//! It is memory of the host's process: the platform's own where it gives the device some
-//! ([`Region::over`]; the Vulkan platform's, which it frees once the runtime holds no import of
-//! its pages: on Linux a shared mapping of a memfd of the library's, which every GPU imports,
-//! RADV through dma-bufs of its pages, and on macOS, or where the host gives no memfd, private
-//! memory of the library's), else memory of its own ([`Region::new`]), which its drop frees:
-//! private anonymous memory on Linux and macOS (`mmap` with `MAP_PRIVATE | MAP_ANONYMOUS`,
-//! `region/unix.rs`), committed private memory on Windows (`VirtualAlloc`, `region/windows.rs`).
-//! Either is handed out zeroed and takes a physical page only when something first touches it, so
-//! a page neither the guest nor the host has used costs no host memory; a GPU import that pins the
-//! region commits what it pins. The host maps it into the guest once, at the device's start, and it stays mapped, at the
-//! same address, until the device's end.
+//! It is memory of the host's process, the region's own ([`Region::new`], which the graphics
+//! device makes at its start), which its drop frees: private anonymous memory on Linux and macOS
+//! (`mmap` with `MAP_PRIVATE | MAP_ANONYMOUS`, `region/unix.rs`), committed private memory on
+//! Windows (`VirtualAlloc`, `region/windows.rs`). [`Region::over`] takes memory a caller gives
+//! instead, which its holder frees; no device gives the region memory, and only the tests call
+//! it. Either is handed out zeroed and takes a physical page only when something first touches
+//! it, so a page neither the guest nor the host has used costs no host memory; a GPU import that
+//! pins the region commits what it pins. The host maps it into the guest once, at the device's
+//! start, and it stays mapped, at the same address, until the device's end.
 //!
 //! **Guest writes.** The guest writes the region while the host reads it. The host reads the
 //! rings' counters and flags with atomic loads and stores at their offsets, and copies out what a
@@ -51,7 +49,7 @@ pub struct Region {
     len: usize,
     /// The blocks the processes hold, by offset.
     blocks: Mutex<BTreeMap<u64, Held>>,
-    /// What holds the memory where the platform gave it ([`Region::over`]), which frees it as it
+    /// What holds the memory where a caller gave it ([`Region::over`]), which frees it as it
     /// drops; `None` for the region's own mapping ([`Region::new`]), which its drop unmaps.
     memory: Option<Box<dyn Send + Sync>>,
 }
