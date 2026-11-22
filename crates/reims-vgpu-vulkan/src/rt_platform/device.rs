@@ -70,7 +70,13 @@
 //! (`Metrics::render_records_stale`), and the most bytes of the device's pipeline cache blob,
 //! [`PIPELINE_CACHE_MOST_CODE`] (below), so that a boot's reader can tell a boot on a cold
 //! directory, which lowers what a warm one loads, and set the bytes it wrote beside its blob's
-//! size. The counts line carries only the codes counted above zero, so an absent code reads as 0.
+//! size. Beside the translations it carries the two sides of the pipelines' makes, as amounts: the
+//! nanoseconds rt's calls into the translator took, [`TRANSLATION_NS_CODE`]
+//! (`Metrics::translation_nanos`), and the `VkPipeline`s rt made, [`PIPELINES_CREATED_CODE`]
+//! (`Metrics::pipelines_created`), with the nanoseconds the driver's calls that made them took,
+//! [`PIPELINE_CREATION_NS_CODE`] (`Metrics::pipeline_creation_nanos`). Calls on several threads at
+//! once each count their own time, so where they overlap the nanoseconds pass the time that went
+//! by. The counts line carries only the codes counted above zero, so an absent code reads as 0.
 //!
 //! **Its render stages past the kernels' bound.** rt compiles a kernel whose stage weighs more
 //! than the kernels' stage bound only in the compile helper, and a render stage that heavy in the
@@ -181,6 +187,19 @@ pub const TRANSLATIONS_CODE: &str = "rt-translations";
 /// lowering (`Metrics::translations_loaded`), an amount on the counts line ([`fold_metrics`]).
 pub const TRANSLATIONS_LOADED_CODE: &str = "rt-translations-loaded";
 
+/// The code of the nanoseconds rt's calls into the translator took, those refused among them
+/// (`Metrics::translation_nanos`), an amount on the counts line ([`fold_metrics`]).
+pub const TRANSLATION_NS_CODE: &str = "rt-translation-ns";
+
+/// The code of the `VkPipeline`s rt made (`Metrics::pipelines_created`), an amount on the counts
+/// line ([`fold_metrics`]).
+pub const PIPELINES_CREATED_CODE: &str = "rt-pipelines-created";
+
+/// The code of the nanoseconds the driver's `vkCreate*Pipelines` calls took, those that failed
+/// among them (`Metrics::pipeline_creation_nanos`), an amount on the counts line
+/// ([`fold_metrics`]).
+pub const PIPELINE_CREATION_NS_CODE: &str = "rt-pipeline-creation-ns";
+
 /// The code of the render contents' records pipeline states read from rt's cache directory, each
 /// naming the lowerings of the content's stages, which count among the translations loaded
 /// (`Metrics::render_records_read`), an amount on the counts line ([`fold_metrics`]).
@@ -248,10 +267,11 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 
 /// The metrics the counts line carries ([`folded_counts`]): the over-copy metrics, then the
 /// command buffers held for room, the cache writes dropped, the cache bytes written, the
-/// translations, the translations loaded, the render records read and stale, the render
+/// translations, the translations loaded, the translator's nanoseconds, the `VkPipeline`s made
+/// and the driver's nanoseconds making them, the render records read and stale, the render
 /// pipelines made with a stage past the kernels' bound, and the compute dispatches' first-use
 /// waits and their nanoseconds.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 10;
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 13;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -270,11 +290,11 @@ type Folding = Option<(rt::Counters, [u64; FOLDED_METRICS])>;
 static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::new(None);
 
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
-/// device, its command buffers held for room, its cache writes, its translations, its render
-/// makes past the kernels' bound and its compute dispatches' first-use waits rose by since the
-/// last fold ([`folded_counts`]), so the counts line carries their totals, then its maxima
-/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
-/// docs). Nothing before the device is made.
+/// device, its command buffers held for room, its cache writes, its translations, its pipelines'
+/// makes and their time, its render makes past the kernels' bound and its compute dispatches'
+/// first-use waits rose by since the last fold ([`folded_counts`]), so the counts line carries
+/// their totals, then its maxima ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at
+/// their highest (the module's docs). Nothing before the device is made.
 pub fn fold_metrics() {
     let (metrics, gauges) = {
         let mut latest = COUNTERS.lock();
@@ -361,7 +381,9 @@ fn follow(counters: rt::Counters) {
 /// ([`over_copy_counts`]), then the command buffers held for room ([`HELD_FOR_ROOM_CODE`]), the
 /// cache writes dropped ([`CACHE_WRITES_DROPPED_CODE`]), the cache bytes written
 /// ([`CACHE_BYTES_WRITTEN_CODE`]), the translations ([`TRANSLATIONS_CODE`]), the translations
-/// loaded ([`TRANSLATIONS_LOADED_CODE`]), the render records read ([`RENDER_RECORDS_READ_CODE`])
+/// loaded ([`TRANSLATIONS_LOADED_CODE`]), the translator's nanoseconds ([`TRANSLATION_NS_CODE`]),
+/// the `VkPipeline`s made ([`PIPELINES_CREATED_CODE`]) and the driver's nanoseconds making them
+/// ([`PIPELINE_CREATION_NS_CODE`]), the render records read ([`RENDER_RECORDS_READ_CODE`])
 /// and stale ([`RENDER_RECORDS_STALE_CODE`]), the render pipelines made with a stage past the
 /// kernels' bound ([`RENDER_MAKES_PAST_KERNEL_BOUND_CODE`]), and the compute dispatches'
 /// first-use waits ([`FIRST_USE_WAITS_CODE`]) and their nanoseconds
@@ -374,6 +396,9 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (CACHE_BYTES_WRITTEN_CODE, m.cache_bytes_written),
         (TRANSLATIONS_CODE, m.translations),
         (TRANSLATIONS_LOADED_CODE, m.translations_loaded),
+        (TRANSLATION_NS_CODE, m.translation_nanos),
+        (PIPELINES_CREATED_CODE, m.pipelines_created),
+        (PIPELINE_CREATION_NS_CODE, m.pipeline_creation_nanos),
         (RENDER_RECORDS_READ_CODE, m.render_records_read),
         (RENDER_RECORDS_STALE_CODE, m.render_records_stale),
         (
@@ -1865,8 +1890,9 @@ mod tests {
     /// counts line carries the metrics' totals: the over-copies and their bytes, those over an
     /// imported block, and each cause's, by the cause's name; and after them the command buffers
     /// held for room, the cache writes dropped, the cache bytes written, the translations, the
-    /// translations loaded, the render records read and stale, the render pipelines made with a
-    /// stage past the kernels' bound, and the compute dispatches' first-use waits and their
+    /// translations loaded, the translator's nanoseconds, the `VkPipeline`s made and the driver's
+    /// nanoseconds making them, the render records read and stale, the render pipelines made with
+    /// a stage past the kernels' bound, and the compute dispatches' first-use waits and their
     /// nanoseconds.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
@@ -1886,6 +1912,9 @@ mod tests {
             CACHE_BYTES_WRITTEN_CODE,
             TRANSLATIONS_CODE,
             TRANSLATIONS_LOADED_CODE,
+            TRANSLATION_NS_CODE,
+            PIPELINES_CREATED_CODE,
+            PIPELINE_CREATION_NS_CODE,
             RENDER_RECORDS_READ_CODE,
             RENDER_RECORDS_STALE_CODE,
             RENDER_MAKES_PAST_KERNEL_BOUND_CODE,
@@ -1910,6 +1939,9 @@ mod tests {
         m.cache_writes_dropped = 1;
         m.cache_bytes_written = 65_536;
         m.translations = 7;
+        m.translation_nanos = 3_000_000;
+        m.pipelines_created = 4;
+        m.pipeline_creation_nanos = 20_000_000;
         m.render_records_read = 2;
         m.render_makes_past_kernel_bound = 1;
         m.first_use_variant_waits = 2;
@@ -1925,6 +1957,9 @@ mod tests {
         m.cache_bytes_written = 98_304;
         m.translations = 9;
         m.translations_loaded = 4;
+        m.translation_nanos = 3_000_000 + 1_250_000;
+        m.pipelines_created = 6;
+        m.pipeline_creation_nanos = 20_000_000 + 8_500_000;
         m.render_records_read = 3;
         m.render_records_stale = 1;
         m.render_makes_past_kernel_bound = 2;
@@ -1937,7 +1972,8 @@ mod tests {
         assert_eq!(
             rose,
             [
-                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 3, 1, 2, 3, 9_000
+                3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
+                28_500_000, 3, 1, 2, 3, 9_000
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
