@@ -30,9 +30,9 @@
 //!   A picture that fails to land is logged and counted, and its value is signalled all the
 //!   same: the command buffer goes on with its output as the landing left it, as a GPU decode's
 //!   error leaves one. Where the hardware wrote the output's device caches, the caches are said
-//!   written before the signal ([`Landing::failed_in_caches`]), so the device reads what it left
+//!   written before the signal (`Landing::failed_in_caches`), so the device reads what it left
 //!   there. Where its work ran past its deadline and may still write (a stall), the landing
-//!   first waits up to [`STALL_HOLD`] for the work the backend kept to be let go, its device done
+//!   first waits up to `STALL_HOLD` for the work the backend kept to be let go, its device done
 //!   with it, and the process dies past it: no read of the caches comes before their acquire,
 //!   and none waits for them unbounded. A picture the hardware answered failed that the backend
 //!   lands all the same, as the hardware left it ([`Landing::hardware_failed`]), is logged and
