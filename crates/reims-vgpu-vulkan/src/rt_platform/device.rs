@@ -119,6 +119,16 @@
 //! boot's line says whether its pipelines met a fresh cache, and whether the blob the next boot
 //! seeds from missed a write.
 //!
+//! **Its emulated SIMD groups and its dropped makes.** rt counts the dispatches, direct and
+//! indirect, that ran a kernel's emulated-SIMD-group module, a threadgroup not whole groups of the
+//! width the kernel's own module runs, as 80 threads, or 32 on a device of 64-lane subgroups
+//! (`Metrics::emulated_simdgroup_dispatches`); and the compiled contents, compute or render, a
+//! state's make dropped because an equal one landed in the device's map of contents first, the
+//! state taking the map's (`Metrics::kernel_makes_dropped`). The counts line carries both as
+//! amounts, [`EMULATED_SIMDGROUP_DISPATCHES_CODE`] and [`KERNEL_MAKES_DROPPED_CODE`], so a boot's
+//! line says how often its kernels took the emulated SIMD-group form, and whether two makes of one
+//! content compiled it at once.
+//!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
@@ -268,6 +278,15 @@ pub const PIPELINE_CACHES_REPLACED_CODE: &str = "rt-pipeline-caches-replaced";
 /// amount on the counts line ([`fold_metrics`]).
 pub const PIPELINE_CACHE_WRITES_SKIPPED_CODE: &str = "rt-pipeline-cache-writes-skipped";
 
+/// The code of the dispatches that ran a kernel's emulated-SIMD-group module
+/// (`Metrics::emulated_simdgroup_dispatches`), an amount on the counts line ([`fold_metrics`]).
+pub const EMULATED_SIMDGROUP_DISPATCHES_CODE: &str = "rt-emulated-simdgroup-dispatches";
+
+/// The code of the compiled contents a state's make dropped because an equal one landed in the
+/// device's map of contents first (`Metrics::kernel_makes_dropped`), an amount on the counts line
+/// ([`fold_metrics`]).
+pub const KERNEL_MAKES_DROPPED_CODE: &str = "rt-kernel-makes-dropped";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -306,9 +325,10 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// translations, the translations loaded, the translator's nanoseconds, the `VkPipeline`s made
 /// and the driver's nanoseconds making them, the render records read and stale, the render
 /// pipelines made with a stage past the kernels' bound, the compute dispatches' first-use waits
-/// and their nanoseconds, the exported blocks whose address went out, and the pipeline caches
-/// replaced and the cache's writes skipped past its bound.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 16;
+/// and their nanoseconds, the exported blocks whose address went out, the pipeline caches
+/// replaced and the cache's writes skipped past its bound, the dispatches that ran an
+/// emulated-SIMD-group module, and the compiled contents a state's make dropped.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 18;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -329,8 +349,9 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
 /// device, its command buffers held for room, its cache writes, its translations, its pipelines'
 /// makes and their time, its render makes past the kernels' bound, its compute dispatches'
-/// first-use waits, its exported blocks addressed and its pipeline caches replaced and cache
-/// writes skipped past their bound rose by since the last fold
+/// first-use waits, its exported blocks addressed, its pipeline caches replaced and cache writes
+/// skipped past their bound, its emulated-SIMD-group dispatches and its dropped makes rose by
+/// since the last fold
 /// ([`folded_counts`]), so the counts line carries their totals, then its maxima
 /// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
 /// docs). Nothing before the device is made.
@@ -426,9 +447,11 @@ fn follow(counters: rt::Counters) {
 /// and stale ([`RENDER_RECORDS_STALE_CODE`]), the render pipelines made with a stage past the
 /// kernels' bound ([`RENDER_MAKES_PAST_KERNEL_BOUND_CODE`]), the compute dispatches' first-use
 /// waits ([`FIRST_USE_WAITS_CODE`]) and their nanoseconds ([`FIRST_USE_WAIT_NS_CODE`]), the
-/// exported blocks whose address went out ([`EXPORTED_BLOCKS_ADDRESSED_CODE`]), and the pipeline
+/// exported blocks whose address went out ([`EXPORTED_BLOCKS_ADDRESSED_CODE`]), the pipeline
 /// caches replaced ([`PIPELINE_CACHES_REPLACED_CODE`]) and the cache's writes skipped
-/// ([`PIPELINE_CACHE_WRITES_SKIPPED_CODE`]) past its bound.
+/// ([`PIPELINE_CACHE_WRITES_SKIPPED_CODE`]) past its bound, the dispatches that ran an
+/// emulated-SIMD-group module ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), and the compiled
+/// contents a state's make dropped ([`KERNEL_MAKES_DROPPED_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -454,6 +477,11 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
             PIPELINE_CACHE_WRITES_SKIPPED_CODE,
             m.pipeline_cache_writes_skipped,
         ),
+        (
+            EMULATED_SIMDGROUP_DISPATCHES_CODE,
+            m.emulated_simdgroup_dispatches,
+        ),
+        (KERNEL_MAKES_DROPPED_CODE, m.kernel_makes_dropped),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -1940,8 +1968,9 @@ mod tests {
     /// translations loaded, the translator's nanoseconds, the `VkPipeline`s made and the driver's
     /// nanoseconds making them, the render records read and stale, the render pipelines made with
     /// a stage past the kernels' bound, the compute dispatches' first-use waits and their
-    /// nanoseconds, the exported blocks whose address went out, and the pipeline caches replaced
-    /// and the cache's writes skipped past its bound.
+    /// nanoseconds, the exported blocks whose address went out, the pipeline caches replaced and
+    /// the cache's writes skipped past its bound, the dispatches that ran an emulated-SIMD-group
+    /// module, and the compiled contents a state's make dropped.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -1971,6 +2000,8 @@ mod tests {
             EXPORTED_BLOCKS_ADDRESSED_CODE,
             PIPELINE_CACHES_REPLACED_CODE,
             PIPELINE_CACHE_WRITES_SKIPPED_CODE,
+            EMULATED_SIMDGROUP_DISPATCHES_CODE,
+            KERNEL_MAKES_DROPPED_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -1999,6 +2030,7 @@ mod tests {
         m.first_use_variant_wait_nanos = 5_000;
         m.exported_blocks_addressed = 1;
         m.pipeline_caches_replaced = 1;
+        m.emulated_simdgroup_dispatches = 4;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -2021,6 +2053,8 @@ mod tests {
         m.exported_blocks_addressed = 2;
         m.pipeline_caches_replaced = 3;
         m.pipeline_cache_writes_skipped = 1;
+        m.emulated_simdgroup_dispatches = 11;
+        m.kernel_makes_dropped = 2;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -2029,7 +2063,7 @@ mod tests {
             rose,
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
-                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1
+                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 11, 2
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
