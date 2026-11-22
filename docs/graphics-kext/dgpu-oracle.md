@@ -2793,7 +2793,7 @@ buffers' `GPUStartTime` and `GPUEndTime` are on it: each run's calibration buffe
 m3-max-68129 ran the probe before its arm 4 and its 500 ms warm-up were added. That job's first run
 calibrated short, and its buffers ran 46.7 ms. In every other run, L1 to L3 ran 59.84 to 60.27 ms.
 
-What a queue answers, the same on both GPUs *(class 3: both x86 GPUs; the M3 did not run it)*:
+What a queue answers, the same on both GPUs and on the M3 *(class 3)*:
 - The queue is `MTLIGAccelCommandQueue` on the 630 and `GFXAAMD_MtlCmdQueue` on the 5300M, each a
   `MTLIOAccelCommandQueue`. It answers all four setters: `setGPUPriority:` and
   `setBackgroundGPUPriority:` as `c24@0:8Q16`, and their offset forms as `c28@0:8Q16S24`. Each
@@ -2806,6 +2806,10 @@ What a queue answers, the same on both GPUs *(class 3: both x86 GPUs; the M3 did
   - `setGPUPriority: 0` reads 0.
   - The offset forms set the same values (`setGPUPriority: 2 offset: 1` reads 2), and no getter
     reads an offset back.
+- The M3 Max under macOS 27.0.1 (26A434) answers the same, every setter returning 1 and every
+  readback above (m3-max-68256: the probe built for arm64 and stopped after these lines by a flag
+  not committed). Its queue is `AGXG15XFamilyCommandQueue`, an `IOGPUMetalCommandQueue`, with the
+  setters as `B24@0:8Q16` and `B28@0:8Q16S24`.
 - So the service's marks change one value: its queues' GPU priority, from 1 to 2. WindowServer's
   change its own GPU priority from 1 to 0.
 
@@ -2844,7 +2848,7 @@ every arm. How soon B runs differs *(class 2)*:
 What our stack does:
 - **The marks.** The bundle keeps each setter's value and answers it back from the getters
   (`RgfxCommandObjects.mm`). A new queue there reads GPU priority 1 and background priority 2, as
-  both Macs' do (`test_queue_priorities_read_back_as_metals`). The bundle sends the host no
+  all three Macs' do (`test_queue_priorities_read_back_as_metals`). The bundle sends the host no
   priority: a `QUEUE_CREATE` carries 0 for every queue (design.md, "Rings"). The wire's comment on
   that field, `RgfxQueueCreate.priority` in `reims_graphics_wire.h`, read "0 normal and higher
   higher", the opposite of the order the 630 keeps, where a lower GPU priority value runs first and
