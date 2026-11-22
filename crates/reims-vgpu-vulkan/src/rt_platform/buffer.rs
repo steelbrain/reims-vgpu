@@ -532,6 +532,20 @@ impl RtBuffer {
         Some(made.gpu_address())
     }
 
+    /// The exported block it lies in, by rt's number (`BlockInfo::id`), and its first byte's
+    /// offset in it, where rt made it in one: an exportable buffer, in an exported block of its
+    /// own (`super::export`), for a lost device's walk (`super::fault`), which names it where rt's
+    /// fault line names the block (`export block N`). `None` for any other, whose range
+    /// [`fault_address`](Self::fault_address) states.
+    pub(super) fn exported_block(&self) -> Option<(u32, u64)> {
+        let made = self.rt.get()?;
+        #[cfg(unix)]
+        let exported = self.exported.get().is_some();
+        #[cfg(not(unix))]
+        let exported = false;
+        exported.then(|| (made.block().get(), made.offset()))
+    }
+
     /// The blocks its device knows (`super::fault`).
     pub(super) fn device_known(&self) -> &KnownBlocks {
         self.device.known_blocks()

@@ -289,6 +289,20 @@ mod tests {
             .map_or(0, |(_, n)| n)
     }
 
+    /// An exported buffer of `length` bytes is kept by a lost device's walk by its block's number
+    /// and its offset in it, rt's, as rt's fault line names the block, with no range or block of
+    /// its own (`super::super::fault::buffer_parts`).
+    fn kept_by_its_block(buffer: &RtObj<RtBuffer>, length: u64) {
+        let made = buffer.made_rt().expect("made by rt");
+        let block = (made.block().get(), made.offset());
+        assert_eq!(buffer.exported_block(), Some(block));
+        let parts = super::super::fault::buffer_parts(3, 7, false, buffer);
+        assert!(parts.object.is_none() && parts.block.is_none());
+        let held = parts.exported.expect("the buffer kept by its exported block");
+        assert_eq!((held.block, held.offset, held.len), (block.0, block.1, length));
+        assert_eq!((held.context, held.id, held.storage), (3, 7, 2));
+    }
+
     /// Exportable buffers on the GPU the test holds, where its device exports an opaque fd: a
     /// Private buffer of the asked length at a GPU address, its byte 32 on a multiple of 256
     /// bytes of its memory where asked; each export a new fd of the dedicated allocation, which
@@ -318,6 +332,7 @@ mod tests {
         assert_eq!((buffer.length(), buffer.storage_mode()), (length, 2));
         assert_eq!(buffer.resource_options(), 0x220);
         assert_eq!(buffer.fault_address(), None);
+        kept_by_its_block(&buffer, length);
         assert_eq!(addressed() - before, 0, "no address of the block out");
         assert_ne!(buffer.gpu_address(), 0);
         assert_eq!(addressed() - before, 1, "the buffer's address read");
@@ -349,6 +364,7 @@ mod tests {
         assert!(plain.export_memory().is_err());
         assert!(plain.external_write_done().is_err());
         assert_eq!(plain.fault_address(), Some(plain.gpu_address()));
+        assert_eq!(plain.exported_block(), None);
         let shared = device.new_exportable_buffer_of_length(on, 4096, 0, None);
         assert!(shared.expect("never a raise").is_none());
         assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
@@ -383,6 +399,7 @@ mod tests {
         assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
         assert_eq!((buffer.length(), buffer.storage_mode()), (length, 2));
         assert_eq!(buffer.fault_address(), None);
+        kept_by_its_block(&buffer, length);
         assert_eq!(addressed() - before, 0, "no address of the block out");
         assert_ne!(buffer.gpu_address(), 0);
         assert_eq!(addressed() - before, 1, "the buffer's address read");

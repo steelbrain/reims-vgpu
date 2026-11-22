@@ -35,8 +35,12 @@
 //!   `FaultPlace` displays it: the ranges of rt's own that meet the bytes (its pool's
 //!   allocations, its parameter ring's blocks, imports, exports, each by its block's number
 //!   (`export block N`, rt's `BlockInfo::id`), surfaces' buffers and indirect command buffers'
-//!   preprocess regions), live or among the last it freed, and the nearest below and above. It answers another question than the host's placement above, which places among
-//!   the guest's objects and the blocks the host sees: both are written.
+//!   preprocess regions), live or among the last it freed, and the nearest below and above. It
+//!   answers another question than the host's placement above, which places among the guest's
+//!   objects and the blocks the host sees: both are written. Of each exported block the line
+//!   names, the line then names the tables' live objects that lie in it ([`ExportedObject`]),
+//!   which the host's placement cannot place, each by its offset in the block, or says that none
+//!   does: an object no table stores, the host's own, is not among them.
 //! - **What the placement saw**: the live objects of each kind, the decoders and contexts whose
 //!   tables were walked and those not walked, the live textures with no GPU range the platform
 //!   knows, the mapped blocks from each source, what the host does not see, and the released
@@ -50,7 +54,9 @@
 //!    buffer, and the `Shared` buffers over two-copy `Managed` textures' CPU copies, each removed
 //!    entry kept for an open view among them. A deferred buffer rt has not made yet has no range,
 //!    nor has a buffer in an exported block of its own (`super::export`), whose address the
-//!    placement never asks of rt (`RtBuffer::fault_address`), nor a texture over such a buffer.
+//!    placement never asks of rt (`RtBuffer::fault_address`), nor a texture over such a buffer:
+//!    the walk keeps those by their exported block's number and their offset in it
+//!    (`RtBuffer::exported_block`), for rt's placement's lines (above).
 //!    A texture rt made as an image of its own, in a heap or not, has no GPU range the platform
 //!    knows: one in a heap lies in its heap's range; any other's memory is rt's alone.
 //! 2. The blocks still mapped that the host sees ([`MappedBlock`]): rt's pool allocations
@@ -61,9 +67,10 @@
 //!
 //! What the host does not see, so an access there reads as in no mapped block: rt's parameter
 //! ring, zero source and staging region, which rt allocates beside its pool; the images rt makes
-//! with memory of their own; exports and surfaces (D3D11 planes among them, on Windows); and an
-//! import by the pages' pointer that no live object or known block lies in (one rt still holds for
-//! work in flight after its buffer went).
+//! with memory of their own; exports and surfaces (D3D11 planes among them, on Windows), by their
+//! ranges, though the tables' objects in an exported block are kept by its number for rt's lines
+//! (above); and an import by the pages' pointer that no live object or known block lies in (one rt
+//! still holds for work in flight after its buffer went).
 //!
 //! **The history of released ranges** ([`Releases`]): the device's last [`RELEASES_KEPT`]
 //! released ranges of the tables' objects, oldest first; a release past them drops the oldest,
@@ -180,6 +187,30 @@ pub struct LiveObject {
     pub storage: u64,
     /// Its first byte's GPU address.
     pub gpu_address: u64,
+    /// Its length in bytes.
+    pub len: u64,
+    /// Removed by the guest, and kept for an open view of the table that names it.
+    pub gone: bool,
+}
+
+/// A live object of a decoder's tables that lies in an exported block, whose GPU range the
+/// placement never asks of rt (`RtBuffer::fault_address`): a buffer in an exported block of its
+/// own (`super::export`), or a texture over one, as the walk at the loss found it, by the block's
+/// number, which rt's fault line names it by (`export block N`, rt's `BlockInfo::id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportedObject {
+    /// The exported block's number (rt's `BlockId::get`).
+    pub block: u32,
+    /// Its context.
+    pub context: u32,
+    /// The guest's object id.
+    pub id: u64,
+    /// What it is.
+    pub kind: ObjectKind,
+    /// Its `MTLStorageMode`.
+    pub storage: u64,
+    /// Its first byte's offset in the block.
+    pub offset: u64,
     /// Its length in bytes.
     pub len: u64,
     /// Removed by the guest, and kept for an open view of the table that names it.
@@ -364,27 +395,84 @@ fn storage_name(mode: u64) -> String {
     }
 }
 
-/// An object as the line names it.
-fn object_text(object: &LiveObject) -> String {
-    let kind = match object.kind {
+/// An object's kind as the line names it.
+fn kind_name(kind: ObjectKind) -> &'static str {
+    match kind {
         ObjectKind::Buffer => "buffer",
         ObjectKind::Texture => "texture",
         ObjectKind::Heap => "heap",
         ObjectKind::ManagedCopy => "the CPU-copy buffer of Managed texture",
-    };
-    let gone = if object.gone {
+    }
+}
+
+/// The words of an object removed by the guest and kept for an open view, where `gone`.
+fn gone_words(gone: bool) -> &'static str {
+    if gone {
         ", removed and kept for an open view"
     } else {
         ""
-    };
+    }
+}
+
+/// An object as the line names it.
+fn object_text(object: &LiveObject) -> String {
     format!(
-        "{kind} {:#x} of context {} ({}, length {:#x}, at {:#x}{gone})",
+        "{} {:#x} of context {} ({}, length {:#x}, at {:#x}{})",
+        kind_name(object.kind),
         object.id,
         object.context,
         storage_name(object.storage),
         object.len,
-        object.gpu_address
+        object.gpu_address,
+        gone_words(object.gone)
     )
+}
+
+/// An object in an exported block as the line names it, by its offset in the block.
+fn exported_text(object: &ExportedObject) -> String {
+    format!(
+        "{} {:#x} of context {} ({}, length {:#x}, at offset {:#x} in it{})",
+        kind_name(object.kind),
+        object.id,
+        object.context,
+        storage_name(object.storage),
+        object.len,
+        object.offset,
+        gone_words(object.gone)
+    )
+}
+
+/// The numbers of the exported blocks among `ranges`, ranges of rt's placement of an address
+/// (`FaultPlace`'s holders, then the nearest below and above), each once, in their order.
+fn export_blocks<'a>(ranges: impl IntoIterator<Item = &'a rt::FaultRange>) -> Vec<u32> {
+    let mut blocks = Vec::new();
+    for range in ranges {
+        if let rt::RangeKind::Export(block) = range.kind
+            && !blocks.contains(&block.get())
+        {
+            blocks.push(block.get());
+        }
+    }
+    blocks
+}
+
+/// What rt's placement's line adds of the exported blocks `blocks` it names: for each, the live
+/// objects of the tables that lie in it, of `exported`, or that none does.
+fn exports_text(blocks: &[u32], exported: &[ExportedObject]) -> String {
+    let mut text = String::new();
+    for &block in blocks {
+        let held = (exported.iter())
+            .filter(|object| object.block == block)
+            .map(exported_text)
+            .collect::<Vec<_>>();
+        let held = if held.is_empty() {
+            "no live object of the tables".to_owned()
+        } else {
+            held.join(", ")
+        };
+        text.push_str(&format!("; export block {block} holds {held}"));
+    }
+    text
 }
 
 /// A block as the line names it.
@@ -1094,6 +1182,8 @@ impl Placement<'_> {
 pub struct Walked {
     /// The live objects whose GPU range is known.
     pub objects: Vec<LiveObject>,
+    /// The live objects that lie in an exported block, whose GPU range the walk never asks.
+    pub exported: Vec<ExportedObject>,
     /// The blocks of live objects: a heap's block, the import a buffer lies in.
     pub blocks: Vec<MappedBlock>,
     /// How many contexts' tables were walked.
@@ -1102,7 +1192,7 @@ pub struct Walked {
     pub unwalked: Vec<u32>,
     /// Whether the decoder's map of its contexts was not had in time, so no table was walked.
     pub contexts_busy: bool,
-    /// The live textures with no GPU range the platform knows.
+    /// The live textures with no GPU range the platform knows, nor an exported block they lie in.
     pub unranged_textures: u64,
 }
 
@@ -1111,6 +1201,8 @@ pub struct Walked {
 pub struct Parts {
     /// The object, where its GPU range is known.
     pub object: Option<LiveObject>,
+    /// The object, where it lies in an exported block instead.
+    pub exported: Option<ExportedObject>,
     /// Its block, where it is one the host sees no other way: a heap's, or the import a buffer
     /// lies in.
     pub block: Option<MappedBlock>,
@@ -1119,11 +1211,12 @@ pub struct Parts {
 impl Walked {
     /// Adds what an object of the tables adds, `texture` where it is a texture.
     pub fn add(&mut self, parts: Parts, texture: bool) {
-        match parts.object {
-            Some(object) => self.objects.push(object),
-            None if texture => self.unranged_textures += 1,
-            None => {}
+        match (parts.object, &parts.exported) {
+            (Some(object), _) => self.objects.push(object),
+            (None, None) if texture => self.unranged_textures += 1,
+            (None, _) => {}
         }
+        self.exported.extend(parts.exported);
         self.blocks.extend(parts.block);
     }
 }
@@ -1151,12 +1244,24 @@ fn import_kind(known: &KnownBlocks, id: rt::BlockId) -> Option<&'static str> {
 }
 
 /// What a live buffer of the tables adds: its range, and the import it lies in where it lies in
-/// one (its block, which the host sees no other way). A deferred buffer rt has not made yet adds
-/// nothing.
+/// one (its block, which the host sees no other way); or, for one in an exported block of its
+/// own, the block's number and its offset in it ([`ExportedObject`]). A deferred buffer rt has
+/// not made yet adds nothing.
 pub fn buffer_parts(context: u32, id: u64, gone: bool, buffer: &RtObj<RtBuffer>) -> Parts {
+    let exported = (buffer.exported_block()).map(|(block, offset)| ExportedObject {
+        block,
+        context,
+        id,
+        kind: ObjectKind::Buffer,
+        storage: buffer.storage_mode(),
+        offset,
+        len: buffer.made_rt().map_or(0, rt::Buffer::length),
+        gone,
+    });
     let (Some(made), Some(gpu_address)) = (buffer.made_rt(), buffer.fault_address()) else {
         return Parts {
             object: None,
+            exported,
             block: None,
         };
     };
@@ -1178,6 +1283,7 @@ pub fn buffer_parts(context: u32, id: u64, gone: bool, buffer: &RtObj<RtBuffer>)
     });
     Parts {
         object: Some(object),
+        exported: None,
         block,
     }
 }
@@ -1189,17 +1295,37 @@ pub fn managed_copy_parts(context: u32, id: u64, gone: bool, buffer: &RtObj<RtBu
     if let Some(object) = &mut parts.object {
         object.kind = ObjectKind::ManagedCopy;
     }
+    if let Some(object) = &mut parts.exported {
+        object.kind = ObjectKind::ManagedCopy;
+    }
     parts
 }
 
 /// What a live texture of the tables adds: its range where it lies over a buffer (its bytes in
-/// the buffer); none for any other.
+/// the buffer); for one over a buffer in an exported block, the block's number and its bytes'
+/// offset in it ([`ExportedObject`]); none for any other.
 pub fn texture_parts(context: u32, id: u64, gone: bool, texture: &RtObj<RtTexture>) -> Parts {
-    let range = texture.over().and_then(|(buffer, bytes)| {
-        let buffer = buffer.upgrade()?;
-        let len = bytes.end.checked_sub(bytes.start)?;
-        Some((buffer.fault_address()?.checked_add(bytes.start)?, len))
-    });
+    let (mut range, mut exported) = (None, None);
+    if let Some((buffer, bytes)) = texture.over()
+        && let Some(buffer) = buffer.upgrade()
+        && let Some(len) = bytes.end.checked_sub(bytes.start)
+    {
+        range = (buffer.fault_address())
+            .and_then(|address| address.checked_add(bytes.start))
+            .map(|gpu_address| (gpu_address, len));
+        exported = buffer.exported_block().and_then(|(block, offset)| {
+            Some(ExportedObject {
+                block,
+                context,
+                id,
+                kind: ObjectKind::Texture,
+                storage: texture.storage_mode(),
+                offset: offset.checked_add(bytes.start)?,
+                len,
+                gone,
+            })
+        });
+    }
     Parts {
         object: range.map(|(gpu_address, len)| LiveObject {
             context,
@@ -1210,6 +1336,7 @@ pub fn texture_parts(context: u32, id: u64, gone: bool, texture: &RtObj<RtTextur
             len,
             gone,
         }),
+        exported,
         block: None,
     }
 }
@@ -1227,6 +1354,7 @@ pub fn heap_parts(context: u32, id: u64, gone: bool, heap: &RtObj<RtHeap>) -> Pa
             len: size,
             gone,
         }),
+        exported: None,
         block: Some(MappedBlock {
             what: format!(
                 "heap {id:#x}'s block {} of allocation {} (the heap at offset {offset:#x})",
@@ -1341,7 +1469,7 @@ impl FaultWatch {
             fault.instructions.len()
         )];
         let (released, dropped) = self.releases.kept();
-        let (objects, blocks, seen) = self.seen();
+        let (objects, exported, blocks, seen) = self.seen();
         let placed = |at: &rt::FaultAddress| {
             let placement = place(at.address, at.precision, &objects, &blocks);
             let (start, end) = placement.range;
@@ -1356,9 +1484,12 @@ impl FaultWatch {
         for at in &fault.accesses {
             lines.push(format!("{head}access {}\n", placed(at)));
         }
-        // rt's own placement of each address among its ranges, live and recently freed.
+        // rt's own placement of each address among its ranges, live and recently freed, with
+        // the tables' objects in each exported block it names.
         for place in &fault.places {
-            lines.push(format!("{head}rt places {place}\n"));
+            let ranges = (place.holders.iter()).chain(&place.below).chain(&place.above);
+            let exports = exports_text(&export_blocks(ranges), &exported);
+            lines.push(format!("{head}rt places {place}{exports}\n"));
         }
         let kept = kept_text(&released, dropped);
         lines.push(format!("{head}{seen}. {kept}\n"));
@@ -1367,16 +1498,17 @@ impl FaultWatch {
 
     /// What the host sees now: the live objects of the tables' walk, every mapped block it sees,
     /// and what it saw and did not, as the line says it.
-    fn seen(&self) -> (Vec<LiveObject>, Vec<MappedBlock>, String) {
+    fn seen(&self) -> (Vec<LiveObject>, Vec<ExportedObject>, Vec<MappedBlock>, String) {
         let tables = (self.tables.lock().iter())
             .filter(|t| t.live())
             .cloned()
             .collect::<Vec<_>>();
-        let (mut objects, mut of_objects) = (Vec::new(), Vec::new());
+        let (mut objects, mut exported, mut of_objects) = (Vec::new(), Vec::new(), Vec::new());
         let (mut contexts, mut unwalked, mut busy, mut unranged) = (0, Vec::new(), 0, 0);
         for table in &tables {
             let mut walked = table.walk();
             objects.append(&mut walked.objects);
+            exported.append(&mut walked.exported);
             of_objects.append(&mut walked.blocks);
             contexts += walked.contexts;
             unwalked.append(&mut walked.unwalked);
@@ -1448,7 +1580,8 @@ impl FaultWatch {
         let seen = format!(
             "placed among {} live objects with a GPU range ({} buffers, {} textures over a \
              buffer, {} heaps, {} two-copy Managed textures' CPU-copy buffers) of {} decoders' {} \
-             contexts' tables, walked at the loss{not_walked}, beside {unranged} live textures \
+             contexts' tables, walked at the loss{not_walked}, beside {} live objects in an \
+             exported block, which rt's lines name by its number, and {unranged} live textures \
              with no GPU range the platform knows (images of rt's own: one in a heap lies in its \
              heap's range); and among {} mapped blocks the host sees: {} of rt's pool \
              allocations, {known_text}, {dma_bufs} more live dma-buf imports, {of_objects_count} \
@@ -1463,10 +1596,11 @@ impl FaultWatch {
             count(ObjectKind::ManagedCopy),
             tables.len(),
             contexts,
+            exported.len(),
             blocks.len(),
             pool.len(),
         );
-        (objects, blocks, seen)
+        (objects, exported, blocks, seen)
     }
 }
 
@@ -1494,6 +1628,43 @@ mod tests {
             len,
             gone: false,
         }
+    }
+
+    fn exported(block: u32, kind: ObjectKind, id: u64, offset: u64, len: u64) -> ExportedObject {
+        ExportedObject {
+            block,
+            context: 3,
+            id,
+            kind,
+            storage: 2,
+            offset,
+            len,
+            gone: false,
+        }
+    }
+
+    /// Of each exported block rt's placement names, its line names the tables' live objects that
+    /// lie in it, by kind, guest id, context, storage mode, length and offset in the block, one
+    /// removed and kept for an open view said so, in the order the walk found them; a block none
+    /// lies in says so, and a placement that names no exported block adds nothing
+    #[test]
+    fn an_exported_block_rt_names_is_joined_to_the_objects_in_it() {
+        let held = [
+            exported(12, ObjectKind::Buffer, 0x1_0000_0005, 0xe0, 0x1000),
+            exported(14, ObjectKind::Buffer, 0x1_0000_0006, 0, 0x1000),
+            ExportedObject {
+                gone: true,
+                ..exported(12, ObjectKind::Texture, 0x1_0000_0007, 0x100, 0x800)
+            },
+        ];
+        assert_eq!(
+            exports_text(&[12, 13], &held),
+            "; export block 12 holds buffer 0x100000005 of context 3 (Private, length 0x1000, at \
+             offset 0xe0 in it), texture 0x100000007 of context 3 (Private, length 0x800, at \
+             offset 0x100 in it, removed and kept for an open view); export block 13 holds no \
+             live object of the tables"
+        );
+        assert_eq!(exports_text(&[], &held), "");
     }
 
     fn block(what: &str, gpu_address: u64, len: u64, import: Option<&'static str>) -> MappedBlock {
@@ -1673,6 +1844,7 @@ mod tests {
     /// A decoder's tables as a test makes them.
     struct Tables {
         objects: Vec<LiveObject>,
+        exported: Vec<ExportedObject>,
         blocks: Vec<MappedBlock>,
         unwalked: Vec<u32>,
         live: bool,
@@ -1690,6 +1862,18 @@ mod tests {
                 walked.add(
                     Parts {
                         object: Some(object.clone()),
+                        exported: None,
+                        block: None,
+                    },
+                    texture,
+                );
+            }
+            for object in &self.exported {
+                let texture = object.kind == ObjectKind::Texture;
+                walked.add(
+                    Parts {
+                        object: None,
+                        exported: Some(object.clone()),
                         block: None,
                     },
                     texture,
@@ -1698,6 +1882,7 @@ mod tests {
             walked.add(
                 Parts {
                     object: None,
+                    exported: None,
                     block: None,
                 },
                 true,
@@ -1724,6 +1909,7 @@ mod tests {
         let watch = FaultWatch::new(Arc::clone(&allocations), KnownBlocks::default());
         watch.watch(Arc::new(Tables {
             objects: vec![buffer(0x9, 0x1000, 0x1000)],
+            exported: Vec::new(),
             blocks: Vec::new(),
             unwalked: Vec::new(),
             live: false,
@@ -1736,6 +1922,7 @@ mod tests {
                     ..buffer(0x1_0000_0002, 0x52_0000_0800, 0x400)
                 },
             ],
+            exported: vec![exported(12, ObjectKind::Texture, 0x1_0000_0004, 0x100, 0x800)],
             blocks: vec![block(
                 "buffer 0x100000003's block 44",
                 0x60_0000_0000,
@@ -1817,7 +2004,8 @@ mod tests {
                 "{head}placed among 2 live objects with a GPU range (1 buffers, 1 textures over a \
                  buffer, 0 heaps, 0 two-copy Managed textures' CPU-copy buffers) of 1 decoders' 2 \
                  contexts' tables, walked at the loss; the tables of contexts [5] were not had in \
-                 time and not walked, beside 1 live textures with no GPU range the platform knows \
+                 time and not walked, beside 1 live objects in an exported block, which rt's lines \
+                 name by its number, and 1 live textures with no GPU range the platform knows \
                  (images of rt's own: one in a heap lies in its heap's range); and among 3 mapped \
                  blocks the host sees: 2 of rt's pool allocations, 0 known blocks, 0 more live \
                  dma-buf imports, 1 blocks of live objects (heaps' blocks, buffers' imports). Not \
