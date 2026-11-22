@@ -81,8 +81,9 @@ measured, with the platform's own refusals of Metal's, and a heap texture's plac
 own rule refuses too. No refusal of rt's declares the device's basis, and rt's limits and gaps
 keep their own codes whatever their basis. `rt-refused-ours` counts those rt declares its own
 (a gap, cap or deadline of rt's, or the misuse of an extension of rt's): among them an indirect
-argument offset off a multiple of 4 or without the arguments' bytes after it
-(`Refusal::IndirectOffset`), a pass attachment's slice past its texture's
+argument offset without the arguments' bytes after it (`Refusal::IndirectArgumentsPastEnd`; an
+offset off a multiple of 4 is Metal's documented refusal, `Refusal::IndirectOffset`, counted as
+Metal's), a pass attachment's slice past its texture's
 (`Refusal::AttachmentPlace`), a buffer offset set on an empty slot (`Refusal::NoBufferAtIndex`),
 a Managed buffer's modified range past its end (`Refusal::ModifiedRange`), a wait in a
 scheduled handler or on rt's own thread (`Refusal::InScheduledHandler`,

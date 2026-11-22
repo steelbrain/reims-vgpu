@@ -265,8 +265,8 @@ pub enum RtRefusal {
     /// [`RtRefusal::of_basis`]), such as a texture buffer not over a buffer its consumer places
     /// (`Refusal::TextureBufferNotOverBuffer`), which the device's texture buffer no longer
     /// reaches, made over a buffer of the platform's own (`super::texture`'s
-    /// `make_texture_buffer`), or an indirect argument offset rt's Vulkan commands do not read at
-    /// (`Refusal::IndirectOffset`).
+    /// `make_texture_buffer`), or an indirect argument offset that leaves the buffer fewer bytes
+    /// than the arguments' (`Refusal::IndirectArgumentsPastEnd`).
     Ours,
     /// One of the device's or rt's fixed limits (`Error::Limit`).
     Limit,

@@ -12,10 +12,11 @@
 //!   draw's arguments (`MTLDrawPrimitivesIndirectArguments`,
 //!   `MTLDrawIndexedPrimitivesIndirectArguments`, `MTLDrawPatchIndirectArguments`) from the
 //!   buffer at the offset as the draw runs, so arguments of no vertices, indices or patches draw
-//!   nothing, and rt's command buffer keeps the buffer until it retires. An offset rt refuses (one
-//!   not a multiple of 4, or without the arguments' 16 or 20 bytes after it in the buffer) is
-//!   rt's refusal on a rule of its own (`Refusal::IndirectOffset`), counted (`rt-refused-ours`),
-//!   and a patch index buffer rt's gap, as the direct patch draw's is.
+//!   nothing, and rt's command buffer keeps the buffer until it retires. An offset not a multiple
+//!   of 4 is Metal's refusal (`Refusal::IndirectOffset`, whose basis is Metal's documented rule),
+//!   counted as Metal's; one without the arguments' 16 or 20 bytes after it in the buffer is rt's
+//!   refusal on a rule of its own (`Refusal::IndirectArgumentsPastEnd`), counted
+//!   (`rt-refused-ours`); and a patch index buffer is rt's gap, as the direct patch draw's is.
 //! - **Attribute strides** (`setVertexBufferOffset:attributeStride:atIndex:`,
 //!   `setVertexBuffers:offsets:attributeStrides:withRange:`) bind as the calls without them: only a
 //!   layout of `MTLBufferLayoutStrideDynamic` reads a stride, and rt refuses such a state as it is
@@ -1575,9 +1576,10 @@ mod tests {
     /// Indirect draws of primitives, indexed primitives and patches each draw what the arguments
     /// written into their buffer say, read at the draw's offset as the draw runs: a vertex start,
     /// an index start and a base vertex, a patch start. Arguments of no vertices or patches draw
-    /// nothing. An offset off a multiple of 4, or without the arguments' bytes after it, is rt's
-    /// refusal on a rule of its own (`Refusal::IndirectOffset`), and a patch index buffer rt's gap,
-    /// each counted and drawing nothing. None is counted unbuilt or as Metal's refusal.
+    /// nothing. An offset off a multiple of 4 is Metal's refusal (`Refusal::IndirectOffset`), one
+    /// without the arguments' bytes after it rt's refusal on a rule of its own
+    /// (`Refusal::IndirectArgumentsPastEnd`), and a patch index buffer rt's gap, each counted and
+    /// drawing nothing. None is counted unbuilt.
     #[test]
     fn indirect_draws_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1657,12 +1659,13 @@ mod tests {
         assert_eq!(drawn(bound(state, triangles, indexed)), every(blue));
         assert_eq!(counted(metal), before.0);
 
-        // An offset 2 bytes past a multiple of 4, and one 12 bytes before the buffer's end.
+        // An offset 2 bytes past a multiple of 4 (Metal's refusal), and one 12 bytes before the
+        // buffer's end (rt's own).
         assert_eq!(counted(ours), before.3);
         assert_eq!(drawn(draw(2)), every(red));
         assert_eq!(drawn(draw(44)), every(red));
-        assert_eq!(counted(ours), before.3 + 2);
-        assert_eq!(counted(metal), before.0);
+        assert_eq!(counted(ours), before.3 + 1);
+        assert_eq!(counted(metal), before.0 + 1);
 
         // Patch 0's control points all (0, 0), which draws no pixel; patch 1's a triangle over
         // the target. Factors of 1 (`half`, edges and inside) for every patch, Metal's default
@@ -1711,8 +1714,8 @@ mod tests {
         assert_eq!(drawn(patch_draw(20, false)), every(red));
         assert_eq!(drawn(patch_draw(4, true)), every(red));
         assert_eq!(counted(gap), before.1 + 1);
-        assert_eq!(counted(ours), before.3 + 2);
-        assert_eq!(counted(metal), before.0);
+        assert_eq!(counted(ours), before.3 + 1);
+        assert_eq!(counted(metal), before.0 + 1);
         assert_eq!(counted(unbuilt), before.2);
     }
 
