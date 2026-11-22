@@ -1442,7 +1442,10 @@ pub(super) fn zero_hands() -> usize {
     static HANDS: OnceLock<usize> = OnceLock::new();
     *HANDS.get_or_init(|| {
         let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        threads.checked_div(4).unwrap_or(1).clamp(1, ZERO_HANDS_MOST)
+        threads
+            .checked_div(4)
+            .unwrap_or(1)
+            .clamp(1, ZERO_HANDS_MOST)
     })
 }
 

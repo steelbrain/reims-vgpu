@@ -1204,9 +1204,8 @@ impl Shared {
                 MutexGuard::unlocked(&mut st, || {
                     log::info!("pool: the empty piece at {at:#x} goes back to the source");
                     if let Some((len, since)) = piece {
-                        let empty = since.map_or(Duration::ZERO, |since| {
-                            now.saturating_duration_since(since)
-                        });
+                        let empty = since
+                            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
                         let empty = u64::try_from(empty.as_nanos()).unwrap_or(u64::MAX);
                         // poolback: the piece's address and length, and the nanoseconds it
                         // stood empty
