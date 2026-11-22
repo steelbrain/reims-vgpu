@@ -50,6 +50,15 @@ pub const DMA_BUF_BUFFER: &str = "newBufferWithLength:options: (dma-buf, padding
 /// selector of Metal's names it.
 pub const EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (exportable)";
 
+/// The name the fake logs and scripts `GpuDevice::new_deferred_exportable_buffer_of_length` under
+/// for `SurfaceHandle::OpaqueFd`: no selector of Metal's names it.
+pub const DEFERRED_EXPORTABLE_BUFFER: &str = "newBufferWithLength:options: (deferred, exportable)";
+
+/// The name the fake logs and scripts `GpuDevice::new_deferred_exportable_buffer_of_length` under
+/// for `SurfaceHandle::DmaBuf`: no selector of Metal's names it.
+pub const DEFERRED_DMA_BUF_BUFFER: &str =
+    "newBufferWithLength:options: (deferred, dma-buf, padding unobserved)";
+
 /// The name the fake logs and scripts each plane's texture of `GpuDevice::new_exported_surface`
 /// under, where its world makes such surfaces ([`World::give_exported_surfaces`]), with the
 /// plane's pixel format, width, height and usage: no selector of Metal's names it.
@@ -382,6 +391,43 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                 Arg::U64(aligned_byte.unwrap_or(0)),
             ],
             |w| new_buffer(w, length, options, Backing::Fresh, None),
+        )
+    }
+
+    /// Logged and scripted under [`DEFERRED_EXPORTABLE_BUFFER`] (`SurfaceHandle::OpaqueFd`) or
+    /// [`DEFERRED_DMA_BUF_BUFFER`] (`SurfaceHandle::DmaBuf`), as no selector of Metal's names it,
+    /// with the aligned byte after the length and options (0 for none); its buffer is
+    /// [`DEFERRED_BUFFER`]'s, its memory not made until
+    /// [`Buffer::make_memory`](crate::core::platform::resource::Buffer::make_memory) makes it,
+    /// which exports nothing.
+    #[cfg(unix)]
+    fn new_deferred_exportable_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+        handle: crate::core::platform::resource::SurfaceHandle,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
+        let sel = match handle {
+            crate::core::platform::resource::SurfaceHandle::OpaqueFd => DEFERRED_EXPORTABLE_BUFFER,
+            crate::core::platform::resource::SurfaceHandle::DmaBuf => DEFERRED_DMA_BUF_BUFFER,
+        };
+        self.make(
+            Policy::On(on),
+            sel,
+            vec![
+                Arg::U64(length),
+                Arg::U64(options),
+                Arg::U64(aligned_byte.unwrap_or(0)),
+            ],
+            |w| {
+                let b = new_buffer(w, length, options, Backing::Fresh, None)?;
+                if let Model::Buffer(m) = &mut b.state().model {
+                    m.deferred = Some(false);
+                }
+                Some(b)
+            },
         )
     }
 

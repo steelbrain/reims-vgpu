@@ -35,6 +35,17 @@
 //! comes back: nothing reads the buffer through the device before its next copy, which writes it
 //! anew (rt's contract).
 //!
+//! **Deferred exports** ([`deferred`], `GpuDevice::new_deferred_exportable_buffer_of_length`). A
+//! deferred buffer (`super::buffer`, "Deferred memory") may name the export its memory takes:
+//! its first use then makes the memory as [`exportable`] makes a buffer's, a buffer of its own
+//! exported block, on the thread of that use, and an export of the memory
+//! (`Buffer::export_memory`, `Buffer::export_dma_buf`) is such a use. Until then it holds no
+//! block, exports nothing and takes no acquire. Its zeros are rt's GPU fill ahead of the next
+//! command buffer, as any new buffer's: another API's write that comes before the platform's
+//! next work is the caller's to order after zeros of its own. Where rt refuses the export as the
+//! memory is made, counted as below, the memory is made as any deferred buffer's, and the buffer
+//! exports nothing.
+//!
 //! **Refusals.** Where rt makes no exported block (a device that exports no opaque fd, a dma-buf
 //! without the foreign queue family, a limit) or no buffer in it, the call answers `None` and the
 //! caller makes the buffer as any other: counted ([`EXPORT_REFUSED_CODE`]), the process's first
@@ -114,6 +125,80 @@ pub(super) fn exportable(
     aligned_byte: Option<u64>,
 ) -> Option<RtObj<RtBuffer>> {
     let answered = buffer::private_options(raw)?;
+    let (made, exported) = memory(device, sel, handle, length, aligned_byte)?;
+    Some(buffer::with_export(device, made, answered, exported))
+}
+
+/// [`exportable`]'s buffer whose memory rt makes at its first use, as a deferred buffer's (the
+/// module's docs, "Deferred exports"); `None` where the options are not Private ones, and the
+/// caller makes the buffer as any other.
+pub(super) fn deferred(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    handle: rt::ExportHandle,
+    length: u64,
+    raw: u64,
+    aligned_byte: Option<u64>,
+) -> Option<RtObj<RtBuffer>> {
+    buffer::private_options(raw)?;
+    let export = DeferredExport {
+        sel,
+        handle,
+        aligned_byte,
+    };
+    buffer::deferred_exportable(device, sel, length, raw, export)
+}
+
+/// How a deferred buffer's memory is exported as it is made ([`deferred`]): what [`memory`] takes
+/// beside its length.
+pub(super) struct DeferredExport {
+    /// The make's selector, which a refusal names.
+    pub(super) sel: &'static str,
+    /// The kind of handle the memory is exported as.
+    pub(super) handle: rt::ExportHandle,
+    /// The byte of the buffer that lies on a multiple of [`ALIGNED_TO`] bytes of its memory.
+    pub(super) aligned_byte: Option<u64>,
+}
+
+impl DeferredExport {
+    /// The memory, as [`memory`] makes it, of a buffer of `length` bytes.
+    pub(super) fn memory(
+        &self,
+        device: &RtObj<RtDevice>,
+        length: u64,
+    ) -> Option<(rt::Buffer, Exported)> {
+        memory(device, self.sel, self.handle, length, self.aligned_byte)
+    }
+
+    /// The buffer of `length` bytes and options `raw` it names, made at once as [`exportable`]
+    /// makes it.
+    pub(super) fn exportable(
+        &self,
+        device: &RtObj<RtDevice>,
+        length: u64,
+        raw: u64,
+    ) -> Option<RtObj<RtBuffer>> {
+        exportable(
+            device,
+            self.sel,
+            self.handle,
+            length,
+            raw,
+            self.aligned_byte,
+        )
+    }
+}
+
+/// rt's buffer of `length` bytes of zeros in its own exported block of `handle`'s kind, for
+/// `sel`, `aligned_byte` of it, where given, on a multiple of 256 bytes of its memory, with what
+/// it keeps of the export (the module's docs); `None` where rt makes none, counted.
+fn memory(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    handle: rt::ExportHandle,
+    length: u64,
+    aligned_byte: Option<u64>,
+) -> Option<(rt::Buffer, Exported)> {
     let offset = start_for(aligned_byte);
     let Some(span) = offset.checked_add(length) else {
         refused(sel, &format!("a buffer of {length} bytes at {offset}"));
@@ -143,7 +228,7 @@ pub(super) fn exportable(
         size: export.size,
         offset,
     };
-    Some(buffer::with_export(device, made, answered, exported))
+    Some((made, exported))
 }
 
 impl Exported {
@@ -302,5 +387,99 @@ mod tests {
         let shared = device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0, None);
         assert!(shared.expect("never a raise").is_none());
         assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
+    }
+
+    /// Deferred exportable buffers on the GPU the test holds, for each handle (the module's
+    /// docs, "Deferred exports"): a Private buffer of the asked length that holds no memory, at
+    /// GPU address 0, until its first use; an export is such a use, and makes the memory exported
+    /// as the eager make's is, its byte 32 on a multiple of 256 bytes, each export a new handle
+    /// of the dedicated allocation, the other handle's export refused, the acquire taken; a use
+    /// that is no export makes it so too. Where the device exports no such handle, the memory is
+    /// made as any deferred buffer's, the refusal counted, and the export is refused. Options of
+    /// other storage make the eager make's buffer, or none, as it does.
+    #[test]
+    fn deferred_exportable_buffers_on_vulkan() {
+        use std::os::fd::AsRawFd as _;
+
+        use crate::core::platform::resource::{MemoryFor, SurfaceHandle};
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let length = 3840 * 2160 * 3 / 2 + 32;
+        for handle in [SurfaceHandle::OpaqueFd, SurfaceHandle::DmaBuf] {
+            let export = |buffer: &RtObj<RtBuffer>, as_handle: SurfaceHandle| match as_handle {
+                SurfaceHandle::OpaqueFd => buffer.export_memory(),
+                SurfaceHandle::DmaBuf => buffer.export_dma_buf(),
+            };
+            let other = match handle {
+                SurfaceHandle::OpaqueFd => SurfaceHandle::DmaBuf,
+                SurfaceHandle::DmaBuf => SurfaceHandle::OpaqueFd,
+            };
+            let refusals = counted(EXPORT_REFUSED_CODE);
+            let made =
+                device.new_deferred_exportable_buffer_of_length(on, length, 0x20, Some(32), handle);
+            let buffer = (made.expect("never a raise")).expect("a deferred buffer");
+            assert_eq!((buffer.length(), buffer.storage_mode()), (length, 2));
+            assert_eq!(buffer.resource_options(), 0x220);
+            assert!(
+                !buffer.memory_made(),
+                "{handle:?}: no memory before its first use"
+            );
+            assert_eq!(buffer.gpu_address(), 0);
+            assert_eq!(
+                counted(EXPORT_REFUSED_CODE),
+                refusals,
+                "{handle:?}: none asked yet"
+            );
+            let Ok(first) = export(&buffer, handle) else {
+                assert_eq!(counted(EXPORT_REFUSED_CODE), refusals + 1);
+                assert!(
+                    buffer.memory_made(),
+                    "{handle:?}: made as any deferred buffer's"
+                );
+                assert_ne!(buffer.gpu_address(), 0);
+                assert!(buffer.external_write_done().is_err());
+                println!("the device exports no {handle:?}: made unexported, refused, counted");
+                continue;
+            };
+            assert!(buffer.memory_made(), "{handle:?}: the export made it");
+            assert_ne!(buffer.gpu_address(), 0);
+            assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
+            let second = export(&buffer, handle).expect("another");
+            assert_ne!(first.fd.as_raw_fd(), second.fd.as_raw_fd());
+            assert_eq!(first.offset, 224);
+            assert!(first.dedicated && first.length == length);
+            assert!(first.allocation_size >= first.offset + length);
+            assert_eq!(
+                (second.offset, second.allocation_size),
+                (first.offset, first.allocation_size)
+            );
+            assert!(export(&buffer, other).is_err());
+            assert_eq!(buffer.external_write_done(), Ok(()));
+
+            let used =
+                device.new_deferred_exportable_buffer_of_length(on, 4096, 0x20, None, handle);
+            let used = (used.expect("never a raise")).expect("a deferred buffer");
+            assert!(used.make_memory(MemoryFor::Command));
+            assert!(used.memory_made());
+            let exported = export(&used, handle).expect("an export of memory made by a use");
+            assert!(exported.dedicated && exported.offset == 0);
+
+            let shared = device.new_deferred_exportable_buffer_of_length(on, 4096, 0, None, handle);
+            let eager = match handle {
+                SurfaceHandle::OpaqueFd => {
+                    device.new_exportable_buffer_of_length(on, 4096, 0, None)
+                }
+                SurfaceHandle::DmaBuf => {
+                    device.new_dma_buf_buffer_of_length_padding_unobserved(on, 4096, 0, None)
+                }
+            };
+            assert_eq!(
+                (shared.expect("never a raise").is_none()),
+                (eager.expect("never a raise").is_none()),
+                "{handle:?}: other storage as the eager make"
+            );
+            assert_eq!(counted(EXPORT_REFUSED_CODE), refusals);
+        }
     }
 }

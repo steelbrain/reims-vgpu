@@ -4712,6 +4712,26 @@ mod tests {
                     "new_dma_buf_buffer_of_length_padding_unobserved",
                     device.new_dma_buf_buffer_of_length_padding_unobserved(on, len, private, None),
                 ),
+                (
+                    "new_deferred_exportable_buffer_of_length (opaque fd)",
+                    device.new_deferred_exportable_buffer_of_length(
+                        on,
+                        len,
+                        private,
+                        None,
+                        crate::core::platform::resource::SurfaceHandle::OpaqueFd,
+                    ),
+                ),
+                (
+                    "new_deferred_exportable_buffer_of_length (dma-buf)",
+                    device.new_deferred_exportable_buffer_of_length(
+                        on,
+                        len,
+                        private,
+                        None,
+                        crate::core::platform::resource::SurfaceHandle::DmaBuf,
+                    ),
+                ),
             ])
             .collect();
         (made.into_iter())

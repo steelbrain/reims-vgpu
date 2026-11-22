@@ -209,6 +209,42 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = (on, length, options, aligned_byte);
         Ok(None)
     }
+    /// No Metal counterpart: a buffer as
+    /// [`new_exportable_buffer_of_length`](GpuDevice::new_exportable_buffer_of_length)'s, for
+    /// `handle` [`SurfaceHandle::DmaBuf`](super::resource::SurfaceHandle::DmaBuf) as
+    /// [`new_dma_buf_buffer_of_length_padding_unobserved`](GpuDevice::new_dma_buf_buffer_of_length_padding_unobserved)'s,
+    /// whose memory the platform may make only at its first use, as a deferred buffer's
+    /// ([`new_deferred_buffer_of_length`](GpuDevice::new_deferred_buffer_of_length)): the graphics
+    /// lane's device caches for the host's video in the per-shape form, whose pictures land in a
+    /// surface of their own as a rule, so that a cache whose buffer no decode and no copy reaches
+    /// holds no memory of it (`decode::surface_cache`, "Deferred memory"). Its memory is zeros as
+    /// the platform makes it, ahead of the platform's next work; another API's write ahead of
+    /// that work is the caller's to order after zeros of its own. An export of it
+    /// ([`Buffer::export_memory`](super::resource::Buffer::export_memory),
+    /// [`Buffer::export_dma_buf`](super::resource::Buffer::export_dma_buf)) makes it where it is
+    /// not made. Where the platform refuses the export as it makes the memory, the memory is made
+    /// as a deferred buffer's, counted, and the buffer exports nothing. Until then its length and
+    /// options are its own, its contents NULL and its GPU address 0. `Ok(None)` where the platform
+    /// makes none, and the caller makes the buffer as any other. The default makes the buffer as
+    /// the make for `handle` does, its memory at once. Reached both under a handler and with
+    /// none: `on` says which this call is.
+    #[cfg(unix)]
+    fn new_deferred_exportable_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+        handle: super::resource::SurfaceHandle,
+    ) -> RaiseResult<Option<P::Buffer>> {
+        match handle {
+            super::resource::SurfaceHandle::OpaqueFd => {
+                self.new_exportable_buffer_of_length(on, length, options, aligned_byte)
+            }
+            super::resource::SurfaceHandle::DmaBuf => self
+                .new_dma_buf_buffer_of_length_padding_unobserved(on, length, options, aligned_byte),
+        }
+    }
     /// No Metal counterpart: a surface of `desc`'s planes, each a texture of the platform's,
     /// whose memory another API imports through `desc.handle`
     /// ([`ExportedSurface`](super::resource::ExportedSurface)): the host's video writes its

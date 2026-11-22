@@ -189,7 +189,8 @@
 //! it first, and is nil where rt refuses it. Any other use makes it there, and where rt refuses its
 //! memory then, the process ends: that use has no refusal to answer ([`deferred_refused`]). Each
 //! make is rt's take of a Private block on the thread of the use, which allocates there where no
-//! free range of rt's pool fits the length.
+//! free range of rt's pool fits the length; a deferred buffer whose make named an export makes an
+//! exported block of its own instead (`super::export`, "Deferred exports").
 //!
 //! Each deferred buffer is counted as it is made and gone, with the most live at once
 //! ([`DEFERRED`]); each whose memory is made ([`DEFERRED_MADE`]), and of those each made by the use
@@ -481,9 +482,10 @@ pub struct RtBuffer {
     /// A no-copy buffer's deallocator that runs as the buffer goes: one over a known block's
     /// mapping (the module's docs, "A pinned address").
     deallocator: Option<Slot>,
-    /// An exportable buffer's export (`super::export`).
+    /// An exportable buffer's export (`super::export`): a deferred one's from its first use
+    /// (`super::export`, "Deferred exports").
     #[cfg(unix)]
-    exported: Option<super::export::Exported>,
+    exported: OnceLock<super::export::Exported>,
     /// The copy of host pages it lies over (`super::copied`), which a command buffer that uses it
     /// syncs; `None` for any other.
     copied: Option<Arc<super::copied::Copied>>,
@@ -499,6 +501,10 @@ struct Deferred {
     length: u64,
     /// Held while its memory is made, so that one make is made.
     making: Mutex<()>,
+    /// The export its memory takes as it is made, `None` for none (`super::export`, "Deferred
+    /// exports").
+    #[cfg(unix)]
+    export: Option<super::export::DeferredExport>,
 }
 
 impl RtBuffer {
@@ -540,22 +546,29 @@ impl RtBuffer {
         if let Some(made) = self.rt.get() {
             return Some(made);
         }
-        // As `own`'s, its two calls of rt's timed apart ([`DeferredSplit`]).
+        // As `own`'s, its two calls of rt's timed apart ([`DeferredSplit`]); an exported one's
+        // make whole as its take.
         let length = deferred.length;
-        let allocated = pool_allocations_here();
         let start = rt::host_time();
-        let block = take(&self.device, DEFERRED_SEL, rt::MemoryClass::Private, length);
-        let taken = rt::host_time();
-        let allocations = pool_allocations_here().wrapping_sub(allocated);
-        let made = block.and_then(|block| {
-            match (self.device.rt()).new_buffer(block.id, 0, length, Some(0)) {
-                Ok(made) => Some(made),
-                Err(error) => {
-                    rt_refused_create(DEFERRED_SEL, &error);
-                    None
-                }
+        let (made, taken, allocations) = match self.exported_memory(deferred) {
+            Some(made) => (Some(made), rt::host_time(), 0),
+            None => {
+                let allocated = pool_allocations_here();
+                let block = take(&self.device, DEFERRED_SEL, rt::MemoryClass::Private, length);
+                let taken = rt::host_time();
+                let allocations = pool_allocations_here().wrapping_sub(allocated);
+                let made = block.and_then(|block| {
+                    match (self.device.rt()).new_buffer(block.id, 0, length, Some(0)) {
+                        Ok(made) => Some(made),
+                        Err(error) => {
+                            rt_refused_create(DEFERRED_SEL, &error);
+                            None
+                        }
+                    }
+                });
+                (made, taken, allocations)
             }
-        });
+        };
         let end = rt::host_time();
         let took = end.saturating_sub(start);
         let Some(made) = made else {
@@ -581,6 +594,38 @@ impl RtBuffer {
         let most = DEFERRED_FOR_MOST_NS[made_for].fetch_max(took, Ordering::Relaxed);
         crate::answer::count_kind_by(most_code, took.saturating_sub(most));
         Some(self.rt.get_or_init(|| made))
+    }
+
+    /// A deferred buffer's memory, exported as its make named (`super::export`, "Deferred
+    /// exports"), its export kept; `None` where it names none, or where rt refuses the export,
+    /// counted, and the caller makes the memory as any deferred buffer's.
+    #[cfg(unix)]
+    fn exported_memory(&self, deferred: &Deferred) -> Option<rt::Buffer> {
+        let export = deferred.export.as_ref()?;
+        let (made, exported) = export.memory(&self.device, deferred.length)?;
+        let _ = self.exported.set(exported);
+        Some(made)
+    }
+
+    /// No buffer exports its memory off Unix.
+    #[cfg(not(unix))]
+    fn exported_memory(&self, _: &Deferred) -> Option<rt::Buffer> {
+        None
+    }
+
+    /// Its length as an export of its memory names it, the memory made first where it is a
+    /// deferred buffer's not made yet: an export is a use of it (`super::export`, "Deferred
+    /// exports"). `Err` where it was not made exportable, its memory left as it is, or where rt
+    /// refuses the memory.
+    #[cfg(unix)]
+    fn exported_length(&self) -> Result<u64, String> {
+        let exports = (self.exported.get()).is_some()
+            || (self.deferred.as_ref()).is_some_and(|d| d.export.is_some());
+        if !exports {
+            return Err("the buffer was not made exportable".to_owned());
+        }
+        (self.made(None).map(|made| made.length()))
+            .ok_or_else(|| "metal2vulkan-runtime refused the buffer's memory".to_owned())
     }
 
     /// The copy of host pages it lies over, where it lies over one (`super::copied`).
@@ -1046,11 +1091,53 @@ pub fn deferred_of_length(
     length: u64,
     raw: u64,
 ) -> Option<RtObj<RtBuffer>> {
+    let deferred = Deferred {
+        length,
+        making: Mutex::new(()),
+        #[cfg(unix)]
+        export: None,
+    };
+    deferred_as(device, sel, raw, deferred)
+}
+
+/// [`deferred_of_length`]'s buffer whose memory takes `export` as it is made (`super::export`,
+/// "Deferred exports"); where it would not be deferred, the exportable buffer `export` names,
+/// made at once.
+#[cfg(unix)]
+pub(super) fn deferred_exportable(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    length: u64,
+    raw: u64,
+    export: super::export::DeferredExport,
+) -> Option<RtObj<RtBuffer>> {
+    let deferred = Deferred {
+        length,
+        making: Mutex::new(()),
+        export: Some(export),
+    };
+    deferred_as(device, sel, raw, deferred)
+}
+
+/// The buffer of `deferred`'s length and options `raw`, for `sel`, whose memory `deferred` makes
+/// at its first use; one made at once as [`of_length`]'s, or as its export's where it names one,
+/// where the options are not Private ones or rt makes no buffer of the length.
+fn deferred_as(
+    device: &RtObj<RtDevice>,
+    sel: &'static str,
+    raw: u64,
+    deferred: Deferred,
+) -> Option<RtObj<RtBuffer>> {
+    let length = deferred.length;
     let o = match options(raw, false) {
         Ok(o) => o,
         Err(why) => return refused_metal(sel, &why),
     };
     if o.storage != Storage::Private || length == 0 || length > rt::MAX_BUFFER_LENGTH {
+        #[cfg(unix)]
+        if let Some(export) = &deferred.export {
+            return export.exportable(device, length, raw);
+        }
         return made(device, sel, length, o, None, None);
     }
     crate::answer::count_made(DEFERRED);
@@ -1058,17 +1145,14 @@ pub fn deferred_of_length(
     Some(RtObj::new(RtBuffer {
         named: super::fault::Named::default(),
         rt: OnceLock::new(),
-        deferred: Some(Deferred {
-            length,
-            making: Mutex::new(()),
-        }),
+        deferred: Some(deferred),
         device: device.clone_ref(),
         options: o.answered,
         purgeable: texture::purgeable_state(),
         in_heap: false,
         deallocator: None,
         #[cfg(unix)]
-        exported: None,
+        exported: OnceLock::new(),
         copied: None,
     }))
 }
@@ -1222,7 +1306,7 @@ pub(super) fn buffer_of(
         in_heap,
         deallocator,
         #[cfg(unix)]
-        exported: None,
+        exported: OnceLock::new(),
         copied,
     })
 }
@@ -1245,7 +1329,7 @@ pub(super) fn with_export(
         purgeable: texture::purgeable_state(),
         in_heap: false,
         deallocator: None,
-        exported: Some(exported),
+        exported: OnceLock::from(exported),
         copied: None,
     })
 }
@@ -2673,18 +2757,24 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         recorded_answer
     }
 
-    /// An exportable buffer's memory as a new opaque fd (`super::export`); `Err` for any other.
+    /// An exportable buffer's memory as a new opaque fd (`super::export`), a deferred one's made
+    /// first where it is not yet (`super::export`, "Deferred exports"); `Err` for any other, and
+    /// where rt refused the memory or its export.
     #[cfg(unix)]
     fn export_memory(&self) -> Result<ExportedMemory, String> {
-        let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
-        exported.export(rt::ExportHandle::OpaqueFd, self.rt().length())
+        let length = self.exported_length()?;
+        let exported = (self.exported.get()).ok_or("the buffer was not made exportable")?;
+        exported.export(rt::ExportHandle::OpaqueFd, length)
     }
 
-    /// A dma-buf buffer's memory as a new dma-buf (`super::export`); `Err` for any other.
+    /// A dma-buf buffer's memory as a new dma-buf (`super::export`), a deferred one's made first
+    /// where it is not yet (`super::export`, "Deferred exports"); `Err` for any other, and where
+    /// rt refused the memory or its export.
     #[cfg(unix)]
     fn export_dma_buf(&self) -> Result<ExportedMemory, String> {
-        let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
-        exported.export(rt::ExportHandle::DmaBuf, self.rt().length())
+        let length = self.exported_length()?;
+        let exported = (self.exported.get()).ok_or("the buffer was not made exportable")?;
+        exported.export(rt::ExportHandle::DmaBuf, length)
     }
 
     /// rt's acquire of what another API wrote into an exportable buffer's block
@@ -2693,7 +2783,7 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
     fn external_write_done(&self) -> Result<(), String> {
         let recorded_call = crate::recorder::rec_call!(crate::recorder::EXTERNAL_WRITE_DONE, self);
         let recorded_answer = crate::recorder::run(|| -> Result<(), String> {
-            let exported = (self.exported.as_ref()).ok_or("the buffer was not made exportable")?;
+            let exported = (self.exported.get()).ok_or("the buffer was not made exportable")?;
             exported.acquire()
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);

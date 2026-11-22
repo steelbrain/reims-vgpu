@@ -1112,6 +1112,46 @@ impl GpuDevice<RtPlatform> for RtObj<RtDevice> {
         recorded_answer
     }
 
+    /// The make for `handle` (`new_exportable_buffer_of_length`'s,
+    /// `new_dma_buf_buffer_of_length_padding_unobserved`'s), its exported block made at the
+    /// buffer's first use (`super::export`, "Deferred exports"). A recording holds it as the
+    /// make for `handle` it stands for, a buffer of zeros.
+    #[cfg(unix)]
+    fn new_deferred_exportable_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+        handle: crate::core::platform::resource::SurfaceHandle,
+    ) -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+        use crate::core::platform::resource::SurfaceHandle;
+        let (recorded_name, sel, handle) = match handle {
+            SurfaceHandle::OpaqueFd => (
+                "m2v.newExportableBufferOfLength",
+                "newBufferWithLength:options: (exportable)",
+                rt::ExportHandle::OpaqueFd,
+            ),
+            SurfaceHandle::DmaBuf => (
+                "m2v.newDmaBufBufferOfLengthPaddingUnobserved",
+                "newBufferWithLength:options: (dma-buf)",
+                rt::ExportHandle::DmaBuf,
+            ),
+        };
+        let recorded_call =
+            crate::recorder::rec_call!(recorded_name, self, length, options, aligned_byte);
+        let recorded_answer = crate::recorder::run(
+            || -> RaiseResult<Option<<RtPlatform as Platform>::Buffer>> {
+                let _ = on;
+                let made =
+                    super::export::deferred(self, sel, handle, length, options, aligned_byte);
+                Ok(made)
+            },
+        );
+        crate::recorder::rec_done!(recorded_call, recorded_answer);
+        recorded_answer
+    }
+
     /// rt's exported surface of `desc`'s planes (`super::surface`); `None` where rt makes none,
     /// counted, and the caller keeps the planes in images of its own.
     #[cfg(unix)]
