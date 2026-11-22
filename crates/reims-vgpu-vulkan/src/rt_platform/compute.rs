@@ -615,6 +615,7 @@ mod tests {
     const TGMEM: &[u8] = include_bytes!("../../../../tests/shaders/compute_tgmem.metallib");
     const TEXWRITE: &[u8] = include_bytes!("../../../../tests/shaders/compute_texwrite.metallib");
     const SAMPLE: &[u8] = include_bytes!("../../../../tests/shaders/compute_sample.metallib");
+    const STAGEIN: &[u8] = include_bytes!("../../../../tests/shaders/compute_stagein.metallib");
     const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_samplers.metallib"));
 
     fn counted(code: &str) -> u64 {
@@ -1043,6 +1044,160 @@ mod tests {
         assert_eq!(status, done);
         assert_eq!(words(&indirect, 4), [8, 9, 10, 11]);
         assert_eq!(counts(), [direct_before + 1, indirect_before + 1]);
+    }
+
+    /// A kernel's `[[stage_in]]` attribute of a fixed layout stride that steps by the thread's
+    /// position in X is fetched by the encoder's stage-in region (`setStageInRegion:`): thread `x`
+    /// reads element `origin + x / rate` (`stage_in_k` writes it plus `0x100`), at a step rate of
+    /// 1 and of 2, every thread inside the region. A stage-in region read from a buffer is rt's
+    /// gap, counted by its kind, and the dispatch after it fetches by the region set before it.
+    /// The forms rt does not build are refused as the state is made, nil and an `NSError`, each
+    /// counted by its kind: a layout of `MTLBufferLayoutStrideDynamic` (`StageIn-DynamicStride`)
+    /// and an indexed step at a rate of 2 (`StageIn-IndexedStepRate`).
+    #[test]
+    fn a_kernel_s_stage_in_is_fetched_by_the_stage_in_region_on_vulkan() {
+        use crate::core::platform::values::{
+            AttributeDesc, BufferLayoutDesc, FullComputePipelineDesc, StageInputDesc,
+        };
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let done = CommandBufferStatus::COMPLETED;
+        let holding = |values: &[u32]| {
+            let length = 4 * values.len().to_u64();
+            let made = device.new_buffer_of_length(on, length, 0);
+            let made = made.expect("never a raise").expect("a buffer");
+            // SAFETY: the Shared buffer's contents are mapped, `values` long.
+            unsafe {
+                let at = made.contents().as_ptr::<u32>();
+                at.copy_from_nonoverlapping(values.as_ptr(), values.len());
+            }
+            made
+        };
+        let library = device.new_library(STAGEIN).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let kernel = library.new_function(on, "stage_in_k");
+        let kernel = kernel.expect("never a raise").expect("the kernel");
+        // Attribute 0, a `UInt` at offset 0 of buffer 1, whose one layout is `layout`.
+        let stage_input = |layout: BufferLayoutDesc| StageInputDesc {
+            layouts: vec![layout],
+            attributes: vec![AttributeDesc {
+                attribute_index: 0,
+                format: 36,
+                offset: 0,
+                buffer_index: 1,
+            }],
+            index_type: 1,
+            index_buffer_index: 2,
+        };
+        // A layout of buffer 1 of `stride` bytes, stepped by `step` (`MTLStepFunction`) at `rate`.
+        let layout = |stride: u64, step: u64, rate: u64| BufferLayoutDesc {
+            buffer_index: 1,
+            stride,
+            step_function: step,
+            step_rate: rate,
+        };
+        let make = |layout: BufferLayoutDesc| {
+            let desc = FullComputePipelineDesc {
+                stage_input: Some(stage_input(layout)),
+                ..FullComputePipelineDesc::new(&kernel)
+            };
+            device.new_compute_pipeline_state_full(&desc)
+        };
+        let made = |layout: BufferLayoutDesc| {
+            let made = make(layout).map_err(|error| error.description);
+            let made = made.expect("rt makes a stage input of a fixed stride");
+            made.expect("a compute state")
+        };
+        // Element `e` of buffer 1 holds `0x10 + e`.
+        let elements: Vec<u32> = (0..16).map(|e| 0x10 + e).collect();
+        let input = holding(&elements);
+        let region = |x: u64, width: u64| MtlRegion {
+            origin: MtlOrigin { x, y: 0, z: 0 },
+            size: MtlSize::new(width, 1, 1),
+        };
+        // `MTLStepFunctionThreadPositionInGridX`.
+        let by_x = 5;
+
+        // Each thread's element is the region's origin plus its position over the step rate, as an
+        // M3 Max answers (measured: metal2vulkan's recording of its case `stage-in-region-clamps`,
+        // rows `x_o2_r4_g8` and `x_rate2_o1_r2_g8`). Every thread here is inside the region: Metal
+        // leaves a thread past it undefined. By row: the step rate, the region's origin and size,
+        // and what each thread writes.
+        let rows: [(u64, u64, u64, &[u32]); 2] = [
+            (1, 2, 4, &[0x112, 0x113, 0x114, 0x115]),
+            (
+                2,
+                1,
+                8,
+                &[0x111, 0x111, 0x112, 0x112, 0x113, 0x113, 0x114, 0x114],
+            ),
+        ];
+        for (rate, origin, width, expected) in rows {
+            let state = made(layout(4, by_x, rate));
+            let out = holding(&[0; 8]);
+            let status = run(
+                &queue,
+                None,
+                vec![
+                    ComputeCmd::SetComputePipelineState {
+                        state: Some(&state),
+                    },
+                    bind(&[Some(&out), Some(&input)]),
+                    ComputeCmd::SetStageInRegion {
+                        region: region(origin, width),
+                    },
+                    threads(expected.len().to_u64()),
+                ],
+            );
+            assert_eq!(status, done, "rate {rate}");
+            let written = words(&out, expected.len());
+            assert_eq!(written, expected, "rate {rate}, origin {origin}");
+        }
+
+        // A region read from a buffer (origin 0, size 4) is refused, counted, and the region set
+        // before it (origin 2) is the one the dispatch fetches by.
+        let state = made(layout(4, by_x, 1));
+        let (out, indirect) = (holding(&[0; 4]), holding(&[0, 0, 0, 4, 1, 1]));
+        let refused = gaps_named("StageIn-IndirectRegion");
+        let status = run(
+            &queue,
+            None,
+            vec![
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&state),
+                },
+                bind(&[Some(&out), Some(&input)]),
+                ComputeCmd::SetStageInRegion {
+                    region: region(2, 4),
+                },
+                ComputeCmd::SetStageInRegionIndirect {
+                    indirect_buffer: &indirect,
+                    indirect_buffer_offset: 0,
+                },
+                threads(4),
+            ],
+        );
+        assert_eq!(status, done);
+        assert_eq!(gaps_named("StageIn-IndirectRegion"), refused + 1);
+        assert_eq!(words(&out, 4), [0x112, 0x113, 0x114, 0x115]);
+
+        // The forms rt does not build, each refused as the state is made, counted by its kind: a
+        // layout of `MTLBufferLayoutStrideDynamic` stepped by X, and one stepped by
+        // `MTLStepFunctionThreadPositionInGridXIndexed` (7) at a rate of 2.
+        let gap = RtRefusal::Gap.code();
+        for (refused, kind) in [
+            (layout(u64::MAX, by_x, 1), "StageIn-DynamicStride"),
+            (layout(4, 7, 2), "StageIn-IndexedStepRate"),
+        ] {
+            let (gaps, named) = (counted(gap), gaps_named(kind));
+            let refusal = make(refused).err();
+            let refusal = refusal.unwrap_or_else(|| panic!("{kind}: refused"));
+            assert!(refusal.description.contains(gap), "{kind}: {refusal:?}");
+            assert_eq!(counted(gap), gaps + 1, "{kind}");
+            assert_eq!(gaps_named(kind), named + 1, "{kind}");
+        }
     }
 
     /// A declaration of no usage (`useResources:count:usage:` of 0) declares nothing and is no
