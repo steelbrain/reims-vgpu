@@ -6,8 +6,9 @@
 //! counted under its piece's code, `rt-unbuilt-<piece>` ([`Unbuilt::code`]), in the process's
 //! degradation counts ([`crate::answer::count_kind`], which the `reims-vgpu: degradation counts:`
 //! line gives, docs/conventions.md). The first refusal of each kind in the process writes one line
-//! on stderr naming the call, the piece and the code. A boot's counts line therefore lists every
-//! unbuilt piece the boot reached, with how many times.
+//! on stderr naming the call, the piece and the code, and what the call asked of the piece where
+//! its site names it, as structure alone ([`refuse_with`]: a render pass's sample positions). A
+//! boot's counts line therefore lists every unbuilt piece the boot reached, with how many times.
 //!
 //! A call of a built piece that rt refuses (its `Error`: a limit, a refusal of Metal's, a known
 //! gap, a failed Vulkan call) answers the same way, counted under the error's kind,
@@ -97,6 +98,7 @@ pub enum Unbuilt {
     Blit,
     /// A render pass descriptor's properties rt's pass has no field of: imageblock and threadgroup
     /// memory lengths, tile sizes and sample positions. A set of one other than Metal's default
+    /// (sample positions other than Metal's default positions of their count, `super::descriptor`)
     /// keeps nothing, and the pass renders without it.
     RenderPass,
     /// Rasterization rate maps, their descriptors and layers: rt has none. A layer's creation
@@ -206,9 +208,22 @@ static SAID: [AtomicBool; Unbuilt::ALL.len()] =
 /// process's first refusal of the piece writes its line on stderr. The caller answers as Metal's
 /// call answers where it fails.
 pub fn refuse(piece: Unbuilt, sel: &'static str) {
+    refused_piece(piece, sel, None);
+}
+
+/// Refuses the call `sel` for the unbuilt `piece` as [`refuse`] does, the line of the process's
+/// first refusal of the piece, where this call writes it, naming `what` too: what the call asked
+/// of the piece, as structure alone (a render pass's sample positions, `super::descriptor`).
+pub fn refuse_with(piece: Unbuilt, sel: &'static str, what: &dyn std::fmt::Display) {
+    refused_piece(piece, sel, Some(what));
+}
+
+/// Counts a refusal of the call `sel` under `piece`'s code; the process's first of the piece
+/// writes its line ([`refusal_line`]), naming `what` where the caller names it.
+fn refused_piece(piece: Unbuilt, sel: &'static str, what: Option<&dyn std::fmt::Display>) {
     crate::answer::count_kind(piece.code());
     if first(&SAID, piece.at()) {
-        say(&refusal_line(piece, sel));
+        say(&refusal_line(piece, sel, what));
     }
 }
 
@@ -237,14 +252,20 @@ pub fn refused_error(piece: Unbuilt, sel: &'static str) -> NsErrorText {
     }
 }
 
-/// The line of the process's first refusal of `piece`, at `sel`.
-fn refusal_line(piece: Unbuilt, sel: &'static str) -> String {
-    format!(
-        "reims-vgpu: {sel}: {} is not built on metal2vulkan-runtime; refused ({}), the first of \
-         its kind\n",
-        piece.what(),
-        piece.code()
-    )
+/// The line of the process's first refusal of `piece`, at `sel`, and what the call asked of the
+/// piece, `what`, where it names it, after the line's `: ` as [`detail_line`] gives it.
+fn refusal_line(piece: Unbuilt, sel: &str, what: Option<&dyn std::fmt::Display>) -> String {
+    let (what_piece, code) = (piece.what(), piece.code());
+    match what {
+        Some(what) => format!(
+            "reims-vgpu: {sel}: {what_piece} is not built on metal2vulkan-runtime; refused \
+             ({code}), the first of its kind: {what}\n"
+        ),
+        None => format!(
+            "reims-vgpu: {sel}: {what_piece} is not built on metal2vulkan-runtime; refused \
+             ({code}), the first of its kind\n"
+        ),
+    }
 }
 
 /// The kind of an error rt answered a built piece's call with.
@@ -1162,13 +1183,19 @@ mod tests {
         assert_eq!(counted_code(&place), HEAP_TEXTURE_PLACE);
     }
 
-    /// The first refusal's line names the call, the piece and its code.
+    /// The first refusal's line names the call, the piece and its code, and what the call asked
+    /// of the piece where its site names it.
     #[test]
     fn the_first_refusal_s_line_names_the_call_and_the_code() {
         assert_eq!(
-            refusal_line(Unbuilt::Buffer, "newBufferWithDescriptor:"),
+            refusal_line(Unbuilt::Buffer, "newBufferWithDescriptor:", None),
             "reims-vgpu: newBufferWithDescriptor:: a Private buffer of bytes is not built on \
              metal2vulkan-runtime; refused (rt-unbuilt-buffer), the first of its kind\n"
+        );
+        assert_eq!(
+            refusal_line(Unbuilt::RateMap, "test", Some(&"a map of 2 layers")),
+            "reims-vgpu: test: a rasterization rate map is not built on metal2vulkan-runtime; \
+             refused (rt-unbuilt-rate-map), the first of its kind: a map of 2 layers\n"
         );
     }
 }

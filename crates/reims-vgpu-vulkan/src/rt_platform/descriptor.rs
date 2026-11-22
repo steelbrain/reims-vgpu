@@ -30,8 +30,13 @@
 //!     texture); store action options (rt builds none); and `defaultColorSampleCount` (SPI).
 //!   - **Unbuilt** ([`Unbuilt::RenderPass`]), counted at a set of other than Metal's default, and
 //!     kept nowhere, so the pass renders without them: an imageblock sample length, a threadgroup
-//!     memory length, a tile width or height, and sample positions. No rasterization rate map is
-//!     ever made to set.
+//!     memory length, a tile width or height, and sample positions. rt's pass renders its samples
+//!     at Vulkan's standard locations, which are Metal's default positions of 1, 2 and 4 samples
+//!     ([`METAL_DEFAULT_SAMPLE_POSITIONS`]), so a set of positions equal to Metal's defaults of
+//!     their count renders as Metal's does and counts nothing; a set that differs, and a set of
+//!     any other count, whose defaults are not measured, is counted, the process's first line of
+//!     the piece, where such a set writes it, naming the set's count and each position
+//!     ([`SamplePositions`]). No rasterization rate map is ever made to set.
 //! - **The rate map descriptor** is unbuilt ([`Unbuilt::RateMap`]): rt has no rate maps.
 
 use crate::core::platform::descriptor::{RenderPassDescriptor, TextureDescriptor};
@@ -48,7 +53,7 @@ use metal2vulkan_runtime as rt;
 
 use super::diag::{InBuffer, Point, Target};
 use super::tiled::Tiled;
-use super::unbuilt::{Unbuilt, refuse};
+use super::unbuilt::{Unbuilt, refuse, refuse_with};
 use super::{RtBuffer, RtObj, RtPlatform, RtTexture};
 
 /// `MTLTextureDescriptor`: the values set, as Metal's descriptor keeps them.
@@ -567,16 +572,60 @@ fn color_index(index: u64) -> Result<usize, Raise> {
     }
 }
 
+/// Metal's default sample positions of 1, 2 and 4 samples, as `getDefaultSamplePositions:count:`
+/// answers them (measured on the M3 Max, macOS 27: `guest/bundle/tools/samplepos_probe.m`, which
+/// compares the device's answers with these): Vulkan's standard locations of those counts, at
+/// which rt's pass renders. No other count's defaults are measured.
+const METAL_DEFAULT_SAMPLE_POSITIONS: [&[MtlSamplePosition]; 3] = [
+    &[MtlSamplePosition { x: 0.5, y: 0.5 }],
+    &[
+        MtlSamplePosition { x: 0.75, y: 0.75 },
+        MtlSamplePosition { x: 0.25, y: 0.25 },
+    ],
+    &[
+        MtlSamplePosition { x: 0.375, y: 0.125 },
+        MtlSamplePosition { x: 0.875, y: 0.375 },
+        MtlSamplePosition { x: 0.125, y: 0.625 },
+        MtlSamplePosition { x: 0.625, y: 0.875 },
+    ],
+];
+
+/// Whether `positions` are Metal's default positions of their count, each `f32` equal
+/// ([`METAL_DEFAULT_SAMPLE_POSITIONS`]): never at a count whose defaults are not measured.
+fn metal_default_sample_positions(positions: &[MtlSamplePosition]) -> bool {
+    METAL_DEFAULT_SAMPLE_POSITIONS.contains(&positions)
+}
+
+/// A set of sample positions as the line of a refusal names them: their count, then each
+/// `(x, y)`, each coordinate in the shortest form that reads back as its `f32`, so two sets that
+/// differ print differently.
+struct SamplePositions<'a>(&'a [MtlSamplePosition]);
+
+impl std::fmt::Display for SamplePositions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sample positions, count {}:", self.0.len())?;
+        for p in self.0 {
+            write!(f, " ({:?}, {:?})", p.x, p.y)?;
+        }
+        Ok(())
+    }
+}
+
 impl RenderPassDescriptor<RtPlatform> for RtObj<PassFields> {
-    /// Counted for any position ([`Unbuilt::RenderPass`]): rt's pass keeps none, and renders its
-    /// samples at Vulkan's standard locations, which rt requires of the device: Metal's default
-    /// positions of 1, 2 and 4 samples.
+    /// Counted ([`Unbuilt::RenderPass`]) where the positions differ from Metal's default positions
+    /// of their count ([`metal_default_sample_positions`]), and at a count whose defaults are not
+    /// measured: rt's pass keeps none, and renders its samples at Vulkan's standard locations,
+    /// which rt requires of the device: Metal's default positions of 1, 2 and 4 samples. A set
+    /// equal to them, or of none, renders as Metal's does, counting and writing nothing. The
+    /// process's first line of the piece, where a set writes it, names the set's count and each
+    /// position ([`SamplePositions`]).
     fn set_sample_positions(&self, positions: &[MtlSamplePosition]) -> RaiseResult<()> {
         let recorded_call =
             crate::recorder::rec_call!("setSamplePositions:count:", self, positions);
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<()> {
-            if !positions.is_empty() {
-                refuse(Unbuilt::RenderPass, "setSamplePositions:count:");
+            if !positions.is_empty() && !metal_default_sample_positions(positions) {
+                let set = SamplePositions(positions);
+                refuse_with(Unbuilt::RenderPass, "setSamplePositions:count:", &set);
             }
             Ok(())
         });
@@ -1352,8 +1401,112 @@ mod tests {
             tile_height: Some(16),
             ..PassSet::default()
         });
-        let positions = [MtlSamplePosition { x: 0.5, y: 0.5 }];
+        let positions = [
+            MtlSamplePosition { x: 0.25, y: 0.75 },
+            MtlSamplePosition { x: 0.75, y: 0.25 },
+        ];
         assert_eq!(pass.set_sample_positions(&positions), Ok(()));
         assert_eq!(counted(code), before + 5);
+    }
+
+    /// `(x, y)` as Metal's `MTLSamplePositionMake` makes it.
+    fn at(x: f32, y: f32) -> MtlSamplePosition {
+        MtlSamplePosition { x, y }
+    }
+
+    /// Metal's default positions of 1, 2 and 4 samples (measured on the M3 Max, macOS 27,
+    /// `guest/bundle/tools/samplepos_probe.m`) are what rt's pass renders at, so a set of them
+    /// counts nothing; a set that differs from its count's defaults by one position counts, as
+    /// does a set of their positions in another order, and a set of 8, whose defaults are not
+    /// measured.
+    #[test]
+    fn sample_positions_count_only_where_they_differ_from_metal_s_defaults() {
+        let pass = RtObj::new(PassFields::default());
+        let code = Unbuilt::RenderPass.code();
+        let before = counted(code);
+        let one = [at(0.5, 0.5)];
+        let two = [at(0.75, 0.75), at(0.25, 0.25)];
+        let four = [
+            at(0.375, 0.125),
+            at(0.875, 0.375),
+            at(0.125, 0.625),
+            at(0.625, 0.875),
+        ];
+        for defaults in [&one[..], &two, &four] {
+            assert_eq!(pass.set_sample_positions(defaults), Ok(()));
+        }
+        assert_eq!(pass.set_sample_positions(&[]), Ok(()));
+        assert_eq!(counted(code), before);
+
+        let mut moved = four;
+        moved[3] = at(0.625, 0.75);
+        assert_eq!(pass.set_sample_positions(&moved), Ok(()));
+        assert_eq!(counted(code), before + 1);
+        let swapped = [two[1], two[0]];
+        assert_eq!(pass.set_sample_positions(&swapped), Ok(()));
+        assert_eq!(counted(code), before + 2);
+        let eight = [at(0.5, 0.5); 8];
+        assert_eq!(pass.set_sample_positions(&eight), Ok(()));
+        assert_eq!(counted(code), before + 3);
+    }
+
+    /// A set's line names its count and each position as the `f32` it is, so sets one ulp apart
+    /// print apart.
+    #[test]
+    fn sample_positions_print_their_count_and_each_position() {
+        let set = [at(0.125, 0.625), at(0.875, 0.375)];
+        assert_eq!(
+            SamplePositions(&set).to_string(),
+            "sample positions, count 2: (0.125, 0.625) (0.875, 0.375)"
+        );
+        let half = SamplePositions(&[at(0.5, 0.5)]).to_string();
+        assert_eq!(half, "sample positions, count 1: (0.5, 0.5)");
+        let past_half = [at(f32::from_bits(0.5f32.to_bits() + 1), 0.5)];
+        let past_half = SamplePositions(&past_half).to_string();
+        assert_eq!(past_half, "sample positions, count 1: (0.50000006, 0.5)");
+    }
+
+    /// The process's first count of a render pass's unbuilt piece, from a set of sample positions
+    /// that differs from Metal's defaults, writes the piece's line naming the set's count and each
+    /// position; a set of Metal's defaults before it writes none, and a set after it none (in a
+    /// child, whose stderr is its own).
+    #[test]
+    fn the_first_differing_sample_positions_name_their_count_and_positions() {
+        use crate::core::testkit::death::{Expect, Options, Outcome, run};
+        run(
+            Expect::Any,
+            Options::default(),
+            module_path!(),
+            "the_first_differing_sample_positions_name_their_count_and_positions",
+            |_| {
+                let pass = RtObj::new(PassFields::default());
+                let defaults = [at(0.75, 0.75), at(0.25, 0.25)];
+                let left = [
+                    at(0.125, 0.125),
+                    at(0.375, 0.375),
+                    at(0.125, 0.625),
+                    at(0.375, 0.875),
+                ];
+                for set in [&defaults[..], &left, &[at(0.5, 0.25); 8]] {
+                    assert_eq!(pass.set_sample_positions(set), Ok(()));
+                }
+            },
+            |r| {
+                assert_eq!(r.outcome(), &Outcome::Returned, "{}", r.stderr());
+                let out = r.stderr();
+                let lines: Vec<&str> = (out.lines())
+                    .filter(|l| l.contains("rt-unbuilt-render-pass"))
+                    .collect();
+                // A line ends with what was written: the child's first line starts with
+                // libtest's own "test NAME ... ".
+                let said = "reims-vgpu: setSamplePositions:count:: a render pass's memory \
+                            lengths, tiles or samples is not built on metal2vulkan-runtime; \
+                            refused (rt-unbuilt-render-pass), the first of its kind: sample \
+                            positions, count 4: (0.125, 0.125) (0.375, 0.375) (0.125, 0.625) \
+                            (0.375, 0.875)";
+                assert_eq!(lines.len(), 1, "{out}");
+                assert!(lines.iter().all(|l| l.ends_with(said)), "{out}");
+            },
+        );
     }
 }
