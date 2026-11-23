@@ -41,7 +41,7 @@ pub fn file(src: &Path, dst: &Path, progress: &mut dyn FnMut(&str)) -> Result<()
     copy(src, dst, LONG, progress)
 }
 
-/// [`file`], where a full copy of more than `long` bytes of data is told.
+/// [`file()`], where a full copy of more than `long` bytes of data is told.
 fn copy(src: &Path, dst: &Path, long: u64, progress: &mut dyn FnMut(&str)) -> Result<()> {
     let fail = || format!("could not copy {} to {}", src.display(), dst.display());
     let refused = match clone(src, dst) {

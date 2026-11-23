@@ -88,7 +88,7 @@ pub fn beside() -> Option<PathBuf> {
 
 /// The commit cargo installed the reims-util at `bin` from, where it installed it from reims-util's
 /// repository: the install root holding `bin/` keeps cargo's record of each package it installed,
-/// `.crates2.json`, keyed "reims-util 0.1.0 (git+<repository>?rev=<rev>#<commit>)".
+/// `.crates2.json`, keyed `reims-util 0.1.0 (git+<repository>?rev=<rev>#<commit>)`.
 pub fn installed_commit(bin: &Path) -> Option<String> {
     let root = bin.parent()?.parent()?;
     let text = std::fs::read_to_string(root.join(".crates2.json")).ok()?;
