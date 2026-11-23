@@ -17,7 +17,9 @@
  * is an IOKit user client, and unlink outside Lockdown Mode. Neither call that sets a file's
  * times is on every list: setattrlist is on 11's alone, utimes on none, so RgfxTouchFile sets a
  * file's time with a write. tests/files_tests.mm runs each function, and the GL store, in a
- * sandbox that kills the process at every file system call some list leaves out.
+ * sandbox that kills the process at the file system calls some list leaves out (at 67 of the 97:
+ * the kernel lets 30 that write through), and tests/bundle_files_check.sh bans the bundle's
+ * imports of the library calls that make any of them.
  *
  * Each function returns 0, or the errno of the call that failed.
  */

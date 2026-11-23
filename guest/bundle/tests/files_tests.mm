@@ -7,11 +7,17 @@
  * and keeps its bytes.
  *
  * And the rule the bundle's writes keep (src/RgfxFiles.hpp): each function, and the GL store over
- * them, runs in a child of this binary under a sandbox that kills it (SIGKILL) at every file
- * system call some WebKit WebContent profile read leaves out (kLeftOut), as WebKit's profile on
- * macOS 11 and 12 kills its process at a call its list leaves out. The controls show that the
- * sandbox kills at such a call: utimes and setattrlist, which set a file's times, and
- * open_dprotected_np, which Foundation's atomic write makes on macOS 11.
+ * them, runs in a child of this binary under a sandbox that asks the kernel to kill it (SIGKILL)
+ * at every file system call some WebKit WebContent profile read leaves out (kLeftOut), as
+ * WebKit's profile on macOS 11 and 12 kills its process at a call its list leaves out. The kernel
+ * kills at 67 of those 97 calls (measured: macOS 27.0.1, arm64 and x86_64 under Rosetta, each
+ * call made under this sandbox). The other 30, link, mknod, chown, chflags, fchflags, fchown,
+ * utimes, futimes, pwrite, undelete, searchfs, setxattr, removexattr, fremovexattr, fsctl, ffsctl,
+ * chmod_extended, fchmod_extended, lchown, writev_nocancel, pwrite_nocancel, clonefileat,
+ * fchmodat, fchownat, linkat, unlinkat, fclonefileat, fs_snapshot, pwritev and pwritev_nocancel,
+ * run as if unlisted, so tests/bundle_files_check.sh bans the bundle's imports of the library
+ * calls that make them. The controls show that the sandbox kills: setattrlist, which sets a file's
+ * times, and open_dprotected_np, which Foundation's atomic write makes on macOS 11.
  */
 #include <dirent.h>
 #include <fcntl.h>
@@ -304,8 +310,8 @@ bool exitedZero(int status) { return WIFEXITED(status) && WEXITSTATUS(status) ==
 bool killed(int status) { return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL; }
 
 // Each function, and the GL store over them, makes only calls every WebContent list read takes:
-// under a sandbox that kills at every call some list leaves out, they run to their end. The
-// controls are killed.
+// under a sandbox that kills at the calls some list leaves out (all but the 30 the kernel lets
+// through, above), they run to their end. The controls are killed.
 void test_calls_every_webcontent_list_takes()
 {
 	Scratch s;
@@ -321,7 +327,7 @@ void test_calls_every_webcontent_list_takes()
 	if (!exitedZero(store))
 		std::fprintf(stderr, "--files-sandboxed store ended with status %d\n", store);
 	CHECK(exitedZero(store));
-	for (const char *control : {"utimes", "setattrlist", "open_dprotected_np"}) {
+	for (const char *control : {"setattrlist", "open_dprotected_np"}) {
 		const int status = runSandboxed(s.path, control);
 		if (!killed(status))
 			std::fprintf(stderr, "--files-sandboxed %s ended with status %d\n", control, status);
@@ -414,8 +420,6 @@ int rgfxFilesSandboxedCase(const char *directory, const char *name)
 		sandboxedFiles(dir);
 	else if (std::strcmp(name, "store") == 0)
 		sandboxedStore(dir);
-	else if (std::strcmp(name, "utimes") == 0)
-		utimes(control.c_str(), nullptr);
 	else if (std::strcmp(name, "setattrlist") == 0) {
 		struct attrlist list = {};
 		list.bitmapcount = ATTR_BIT_MAP_COUNT;

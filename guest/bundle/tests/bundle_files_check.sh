@@ -20,11 +20,12 @@ if [ -n "$paths" ]; then
 	echo "bundle_files_check: FAIL: a temporary path in $exe: $paths"
 	fails=1
 fi
-# open(2)'s family but open itself, the calls that set a file's times or attributes, and the
-# calls that rename, remove, make, clone or copy at a directory's descriptor or by other routes:
-# each is left out of some WebContent list (tests/files_tests.mm), or is a library call that makes
-# one.
-calls=$(nm -u "$exe" | grep -E '^_(openat|open_dprotected_np|openat_dprotected_np|guarded_open_np|guarded_open_dprotected_np|fopen|freopen|creat|mkstemp|mkstemps|mkostemp|mkostemps|mkdtemp|tmpfile|utimes|futimes|lutimes|utimensat|futimens|setattrlist|setattrlistat|fsetattrlist|renameat|renamex_np|renameatx_np|unlinkat|mkdirat|clonefile|clonefileat|fclonefileat|copyfile|fcopyfile|exchangedata|removefile)(\$.*)?$' || true)
+# open(2)'s family but open itself, the calls that set a file's times or attributes, the calls
+# that rename, remove, make, clone or copy at a directory's descriptor or by other routes, and the
+# library calls that make the 30 system calls the test's sandbox cannot kill at (links, owners,
+# flags, positioned writes, extended attributes, fsctl, ACL modes, snapshots): each is left out of
+# some WebContent list (tests/files_tests.mm), or is a library call that makes one.
+calls=$(nm -u "$exe" | grep -E '^_(openat|open_dprotected_np|openat_dprotected_np|guarded_open_np|guarded_open_dprotected_np|fopen|freopen|creat|mkstemp|mkstemps|mkostemp|mkostemps|mkdtemp|tmpfile|utimes|futimes|lutimes|utimensat|futimens|setattrlist|setattrlistat|fsetattrlist|renameat|renamex_np|renameatx_np|unlinkat|mkdirat|clonefile|clonefileat|fclonefileat|copyfile|fcopyfile|exchangedata|removefile|link|linkat|mknod|mknodat|chown|lchown|fchown|fchownat|chflags|lchflags|fchflags|chflagsat|pwrite|pwritev|undelete|searchfs|setxattr|removexattr|fremovexattr|fsctl|ffsctl|chmodx_np|fchmodx_np|fchmodat|fs_snapshot_[a-z_]+|writev\$NOCANCEL)(\$.*)?$' || true)
 if [ -n "$calls" ]; then
 	echo "bundle_files_check: FAIL: $exe imports" $calls
 	fails=1
