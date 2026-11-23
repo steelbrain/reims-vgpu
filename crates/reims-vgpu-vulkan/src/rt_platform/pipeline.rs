@@ -89,8 +89,8 @@ use super::stage::{StageKey, UNFILLED_AT_MAKE, counted, stage_of};
 use super::state::value;
 use super::texture::OwnIndices;
 use super::unbuilt::{
-    RtRefusal, refused_error_as, rt_refused_create, rt_refused_error, rt_refused_imageblock,
-    translation,
+    RtRefusal, naming_functions, refused_error_as, rt_refused_create, rt_refused_error,
+    rt_refused_imageblock, stage_function, translation,
 };
 use super::{RtObj, RtPlatform};
 
@@ -230,12 +230,20 @@ pub struct RtComputePipeline {
     written: Box<[u32]>,
     /// Its device's stage fills, which its makes ahead start.
     fills: Arc<StageFills<StageKey>>,
+    /// Its kernel, which the first line of each kind of rt's refusals of its dispatches names
+    /// (`super::compute`).
+    kernel: Option<metal2vulkan::library::Function>,
 }
 
 impl RtComputePipeline {
     /// rt's state.
     pub fn rt(&self) -> &rt::ComputePipelineState {
         &self.rt
+    }
+
+    /// Its kernel (`super::unbuilt::stage_function`).
+    pub(super) fn kernel(&self) -> Option<&metal2vulkan::library::Function> {
+        self.kernel.as_ref()
     }
 
     /// The samplers it numbers, in rt's order.
@@ -370,7 +378,8 @@ fn stage_input(input: &StageInputDesc) -> Result<StageInputDescriptor, String> {
 }
 
 /// rt's state of `descriptor`, by the creator `sel`, its samplers' indices taken (the module's
-/// docs). `Err` is the creator's `NSError`, counted under the refusal's kind.
+/// docs). `Err` is the creator's `NSError`, counted under the refusal's kind, the first line of
+/// each kind naming the kernel (`super::unbuilt::naming_functions`).
 fn make(
     device: &RtObj<RtDevice>,
     sel: &'static str,
@@ -393,7 +402,12 @@ fn make(
             stage::refused_for(&device.stage_fills().fill(stage, Site::Make));
         }
     }
-    let (rt, lease) = taking.made(sel, made)?;
+    let kernel = stage_function(&descriptor.kernel);
+    let named = match (&made, &kernel) {
+        (Err(_), Some(kernel)) => vec![("kernel", kernel.clone())],
+        _ => Vec::new(),
+    };
+    let (rt, lease) = naming_functions(named, || taking.made(sel, made))?;
     let written = written_slots(rt.texture_accesses());
     Ok(RtObj::new(RtComputePipeline {
         rt,
@@ -401,6 +415,7 @@ fn make(
         unique_identifier: next_identifier(),
         written,
         fills: Arc::clone(device.stage_fills()),
+        kernel,
     }))
 }
 

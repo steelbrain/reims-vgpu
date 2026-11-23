@@ -1679,8 +1679,10 @@ fn air_file(library: &rt::Library) -> String {
     format!("{hash}.metallib")
 }
 
-/// `f` as the lines name it: its library's file, its index and its name.
-fn function_name(f: &metal2vulkan::library::Function) -> String {
+/// `f` as the lines name it: its library's file, its index and its name. The first line of each
+/// kind of the refusals a site names functions at names them so too
+/// (`super::unbuilt::naming_functions`), for the user's log.
+pub(super) fn function_name(f: &metal2vulkan::library::Function) -> String {
     format!("{} #{} {}", air_file(f.library()), f.index(), f.info().name)
 }
 

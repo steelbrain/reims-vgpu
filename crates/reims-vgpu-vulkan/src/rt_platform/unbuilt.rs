@@ -25,11 +25,16 @@
 //! site names it, as structure alone: a texture's descriptor, a view's and the texture it views, a
 //! copy's kind, textures, places, buffer layout and what its two textures share, a pass's
 //! attachments and store actions, a draw's primitive type and its pipeline state's rasterization
-//! fields ([`refusal_detail`]). No name of the guest's (a function's, a symbol's, a library's, a
-//! label) is in a line or an `NSError` of this module's. A texture rt makes none of
-//! for its pixel format (`Gap::TextureFormat`) is counted under its format's own code instead,
-//! `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a boot's counts line gives each
-//! format number with its count. A pipeline state's imageblock length rt refuses
+//! fields ([`refusal_detail`]). rt's error is in a line or an `NSError` of this module's as
+//! structure alone: no name of the guest's it carries (a function's, a symbol's, a library's) is in
+//! one, nor a label. Where a refused dispatch, a refused draw or a pipeline state's refused make
+//! names the functions it runs ([`naming_functions`]), the first line of each kind written there
+//! names them, each by its role, its library's file, its index and its name, as the boot
+//! diagnostics name a refused state's AIR, so the user's log says which of the guest's functions rt
+//! refused; no `NSError`, and no line past the first of its kind, names them. A texture rt makes
+//! none of for its pixel format (`Gap::TextureFormat`) is counted under its format's own code
+//! instead, `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a boot's counts line gives
+//! each format number with its count. A pipeline state's imageblock length rt refuses
 //! (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
 //! `rt-refused-imageblock-length` ([`rt_refused_imageblock`]). So is a heap texture rt refuses on
 //! its place in its block where Metal places it in its heap, `rt-refused-heap-texture-place`
@@ -37,7 +42,9 @@
 //!
 //! [`Unbuilt::ALL`] is the list of what is still unbuilt. A piece leaves it when it is built.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use metal2vulkan_runtime as rt;
@@ -246,17 +253,18 @@ pub fn refused_error(piece: Unbuilt, sel: &'static str) -> NsErrorText {
 }
 
 /// The line of the process's first refusal of `piece`, at `sel`, and what the call asked of the
-/// piece, `what`, where it names it, after the line's `: ` as [`detail_line`] gives it.
+/// piece, `what`, where it names it, after the line's `: ` as [`detail_line`] gives it; then the
+/// functions its site names ([`named`]).
 fn refusal_line(piece: Unbuilt, sel: &str, what: Option<&dyn std::fmt::Display>) -> String {
-    let (what_piece, code) = (piece.what(), piece.code());
+    let (what_piece, code, named) = (piece.what(), piece.code(), named());
     match what {
         Some(what) => format!(
             "reims-vgpu: {sel}: {what_piece} is not built on metal2vulkan-runtime; refused \
-             ({code}), the first of its kind: {what}\n"
+             ({code}), the first of its kind: {what}{named}\n"
         ),
         None => format!(
             "reims-vgpu: {sel}: {what_piece} is not built on metal2vulkan-runtime; refused \
-             ({code}), the first of its kind\n"
+             ({code}), the first of its kind{named}\n"
         ),
     }
 }
@@ -434,14 +442,15 @@ fn first_named(name: String) -> bool {
 /// The line [`refusal_detail`] writes of rt's `error` of the call `sel`, of the kind `name`, and
 /// what the call asked of rt, `what`, where it names it: rt's error as [`said`] gives it and, but
 /// for the translator's refusal, whose fields can name the guest's functions and symbols, as it
-/// debugs (its variant's fields), the name, and the code of [`counted_code`].
+/// debugs (its variant's fields), the name, and the code of [`counted_code`]; then the functions
+/// its site names ([`named`]).
 fn detail_line(
     sel: &str,
     error: &rt::Error,
     name: &str,
     what: Option<&dyn std::fmt::Display>,
 ) -> String {
-    let (code, said) = (counted_code(error), said(error));
+    let (code, said, named) = (counted_code(error), said(error), named());
     let fields = match error {
         rt::Error::Translation { .. } => String::new(),
         _ => format!("; {error:?}"),
@@ -449,11 +458,11 @@ fn detail_line(
     match what {
         Some(what) => format!(
             "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({said}{fields}); the first of \
-             {name} ({code}): {what}\n"
+             {name} ({code}): {what}{named}\n"
         ),
         None => format!(
             "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({said}{fields}); the first of \
-             {name} ({code})\n"
+             {name} ({code}){named}\n"
         ),
     }
 }
@@ -513,16 +522,80 @@ fn counted_code(error: &rt::Error) -> std::borrow::Cow<'static, str> {
 
 /// Counts a refusal of the call `sel` of the kind `kind` under its code, and under the code of the
 /// make that runs on the thread where one names one (`crate::answer::refusing_as`), and the
-/// process's first of the kind writes its line on stderr, naming the call and `why`.
+/// process's first of the kind writes its line on stderr ([`kind_line`]), naming the call and
+/// `why`.
 pub fn refused_as(sel: &'static str, kind: RtRefusal, why: &dyn std::fmt::Display) {
     count_refusal(kind);
     if first(&SAID_RT, kind.at()) {
-        say(&format!(
-            "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({why}); refused ({}), the first \
-             of its kind\n",
-            kind.code()
-        ));
+        say(&kind_line(sel, kind, why));
     }
+}
+
+/// The line of the process's first refusal of the kind `kind` ([`refused_as`]): the call `sel`,
+/// `why`, the kind's code, and the functions its site names ([`named`]).
+fn kind_line(sel: &str, kind: RtRefusal, why: &dyn std::fmt::Display) -> String {
+    format!(
+        "reims-vgpu: {sel}: metal2vulkan-runtime refused it ({why}); refused ({}), the first of \
+         its kind{}\n",
+        kind.code(),
+        named()
+    )
+}
+
+/// The functions a refusal's site names on the first line of each kind it writes, each by its
+/// role in what runs it (`kernel`, `vertex`, `fragment`; `object` and `mesh` of a mesh state)
+/// ([`naming_functions`]).
+pub type Named = Vec<(&'static str, metal2vulkan::library::Function)>;
+
+thread_local! {
+    /// The functions the first lines written on the thread name, while a site that names them
+    /// runs ([`naming_functions`]).
+    static NAMING: RefCell<Named> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `refuse` with the first line of each kind it writes on this thread naming `functions`
+/// ([`named`]): a refused dispatch's kernel, a refused draw's or a refused state's functions, so
+/// the user's log says which of the guest's functions rt refused. With none, `refuse` runs under
+/// what a site around it names. It counts nothing, and no `NSError` names them.
+pub fn naming_functions<T>(functions: Named, refuse: impl FnOnce() -> T) -> T {
+    /// Puts back what the site around it named, however `refuse` returns.
+    struct Restore(Named);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let was = std::mem::take(&mut self.0);
+            NAMING.with(|n| *n.borrow_mut() = was);
+        }
+    }
+    if functions.is_empty() {
+        return refuse();
+    }
+    let _restore = Restore(NAMING.with(|n| n.replace(functions)));
+    refuse()
+}
+
+/// The function of a stage's `source` that [`naming_functions`] names: none of a compiled
+/// function's.
+pub fn stage_function(source: &rt::StageSource) -> Option<metal2vulkan::library::Function> {
+    match source {
+        rt::StageSource::Function(f) => Some(f.function.clone()),
+        rt::StageSource::Compiled(_) => None,
+    }
+}
+
+/// The tail of a first line of the functions [`naming_functions`] names on this thread: `; ` and
+/// each one's role and name as the boot diagnostics name a refused state's functions
+/// (`super::diag::function_name`: its library's file, `<its SHA-256's first 16 hex
+/// digits>.metallib`, its index and its name), split by `, `; nothing where none is named.
+fn named() -> String {
+    NAMING.with(|n| {
+        let mut out = String::new();
+        for (at, (role, function)) in n.borrow().iter().enumerate() {
+            let split = if at == 0 { "; " } else { ", " };
+            let name = super::diag::function_name(function);
+            let _ = write!(out, "{split}{role} {name}");
+        }
+        out
+    })
 }
 
 /// Counts a creator's refusal of the kind `kind` again, with no line: a call answered from a
@@ -1065,10 +1138,11 @@ mod tests {
     }
 
     /// No line the library writes of the translator's refusals, nor the `NSError` a creator
-    /// answers of one, names what the guest named: refusals whose display names a function, a
-    /// symbol and an entry point (`secret_fn`, a name of our own) write the first line of their
-    /// kind, the first line of each name and an `NSError` each, which give the refusal as
-    /// structure alone (in a child, whose stderr is its own)
+    /// answers of one, names what the guest named in the refusal: refusals whose display names a
+    /// function, a symbol and an entry point (`secret_fn`, a name of our own) write the first line
+    /// of their kind, the first line of each name and an `NSError` each, which give the refusal as
+    /// structure alone (in a child, whose stderr is its own). What a site names of the guest's is
+    /// its functions alone, on its first lines (`a_site_s_functions_are_named_on_its_first_lines`).
     #[test]
     fn no_line_of_a_translator_refusal_names_the_guest_s_function() {
         use crate::core::testkit::death::{Expect, Options, Outcome, run};
@@ -1189,6 +1263,77 @@ mod tests {
             refusal_line(Unbuilt::RateMap, "test", Some(&"a map of 2 layers")),
             "reims-vgpu: test: a rasterization rate map is not built on metal2vulkan-runtime; \
              refused (rt-unbuilt-rate-map), the first of its kind: a map of 2 layers\n"
+        );
+    }
+
+    /// Where a site names functions ([`naming_functions`]), the first line of each kind written
+    /// there names each after what the line names, by its role, its library's file, its index and
+    /// its name; a site inside it names its own, and one that names none leaves its names. No line
+    /// past the site, and no `NSError`, names them (functions of our own: `add_one`, and
+    /// `render_small` and `render_color` of two libraries).
+    #[test]
+    fn a_site_s_functions_are_named_on_its_first_lines() {
+        const ADD: &[u8] = include_bytes!("../../../../tests/shaders/compute_add.metallib");
+        const SMALL: &[u8] = include_bytes!("../../../../tests/shaders/render_small.metallib");
+        const COLOR: &[u8] = include_bytes!("../../../../tests/shaders/render_color.metallib");
+        let function = |bytes: &[u8], name: &str| {
+            let library = rt::Library::from_metallib(bytes).expect("a library");
+            let hash: String = (library.content_hash().iter().take(8))
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let function = library.function(name).expect("the function");
+            let said = format!("{hash}.metallib #{} {name}", function.index());
+            (function, said)
+        };
+        let (kernel, kernel_said) = function(ADD, "add_one");
+        let (vertex, vertex_said) = function(SMALL, "render_small");
+        let (fragment, fragment_said) = function(COLOR, "render_color");
+        let sel = "dispatchThreads:threadsPerThreadgroup:";
+        let wide = rt::Error::Unsupported(rt::Gap::Draw {
+            kind: rt::DrawKind::LineWidth,
+        });
+        let lines = || {
+            [
+                kind_line(sel, RtRefusal::Gap, &said(&wide)),
+                detail_line(sel, &wide, "Draw-LineWidth", Some(&"a draw")),
+                refusal_line(Unbuilt::ComputeCommand, sel, None),
+            ]
+        };
+        let plain = lines();
+        assert_eq!(
+            plain[0],
+            "reims-vgpu: dispatchThreads:threadsPerThreadgroup:: metal2vulkan-runtime refused it \
+             (a draw with LineWidth is not built); refused (rt-refused-gap), the first of its \
+             kind\n"
+        );
+        let with = |tail: &str| {
+            let mut lines = plain.clone();
+            for line in &mut lines {
+                line.insert_str(line.len() - 1, tail);
+            }
+            lines
+        };
+        let kernel_tail = format!("; kernel {kernel_said}");
+        assert_eq!(
+            naming_functions(vec![("kernel", kernel.clone())], lines),
+            with(&kernel_tail)
+        );
+        let drawn = vec![("vertex", vertex), ("fragment", fragment)];
+        let draw_tail = format!("; vertex {vertex_said}, fragment {fragment_said}");
+        let (inner, around) = naming_functions(vec![("kernel", kernel.clone())], || {
+            let inner = naming_functions(drawn, lines);
+            assert_eq!(naming_functions(Vec::new(), lines), with(&kernel_tail));
+            (inner, lines())
+        });
+        assert_eq!(inner, with(&draw_tail));
+        assert_eq!(around, with(&kernel_tail));
+        assert_eq!(lines(), plain);
+        let sel = "newComputePipelineStateWithFunction:error:";
+        let answered = naming_functions(vec![("kernel", kernel)], || rt_refused_error(sel, &wide));
+        assert_eq!(
+            answered.description,
+            "metal2vulkan-runtime refused it: a draw with LineWidth is not built \
+             (rt-refused-gap)"
         );
     }
 }

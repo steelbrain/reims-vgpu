@@ -67,7 +67,10 @@ use super::pipeline::{
     specialized, writes, written_slots,
 };
 use super::state::value;
-use super::unbuilt::{RtRefusal, Unbuilt, refused_error, refused_error_as, rt_refused_imageblock};
+use super::unbuilt::{
+    Named, RtRefusal, Unbuilt, naming_functions, refused_error, refused_error_as,
+    rt_refused_imageblock, stage_function,
+};
 use super::{RtObj, RtPlatform};
 
 /// `newRenderPipelineStateWithDescriptor:error:`.
@@ -101,6 +104,9 @@ pub struct RtRenderPipeline {
     /// Its rasterization fields, for the first line of each kind of rt's refusals of a draw of it
     /// (`super::render`).
     raster: Raster,
+    /// Its vertex and fragment functions, by their roles, which the first line of each kind of
+    /// rt's refusals of a draw of it names (`super::render`).
+    functions: Named,
 }
 
 /// A render pipeline state's rasterization fields as its descriptor set them, for the first line
@@ -160,6 +166,11 @@ impl RtRenderPipeline {
     /// Its rasterization fields.
     pub fn raster(&self) -> Raster {
         self.raster
+    }
+
+    /// Its functions, by their roles (`super::unbuilt::naming_functions`).
+    pub(super) fn functions(&self) -> Named {
+        self.functions.clone()
     }
 
     /// The samplers it numbers, in rt's order.
@@ -225,12 +236,21 @@ pub fn of_descriptor(
     make(device, &d, (formats, samples))
 }
 
-/// Unbuilt ([`Unbuilt::MeshPipeline`]): the creator's `NSError`.
+/// Unbuilt ([`Unbuilt::MeshPipeline`]): the creator's `NSError`, the first refusal's line naming
+/// the descriptor's functions (`super::unbuilt::naming_functions`).
 pub fn of_mesh_descriptor(
     desc: &FullMeshRenderPipelineDesc<'_, RtPlatform>,
 ) -> Result<RtObj<RtRenderPipeline>, NsErrorText> {
-    let _ = desc;
-    Err(refused_error(Unbuilt::MeshPipeline, WITH_MESH_DESCRIPTOR))
+    let stages = [
+        ("object", desc.object),
+        ("mesh", Some(desc.mesh)),
+        ("fragment", desc.fragment),
+    ];
+    let named = (stages.into_iter())
+        .filter_map(|(role, f)| f.map(|f| (role, f.linked().function.clone())))
+        .collect();
+    let refused = || refused_error(Unbuilt::MeshPipeline, WITH_MESH_DESCRIPTOR);
+    Err(naming_functions(named, refused))
 }
 
 /// The `NSError` of Metal's refusal of the value named by `why`, counted.
@@ -390,7 +410,8 @@ fn tessellation(t: &TessellationDesc) -> Result<Option<TessellationDescriptor>, 
 
 /// rt's state of `descriptor`, its samplers' indices taken (the module's docs), of colour formats
 /// and sample count `colors` ([`RtRenderPipeline::colors`]). `Err` is the creator's `NSError`,
-/// counted under the refusal's kind.
+/// counted under the refusal's kind, the first line of each kind naming its functions
+/// (`super::unbuilt::naming_functions`).
 fn make(
     device: &RtObj<RtDevice>,
     descriptor: &rt::RenderPipelineDescriptor,
@@ -406,7 +427,19 @@ fn make(
     if let Err(error) = &made {
         super::diag::keep_refused_render(WITH_DESCRIPTOR, error, descriptor);
     }
-    let (rt, lease) = taking.made(WITH_DESCRIPTOR, made)?;
+    let stages = [
+        ("vertex", stage_function(&descriptor.vertex)),
+        ("fragment", descriptor.fragment.as_ref().and_then(stage_function)),
+    ];
+    let functions: Named = (stages.into_iter())
+        .filter_map(|(role, f)| f.map(|f| (role, f)))
+        .collect();
+    let named = if made.is_err() {
+        functions.clone()
+    } else {
+        Vec::new()
+    };
+    let (rt, lease) = naming_functions(named, || taking.made(WITH_DESCRIPTOR, made))?;
     let vertex_written = written_slots(rt.texture_accesses(rt::Stage::Vertex));
     let fragment_written = written_slots(rt.texture_accesses(rt::Stage::Fragment));
     Ok(RtObj::new(RtRenderPipeline {
@@ -417,6 +450,7 @@ fn make(
         fragment_written,
         colors,
         raster: Raster::of(descriptor),
+        functions,
     }))
 }
 

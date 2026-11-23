@@ -60,7 +60,9 @@
 //!   ([`Kept::fail_internal`]); after a cancelled fill it is rt's refusal.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
-//! before the refused one are bound.
+//! before the refused one are bound. The first line of each kind of rt's refusals of a dispatch,
+//! and of an unbuilt one, names the kernel of the pipeline state set
+//! (`super::unbuilt::naming_functions`).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -82,7 +84,7 @@ use super::copied::Used;
 use super::diag::Use;
 use super::fault::{EncoderKind, EncoderNames, Naming};
 use super::stage::{StageKey, skipped, unfilled_at_dispatch};
-use super::unbuilt::{Unbuilt, refuse};
+use super::unbuilt::{Unbuilt, naming_functions, refuse};
 use super::{RtObj, RtPlatform};
 
 /// An index, a length or a size past rt's 32 bits.
@@ -135,6 +137,9 @@ struct Open {
     /// The pipeline state set last, which the command buffer keeps: none before one is set, or
     /// once nil is.
     pipeline: Option<ObjId>,
+    /// The kernel of the pipeline state set last, which the first line of each kind of rt's
+    /// refusals of a dispatch names (`super::unbuilt::naming_functions`).
+    kernel: Option<metal2vulkan::library::Function>,
     /// What its commands name, for a lost device's lines (`super::fault`'s docs, "The command
     /// buffers in flight"), which join its command buffer's as it ends or goes.
     naming: Naming,
@@ -155,6 +160,7 @@ impl RtComputeEncoder {
             open: Mutex::new(Open {
                 rt: Some(encoder),
                 pipeline: None,
+                kernel: None,
                 naming: Naming::new(kept.encoded(), names),
             }),
             mark,
@@ -183,6 +189,7 @@ impl RtComputeEncoder {
         let Open {
             rt: encoder,
             pipeline,
+            kernel,
             ..
         } = open;
         let Some(e) = encoder.as_mut() else {
@@ -276,6 +283,7 @@ impl RtComputeEncoder {
             ComputeCmd::SetComputePipelineState { state } => {
                 let Some(state) = state else {
                     *pipeline = None;
+                    *kernel = None;
                     return Ok(());
                 };
                 e.set_compute_pipeline_state(state.rt())?;
@@ -283,6 +291,7 @@ impl RtComputeEncoder {
                 if *pipeline != Some(id) {
                     self.kept.keep(id, Box::new(state.clone_ref()));
                     *pipeline = Some(id);
+                    *kernel = state.kernel().cloned();
                 }
             }
             ComputeCmd::SetSamplerStatesLodClamps {
@@ -378,6 +387,17 @@ impl RtComputeEncoder {
         }
         Ok(())
     }
+}
+
+/// Whether `cmd` is a dispatch, which runs the kernel of the pipeline state set.
+fn dispatches(cmd: &ComputeCmd<'_, RtPlatform>) -> bool {
+    matches!(
+        cmd,
+        ComputeCmd::DispatchThreadgroups { .. }
+            | ComputeCmd::DispatchThreadgroupsIndirect { .. }
+            | ComputeCmd::DispatchThreads { .. }
+            | ComputeCmd::DispatchThreadsIndirect { .. }
+    )
 }
 
 /// `Ok` where a pipeline state is set ([`Open::pipeline`]); a dispatch without one is Metal's
@@ -532,19 +552,26 @@ impl ComputeEncoder<RtPlatform> for RtObj<RtComputeEncoder> {
             let _ = on;
             let sel = cmd.selector();
             let ending = matches!(cmd, ComputeCmd::EndEncoding);
+            let dispatch = dispatches(&cmd);
             note_copies(self.kept.copies(), &cmd);
             let mut open = self.open.lock();
             if let Some(names) = open.naming.names() {
                 note_names(names, &cmd);
             }
             let stopped = self.command(&mut open, cmd).err();
+            let functions = match (&stopped, &open.kernel) {
+                (Some(Stop::Rt(_) | Stop::Unbuilt(_)), Some(kernel)) if dispatch => {
+                    vec![("kernel", kernel.clone())]
+                }
+                _ => Vec::new(),
+            };
             if ending && let Some(e) = open.rt.take() {
                 e.end_encoding();
                 self.mark.end();
                 open.naming.end();
             }
             drop(open);
-            report(sel, stopped);
+            naming_functions(functions, || report(sel, stopped));
             Ok(())
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);

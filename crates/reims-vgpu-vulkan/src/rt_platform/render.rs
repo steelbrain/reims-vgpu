@@ -86,7 +86,9 @@
 //!   command after `endEncoding`.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
-//! before the refused one are bound.
+//! before the refused one are bound. The first line of each kind of rt's refusals of a draw of
+//! primitives or patches, and of an unbuilt one, names the vertex and fragment functions of the
+//! pipeline state set (`super::unbuilt::naming_functions`).
 
 use metal2vulkan::metal::{
     CullMode, DepthClipMode, IndexType, PrimitiveType, TriangleFillMode, Winding,
@@ -107,7 +109,7 @@ use super::diag::{self, Bound, Target, Use};
 use super::fault::{EncoderKind, EncoderNames, Naming};
 use super::render_pipeline::{Raster, RtRenderPipeline};
 use super::texture::RtTexture;
-use super::unbuilt::{Unbuilt, refuse};
+use super::unbuilt::{Unbuilt, naming_functions, refuse};
 use super::{RtBuffer, RtObj, RtPlatform};
 
 /// A count, a base or an index past rt's 32 bits.
@@ -678,6 +680,19 @@ fn drawn_primitive(cmd: &RenderCmd<'_, RtPlatform>) -> Option<u64> {
     }
 }
 
+/// Whether `cmd` is a draw of primitives or patches, which runs the vertex and fragment functions
+/// of the pipeline state set.
+fn draws(cmd: &RenderCmd<'_, RtPlatform>) -> bool {
+    drawn_primitive(cmd).is_some()
+        || matches!(
+            cmd,
+            RenderCmd::DrawPatches { .. }
+                | RenderCmd::DrawPatchesIndirect { .. }
+                | RenderCmd::DrawIndexedPatches { .. }
+                | RenderCmd::DrawIndexedPatchesIndirect { .. }
+        )
+}
+
 /// What an execution `cmd` asks of rt ([`super::icb::ExecutionDetail`]), for the process's first
 /// line of each kind of rt's refusals of one; none for a command other than an execution.
 fn execution(cmd: &RenderCmd<'_, RtPlatform>) -> Option<super::icb::ExecutionDetail> {
@@ -925,16 +940,23 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             note_copies(self.kept.copies(), &cmd);
             let primitive = drawn_primitive(&cmd);
             let execution = execution(&cmd);
+            let draw = draws(&cmd);
             let mut open = self.open.lock();
             if let Some(names) = open.naming.names() {
                 note_names(names, &cmd);
             }
             let stopped = self.command(&mut open, cmd).err();
+            let functions = match (&stopped, &open.seen.state) {
+                (Some(Stop::Rt(_) | Stop::Unbuilt(_)), Some(state)) if draw => state.functions(),
+                _ => Vec::new(),
+            };
             if let Some(Stop::Rt(error @ rt::Error::Unsupported(rt::Gap::Draw { kind }))) = &stopped
             {
                 let raster = open.seen.state.as_ref().map(|state| state.raster());
                 let what = DrawDetail { primitive, raster };
-                super::unbuilt::refusal_detail(sel, error, Some(&what));
+                naming_functions(functions.clone(), || {
+                    super::unbuilt::refusal_detail(sel, error, Some(&what));
+                });
                 match kind {
                     rt::DrawKind::AttachmentRead => self.attachment_read(&open.seen),
                     rt::DrawKind::FetchedAttachment => self.fetched_attachment(&open.seen),
@@ -958,7 +980,7 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
                 open.naming.end();
             }
             drop(open);
-            report(sel, stopped);
+            naming_functions(functions, || report(sel, stopped));
             Ok(())
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
