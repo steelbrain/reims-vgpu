@@ -543,7 +543,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let pool_host = pool_host(&config)?;
             let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)
                 .map_err(|_| Error::HostResources)?;
-            let region = Arc::new(Region::new(size).ok_or(Error::HostResources)?);
+            let region = (platform.graphics_region(size))
+                .or_else(|| Region::new(size))
+                .ok_or(Error::HostResources)?;
+            let region = Arc::new(region);
             // The device the decoder drives, and its caps blob, which the guest bundle reads
             // before it makes any queue. A host with no GPU device cannot run the lane.
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;

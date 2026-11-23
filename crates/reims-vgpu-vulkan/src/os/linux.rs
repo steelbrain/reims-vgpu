@@ -30,7 +30,7 @@ pub(crate) use import::{imports_need_files, several_dma_bufs_refused};
 pub(crate) use import::{learn_dma_buf_granule, views_need_files};
 pub use lease::{GuestMemoryLease, lease_guest_memory};
 pub use threads::LinuxThreads;
-pub use vm::LinuxVm;
+pub use vm::{LinuxVm, RegionMemory};
 
 #[cfg(test)]
 pub(crate) use vm::allocate_aliasable;

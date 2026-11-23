@@ -762,8 +762,9 @@ impl DeviceMemory for RegionMemory {
     }
 
     /// A dma-buf of the block's pages behind `ranges`, where the Vulkan platform's backing table
-    /// knows the files behind the region's mapping (`platform/vulkan/lent_memory.rs`); refused
-    /// where it does not. The region stays mapped while it lives.
+    /// knows the file behind the region's mapping (the platform's region on Linux,
+    /// `reims_vgpu_vulkan::os::RegionMemory`); refused where it does not, as for the region's own
+    /// private anonymous memory. The region stays mapped while it lives.
     #[cfg(target_os = "linux")]
     fn dma_buf_of(&self, ranges: &[(usize, usize)]) -> Result<SurfaceDmaBuf, DmaBufError> {
         let first = usize::try_from(self.first)

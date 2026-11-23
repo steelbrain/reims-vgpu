@@ -7,9 +7,10 @@
 //! dma-bufs are Linux's alone.
 //!
 //! Two kinds of entry:
-//! - **Registrations** of memory the library does not map itself: the guest's RAM, a shared
-//!   mapping of the files the host names in its memory map (the `guest_memory` lease of the
-//!   memory map's device).
+//! - **Registrations** of memory no view of the OS's VM maps: the guest's RAM, a shared mapping
+//!   of the files the host names in its memory map (the `guest_memory` lease of the memory map's
+//!   device), and on Linux a graphics device's region, a shared mapping of a memfd of the
+//!   library's (`super::linux`'s `RegionMemory`), which only its holder unmaps.
 //!   One registered again over the same descriptor and offset is counted, and goes with the
 //!   last. The C API duplicates the host's descriptors for each device it makes, so devices over
 //!   the same RAM register it each under its own: a byte resolves through the first registration
@@ -691,14 +692,15 @@ pub(crate) struct Registration {
 
 impl Registration {
     /// Registers `length` bytes from `first` as showing `backing`: counted again where the same
-    /// bytes are registered over the same file and offset.
-    #[cfg(test)]
+    /// bytes are registered over the same file and offset. A graphics device's region on Linux
+    /// (`super::linux`'s `RegionMemory`), and the tests'.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
     pub(crate) fn new(first: u64, length: u64, backing: Backing) -> Registration {
         Registration::made(first, length, backing, false)
     }
 
-    /// The tests' `Registration::new`, of a range of the guest's RAM (the OS's lease of it,
-    /// Linux's `super::linux::lease`).
+    /// As [`Registration::new`], of a range of the guest's RAM (the OS's lease of it, Linux's
+    /// `super::linux::lease`).
     pub(crate) fn guest_ram(first: u64, length: u64, backing: Backing) -> Registration {
         Registration::made(first, length, backing, true)
     }

@@ -158,6 +158,15 @@ pub trait ApiPlatform: Platform {
         Ok(())
     }
 
+    /// A graphics device's region of `len` bytes (BAR 2, `reims_vgpu_graphics::region::Region`)
+    /// in memory of the platform's own, where its GPUs import that better than the region's own
+    /// private anonymous memory; `None` by default, and where the host gives none, for the
+    /// region's own ([`crate::GraphicsDevice::with_platform`]).
+    fn graphics_region(&self, len: usize) -> Option<reims_vgpu_graphics::region::Region> {
+        let _ = len;
+        None
+    }
+
     /// The host's hardware video for a graphics device on `device`, the guest's video driver's
     /// (`crate::GraphicsVideo`), whose host APIs' threads and waits are `runtime`'s; `None` where
     /// the platform has none, and by default.
@@ -172,13 +181,16 @@ pub trait ApiPlatform: Platform {
 }
 
 /// A graphics device's region of `len` bytes for a test on a platform, as the device takes one
-/// ([`crate::GraphicsDevice::with_platform`]): the region's own anonymous mapping.
+/// ([`crate::GraphicsDevice::with_platform`]): the platform's ([`ApiPlatform::graphics_region`]),
+/// else the region's own private anonymous mapping.
 #[cfg(test)]
 pub(crate) fn test_region<P: ApiPlatform>(
-    _platform: &P,
+    platform: &P,
     len: usize,
 ) -> reims_vgpu_graphics::region::Region {
-    reims_vgpu_graphics::region::Region::new(len).expect("a region")
+    (platform.graphics_region(len))
+        .or_else(|| reims_vgpu_graphics::region::Region::new(len))
+        .expect("a region")
 }
 
 /// This process's count of the degradation kind `code`

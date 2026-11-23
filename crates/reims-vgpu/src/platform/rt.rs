@@ -83,6 +83,22 @@ impl ApiPlatform for RtPlatform {
         self.let_go_of_device(bound)
     }
 
+    /// On Linux a shared mapping of a memfd of the library's, registered in its backing table
+    /// (`reims_vgpu_vulkan::os::RegionMemory`): RADV takes no pointer to it and imports dma-bufs
+    /// of its blocks' pages (`rt_platform::buffer`, "Dma-bufs of the pages"), which spares each of
+    /// the device's submissions amdgpu's walk of every page of a userptr import; a device that
+    /// takes the pointer imports it by pointer. None on macOS and Windows, whose region is its own
+    /// private memory.
+    #[cfg(target_os = "linux")]
+    fn graphics_region(&self, len: usize) -> Option<reims_vgpu_graphics::region::Region> {
+        let memory = reims_vgpu_vulkan::os::RegionMemory::new(len.to_u64())?;
+        let base = memory.base();
+        // SAFETY: the memory's `len` bytes from its page-aligned first byte are fresh zeros of a
+        // mapping of its own, read and write, which nothing else reaches and which it unmaps only
+        // as it drops, after the region's last use.
+        unsafe { reims_vgpu_graphics::region::Region::over(base, len, Box::new(memory)) }
+    }
+
     /// The whole texture, through rt's `getBytes:` (`RtTexture::read_pixels`); `dst` is left as
     /// it was where rt refuses it, counted.
     fn read_pixels(

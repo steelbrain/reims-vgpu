@@ -12,7 +12,8 @@
 //!   file, so no view can be made of it: it serves reservations and the address space views are
 //!   mapped over. A range a view must be made of comes from [`allocate_aliasable`], a shared
 //!   mapping of a file of its own (core's `HostVm::allocate_aliasable`), as a dma-buf takes file
-//!   pages alone: the tests' stand-in for guest memory is one.
+//!   pages alone: the tests' stand-in for guest memory is one. A graphics device's region is such
+//!   a mapping too, registered in the table rather than recorded as a run ([`RegionMemory`]).
 //! - **`remap_shared_overwrite`** fails with `KERN_INVALID_ADDRESS` where a byte of the source
 //!   has no file behind it, as Mach fails for an unmapped source, before it maps anything. A
 //!   piece the kernel refuses fails the call with nothing changed, as Mach's remap is all or
@@ -520,6 +521,75 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
         files::record(at, length, backing, prot);
         Ok(HostAddr::from_addr(at.to_usize()))
     })
+}
+
+/// A graphics device's region (BAR 2, `reims-vgpu-graphics`'s `Region`) in memory of the
+/// library's own: a shared mapping, read and write, of a memfd of its own ([`memfd`], sealed
+/// against growing and shrinking), registered in the backing table ([`files::Registration`]) so
+/// that an import of its pages finds their file, and unmapped only as it drops.
+///
+/// A device that takes no pointer to file pages imports dma-bufs of them instead (the rt
+/// platform's `buffer` module, "Dma-bufs of the pages"), as RADV refuses every page with a file
+/// behind it. RADV imports host memory by pointer as an amdgpu userptr, whose pages amdgpu walks
+/// (`hmm_range_fault`) in each submission of the device's while the import lives, where a dma-buf
+/// import costs a submission the same at any size (**measured** 2026-11-07, Radeon 780M, RADV of
+/// Mesa 26.2.6, Linux 7.3.1, raw Vulkan, the median of 300 empty submissions: 6.9 us with none
+/// held; 256 MiB of pointer imports in 4 pieces 90.7 us, in 128 pieces 171 us; 256 MiB of
+/// dma-buf imports in 4 pieces 12.2 us, in 128 pieces 66.8 us). The region's blocks are the
+/// guest's Shared buffers, upload chunks, heaps and the displays' scanouts, each imported as its
+/// buffer or heap is made. A device that takes the pointer imports it by pointer, as it did the
+/// private anonymous memory the region is where the platform gives none.
+///
+/// As private anonymous memory is, the file is zeros, and a page of it takes host memory only when
+/// something first touches it. A registration, not a run: no fold of the views remaps it, and the
+/// views' budget does not count its one mapping, which the budget's reserve covers, as it covers
+/// the leases of the guest's RAM.
+#[derive(Debug)]
+pub struct RegionMemory {
+    first: u64,
+    length: u64,
+    registration: Option<files::Registration>,
+}
+
+impl RegionMemory {
+    /// `len` bytes of zeros, rounded up to whole pages; `None` for none, or where the kernel gives
+    /// no file ([`memfd`], counted as the host's memory running out) or no mapping of it.
+    pub fn new(len: u64) -> Option<RegionMemory> {
+        let (_, length) = pages(HostAddr::NULL, len)?;
+        if length == 0 {
+            return None;
+        }
+        let (first, backing) = reclaiming(|| {
+            let backing = Backing {
+                file: memfd(length).ok()?,
+                offset: 0,
+            };
+            let first = file(None, length, &backing, VmProt::READ | VmProt::WRITE).ok()?;
+            Some((first, backing))
+        })?;
+        Some(RegionMemory {
+            first,
+            length,
+            registration: Some(files::Registration::new(first, length, backing)),
+        })
+    }
+
+    /// Its first byte.
+    pub fn base(&self) -> *mut u8 {
+        ptr(self.first).cast()
+    }
+}
+
+impl Drop for RegionMemory {
+    /// Drops the registration, then the mapping, which `LinuxVm::deallocate` refuses as it does
+    /// every registered byte. It goes with the region's last reference, after every import of its
+    /// pages: a no-copy buffer's deallocator, which holds the region (the scanout's,
+    /// `reims-vgpu`'s `graphics::sink`), runs once the runtime has freed the buffer's import.
+    fn drop(&mut self) {
+        drop(self.registration.take());
+        // SAFETY: the mapping `new` made, which nothing reaches after this.
+        unsafe { libc::munmap(ptr(self.first), self.length.to_usize()) };
+    }
 }
 
 /// A new file of `length` bytes of zeros in memory (`memfd_create`), sealed against growing and
@@ -1144,9 +1214,9 @@ impl HostVm for LinuxVm {
     }
 
     /// `munmap` of the range's pages, which show no file from then on; none for no bytes (module
-    /// docs). A range of memory the library registered and does not own (the guest's RAM) is
-    /// refused, unmapped by nothing. It goes a piece at a time ([`DEALLOCATE_PIECE`]), each
-    /// forgotten and then unmapped.
+    /// docs). A range of registered memory, which only its holder unmaps (the guest's RAM, a
+    /// graphics device's region, [`RegionMemory`]), is refused, unmapped by nothing. It goes a
+    /// piece at a time ([`DEALLOCATE_PIECE`]), each forgotten and then unmapped.
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn {
         if len == 0 {
             return KernReturn::SUCCESS;
@@ -1885,5 +1955,89 @@ pub(crate) mod tests {
         assert!(!at_the_limit("65527", "65530"));
         assert!(!at_the_limit("?", "65530"));
         assert!(!at_the_limit("65530", "?"));
+    }
+
+    /// The permissions `/proc/self/maps` lists for the mapping that holds `at`, as `rw-s`.
+    fn perms_at(at: u64) -> Option<String> {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        maps.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (low, high) = fields.next()?.split_once('-')?;
+            let low = u64::from_str_radix(low, 16).ok()?;
+            let high = u64::from_str_radix(high, 16).ok()?;
+            (low..high)
+                .contains(&at)
+                .then(|| fields.next().unwrap_or("").to_owned())
+        })
+    }
+
+    /// A graphics device's region's memory is one shared mapping, read and write, of a memfd of
+    /// its own sealed against growing and shrinking, from the file's first byte: zeros, which a
+    /// write through the mapping changes in the file, registered in the table while it lives, so
+    /// that its pages resolve to the file, refused by `deallocate`, and forgotten and unmapped as it
+    /// drops; none for no bytes
+    #[test]
+    fn a_region_s_memory_is_a_sealed_memfd_mapped_shared() {
+        let len = 16 * page();
+        let memory = RegionMemory::new(len - 100).expect("a region's memory");
+        let first = memory.base().addr().to_u64();
+        assert!(first.is_multiple_of(page()));
+        let at = HostAddr::from_addr(first.to_usize());
+        assert!((0..len).all(|off| read(at, off) == 0));
+        assert_eq!(perms_at(first).as_deref(), Some("rw-s"));
+        assert_eq!(perms_at(first + len - 1).as_deref(), Some("rw-s"));
+
+        let pieces = files::pieces(first, len).expect("the region's pages registered");
+        assert_eq!(pieces.len(), 1);
+        let piece = &pieces[0];
+        assert_eq!((piece.at, piece.length, piece.backing.offset), (0, len, 0));
+        assert_eq!(files::writable(first, len), Some(true));
+        let fd = piece.backing.file.as_raw_fd();
+        // SAFETY: a query of an open descriptor.
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        let sealed = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+        assert_eq!(seals & sealed, sealed, "seals {seals:#x}");
+        // SAFETY: an empty stat buffer for the kernel to fill.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: an open descriptor and a stat buffer to fill.
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        assert_eq!(stat.st_size, libc::off_t::try_from(len).unwrap());
+
+        write(at, 3 * page() + 5, 0xa5);
+        let mut byte = 0u8;
+        let offset = libc::off_t::try_from(3 * page() + 5).unwrap();
+        // SAFETY: a one-byte read of an open descriptor into a byte of the test's.
+        let n = unsafe { libc::pread(fd, (&raw mut byte).cast(), 1, offset) };
+        assert_eq!((n, byte), (1, 0xa5), "the write is the file's");
+
+        assert_eq!(vm().deallocate(at, page()), INVALID_ARGUMENT);
+        assert_eq!(read(at, 3 * page() + 5), 0xa5, "still mapped");
+        drop(memory);
+        assert!(files::pieces(first, len).is_none());
+        assert!(!mapped(at), "unmapped");
+        assert!(RegionMemory::new(0).is_none());
+    }
+
+    /// A graphics device's region's memory, 1 GiB as the device's is, takes host memory only for
+    /// the pages that are touched: its file holds a few pages after four of them are written
+    #[test]
+    fn a_region_s_memory_takes_only_the_pages_that_are_touched() {
+        const LEN: u64 = 1 << 30;
+        let memory = RegionMemory::new(LEN).expect("a region's memory");
+        let first = memory.base().addr().to_u64();
+        let at = HostAddr::from_addr(first.to_usize());
+        for i in 0..4 {
+            write(at, i * (LEN / 4) + 7, 0x5a);
+        }
+        let pieces = files::pieces(first, LEN).expect("the region's pages registered");
+        let fd = pieces[0].backing.file.as_raw_fd();
+        // SAFETY: an empty stat buffer for the kernel to fill.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: an open descriptor and a stat buffer to fill.
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        let held = u64::try_from(stat.st_blocks).unwrap() * 512;
+        assert!(held >= 4 * page(), "{held:#x} bytes held");
+        assert!(held < LEN / 4, "{held:#x} bytes held of {LEN:#x}");
+        assert!((0..4).all(|i| read(at, i * (LEN / 4) + 7) == 0x5a));
     }
 }

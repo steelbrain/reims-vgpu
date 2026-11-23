@@ -51,6 +51,11 @@ use host_os::cache_directory as host_cache_directory;
 /// The guest's RAM named to the room the compile helpers run side by side in
 /// (`os/compile_helper.rs`), while a device made over it lives.
 pub use compile_helper::{GuestRamHeld, hold_guest_ram};
+/// A graphics device's region in a shared mapping of a memfd of the library's, registered in the
+/// backing table, so a device that takes no pointer to it imports dma-bufs of its pages, on Linux
+/// (`os/linux/vm.rs`).
+#[cfg(target_os = "linux")]
+pub use host_os::RegionMemory;
 #[cfg(test)]
 pub(crate) use host_os::allocate_aliasable;
 /// A compile-pool make ended after `took` of wall time: on Linux with glibc, a make of 250 ms or

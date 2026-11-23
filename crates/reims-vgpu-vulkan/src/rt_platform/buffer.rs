@@ -78,8 +78,9 @@
 //! bytes: counted ([`READ_ONLY_CODE`]), the process's first with a line.
 //!
 //! **Dma-bufs of the pages** (Linux). A GPU may take no pointer to some pages: RADV refuses the
-//! pages of a shared mapping of a memfd at the import, as the guest's RAM and the views of its
-//! pages are (rt's `import_host_memory`). There the import is of a dma-buf of the files behind the
+//! pages of a shared mapping of a memfd at the import, as the guest's RAM, the views of its pages
+//! and a graphics device's region are (rt's `import_host_memory`; the region's memory,
+//! `crate::os::RegionMemory`). There the import is of a dma-buf of the files behind the
 //! pages instead (`crate::os::dma_buf_of_host`, rt's `import_dma_buf`), one dma-buf a block, so
 //! the bytes are the same pages the CPU's mapping reaches. One holds as many runs of file pages as
 //! udmabuf's `list_limit` takes, and as many bytes as its `size_limit_mb`: at the stock limit of
@@ -4339,6 +4340,93 @@ mod tests {
         let ran = || freed.load(Ordering::Acquire);
         assert!(waits_for(ran), "the deallocator ran");
         assert!(!device.known_blocks().is_dma_buf(id));
+    }
+
+    /// On Linux, on the GPU the test holds, where the GPU takes no pointer to a no-copy buffer's
+    /// pages (`POINTER_REFUSED`, as RADV refuses a memfd's): a buffer over whole pages of a
+    /// graphics device's region (`crate::os::RegionMemory`), as the window's scanout and the
+    /// guest's no-copy buffers over its blocks are made, is a range of rt's import of a dma-buf of
+    /// the region's file, counted, never by pointer nor over a copy; its `contents` are the span,
+    /// whose bytes a blit reads and writes through the import. Its deallocator runs once rt freed
+    /// the import, and the device then forgets it. Where the host makes no dma-buf (no udmabuf),
+    /// the buffer is made over a copy, counted, and the test says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_region_span_imports_as_a_dma_buf_where_no_pointer_is_taken_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        POINTER_REFUSED.set(true);
+        let page = device.facts().page_size;
+        let region = crate::os::RegionMemory::new(64 * page).expect("a region's memory");
+        let base = HostPtr::from_ptr(region.base());
+        let at = base.wrapping_add(3 * page);
+        let length = 5 * page;
+        // SAFETY: the span's first 128 bytes, fresh pages of the test's own region.
+        unsafe { at.as_ptr::<u8>().write_bytes(0x5a, 128) };
+        let codes = [
+            IMPORTS_POINTER,
+            IMPORTS_DMA_BUF,
+            IMPORTS_REFUSED,
+            IMPORTS_COPIED,
+            IMPORTS_DMA_BUFS,
+        ];
+        let counts = || codes.map(counted);
+        let before = counts();
+        let freed = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&freed);
+        let deallocator = move || ran.store(true, Ordering::Release);
+        // SAFETY: the region's pages, which live to the test's end.
+        let bytes = unsafe { HostRange::new(at, length) };
+        let made = device.new_buffer_over_host_memory(on, bytes, 0, Some(Box::new(deallocator)));
+        let buffer = made
+            .expect("never a raise")
+            .expect("a buffer over the span");
+        assert_eq!((buffer.contents(), buffer.length()), (at, length));
+        let id = buffer.rt().block();
+        if !device.known_blocks().is_dma_buf(id) {
+            let mut copied = before;
+            (copied[2], copied[3]) = (before[2] + 1, before[3] + 1);
+            assert_eq!(counts(), copied);
+            eprintln!("no dma-buf imported here: made over a copy, counted; the rest unchecked");
+            return;
+        }
+        let mut imported = before;
+        imported[1] += 1;
+        assert_eq!(counts(), imported, "one dma-buf, no pointer, no copy");
+        assert_eq!(read(buffer.contents(), 128), [0x5a; 128]);
+
+        // A blit reads the region's bytes through the import, and writes the pages the CPU reads.
+        let of = |length, options| device.new_buffer_of_length(on, length, options);
+        let of = |length| of(length, 0).expect("never a raise").expect("a buffer");
+        let (out, source) = (of(64), of(64));
+        // SAFETY: the Shared buffer's 64 bytes, mapped while it lives.
+        unsafe { source.contents().as_ptr::<u8>().write_bytes(0x77, 64) };
+        let queue = device.new_command_queue().expect("a command queue");
+        let commands = queue.command_buffer(on).expect("never a raise");
+        let commands = commands.expect("a command buffer");
+        let encoder = commands.blit_encoder(on).expect("never a raise");
+        let encoder = encoder.expect("a blit encoder");
+        for (from, to, offset) in [(&buffer, &out, 0), (&source, &buffer, 4 * page)] {
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(from),
+                source_offset: 0,
+                destination_buffer: Some(to),
+                destination_offset: offset,
+                size: 64,
+            };
+            assert_eq!(encoder.encode(on, copy), Ok(()));
+        }
+        assert_eq!(encoder.encode(on, BlitCmd::EndEncoding), Ok(()));
+        assert_eq!(commands.commit(on), Ok(()));
+        assert_eq!(commands.wait_until_completed(on), Ok(()));
+        assert_eq!(read(out.contents(), 64), [0x5a; 64]);
+        assert_eq!(read(at.wrapping_add(4 * page), 64), [0x77; 64]);
+        drop((encoder, commands, buffer));
+        let ran = || freed.load(Ordering::Acquire);
+        assert!(waits_for(ran), "the deallocator ran");
+        assert!(!device.known_blocks().is_dma_buf(id));
+        drop(region);
     }
 
     /// On Linux, on the GPU the test holds, a no-copy buffer over a view of more runs of a file's
