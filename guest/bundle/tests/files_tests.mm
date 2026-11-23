@@ -176,23 +176,26 @@ void test_whole_writes_make_and_replace()
 	CHECK(readAll(s.path + "/g.bin") == first);
 }
 
-// A write that fails says why and leaves no file of its own: to a directory that is not there,
-// over a directory, and in a directory it may not write in (the file there keeps its bytes).
+// A write that fails says why, and whether it got as far as making its file, and leaves no file of
+// its own: to a directory that is not there, over a directory, and in a directory it may not write
+// in (the file there keeps its bytes).
 void test_whole_write_failures_leave_nothing()
 {
 	Scratch s;
 	const std::vector<uint8_t> b = bytesOf(100, 3);
-	CHECK(RgfxWriteFileWhole(s.path + "/gone/f.bin", b.data(), b.size()) == ENOENT);
+	bool made = true;
+	CHECK(RgfxWriteFileWhole(s.path + "/gone/f.bin", b.data(), b.size(), &made) == ENOENT && !made);
 	CHECK(RgfxMakeDirectories(s.path + "/d") == 0);
-	CHECK(RgfxWriteFileWhole(s.path + "/d", b.data(), b.size()) == EISDIR);
+	CHECK(RgfxWriteFileWhole(s.path + "/d", b.data(), b.size(), &made) == EISDIR && made);
 	CHECK(namesIn(s.path) == std::vector<std::string>{"d"});
 	CHECK(namesIn(s.path + "/d").empty());
 	const std::string ro = s.path + "/ro";
 	CHECK(RgfxMakeDirectories(ro) == 0);
-	CHECK(RgfxWriteFileWhole(ro + "/f.bin", b.data(), b.size()) == 0);
+	made = false;
+	CHECK(RgfxWriteFileWhole(ro + "/f.bin", b.data(), b.size(), &made) == 0 && made);
 	CHECK(chmod(ro.c_str(), 0555) == 0);
 	const std::vector<uint8_t> other = bytesOf(10, 4);
-	CHECK(RgfxWriteFileWhole(ro + "/f.bin", other.data(), other.size()) == EACCES);
+	CHECK(RgfxWriteFileWhole(ro + "/f.bin", other.data(), other.size(), &made) == EACCES && !made);
 	CHECK(readAll(ro + "/f.bin") == b);
 	CHECK(namesIn(ro) == std::vector<std::string>{"f.bin"});
 	CHECK(chmod(ro.c_str(), 0755) == 0);

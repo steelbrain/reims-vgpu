@@ -6139,22 +6139,42 @@ void test_dynamic_library_routing()
 	CHECK(std::memcmp(written.bytes, bytes.data(), bytes.size()) == 0);
 
 	// A write the system refuses answers the error Foundation's atomic write answers for it (this
-	// Mac's Foundation the reference): in a directory the process may not write in.
+	// Mac's Foundation the reference): in a directory the process may not write in, which refuses
+	// the file made beside it, and, past that file, a name too long and a directory at the path.
+	// Their debug descriptions, diagnostics, are each one's own.
 	NSString *ro = [dir stringByAppendingPathComponent:@"ro"];
 	CHECK(mkdir(ro.fileSystemRepresentation, 0755) == 0 && chmod(ro.fileSystemRepresentation, 0555) == 0);
-	NSURL *refused = [NSURL fileURLWithPath:[ro stringByAppendingPathComponent:@"lib.metallib"]];
-	NSError *ours = nil, *foundation = nil;
-	CHECK(![dylib serializeToURL:refused error:&ours]);
-	CHECK(![[NSData dataWithBytes:"x" length:1] writeToURL:refused options:NSDataWritingAtomic error:&foundation]);
-	NSError *ourCause = ours.userInfo[NSUnderlyingErrorKey], *theirCause = foundation.userInfo[NSUnderlyingErrorKey];
-	const bool same = [ours.domain isEqualToString:foundation.domain] && ours.code == foundation.code &&
-	                  [[NSSet setWithArray:ours.userInfo.allKeys] isEqualToSet:[NSSet setWithArray:foundation.userInfo.allKeys]] &&
-	                  [ours.userInfo[NSFilePathErrorKey] isEqual:foundation.userInfo[NSFilePathErrorKey]] &&
-	                  [ourCause.domain isEqualToString:theirCause.domain] && ourCause.code == theirCause.code;
-	if (!same)
-		std::fprintf(stderr, "the dynamic library's refused write answered %s\nFoundation's answered %s\n",
-		             ours.description.UTF8String, foundation.description.UTF8String);
-	CHECK(same);
+	NSString *adir = [dir stringByAppendingPathComponent:@"adir"];
+	CHECK(mkdir(adir.fileSystemRepresentation, 0755) == 0);
+	NSString *longName = [@"" stringByPaddingToLength:300 withString:@"n" startingAtIndex:0];
+	for (NSString *at in @[
+		     [ro stringByAppendingPathComponent:@"lib.metallib"], [dir stringByAppendingPathComponent:longName], adir
+	     ]) {
+		NSURL *refused = [NSURL fileURLWithPath:at];
+		NSError *ours = nil, *foundation = nil;
+		CHECK(![dylib serializeToURL:refused error:&ours]);
+		CHECK(![[NSData dataWithBytes:"x" length:1] writeToURL:refused options:NSDataWritingAtomic error:&foundation]);
+		NSError *ourCause = ours.userInfo[NSUnderlyingErrorKey], *theirCause = foundation.userInfo[NSUnderlyingErrorKey];
+		NSURL *ourURL = ours.userInfo[NSURLErrorKey], *theirURL = foundation.userInfo[NSURLErrorKey];
+		const bool same =
+		    [ours.domain isEqualToString:foundation.domain] && ours.code == foundation.code &&
+		    [[NSSet setWithArray:ours.userInfo.allKeys] isEqualToSet:[NSSet setWithArray:foundation.userInfo.allKeys]] &&
+		    [ours.userInfo[NSFilePathErrorKey] isEqual:foundation.userInfo[NSFilePathErrorKey]] &&
+		    (ourURL == theirURL || [ourURL.absoluteString isEqualToString:theirURL.absoluteString]) &&
+		    (ours.userInfo[@"NSUserStringVariant"] == foundation.userInfo[@"NSUserStringVariant"] ||
+		     [ours.userInfo[@"NSUserStringVariant"] isEqual:foundation.userInfo[@"NSUserStringVariant"]]) &&
+		    [ours.localizedDescription isEqualToString:foundation.localizedDescription] &&
+		    [ourCause.domain isEqualToString:theirCause.domain] && ourCause.code == theirCause.code;
+		if (!same)
+			std::fprintf(stderr, "the dynamic library's refused write answered %s\nFoundation's answered %s\n",
+			             ours.description.UTF8String, foundation.description.UTF8String);
+		CHECK(same);
+	}
+	// None leaves a file of its own behind.
+	NSFileManager *files = [NSFileManager defaultManager];
+	CHECK([files contentsOfDirectoryAtPath:ro error:nil].count == 0 && [files contentsOfDirectoryAtPath:adir error:nil].count == 0);
+	for (NSString *name in [files contentsOfDirectoryAtPath:dir error:nil])
+		CHECK(![name hasPrefix:@".rgfx-"]);
 	CHECK(chmod(ro.fileSystemRepresentation, 0755) == 0);
 	[[NSFileManager defaultManager] removeItemAtPath:dir error:nil];
 }

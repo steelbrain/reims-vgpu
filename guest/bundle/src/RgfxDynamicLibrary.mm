@@ -10,14 +10,23 @@
 #include "RgfxSerializer.hpp"
 
 #include <cerrno>
+#include <cstring>
 
 namespace {
 
-// Foundation's error for a write that failed with `posix`: NSCocoaErrorDomain, its write code for
-// the errno, the file's path and the POSIX error under it (read from code: swift-corelibs-
-// foundation's _NSErrorWithErrno, for a write).
-NSError *writeError(int posix, NSString *path)
+// Foundation's error for an atomic write of `path` that failed with `posix`, as this Mac's
+// Foundation answers it (measured: macOS 27.0.1, beside RgfxWriteFileWhole on the same refusals:
+// a folder the process may not write in, a read-only volume, a name too long, a directory at the
+// path; tests/shell_tests.mm pins all but the volume against Foundation). NSCocoaErrorDomain, its write
+// code for the errno, the file's path and file URL, and the POSIX error under it. A write refused
+// its file in the folder (`madeFile` false) also names the folder (NSUserStringVariant "Folder",
+// with which the description says "in the folder") and carries a debug description, ours in our
+// own words. A rename onto a directory (EISDIR) answers what Foundation answers there: no such file
+// (NSFileNoSuchFileError over ENOENT).
+NSError *writeError(int posix, NSString *path, bool madeFile)
 {
+	if (madeFile && posix == EISDIR)
+		posix = ENOENT;
 	NSInteger code;
 	switch (posix) {
 	case ENOENT:
@@ -44,14 +53,18 @@ NSError *writeError(int posix, NSString *path)
 		code = NSFileWriteUnknownError;
 		break;
 	}
-	return [NSError errorWithDomain:NSCocoaErrorDomain
-	                           code:code
-	                       userInfo:@{
-		                       NSFilePathErrorKey : path ?: @"",
-		                       NSUnderlyingErrorKey : [NSError errorWithDomain:NSPOSIXErrorDomain
-		                                                                  code:posix
-		                                                              userInfo:nil]
-	                       }];
+	NSMutableDictionary *info = [NSMutableDictionary dictionary];
+	info[NSFilePathErrorKey] = path ?: @"";
+	if (path.length > 0)
+		info[NSURLErrorKey] = [NSURL fileURLWithPath:path isDirectory:NO];
+	info[NSUnderlyingErrorKey] = [NSError errorWithDomain:NSPOSIXErrorDomain code:posix userInfo:nil];
+	if (!madeFile) {
+		info[@"NSUserStringVariant"] = @[ @"Folder" ];
+		info[NSDebugDescriptionErrorKey] =
+		    [NSString stringWithFormat:@"the file to write whole beside %@ could not be made: %s (errno %d)",
+		                               path.lastPathComponent, strerror(posix), posix];
+	}
+	return [NSError errorWithDomain:NSCocoaErrorDomain code:code userInfo:info];
 }
 
 } // namespace
@@ -133,11 +146,12 @@ NSError *writeError(int posix, NSString *path)
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(source, &bytes, &size);
 	const char *path = url.fileSystemRepresentation;
-	const int failure = path != nullptr ? RgfxWriteFileWhole(path, bytes, size) : ENOENT;
+	bool madeFile = false;
+	const int failure = path != nullptr ? RgfxWriteFileWhole(path, bytes, size, &madeFile) : ENOENT;
 	(void)map;
 	if (failure != 0) {
 		if (error)
-			*error = writeError(failure, url.path);
+			*error = writeError(failure, url.path, madeFile);
 		return NO;
 	}
 	return YES;

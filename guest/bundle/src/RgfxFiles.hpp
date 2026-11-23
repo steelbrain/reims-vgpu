@@ -36,8 +36,10 @@ int RgfxReadFile(const std::string &path, std::vector<uint8_t> &out);
 /// directory (".rgfx-<16 hex digits>.tmp"), then renamed over `path`. A reader sees the old file
 /// or the new one, never part of one. The file is made with mode 0666 less the process's umask,
 /// as open(2) makes a file. A failed write removes its own file. A process that ends during the
-/// write leaves that file behind, and the GL store's trim removes it later.
-int RgfxWriteFileWhole(const std::string &path, const void *bytes, size_t length);
+/// write leaves that file behind, and the GL store's trim removes it later. `madeFile`, where
+/// given, is set to whether the write made its file in the directory: a failure with it false
+/// failed at making that file, one with it true at writing it or renaming it over `path`.
+int RgfxWriteFileWhole(const std::string &path, const void *bytes, size_t length, bool *madeFile = nullptr);
 
 /// Makes the directory `path` and any of its parents that are not there (mode 0777 less the
 /// umask). 0 where it is there already, and ENOTDIR where something else is at `path`.

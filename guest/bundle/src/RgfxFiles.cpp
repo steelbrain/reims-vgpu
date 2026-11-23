@@ -99,9 +99,11 @@ int RgfxReadFile(const std::string &path, std::vector<uint8_t> &out)
 	return 0;
 }
 
-int RgfxWriteFileWhole(const std::string &path, const void *bytes, size_t length)
+int RgfxWriteFileWhole(const std::string &path, const void *bytes, size_t length, bool *madeFile)
 {
 	static std::atomic<uint64_t> serial{0};
+	if (madeFile)
+		*madeFile = false;
 	const std::string directory = parentOf(path);
 	std::string temporary;
 	int fd = -1;
@@ -117,6 +119,8 @@ int RgfxWriteFileWhole(const std::string &path, const void *bytes, size_t length
 		if (fd < 0 && (errno != EEXIST || attempt == 7))
 			return errno;
 	}
+	if (madeFile)
+		*madeFile = true;
 	const uint8_t *p = static_cast<const uint8_t *>(bytes);
 	size_t left = length;
 	int failure = 0;
