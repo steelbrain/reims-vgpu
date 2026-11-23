@@ -244,6 +244,16 @@
 //! (`Metrics::heap_moves`), and the counts line carries them as an amount, [`HEAP_MOVES_CODE`], so
 //! a boot's line says whether its heap textures took them.
 //!
+//! **Its draws' reads of their own attachments.** A draw that reads an attachment of its own pass,
+//! a fragment function's colour read or a texture argument over the attachment, reads it in place
+//! through the attachment feedback loop, with the image in the feedback layout
+//! (`Metrics::attachment_loop_reads`, a count, no bytes); on a device without the loop it reads
+//! the image's shadow instead, which rt copies from the image first, copies Metal does not make
+//! (`Metrics::attachment_read_copies`, and their bytes, `attachment_read_copy_bytes`, which count
+//! in `bytes_copied` too). The counts line carries all three as amounts,
+//! [`ATTACHMENT_LOOP_READS_CODE`], [`ATTACHMENT_READ_COPIES_CODE`] and
+//! [`ATTACHMENT_READ_COPY_BYTES_CODE`], so a host's line says which route its draws took.
+//!
 //! **Its Direct3D 11 planes' hand-overs.** On Windows, each submission whose command buffers keep
 //! a plane of a Direct3D 11 surface (`super::d3d11_surface`), or whose uploads copy into or out of
 //! one, acquires those planes from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own
@@ -519,6 +529,20 @@ pub const LEVEL_FIELD_COMMANDS_CODE: &str = "rt-level-field-commands";
 /// (`Metrics::heap_moves`), an amount on the counts line ([`fold_metrics`]).
 pub const HEAP_MOVES_CODE: &str = "rt-heap-moves";
 
+/// The code of the draws that read an attachment of their own pass in place, through the
+/// attachment feedback loop, with the image in the feedback layout
+/// (`Metrics::attachment_loop_reads`), an amount on the counts line ([`fold_metrics`]).
+pub const ATTACHMENT_LOOP_READS_CODE: &str = "rt-attachment-loop-reads";
+
+/// The code of the copies into an image's shadow that a draw reading an attachment of its own
+/// pass takes first on a device without the attachment feedback loop
+/// (`Metrics::attachment_read_copies`), an amount on the counts line ([`fold_metrics`]).
+pub const ATTACHMENT_READ_COPIES_CODE: &str = "rt-attachment-read-copies";
+
+/// The code of the bytes of those copies (`Metrics::attachment_read_copy_bytes`), an amount on
+/// the counts line ([`fold_metrics`]).
+pub const ATTACHMENT_READ_COPY_BYTES_CODE: &str = "rt-attachment-read-copy-bytes";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -595,10 +619,11 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// partial-threadgroups variant, the dispatches that wrote a view through its image's extended
 /// storage usage, the submissions that handed Direct3D 11 planes over, the dispatches and draws
 /// that pushed a storage texture's level fields, the heap textures moved out of the undefined
-/// layout, the main pipelines the states' finishes made and their nanoseconds, the first-use
-/// waits for an unfinished main pipeline and their nanoseconds, and the over-copies of a kind rt
-/// kept none of.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 34;
+/// layout, the draws that read an attachment of their own pass through the feedback loop, the
+/// copies into attachments' shadows on a device without it and their bytes, the main pipelines
+/// the states' finishes made and their nanoseconds, the first-use waits for an unfinished main
+/// pipeline and their nanoseconds, and the over-copies of a kind rt kept none of.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 37;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -631,12 +656,14 @@ static OVER_COPY_KINDS_LOGGED: crate::core::sync::Mutex<Vec<rt::OverCopyKind>> =
 /// its whole and ragged grids on a partial-threadgroups variant, its dispatches that wrote views
 /// through an extended usage, its submissions that handed Direct3D 11 planes over, its dispatches
 /// and draws that pushed level fields, its heap textures' moves out of the undefined layout, its
-/// states' finishes and their waits and its over-copies of a kind rt kept none of rose by since
-/// the last fold ([`folded_counts`]), so the counts line carries their totals, then its maxima
-/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest, and logs its
-/// over-copies' kinds the process had not logged ([`note_over_copy_kinds`]) (the module's docs).
-/// Nothing of rt's before the device is made. First it counts the dispatches the rt platform's
-/// compute encoders encoded since the last fold (`super::compute::fold_dispatches`).
+/// draws' reads of their own attachments through the feedback loop and its copies into the
+/// attachments' shadows on a device without it, its states' finishes and their waits and its
+/// over-copies of a kind rt kept none of rose by since the last fold ([`folded_counts`]), so the
+/// counts line carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
+/// ([`note_gauges`]) at their highest, and logs its over-copies' kinds the process had not logged
+/// ([`note_over_copy_kinds`]) (the module's docs). Nothing of rt's before the device is made.
+/// First it counts the dispatches the rt platform's compute encoders encoded since the last fold
+/// (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
     super::compute::fold_dispatches();
     let (metrics, gauges, kinds) = {
@@ -826,7 +853,10 @@ fn over_copy_kind_line(
 /// ([`EXTENDED_VIEW_DISPATCHES_CODE`]), the submissions that handed Direct3D 11 planes over
 /// ([`D3D11_PLANE_SUBMISSIONS_CODE`]), the dispatches and draws that pushed a storage texture's
 /// level fields ([`LEVEL_FIELD_COMMANDS_CODE`]), the heap textures moved out of the undefined
-/// layout ([`HEAP_MOVES_CODE`]), the main pipelines the states' finishes made
+/// layout ([`HEAP_MOVES_CODE`]), the draws that read an attachment of their own pass through the
+/// feedback loop ([`ATTACHMENT_LOOP_READS_CODE`]), the copies into attachments' shadows on a
+/// device without it ([`ATTACHMENT_READ_COPIES_CODE`]) and their bytes
+/// ([`ATTACHMENT_READ_COPY_BYTES_CODE`]), the main pipelines the states' finishes made
 /// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), the
 /// first-use waits for an unfinished main pipeline ([`UNFINISHED_WAITS_CODE`]) and their
 /// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]), and the over-copies of a kind rt kept none of
@@ -881,6 +911,12 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (D3D11_PLANE_SUBMISSIONS_CODE, m.d3d11_plane_submissions),
         (LEVEL_FIELD_COMMANDS_CODE, m.level_field_commands),
         (HEAP_MOVES_CODE, m.heap_moves),
+        (ATTACHMENT_LOOP_READS_CODE, m.attachment_loop_reads),
+        (ATTACHMENT_READ_COPIES_CODE, m.attachment_read_copies),
+        (
+            ATTACHMENT_READ_COPY_BYTES_CODE,
+            m.attachment_read_copy_bytes,
+        ),
         (FINISHED_PIPELINES_CODE, m.finished_pipelines),
         (FINISHED_PIPELINE_NS_CODE, m.finished_pipeline_nanos),
         (UNFINISHED_WAITS_CODE, m.first_use_unfinished_waits),
@@ -2486,9 +2522,11 @@ mod tests {
     /// partial-threadgroups variant, the dispatches that wrote a view through its image's extended
     /// storage usage, the submissions that handed Direct3D 11 planes over, the dispatches and draws
     /// that pushed a storage texture's level fields, the heap textures moved out of the undefined
-    /// layout, the main pipelines the states' finishes made and their nanoseconds, the first-use
-    /// waits for an unfinished main pipeline and their nanoseconds, and the over-copies of a kind
-    /// rt kept none of.
+    /// layout, the draws that read an attachment of their own pass through the feedback loop, the
+    /// copies into attachments' shadows on a device without it and their bytes, the main
+    /// pipelines the states' finishes made and their nanoseconds, the first-use waits for an
+    /// unfinished main pipeline and their nanoseconds, and the over-copies of a kind rt kept none
+    /// of.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2531,6 +2569,9 @@ mod tests {
             D3D11_PLANE_SUBMISSIONS_CODE,
             LEVEL_FIELD_COMMANDS_CODE,
             HEAP_MOVES_CODE,
+            ATTACHMENT_LOOP_READS_CODE,
+            ATTACHMENT_READ_COPIES_CODE,
+            ATTACHMENT_READ_COPY_BYTES_CODE,
             FINISHED_PIPELINES_CODE,
             FINISHED_PIPELINE_NS_CODE,
             UNFINISHED_WAITS_CODE,
@@ -2576,6 +2617,9 @@ mod tests {
         m.d3d11_plane_submissions = 3;
         m.level_field_commands = 5;
         m.heap_moves = 2;
+        m.attachment_loop_reads = 7;
+        m.attachment_read_copies = 1;
+        m.attachment_read_copy_bytes = 1_048_576;
         m.finished_pipelines = 2;
         m.finished_pipeline_nanos = 12_000_000;
         m.first_use_unfinished_waits = 1;
@@ -2616,6 +2660,9 @@ mod tests {
         m.d3d11_plane_submissions = 12;
         m.level_field_commands = 8;
         m.heap_moves = 6;
+        m.attachment_loop_reads = 7 + 12;
+        m.attachment_read_copies = 3;
+        m.attachment_read_copy_bytes = 3 * 1_048_576;
         m.finished_pipelines = 5;
         m.finished_pipeline_nanos = 12_000_000 + 6_750_000;
         m.first_use_unfinished_waits = 3;
@@ -2630,7 +2677,7 @@ mod tests {
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
                 28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 9, 4,
-                12, 8, 6, 5, 18_750_000, 3, 1_300_000, 4
+                12, 8, 6, 19, 3, 3_145_728, 5, 18_750_000, 3, 1_300_000, 4
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
