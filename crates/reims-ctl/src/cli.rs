@@ -1251,7 +1251,10 @@ pub fn set_installer(
         && let Err(e) = std::fs::remove_file(&c)
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        kept = format!("; its old copy {} could not be deleted: {e}", paths::tilde(&c));
+        kept = format!(
+            "; its old copy {} could not be deleted: {e}",
+            paths::tilde(&c)
+        );
         if running {
             kept.push_str(". Delete it once the VM stops");
         }
@@ -2422,14 +2425,22 @@ mod tests {
             .unwrap();
         let installer = |vm: &Vm| vm.config.q35.as_ref().unwrap().installer.clone();
         let mut quiet = |_: &str| {};
-        let e = set_installer(&mut vm, Some(dmg), &mut quiet).unwrap_err().to_string();
-        assert!(e.ends_with("so a new copy cannot replace it: stop the VM first"), "{e}");
+        let e = set_installer(&mut vm, Some(dmg), &mut quiet)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.ends_with("so a new copy cannot replace it: stop the VM first"),
+            "{e}"
+        );
         assert!(!d.join("vm").join("installer.img.part").exists());
         let saved = Vm::load(&d.join("vm")).unwrap();
         assert_eq!(installer(&saved), Some(create::INSTALLER_COPY.into()));
         // An eject takes it out of the settings, and says the copy stays.
         let said = set_installer(&mut vm, None, &mut quiet).unwrap();
-        assert!(said.starts_with("t: installer removed; its old copy "), "{said}");
+        assert!(
+            said.starts_with("t: installer removed; its old copy "),
+            "{said}"
+        );
         assert!(said.contains(" could not be deleted: "), "{said}");
         assert_eq!(installer(&vm), None);
         assert!(copy.is_file());
