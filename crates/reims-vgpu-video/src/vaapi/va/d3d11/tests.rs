@@ -365,7 +365,9 @@ fn misc_flags(texture: &Com) -> u32 {
 fn the_targets_are_shared_by_nt_handle_with_no_keyed_mutex() {
     let draw = PlaneDraw::new(None).expect("the plane draws");
     for ten_bit in [false, true] {
-        let to = draw.targets((64, 48), ten_bit).expect("the targets, opened");
+        let to = draw
+            .targets((64, 48), ten_bit)
+            .expect("the targets, opened");
         for (plane, target) in ["luma", "chroma"].iter().zip(&to.planes) {
             assert_eq!(
                 misc_flags(&target.native),

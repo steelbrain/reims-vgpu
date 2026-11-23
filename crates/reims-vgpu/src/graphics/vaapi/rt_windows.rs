@@ -645,7 +645,10 @@ mod tests {
                          chroma Direct3D right, rt sampled right, rt copied right",
                         case.name()
                     );
-                    assert!(line.split("; ").any(|part| part == want), "{want} in {line}");
+                    assert!(
+                        line.split("; ").any(|part| part == want),
+                        "{want} in {line}"
+                    );
                 }
             }
         });
