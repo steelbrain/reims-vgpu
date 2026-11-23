@@ -132,12 +132,18 @@ impl Frame {
         self.full_range
     }
 
-    /// The bits a sample holds: 8 for an NV12 frame, 10 for a P010 one.
+    /// The bits a sample holds: 8 for an NV12 or a 4:4:4 frame, 10 for a P010 one.
     pub fn bit_depth(&self) -> u32 {
         match self.surface.format() {
-            SurfaceFormat::Nv12 => 8,
+            SurfaceFormat::Nv12 | SurfaceFormat::Xyuv => 8,
             SurfaceFormat::P010 => 10,
         }
+    }
+
+    /// Whether the frame is 4:4:4 (HEVC Main 4:4:4's, [`super::HevcDecoder::lands_4_4_4`]),
+    /// which [`ReadBack::copy_4_4_4_into`] reads back, and else 4:2:0.
+    pub fn is_4_4_4(&self) -> bool {
+        self.surface.format() == SurfaceFormat::Xyuv
     }
 
     /// What the frames of this frame's surface pool came back through so
@@ -305,6 +311,27 @@ impl ReadBack<'_> {
             y.bytes_per_row,
             uv.bytes,
             uv.bytes_per_row,
+        )
+    }
+
+    /// Copies an 8-bit 4:4:4 frame ([`Frame::is_4_4_4`]), cropped, into two planes as CoreVideo's
+    /// `444v` and `444f` and ffmpeg's `nv24` lay them out: `y`, and `cbcr`, each pixel's Cb
+    /// then Cr, as many rows as `y`, whose rows hold `row_bytes` of the picture each. Planes of
+    /// fewer rows or columns than the frame take its top left, as [`ReadBack::copy_into`]'s do.
+    pub fn copy_4_4_4_into(&self, y: PlaneRows<'_>, cbcr: PlaneRows<'_>) -> Result<(), Error> {
+        let frame = self.frame;
+        let fit = |rows: usize| u32::try_from(rows).unwrap_or(u32::MAX);
+        let rect = Rect {
+            width: (frame.rect.width)
+                .min(fit(y.row_bytes.min(y.bytes_per_row)))
+                .min(fit(cbcr.row_bytes.min(cbcr.bytes_per_row) / 2)),
+            height: (frame.rect.height).min(fit(y.rows)).min(fit(cbcr.rows)),
+            ..frame.rect
+        };
+        self.surface.copy_4_4_4_to(
+            rect,
+            (y.bytes, y.bytes_per_row),
+            (cbcr.bytes, cbcr.bytes_per_row),
         )
     }
 

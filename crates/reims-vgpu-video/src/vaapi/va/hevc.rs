@@ -1,6 +1,11 @@
 //! HEVC decoding on VA-API: [`crate::codec::hevc::Decoder`] over an accelerator
 //! that fills libva's HEVC buffers (va_dec_hevc.h) and decodes into a pool
-//! of NV12 surfaces for Main, P010 ones for Main 10.
+//! of NV12 surfaces for Main, P010 ones for Main 10, and, for a caller that
+//! lands 4:4:4 pictures ([`HevcDecoder::lands_4_4_4`]), XYUV ones for the
+//! range extensions' 4:4:4 at 8 bits, on the driver's `HEVCMain444`. Those
+//! pictures' parameters go as va_dec_hevc.h's `…Extension` structures, the
+//! base one with the range extensions' after it, in the picture's and each
+//! slice's parameter buffer, as ffmpeg sends them for that profile.
 
 use super::buffer::{Buffer, render_decode};
 use super::caps::{Context, Entrypoint, Profile};
@@ -16,6 +21,7 @@ use crate::codec::hevc::{
     SliceParams,
     hvcc::DecoderConfiguration,
     nal::{NalUnit, is_idr, is_irap, nal_type},
+    pps::Pps,
     slice::SliceType,
     sps::Sps,
 };
@@ -36,7 +42,8 @@ const MAX_CURRENT_REFERENCES: usize = 8;
 /// record's length size, as VideoToolbox's samples are, or Annex B for
 /// [`HevcDecoder::new_annex_b`]. Frames come out in decode order unless
 /// [`HevcDecoder::set_output_order`] asks for display order. Main streams
-/// decode into NV12 frames, Main 10 ones into P010.
+/// decode into NV12 frames, Main 10 ones into P010, and 4:4:4 ones at 8 bits
+/// into XYUV where the caller lands them ([`HevcDecoder::lands_4_4_4`]).
 pub struct HevcDecoder {
     inner: Decoder<VaHevc>,
 }
@@ -51,7 +58,9 @@ impl HevcDecoder {
     /// A decoder for samples described by an `hvcC` record (ISO/IEC
     /// 14496-15, 8.3.3.1), whose parameter sets it takes. The record's
     /// first SPS is checked against what the decoder and the driver take,
-    /// so that a stream they cannot decode is refused here.
+    /// so that a stream they cannot decode is refused here. A 4:4:4 stream
+    /// the driver decodes is taken here, and refused at its first picture
+    /// unless [`Self::lands_4_4_4`] was called before it.
     pub fn new(display: &Display, hvcc: &[u8]) -> Result<Self, Error> {
         let inner = Decoder::from_hvcc(VaHevc::new(display), hvcc)?;
         let config = DecoderConfiguration::parse(hvcc)?;
@@ -62,7 +71,7 @@ impl HevcDecoder {
         if let Some(sps) = first_sps {
             let sps = Sps::parse(sps)?;
             hevc::check_supported(&sps)?;
-            select_profile(display, &sps)?;
+            select_profile(display, &sps, true)?;
         }
         Ok(Self { inner })
     }
@@ -72,6 +81,14 @@ impl HevcDecoder {
         Self {
             inner: Decoder::new(VaHevc::new(display), NalFormat::AnnexB),
         }
+    }
+
+    /// Has a 4:4:4 stream at 8 bits decoded, into XYUV surfaces, whose
+    /// frames the caller reads back with [`super::ReadBack::copy_4_4_4_into`]
+    /// ([`Frame::is_4_4_4`]); without it, a 4:4:4 stream is refused when its
+    /// SPS is taken.
+    pub fn lands_4_4_4(&mut self) {
+        self.inner.accelerator_mut().four_four_four = true;
     }
 
     /// Chooses decode order (the default) or display order.
@@ -173,6 +190,8 @@ struct VaHevc {
     session: Option<Session>,
     /// What gives the decode in hand its picture's target, taken as the picture is made.
     target_for: Option<TargetFor>,
+    /// Whether the caller lands 4:4:4 pictures ([`HevcDecoder::lands_4_4_4`]).
+    four_four_four: bool,
 }
 
 /// What one SPS's pictures are decoded with.
@@ -198,6 +217,7 @@ impl VaHevc {
             display: display.clone_ref(),
             session: None,
             target_for: None,
+            four_four_four: false,
         }
     }
 
@@ -209,25 +229,26 @@ impl VaHevc {
 }
 
 /// The VA profile and surface format for `sps`'s stream: Main at 8 bits,
-/// Main 10 at 10, of 4:2:0 (`check_supported` has refused other depths);
-/// none for the range extensions' 4:4:4, whose pictures this module does
-/// not land.
-fn profile_for(sps: &Sps) -> Result<(Profile, SurfaceFormat), Error> {
-    if sps.chroma_format_idc != 1 {
-        return Err(Error::Unsupported(
-            "HEVC: VA-API decodes 4:2:0 here, not the range extensions' 4:4:4".into(),
-        ));
+/// Main 10 at 10, of 4:2:0, and Main 4:4:4 of the range extensions' 4:4:4
+/// at 8 bits where the caller lands its pictures (`four_four_four`).
+/// `check_supported` has refused other depths and formats.
+fn profile_for(sps: &Sps, four_four_four: bool) -> Result<(Profile, SurfaceFormat), Error> {
+    match (sps.chroma_format_idc, sps.bit_depth_luma_minus8) {
+        (1, 0) => Ok((Profile::HEVC_MAIN, SurfaceFormat::Nv12)),
+        (1, _) => Ok((Profile::HEVC_MAIN10, SurfaceFormat::P010)),
+        (3, 0) if four_four_four => Ok((Profile::HEVC_MAIN444, SurfaceFormat::Xyuv)),
+        (3, 0) => Err(Error::Unsupported(
+            "HEVC 4:4:4: its caller lands 4:2:0 pictures alone".into(),
+        )),
+        _ => Err(Error::Unsupported(
+            "HEVC: VA-API decodes 4:2:0 here, and 4:4:4 at 8 bits".into(),
+        )),
     }
-    Ok(if sps.bit_depth_luma_minus8 == 0 {
-        (Profile::HEVC_MAIN, SurfaceFormat::Nv12)
-    } else {
-        (Profile::HEVC_MAIN10, SurfaceFormat::P010)
-    })
 }
 
 /// The VA profile, when the driver decodes `sps`'s stream at its size.
-fn select_profile(display: &Display, sps: &Sps) -> Result<Profile, Error> {
-    let (profile, format) = profile_for(sps)?;
+fn select_profile(display: &Display, sps: &Sps, four_four_four: bool) -> Result<Profile, Error> {
+    let (profile, format) = profile_for(sps, four_four_four)?;
     let name = profile.name().unwrap_or("HEVC");
     if !display.supports(profile, Entrypoint::VLD) {
         return Err(Error::Unsupported(format!(
@@ -269,8 +290,8 @@ impl Accelerator for VaHevc {
 
     fn configure(&mut self, sps: &Sps, _dpb_size: usize) -> Result<(), Error> {
         self.session = None;
-        let profile = select_profile(&self.display, sps)?;
-        let (_, format) = profile_for(sps)?;
+        let profile = select_profile(&self.display, sps, self.four_four_four)?;
+        let (_, format) = profile_for(sps, self.four_four_four)?;
         let (width, height) = (
             sps.pic_width_in_luma_samples,
             sps.pic_height_in_luma_samples,
@@ -303,7 +324,8 @@ impl Accelerator for VaHevc {
         let target_for = self.target_for.take();
         let pool = &self.session()?.pool;
         let lent = target_for
-            .and_then(|target_for| target_for(pool.shape(), role))
+            .zip(pool.shape())
+            .and_then(|(target_for, shape)| target_for(shape, role))
             .and_then(|target| pool.lend_target(target));
         match lent {
             Some(surface) => Ok(surface),
@@ -324,12 +346,25 @@ impl Accelerator for VaHevc {
             .ok_or_else(|| Error::Unsupported("decoding without a context".into()))?;
         let context = decoding.id;
         let display = &self.display;
-        let picture_buffer = Buffer::with_value(
-            display,
-            context,
-            ffi::VAPictureParameterBufferType,
-            &picture_parameters(picture, params)?,
-        )?;
+        // The range extensions' profile takes the extension structures
+        // whole (va_dec_hevc.h), as ffmpeg sends them.
+        let extensions = session.profile == Profile::HEVC_MAIN444;
+        let base = picture_parameters(picture, params)?;
+        let picture_buffer = if extensions {
+            let parameters = ffi::VAPictureParameterBufferHEVCExtension {
+                base,
+                rext: range_extension_parameters(params.sps, params.pps),
+                scc: ffi::VAPictureParameterBufferHEVCScc::none(),
+            };
+            Buffer::with_value(
+                display,
+                context,
+                ffi::VAPictureParameterBufferType,
+                &parameters,
+            )?
+        } else {
+            Buffer::with_value(display, context, ffi::VAPictureParameterBufferType, &base)?
+        };
         // va_dec_hevc.h: the matrix is sent "only when
         // scaling_list_enabled_flag = 1".
         let matrix_buffer = match &params.scaling_lists {
@@ -343,13 +378,23 @@ impl Accelerator for VaHevc {
         };
         let mut slice_buffers = Vec::with_capacity(slices.len());
         for slice in slices {
-            slice_buffers.push((
+            let base = slice_parameters(slice)?;
+            let parameters = if extensions {
+                let parameters = ffi::VASliceParameterBufferHEVCExtension {
+                    base,
+                    rext: slice_range_extension(slice),
+                };
                 Buffer::with_value(
                     display,
                     context,
                     ffi::VASliceParameterBufferType,
-                    &slice_parameters(slice)?,
-                )?,
+                    &parameters,
+                )?
+            } else {
+                Buffer::with_value(display, context, ffi::VASliceParameterBufferType, &base)?
+            };
+            slice_buffers.push((
+                parameters,
                 Buffer::with_bytes(display, context, ffi::VASliceDataBufferType, slice.nal)?,
             ));
         }
@@ -682,6 +727,79 @@ fn slice_parameters(slice: &SliceParams<'_>) -> Result<ffi::VASliceParameterBuff
     Ok(out)
 }
 
+/// `VAPictureParameterBufferHEVCRext` of an SPS's and a PPS's range
+/// extensions: their flags, and the PPS's chroma QP offset lists (7.3.2.3.2).
+fn range_extension_parameters(sps: &Sps, pps: &Pps) -> ffi::VAPictureParameterBufferHEVCRext {
+    use ffi::hevc_range_extension_pic_fields as rf;
+    let flag = u32::from;
+    let (s, p) = (&sps.range_extension, &pps.range_extension);
+    let range_extension_pic_fields = rf::TRANSFORM_SKIP_ROTATION_ENABLED_FLAG
+        .put(flag(s.transform_skip_rotation_enabled_flag))
+        | rf::TRANSFORM_SKIP_CONTEXT_ENABLED_FLAG.put(flag(s.transform_skip_context_enabled_flag))
+        | rf::IMPLICIT_RDPCM_ENABLED_FLAG.put(flag(s.implicit_rdpcm_enabled_flag))
+        | rf::EXPLICIT_RDPCM_ENABLED_FLAG.put(flag(s.explicit_rdpcm_enabled_flag))
+        | rf::EXTENDED_PRECISION_PROCESSING_FLAG.put(flag(s.extended_precision_processing_flag))
+        | rf::INTRA_SMOOTHING_DISABLED_FLAG.put(flag(s.intra_smoothing_disabled_flag))
+        | rf::HIGH_PRECISION_OFFSETS_ENABLED_FLAG.put(flag(s.high_precision_offsets_enabled_flag))
+        | rf::PERSISTENT_RICE_ADAPTATION_ENABLED_FLAG
+            .put(flag(s.persistent_rice_adaptation_enabled_flag))
+        | rf::CABAC_BYPASS_ALIGNMENT_ENABLED_FLAG.put(flag(s.cabac_bypass_alignment_enabled_flag))
+        | rf::CROSS_COMPONENT_PREDICTION_ENABLED_FLAG
+            .put(flag(p.cross_component_prediction_enabled_flag))
+        | rf::CHROMA_QP_OFFSET_LIST_ENABLED_FLAG.put(flag(p.chroma_qp_offset_list_enabled_flag));
+    let mut out = ffi::VAPictureParameterBufferHEVCRext {
+        range_extension_pic_fields,
+        diff_cu_chroma_qp_offset_depth: p.diff_cu_chroma_qp_offset_depth,
+        chroma_qp_offset_list_len_minus1: u8::try_from(
+            p.chroma_qp_offset_lists.len().saturating_sub(1),
+        )
+        .unwrap_or(u8::MAX),
+        log2_sao_offset_scale_luma: p.log2_sao_offset_scale_luma,
+        log2_sao_offset_scale_chroma: p.log2_sao_offset_scale_chroma,
+        log2_max_transform_skip_block_size_minus2: p.log2_max_transform_skip_block_size_minus2,
+        ..Default::default()
+    };
+    for ((cb, cr), &(cb_offset, cr_offset)) in (out.cb_qp_offset_list.iter_mut())
+        .zip(out.cr_qp_offset_list.iter_mut())
+        .zip(&p.chroma_qp_offset_lists)
+    {
+        (*cb, *cr) = (cb_offset, cr_offset);
+    }
+    out
+}
+
+/// `VASliceParameterBufferHEVCRext` of a slice: its prediction weights'
+/// offsets at 16 bits, as the base structure has them at 8 (the same
+/// values, at the 8 bits this decodes), and `cu_chroma_qp_offset_enabled_flag`.
+fn slice_range_extension(slice: &SliceParams<'_>) -> ffi::VASliceParameterBufferHEVCRext {
+    let h = slice.header;
+    let mut out = ffi::VASliceParameterBufferHEVCRext {
+        slice_ext_flags: ffi::hevc_slice_ext_flags::CU_CHROMA_QP_OFFSET_ENABLED_FLAG
+            .put(u32::from(h.cu_chroma_qp_offset_enabled_flag)),
+        ..Default::default()
+    };
+    if let Some(table) = &h.pred_weight_table {
+        for list in 0..2 {
+            let (luma_offset, chroma_offset) = if list == 0 {
+                (&mut out.luma_offset_l0, &mut out.chroma_offset_l0)
+            } else {
+                (&mut out.luma_offset_l1, &mut out.chroma_offset_l1)
+            };
+            for (i, entry) in table.entries[list].iter().enumerate().take(15) {
+                if let Some((_, offset)) = entry.luma {
+                    luma_offset[i] = i16::from(offset);
+                }
+                if entry.chroma.is_some() {
+                    for (c, slot) in chroma_offset[i].iter_mut().enumerate() {
+                        *slot = table.chroma_offset(list, i, c);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +815,63 @@ mod tests {
         assert_eq!(DIAGONAL_8X8[63], 63);
         let coded: [u8; 16] = core::array::from_fn(|i| i as u8);
         assert_eq!(raster(&coded, &DIAGONAL_4X4)[..4], [0, 2, 5, 9]);
+    }
+
+    #[test]
+    fn a_4_4_4_stream_takes_main_4_4_4_into_xyuv_where_its_caller_lands_it() -> Result<(), Error> {
+        use crate::codec::hevc::tests::{sps_4_4_4_with, sps_of};
+        let four = Sps::parse(&sps_4_4_4_with(0))?;
+        assert_eq!(
+            profile_for(&four, true)?,
+            (Profile::HEVC_MAIN444, SurfaceFormat::Xyuv)
+        );
+        assert!(matches!(
+            profile_for(&four, false),
+            Err(Error::Unsupported(why)) if why == "HEVC 4:4:4: its caller lands 4:2:0 pictures alone"
+        ));
+        let main = Sps::parse(&sps_of(1, 1, 0, false, None))?;
+        let ten = Sps::parse(&sps_of(2, 1, 2, false, None))?;
+        for four_four_four in [false, true] {
+            assert_eq!(
+                profile_for(&main, four_four_four)?,
+                (Profile::HEVC_MAIN, SurfaceFormat::Nv12)
+            );
+            assert_eq!(
+                profile_for(&ten, four_four_four)?,
+                (Profile::HEVC_MAIN10, SurfaceFormat::P010)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn range_extension_parameters_carry_each_flag_and_the_chroma_qp_offset_lists()
+    -> Result<(), Error> {
+        use crate::codec::hevc::pps::PpsRangeExtension;
+        use crate::codec::hevc::tests::{pps_with_range_extension, sps_4_4_4_with};
+        // sps_range_extension()'s flags in syntax order: rotation, implicit RDPCM,
+        // persistent Rice adaptation and CABAC bypass alignment on.
+        let sps = Sps::parse(&sps_4_4_4_with(0b1_0100_0011))?;
+        let pps = Pps::parse(&pps_with_range_extension(PpsRangeExtension {
+            log2_max_transform_skip_block_size_minus2: 2,
+            cross_component_prediction_enabled_flag: true,
+            chroma_qp_offset_list_enabled_flag: true,
+            diff_cu_chroma_qp_offset_depth: 1,
+            chroma_qp_offset_lists: vec![(-3, 4), (5, -6)],
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
+        }))?;
+        let rext = range_extension_parameters(&sps, &pps);
+        // va_dec_hevc.h's bits: 0, 2, 7 and 8 of the SPS's, 9 and 10 of the PPS's.
+        assert_eq!(rext.range_extension_pic_fields, 0x785);
+        assert_eq!(rext.diff_cu_chroma_qp_offset_depth, 1);
+        assert_eq!(rext.chroma_qp_offset_list_len_minus1, 1);
+        assert_eq!(rext.log2_max_transform_skip_block_size_minus2, 2);
+        assert_eq!(rext.cb_qp_offset_list, [-3, 5, 0, 0, 0, 0]);
+        assert_eq!(rext.cr_qp_offset_list, [4, -6, 0, 0, 0, 0]);
+        let plain = range_extension_parameters(&Sps::parse(&sps_4_4_4_with(0))?, &pps);
+        assert_eq!(plain.range_extension_pic_fields, 0x600);
+        Ok(())
     }
 
     #[test]

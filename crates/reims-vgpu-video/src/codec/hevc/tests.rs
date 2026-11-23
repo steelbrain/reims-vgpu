@@ -320,6 +320,31 @@ pub(crate) fn sps_of(
     })
 }
 
+/// A 64x48 SPS of the range extensions' 4:4:4 at 8 bits whose `sps_range_extension()` has the
+/// nine flags `tools`, the first the most significant, the rest as [`SpsSpec`]'s default: a
+/// stream's SPS for the VA-API module's tests, built where that module is.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn sps_4_4_4_with(tools: u32) -> Vec<u8> {
+    sps(&SpsSpec {
+        profile_idc: 4,
+        chroma_format_idc: 3,
+        range_extension: true,
+        range_tools: tools,
+        ..SpsSpec::default()
+    })
+}
+
+/// A PPS of `transform_skip_enabled_flag` and `extension`, the rest as [`PpsSpec`]'s default: a
+/// stream's PPS for the VA-API module's tests, built where that module is.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn pps_with_range_extension(extension: pps::PpsRangeExtension) -> Vec<u8> {
+    pps(&PpsSpec {
+        transform_skip: true,
+        range_extension: Some(extension),
+        ..PpsSpec::default()
+    })
+}
+
 #[derive(Clone, Default)]
 struct PpsSpec {
     dependent_slices: bool,

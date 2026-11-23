@@ -144,6 +144,9 @@ impl ImportWrites {
         match format {
             SurfaceFormat::Nv12 => self.nv12.clone(),
             SurfaceFormat::P010 => self.p010.clone(),
+            SurfaceFormat::Xyuv => {
+                Err("the import check checks NV12 and P010 imports alone".into())
+            }
         }
     }
 
@@ -403,7 +406,7 @@ fn sample(format: SurfaceFormat, plane: usize, column: usize, row: usize) -> u16
     let (a, b, c) = if plane == 0 { (3, 5, 7) } else { (7, 11, 101) };
     let value = column * a + row * b + c;
     match format {
-        SurfaceFormat::Nv12 => (value % 256) as u16,
+        SurfaceFormat::Nv12 | SurfaceFormat::Xyuv => (value % 256) as u16,
         SurfaceFormat::P010 => ((value * 13 % 1024) as u16) << 6,
     }
 }
@@ -540,6 +543,7 @@ fn trial_in(
     let fourcc = match picture.format {
         SurfaceFormat::Nv12 => FourCc::new(*b"420v"),
         SurfaceFormat::P010 => FourCc::new(*b"x420"),
+        SurfaceFormat::Xyuv => return Err("no trial of XYUV imports".to_owned()),
     };
     let plane = |n: usize| PlaneLayout {
         offset: planes[n].0,
@@ -1051,6 +1055,7 @@ mod tests {
                         pixel_format: match format {
                             SurfaceFormat::Nv12 => FourCc::new(*b"420v"),
                             SurfaceFormat::P010 => FourCc::new(*b"x420"),
+                            SurfaceFormat::Xyuv => unreachable!("FORMATS has no XYUV"),
                         },
                         width: picture.width,
                         height: picture.height,

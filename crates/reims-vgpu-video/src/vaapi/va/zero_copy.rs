@@ -737,6 +737,11 @@ impl Strip {
         write: ImportWrite,
     ) -> Result<Self, String> {
         let past = || "a buffer past 4 GiB".to_owned();
+        let drm_format = match format {
+            SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
+            SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
+            SurfaceFormat::Xyuv => return Err("no import of XYUV into two planes".to_owned()),
+        };
         let alignment = write.alignment;
         let (Some(&luma_at), Some(&chroma_at)) = (dma_buf.offsets.first(), dma_buf.offsets.get(1))
         else {
@@ -792,10 +797,7 @@ impl Strip {
             drm_format_modifier: ffi::DRM_FORMAT_MOD_LINEAR,
         };
         descriptor.layers[0] = ffi::VADRMPRIMESurfaceLayer {
-            drm_format: match format {
-                SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
-                SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
-            },
+            drm_format,
             num_planes: 2,
             object_index: [0, 0, 0, 0],
             offset: [luma_at, chroma_at, 0, 0],

@@ -41,6 +41,7 @@
 #define HPIC(f) HEVC(VAPictureParameterBufferHEVC, pic_fields, bits, f)
 #define HSLICEPARSE(f) HEVC(VAPictureParameterBufferHEVC, slice_parsing_fields, bits, f)
 #define HLONG(f) HEVC(VASliceParameterBufferHEVC, LongSliceFlags, fields, f)
+#define HREXT(f) HEVC(VAPictureParameterBufferHEVCRext, range_extension_pic_fields, bits, f)
 
 int main(void)
 {
@@ -247,6 +248,45 @@ int main(void)
     F(VAIQMatrixBufferHEVC, ScalingListDC32x32);
     F(VAIQMatrixBufferHEVC, va_reserved);
 
+    S(VAPictureParameterBufferHEVCRext);
+    F(VAPictureParameterBufferHEVCRext, range_extension_pic_fields);
+    F(VAPictureParameterBufferHEVCRext, diff_cu_chroma_qp_offset_depth);
+    F(VAPictureParameterBufferHEVCRext, chroma_qp_offset_list_len_minus1);
+    F(VAPictureParameterBufferHEVCRext, log2_sao_offset_scale_luma);
+    F(VAPictureParameterBufferHEVCRext, log2_sao_offset_scale_chroma);
+    F(VAPictureParameterBufferHEVCRext, log2_max_transform_skip_block_size_minus2);
+    F(VAPictureParameterBufferHEVCRext, cb_qp_offset_list);
+    F(VAPictureParameterBufferHEVCRext, cr_qp_offset_list);
+
+    S(VAPictureParameterBufferHEVCScc);
+    F(VAPictureParameterBufferHEVCScc, screen_content_pic_fields);
+    F(VAPictureParameterBufferHEVCScc, palette_max_size);
+    F(VAPictureParameterBufferHEVCScc, delta_palette_max_predictor_size);
+    F(VAPictureParameterBufferHEVCScc, predictor_palette_size);
+    F(VAPictureParameterBufferHEVCScc, predictor_palette_entries);
+    F(VAPictureParameterBufferHEVCScc, pps_act_y_qp_offset_plus5);
+    F(VAPictureParameterBufferHEVCScc, pps_act_cb_qp_offset_plus5);
+    F(VAPictureParameterBufferHEVCScc, pps_act_cr_qp_offset_plus3);
+
+    S(VAPictureParameterBufferHEVCExtension);
+    F(VAPictureParameterBufferHEVCExtension, base);
+    F(VAPictureParameterBufferHEVCExtension, rext);
+    F(VAPictureParameterBufferHEVCExtension, scc);
+
+    S(VASliceParameterBufferHEVCRext);
+    F(VASliceParameterBufferHEVCRext, luma_offset_l0);
+    F(VASliceParameterBufferHEVCRext, ChromaOffsetL0);
+    F(VASliceParameterBufferHEVCRext, luma_offset_l1);
+    F(VASliceParameterBufferHEVCRext, ChromaOffsetL1);
+    F(VASliceParameterBufferHEVCRext, slice_ext_flags);
+    F(VASliceParameterBufferHEVCRext, slice_act_y_qp_offset);
+    F(VASliceParameterBufferHEVCRext, slice_act_cb_qp_offset);
+    F(VASliceParameterBufferHEVCRext, slice_act_cr_qp_offset);
+
+    S(VASliceParameterBufferHEVCExtension);
+    F(VASliceParameterBufferHEVCExtension, base);
+    F(VASliceParameterBufferHEVCExtension, rext);
+
     SEQ(chroma_format_idc);
     SEQ(residual_colour_transform_flag);
     SEQ(gaps_in_frame_num_value_allowed_flag);
@@ -318,6 +358,18 @@ int main(void)
     HLONG(slice_deblocking_filter_disabled_flag);
     HLONG(collocated_from_l0_flag);
     HLONG(slice_loop_filter_across_slices_enabled_flag);
+    HREXT(transform_skip_rotation_enabled_flag);
+    HREXT(transform_skip_context_enabled_flag);
+    HREXT(implicit_rdpcm_enabled_flag);
+    HREXT(explicit_rdpcm_enabled_flag);
+    HREXT(extended_precision_processing_flag);
+    HREXT(intra_smoothing_disabled_flag);
+    HREXT(high_precision_offsets_enabled_flag);
+    HREXT(persistent_rice_adaptation_enabled_flag);
+    HREXT(cabac_bypass_alignment_enabled_flag);
+    HREXT(cross_component_prediction_enabled_flag);
+    HREXT(chroma_qp_offset_list_enabled_flag);
+    HEVC(VASliceParameterBufferHEVCRext, slice_ext_flags, bits, cu_chroma_qp_offset_enabled_flag);
     C(VA_STATUS_SUCCESS);
     C(VA_STATUS_ERROR_TIMEDOUT);
     C(VA_STATUS_ERROR_UNIMPLEMENTED);
@@ -327,8 +379,10 @@ int main(void)
     C(VA_PROGRESSIVE);
     C(VA_RT_FORMAT_YUV420);
     C(VA_RT_FORMAT_YUV420_10);
+    C(VA_RT_FORMAT_YUV444);
     C(VA_FOURCC_NV12);
     C(VA_FOURCC_P010);
+    C(VA_FOURCC_XYUV);
     C(VA_SLICE_DATA_FLAG_ALL);
     C(VA_PICTURE_H264_INVALID);
     C(VA_PICTURE_H264_SHORT_TERM_REFERENCE);
@@ -344,6 +398,7 @@ int main(void)
     C(VAProfileH264ConstrainedBaseline);
     C(VAProfileHEVCMain);
     C(VAProfileHEVCMain10);
+    C(VAProfileHEVCMain444);
     C(VAEntrypointVLD);
     C(VAEntrypointVideoProc);
     C(VAConfigAttribRTFormat);

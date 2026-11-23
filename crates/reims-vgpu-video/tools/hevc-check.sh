@@ -16,8 +16,11 @@
 # from its Annex B form, in display order; every frame's MD5, over NV12
 # for Main and P010 for Main 10, must equal ffmpeg's. Decode order must
 # give the same frames. Streams the decoder must refuse (4:2:2 and 12-bit,
-# which the codec crate refuses, and 4:4:4, which it takes and the VA
-# accelerator refuses) must fail with their refusal.
+# which the codec crate refuses) must fail with their refusal. The range
+# extensions' 4:4:4 at 8 bits decodes, its MD5s over NV24, where the
+# driver lists a Main 4:4:4 decoder of 4:4:4 render targets and XYUV
+# surfaces (examples/vaapi-probe), and is refused, naming the driver's
+# Main 4:4:4, where it does not.
 #
 # x265's own reconstruction (--recon) is a second reference. ffmpeg n9.0.2's
 # software decode differs from it on some CTB-16 streams with SAO and
@@ -44,11 +47,19 @@ node=${1:-/dev/dri/renderD128}
 out=${RVGV_HEVC_OUT:-$root/build/hevc-check}
 mkdir -p "$out"
 
-build reims-vgpu-video hevc-framemd5 hevc-info hevc-cut hevc-craft
+build reims-vgpu-video hevc-framemd5 hevc-info hevc-cut hevc-craft vaapi-probe
 tool=$CARGO_TARGET_DIR/release/examples/hevc-framemd5
 info=$CARGO_TARGET_DIR/release/examples/hevc-info
 cut=$CARGO_TARGET_DIR/release/examples/hevc-cut
 craft=$CARGO_TARGET_DIR/release/examples/hevc-craft
+
+# Whether the driver lists HEVC Main 4:4:4's decoder of 4:4:4 render
+# targets and XYUV surfaces, the 4:4:4 streams' decode.
+four_four_four=0
+probe=$("$CARGO_TARGET_DIR/release/examples/vaapi-probe" "$node" 2>&1 || true)
+if grep -Eq '^HEVCMain444 +VLD +rt=([^ ]*,)?YUV444[, ].* surfaces=([^ ]*,)?XYUV[, ]' <<<"$probe"; then
+  four_four_four=1
+fi
 
 # Asymmetric scaling lists in HM's format, so that a list in the wrong
 # scan order, transposed, in the wrong slot or with the wrong DC changes
@@ -114,6 +125,16 @@ streams=(
   # picture alone, which may then be long-term with no change to the
   # picture.
   "main-720p-ref1|1280x720|60|8|testsrc2|--preset fast --bframes 0 --ref 1 --no-temporal-mvp --keyint 300"
+)
+
+# The range extensions' 4:4:4 at 8 bits, x265's: name|size|frames|source
+# filter|x265 options. Each frame's MD5 is over NV24, luma then each
+# pixel's Cb and Cr, the two planes the decoder lands it in; the fade's
+# weighted prediction sends the slices' range extension parameters.
+rext_streams=(
+  "main444-360p|640x360|10|testsrc2|--preset fast --profile main444-8"
+  "main444-720p-fade|1280x720|60|fade|--preset fast --profile main444-8 --weightp --weightb --bframes 3 --ref 3"
+  "main444-1366x766-ctu16|1366x766|30|testsrc2|--preset fast --profile main444-8 --ctu 16 --bframes 2 --tskip"
 )
 
 # kvazaar 2.3.2's streams, 8 bits only as CachyOS builds it, for what x265
@@ -201,6 +222,8 @@ encode() {
   local pix_out=nv12
   if (( bits > 8 )); then
     pix_out=p010le
+  elif [[ $csp == 444 ]]; then
+    pix_out=nv24
   fi
   hashes "$out/$name.recon" -i "$out/$name.recon.y4m" -pix_fmt "$pix_out" || return 1
   rm -f "$out/$name.recon.y4m"
@@ -263,12 +286,15 @@ picture_hashes() {
   echo "$(grep -c 'Verifying checksum' <<<"$log") $(grep -c 'mismatching checksum' <<<"$log")"
 }
 
+# reference NAME BITS [PIXEL FORMAT]: ffmpeg's software decode's MD5s, over
+# NV12 or P010 as BITS says, or the format given.
 reference() {
   local name=$1 bits=$2
   local pix=nv12
   if (( bits > 8 )); then
     pix=p010le
   fi
+  pix=${3:-$pix}
   if [[ ! -s $out/$name.ref ]]; then
     hashes "$out/$name.ref" -hwaccel none -i "$out/$name.265" -fps_mode passthrough -pix_fmt "$pix"
   fi
@@ -314,9 +340,10 @@ bits_of() {
 rext='^hevc-framemd5: unsupported: range extensions streams other than 4:4:4 at 8 bits'
 refusals=(
   "main422-10|640x360|10|10|422|--preset fast --profile main422-10|$rext"
-  "main444-8|640x360|10|8|444|--preset fast --profile main444-8|^hevc-framemd5: the driver cannot: HEVC: VA-API decodes 4:2:0 here"
   "main12|640x360|10|12|420|--preset fast --profile main12|$rext"
 )
+# The 4:4:4 streams' refusal where the driver decodes none of them.
+rext_refused='^hevc-framemd5: (sample [0-9]+: )?the driver cannot: HEVCMain444: '
 kvazaar_refusals=(
   "kvz-720p-tiles-col64|1280x720|10|testsrc2|--preset fast --gop 8 --level 5.1 --tiles-width-split 64,128,1216|ColumnWidthInLumaSamples is out of range"
 )
@@ -330,6 +357,11 @@ kvazaar_partial=(
 )
 
 echo "hevc-check on $node, $(date -Is), $(hostname), $(x265 --version 2>&1 | grep -m1 -o 'version [^ ]*'), $(kvazaar --version 2>&1 | head -n1)"
+if (( four_four_four )); then
+  echo "     4:4:4 at 8 bits: the driver lists HEVC Main 4:4:4's decoder into XYUV: decoded"
+else
+  echo "     4:4:4 at 8 bits: the driver lists no HEVC Main 4:4:4 decoder into XYUV: refused"
+fi
 
 # Every stream and its reference first, then the GPU. Each checked stream
 # goes into `made` as name|bits.
@@ -349,6 +381,23 @@ for entry in "${streams[@]}"; do
     cp "$out/$name.recon" "$out/$name.expect"
   fi
   made+=("$name|$bits")
+done
+for entry in "${rext_streams[@]}"; do
+  IFS='|' read -r name size frames kind opts <<<"$entry"
+  if ! encode "$name" "$size" "$frames" 8 "$kind" "$opts" 444; then
+    failed=1
+    continue
+  fi
+  (( four_four_four )) || continue
+  reference "$name" 8 nv24
+  cp "$out/$name.ref" "$out/$name.expect"
+  if ! cmp -s "$out/$name.ref" "$out/$name.recon"; then
+    echo "NOTE $name: ffmpeg's decode differs from x265's reconstruction from frame" \
+      "$(paste "$out/$name.ref" "$out/$name.recon" | awk '$1 != $2 { print NR - 1; exit }'):" \
+      "checking against the reconstruction"
+    cp "$out/$name.recon" "$out/$name.expect"
+  fi
+  made+=("$name|8")
 done
 for entry in "${kvazaar_streams[@]}"; do
   IFS='|' read -r name size frames kind opts <<<"$entry"
@@ -519,6 +568,15 @@ for entry in "${refusals[@]}"; do
   [[ -s $out/$name.mp4 ]] || continue
   refused "$name" "$out/$name.mp4" "$why"
 done
+if (( ! four_four_four )); then
+  for entry in "${rext_streams[@]}"; do
+    IFS='|' read -r name _ <<<"$entry"
+    [[ -s $out/$name.mp4 ]] || continue
+    for input in "$out/$name.mp4" "$out/$name.265"; do
+      refused "$name (${input##*.})" "$input" "$rext_refused"
+    done
+  done
+fi
 for entry in "${kvazaar_refusals[@]}"; do
   IFS='|' read -r name _ _ _ _ why <<<"$entry"
   [[ -s $out/$name.mp4 ]] || continue

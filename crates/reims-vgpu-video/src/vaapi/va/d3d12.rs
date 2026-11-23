@@ -453,6 +453,11 @@ impl Device {
         width: u32,
         height: u32,
     ) -> Result<SharedTexture, String> {
+        let dxgi_format = match format {
+            SurfaceFormat::Nv12 => DXGI_FORMAT_NV12,
+            SurfaceFormat::P010 => DXGI_FORMAT_P010,
+            SurfaceFormat::Xyuv => return Err("no shared texture of XYUV".to_owned()),
+        };
         let heap = HeapProperties {
             type_: D3D12_HEAP_TYPE_DEFAULT,
             cpu_page_property: 0,
@@ -467,10 +472,7 @@ impl Device {
             height,
             depth_or_array_size: 1,
             mip_levels: 1,
-            format: match format {
-                SurfaceFormat::Nv12 => DXGI_FORMAT_NV12,
-                SurfaceFormat::P010 => DXGI_FORMAT_P010,
-            },
+            format: dxgi_format,
             sample_count: 1,
             sample_quality: 0,
             layout: 0,

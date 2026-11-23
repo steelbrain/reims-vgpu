@@ -38,6 +38,8 @@ impl Profile {
     pub const HEVC_MAIN: Self = Self(ffi::VAProfileHEVCMain);
     /// `VAProfileHEVCMain10`.
     pub const HEVC_MAIN10: Self = Self(ffi::VAProfileHEVCMain10);
+    /// `VAProfileHEVCMain444`: the range extensions' 4:4:4 at 8 bits.
+    pub const HEVC_MAIN444: Self = Self(ffi::VAProfileHEVCMain444);
 
     /// va.h's name for the profile, without its `VAProfile` prefix.
     pub fn name(self) -> Option<&'static str> {
@@ -135,6 +137,8 @@ pub struct Fourcc(pub u32);
 impl Fourcc {
     /// `VA_FOURCC_NV12`.
     pub const NV12: Self = Self(ffi::VA_FOURCC_NV12);
+    /// `VA_FOURCC_XYUV`.
+    pub const XYUV: Self = Self(ffi::VA_FOURCC_XYUV);
 }
 
 impl std::fmt::Display for Fourcc {

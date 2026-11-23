@@ -141,6 +141,74 @@ fn a_profile_whose_config_decodes_none_of_its_formats_is_left_out() {
     assert!(caps_of(&driver(Vec::new())).is_empty());
 }
 
+/// An HEVC 4:4:4 stream decodes where the driver's Main 4:4:4 decoder writes XYUV surfaces of
+/// 4:4:4 render targets at its size and the stream is of 8 bits, as iHD's answers on an Iris Xe
+/// (AYUV and XYUV up to 16384x16384), and is declined, naming why, everywhere else
+#[test]
+fn an_hevc_4_4_4_stream_decodes_on_a_main_4_4_4_decoder_of_xyuv_surfaces_alone() {
+    use reims_vgpu_video::paravirt::Codec as StreamCodec;
+    let stream = |luma_bits: u8, width: u32, height: u32| Stream {
+        codec: StreamCodec::Hevc,
+        profile: 4,
+        chroma_format_idc: 3,
+        luma_bits,
+        chroma_bits: luma_bits,
+        width,
+        height,
+    };
+    let ayuv = Fourcc(u32::from_le_bytes(*b"AYUV"));
+    let iris = |pixel_formats: Vec<Fourcc>, rt_formats: u32| {
+        let mut config = config(
+            Profile::HEVC_MAIN444,
+            rt_formats,
+            (16384, 16384),
+            Some((16, 16)),
+        );
+        if let Ok(surfaces) = config.surfaces.as_mut() {
+            surfaces.pixel_formats = pixel_formats;
+        }
+        config
+    };
+    let taken = iris(vec![ayuv, Fourcc::XYUV], 0x0000_000f);
+    assert_eq!(declines_4_4_4(Some(&taken), &stream(8, 1920, 1080)), None);
+    assert_eq!(declines_4_4_4(Some(&taken), &stream(8, 16384, 16)), None);
+    let declined = [
+        (
+            None,
+            stream(8, 1920, 1080),
+            "VA-API: the driver has no HEVC Main 4:4:4 decoder",
+        ),
+        (
+            Some(&taken),
+            stream(10, 1920, 1080),
+            "VA-API decodes HEVC 4:4:4 at 8 bits here, not 10",
+        ),
+        (
+            Some(&taken),
+            stream(8, 16400, 1080),
+            "VA-API decodes HEVC 4:4:4 up to 16384x16384, not 16400x1080",
+        ),
+        (
+            Some(&taken),
+            stream(8, 8, 8),
+            "VA-API decodes HEVC 4:4:4 from 16x16, not 8x8",
+        ),
+    ];
+    for (config, stream, why) in declined {
+        assert_eq!(declines_4_4_4(config, &stream).as_deref(), Some(why));
+    }
+    let packed_alone = iris(vec![ayuv], 0x0000_000f);
+    assert_eq!(
+        declines_4_4_4(Some(&packed_alone), &stream(8, 1920, 1080)).as_deref(),
+        Some("VA-API writes HEVC 4:4:4 as [AYUV], not XYUV")
+    );
+    let no_4_4_4 = iris(vec![Fourcc::XYUV], RT_YUV420);
+    assert_eq!(
+        declines_4_4_4(Some(&no_4_4_4), &stream(8, 1920, 1080)).as_deref(),
+        Some("VA-API: the driver's HEVC Main 4:4:4 decoder has no 4:4:4 render targets")
+    );
+}
+
 /// The layout is granularity [2, 2] at the largest alignment the import check found for the
 /// codec's formats, and zero where it found none
 #[test]

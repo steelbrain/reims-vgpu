@@ -1864,15 +1864,19 @@ Stages:
       session's `dsta` on one is refused with
       `kVTVideoDecoderUnsupportedDataFormatErr`: the arms decode 4:2:0
       pictures, of 8 bits, or 10 in HEVC, in the profiles and tools the
-      codec's `check_supported` takes, and NVDEC also HEVC's 4:4:4 at 8
-      bits (the range extensions' Main 4:4:4 streams) where its caps
-      answer HEVC 4:4:4 at that depth and the stream's size, each picture
-      landing in the 4:4:4 format its `TDrs` names ('444v', '444f'), its Cb
-      and Cr interleaved by the CPU (`graphics::nvidia`'s module doc). A
+      codec's `check_supported` takes, and NVDEC and VA-API also HEVC's
+      4:4:4 at 8 bits (the range extensions' Main 4:4:4 streams) where
+      NVDEC's caps answer HEVC 4:4:4 at that depth and the stream's size,
+      or the VA driver lists a Main 4:4:4 decoder of 4:4:4 render targets
+      and XYUV surfaces at that size (iHD's), each picture landing in the
+      4:4:4 format its `TDrs` names ('444v', '444f'), its Cb and Cr
+      interleaved by the CPU from NVDEC's three planes or VA-API's XYUV
+      samples (`graphics::nvidia`'s and `graphics::vaapi`'s module docs). A
       stream the codec refuses (4:2:2, monochrome, a HEIC image's alpha
       item, a 4:4:4 stream past 8 bits), or one the arm declines (4:4:4 on
-      VA-API, and on an NVIDIA GPU whose caps lack it: the arm's
-      `guest_declines`), is then refused at the session's start, not at
+      a VA driver without that decoder, radeonsi's, and on an NVIDIA GPU
+      whose caps lack it: the arm's `guest_declines`), is then refused at
+      the session's start, not at
       each tile or frame, and every tile a session takes lands in the
       format its `TDrs` names. The refusal's warning names the stream and
       why: the codec's refusal or the arm's decline, its codec, its

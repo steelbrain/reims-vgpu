@@ -216,7 +216,11 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   does, `kVTVideoDecoderBadDataErr` and no image for each picture until the IRAP picture, and
   none of them reaches the device (**measured** in the guest on a Radeon 780M, 2026-11-20).
   A stream the decoder does not take, an `avcC` or `hvcC` record's error, and the hardware's or
-  the host API's errors still fault the command buffer.
+  the host API's errors still fault the command buffer. The range extensions' streams, HEVC's
+  4:4:4 at 8 bits among them, are streams this decoder does not take: the caps offer 4:2:0
+  alone, and its decoders land 4:2:0 pictures alone, where VideoToolbox's paravirtual decoders
+  on arm64 guests land HEVC 4:4:4 at 8 bits on hosts that decode it
+  ([design.md](../graphics-kext/design.md), "The answers are the host's arms'").
 
 ## An encode
 

@@ -110,14 +110,61 @@ pub(crate) fn asked() -> Option<ReadbackWay> {
 
 /// The bytes a row and the rows of `rect`'s two planes: luma, then the
 /// interleaved chroma, whose last pair and row an odd width or height
-/// shares with its last luma column or row.
+/// shares with its last luma column or row; for XYUV, its one plane's
+/// pixels, four bytes each, and no second plane.
 pub(crate) fn plane_extents(format: SurfaceFormat, rect: Rect) -> [(usize, usize); 2] {
     let sample = format.bytes_per_sample();
     let (width, height) = (to_usize(rect.width), to_usize(rect.height));
-    [
-        (width * sample, height),
-        (width.div_ceil(2) * 2 * sample, height.div_ceil(2)),
-    ]
+    match format {
+        SurfaceFormat::Xyuv => [(width * 4, height), (0, 0)],
+        SurfaceFormat::Nv12 | SurfaceFormat::P010 => [
+            (width * sample, height),
+            (width.div_ceil(2) * 2 * sample, height.div_ceil(2)),
+        ],
+    }
+}
+
+/// Splits `rect` of an XYUV plane in `bytes`, at `plane`'s offset with its
+/// pitch, into two destinations, each with its stride: the luma, a byte a
+/// pixel, and the chroma, each pixel's Cb then Cr. Each source row is first
+/// read whole into a row of the caller's with `copy` (streaming loads where
+/// the bytes are a mapping of video memory), then split.
+pub(crate) fn split_xyuv(
+    bytes: &[u8],
+    (offset, pitch): (usize, usize),
+    rect: Rect,
+    destinations: [(&mut [u8], usize); 2],
+    copy: fn(&mut [u8], &[u8]),
+) -> Result<(), Error> {
+    fn destination(plane: &mut [u8], row: usize, stride: usize, len: usize) -> Option<&mut [u8]> {
+        let start = row.checked_mul(stride)?;
+        plane.get_mut(start..start.checked_add(len)?)
+    }
+    let short = || Error::Unsupported("an image smaller than its pitches".into());
+    let too_small = || Error::PlaneTooSmall("destination");
+    let [(y, y_stride), (cbcr, cbcr_stride)] = destinations;
+    let width = to_usize(rect.width);
+    let x = to_usize(rect.x).checked_mul(4).ok_or_else(short)?;
+    let mut row_bytes = vec![0u8; width.checked_mul(4).ok_or_else(short)?];
+    for row in 0..to_usize(rect.height) {
+        let src = to_usize(rect.y)
+            .checked_add(row)
+            .and_then(|row| row.checked_mul(pitch))
+            .and_then(|start| start.checked_add(offset)?.checked_add(x))
+            .and_then(|start| bytes.get(start..start.checked_add(row_bytes.len())?))
+            .ok_or_else(short)?;
+        copy(&mut row_bytes, src);
+        let (pixels, _) = row_bytes.as_chunks::<4>();
+        let luma = destination(y, row, y_stride, width).ok_or_else(too_small)?;
+        for (sample, pixel) in luma.iter_mut().zip(pixels) {
+            *sample = pixel[2];
+        }
+        let chroma = destination(cbcr, row, cbcr_stride, width * 2).ok_or_else(too_small)?;
+        for (pair, pixel) in chroma.as_chunks_mut::<2>().0.iter_mut().zip(pixels) {
+            *pair = [pixel[1], pixel[0]];
+        }
+    }
+    Ok(())
 }
 
 /// Copies `rect` out of `bytes`, whose planes are at `offsets` with
@@ -217,11 +264,12 @@ pub(crate) enum HostFormat {
 }
 
 impl HostFormat {
-    /// The decoders' format's.
-    pub(crate) fn of(format: SurfaceFormat) -> Self {
+    /// The decoders' format's; `None` for XYUV, which no host surface is of.
+    pub(crate) fn of(format: SurfaceFormat) -> Option<Self> {
         match format {
-            SurfaceFormat::Nv12 => Self::Nv12,
-            SurfaceFormat::P010 => Self::P010,
+            SurfaceFormat::Nv12 => Some(Self::Nv12),
+            SurfaceFormat::P010 => Some(Self::P010),
+            SurfaceFormat::Xyuv => None,
         }
     }
 
@@ -484,7 +532,9 @@ impl Staging {
         width: u32,
         height: u32,
     ) -> Result<Self, Error> {
-        let host = HostSurface::new(display, HostFormat::of(format), width, height)?;
+        let host_format = HostFormat::of(format)
+            .ok_or_else(|| Error::Unsupported(format!("no host surface of {}", format.name())))?;
+        let host = HostSurface::new(display, host_format, width, height)?;
         let context = Config::new(display, Profile::NONE, Entrypoint::VIDEO_PROC, &mut [])
             .and_then(|config| Context::new(display, config, width, height, &mut [host.surface]))?;
         Ok(Self {
@@ -804,7 +854,7 @@ pub(crate) struct MappedRead<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostFormat, Rect, SurfaceFormat, copy_rect, copy_row};
+    use super::{HostFormat, Rect, SurfaceFormat, copy_rect, copy_row, split_xyuv};
     use crate::vaapi::va::display::Error;
 
     /// An NV12 frame of 4x4 in 8 bytes a row: luma 0 to 31, then chroma
@@ -836,6 +886,50 @@ mod tests {
         assert!(copied.is_ok());
         assert_eq!(y, [18, 19, 26, 27]);
         assert_eq!(uv, [110, 111]);
+    }
+
+    /// An XYUV plane's rectangle splits into luma and the Cb/Cr pairs, Cb first: each pixel's
+    /// bytes are Cr, Cb, Y and one unused, in that order.
+    #[test]
+    fn an_xyuv_rectangle_splits_into_luma_and_cb_cr_pairs() {
+        // 3x2 pixels at 16 bytes a row, from byte 4: pixel (x, y) is Cr 40 + n, Cb 20 + n,
+        // Y n, X 0xff, n = 3y + x.
+        let mut bytes = vec![0xee; 4 + 32];
+        for n in 0..6u8 {
+            let at = 4 + usize::from(n / 3) * 16 + usize::from(n % 3) * 4;
+            bytes[at..at + 4].copy_from_slice(&[40 + n, 20 + n, n, 0xff]);
+        }
+        let (mut y, mut cbcr) = (vec![0; 2 * 3], vec![0; 2 * 5]);
+        let split = split_xyuv(
+            &bytes,
+            (4, 16),
+            rect(1, 0, 2, 2),
+            [(&mut y, 3), (&mut cbcr, 5)],
+            copy_row,
+        );
+        assert!(split.is_ok());
+        // The second and third columns; past each row's bytes, the strides' spare bytes stay.
+        assert_eq!(y, [1, 2, 0, 4, 5, 0]);
+        assert_eq!(cbcr, [21, 41, 22, 42, 0, 24, 44, 25, 45, 0]);
+        // A crop past the plane, and destinations too small, are refused.
+        let (mut y, mut cbcr) = (vec![0; 6], vec![0; 12]);
+        let past = split_xyuv(
+            &bytes,
+            (4, 16),
+            rect(0, 1, 3, 2),
+            [(&mut y, 3), (&mut cbcr, 6)],
+            copy_row,
+        );
+        assert!(matches!(past, Err(Error::Unsupported(_))));
+        let (mut y, mut cbcr) = (vec![0; 6], vec![0; 7]);
+        let small = split_xyuv(
+            &bytes,
+            (4, 16),
+            rect(0, 0, 3, 2),
+            [(&mut y, 3), (&mut cbcr, 6)],
+            copy_row,
+        );
+        assert!(matches!(small, Err(Error::PlaneTooSmall(_))));
     }
 
     #[test]

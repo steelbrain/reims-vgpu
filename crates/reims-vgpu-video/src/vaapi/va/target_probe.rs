@@ -58,6 +58,13 @@ fn import(
     width: u32,
     height: u32,
 ) -> Result<ffi::VASurfaceID, Error> {
+    let drm_format = match format {
+        SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
+        SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
+        SurfaceFormat::Xyuv => {
+            return Err(Error::Unsupported("a probe surface of XYUV".into()));
+        }
+    };
     let (w, h) = (width as usize, height as usize);
     let pitch = (w * format.bytes_per_sample()).next_multiple_of(laid.row_align);
     let chroma_at = (laid.luma_at + pitch * h).next_multiple_of(256);
@@ -79,10 +86,7 @@ fn import(
         drm_format_modifier: ffi::DRM_FORMAT_MOD_LINEAR,
     };
     descriptor.layers[0] = ffi::VADRMPRIMESurfaceLayer {
-        drm_format: match format {
-            SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
-            SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
-        },
+        drm_format,
         num_planes: 2,
         object_index: [0, 0, 0, 0],
         offset: [laid.luma_at as u32, chroma_at as u32, 0, 0],

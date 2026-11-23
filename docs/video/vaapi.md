@@ -1109,6 +1109,18 @@ said:
   `Frame::bit_depth` says which, and `copy_p010_to` copies two bytes a
   sample. The conformance window crops in chroma units, so a 4:2:0 frame
   is always of even size.
+- Main 4:4:4 at 8 bits, for a caller that lands it, decodes into XYUV
+  surfaces (`VAProfileHEVCMain444`, `VA_RT_FORMAT_YUV444`): one plane of
+  four bytes a pixel, Cr, Cb, Y and a byte unused, in memory order, as DRM's
+  `XYUV8888` and ffmpeg's VUYX. iHD lists AYUV and XYUV for the profile
+  (2026-11-22); XYUV is the one without alpha. `Frame::is_4_4_4` says so,
+  and `ReadBack::copy_4_4_4_into` reads a frame back through `vaGetImage`
+  (an XYUV image: the import check, which checks NV12 and P010 imports, has
+  no answer for XYUV, so no staged copy back is made) and splits it on the
+  CPU into two planes, luma and each pixel's Cb then Cr, as CoreVideo's
+  `444v` and `444f` and ffmpeg's NV24 lay them out. A decode's target
+  (`super::target`), the in-place write into a guest's surface and the
+  zero-copy import take no XYUV: the frame lands by that read back alone.
 
 ### What it refuses
 
@@ -1131,10 +1143,26 @@ The codec module decodes the 4:4:4 streams it takes with their tools: the
 SPS's nine range extension flags and the PPS's transform skip size,
 cross-component prediction, chroma QP offset lists and SAO offset scales,
 each held to 7.4.3.3.2's ranges, and a slice's
-`cu_chroma_qp_offset_enabled_flag`. This module's accelerator refuses them
-with `Error::Unsupported("HEVC: VA-API decodes 4:2:0 here, not the range
-extensions' 4:4:4")` (`profile_for`): its pictures and surfaces are
-4:2:0's. NVDEC decodes them ([nvidia.md](nvidia.md), "What it refuses").
+`cu_chroma_qp_offset_enabled_flag`. This module's accelerator decodes them
+for a caller that lands them (`HevcDecoder::lands_4_4_4`, which
+VideoToolbox's paravirtual decoders call), on the driver's `HEVCMain444`
+into XYUV surfaces (`profile_for`, and "Surfaces, formats and readback"),
+and refuses them for any other caller, before anything reaches the driver,
+with `Error::Unsupported("HEVC 4:4:4: its caller lands 4:2:0 pictures
+alone")`. A driver with no such decoder refuses them with its own answer,
+`HEVCMain444: the driver has no decoder`. iHD 26.3.5 on an Iris Xe lists
+`HEVCMain444` VLD with 4:4:4 render targets and AYUV and XYUV surfaces up
+to 16384x16384 (`vaapi-probe`, 2026-11-22); radeonsi on the Radeon 780M
+lists none. The picture's parameters go as va_dec_hevc.h's
+`VAPictureParameterBufferHEVCExtension`, the base structure and the range
+extensions' (`VAPictureParameterBufferHEVCRext`: the SPS's and the PPS's
+flags, the chroma QP offset lists, the SAO offset scales and the transform
+skip size) with screen content's zeroed, and each slice's as
+`VASliceParameterBufferHEVCExtension`, whose range extension part holds the
+prediction weights' offsets at 16 bits and
+`cu_chroma_qp_offset_enabled_flag`: the whole structures in the usual
+buffer types, as ffmpeg sends them for that profile. NVDEC decodes them too
+([nvidia.md](nvidia.md), "What it refuses").
 
 Parameter sets, slice headers and pictures past the standard's ranges
 are refused with `OutOfRange`, or the variant that names what they break
@@ -1158,8 +1186,9 @@ as ffmpeg's own VA-API decode did (kvz-720p-ref15 from its tenth picture
 on, on the Radeon 780M, 2026-10-24; "Testing HEVC"). Each picture after
 it is refused until an IRAP picture.
 
-x265's streams of Main 4:2:2 10 and Main 12 are refused so, and its Main
-4:4:4 streams by the accelerator. `HevcDecoder::new` checks the `hvcC` record's first SPS, the driver's
+x265's streams of Main 4:2:2 10 and Main 12 are refused so; its Main 4:4:4
+streams decode where the driver lists `HEVCMain444` into XYUV, and are
+refused with the driver's answer elsewhere. `HevcDecoder::new` checks the `hvcC` record's first SPS, the driver's
 profile and its largest size, so that a session the driver cannot serve
 fails when it is made.
 
@@ -1676,7 +1705,12 @@ set, and every frame's MD5 over packed NV12 or P010 must match. Then:
 - 2- and 3-byte NAL lengths, strides padded 192 bytes, a caller holding
   24 frames;
 - a switch from Main 720p to Main 10 1080p at an IDR picture, mid-stream;
-- Main 4:2:2 10, Main 4:4:4 and Main 12, which must be refused;
+- Main 4:2:2 10 and Main 12, which must be refused;
+- x265's Main 4:4:4 streams at 8 bits (main444-360p; main444-720p-fade,
+  with weighted prediction; main444-1366x766-ctu16, with CTBs of 16 and
+  transform skip), whose MD5s over NV24 must match where `vaapi-probe`
+  lists `HEVCMain444`'s decoder of 4:4:4 render targets and XYUV surfaces,
+  and which must be refused, naming `HEVCMain444`, where it does not;
 - kvazaar's kvz-720p-tiles-narrow and kvz-720p-tiles-short, whose tile
   column of 192 samples and row of 16 Main does not allow (H.265 A.3.2 and
   A.3.3: 256 and 64 at least), which must match on every frame;

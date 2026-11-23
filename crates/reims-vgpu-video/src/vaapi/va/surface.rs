@@ -1,6 +1,8 @@
 //! Decode surfaces: a pool of surfaces of one format and size, lent out
 //! one at a time, and their readback into caller-provided planes. 8-bit
-//! 4:2:0 is NV12, and 10-bit 4:2:0 is P010.
+//! 4:2:0 is NV12, 10-bit 4:2:0 is P010, and 8-bit 4:4:4 is XYUV, whose
+//! frames are split into two planes as they are read back
+//! ([`SurfaceReadBack::copy_4_4_4_to`]).
 //!
 //! A pool makes a surface only when one is asked of it and none is free
 //! ([`SurfacePool::get`]), so it holds no more surfaces than were lent at
@@ -53,7 +55,7 @@ mod shared;
 const MAX_SURFACES: usize = 48;
 
 /// What a pool's surfaces hold: 4:2:0 in two planes, luma then
-/// interleaved Cb/Cr.
+/// interleaved Cb/Cr, or 4:4:4 packed in one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SurfaceFormat {
     /// 8-bit samples (`VA_FOURCC_NV12`).
@@ -61,6 +63,10 @@ pub(crate) enum SurfaceFormat {
     /// 10-bit samples in the top bits of little-endian 16-bit words
     /// (`VA_FOURCC_P010`).
     P010,
+    /// 8-bit 4:4:4 in one plane, four bytes a pixel: Cr, Cb, Y and one
+    /// unused, in that order in memory (`VA_FOURCC_XYUV`, ffmpeg's `VUYX`).
+    /// HEVC Main 4:4:4's.
+    Xyuv,
 }
 
 impl SurfaceFormat {
@@ -69,6 +75,7 @@ impl SurfaceFormat {
         match self {
             Self::Nv12 => ffi::VA_RT_FORMAT_YUV420,
             Self::P010 => ffi::VA_RT_FORMAT_YUV420_10,
+            Self::Xyuv => ffi::VA_RT_FORMAT_YUV444,
         }
     }
 
@@ -76,22 +83,32 @@ impl SurfaceFormat {
         match self {
             Self::Nv12 => ffi::VA_FOURCC_NV12,
             Self::P010 => ffi::VA_FOURCC_P010,
+            Self::Xyuv => ffi::VA_FOURCC_XYUV,
         }
     }
 
-    /// Bits a pixel takes, over both planes.
+    /// Bits a pixel takes, over its planes.
     pub(crate) fn bits_per_pixel(self) -> u32 {
         match self {
             Self::Nv12 => 12,
             Self::P010 => 24,
+            Self::Xyuv => 32,
         }
     }
 
     /// The bytes one sample takes.
     pub(crate) fn bytes_per_sample(self) -> usize {
         match self {
-            Self::Nv12 => 1,
+            Self::Nv12 | Self::Xyuv => 1,
             Self::P010 => 2,
+        }
+    }
+
+    /// Its planes: luma and chroma, or one of packed pixels.
+    pub(crate) fn planes(self) -> u32 {
+        match self {
+            Self::Nv12 | Self::P010 => 2,
+            Self::Xyuv => 1,
         }
     }
 
@@ -100,6 +117,7 @@ impl SurfaceFormat {
         match self {
             Self::Nv12 => "NV12",
             Self::P010 => "P010",
+            Self::Xyuv => "XYUV",
         }
     }
 }
@@ -285,7 +303,7 @@ impl SurfacePool {
         let inner = &self.inner;
         let shape = target.shape();
         let fits = target.is_on(&inner.display)
-            && shape.format == TargetFormat::of(inner.format)
+            && TargetFormat::of(inner.format) == Some(shape.format)
             && shape.coded == (inner.width, inner.height)
             && inner.stalled().is_ok();
         fits.then(|| Surface {
@@ -295,12 +313,13 @@ impl SurfacePool {
         })
     }
 
-    /// The format and coded size of its surfaces, which a decode's target is asked for.
-    pub(crate) fn shape(&self) -> TargetShape {
-        TargetShape {
-            format: TargetFormat::of(self.inner.format),
+    /// The format and coded size of its surfaces, which a decode's target is asked for; `None`
+    /// for a format no target is of.
+    pub(crate) fn shape(&self) -> Option<TargetShape> {
+        Some(TargetShape {
+            format: TargetFormat::of(self.inner.format)?,
             coded: (self.inner.width, self.inner.height),
-        }
+        })
     }
 
     /// Whether the pool is stalled (module docs).
@@ -619,51 +638,119 @@ impl SurfaceReadBack<'_> {
         uv_stride: usize,
     ) -> Result<(), Error> {
         let pool = &self.surface.pool;
+        if pool.format.planes() != 2 {
+            return Err(Error::Unsupported(format!(
+                "copying {} pixels as they are into two planes",
+                pool.format.name()
+            )));
+        }
         let [(luma_bytes, luma_rows), (chroma_bytes, chroma_rows)] =
             readback::plane_extents(pool.format, rect);
+        self.check_planes(
+            rect,
+            (y.len(), y_stride, luma_rows, luma_bytes),
+            (uv.len(), uv_stride, chroma_rows, chroma_bytes),
+        )?;
+        let started = pool.display.runtime().now();
+        let destinations = [(y, y_stride), (uv, uv_stride)];
+        copy_rect(
+            self.bytes(),
+            self.read.planes,
+            pool.format,
+            rect,
+            destinations,
+            self.read.copy,
+        )?;
+        self.count_copy(started);
+        Ok(())
+    }
+
+    /// Copies `rect` of an XYUV surface into two planes of 8-bit 4:4:4, as
+    /// CoreVideo's `444v` and ffmpeg's `nv24` lay them out: `y` with
+    /// `y_stride` bytes a row, and `cbcr`, each pixel's Cb then Cr, with
+    /// `cbcr_stride`; `rect.height` rows each. The CPU's copy alone: each
+    /// row is read whole with the way back's row copy, then split.
+    pub(crate) fn copy_4_4_4_to(
+        &self,
+        rect: Rect,
+        (y, y_stride): (&mut [u8], usize),
+        (cbcr, cbcr_stride): (&mut [u8], usize),
+    ) -> Result<(), Error> {
+        let pool = &self.surface.pool;
+        if pool.format != SurfaceFormat::Xyuv {
+            return Err(Error::Unsupported(format!(
+                "reading a {} frame back as 4:4:4",
+                pool.format.name()
+            )));
+        }
+        let (width, rows) = (to_usize(rect.width), to_usize(rect.height));
+        self.check_planes(
+            rect,
+            (y.len(), y_stride, rows, width),
+            (cbcr.len(), cbcr_stride, rows, width.saturating_mul(2)),
+        )?;
+        let started = pool.display.runtime().now();
+        readback::split_xyuv(
+            self.bytes(),
+            self.read.planes[0],
+            rect,
+            [(y, y_stride), (cbcr, cbcr_stride)],
+            self.read.copy,
+        )?;
+        self.count_copy(started);
+        Ok(())
+    }
+
+    /// `Err` where a destination plane, given as its length, its stride, and the rows and the
+    /// bytes a row of `rect` it is to hold, holds less, or where `rect` lies past what was read
+    /// back.
+    fn check_planes(
+        &self,
+        rect: Rect,
+        luma: (usize, usize, usize, usize),
+        chroma: (usize, usize, usize, usize),
+    ) -> Result<(), Error> {
         // Whether a plane of `len` bytes holds `rows` rows of `bytes`,
         // `stride` apart.
-        let holds = |len: usize, stride: usize, rows: usize, bytes: usize| {
+        let holds = |(len, stride, rows, bytes): (usize, usize, usize, usize)| {
             stride >= bytes
                 && stride
                     .checked_mul(rows.saturating_sub(1))
                     .and_then(|start| start.checked_add(bytes))
                     .is_some_and(|end| end <= len)
         };
-        if !holds(y.len(), y_stride, luma_rows, luma_bytes) {
+        if !holds(luma) {
             return Err(Error::PlaneTooSmall("luma"));
         }
-        if !holds(uv.len(), uv_stride, chroma_rows, chroma_bytes) {
+        if !holds(chroma) {
             return Err(Error::PlaneTooSmall("chroma"));
         }
-        let read = &self.read;
+        let bounds = self.read.bounds;
         let within = |at: u32, length: u32, bound: u32| {
             at.checked_add(length).is_some_and(|end| end <= bound)
         };
-        if !within(rect.x, rect.width, read.bounds.0) || !within(rect.y, rect.height, read.bounds.1)
-        {
+        if !within(rect.x, rect.width, bounds.0) || !within(rect.y, rect.height, bounds.1) {
             return Err(Error::Unsupported("a crop larger than its surface".into()));
         }
-        let started = pool.display.runtime().now();
+        Ok(())
+    }
+
+    /// The read back's bytes.
+    fn bytes(&self) -> &[u8] {
         // SAFETY: the read back's `len` bytes, readable until it drops:
         // the staging surface's memory, held by the pool's way back, which
         // this keeps locked, or a mapping undone only as it drops.
-        let bytes = unsafe { core::slice::from_raw_parts(read.bytes, read.len) };
-        let destinations = [(y, y_stride), (uv, uv_stride)];
-        copy_rect(
-            bytes,
-            read.planes,
-            pool.format,
-            rect,
-            destinations,
-            read.copy,
-        )?;
+        unsafe { core::slice::from_raw_parts(self.read.bytes, self.read.len) }
+    }
+
+    /// Counts a copy out of the read back, begun at `started`, in the pool's times.
+    fn count_copy(&self, started: MonoTime) {
+        let pool = &self.surface.pool;
         pool.times.lock().add(
             self.wait,
             self.transfer,
             pool.display.runtime().elapsed_since(started),
         );
-        Ok(())
     }
 }
 
@@ -1159,15 +1246,16 @@ fn create_image(
 }
 
 /// Maps a filled image of `format`, `derived` or made by `vaCreateImage`
-/// (`image::map_buffer`): its bytes, their length and its two planes'
-/// offsets and pitches, readable until `vaUnmapBuffer` of its buffer.
+/// (`image::map_buffer`): its bytes, their length and its first two planes'
+/// offsets and pitches (the second unused for a format of one), readable
+/// until `vaUnmapBuffer` of its buffer.
 fn map_image(
     display: &Display,
     format: SurfaceFormat,
     image: &ffi::VAImage,
     derived: bool,
 ) -> Result<MappedImage, Error> {
-    if image.format.fourcc != format.fourcc() || image.num_planes < 2 {
+    if image.format.fourcc != format.fourcc() || image.num_planes < format.planes() {
         return Err(Error::Unsupported(format!(
             "reading back an image of {}",
             super::caps::Fourcc(image.format.fourcc)

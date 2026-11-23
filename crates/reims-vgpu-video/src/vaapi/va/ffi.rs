@@ -50,9 +50,11 @@ pub(crate) const VA_PROGRESSIVE: c_int = 0x1;
 
 pub(crate) const VA_RT_FORMAT_YUV420: c_uint = 0x0000_0001;
 pub(crate) const VA_RT_FORMAT_YUV420_10: c_uint = 0x0000_0100;
+pub(crate) const VA_RT_FORMAT_YUV444: c_uint = 0x0000_0004;
 
 pub(crate) const VA_FOURCC_NV12: u32 = 0x3231_564e;
 pub(crate) const VA_FOURCC_P010: u32 = 0x3031_3050;
+pub(crate) const VA_FOURCC_XYUV: u32 = 0x5655_5958;
 
 pub(crate) const VA_SLICE_DATA_FLAG_ALL: u32 = 0x00;
 
@@ -73,6 +75,7 @@ pub(crate) const VAProfileH264High: VAProfile = 7;
 pub(crate) const VAProfileH264ConstrainedBaseline: VAProfile = 13;
 pub(crate) const VAProfileHEVCMain: VAProfile = 17;
 pub(crate) const VAProfileHEVCMain10: VAProfile = 18;
+pub(crate) const VAProfileHEVCMain444: VAProfile = 26;
 
 // VAEntrypoint.
 pub(crate) const VAEntrypointVLD: VAEntrypoint = 1;
@@ -459,6 +462,89 @@ pub(crate) struct VAIQMatrixBufferHEVC {
     pub(crate) va_reserved: [u32; VA_PADDING_LOW],
 }
 
+/// `VAPictureParameterBufferHEVCRext` (va_dec_hevc.h): the range extensions'
+/// picture parameters, of their SPS and PPS extensions.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VAPictureParameterBufferHEVCRext {
+    /// `range_extension_pic_fields.value`: see [`hevc_range_extension_pic_fields`].
+    pub(crate) range_extension_pic_fields: u32,
+    pub(crate) diff_cu_chroma_qp_offset_depth: u8,
+    pub(crate) chroma_qp_offset_list_len_minus1: u8,
+    pub(crate) log2_sao_offset_scale_luma: u8,
+    pub(crate) log2_sao_offset_scale_chroma: u8,
+    pub(crate) log2_max_transform_skip_block_size_minus2: u8,
+    pub(crate) cb_qp_offset_list: [i8; 6],
+    pub(crate) cr_qp_offset_list: [i8; 6],
+}
+
+/// `VAPictureParameterBufferHEVCScc` (va_dec_hevc.h): screen content coding's
+/// picture parameters, which a range extensions' decode sends zeroed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VAPictureParameterBufferHEVCScc {
+    pub(crate) screen_content_pic_fields: u32,
+    pub(crate) palette_max_size: u8,
+    pub(crate) delta_palette_max_predictor_size: u8,
+    pub(crate) predictor_palette_size: u8,
+    pub(crate) predictor_palette_entries: [[u16; 128]; 3],
+    pub(crate) pps_act_y_qp_offset_plus5: i8,
+    pub(crate) pps_act_cb_qp_offset_plus5: i8,
+    pub(crate) pps_act_cr_qp_offset_plus3: i8,
+}
+
+impl VAPictureParameterBufferHEVCScc {
+    /// Every field zero: no screen content coding tool.
+    pub(crate) fn none() -> Self {
+        Self {
+            screen_content_pic_fields: 0,
+            palette_max_size: 0,
+            delta_palette_max_predictor_size: 0,
+            predictor_palette_size: 0,
+            predictor_palette_entries: [[0; 128]; 3],
+            pps_act_y_qp_offset_plus5: 0,
+            pps_act_cb_qp_offset_plus5: 0,
+            pps_act_cr_qp_offset_plus3: 0,
+        }
+    }
+}
+
+/// `VAPictureParameterBufferHEVCExtension` (va_dec_hevc.h): the picture
+/// parameters of a range extensions' profile, sent whole in their buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VAPictureParameterBufferHEVCExtension {
+    pub(crate) base: VAPictureParameterBufferHEVC,
+    pub(crate) rext: VAPictureParameterBufferHEVCRext,
+    pub(crate) scc: VAPictureParameterBufferHEVCScc,
+}
+
+/// `VASliceParameterBufferHEVCRext` (va_dec_hevc.h): a slice's prediction
+/// weight offsets at 16 bits, in place of the base structure's 8-bit ones,
+/// and its extension flags.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VASliceParameterBufferHEVCRext {
+    pub(crate) luma_offset_l0: [i16; 15],
+    pub(crate) chroma_offset_l0: [[i16; 2]; 15],
+    pub(crate) luma_offset_l1: [i16; 15],
+    pub(crate) chroma_offset_l1: [[i16; 2]; 15],
+    /// `slice_ext_flags.value`: see [`hevc_slice_ext_flags`].
+    pub(crate) slice_ext_flags: u32,
+    pub(crate) slice_act_y_qp_offset: i8,
+    pub(crate) slice_act_cb_qp_offset: i8,
+    pub(crate) slice_act_cr_qp_offset: i8,
+}
+
+/// `VASliceParameterBufferHEVCExtension` (va_dec_hevc.h): the slice
+/// parameters of a range extensions' profile, sent whole in their buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VASliceParameterBufferHEVCExtension {
+    pub(crate) base: VASliceParameterBufferHEVC,
+    pub(crate) rext: VASliceParameterBufferHEVCRext,
+}
+
 /// A bit-field of a `uint32_t` union in va.h: its lowest bit and width.
 /// GCC and Clang lay x86-64 bit-fields out from bit 0 in declaration
 /// order; the layout test checks each against the C compiler.
@@ -569,6 +655,28 @@ pub(crate) mod hevc_long_slice_flags {
     pub(crate) const SLICE_DEBLOCKING_FILTER_DISABLED_FLAG: BitField = BitField::new(11, 1);
     pub(crate) const COLLOCATED_FROM_L0_FLAG: BitField = BitField::new(12, 1);
     pub(crate) const SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED_FLAG: BitField = BitField::new(13, 1);
+}
+
+/// `VAPictureParameterBufferHEVCRext::range_extension_pic_fields.bits`.
+pub(crate) mod hevc_range_extension_pic_fields {
+    use super::BitField;
+    pub(crate) const TRANSFORM_SKIP_ROTATION_ENABLED_FLAG: BitField = BitField::new(0, 1);
+    pub(crate) const TRANSFORM_SKIP_CONTEXT_ENABLED_FLAG: BitField = BitField::new(1, 1);
+    pub(crate) const IMPLICIT_RDPCM_ENABLED_FLAG: BitField = BitField::new(2, 1);
+    pub(crate) const EXPLICIT_RDPCM_ENABLED_FLAG: BitField = BitField::new(3, 1);
+    pub(crate) const EXTENDED_PRECISION_PROCESSING_FLAG: BitField = BitField::new(4, 1);
+    pub(crate) const INTRA_SMOOTHING_DISABLED_FLAG: BitField = BitField::new(5, 1);
+    pub(crate) const HIGH_PRECISION_OFFSETS_ENABLED_FLAG: BitField = BitField::new(6, 1);
+    pub(crate) const PERSISTENT_RICE_ADAPTATION_ENABLED_FLAG: BitField = BitField::new(7, 1);
+    pub(crate) const CABAC_BYPASS_ALIGNMENT_ENABLED_FLAG: BitField = BitField::new(8, 1);
+    pub(crate) const CROSS_COMPONENT_PREDICTION_ENABLED_FLAG: BitField = BitField::new(9, 1);
+    pub(crate) const CHROMA_QP_OFFSET_LIST_ENABLED_FLAG: BitField = BitField::new(10, 1);
+}
+
+/// `VASliceParameterBufferHEVCRext::slice_ext_flags.bits`.
+pub(crate) mod hevc_slice_ext_flags {
+    use super::BitField;
+    pub(crate) const CU_CHROMA_QP_OFFSET_ENABLED_FLAG: BitField = BitField::new(0, 1);
 }
 
 // libva's functions, loaded at run time rather than linked (`super::libva`):
@@ -776,6 +884,41 @@ mod tests {
             scaling_list_16x16 => "ScalingList16x16", scaling_list_32x32 => "ScalingList32x32",
             scaling_list_dc_16x16 => "ScalingListDC16x16",
             scaling_list_dc_32x32 => "ScalingListDC32x32", va_reserved => "va_reserved",
+        });
+        layout!(out, VAPictureParameterBufferHEVCRext, "VAPictureParameterBufferHEVCRext", {
+            range_extension_pic_fields => "range_extension_pic_fields",
+            diff_cu_chroma_qp_offset_depth => "diff_cu_chroma_qp_offset_depth",
+            chroma_qp_offset_list_len_minus1 => "chroma_qp_offset_list_len_minus1",
+            log2_sao_offset_scale_luma => "log2_sao_offset_scale_luma",
+            log2_sao_offset_scale_chroma => "log2_sao_offset_scale_chroma",
+            log2_max_transform_skip_block_size_minus2 =>
+                "log2_max_transform_skip_block_size_minus2",
+            cb_qp_offset_list => "cb_qp_offset_list", cr_qp_offset_list => "cr_qp_offset_list",
+        });
+        layout!(out, VAPictureParameterBufferHEVCScc, "VAPictureParameterBufferHEVCScc", {
+            screen_content_pic_fields => "screen_content_pic_fields",
+            palette_max_size => "palette_max_size",
+            delta_palette_max_predictor_size => "delta_palette_max_predictor_size",
+            predictor_palette_size => "predictor_palette_size",
+            predictor_palette_entries => "predictor_palette_entries",
+            pps_act_y_qp_offset_plus5 => "pps_act_y_qp_offset_plus5",
+            pps_act_cb_qp_offset_plus5 => "pps_act_cb_qp_offset_plus5",
+            pps_act_cr_qp_offset_plus3 => "pps_act_cr_qp_offset_plus3",
+        });
+        layout!(out, VAPictureParameterBufferHEVCExtension,
+            "VAPictureParameterBufferHEVCExtension", {
+            base => "base", rext => "rext", scc => "scc",
+        });
+        layout!(out, VASliceParameterBufferHEVCRext, "VASliceParameterBufferHEVCRext", {
+            luma_offset_l0 => "luma_offset_l0", chroma_offset_l0 => "ChromaOffsetL0",
+            luma_offset_l1 => "luma_offset_l1", chroma_offset_l1 => "ChromaOffsetL1",
+            slice_ext_flags => "slice_ext_flags",
+            slice_act_y_qp_offset => "slice_act_y_qp_offset",
+            slice_act_cb_qp_offset => "slice_act_cb_qp_offset",
+            slice_act_cr_qp_offset => "slice_act_cr_qp_offset",
+        });
+        layout!(out, VASliceParameterBufferHEVCExtension, "VASliceParameterBufferHEVCExtension", {
+            base => "base", rext => "rext",
         });
         let seq = [
             ("chroma_format_idc", seq_fields::CHROMA_FORMAT_IDC),
@@ -986,6 +1129,65 @@ mod tests {
                 ));
             }
         }
+        {
+            use hevc_range_extension_pic_fields as f;
+            let fields = [
+                (
+                    "transform_skip_rotation_enabled_flag",
+                    f::TRANSFORM_SKIP_ROTATION_ENABLED_FLAG,
+                ),
+                (
+                    "transform_skip_context_enabled_flag",
+                    f::TRANSFORM_SKIP_CONTEXT_ENABLED_FLAG,
+                ),
+                (
+                    "implicit_rdpcm_enabled_flag",
+                    f::IMPLICIT_RDPCM_ENABLED_FLAG,
+                ),
+                (
+                    "explicit_rdpcm_enabled_flag",
+                    f::EXPLICIT_RDPCM_ENABLED_FLAG,
+                ),
+                (
+                    "extended_precision_processing_flag",
+                    f::EXTENDED_PRECISION_PROCESSING_FLAG,
+                ),
+                (
+                    "intra_smoothing_disabled_flag",
+                    f::INTRA_SMOOTHING_DISABLED_FLAG,
+                ),
+                (
+                    "high_precision_offsets_enabled_flag",
+                    f::HIGH_PRECISION_OFFSETS_ENABLED_FLAG,
+                ),
+                (
+                    "persistent_rice_adaptation_enabled_flag",
+                    f::PERSISTENT_RICE_ADAPTATION_ENABLED_FLAG,
+                ),
+                (
+                    "cabac_bypass_alignment_enabled_flag",
+                    f::CABAC_BYPASS_ALIGNMENT_ENABLED_FLAG,
+                ),
+                (
+                    "cross_component_prediction_enabled_flag",
+                    f::CROSS_COMPONENT_PREDICTION_ENABLED_FLAG,
+                ),
+                (
+                    "chroma_qp_offset_list_enabled_flag",
+                    f::CHROMA_QP_OFFSET_LIST_ENABLED_FLAG,
+                ),
+            ];
+            for (name, field) in fields {
+                out.push(format!(
+                    "hevc.range_extension_pic_fields.{name} {:#x}",
+                    field.put(u32::MAX)
+                ));
+            }
+            out.push(format!(
+                "hevc.slice_ext_flags.cu_chroma_qp_offset_enabled_flag {:#x}",
+                hevc_slice_ext_flags::CU_CHROMA_QP_OFFSET_ENABLED_FLAG.put(u32::MAX)
+            ));
+        }
         // Each constant, as the C side prints it.
         constants!(
             out,
@@ -998,8 +1200,10 @@ mod tests {
             VA_PROGRESSIVE,
             VA_RT_FORMAT_YUV420,
             VA_RT_FORMAT_YUV420_10,
+            VA_RT_FORMAT_YUV444,
             VA_FOURCC_NV12,
             VA_FOURCC_P010,
+            VA_FOURCC_XYUV,
             VA_SLICE_DATA_FLAG_ALL,
             VA_PICTURE_H264_INVALID,
             VA_PICTURE_H264_SHORT_TERM_REFERENCE,
@@ -1015,6 +1219,7 @@ mod tests {
             VAProfileH264ConstrainedBaseline,
             VAProfileHEVCMain,
             VAProfileHEVCMain10,
+            VAProfileHEVCMain444,
             VAEntrypointVLD,
             VAEntrypointVideoProc,
             VAConfigAttribRTFormat,

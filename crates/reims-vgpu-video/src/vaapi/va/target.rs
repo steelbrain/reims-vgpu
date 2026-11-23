@@ -73,10 +73,12 @@ impl TargetFormat {
         }
     }
 
-    pub(crate) fn of(format: SurfaceFormat) -> TargetFormat {
+    /// A decode's of `format`; `None` for XYUV, which no target is of.
+    pub(crate) fn of(format: SurfaceFormat) -> Option<TargetFormat> {
         match format {
-            SurfaceFormat::Nv12 => TargetFormat::Nv12,
-            SurfaceFormat::P010 => TargetFormat::P010,
+            SurfaceFormat::Nv12 => Some(TargetFormat::Nv12),
+            SurfaceFormat::P010 => Some(TargetFormat::P010),
+            SurfaceFormat::Xyuv => None,
         }
     }
 
@@ -427,9 +429,9 @@ fn create(
         drm_format_modifier: laid.modifier,
     };
     descriptor.layers[0] = ffi::VADRMPRIMESurfaceLayer {
-        drm_format: match format {
-            SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
-            SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
+        drm_format: match shape.format {
+            TargetFormat::Nv12 => ffi::DRM_FORMAT_NV12,
+            TargetFormat::P010 => ffi::DRM_FORMAT_P010,
         },
         num_planes: 2,
         object_index: [0, 0, 0, 0],

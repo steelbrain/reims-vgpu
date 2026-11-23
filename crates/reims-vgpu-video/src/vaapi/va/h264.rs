@@ -305,7 +305,8 @@ impl Accelerator for VaH264 {
         let target_for = self.target_for.take();
         let pool = &self.session()?.pool;
         let lent = target_for
-            .and_then(|target_for| target_for(pool.shape(), role))
+            .zip(pool.shape())
+            .and_then(|(target_for, shape)| target_for(shape, role))
             .and_then(|target| pool.lend_target(target));
         match lent {
             Some(surface) => Ok(surface),
