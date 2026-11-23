@@ -1117,13 +1117,14 @@ mod tests {
     }
 
     /// Blits on the GPU the test holds: buffer fills, a pattern of one byte value among them,
-    /// and copies; a buffer to a texture and back, a region of it to another texture, through
-    /// the plain and options forms; whole slices and levels of a 2D array, each level's whole
-    /// extent; mipmaps; a Managed buffer filled on the GPU and synchronized, and a Managed
-    /// texture's synchronizes; optimizes and invalidates; fences between two encoders. Each
-    /// encodes nothing, counted: an unequal pattern, blit options, a texture fill with bytes or
-    /// a colour, a nil argument, a copy rt refuses, a second encoder while one is open and a
-    /// command after `endEncoding`. No blit copies the guest's RAM.
+    /// and copies, one at an offset and a size that are not multiples of 4, which Metal copies;
+    /// a buffer to a texture and back, a region of it to another texture, through the plain and
+    /// options forms; whole slices and levels of a 2D array, each level's whole extent; mipmaps;
+    /// a Managed buffer filled on the GPU and synchronized, and a Managed texture's
+    /// synchronizes; optimizes and invalidates; fences between two encoders. Each encodes
+    /// nothing, counted: an unequal pattern, blit options, a texture fill with bytes or a
+    /// colour, a nil argument, a second encoder while one is open and a command after
+    /// `endEncoding`. No blit copies the guest's RAM.
     #[test]
     fn blits_on_vulkan() {
         let platform = RtPlatform::new();
@@ -1170,6 +1171,18 @@ mod tests {
         let mut filled = vec![0x5a; 256];
         filled[..64].fill(0x11);
         assert_eq!(read(&a, 256), filled);
+
+        // An offset and a size that are not multiples of 4: Metal copies them.
+        let cmds = vec![BlitCmd::CopyBufferToBuffer {
+            source_buffer: Some(&a),
+            source_offset: 1,
+            destination_buffer: Some(&b),
+            destination_offset: 0,
+            size: 3,
+        }];
+        assert_eq!(blit(&queue, cmds), done);
+        copied[..3].fill(0x11);
+        assert_eq!(read(&b, 256), copied);
 
         // A buffer to a texture and back; a region of it to another texture.
         let small = TextureDesc {
@@ -1366,20 +1379,13 @@ mod tests {
                 options: 0,
             },
             BlitCmd::GenerateMipmaps { texture: None },
-            BlitCmd::CopyBufferToBuffer {
-                source_buffer: Some(&a),
-                source_offset: 0,
-                destination_buffer: Some(&b),
-                destination_offset: 0,
-                size: 3,
-            },
             copy(false, (&down, 0), (&t, 0, 0), 4),
         ];
         assert_eq!(blit(&queue, cmds), done);
         assert_eq!((read(&a, 256), read(&b, 256)), (filled, copied));
         assert_eq!(read(&down, 64), texels);
         let after = [counted(metal), counted(fill_texture), counted(unbuilt)];
-        assert_eq!(after, [before[0] + 3, before[1] + 1, before[2] + 3]);
+        assert_eq!(after, [before[0] + 2, before[1] + 1, before[2] + 3]);
 
         // Fences between two encoders; a second encoder while one is open, a command after
         // `endEncoding` and the guest's RAM.
