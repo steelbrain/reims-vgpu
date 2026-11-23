@@ -49,16 +49,17 @@
 //!   the state's finish or by an earlier make.
 //! - **Its main pipeline.** rt's make of the state makes everything up to the driver's create of
 //!   the state's main `VkPipeline` (a tiling kernel's tiles', an image-only kernel's square
-//!   workgroups', or an observing kernel's whole and ragged grids' at its
+//!   workgroups', or an observing kernel's two, its plain module's for its whole grids and its
+//!   partial-threadgroups variant's for its ragged grids, at its
 //!   `requiredThreadsPerThreadgroup`, or at `[N, 1, 1]` for the bound `N` of threads its state
 //!   declares), and answers. The state's finish ([`ComputePipeline::finish`]) makes that
-//!   pipeline, rt's `finish_pipeline`, on the thread that made the state: the device's compile
-//!   thread, after the create's reply and before its store (reims-vgpu's `graphics::compile`,
-//!   "Order"). rt counts what the finishes made and their time (`Metrics::finished_pipelines`,
-//!   `finished_pipeline_nanos`). A finish rt fails, the driver's create, keeps nothing: the
-//!   state's first dispatch, or a make ahead of it, makes the pipeline again, the dispatch
-//!   waiting for the make (`Metrics::first_use_unfinished_waits`), and fails as a dispatch rt
-//!   refuses where that make fails too.
+//!   pipeline, or that kernel's two, rt's `finish_pipeline`, on the thread that made the state:
+//!   the device's compile thread, after the create's reply and before its store (reims-vgpu's
+//!   `graphics::compile`, "Order"). rt counts what the finishes made and their time
+//!   (`Metrics::finished_pipelines`, `finished_pipeline_nanos`). A finish rt fails, the driver's
+//!   create, keeps nothing: the state's first dispatch, or a make ahead of it, makes the pipeline
+//!   again, the dispatch waiting for the make (`Metrics::first_use_unfinished_waits`), and fails
+//!   as a dispatch rt refuses where that make fails too.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

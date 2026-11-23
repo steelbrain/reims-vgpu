@@ -73,7 +73,7 @@
 //! **Its translations.** Beside the cache's bytes the counts line carries, as amounts, the
 //! modules rt's translator lowered, [`TRANSLATIONS_CODE`] (`Metrics::translations`: of a compute
 //! content, its partial-threadgroups variant, the plain module of a kernel that observes its
-//! threadgroup partition where its state keeps one beside the variant, and an emulated-SIMD-group
+//! threadgroup partition, which its state keeps beside the variant, and an emulated-SIMD-group
 //! variant; of a render content, each function the cache directory did not hold), and the
 //! lowered kernels pipeline states took from the cache directory in their stead,
 //! [`TRANSLATIONS_LOADED_CODE`] (`Metrics::translations_loaded`), the render contents' records
@@ -192,21 +192,22 @@
 //! it is what shows that a boot's resolves ran.
 //!
 //! **Its partial-threadgroups variant's grids.** A kernel that observes its threadgroup
-//! partition runs every dispatch on its partial-threadgroups variant, whole grids
-//! (`dispatchThreads` of whole threadgroups, `dispatchThreadgroups`) and indirect dispatches
-//! among them, so rt makes one `VkPipeline` of a size for it, where Metal compiles one function.
-//! A dispatch runs the plain module instead where the variant does not take its threadgroup, or
-//! where the variant's threadgroup memory, its predicated walk's 4-byte vote word included, passes
-//! the device's `maxComputeSharedMemorySize`, decided per dispatch from the encoder's lengths. rt
-//! counts the dispatches of whole threadgroups, direct and indirect, that ran the variant
-//! (`Metrics::partial_variant_whole_grids`), and the counts line carries them as an amount,
-//! [`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`], so a boot's line says how often its whole grids took the
-//! variant. A ragged grid, `dispatchThreads` of a grid that is not a whole number of
+//! partition runs its whole grids (`dispatchThreads` of whole threadgroups,
+//! `dispatchThreadgroups`) and its indirect dispatches on its plain module at their own
+//! threadgroup size, and its ragged grids on its partial-threadgroups variant, so rt's state
+//! lowers both modules for it, where Metal compiles one function. rt counts the dispatches of
+//! whole threadgroups, direct and indirect, that ran the variant
+//! (`Metrics::partial_variant_whole_grids`), which none does, and the counts line carries them as
+//! an amount, [`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`], so a boot's line shows that its whole grids
+//! ran the plain module. A ragged grid, `dispatchThreads` of a grid that is not a whole number of
 //! threadgroups, runs only on the variant, its regions flagged so that each threadgroup runs only
-//! the grid's threads; one the variant cannot take is rt's refusal (`Gap::PartialThreadgroups`).
-//! rt counts the ragged grids that ran the variant apart (`Metrics::partial_variant_ragged_grids`;
-//! a refused one counts in neither), and the counts line carries them as an amount too,
-//! [`PARTIAL_VARIANT_RAGGED_GRIDS_CODE`], so a boot's line says how many of its ragged grids ran.
+//! the grid's threads; one the variant cannot take is rt's refusal (`Gap::PartialThreadgroups`),
+//! as is one whose threadgroup memory, the variant's predicated walk's 4-byte vote word included,
+//! passes the device's `maxComputeSharedMemorySize`, decided per dispatch from the encoder's
+//! lengths. rt counts the ragged grids that ran the variant apart
+//! (`Metrics::partial_variant_ragged_grids`; a refused one counts in neither), and the counts line
+//! carries them as an amount too, [`PARTIAL_VARIANT_RAGGED_GRIDS_CODE`], so a boot's line says how
+//! many of its ragged grids ran.
 //!
 //! **Its views written through an extended usage.** A texture made for shader writes whose own
 //! format the device does not store (an 8-bit sRGB format) is made, where the device's image
