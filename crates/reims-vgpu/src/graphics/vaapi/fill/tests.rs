@@ -411,3 +411,130 @@ fn on_rt_the_kernel_writes_a_frame_as_the_upload_writes_it() {
         }
     });
 }
+
+/// On the host's GPU, a plane with no margin (`unit` 0, a decode's copy into its output's planes:
+/// `gpu_copy`) has each row's bytes copied from the source byte for byte, and keeps every other
+/// byte of its buffer, those that share a row's last word with it among them: rows of 0, 1, 2 and
+/// 3 bytes past a whole word, at CoreVideo's 1366-wide NV12 pitch and others, from sources on a
+/// word and off one, into buffers whose bytes are a pattern of their own.
+#[test]
+fn on_rt_a_row_with_no_margin_keeps_the_bytes_past_it_in_its_last_word() {
+    use reims_vgpu_vulkan::RtPlatform;
+
+    let platform = crate::rt_test_end::platform();
+    crate::entry::run(|_| {
+        let device = platform.system_default_device().expect("an rt device");
+        let pipeline = Pipeline::<RtPlatform> {
+            device: device.clone_ref(),
+            made: OnceLock::new(),
+        };
+        let pipeline = pipeline.get().expect("the kernel's pipeline");
+        let queue = device.new_command_queue().expect("a queue");
+        let shared = |length: u64| {
+            (device.new_buffer_of_length(OnFault::Return, length, 0))
+                .expect("no raise")
+                .expect("a buffer")
+        };
+        let arguments = shared(2 * ARGUMENTS_APART);
+        // (the luma's and the chroma's row bytes, the output's pitch, the luma's rows, the source
+        // planes' first byte).
+        let cases: [(u32, u32, u32, u32, u32); 7] = [
+            (1366, 1366, 1376, 12, 0),
+            (854, 854, 864, 9, 0),
+            (853, 854, 864, 9, 0),
+            (855, 856, 864, 9, 0),
+            (2732, 2732, 2752, 8, 0),
+            (5, 6, 8, 3, 3),
+            (1, 2, 4, 2, 1),
+        ];
+        for (luma_bytes, chroma_bytes, pitch, rows, first) in cases {
+            let what = format!("rows of {luma_bytes} and {chroma_bytes} at {pitch}, from {first}");
+            let source_pitch = pitch + 4;
+            let chroma_rows = rows.div_ceil(2);
+            let plane = |row_bytes: u32, rows: u32| FillPlane {
+                first,
+                source_pitch,
+                row_bytes,
+                rows,
+                unit: 0,
+                coded_words: row_bytes.div_ceil(4),
+                coded_rows: rows,
+                pitch_words: pitch / 4,
+                tiling: TILING_LINEAR,
+            };
+            let source_chroma = u64::from(source_pitch * rows).next_multiple_of(BINDING_ALIGNMENT);
+            let source_length = source_chroma + u64::from(source_pitch * chroma_rows) + 64;
+            let (luma_at, chroma_at) = (32, 32 + u64::from(pitch * rows) + 8);
+            let length = chroma_at + u64::from(pitch * chroma_rows) + 64;
+            let fills = [
+                PlaneFill {
+                    bound: 0,
+                    at: luma_at,
+                    plane: plane(luma_bytes, rows),
+                },
+                PlaneFill {
+                    bound: source_chroma,
+                    at: chroma_at,
+                    plane: plane(chroma_bytes, chroma_rows),
+                },
+            ];
+            let bytes = pattern(source_length as usize);
+            let before: Vec<u8> = (pattern(length as usize + 7).into_iter().skip(7))
+                .map(|b| !b)
+                .collect();
+            let source = shared(source_length);
+            let output = shared(length);
+            // SAFETY: the buffers' host bytes, which no GPU work reaches yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    source.contents().as_ptr::<u8>(),
+                    bytes.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    before.as_ptr(),
+                    output.contents().as_ptr::<u8>(),
+                    before.len(),
+                );
+            }
+            let cb = (queue.command_buffer(OnFault::Return))
+                .expect("no raise")
+                .expect("a command buffer");
+            let planes = Planes::<RtPlatform> {
+                pipeline: &pipeline,
+                arguments: &arguments,
+                destinations: [&output, &output],
+                sources: [&source, &source],
+            };
+            assert_eq!(
+                encode_planes::<RtPlatform>(&cb, &planes, &fills),
+                None,
+                "{what}"
+            );
+            cb.commit(OnFault::Return).expect("the commit");
+            cb.wait_until_completed(OnFault::Return).expect("the wait");
+            assert_eq!(cb.status(), CommandBufferStatus::COMPLETED, "{what}");
+            // SAFETY: the output's host bytes, which the GPU wrote and the wait saw done.
+            let written = unsafe {
+                std::slice::from_raw_parts(output.contents().as_ptr::<u8>(), length as usize)
+            };
+            let mut want = before.clone();
+            for fill in &fills {
+                let p = &fill.plane;
+                for row in 0..u64::from(p.rows) {
+                    let from = (fill.bound + u64::from(p.first) + row * u64::from(p.source_pitch))
+                        as usize;
+                    let to = (fill.at + row * u64::from(p.pitch_words) * 4) as usize;
+                    let n = p.row_bytes as usize;
+                    want[to..to + n].copy_from_slice(&bytes[from..from + n]);
+                }
+            }
+            if let Some(at) = (0..want.len()).find(|&at| written[at] != want[at]) {
+                panic!(
+                    "{what}: byte {at} is {:#04x}, not {:#04x} (it held {:#04x})",
+                    written[at], want[at], before[at]
+                );
+            }
+        }
+    });
+}

@@ -81,9 +81,10 @@ const BINDING_ALIGNMENT: u64 = 256;
 pub(super) const ARGUMENTS_APART: u64 = 256;
 
 /// What `videoEncodeFill` takes of a plane (`shaders.metal`'s `VideoFillPlane`): where the plane
-/// lies in its source buffer as bound, its rows and the bytes its margin repeats, the input's
-/// words a row, its rows and its words from one row to the next, and how the input lays its words
-/// out ([`TILING_LINEAR`] or [`TILING_INTEL_Y`]).
+/// lies in its source buffer as bound, its rows and the bytes its margin repeats, or 0 for rows
+/// with no margin, whose last word keeps the input's bytes past each row (a decode's copy into its
+/// output's planes, `gpu_copy`), the input's words a row, its rows and its words from one row to
+/// the next, and how the input lays its words out ([`TILING_LINEAR`] or [`TILING_INTEL_Y`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct FillPlane {
     pub(super) first: u32,

@@ -303,9 +303,11 @@ kernel void displayMirrorTileList(device const uint *now [[buffer(0)]],
 // One plane of a frame that videoEncodeFill writes into a video encoder's input (reims-vgpu's
 // graphics/vaapi/fill.rs, `FillPlane`, 36 bytes): where the frame's plane lies in the source
 // buffer as bound, its first byte and the bytes from one row to the next; the bytes of a row of the
-// frame's samples, its rows, and the bytes a row's margin repeats (a sample, or a Cb/Cr pair);
-// the input's words a row, its rows and its words from one row to the next; and how the input
-// lays its words out: 0 linear, 1 in Intel's Y tiles.
+// frame's samples, its rows, and the bytes a row's margin repeats (a sample, or a Cb/Cr pair), or
+// 0 for a row with no margin, whose last word keeps the input's bytes past the row (a decode's
+// copy into its output's planes, graphics/vaapi/gpu_copy.rs); the input's words a row, its rows
+// and its words from one row to the next; and how the input lays its words out: 0 linear, 1 in
+// Intel's Y tiles.
 struct VideoFillPlane {
     uint first;
     uint source_pitch;
@@ -338,7 +340,11 @@ static uint video_fill_byte(device const uint *source, uint at) {
 // Word `at.x` of row `at.y` of a plane of the encoder's input: the frame's row there (its last
 // for a row past them), and past the row's bytes its last `unit` bytes repeated, as the VA crate's
 // upload fills the margin to the coded size. 32-bit loads and stores alone; a word within the
-// row's bytes is one load where it starts on a word, two where it does not.
+// row's bytes is one load where it starts on a word, two where it does not. With no margin
+// (`unit` 0), a row's last word that holds 1 to 3 of its bytes takes those from the source and
+// keeps the input's others, by a 32-bit atomic AND that clears the row's bytes and an atomic OR
+// that sets them: no thread writes a byte past the row, as the CPU's copy of a row writes its
+// bytes alone, with no 8-bit store, which not every device makes.
 kernel void videoEncodeFill(device const uint *source [[buffer(0)]],
                             device uint *input [[buffer(1)]],
                             constant VideoFillPlane &plane [[buffer(2)]],
@@ -356,6 +362,18 @@ kernel void videoEncodeFill(device const uint *source [[buffer(0)]],
         if (shift != 0) {
             word = (word >> shift) | (source[(from >> 2) + 1] << (32 - shift));
         }
+    } else if (plane.unit == 0) {
+        uint bytes = plane.row_bytes - x;
+        word = 0;
+        for (uint i = 0; i < bytes; i++) {
+            word |= video_fill_byte(source, row + x + i) << (i * 8);
+        }
+        uint kept = 0xffffffffu << (bytes * 8);
+        device atomic_uint *to = reinterpret_cast<device atomic_uint *>(
+            input + video_fill_word_at(at.x, at.y, plane.pitch_words, plane.tiling));
+        atomic_fetch_and_explicit(to, kept, memory_order_relaxed);
+        atomic_fetch_or_explicit(to, word, memory_order_relaxed);
+        return;
     } else {
         uint last = plane.row_bytes - plane.unit;
         word = 0;
