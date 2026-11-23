@@ -673,9 +673,15 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
     /// asked; it makes nothing. Where the test had it refuse for a stage
     /// ([`FakeStages::refuse_next_prepare`](crate::core::testkit::stages::FakeStages::refuse_next_prepare)),
     /// it hands the stage to the fills, and waits for nothing.
-    fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
+    fn prepare_dispatch(
+        &self,
+        dispatch: Dispatch,
+        threads: MtlSize,
+        lengths: &[(u64, u64)],
+        imageblock: [u64; 2],
+    ) {
         let world = self.world();
-        world.note_prepared(prepared(self, dispatch, threads, lengths));
+        world.note_prepared(prepared(self, dispatch, threads, lengths, imageblock));
         if let Some(stage) = world.stages().prepare_refusal() {
             let _ = world.stages().fills().fill(stage, Site::MakeAhead);
         }
@@ -691,9 +697,10 @@ impl ComputePipeline<FakePlatform> for Fk<kind::ComputePipeline> {
         dispatch: Dispatch,
         threads: MtlSize,
         lengths: &[(u64, u64)],
+        imageblock: [u64; 2],
     ) -> Option<(FakeVariant, bool)> {
         self.world()
-            .dispatch_variant(prepared(self, dispatch, threads, lengths))
+            .dispatch_variant(prepared(self, dispatch, threads, lengths, imageblock))
     }
 
     /// Noted beside the call log, then scripted as [`FINISH`] (this module's `finish`).
@@ -727,12 +734,13 @@ fn finish(world: &World, state: ObjId, class: &'static str) -> Result<(), String
 }
 
 /// A dispatch of `state`, of `threads` threads a threadgroup with the threadgroup memory
-/// `lengths`, as the world notes its make ahead.
+/// `lengths` and the imageblock size `imageblock`, as the world notes its make ahead.
 fn prepared(
     state: &Fk<kind::ComputePipeline>,
     dispatch: Dispatch,
     threads: MtlSize,
     lengths: &[(u64, u64)],
+    [width, height]: [u64; 2],
 ) -> Prepared {
     let size = |s: MtlSize| (s.width, s.height, s.depth);
     let dispatch = match dispatch {
@@ -745,6 +753,7 @@ fn prepared(
         dispatch,
         threads: size(threads),
         lengths: lengths.to_vec(),
+        imageblock: (width, height),
     }
 }
 

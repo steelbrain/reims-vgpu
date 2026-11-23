@@ -7,9 +7,10 @@
 use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
     RGFX_OP_COMPUTE_DISPATCH_THREADS, RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
-    RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH, RgfxComputeOpDispatchThreadgroups,
-    RgfxComputeOpDispatchThreadgroupsIndirect, RgfxComputeOpDispatchThreads,
-    RgfxComputeOpSetComputePipelineState, RgfxComputeOpSetThreadgroupMemoryLength,
+    RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH, RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH,
+    RgfxComputeOpDispatchThreadgroups, RgfxComputeOpDispatchThreadgroupsIndirect,
+    RgfxComputeOpDispatchThreads, RgfxComputeOpSetComputePipelineState,
+    RgfxComputeOpSetImageblockWidth, RgfxComputeOpSetThreadgroupMemoryLength,
 };
 use reims_vgpu_graphics::ops::{
     RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
@@ -143,6 +144,12 @@ fn length(length: u64, index: u64) -> Vec<u8> {
     )
 }
 
+/// `setImageblockWidth:height:`.
+fn imageblock(width: u64, height: u64) -> Vec<u8> {
+    let body = RgfxComputeOpSetImageblockWidth { width, height };
+    op(RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH, body.as_bytes())
+}
+
 /// `dispatchThreads:threadsPerThreadgroup:`.
 pub(super) fn threads([w, h, d]: [u64; 3], [tw, th, td]: [u64; 3]) -> Vec<u8> {
     let body = RgfxComputeOpDispatchThreads {
@@ -250,24 +257,28 @@ fn each_dispatch_shape_is_made_ahead_once_with_its_own_arguments() {
             dispatch: PreparedGrid::Threads(64, 1, 1),
             threads: (32, 1, 1),
             lengths: vec![(0, 256)],
+            imageblock: (1, 1),
         },
         Prepared {
             state: states[0],
             dispatch: PreparedGrid::Threadgroups(4, 2, 1),
             threads: (8, 8, 1),
             lengths: vec![(0, 128), (1, 512)],
+            imageblock: (1, 1),
         },
         Prepared {
             state: states[1],
             dispatch: PreparedGrid::ThreadgroupsIndirect,
             threads: (16, 1, 1),
             lengths: vec![(0, 128), (1, 512)],
+            imageblock: (1, 1),
         },
         Prepared {
             state: states[0],
             dispatch: PreparedGrid::Threads(64, 1, 1),
             threads: (32, 1, 1),
             lengths: vec![],
+            imageblock: (1, 1),
         },
     ];
     expected.sort();
@@ -284,6 +295,59 @@ fn each_dispatch_shape_is_made_ahead_once_with_its_own_arguments() {
     assert_eq!(completed(&platform, &mut ring, 101), RGFX_CB_OK);
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(made(&platform), expected, "a shape was made ahead again");
+}
+
+/// With the fake's keys, the imageblock size a dispatch's encoder set last reaches its make
+/// ahead, direct or indirect: 1 by 1 before the encoder sets one, and again in a new encoder, so
+/// a dispatch of one shape at two sizes is made ahead at each, and at 1 by 1 once; the buffer
+/// completes as without the pre-pass
+#[test]
+fn each_dispatch_is_made_ahead_at_its_encoder_s_imageblock_size() {
+    let (device, platform, mut guest, mut ring) = with_states(&[11]);
+    guest.send(&device, buffer_create(obj(CONTEXT, 20)));
+    carried_out_of(&device, &mut guest, CONTEXT);
+    let state = platform.world().live(CLASS);
+    assert_eq!(state.len(), 1);
+    let ops = [
+        begin(),
+        set_state(11),
+        threads([64, 1, 1], [32, 1, 1]),
+        imageblock(4, 2),
+        threads([64, 1, 1], [32, 1, 1]),
+        indirect(20, [16, 1, 1]),
+        end(),
+        begin(),
+        set_state(11),
+        threads([64, 1, 1], [32, 1, 1]),
+        groups([4, 2, 1], [8, 8, 1]),
+        end(),
+    ];
+    let gate = WalkGate::on(&device);
+    ring.send(&device, command_buffer_of(100, &ops));
+    assert!(gate.reached(), "the walk did not start");
+    let shape = |dispatch, threads, imageblock| Prepared {
+        state: state[0],
+        dispatch,
+        threads,
+        lengths: vec![],
+        imageblock,
+    };
+    let mut expected = vec![
+        shape(PreparedGrid::Threads(64, 1, 1), (32, 1, 1), (1, 1)),
+        shape(PreparedGrid::Threads(64, 1, 1), (32, 1, 1), (4, 2)),
+        shape(PreparedGrid::ThreadgroupsIndirect, (16, 1, 1), (4, 2)),
+        shape(PreparedGrid::Threadgroups(4, 2, 1), (8, 8, 1), (1, 1)),
+    ];
+    expected.sort();
+    assert!(
+        eventually(|| made(&platform).len() >= expected.len()),
+        "made ahead: {:?}",
+        made(&platform)
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(made(&platform), expected);
+    gate.open();
+    assert_eq!(completed(&platform, &mut ring, 100), RGFX_CB_OK);
 }
 
 /// Dispatches of one key, of two shapes of a compute state or of two states, are made ahead
@@ -321,12 +385,14 @@ fn dispatches_of_one_key_are_made_ahead_once() {
             dispatch: PreparedGrid::Threads(64, 1, 1),
             threads: (32, 1, 1),
             lengths: vec![],
+            imageblock: (1, 1),
         },
         Prepared {
             state: states[0],
             dispatch: PreparedGrid::Threadgroups(4, 2, 1),
             threads: (8, 8, 1),
             lengths: vec![],
+            imageblock: (1, 1),
         },
     ];
     expected.sort();
@@ -370,6 +436,7 @@ fn a_dispatch_of_no_key_is_made_ahead_never_and_counted() {
         dispatch: PreparedGrid::Threadgroups(4, 2, 1),
         threads: (8, 8, 1),
         lengths: vec![],
+        imageblock: (1, 1),
     }];
     assert!(
         eventually(|| !made(&platform).is_empty()),
@@ -399,6 +466,7 @@ fn a_key_handed_before_is_made_ahead_never_again() {
         dispatch: PreparedGrid::Threads(64, 1, 1),
         threads: (32, 1, 1),
         lengths: vec![],
+        imageblock: (1, 1),
     };
     let ops = [
         begin(),
@@ -437,6 +505,7 @@ fn a_key_handed_before_is_made_ahead_never_again() {
             dispatch: PreparedGrid::Threadgroups(4, 2, 1),
             threads: (8, 8, 1),
             lengths: vec![],
+            imageblock: (1, 1),
         },
     ];
     expected.sort();
@@ -583,12 +652,14 @@ fn the_walk_makes_the_shapes_no_thread_took_at_its_first_dispatch() {
             dispatch: PreparedGrid::Threads(64, 1, 1),
             threads: (32, 1, 1),
             lengths: vec![],
+            imageblock: (1, 1),
         },
         Prepared {
             state: state[0],
             dispatch: PreparedGrid::Threadgroups(4, 2, 1),
             threads: (8, 8, 1),
             lengths: vec![],
+            imageblock: (1, 1),
         },
     ];
     expected.sort();

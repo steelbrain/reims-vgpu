@@ -120,10 +120,12 @@ whose Metal answer is not measured (`rt_platform/compute.rs`, `rt_platform/diag.
 is a gap too: nil and an `NSError`. The device answers `maxVertexAmplificationCount` 1
 (`rt_platform::answers::VERTEX_AMPLIFICATION_COUNT`; Metal answers 2 on the M3 Max), so
 `supportsVertexAmplificationCount:` answers no above one, and a guest that asks first reaches no
-create. A compute pipeline whose kernel has an explicit imageblock is made, and its dispatches
-run it at 1 by 1 whatever `setImageblockWidth:height:` set, where Metal runs it at the size the
-encoder set: the compute encoder gives rt no size (`rt_platform/compute.rs`). arm64 guests make
-one such pipeline once at login (measured on macOS 15, 26 and 27 boots). A render pass that resolves into a texture made without
+create. A compute encoder's `setImageblockWidth:height:` of a width or a height that is not a
+power of two, 0 included, or of more than 1024 cells, is rt's refusal (`Refusal::ImageblockSize`),
+counted as Metal's (`rt-refused-metal`), and the encoder's later dispatches run a kernel's
+explicit imageblock at the size set before it: Metal's validation layer stops each such size at
+the call (measured by metal2vulkan on the M3 Max), and what Metal runs after one without its
+validation layer is not measured (`rt_platform/compute.rs`). A render pass that resolves into a texture made without
 `RenderTarget` usage that rt can resolve into neither in place nor through a resolve image is
 refused (`Gap::RenderPass`, `ResolveUsage`) and skipped whole (below), where Metal resolves into a
 texture of any usage: a depth or stencil texture, a colour texture of a type other than 2D, 2D

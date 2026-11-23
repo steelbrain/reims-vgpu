@@ -3,18 +3,22 @@
 //!
 //! Where the platform makes a kernel's pipeline per dispatch shape (the rt platform: the state's
 //! make lowers every variant, but a kernel's `VkPipeline` depends on the threadgroup size, the
-//! threadgroup memory lengths and the grid's tiles, which come with each dispatch), the first
-//! dispatch of each shape made it on the walk's thread, and the buffer's commit, and its
-//! process's wait for it, waited the make out. The pre-pass reads a buffer's
+//! threadgroup memory lengths, the imageblock size and the grid's tiles, which come with each
+//! dispatch), the first dispatch of each shape made it on the walk's thread, and the buffer's
+//! commit, and its process's wait for it, waited the make out. The pre-pass reads a buffer's
 //! dispatches as its queue's service thread begins it, and hands each pipeline not handed before
 //! to the compile pool (`CompileKind::Prepass`, `graphics::compile`, "Turns"), whose threads make
 //! it ([`ComputePipeline::prepare_dispatch`]) while the walk goes on; a dispatch then finds it
 //! made, or waits for the one thread making it.
 //!
 //! - **What it reads.** Each compute encoder's `dispatchThreads`, `dispatchThreadgroups` and
-//!   indirect `dispatchThreadgroups`, in stream order, with the compute state set before it and
-//!   the threadgroup memory lengths its encoder set before it (each index once, in the order first
-//!   set, at its last length). Not read: a dispatch with no state set, or of an id its view of the
+//!   indirect `dispatchThreadgroups`, in stream order, with the compute state set before it, the
+//!   threadgroup memory lengths its encoder set before it (each index once, in the order first
+//!   set, at its last length) and the imageblock size it set last (`setImageblockWidth:height:`;
+//!   1 by 1 where it set none, `IMAGEBLOCK_UNSET`). A size the encoder refuses leaves its size
+//!   as it was, where the read takes the guest's: the rt platform answers no key of a dispatch at
+//!   such a size of a kernel that reaches an imageblock, so it hands nothing (below), and the walk
+//!   makes its pipeline. Not read: a dispatch with no state set, or of an id its view of the
 //!   table holds no compute state for (refused, or never made: the walk drops or faults it), an
 //!   indirect dispatch of no buffer (the walk faults it), the indirect `dispatchThreads`, which
 //!   the platform's make ahead takes no grid of, and the dispatches an indirect command buffer
@@ -88,15 +92,16 @@ use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
     RGFX_OP_COMPUTE_DISPATCH_THREADS, RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT,
     RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER, RGFX_OP_COMPUTE_EXECUTE_COMMANDS_INDIRECT,
-    RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH,
-    RgfxComputeOpDispatchThreadgroups, RgfxComputeOpDispatchThreadgroupsIndirect,
-    RgfxComputeOpDispatchThreads, RgfxComputeOpSetComputePipelineState,
+    RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH,
+    RGFX_OP_COMPUTE_SET_THREADGROUP_MEMORY_LENGTH, RgfxComputeOpDispatchThreadgroups,
+    RgfxComputeOpDispatchThreadgroupsIndirect, RgfxComputeOpDispatchThreads,
+    RgfxComputeOpSetComputePipelineState, RgfxComputeOpSetImageblockWidth,
     RgfxComputeOpSetThreadgroupMemoryLength,
 };
 use reims_vgpu_graphics::ops::{
     RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxCommandBuffer,
 };
-use reims_vgpu_vulkan::core::platform::compute::Dispatch;
+use reims_vgpu_vulkan::core::platform::compute::{Dispatch, IMAGEBLOCK_UNSET};
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::platform::resource::ComputePipeline;
 use reims_vgpu_vulkan::core::platform::types::MtlSize;
@@ -139,6 +144,7 @@ struct Shape {
     dispatch: Dispatch,
     threads: MtlSize,
     lengths: Box<[(u64, u64)]>,
+    imageblock: [u64; 2],
 }
 
 /// The keys of the pipelines the device's pre-passes handed, the latest [`MEMO`], of every
@@ -394,7 +400,12 @@ fn make_next<P: Platform>(shared: &Shared<P>) -> bool {
     state.running.push(running);
     drop(state);
     let shape = &item.shape;
-    (item.state).prepare_dispatch(shape.dispatch, shape.threads, &shape.lengths);
+    (item.state).prepare_dispatch(
+        shape.dispatch,
+        shape.threads,
+        &shape.lengths,
+        shape.imageblock,
+    );
     drop(item);
     let mut state = shared.state.lock();
     if let Some(at) = state
@@ -439,8 +450,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let mut items = VecDeque::new();
         let mut state: Option<(u64, &Entry<P>)> = None;
         let mut lengths: Vec<(u64, u64)> = Vec::new();
-        // The last dispatch's state, dispatch and threads, while the lengths stay as they were:
-        // a run of the same dispatch looks its key up once.
+        let mut imageblock = IMAGEBLOCK_UNSET;
+        // The last dispatch's state, dispatch and threads, while the lengths and the imageblock
+        // size stay as they were: a run of the same dispatch looks its key up once.
         let mut last: Option<(u64, Dispatch, MtlSize)> = None;
         let mut past_most = 0u64;
         let mut no_variant = 0u64;
@@ -449,6 +461,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 RGFX_OP_ENCODER_BEGIN_COMPUTE | RGFX_OP_ENCODER_END => {
                     state = None;
                     lengths.clear();
+                    imageblock = IMAGEBLOCK_UNSET;
                     last = None;
                     None
                 }
@@ -466,6 +479,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                             Some((_, length)) => *length = op.length,
                             None => lengths.push((op.index, op.length)),
                         }
+                        last = None;
+                    }
+                    None
+                }
+                RGFX_OP_COMPUTE_SET_IMAGEBLOCK_WIDTH => {
+                    if let Some(op) = read::<RgfxComputeOpSetImageblockWidth>(body) {
+                        imageblock = [op.width, op.height];
                         last = None;
                     }
                     None
@@ -517,7 +537,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let ObjHandle::ComputePipeline(handle) = &entry.handle else {
                 continue;
             };
-            let Some((key, is_made)) = handle.dispatch_variant(dispatch, threads, &lengths) else {
+            let variant = handle.dispatch_variant(dispatch, threads, &lengths, imageblock);
+            let Some((key, is_made)) = variant else {
                 made = false;
                 no_variant += 1;
                 continue;
@@ -540,6 +561,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 dispatch,
                 threads,
                 lengths: lengths.as_slice().into(),
+                imageblock,
             };
             items.push_back(Item {
                 state: handle.clone_ref(),

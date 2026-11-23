@@ -267,6 +267,14 @@ pub enum Dispatch {
     ThreadgroupsIndirect,
 }
 
+/// The imageblock size, width then height, of a compute encoder that `setImageblockWidth:height:`
+/// ([`ComputeCmd::SetImageblockWidth`]) has not set: 1 by 1, the size Metal's dispatches of such
+/// an encoder run a kernel's explicit imageblock at (measured on the M3 Max by metal2vulkan's
+/// conformance case `compute-imageblock-sizes`). A pre-pass passes it to
+/// [`ComputePipeline::prepare_dispatch`](super::resource::ComputePipeline::prepare_dispatch) for
+/// the dispatches before the encoder's first set.
+pub const IMAGEBLOCK_UNSET: [u64; 2] = [1, 1];
+
 /// The compute encoder core gets from `-computeCommandEncoder` or
 /// `-computeCommandEncoderWithDescriptor:` (`CommandBuffer`).
 pub trait ComputeEncoder<P: Platform>: Handle {

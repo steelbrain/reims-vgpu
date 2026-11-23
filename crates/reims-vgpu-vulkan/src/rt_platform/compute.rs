@@ -24,10 +24,17 @@
 //!   before it, or none.
 //! - **Barriers**: `memoryBarrierWithScope:` and `memoryBarrierWithResources:count:` are rt's one
 //!   global barrier, whatever the scope or the resources.
-//! - **Nothing to record**: `setImageblockWidth:height:`, whose size the encoder does not give rt,
-//!   so rt dispatches a kernel's explicit imageblock at 1 by 1, the size of an encoder that sets
-//!   none (`super::pipeline`'s `IMAGEBLOCK_SIZE`), and
-//!   `insertCompressedTextureReinterpretationFlush` (rt keeps no lossless compression).
+//! - **The imageblock size**: `setImageblockWidth:height:` is rt's, the size of the explicit
+//!   imageblock each threadgroup of the encoder's later dispatches takes, direct or indirect; an
+//!   encoder that sets none dispatches at 1 by 1, as Metal's does (`IMAGEBLOCK_UNSET`, core's
+//!   `platform::compute`), and a kernel that reaches no imageblock reads none. rt refuses a width
+//!   or a height that is not a power of two, 0 included, or more than 1024 cells
+//!   (`Refusal::ImageblockSize`): sizes Metal's validation layer stops at the call (measured on
+//!   the M3 Max, rt's `Refusal::ImageblockSize` docs), so the refusal is counted by its basis as
+//!   Metal's (`rt-refused-metal`), and the encoder's later dispatches run at the size set before
+//!   it. What Metal does with such a size without its validation layer is not measured.
+//! - **Nothing to record**: `insertCompressedTextureReinterpretationFlush` (rt keeps no lossless
+//!   compression).
 //! - **Each dispatch rt encodes is counted by its form**, with one relaxed add, for the counts
 //!   line, where rt counts none: direct (`dispatchThreads:threadsPerThreadgroup:` and
 //!   `dispatchThreadgroups:threadsPerThreadgroup:`, [`DISPATCHES_DIRECT_CODE`]) and indirect
@@ -245,9 +252,7 @@ impl RtComputeEncoder {
             | ComputeCmd::EncodeStartWhile { .. } => {
                 return Err(Stop::Unbuilt(Unbuilt::Predication));
             }
-            ComputeCmd::EndEncoding
-            | ComputeCmd::CompressedTextureReinterpretationFlush
-            | ComputeCmd::SetImageblockWidth { .. } => {}
+            ComputeCmd::EndEncoding | ComputeCmd::CompressedTextureReinterpretationFlush => {}
             ComputeCmd::ExecuteCommandsIndirect { .. }
             | ComputeCmd::ExecuteCommandsInBuffer { .. } => {
                 return Err(Stop::Metal(
@@ -345,6 +350,9 @@ impl RtComputeEncoder {
                         self.kept.used(texture, Use::Sampled);
                     }
                 }
+            }
+            ComputeCmd::SetImageblockWidth { width, height } => {
+                e.set_imageblock_size(small(width)?, small(height)?)?;
             }
             ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
                 e.set_threadgroup_memory_length(small(length)?, small(index)?)?;
@@ -650,6 +658,10 @@ mod tests {
     const TEXWRITE: &[u8] = include_bytes!("../../../../tests/shaders/compute_texwrite.metallib");
     const SAMPLE: &[u8] = include_bytes!("../../../../tests/shaders/compute_sample.metallib");
     const STAGEIN: &[u8] = include_bytes!("../../../../tests/shaders/compute_stagein.metallib");
+    /// `mutdec_imageblock.metal`'s kernel, of an explicit imageblock, whose thread 0 writes the
+    /// imageblock's width and height to buffer 0.
+    const IMAGEBLOCK: &[u8] =
+        include_bytes!("../../../../tests/shaders/mutdec_imageblock.metallib");
     const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_samplers.metallib"));
 
     fn counted(code: &str) -> u64 {
@@ -1078,6 +1090,100 @@ mod tests {
         assert_eq!(status, done);
         assert_eq!(words(&indirect, 4), [8, 9, 10, 11]);
         assert_eq!(counts(), [direct_before + 1, indirect_before + 1]);
+    }
+
+    /// A kernel's explicit imageblock runs at the size `setImageblockWidth:height:` set last on
+    /// its encoder, direct or indirect, and at 1 by 1 before the encoder sets one, as Metal's
+    /// does: `mutdec_imageblock` writes the extent its imageblock answers. A size rt refuses (not
+    /// a power of two, or more than 1024 cells), which Metal's validation layer stops, is counted
+    /// as Metal's refusal, and so is a size past 32 bits; the dispatches after them run at the
+    /// size set before, and the command buffer completes.
+    #[test]
+    fn a_kernel_s_imageblock_runs_at_its_encoder_s_size_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let done = CommandBufferStatus::COMPLETED;
+        let metal = RtRefusal::Refused.code();
+        let holding = |values: &[u32]| {
+            let length = 4 * values.len().to_u64();
+            let made = device.new_buffer_of_length(on, length, 0);
+            let made = made.expect("never a raise").expect("a buffer");
+            // SAFETY: the Shared buffer's contents are mapped, `values` long.
+            unsafe {
+                let at = made.contents().as_ptr::<u32>();
+                at.copy_from_nonoverlapping(values.as_ptr(), values.len());
+            }
+            made
+        };
+        let library = device.new_library(IMAGEBLOCK).expect("never a raise");
+        let library = library.expect("a metallib").expect("a library");
+        let kernel = library.new_function(on, "mutdec_imageblock");
+        let kernel = kernel.expect("never a raise").expect("the kernel");
+        let made = device.new_compute_pipeline_state_for_function(Some(&kernel));
+        let state = made.expect("a compute state").expect("a compute state");
+        // Each dispatch's extent, in a buffer of its own that no dispatch wrote before.
+        let guard = 0xdead_beef;
+        let extents: Vec<_> = (0..4).map(|_| holding(&[guard; 2])).collect();
+        let groups = holding(&[1, 1, 1]);
+        let size = |width, height| ComputeCmd::SetImageblockWidth { width, height };
+        // One threadgroup of `width` by `height` threads, each a cell of the imageblock.
+        let one_group = |width, height| ComputeCmd::DispatchThreadgroups {
+            threadgroups_per_grid: MtlSize::new(1, 1, 1),
+            threads_per_threadgroup: MtlSize::new(width, height, 1),
+        };
+        let before = counted(metal);
+        let status = run(
+            &queue,
+            None,
+            vec![
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&state),
+                },
+                bind(&[Some(&extents[0])]),
+                one_group(1, 1),
+                size(4, 2),
+                bind(&[Some(&extents[1])]),
+                one_group(4, 2),
+                size(24, 1),
+                size(64, 32),
+                size(1 << 32, 1),
+                bind(&[Some(&extents[2])]),
+                one_group(4, 2),
+                // 1024 cells, Metal's most, which rt takes.
+                size(1024, 1),
+                size(4, 4),
+                bind(&[Some(&extents[3])]),
+                ComputeCmd::DispatchThreadgroupsIndirect {
+                    indirect_buffer: Some(&groups),
+                    indirect_buffer_offset: 0,
+                    threads_per_threadgroup: MtlSize::new(4, 4, 1),
+                },
+            ],
+        );
+        assert_eq!(status, done);
+        assert_eq!(words(&extents[0], 2), [1, 1]);
+        assert_eq!(words(&extents[1], 2), [4, 2]);
+        assert_eq!(words(&extents[2], 2), [4, 2]);
+        assert_eq!(words(&extents[3], 2), [4, 4]);
+        assert_eq!(counted(metal), before + 3);
+
+        // A new encoder runs at 1 by 1 again.
+        let fresh = holding(&[guard; 2]);
+        let status = run(
+            &queue,
+            None,
+            vec![
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&state),
+                },
+                bind(&[Some(&fresh)]),
+                one_group(1, 1),
+            ],
+        );
+        assert_eq!(status, done);
+        assert_eq!(words(&fresh, 2), [1, 1]);
     }
 
     /// A kernel's `[[stage_in]]` attribute of a fixed layout stride that steps by the thread's

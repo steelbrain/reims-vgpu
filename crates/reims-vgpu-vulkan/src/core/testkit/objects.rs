@@ -1097,6 +1097,8 @@ pub struct Prepared {
     pub threads: (u64, u64, u64),
     /// The threadgroup memory lengths, as (index, length) pairs.
     pub lengths: Vec<(u64, u64)>,
+    /// The imageblock size, as (width, height).
+    pub imageblock: (u64, u64),
 }
 
 /// A [`Prepared`] call's dispatch, ordered so a test can sort the calls several threads made.

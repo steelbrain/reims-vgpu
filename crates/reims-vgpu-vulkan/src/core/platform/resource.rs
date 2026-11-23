@@ -531,10 +531,12 @@ pub trait ComputePipeline<P: Platform>: Handle {
     }
     /// No Metal counterpart: makes ahead, on the calling thread, what a dispatch of the state
     /// makes at its first use, so the dispatch finds it made: a platform whose pipeline depends
-    /// on the dispatch's threadgroup size, threadgroup memory lengths or grid compiles it there.
-    /// `dispatch` and `threads_per_threadgroup` are the dispatch's own arguments, and
-    /// `threadgroup_memory_lengths` what `setThreadgroupMemoryLength:atIndex:` set on its
-    /// encoder before it, as (index, length) pairs, each index once, in the order first set.
+    /// on the dispatch's threadgroup size, threadgroup memory lengths, imageblock size or grid
+    /// compiles it there. `dispatch` and `threads_per_threadgroup` are the dispatch's own
+    /// arguments, `threadgroup_memory_lengths` what `setThreadgroupMemoryLength:atIndex:` set on
+    /// its encoder before it, as (index, length) pairs, each index once, in the order first set,
+    /// and `imageblock_size` what `setImageblockWidth:height:` set on it last, width then height,
+    /// [`IMAGEBLOCK_UNSET`](super::compute::IMAGEBLOCK_UNSET) where it set none.
     ///
     /// It changes nothing the guest or the dispatch observes, and reports nothing: every result
     /// and error is the dispatch's own. A dispatch that needs what another thread is making here
@@ -545,6 +547,7 @@ pub trait ComputePipeline<P: Platform>: Handle {
         _dispatch: super::compute::Dispatch,
         _threads_per_threadgroup: MtlSize,
         _threadgroup_memory_lengths: &[(u64, u64)],
+        _imageblock_size: [u64; 2],
     ) {
     }
     /// No Metal counterpart: the key of the pipeline a dispatch of the state runs
@@ -563,6 +566,7 @@ pub trait ComputePipeline<P: Platform>: Handle {
         _dispatch: super::compute::Dispatch,
         _threads_per_threadgroup: MtlSize,
         _threadgroup_memory_lengths: &[(u64, u64)],
+        _imageblock_size: [u64; 2],
     ) -> Option<(P::DispatchVariant, bool)> {
         None
     }

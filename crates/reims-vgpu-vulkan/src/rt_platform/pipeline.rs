@@ -597,18 +597,25 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     }
 
     /// rt's make ahead (`prepare_dispatch`) of the `VkPipeline` the dispatch would make at its
-    /// first use, at its threadgroup size, threadgroup memory lengths and grid tiles, and the
-    /// imageblock size its encoder dispatches at ([`IMAGEBLOCK_SIZE`]). A value past rt's 32 bits
-    /// makes nothing: the dispatch, or the length's set, refuses it (`super::compute`). rt's one
-    /// refusal here is of a kernel past its stage bound whose compile the cache directory does not
-    /// hold, and its fill starts (`super::stage`): the dispatch waits for that fill in its walk.
-    fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
-        let Some(args) = RtDispatch::of(dispatch, threads, lengths) else {
+    /// first use, at its threadgroup size, threadgroup memory lengths, imageblock size and grid
+    /// tiles. A value past rt's 32 bits makes nothing: the dispatch, or the length's or the
+    /// size's set, refuses it (`super::compute`). So does a size rt's encoder refuses
+    /// (`Refusal::ImageblockSize`), for a kernel that reaches an imageblock. rt's one refusal
+    /// here is of a kernel past its stage bound whose compile the cache directory does not hold,
+    /// and its fill starts (`super::stage`): the dispatch waits for that fill in its walk.
+    fn prepare_dispatch(
+        &self,
+        dispatch: Dispatch,
+        threads: MtlSize,
+        lengths: &[(u64, u64)],
+        imageblock: [u64; 2],
+    ) {
+        let Some(args) = RtDispatch::of(dispatch, threads, lengths, imageblock) else {
             return;
         };
         let state = &self.rt;
         let prepared =
-            state.prepare_dispatch(args.dispatch, args.threads, &args.lengths, IMAGEBLOCK_SIZE);
+            state.prepare_dispatch(args.dispatch, args.threads, &args.lengths, args.imageblock);
         if let Err(error) = prepared
             && let Some(stage) = stage_of(&error)
         {
@@ -619,17 +626,19 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     /// rt's key (`dispatch_variant`) of the `VkPipeline` the dispatch runs, and whether rt made
     /// it: of the compiled content, so the states of one content answer one key for one
     /// dispatch. rt reads made from the kernel's variants, false for a make that ends after the
-    /// read. `None` where rt would make nothing for it, and for a value past rt's 32 bits, as
+    /// read. The imageblock size is part of the key of a kernel that reaches an imageblock alone.
+    /// `None` where rt would make nothing for it, and for a value past rt's 32 bits, as
     /// [`prepare_dispatch`](Self::prepare_dispatch) makes nothing there.
     fn dispatch_variant(
         &self,
         dispatch: Dispatch,
         threads: MtlSize,
         lengths: &[(u64, u64)],
+        imageblock: [u64; 2],
     ) -> Option<(rt::DispatchVariant, bool)> {
-        let args = RtDispatch::of(dispatch, threads, lengths)?;
+        let args = RtDispatch::of(dispatch, threads, lengths, imageblock)?;
         self.rt
-            .dispatch_variant(args.dispatch, args.threads, &args.lengths, IMAGEBLOCK_SIZE)
+            .dispatch_variant(args.dispatch, args.threads, &args.lengths, args.imageblock)
     }
 
     /// The driver's create of the state's main pipeline, which rt's make of the state (`make`)
@@ -650,12 +659,6 @@ pub(super) fn finished(finish: Result<(), rt::Error>) -> Result<(), String> {
     finish.map_err(|error| error.to_string())
 }
 
-/// The imageblock size rt's make ahead and key of a dispatch take: 1 by 1, the size rt's compute
-/// encoder dispatches a kernel's explicit imageblock at where `setImageblockWidth:height:` set
-/// none, as Metal's does. The platform's encoders give rt no size (`super::compute`), so every
-/// dispatch runs at it.
-const IMAGEBLOCK_SIZE: [u32; 2] = [1, 1];
-
 /// A dispatch's arguments as rt's make ahead and key take them.
 struct RtDispatch {
     /// Its grid.
@@ -664,12 +667,19 @@ struct RtDispatch {
     threads: [u32; 3],
     /// Its threadgroup memory lengths, by index.
     lengths: Vec<(u32, u32)>,
+    /// Its encoder's imageblock size, width then height.
+    imageblock: [u32; 2],
 }
 
 impl RtDispatch {
-    /// The dispatch's, of its `threads` per threadgroup and its threadgroup memory `lengths`;
-    /// `None` where a value is past rt's 32 bits.
-    fn of(dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) -> Option<Self> {
+    /// The dispatch's, of its `threads` per threadgroup, its threadgroup memory `lengths` and its
+    /// encoder's `imageblock` size; `None` where a value is past rt's 32 bits.
+    fn of(
+        dispatch: Dispatch,
+        threads: MtlSize,
+        lengths: &[(u64, u64)],
+        [width, height]: [u64; 2],
+    ) -> Option<Self> {
         let small = |n: u64| u32::try_from(n).ok();
         let size = |s: MtlSize| Some([small(s.width)?, small(s.height)?, small(s.depth)?]);
         let threads = size(threads)?;
@@ -685,6 +695,7 @@ impl RtDispatch {
             dispatch,
             threads,
             lengths,
+            imageblock: [small(width)?, small(height)?],
         })
     }
 }
@@ -692,6 +703,7 @@ impl RtDispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::platform::compute::IMAGEBLOCK_UNSET;
     use crate::core::platform::device::GpuDevice as _;
     use crate::core::platform::resource::{FunctionConstant, Library as _};
     use crate::core::platform::values::{AttributeDesc, BufferLayoutDesc};
@@ -705,6 +717,10 @@ mod tests {
 
     /// `tests/shaders/compute_tgstatic.metal`'s kernel, of 64 words of static threadgroup memory.
     const TGSTATIC: &[u8] = include_bytes!("../../../../tests/shaders/compute_tgstatic.metallib");
+
+    /// `tests/shaders/mutdec_imageblock.metal`'s kernel, of an explicit imageblock.
+    const IMAGEBLOCK: &[u8] =
+        include_bytes!("../../../../tests/shaders/mutdec_imageblock.metallib");
 
     fn counted(code: &str) -> u64 {
         (crate::answer::degradation_counts().into_iter())
@@ -973,7 +989,9 @@ mod tests {
     /// another for another threadgroup size of a kernel that observes its threadgroups, or for
     /// another kernel; none where rt would make nothing (a threadgroup size past the state's
     /// most, a grid of no threadgroups) and for a value past rt's 32 bits. A key is made once
-    /// its pipeline is made ahead, for every state of its kernel, and not before
+    /// its pipeline is made ahead, for every state of its kernel, and not before. The encoder's
+    /// imageblock size keys a kernel that reaches an imageblock alone: another size is another
+    /// key, and a size rt's encoder refuses is none
     #[test]
     fn dispatch_variants_on_vulkan() {
         let platform = RtPlatform::new();
@@ -994,7 +1012,8 @@ mod tests {
         let variant =
             |state: &RtObj<RtComputePipeline>, groups, threads, lengths: &[(u64, u64)]| {
                 let grid = Dispatch::Threadgroups(MtlSize::new(groups, 1, 1));
-                state.dispatch_variant(grid, MtlSize::new(threads, 1, 1), lengths)
+                let threads = MtlSize::new(threads, 1, 1);
+                state.dispatch_variant(grid, threads, lengths, IMAGEBLOCK_UNSET)
             };
         let key = |state: &RtObj<RtComputePipeline>, groups, threads, lengths: &[(u64, u64)]| {
             variant(state, groups, threads, lengths).map(|(key, _)| key)
@@ -1012,7 +1031,7 @@ mod tests {
         // and a make ahead of the dispatch makes the key's, for both states.
         assert_eq!(variant(&first, 2, 32, &[]), made.map(|key| (key, false)));
         let grid = Dispatch::Threadgroups(MtlSize::new(2, 1, 1));
-        first.prepare_dispatch(grid, MtlSize::new(32, 1, 1), &[]);
+        first.prepare_dispatch(grid, MtlSize::new(32, 1, 1), &[], IMAGEBLOCK_UNSET);
         assert_eq!(variant(&first, 2, 32, &[]), made.map(|key| (key, true)));
         assert_eq!(variant(&second, 4, 32, &[]), made.map(|key| (key, true)));
         assert_eq!(key(&first, 4, 32, &[]), made);
@@ -1029,6 +1048,32 @@ mod tests {
         assert_eq!(key(&first, 0, 32, &[]), None);
         assert_eq!(key(&first, 1 << 32, 32, &[]), None);
         assert_eq!(key(&first, 2, 32, &[(1 << 32, 16)]), None);
+
+        // The key of `state`'s dispatch of one threadgroup of `threads` at the imageblock `size`.
+        let sized = |state: &RtObj<RtComputePipeline>, [w, h]: [u64; 2], size: [u64; 2]| {
+            let grid = Dispatch::Threadgroups(MtlSize::new(1, 1, 1));
+            let threads = MtlSize::new(w, h, 1);
+            let variant = state.dispatch_variant(grid, threads, &[], size);
+            variant.map(|(key, _)| key)
+        };
+        let imageblock = state(&function(IMAGEBLOCK, "mutdec_imageblock"));
+        let unset = sized(&imageblock, [4, 2], IMAGEBLOCK_UNSET);
+        assert!(unset.is_some(), "no key of an imageblock kernel's dispatch");
+        let set = sized(&imageblock, [4, 2], [4, 2]);
+        assert!(set.is_some(), "no key of an imageblock of 4 by 2");
+        assert_ne!(set, unset);
+        assert_eq!(sized(&imageblock, [4, 2], [4, 2]), set);
+        assert_ne!(sized(&imageblock, [4, 2], [4, 4]), set);
+        // Not a power of two, and more than 1024 cells: rt's encoder refuses either.
+        assert_eq!(sized(&imageblock, [4, 2], [24, 1]), None);
+        assert_eq!(sized(&imageblock, [4, 2], [64, 32]), None);
+        assert_eq!(sized(&imageblock, [4, 2], [1 << 32, 1]), None);
+        // `tg_static` reaches no imageblock: one key whatever size rt takes.
+        let plain = sized(&first, [32, 1], IMAGEBLOCK_UNSET);
+        assert!(plain.is_some(), "no key of a kernel of no imageblock");
+        assert_eq!(sized(&first, [32, 1], [4, 2]), plain);
+        assert_eq!(sized(&first, [32, 1], [24, 1]), plain);
+        assert_eq!(sized(&first, [32, 1], [1 << 32, 1]), None);
     }
 
     /// A state's finish, on the GPU the test holds, is the driver's create of its main pipeline
