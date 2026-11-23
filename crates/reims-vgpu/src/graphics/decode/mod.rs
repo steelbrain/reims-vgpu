@@ -5616,8 +5616,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     != 0,
                 max_total_threads_per_threadgroup: m.max_total_threads_per_threadgroup.into(),
                 max_call_stack_depth: m.max_call_stack_depth.into(),
-                support_indirect_command_buffers: m.flags & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
-                    != 0,
+                support_indirect_command_buffers: m.flags & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB != 0,
                 stage_input,
                 open_cl_mode: m.flags & RGFX_COMPUTE_PIPELINE_OPENCL_MODE != 0,
             };
@@ -5625,7 +5624,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 &fields,
                 &self.function_key(m.function_library_obj_id, name, &constants),
                 linked.len(),
-                libraries.preloaded.len().saturating_add(libraries.loaded.len()),
+                libraries
+                    .preloaded
+                    .len()
+                    .saturating_add(libraries.loaded.len()),
             );
             return Ok(PipelineJob {
                 obj_id: m.obj_id,

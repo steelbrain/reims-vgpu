@@ -114,12 +114,7 @@ pub(super) fn compute(
         fields.max_total_threads_per_threadgroup
     );
     if let Some(input) = &fields.stage_input {
-        layout(
-            &mut text,
-            " stage input",
-            &input.layouts,
-            &input.attributes,
-        );
+        layout(&mut text, " stage input", &input.layouts, &input.attributes);
     }
     if linked > 0 {
         let _ = write!(text, " linked {linked}");
@@ -168,7 +163,12 @@ fn colors(text: &mut String, colors: &[(u64, ColorAttachmentDesc)]) {
 }
 
 /// Appends `<what> [<layouts>, <attributes>]` (the module docs).
-fn layout(text: &mut String, what: &str, layouts: &[BufferLayoutDesc], attributes: &[AttributeDesc]) {
+fn layout(
+    text: &mut String,
+    what: &str,
+    layouts: &[BufferLayoutDesc],
+    attributes: &[AttributeDesc],
+) {
     let _ = write!(text, "{what} [");
     let mut first = true;
     let mut sep = |text: &mut String| {
@@ -228,8 +228,18 @@ mod tests {
             function_key(Some(lib), 0x2_0000_0009, "fragment_main", &[constant(0, 1)])
         );
         let others = [
-            function_key(Some([8; 32]), 0x1_0000_0003, "fragment_main", &[constant(0, 1)]),
-            function_key(Some(lib), 0x1_0000_0003, "fragment_mainx", &[constant(0, 1)]),
+            function_key(
+                Some([8; 32]),
+                0x1_0000_0003,
+                "fragment_main",
+                &[constant(0, 1)],
+            ),
+            function_key(
+                Some(lib),
+                0x1_0000_0003,
+                "fragment_mainx",
+                &[constant(0, 1)],
+            ),
             function_key(Some(lib), 0x1_0000_0003, "fragment_main", &[constant(1, 1)]),
             function_key(Some(lib), 0x1_0000_0003, "fragment_main", &[constant(0, 2)]),
             function_key(Some(lib), 0x1_0000_0003, "fragment_main", &[]),
