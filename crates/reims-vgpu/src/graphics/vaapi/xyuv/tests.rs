@@ -20,7 +20,7 @@ fn route_on(
     platform: &Arc<FakePlatform>,
     xyuv: Result<ImportWrite, String>,
 ) -> Result<XyuvGathers<FakePlatform>, String> {
-    let pipeline = Arc::new(GatherPipeline::new(&platform.device()));
+    let pipeline = Arc::new(GatherPipeline::<FakePlatform>::new(&platform.device()));
     route(
         &answers(xyuv),
         &pipeline,
@@ -46,7 +46,7 @@ fn the_route_is_the_import_check_s_xyuv_answer() {
         "the driver's video processing writes no XYUV import right: a wrong byte"
     );
     let unanswered = ImportWrites::of_answers(Ok(WHOLE_ROWS), Ok(WHOLE_ROWS));
-    let pipeline = Arc::new(GatherPipeline::new(&platform.device()));
+    let pipeline = Arc::new(GatherPipeline::<FakePlatform>::new(&platform.device()));
     let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
     assert!(route(&unanswered, &pipeline, &runtime).is_err());
 }
@@ -55,7 +55,7 @@ fn the_route_is_the_import_check_s_xyuv_answer() {
 #[test]
 fn a_route_makes_nothing_before_its_first_picture() {
     let platform = Arc::new(FakePlatform::new());
-    let pipeline = Arc::new(GatherPipeline::new(&platform.device()));
+    let pipeline = Arc::new(GatherPipeline::<FakePlatform>::new(&platform.device()));
     let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
     let mark = platform.call_log().mark();
     let gathers = route(&answers(Ok(WHOLE_ROWS)), &pipeline, &runtime).expect("a route");
