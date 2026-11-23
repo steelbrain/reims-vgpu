@@ -186,6 +186,19 @@ if [[ $SKIP_QEMU == 1 && ! -x "$DATA/qemu/current/bin/$QEMU_BINARY" ]]; then
   die "--skip-qemu keeps the installed QEMU, and none is installed ($(shown "$DATA/qemu/current/bin/$QEMU_BINARY") is missing): run this without --skip-qemu, which builds it"
 fi
 
+# ------------------------------------------------------------------ git
+
+# On Windows the update and the line ends' rewrite below run git before the
+# dependencies' install, which installs the rest: MSYS2's git, a package of its
+# own, since Git for Windows, which cloned the checkout, is not on the CLANG64
+# shell's PATH (MSYS2's login shell starts from a PATH of its own, with only
+# Windows' system directories).
+if [[ $WINDOWS == 1 ]] && ! command -v git >/dev/null; then
+  say "Missing package: git (MSYS2's own, which this runs before it installs the other packages)"
+  ask "Install it with pacman?" || die "install it (pacman -S --needed git), then run this again"
+  pacman -S --needed --noconfirm git
+fi
+
 # ------------------------------------------------------------------ update
 
 # published BEFORE: whether HEAD is a commit the remote branch once held, as
