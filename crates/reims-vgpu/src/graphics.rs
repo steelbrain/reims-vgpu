@@ -2259,10 +2259,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
     /// `BLOCK_RELEASE` (`Host::block_released`): refused at once where an object the decoder
     /// holds lies in the block, else answered once every command buffer of the block's context
-    /// the decoder committed has finished, every one another holder's context committed before
-    /// its `BLOCK_UNSHARE`, its close, or the release where neither came first, which the device
-    /// hands on as an unshare ([`Self::unshare_block`]), and once the display no longer shows
-    /// or draws a surface's texture over the block ([`DisplayHold`]).
+    /// the decoder has begun has finished, every one it began for another holder's context
+    /// before its `BLOCK_UNSHARE`, its close, or the release where neither came first, which the
+    /// device hands on as an unshare ([`Self::unshare_block`]), and once the display no longer
+    /// shows or draws a surface's texture over the block ([`DisplayHold`]). A command buffer
+    /// posted on a ring and not yet begun is not waited for.
     fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         // Its waits' ends, for a slow answer's line (`slow_answers`).
         let marks = Arc::new(ReleaseMarks::asked());
@@ -2387,8 +2388,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
     /// `POOL_GIVE` (`Host::pool_give`): not found where context `give.context` holds no such block
     /// of the Shared pool, refused at once where an object the decoder holds lies in it, else
-    /// answered, and the block freed, once every command buffer of the context the decoder
-    /// committed has finished ([`PoolLedger::give`]).
+    /// answered, and the block freed, once every command buffer of the context the decoder has
+    /// begun has finished ([`PoolLedger::give`]). A command buffer posted on a ring and not yet
+    /// begun is not waited for.
     fn give_pool_block(&self, give: &RgfxPoolGive, answer: CompleteAnswer) {
         // For a slow answer's line (`slow_answers`).
         let asked = host_time();
@@ -2485,7 +2487,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// `PRIVATE_GIVE` (`Host::private_give`): not found where context `give.context` holds no
     /// such Private block, refused at once where a buffer or heap the decoder holds lies in it,
     /// else answered, and the block freed, once every command buffer of the context the decoder
-    /// committed has finished ([`PrivateBlocks::give`]).
+    /// has begun has finished ([`PrivateBlocks::give`]). A command buffer posted on a ring and
+    /// not yet begun is not waited for.
     fn give_private_block(&self, give: &RgfxPrivateGive, answer: CompleteAnswer) {
         // For a slow answer's line (`slow_answers`).
         let asked = host_time();

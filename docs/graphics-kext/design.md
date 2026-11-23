@@ -4689,12 +4689,14 @@ The host refuses the release at once where an object it holds lies in the
 block: a buffer or heap over host memory, or a buffer, texture or heap placed
 in one, which keeps its parent's span after the parent's destroy. It also
 refuses one where a live queue's ring lies in the block. Otherwise it answers
-OK once every command buffer the context committed before the release has run
-its completion handler, and, for a shared block, every one each other holder
-committed before its `BLOCK_UNSHARE`, before its close, or before the release
-itself where neither came first: the kext unwired that holder's pages at its
-unshare, or at a close it took for refused, and gives the surface's memory back
-at the answer. The kext posts an unshare out of its lock, so another holder's
+OK once every command buffer the host has begun for the context before the
+release has run its completion handler, and, for a shared block, every one it
+began for each other holder before its `BLOCK_UNSHARE`, before its close, or
+before the release itself where neither came first: the kext unwired that
+holder's pages at its unshare, or at a close it took for refused, and gives
+the surface's memory back at the answer. A command buffer posted on a ring
+and not yet begun is not waited for. The kext posts an unshare out of its
+lock, so another holder's
 release can come first, and the host then takes the release as that holder's
 unshare too; the unshare that follows is not counted again. It also waits
 while the host's display holds a surface's texture over the block, as a
@@ -5149,11 +5151,12 @@ reads it once.
   destroy goes first. The kext takes the block's mapping out of the process,
   then posts `POOL_GIVE`, after every message the process posted before. The
   host refuses it while an object lies in the block, and otherwise answers
-  once every command buffer the context committed has finished, and only then
-  does the block go back to the pool. A context's close takes every mapping
-  out of the process before its `CONTEXT_CLOSE`, which gives back every block
-  the context still holds the same way. The device's reset frees every block
-  at once.
+  once every command buffer the host has begun for the context has finished,
+  and only then does the block go back to the pool. A command buffer posted
+  on a ring and not yet begun is not waited for. A context's close takes
+  every mapping out of the process before its `CONTEXT_CLOSE`, which gives
+  back every block the context still holds the same way. The device's reset
+  frees every block at once.
 - **What moves.** Buffers' slabs: a class's and a large buffer's own,
   and so every buffer that lies in one, upload chunks and Managed buffers'
   copies among them; and a Shared heap, which an Apple GPU's device makes
@@ -5221,9 +5224,10 @@ its kext sets that bit and the device took the feature.
   destroy goes first. The kext posts `PRIVATE_GIVE` and returns. The host
   refuses it while an object it holds still lies in the block, answers
   `NOT_FOUND` for a block the context does not hold, and otherwise lets the
-  block go once every command buffer the context committed has finished. A
-  context's `CONTEXT_CLOSE` lets go of every block it still holds, and the
-  device's reset of every block.
+  block go once every command buffer the host has begun for the context has
+  finished. A command buffer posted on a ring and not yet begun is not waited
+  for. A context's `CONTEXT_CLOSE` lets go of every block it still holds, and
+  the device's reset of every block.
 - **Its addresses.** On metal2vulkan-runtime's device a block is device memory no
   process maps, its address the memory's Vulkan device address, and the host
   answers the whole block it took. On a platform that gives no Private blocks
