@@ -668,7 +668,10 @@ mod tests {
             let ten_bit = frame.bit_depth() > 8;
             let sample = if ten_bit { 2 } else { 1 };
             let (width, height) = (frame.width().to_usize(), frame.height().to_usize());
-            assert!(width >= BLOCK && height >= BLOCK, "a picture of {width}x{height}");
+            assert!(
+                width >= BLOCK && height >= BLOCK,
+                "a picture of {width}x{height}"
+            );
 
             let draw = Arc::new(PlaneDraw::new(Some(luid)).expect("the plane draws"));
             let size = (frame.width(), frame.height());
@@ -735,7 +738,10 @@ mod tests {
                  differ, Direct3D against rt: 0 of {c} differ, rt against rt again: 0 of {c} \
                  differ; the decoded luma: "
             );
-            assert!(line.contains(&want), "the line: {line}\nwanted in it: {want}");
+            assert!(
+                line.contains(&want),
+                "the line: {line}\nwanted in it: {want}"
+            );
         });
     }
 }
