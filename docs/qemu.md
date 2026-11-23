@@ -1247,6 +1247,14 @@ usual default host, `x86_64-pc-windows-msvc`, xtask, the build scripts,
 reims-ctl and reims-util would build for MSVC, which links only with Visual
 Studio's `link.exe`.
 
+With `REIMS_INSTALL_SKIP_HOST_CHECKS=1` in its environment, install.ps1
+skips the hypervisor platform's step, its check and its turning on, and
+install-ctl.sh, which gets the variable in CLANG64's login shell, skips its
+own check of the platform; every other step runs as without it. On Linux the
+same variable skips install-ctl.sh's checks of the host for VMs (KVM,
+`/dev/udmabuf`, `vm.max_map_count`, `min_ttl_ms`, the USB udev rule and the
+kvm group), and on a Mac it skips nothing (each script's header).
+
 **Measured** on the mini (2026-11-16, `m3-max-36191`), in a scratch MSYS2
 extracted from MSYS2's base archive (its package list of 2026-09-27, so the
 update step had work to do) and a scratch user profile with rustup's

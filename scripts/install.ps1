@@ -22,6 +22,10 @@
 #
 # REIMS_INSTALL_PRETEND_MISSING (msys2, git, whp, comma-separated) has the checks find those
 # missing, for a dry run of the steps that install them on a machine that has them.
+# REIMS_INSTALL_SKIP_HOST_CHECKS=1 skips step 2, the check of the Windows Hypervisor Platform
+# and its turning on as an administrator, saying once that it skipped it; install-ctl.sh, which
+# gets the variable too, then skips its own check of the platform. Steps 1, 3 and 4 run as they
+# do without it. VMs start only once the platform is on, which reims-ctl doctor checks.
 param(
     [switch]$Yes,
     [switch]$DryRun,
@@ -76,12 +80,15 @@ if (-not $DryRun) {
     if (-not (Test-Path $bash)) { Die "MSYS2 is not in $Msys2 (no $bash): give its folder with -Msys2" }
 }
 
-# 2. The Windows Hypervisor Platform. Win32_OptionalFeature answers without an administrator's
-# rights: InstallState 1 is on.
-$whp = (Get-CimInstance Win32_OptionalFeature -Filter "Name='HypervisorPlatform'").InstallState
+# 2. The Windows Hypervisor Platform, unless REIMS_INSTALL_SKIP_HOST_CHECKS=1 skips the step.
+# Win32_OptionalFeature answers without an administrator's rights: InstallState 1 is on.
+$skipHostChecks = $env:REIMS_INSTALL_SKIP_HOST_CHECKS -eq "1"
+$whp = if ($skipHostChecks) { $null } else { (Get-CimInstance Win32_OptionalFeature -Filter "Name='HypervisorPlatform'").InstallState }
 if ($pretend -contains "whp") { $whp = 2 }
 $restart = $false
-if ($whp -eq 1) {
+if ($skipHostChecks) {
+    Say "REIMS_INSTALL_SKIP_HOST_CHECKS=1: skipping step 2, the check of the Windows Hypervisor Platform, which VMs run on; reims-ctl doctor checks it"
+} elseif ($whp -eq 1) {
     Say "The Windows Hypervisor Platform is on"
 } else {
     if (-not $DryRun -and -not (Ask "Turn on the Windows Hypervisor Platform, which VMs run on? Windows asks for an administrator, and needs a restart after")) {

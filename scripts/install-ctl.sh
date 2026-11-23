@@ -55,6 +55,17 @@
 # target/); XDG_DATA_HOME and XDG_CACHE_HOME move the install, with reims-ctl's
 # record of it, which reims-ctl update reads, and the build from ~/.local/share
 # and ~/.cache.
+#
+# REIMS_INSTALL_SKIP_HOST_CHECKS=1 skips the checks of this host for the VMs
+# it runs, with the changes they offer to make through sudo, and says once that
+# it skipped them: on Linux, KVM, /dev/udmabuf and its group, vm.max_map_count,
+# MGLRU's min_ttl_ms, the udev rule for USB passthrough and the kvm group; on
+# Windows, the Windows Hypervisor Platform. A Mac has none to skip: its one
+# check for VMs, of its macOS release, decides whether mesa, a dependency, is
+# installed. It never skips what the build needs or refuses: the host's OS and
+# architecture, the CLANG64 shell, a path with a space, the dependencies and
+# their installs, rustup, vendor/qemu, and --skip-qemu's need of an installed
+# QEMU. reims-ctl doctor checks the host whenever you run it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -76,6 +87,9 @@ for arg in "$@"; do
       ;;
   esac
 done
+# Unset, or anything but 1, the host's checks run.
+SKIP_HOST_CHECKS=0
+[[ ${REIMS_INSTALL_SKIP_HOST_CHECKS:-} == 1 ]] && SKIP_HOST_CHECKS=1
 
 bold=$'\033[1m' red=$'\033[31m' yellow=$'\033[33m' green=$'\033[32m' off=$'\033[0m'
 [[ -t 1 ]] || bold='' red='' yellow='' green='' off=''
@@ -412,16 +426,25 @@ case "$OS $distro_id $distro_like " in
     warn "$distro_id is neither Debian/Ubuntu, Fedora nor Arch/CachyOS: install the equivalents of these Ubuntu packages yourself if the build stops: ${apt_pkgs[*]}"
     ;;
 esac
+# The rest of the host's checks are for the VMs it runs, on Windows and Linux,
+# and REIMS_INSTALL_SKIP_HOST_CHECKS=1 skips them all (Environment, above).
+if [[ $SKIP_HOST_CHECKS == 1 ]]; then
+  if [[ $WINDOWS == 1 ]]; then
+    say "REIMS_INSTALL_SKIP_HOST_CHECKS=1: skipping this host's check for VMs, of the Windows Hypervisor Platform; reims-ctl doctor checks the host"
+  elif [[ $OS == Linux ]]; then
+    say "REIMS_INSTALL_SKIP_HOST_CHECKS=1: skipping this host's checks for VMs (KVM, /dev/udmabuf and its group, vm.max_map_count, MGLRU's min_ttl_ms, the USB udev rule and the kvm group); reims-ctl doctor checks the host"
+  fi
+fi
 # On Windows, VMs run on the Windows Hypervisor Platform, an optional feature of
 # Windows: Win32_OptionalFeature's InstallState is 1 where it is on.
-if [[ $WINDOWS == 1 ]]; then
+if [[ $WINDOWS == 1 && $SKIP_HOST_CHECKS == 0 ]]; then
   whp="$(powershell -NoProfile -Command "(Get-CimInstance Win32_OptionalFeature -Filter \"Name='HypervisorPlatform'\").InstallState" 2>/dev/null | tr -d '\r')"
   [[ $whp == 1 ]] || warn "the Windows Hypervisor Platform is off, and VMs run on it: turn it on in Windows Features (run optionalfeatures, tick Windows Hypervisor Platform), then restart Windows"
 fi
-# The rest of the host's checks are for the VMs Linux runs: KVM, the library's
-# GPU access to the guest's memory, and USB passthrough. KVM runs x86-64 VMs on
-# x86-64 and arm64 VMs on arm64; arm64 VMs on x86-64 are emulated by TCG.
-if [[ $OS == Linux ]]; then
+# Linux's checks are for the VMs it runs: KVM, the library's GPU access to the
+# guest's memory, and USB passthrough. KVM runs x86-64 VMs on x86-64 and arm64
+# VMs on arm64; arm64 VMs on x86-64 are emulated by TCG.
+if [[ $OS == Linux && $SKIP_HOST_CHECKS == 0 ]]; then
   if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     vms="VMs will not start"
     [[ $ARCH == x86_64 ]] && vms="x86-64 VMs will not start (arm64 VMs, which TCG emulates here, start without it)"
