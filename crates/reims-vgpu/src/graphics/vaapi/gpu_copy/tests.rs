@@ -279,7 +279,8 @@ fn on_rt_the_kernel_copies_a_pictures_crop_from_its_scratch_and_nothing_else() {
 /// the cache as its fill left it. The first [`PICTURES`] pictures of each H.264 and HEVC stream in
 /// `RVG_VA_STREAMS`'s directories, 8 and 10 bits; a picture the copier declines (rows of a width
 /// not on 4 bytes) is counted and named, and a stream the decoder refuses is left at its
-/// refusal. Each copied picture is counted under [`COPIED_CODE`].
+/// refusal. Each copied picture is counted under [`COPIED_CODE`], and the copier's time for it,
+/// from the driver's write to the copy's end, is printed by size and sample.
 #[test]
 #[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
 fn a_picture_copied_by_the_gpu_from_its_scratch_is_the_cpus_copy() {
@@ -329,6 +330,8 @@ fn a_picture_copied_by_the_gpu_from_its_scratch_is_the_cpus_copy() {
         };
         let before = counted();
         let (mut pictures, mut declined) = (0usize, Vec::new());
+        // By (width, height, sample bytes): pictures, and their least, total and most times.
+        let mut times = std::collections::BTreeMap::<(u64, u64, u64), (u32, [Duration; 3])>::new();
         let mut each = |stream: &std::path::Path, id: u64, frame: &Frame| -> bool {
             let sample: u64 = if frame.bit_depth() > 8 { 2 } else { 1 };
             let (width, height) = (u64::from(frame.width()), u64::from(frame.height()));
@@ -373,11 +376,18 @@ fn a_picture_copied_by_the_gpu_from_its_scratch_is_the_cpus_copy() {
             };
             let luma = output(luma_at, luma_bytes, width, height);
             let chroma = output(chroma_at, chroma_bytes, width.div_ceil(2), chroma_rows);
+            let total = copier.total;
             match copier
                 .copy(frame, &writes, &luma, &chroma)
                 .expect("the copy")
             {
-                DeviceWrite::Written => {}
+                DeviceWrite::Written => {
+                    let took = copier.total - total;
+                    let (n, [least, sum, most]) = (times.entry((width, height, sample)))
+                        .or_insert((0, [Duration::MAX, Duration::ZERO, Duration::ZERO]));
+                    *n += 1;
+                    (*least, *sum, *most) = ((*least).min(took), *sum + took, (*most).max(took));
+                }
                 DeviceWrite::Declined(why) => {
                     declined.push(format!("{} picture {id}: {why}", stream.display()));
                     return false;
@@ -429,6 +439,16 @@ fn a_picture_copied_by_the_gpu_from_its_scratch_is_the_cpus_copy() {
              {declined:?}; refused: {refused:?}",
             streams.len()
         );
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        for ((width, height, sample), (n, [least, sum, most])) in &times {
+            eprintln!(
+                "copy times: {width}x{height} at {sample}-byte samples: {n} pictures, {:.3} ms \
+                 least, {:.3} ms each, {:.3} ms at most",
+                ms(*least),
+                ms(*sum / *n),
+                ms(*most)
+            );
+        }
         assert!(pictures > 0, "no picture copied: {declined:?}");
         assert_eq!(counted(), before + pictures as u64);
     });
