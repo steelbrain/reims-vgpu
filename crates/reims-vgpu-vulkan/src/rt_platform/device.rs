@@ -151,6 +151,13 @@
 //! nor the blob's writes in a metric of its own; the blob's bytes are among
 //! [`CACHE_BYTES_WRITTEN_CODE`]'s.
 //!
+//! **Its creations before the seed.** rt's reaper reads the device's blob into its
+//! `VkPipelineCache` off the guest's threads, and a `VkPipeline` made before that is done goes
+//! through the empty cache: it compiles without the blob's data and is not in this run's blob,
+//! so a later run compiles it again (rt's `Metrics::creations_before_seed`). The counts line
+//! carries them as an amount, [`CREATIONS_BEFORE_SEED_CODE`], so a boot's line says whether
+//! pipelines were made before the blob was in.
+//!
 //! **Its emulated SIMD groups and its dropped makes.** rt counts the dispatches, direct and
 //! indirect, that ran a kernel's emulated-SIMD-group module, a threadgroup not whole groups of the
 //! width the kernel's own module runs, as 80 threads, or 32 on a device of 64-lane subgroups
@@ -381,6 +388,11 @@ pub const PIPELINE_CACHE_WRITES_SKIPPED_CODE: &str = "rt-pipeline-cache-writes-s
 /// line ([`fold_metrics`]).
 pub const PIPELINE_CACHE_LOOKS_SKIPPED_CODE: &str = "rt-pipeline-cache-looks-skipped";
 
+/// The code of the `VkPipeline` creations that went through the device's empty pipeline cache
+/// while rt's reaper read the device's blob into it (`Metrics::creations_before_seed`), an amount
+/// on the counts line ([`fold_metrics`]).
+pub const CREATIONS_BEFORE_SEED_CODE: &str = "rt-creations-before-seed";
+
 /// The code of the dispatches that ran a kernel's emulated-SIMD-group module
 /// (`Metrics::emulated_simdgroup_dispatches`), an amount on the counts line ([`fold_metrics`]).
 pub const EMULATED_SIMDGROUP_DISPATCHES_CODE: &str = "rt-emulated-simdgroup-dispatches";
@@ -465,13 +477,13 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// and the driver's nanoseconds making them, the render records read and stale, the render
 /// pipelines made with a stage past the kernels' bound, the compute dispatches' first-use waits
 /// and their nanoseconds, the exported blocks whose address went out, the pipeline caches
-/// replaced, the cache's writes skipped past its bound and the reaper's looks at it skipped, the
-/// dispatches that ran an emulated-SIMD-group module, the compiled contents a state's make
-/// dropped, the resolves of multisample attachments, the copies out of resolve images and their
-/// bytes, the whole grids that ran a partial-threadgroups variant, the main pipelines the states'
-/// finishes made and their nanoseconds, and the first-use waits for an unfinished main pipeline
-/// and their nanoseconds.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 27;
+/// replaced, the cache's writes skipped past its bound, the reaper's looks at it skipped and the
+/// creations made before its seed, the dispatches that ran an emulated-SIMD-group module, the
+/// compiled contents a state's make dropped, the resolves of multisample attachments, the copies
+/// out of resolve images and their bytes, the whole grids that ran a partial-threadgroups variant,
+/// the main pipelines the states' finishes made and their nanoseconds, and the first-use waits for
+/// an unfinished main pipeline and their nanoseconds.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 28;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -493,12 +505,12 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// device, its command buffers held for room, its cache writes, its translations, its pipelines'
 /// makes and their time, its render makes past the kernels' bound, its compute dispatches'
 /// first-use waits, its exported blocks addressed, its pipeline caches replaced and cache writes
-/// skipped past their bound, its reaper's looks at the cache skipped, its emulated-SIMD-group
-/// dispatches, its dropped makes, its resolves, its resolve copies, its whole grids on a
-/// partial-threadgroups variant, its states' finishes and their waits rose by since the last fold
-/// ([`folded_counts`]), so the counts line carries their totals, then its maxima
-/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the module's
-/// docs). Nothing of rt's before the device is made. First it counts the dispatches the rt
+/// skipped past their bound, its reaper's looks at the cache skipped, its creations before the
+/// seed, its emulated-SIMD-group dispatches, its dropped makes, its resolves, its resolve copies,
+/// its whole grids on a partial-threadgroups variant, its states' finishes and their waits rose by
+/// since the last fold ([`folded_counts`]), so the counts line carries their totals, then its
+/// maxima ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the
+/// module's docs). Nothing of rt's before the device is made. First it counts the dispatches the rt
 /// platform's compute encoders encoded since the last fold (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
     super::compute::fold_dispatches();
@@ -609,10 +621,11 @@ fn follow(counters: rt::Counters) {
 /// exported blocks whose address went out ([`EXPORTED_BLOCKS_ADDRESSED_CODE`]), the pipeline
 /// caches replaced ([`PIPELINE_CACHES_REPLACED_CODE`]) and the cache's writes skipped
 /// ([`PIPELINE_CACHE_WRITES_SKIPPED_CODE`]) past its bound, the reaper's looks at the cache
-/// skipped ([`PIPELINE_CACHE_LOOKS_SKIPPED_CODE`]), the dispatches that ran an
-/// emulated-SIMD-group module ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), the compiled contents a
-/// state's make dropped ([`KERNEL_MAKES_DROPPED_CODE`]), the resolves of multisample attachments
-/// ([`RESOLVES_CODE`]), the copies out of resolve images ([`RESOLVE_COPIES_CODE`]) and their bytes
+/// skipped ([`PIPELINE_CACHE_LOOKS_SKIPPED_CODE`]), the creations made before the cache's seed
+/// ([`CREATIONS_BEFORE_SEED_CODE`]), the dispatches that ran an emulated-SIMD-group module
+/// ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), the compiled contents a state's make dropped
+/// ([`KERNEL_MAKES_DROPPED_CODE`]), the resolves of multisample attachments ([`RESOLVES_CODE`]),
+/// the copies out of resolve images ([`RESOLVE_COPIES_CODE`]) and their bytes
 /// ([`RESOLVE_COPY_BYTES_CODE`]), the whole grids that ran a partial-threadgroups variant
 /// ([`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`]), the main pipelines the states' finishes made
 /// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), and the
@@ -647,6 +660,7 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
             PIPELINE_CACHE_LOOKS_SKIPPED_CODE,
             m.pipeline_cache_looks_skipped,
         ),
+        (CREATIONS_BEFORE_SEED_CODE, m.creations_before_seed),
         (
             EMULATED_SIMDGROUP_DISPATCHES_CODE,
             m.emulated_simdgroup_dispatches,
@@ -2255,12 +2269,12 @@ mod tests {
     /// nanoseconds making them, the render records read and stale, the render pipelines made with
     /// a stage past the kernels' bound, the compute dispatches' first-use waits and their
     /// nanoseconds, the exported blocks whose address went out, the pipeline caches replaced, the
-    /// cache's writes skipped past its bound and the reaper's looks at it skipped, the dispatches
-    /// that ran an emulated-SIMD-group module, the compiled contents a state's make dropped, the
-    /// resolves of multisample attachments, the copies out of resolve images and their bytes, the
-    /// whole grids that ran a partial-threadgroups variant, the main pipelines the states'
-    /// finishes made and their nanoseconds, and the first-use waits for an unfinished main
-    /// pipeline and their nanoseconds.
+    /// cache's writes skipped past its bound, the reaper's looks at it skipped and the creations
+    /// made before its seed, the dispatches that ran an emulated-SIMD-group module, the compiled
+    /// contents a state's make dropped, the resolves of multisample attachments, the copies out of
+    /// resolve images and their bytes, the whole grids that ran a partial-threadgroups variant, the
+    /// main pipelines the states' finishes made and their nanoseconds, and the first-use waits for
+    /// an unfinished main pipeline and their nanoseconds.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2291,6 +2305,7 @@ mod tests {
             PIPELINE_CACHES_REPLACED_CODE,
             PIPELINE_CACHE_WRITES_SKIPPED_CODE,
             PIPELINE_CACHE_LOOKS_SKIPPED_CODE,
+            CREATIONS_BEFORE_SEED_CODE,
             EMULATED_SIMDGROUP_DISPATCHES_CODE,
             KERNEL_MAKES_DROPPED_CODE,
             RESOLVES_CODE,
@@ -2330,6 +2345,7 @@ mod tests {
         m.exported_blocks_addressed = 1;
         m.pipeline_caches_replaced = 1;
         m.pipeline_cache_looks_skipped = 2;
+        m.creations_before_seed = 2;
         m.emulated_simdgroup_dispatches = 4;
         m.resolves = 3;
         m.resolve_copies = 1;
@@ -2362,6 +2378,7 @@ mod tests {
         m.pipeline_caches_replaced = 3;
         m.pipeline_cache_writes_skipped = 1;
         m.pipeline_cache_looks_skipped = 7;
+        m.creations_before_seed = 5;
         m.emulated_simdgroup_dispatches = 11;
         m.kernel_makes_dropped = 2;
         m.resolves = 10;
@@ -2380,7 +2397,7 @@ mod tests {
             rose,
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
-                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 11, 2, 10, 4, 14_745_600, 13, 5,
+                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 5,
                 18_750_000, 3, 1_300_000
             ]
         );
