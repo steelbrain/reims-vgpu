@@ -13,8 +13,9 @@
 //! command buffers ([`command`]) with their blit, compute and render encoders ([`blit`],
 //! [`compute`], [`mod@render`]), render pass descriptors ([`descriptor`]), sampler and
 //! depth-stencil states ([`state`]), libraries and their functions ([`library`]), argument
-//! encoders' layouts ([`argument`]), compute pipeline states ([`pipeline`]), render pipeline
-//! states ([`render_pipeline`]), and the swapchain a display's window presents through
+//! encoders' layouts ([`argument`]), compute pipeline states ([`pipeline`]) with their function
+//! handles and visible function tables ([`function_table`]), render pipeline states
+//! ([`render_pipeline`]), and the swapchain a display's window presents through
 //! ([`swapchain`]), its images rt's drawables. Until a piece
 //! is built, every call that reaches it is refused ([`unbuilt`]). The call answers as Metal's call answers where it
 //! fails: a nil object, an `NSError`, zeros. The refusal is counted under the piece's code,
@@ -49,6 +50,7 @@ pub mod event;
 pub mod export;
 pub mod fault;
 pub mod format;
+pub mod function_table;
 pub mod gauge_log;
 pub mod handler_times;
 pub mod heap;
@@ -94,6 +96,7 @@ pub use command::RtCommandBuffer;
 pub use compute::RtComputeEncoder;
 pub use descriptor::{PassFields, RateMapFields, TextureFields};
 pub use device::RtDevice;
+pub use function_table::{RtFunctionHandle, RtFunctionTable};
 pub use heap::RtHeap;
 pub use icb::RtIcb;
 pub use library::{RtFunction, RtLibrary};
@@ -425,8 +428,8 @@ impl Platform for RtPlatform {
     type Library = RtObj<RtLibrary>;
     type Function = RtObj<RtFunction>;
     type ComputePipeline = RtObj<RtComputePipeline>;
-    type FunctionHandle = Unmade<kinds::FunctionHandle>;
-    type VisibleFunctionTable = Unmade<kinds::VisibleFunctionTable>;
+    type FunctionHandle = RtObj<RtFunctionHandle>;
+    type VisibleFunctionTable = RtObj<RtFunctionTable>;
     type DynamicLibrary = Unmade<kinds::DynamicLibrary>;
     type RenderPipeline = RtObj<RtRenderPipeline>;
     type RateMap = Unmade<kinds::RateMap>;

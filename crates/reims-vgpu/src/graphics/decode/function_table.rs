@@ -137,7 +137,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `FUNCTION_TABLE_SET`: the entries the message names set through the table's platform
     /// object. A table or handle the sender does not hold is a bad reference, and a message
     /// shorter than its handles malformed, each setting nothing; a range past the table, or a
-    /// handle the platform refuses, raises in the platform's call, which sets none either.
+    /// handle the platform refuses, is the platform's call's refusal (a raise, or rt's refusal,
+    /// counted), which sets none either.
     pub(crate) fn function_table_set(
         &self,
         message: &[u8],
@@ -412,10 +413,10 @@ mod tests {
     /// ([`table_pipelines`]).
     type Made = (Vec<Result<(), DecodeError>>, Vec<(u64, u32)>);
 
-    /// The creates of `table_kernel`'s and `table_arg_kernel`'s pipelines through the decoder on
-    /// platform `P`, each linking `table_add1` and `table_mul2`: each decode's answer, and each
-    /// reply's pipeline id and status, in order.
-    fn table_pipelines<P: crate::platform::ApiPlatform>() -> Made {
+    /// The creates of `table_kernel`'s and `table_arg_kernel`'s pipelines (100 and 101) of
+    /// library 1 through the decoder on platform `P`, each linking `table_add1` and `table_mul2`:
+    /// the decoder, and each decode's answer and each reply's pipeline id and status, in order.
+    fn table_pipelines<P: crate::platform::ApiPlatform>() -> (GraphicsDecoder<P>, Made) {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
@@ -465,12 +466,13 @@ mod tests {
             });
             answers.push(dec.decode(&device, &bytes).unwrap());
         }
-        (answers, replies.lock().clone())
+        let replies = replies.lock().clone();
+        (dec, (answers, replies))
     }
 
     /// On the rt platform the pipeline of a kernel that calls through a visible function table
     /// the encoder binds at a buffer index is made: `table_kernel`'s, linking the functions the
-    /// guest's tables would hold. The pipeline of a kernel that holds its table in an argument
+    /// guest's tables hold. The pipeline of a kernel that holds its table in an argument
     /// buffer is refused, answered refused and counted under rt's code: `table_arg_kernel`'s,
     /// a resource bound through a descriptor, which rt's translator makes none of
     /// (`rt-refused-translation`). (On the AMD Radeon Pro 5300M both call the functions their
@@ -481,7 +483,7 @@ mod tests {
     fn on_vulkan_rt_makes_a_table_kernel_and_refuses_one_holding_its_table_in_an_argument_buffer() {
         let counted = || ["rt-refused-gap", "rt-refused-translation"].map(crate::platform::counted);
         let before = counted();
-        let (answers, replies) = table_pipelines::<reims_vgpu_vulkan::RtPlatform>();
+        let (_, (answers, replies)) = table_pipelines::<reims_vgpu_vulkan::RtPlatform>();
         assert_eq!(answers, [Ok(()), Err(DecodeError::Refused)]);
         assert_eq!(
             replies,
@@ -489,5 +491,48 @@ mod tests {
         );
         let after = counted();
         assert_eq!([after[0] - before[0], after[1] - before[1]], [0, 1]);
+    }
+
+    /// On the rt platform the guest's handles and tables of `table_kernel`'s pipeline are
+    /// made: a handle of each function it links, and none of the kernel, not found; a table
+    /// whose create answers rt's resource ID, the page its words take and `Shared`, tracked;
+    /// and sets of its entries, a nil one among them. A set past the table is rt's refusal,
+    /// counted under its kind (`rt-refused-ours`) and setting nothing, and decodes as made: the
+    /// guest checks a set's range before it sends it.
+    #[test]
+    fn on_vulkan_rt_makes_the_guest_s_handles_and_tables() {
+        let (dec, (answers, _)) = table_pipelines::<reims_vgpu_vulkan::RtPlatform>();
+        assert_eq!(answers[0], Ok(()));
+        let state = |m: &[u8]| dec.function_pointer_state(m).unwrap().unwrap();
+        for (obj_id, name) in [(0x40, "table_add1"), (0x41, "table_mul2")] {
+            let answer = state(&handle_create(obj_id, 100, 1, name, RGFX_LINKED_FUNCTIONS));
+            assert_eq!(answer.status, RGFX_STATUS_OK, "{name}");
+        }
+        let kernel = state(&handle_create(
+            0x42,
+            100,
+            1,
+            "table_kernel",
+            RGFX_LINKED_FUNCTIONS,
+        ));
+        assert_eq!(kernel.status, RGFX_STATUS_NOT_FOUND);
+        assert!(dec.object(0x42).is_none());
+        let made = state(&table_create(0x50, 100, 3));
+        assert_eq!(made.status, RGFX_STATUS_OK);
+        let Some(ObjHandle::FunctionTable(table)) = dec.object(0x50) else {
+            panic!("no table under the guest's id");
+        };
+        assert_eq!(made.gpu_resource_id, table.gpu_resource_id());
+        assert_ne!(made.gpu_resource_id, 0);
+        assert_eq!((made.allocated_size, made.resource_options), (4096, 512));
+        let ours = || crate::platform::counted("rt-refused-ours");
+        let before = ours();
+        for set in [table_set(0x50, 1, &[0x41, 0]), table_set(0x50, 0, &[0x40])] {
+            assert_eq!(dec.function_table_set(&set).unwrap(), Ok(()));
+        }
+        assert_eq!(ours(), before);
+        let past = table_set(0x50, 2, &[0x40, 0x40]);
+        assert_eq!(dec.function_table_set(&past).unwrap(), Ok(()));
+        assert_eq!(ours(), before + 1);
     }
 }

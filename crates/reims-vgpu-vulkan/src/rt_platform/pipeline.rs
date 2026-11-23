@@ -31,8 +31,7 @@
 //!   answer is 0, counted (`rt-refused-gap`). `gpuResourceID` and `resourceIndex` are 0, as
 //!   Metal's are for a state without indirect command buffer support; and `uniqueIdentifier` is
 //!   one of a process-wide count from 1, where Metal's is an address that differs from run to
-//!   run. Function handles and visible function tables are nil, counted
-//!   (`rt-unbuilt-function-table`): rt's kernels take no function table.
+//!   run. Function handles and visible function tables are rt's (`super::function_table`).
 //! - **Its slots' writes.** Whether the kernel may write the texture bound at a slot is rt's
 //!   interface of it (`texture_accesses`): a slot it writes, or reads and writes, as its
 //!   operations do, not as its argument's `access::` qualifier says. Every other slot it only
@@ -84,12 +83,13 @@ use crate::core::sync::Mutex;
 use crate::core::trace;
 
 use super::device::RtDevice;
+use super::function_table::{RtFunctionHandle, RtFunctionTable};
 use super::library::RtFunction;
 use super::stage::{StageKey, UNFILLED_AT_MAKE, counted, stage_of};
 use super::state::value;
 use super::texture::OwnIndices;
 use super::unbuilt::{
-    RtRefusal, Unbuilt, refuse_create, refused_error_as, rt_refused_error, rt_refused_imageblock,
+    RtRefusal, refused_error_as, rt_refused_create, rt_refused_error, rt_refused_imageblock,
     translation,
 };
 use super::{RtObj, RtPlatform};
@@ -495,7 +495,8 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
         crate::recorder::plain_resource_id(self, || 0)
     }
 
-    /// Unbuilt: nil ([`Unbuilt::FunctionTable`]).
+    /// rt's handle of `function` among the functions the kernel links in `functions` or
+    /// `binary_functions`; nil, Metal's, for any other (`super::function_table`).
     fn function_handle(
         &self,
         function: &RtObj<RtFunction>,
@@ -504,33 +505,35 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
             crate::recorder::rec_call!("functionHandleWithFunction:", self, function);
         let recorded_answer = crate::recorder::run(
             || -> RaiseResult<Option<<RtPlatform as Platform>::FunctionHandle>> {
-                let _ = function;
-                refuse_create(Unbuilt::FunctionTable, "functionHandleWithFunction:");
-                Ok(None)
+                let handle = self.rt.function_handle(function.linked());
+                Ok(handle.map(|handle| RtObj::new(RtFunctionHandle::new(handle))))
             },
         );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
     }
 
-    /// Unbuilt: nil ([`Unbuilt::FunctionTable`]).
+    /// rt's table of `function_count` null entries (`super::function_table`); nil where rt
+    /// refuses it, counted under its kind.
     fn new_visible_function_table(
         &self,
         function_count: u64,
     ) -> RaiseResult<Option<<RtPlatform as Platform>::VisibleFunctionTable>> {
-        let recorded_call = crate::recorder::rec_call!(
-            "newVisibleFunctionTableWithDescriptor:",
-            self,
-            function_count
-        );
+        const SEL: &str = "newVisibleFunctionTableWithDescriptor:";
+        let recorded_call = crate::recorder::rec_call!(SEL, self, function_count);
         let recorded_answer = crate::recorder::run(
             || -> RaiseResult<Option<<RtPlatform as Platform>::VisibleFunctionTable>> {
-                let _ = function_count;
-                refuse_create(
-                    Unbuilt::FunctionTable,
-                    "newVisibleFunctionTableWithDescriptor:",
-                );
-                Ok(None)
+                let descriptor = rt::VisibleFunctionTableDescriptor::new(function_count);
+                match self.rt.new_visible_function_table(&descriptor) {
+                    // rt makes no table past `MAX_BUFFER_LENGTH`, whose entries fit 32 bits.
+                    Ok(table) => Ok(u32::try_from(function_count)
+                        .ok()
+                        .map(|count| RtObj::new(RtFunctionTable::new(table, count)))),
+                    Err(error) => {
+                        rt_refused_create(SEL, &error);
+                        Ok(None)
+                    }
+                }
             },
         );
         crate::recorder::rec_done!(recorded_call, recorded_answer);
@@ -865,7 +868,8 @@ mod tests {
         assert_ne!(first.unique_identifier(), 0);
         assert_ne!(first.unique_identifier(), second.unique_identifier());
 
-        let tables = counted(Unbuilt::FunctionTable.code());
+        // The kernel links no function, so it has no handle, itself included; a table of it is
+        // made all the same (`super::function_table`'s tests call through one).
         assert!(
             first
                 .function_handle(&sample)
@@ -876,9 +880,8 @@ mod tests {
             first
                 .new_visible_function_table(2)
                 .expect("never a raise")
-                .is_none()
+                .is_some()
         );
-        assert_eq!(counted(Unbuilt::FunctionTable.code()), tables + 2);
         assert_eq!(first.static_threadgroup_memory_length(), 0);
         let length = first.imageblock_memory_length(MtlSize::new(8, 8, 1));
         assert_eq!(length.expect("never a raise"), 0);

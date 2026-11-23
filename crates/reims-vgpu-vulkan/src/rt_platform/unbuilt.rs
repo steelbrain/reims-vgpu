@@ -69,10 +69,6 @@ pub enum Unbuilt {
     /// (`newRenderPipelineStateWithMeshDescriptor:options:reflection:error:`): rt has none. Each
     /// answers nil and an `NSError`.
     MeshPipeline,
-    /// Function handles and visible function tables (`functionHandleWithFunction:`,
-    /// `newVisibleFunctionTableWithDescriptor:`): rt's kernels take no function table. Each
-    /// answers nil.
-    FunctionTable,
     /// Render commands rt has no form of: indexed patch draws, mesh draws, tile dispatches,
     /// resolve textures, the private settings of other than Metal's default rt has none of, and a
     /// line width other than 1, at which rt draws no line (`super::render`). Each encodes nothing.
@@ -122,13 +118,12 @@ pub enum Unbuilt {
 
 impl Unbuilt {
     /// Every piece, once, in the order of their codes' places.
-    pub const ALL: [Unbuilt; 18] = [
+    pub const ALL: [Unbuilt; 17] = [
         Unbuilt::Buffer,
         Unbuilt::IosurfaceTexture,
         Unbuilt::SharedTexture,
         Unbuilt::Heap,
         Unbuilt::MeshPipeline,
-        Unbuilt::FunctionTable,
         Unbuilt::RenderCommand,
         Unbuilt::ComputeCommand,
         Unbuilt::Predication,
@@ -151,7 +146,6 @@ impl Unbuilt {
             Unbuilt::SharedTexture => "rt-unbuilt-shared-texture",
             Unbuilt::Heap => "rt-unbuilt-heap",
             Unbuilt::MeshPipeline => "rt-unbuilt-mesh-pipeline",
-            Unbuilt::FunctionTable => "rt-unbuilt-function-table",
             Unbuilt::RenderCommand => "rt-unbuilt-render-command",
             Unbuilt::ComputeCommand => "rt-unbuilt-compute-command",
             Unbuilt::Predication => "rt-unbuilt-predication",
@@ -175,7 +169,6 @@ impl Unbuilt {
             Unbuilt::SharedTexture => "a shared texture",
             Unbuilt::Heap => "a sparse heap",
             Unbuilt::MeshPipeline => "a mesh render pipeline state",
-            Unbuilt::FunctionTable => "a function handle or a visible function table",
             Unbuilt::RenderCommand => "an indexed patch, mesh or tile draw, resolve or GL setting",
             Unbuilt::ComputeCommand => "an indirect dispatchThreads",
             Unbuilt::Predication => "command predication",

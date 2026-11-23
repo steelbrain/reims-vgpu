@@ -20,10 +20,9 @@ use crate::core::platform::icb::TessellationFactorArgs;
 use crate::core::platform::types::MtlCoordinate2D;
 use crate::core::platform::types::MtlRegion;
 use crate::core::platform::types::MtlSize;
-use crate::core::platform::types::NsRange;
 use crate::core::platform::types::SizeAndAlign;
 use crate::core::platform::{Handle, ObjId, Platform};
-use crate::core::platform::{function_table, icb, rate_map};
+use crate::core::platform::{icb, rate_map};
 use crate::core::raise::RaiseResult;
 
 /// No value: the field that makes [`Unmade`] a type without values.
@@ -62,10 +61,6 @@ impl<K: 'static> Handle for Unmade<K> {
 pub mod kinds {
     /// `MTLSharedTextureHandle *`.
     pub enum SharedTextureHandle {}
-    /// `id<MTLFunctionHandle>`.
-    pub enum FunctionHandle {}
-    /// `id<MTLVisibleFunctionTable>`.
-    pub enum VisibleFunctionTable {}
     /// `id<MTLDynamicLibrary>`.
     pub enum DynamicLibrary {}
     /// `id<MTLRasterizationRateMap>`.
@@ -76,25 +71,6 @@ pub mod kinds {
     pub enum IndirectComputeCommand {}
     /// `MTLRasterizationRateLayerDescriptor *`.
     pub enum RateMapLayerDescriptor {}
-}
-
-impl<P: Platform> function_table::VisibleFunctionTable<P> for Unmade<kinds::VisibleFunctionTable> {
-    fn gpu_resource_id(&self) -> u64 {
-        self.unreachable()
-    }
-    fn allocated_size(&self) -> u64 {
-        self.unreachable()
-    }
-    fn resource_options(&self) -> u64 {
-        self.unreachable()
-    }
-    fn set_functions(
-        &self,
-        _functions: &[Option<&P::FunctionHandle>],
-        _range: NsRange,
-    ) -> RaiseResult<()> {
-        self.unreachable()
-    }
 }
 
 impl<P: Platform> icb::IndirectRenderCommand<P> for Unmade<kinds::IndirectRenderCommand> {

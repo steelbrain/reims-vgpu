@@ -21,7 +21,8 @@ pub trait VisibleFunctionTable<P: Platform>: Handle {
     /// sel: setFunctions:withRange:
     /// Entry `range.location + i` calls `functions[i]`, or is null (`None`); `functions`' length is
     /// `range.length`. A range past the table's size, or a handle of another pipeline state where
-    /// the platform has no answer of Metal's, raises, and sets none of them.
+    /// the platform has no answer of Metal's, is the platform's refusal (a raise, or a refusal it
+    /// counts), and sets none of them.
     fn set_functions(
         &self,
         functions: &[Option<&P::FunctionHandle>],

@@ -3,7 +3,9 @@
 //!
 //! - **Each command is rt's call.** A list (`setBuffers:offsets:withRange:`,
 //!   `setTextures:withRange:`, `setSamplerStates:withRange:` and its form with LOD clamps,
-//!   `useResources:count:usage:`, `useHeaps:count:`) is one call per entry, in its order. The
+//!   `setVisibleFunctionTables:withBufferRange:`, `useResources:count:usage:`,
+//!   `useHeaps:count:`) is one call per entry, in its order. A visible function table takes its
+//!   buffer index as a buffer would (`super::function_table`), and a nil one unbinds it. The
 //!   dispatch type is rt's: serial for `computeCommandEncoder`, the descriptor's for
 //!   `computeCommandEncoderWithDescriptor:`.
 //! - **A pipeline state the encoder sets is kept by its command buffer** until the command buffer
@@ -23,8 +25,8 @@
 //! - **Barriers**: `memoryBarrierWithScope:` and `memoryBarrierWithResources:count:` are rt's one
 //!   global barrier, whatever the scope or the resources.
 //! - **Nothing to record**: `setImageblockWidth:height:` (rt makes no kernel that reads an
-//!   imageblock), `insertCompressedTextureReinterpretationFlush` (rt keeps no lossless
-//!   compression), and a nil visible function table (rt binds none).
+//!   imageblock) and `insertCompressedTextureReinterpretationFlush` (rt keeps no lossless
+//!   compression).
 //! - **Each dispatch rt encodes is counted by its form**, with one relaxed add, for the counts
 //!   line, where rt counts none: direct (`dispatchThreads:threadsPerThreadgroup:` and
 //!   `dispatchThreadgroups:threadsPerThreadgroup:`, [`DISPATCHES_DIRECT_CODE`]) and indirect
@@ -337,16 +339,20 @@ impl RtComputeEncoder {
             ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
                 e.set_threadgroup_memory_length(small(length)?, small(index)?)?;
             }
-            ComputeCmd::SetVisibleFunctionTable { function_table, .. } => {
-                if let Some(table) = function_table {
-                    table.unreachable();
-                }
+            ComputeCmd::SetVisibleFunctionTable {
+                function_table,
+                buffer_index,
+            } => {
+                let table = function_table.map(|t| t.rt());
+                e.set_visible_function_table(table, small(buffer_index)?)?;
             }
             ComputeCmd::SetVisibleFunctionTables {
-                function_tables, ..
+                function_tables,
+                range,
             } => {
-                if let Some(table) = function_tables.iter().flatten().next() {
-                    table.unreachable();
+                let at = slots(range, &[function_tables.len()])?;
+                for (table, index) in function_tables.iter().zip(at) {
+                    e.set_visible_function_table(table.map(|t| t.rt()), index)?;
                 }
             }
             ComputeCmd::UpdateFence { fence } => e.update_fence(fence)?,

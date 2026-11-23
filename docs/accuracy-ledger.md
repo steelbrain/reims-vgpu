@@ -54,7 +54,6 @@ many times. The pieces, by code:
 | `rt-unbuilt-shared-texture` | shared textures and their handles (`newSharedTextureWithDescriptor:`): nil |
 | `rt-unbuilt-heap` | sparse heaps: nil |
 | `rt-unbuilt-mesh-pipeline` | mesh render pipeline states: nil and an `NSError` |
-| `rt-unbuilt-function-table` | function handles and visible function tables: nil |
 | `rt-unbuilt-render-command` | indexed patch draws (direct and indirect), mesh draws, tile dispatches, resolve textures, and private settings other than Metal's default: nothing encoded, a line width other than 1 drawing later lines 1 pixel wide |
 | `rt-unbuilt-compute-command` | an indirect `dispatchThreads`: nothing encoded |
 | `rt-unbuilt-predication` | command predication: a start encodes nothing, an end answers NO |
@@ -89,8 +88,10 @@ Metal's), a pass attachment's slice past its texture's
 a Managed buffer's modified range past its end (`Refusal::ModifiedRange`), a wait in a
 scheduled handler or on rt's own thread (`Refusal::InScheduledHandler`,
 `Refusal::WaitOnOwnThread`), a sampler state placed at an index the guest did not reserve
-(`Refusal::IndicesNotGranted`), and a texture buffer not over a buffer its consumer places
-(`Refusal::TextureBufferNotOverBuffer`): rt makes a texture buffer only over a buffer. The
+(`Refusal::IndicesNotGranted`), a visible function table's set of entries past its size
+(`Refusal::FunctionTableIndex`), which sets none of them, and a texture buffer not over a buffer
+its consumer places (`Refusal::TextureBufferNotOverBuffer`): rt makes a texture buffer only over
+a buffer. The
 device's (`newTextureWithDescriptor:` of
 `MTLTextureTypeTextureBuffer`) is made over a buffer of the host's own, of the texture's bytes
 (its row rounded up to the device's `minimumTextureBufferAlignmentForPixelFormat:`) and the
@@ -180,6 +181,15 @@ operations read, combine or count other lanes is made where the device reports
 Metal runs them, and is refused elsewhere (`Translation-SubgroupOperations`): metal2vulkan
 measured KosmicKrisp on the M3 Max and the UHD 630's Windows driver without it, and RADV, ANV,
 NVIDIA and lavapipe with it.
+
+Among them too, a compute pipeline state whose kernel reads a visible function table through an
+argument buffer is refused on every device, where Metal makes it: nil and an `NSError` at the
+create. A kernel that takes its table at a buffer index is made, and its handles and tables are
+rt's (`rt_platform/function_table.rs`); a table's `allocatedSize` is its words' bytes, 4 for
+each of its two header words and each entry, in pages of 4 KiB (4096 up to 1022 entries), where
+the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 count about 8 bytes an entry
+(`docs/graphics-kext/dgpu-oracle.md` Q29). Render pipelines take no tables: the device
+answers `supportsFunctionPointersFromRender` NO, as the two Macs do.
 
 A pipeline create whose driver's create fails after its reply is answered made, where Metal's
 synchronous creator answers the failure as the create's error. rt's creators answer before the
