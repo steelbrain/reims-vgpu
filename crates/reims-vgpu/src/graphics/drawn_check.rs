@@ -11,6 +11,12 @@
 //! of the plane's format that the guest's textures over the plane take, sampled. Each read is
 //! compared with [`expected`] exactly ([`compare`]), and the open writes one line of what each
 //! read, with what the driver answers of rt's import of the targets.
+//!
+//! **The reads of real pictures** (`rt_windows`' module doc) are compared here too: once a boot
+//! for each of the first four sizes and depths of the sessions' pictures and each of a session's
+//! [`READ_PICTURES`] ([`takes`]), four reads of one picture, each of its planes against another
+//! texel by texel ([`differ`]), and the decoded luma's figures ([`luma_figures`]), in one line
+//! ([`reads_line`]).
 
 /// The check's pictures' size in luma samples: the chroma's is half, 32 by 32.
 pub(crate) const SIZE: (u32, u32) = (64, 64);
@@ -186,6 +192,181 @@ impl Case {
     }
 }
 
+/// The pictures of a session the reads of real pictures read, by their place among its pictures
+/// drawn: its first and its 30th.
+pub(crate) const READ_PICTURES: [u64; 2] = [1, 30];
+
+/// The most sizes and depths of pictures a boot's reads of real pictures read.
+const READ_KEYS: usize = 4;
+
+/// What a session's pictures are to the reads of real pictures: their crop's width and height,
+/// and whether their samples are 10-bit.
+pub(crate) type ReadKey = ((u32, u32), bool);
+
+/// Whether picture `READ_PICTURES[which]` of a session of pictures of `key` is read, `read` being
+/// the boot's keys so far, each with whether each of [`READ_PICTURES`] was read: once a boot for
+/// each key and picture, for the first [`READ_KEYS`] keys, so that at most eight are read and a
+/// session too short to reach the 30th leaves it to the next of its key. Marks it read.
+pub(crate) fn takes(read: &mut Vec<(ReadKey, [bool; 2])>, key: ReadKey, which: usize) -> bool {
+    let at = match read.iter().position(|(k, _)| *k == key) {
+        Some(at) => at,
+        None if read.len() < READ_KEYS => {
+            read.push((key, [false; 2]));
+            read.len() - 1
+        }
+        None => return false,
+    };
+    let slot = (read.get_mut(at)).and_then(|(_, taken)| taken.get_mut(which));
+    slot.is_some_and(|slot| !std::mem::replace(slot, true))
+}
+
+/// One read of a picture's two planes, the luma's and the chroma's: each plane's bytes, row after
+/// row with nothing between them, and its width in texels; `Err` says why it read none.
+pub(crate) type Read = Result<[(Vec<u8>, usize); 2], String>;
+
+/// One plane as a read holds it: its texels row after row with nothing between them, `width` a
+/// row, of `texel` bytes each (at most 4).
+#[derive(Clone, Copy)]
+struct PlaneRead<'a> {
+    bytes: &'a [u8],
+    width: usize,
+    texel: usize,
+}
+
+impl PlaneRead<'_> {
+    /// Its whole rows.
+    fn height(&self) -> usize {
+        (self.bytes.len())
+            .checked_div(self.width * self.texel)
+            .unwrap_or(0)
+    }
+
+    /// The texel at (`x`, `y`), its bytes as a little-endian number.
+    fn texel(&self, x: usize, y: usize) -> u32 {
+        let at = (y * self.width + x) * self.texel;
+        let mut word = [0; 4];
+        if let Some(bytes) = self.bytes.get(at..at + self.texel) {
+            word.iter_mut().zip(bytes).for_each(|(to, from)| *to = *from);
+        }
+        u32::from_le_bytes(word)
+    }
+}
+
+/// How `a` and `b` differ, texel by texel over the columns and rows both hold: how many texels
+/// differ, of how many, their bounding box, and the first eight's columns and rows with `a`'s
+/// value and `b`'s.
+fn differ(a: PlaneRead<'_>, b: PlaneRead<'_>) -> String {
+    let (width, height) = (a.width.min(b.width), a.height().min(b.height()));
+    let (mut count, mut bounds, mut first) = (0, None, Vec::new());
+    for y in 0..height {
+        for x in 0..width {
+            let (one, other) = (a.texel(x, y), b.texel(x, y));
+            if one == other {
+                continue;
+            }
+            count += 1;
+            let [x0, _, x1, y1] = bounds.get_or_insert([x, y, x, y]);
+            (*x0, *x1, *y1) = ((*x0).min(x), (*x1).max(x), y);
+            if first.len() < 8 {
+                first.push(format!("({x}, {y}) {one:#x}/{other:#x}"));
+            }
+        }
+    }
+    let total = width * height;
+    match bounds {
+        None => format!("0 of {total} differ"),
+        Some([x0, y0, x1, y1]) => format!(
+            "{count} of {total} differ, in ({x0}, {y0})-({x1}, {y1}), first {}",
+            first.join(", ")
+        ),
+    }
+}
+
+/// The figures of a decoded luma plane's samples in `bytes`, a byte each, or two little-endian
+/// ones where `ten_bit` (P010's 10 bits in the top of 16, as it stores them): the least, the most,
+/// the mean and how many are zero, of how many.
+fn luma_figures(bytes: &[u8], ten_bit: bool) -> String {
+    let size = if ten_bit { 2 } else { 1 };
+    let (mut least, mut most, mut sum, mut zeros, mut n) = (u16::MAX, 0, 0, 0, 0);
+    for sample in bytes.chunks_exact(size) {
+        let value = match sample {
+            [low, high] => u16::from_le_bytes([*low, *high]),
+            [one] => u16::from(*one),
+            _ => 0,
+        };
+        (least, most) = (least.min(value), most.max(value));
+        sum += u64::from(value);
+        zeros += u64::from(value == 0);
+        n += 1u64;
+    }
+    let Some(tenths) = (sum * 10).checked_div(n) else {
+        return "no samples".to_owned();
+    };
+    format!(
+        "min {least} max {most} mean {}.{} zeros {zeros} of {n}",
+        tenths / 10,
+        tenths % 10
+    )
+}
+
+/// Plane `plane` (0 the luma, 1 the chroma) of `read`, its samples 16 bits where `ten_bit`, else
+/// 8; `Err` says why `which` read it not.
+fn plane_of<'a>(
+    read: &'a Read,
+    which: &str,
+    plane: usize,
+    ten_bit: bool,
+) -> Result<PlaneRead<'a>, String> {
+    let sample = if ten_bit { 2 } else { 1 };
+    match read.as_ref().map(|planes| planes.get(plane)) {
+        Ok(Some((bytes, width))) => Ok(PlaneRead {
+            bytes,
+            width: *width,
+            texel: sample * (1 + plane),
+        }),
+        Ok(None) => Err(format!("{which} holds no plane {plane}")),
+        Err(why) => Err(format!("{which} not read ({why})")),
+    }
+}
+
+/// The line of the reads of one real picture: `picture`, what it is, then for each plane how the
+/// `decoded` read differs from `d3d`'s, `d3d`'s from rt's `before`, and `before` from rt's
+/// `after`, each plane's samples 16 bits where `ten_bit`, else 8, and the decoded luma's figures.
+pub(crate) fn reads_line(
+    picture: &str,
+    ten_bit: bool,
+    [decoded, d3d, before, after]: [&Read; 4],
+) -> String {
+    let pair = |(a, one): (&Read, &str), (b, other): (&Read, &str), at: usize| {
+        let a = plane_of(a, one, at, ten_bit);
+        let b = plane_of(b, other, at, ten_bit);
+        let differs = match (a, b) {
+            (Ok(a), Ok(b)) => differ(a, b),
+            (Err(why), _) | (_, Err(why)) => why,
+        };
+        format!("{one} against {other}: {differs}")
+    };
+    let side = |at: usize| {
+        let reads = [
+            (decoded, "decode"),
+            (d3d, "Direct3D"),
+            (before, "rt"),
+            (after, "rt again"),
+        ];
+        let lines: Vec<String> = reads.windows(2).map(|w| pair(w[0], w[1], at)).collect();
+        lines.join(", ")
+    };
+    let figures = match decoded {
+        Ok([(luma, _), _]) => luma_figures(luma, ten_bit),
+        Err(why) => format!("not read ({why})"),
+    };
+    format!(
+        "{picture}; luma: {}; chroma: {}; the decoded luma: {figures}",
+        side(0),
+        side(1)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +455,86 @@ mod tests {
             let got = from_bytes(ten_bit, 1, &bytes);
             assert!(compare(1, &expected(ten_bit, &CASES[0], 1), &got).starts_with("1 of 1024"));
         }
+    }
+
+    /// A boot reads each of a session's two pictures once for each of the first four sizes and
+    /// depths of pictures, none of a fifth's, and a session too short to reach its 30th leaves it
+    /// to the next of its size and depth.
+    #[test]
+    fn a_boot_reads_each_picture_once_for_four_sizes_and_depths() {
+        let mut read = Vec::new();
+        let key = |n: u32, ten_bit: bool| ((1920 + n, 1080), ten_bit);
+        assert!(takes(&mut read, key(0, false), 0));
+        assert!(!takes(&mut read, key(0, false), 0));
+        assert!(takes(&mut read, key(0, false), 1));
+        assert!(!takes(&mut read, key(0, false), 1));
+        assert!(takes(&mut read, key(0, true), 0));
+        assert!(takes(&mut read, key(1, false), 0));
+        assert!(takes(&mut read, key(2, false), 0));
+        assert!(!takes(&mut read, key(3, false), 0));
+        assert!(!takes(&mut read, key(3, false), 1));
+        assert!(takes(&mut read, key(2, false), 1));
+        assert_eq!(read.len(), 4);
+    }
+
+    /// Two reads of a plane differ by how many texels differ, of those both hold, their bounding
+    /// box and the first eight with both values; equal ones by none.
+    #[test]
+    fn two_reads_differ_by_the_count_the_box_and_the_first_eight() {
+        fn plane(bytes: &[u8]) -> PlaneRead<'_> {
+            PlaneRead {
+                bytes,
+                width: 4,
+                texel: 1,
+            }
+        }
+        let zeros = [0u8; 16];
+        let mut ones = [1u8; 16];
+        ones[0] = 0;
+        assert_eq!(differ(plane(&zeros), plane(&zeros)), "0 of 16 differ");
+        assert_eq!(
+            differ(plane(&zeros), plane(&ones)),
+            "15 of 16 differ, in (0, 0)-(3, 3), first (1, 0) 0x0/0x1, (2, 0) 0x0/0x1, \
+             (3, 0) 0x0/0x1, (0, 1) 0x0/0x1, (1, 1) 0x0/0x1, (2, 1) 0x0/0x1, (3, 1) 0x0/0x1, \
+             (0, 2) 0x0/0x1"
+        );
+    }
+
+    /// The line names the picture, then for each plane the decode against Direct3D, Direct3D
+    /// against rt and rt against itself again, over the texels both reads hold, a read that was
+    /// not made in its place, and the decoded luma's figures.
+    #[test]
+    fn the_reads_line_names_each_planes_differences_and_the_luma_figures() {
+        let decoded: Read = Ok([((16..24).collect(), 4), (vec![128, 129, 130, 131], 2)]);
+        let targets = |odd: u8, past: u8| -> Read {
+            let luma = [16, 17, 18, 19, 0, 0, 20, odd, 22, 23, 0, 0];
+            Ok([
+                (luma.to_vec(), 6),
+                (vec![128, 129, 130, 131, past, past], 3),
+            ])
+        };
+        let (d3d, rt) = (targets(21, 0), targets(0x99, 0xff));
+        let again: Read = Err("no reader".to_owned());
+        let line = reads_line("a picture", false, [&decoded, &d3d, &rt, &again]);
+        assert_eq!(
+            line,
+            "a picture; luma: decode against Direct3D: 0 of 8 differ, Direct3D against rt: 1 of \
+             12 differ, in (1, 1)-(1, 1), first (1, 1) 0x15/0x99, rt against rt again: rt again \
+             not read (no reader); chroma: decode against Direct3D: 0 of 2 differ, Direct3D \
+             against rt: 1 of 3 differ, in (2, 0)-(2, 0), first (2, 0) 0x0/0xffff, rt against \
+             rt again: rt again not read (no reader); the decoded luma: min 16 max 23 mean 19.5 \
+             zeros 0 of 8"
+        );
+    }
+
+    /// The decoded luma's figures read 10-bit samples as P010 stores them, and count its zeros.
+    #[test]
+    fn the_luma_figures_read_ten_bit_samples_as_stored() {
+        let bytes = [0x00, 0x10, 0x00, 0x20, 0x00, 0x00];
+        assert_eq!(
+            luma_figures(&bytes, true),
+            "min 0 max 8192 mean 4096.0 zeros 1 of 3"
+        );
+        assert_eq!(luma_figures(&[], false), "no samples");
     }
 }

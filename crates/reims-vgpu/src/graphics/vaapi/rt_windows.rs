@@ -26,12 +26,25 @@
 //! (`Refusal::TextureWithoutIndex`), which a slot would read as nil. The draw's target is
 //! cleared to -1 and the host's bytes set to all ones first, so that a read that wrote nothing
 //! shows. Nothing decides by it.
+//!
+//! **The reads of real pictures**, a diagnostic beside the check, removed with it: a session's
+//! copier reads its first picture drawn and its 30th ([`RtCopier`]'s `drawn`), once a boot for
+//! each of the first four sizes and depths of the sessions' pictures and each of the two
+//! (`graphics::drawn_check`'s `takes`), so at most eight a boot. A picture is read once its draw's
+//! writes are said done, four ways in order: its decode by the CPU (`Frame::read_back`, the CPU's
+//! copy's `vaGetImage`), the surface's planes by the device's blit, the targets by the Direct3D 11
+//! device that made them (`PlaneDraw::read_back`), and the planes by the blit again. One line says
+//! how each read of each plane differs from the next, and what the decoded luma holds. A read not
+//! made says why in its place, and the picture lands as it would have: nothing decides by it.
+//! Direct3D's acquire and copy may resolve the targets in place, which the second blit shows, so a
+//! picture read so may show right to the guest where its neighbours do not.
 
 use std::sync::Arc;
 
 use reims_vgpu_video::core::backend::DeviceWrite;
-use reims_vgpu_video::vaapi::{Frame, GuestWrites, PlaneDraw};
+use reims_vgpu_video::vaapi::{Frame, GuestWrites, PlaneDraw, PlaneRows, Profile};
 use reims_vgpu_vulkan::RtPlatform;
+use reims_vgpu_vulkan::core::num::ToUsize as _;
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
@@ -46,7 +59,9 @@ use reims_vgpu_vulkan::core::platform::values::{
 };
 use reims_vgpu_vulkan::core::platform::{Handle as _, Platform};
 use reims_vgpu_vulkan::core::raise::OnFault;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
+use crate::graphics::drawn::DrawnTarget;
 use crate::graphics::drawn_check;
 use crate::platform::ApiPlatform;
 
@@ -66,6 +81,9 @@ const WHY: &str = "the rt platform imports no shared Direct3D 12 texture to copy
 pub(super) struct RtCopies {
     /// The draws, made at the video's open.
     draw: Option<Arc<PlaneDraw>>,
+    /// The device's reads of the planes, for the check and the reads of real pictures (module
+    /// doc), made with the draws; `Err` says why none were made.
+    reader: Arc<Result<Reader, String>>,
 }
 
 impl RtCopies {
@@ -83,21 +101,32 @@ impl RtCopies {
                 None
             }
         };
+        let reader = match &draw {
+            Some(_) => Reader::new(device),
+            None => Err("no draws".to_owned()),
+        };
         if let Some(draw) = &draw {
             log::info!(
                 target: "reims_vgpu::graphics",
                 "hardware video: the draws' check at the video's open (a diagnostic; the draws \
                  stay as they are): {}",
-                check(device, draw)
+                check(device, draw, &reader)
             );
         }
-        RtCopies { draw }
+        RtCopies {
+            draw,
+            reader: Arc::new(reader),
+        }
     }
 }
 
 impl GpuCopies<RtPlatform> for RtCopies {
     fn copier(&self) -> Result<Box<dyn GpuCopier<RtPlatform>>, String> {
-        Ok(Box::new(RtCopier))
+        Ok(Box::new(RtCopier {
+            draw: self.draw.clone(),
+            reader: Arc::clone(&self.reader),
+            drawn: 0,
+        }))
     }
 
     fn filler(&self) -> Result<Box<dyn GpuFiller<RtPlatform>>, String> {
@@ -109,8 +138,20 @@ impl GpuCopies<RtPlatform> for RtCopies {
     }
 }
 
-/// One session's copier: each picture declined and counted (module doc).
-struct RtCopier;
+/// One session's copier: each picture declined and counted, and the reads of its real pictures
+/// (module doc).
+struct RtCopier {
+    /// The draws, which read their targets back.
+    draw: Option<Arc<PlaneDraw>>,
+    /// The device's reads of the planes.
+    reader: Arc<Result<Reader, String>>,
+    /// The session's pictures drawn so far.
+    drawn: u64,
+}
+
+/// The boot's reads of real pictures so far, by what the sessions' pictures are
+/// (`drawn_check::takes`).
+static READ: Mutex<Vec<(drawn_check::ReadKey, [bool; 2])>> = Mutex::new(Vec::new());
 
 impl GpuCopier<RtPlatform> for RtCopier {
     fn copy(
@@ -122,6 +163,105 @@ impl GpuCopier<RtPlatform> for RtCopier {
     ) -> Result<DeviceWrite, BackendError> {
         Ok(declined())
     }
+
+    /// Reads the picture and writes their line where it is one the reads of real pictures read
+    /// (module doc's "The reads of real pictures").
+    fn drawn(
+        &mut self,
+        frame: &Frame,
+        profile: Option<Profile>,
+        luma: &DrawnTarget<RtPlatform>,
+        chroma: &DrawnTarget<RtPlatform>,
+    ) {
+        self.drawn += 1;
+        let Some(which) = (drawn_check::READ_PICTURES.iter()).position(|&n| n == self.drawn) else {
+            return;
+        };
+        let key = ((frame.width(), frame.height()), frame.bit_depth() > 8);
+        if !drawn_check::takes(&mut READ.lock(), key, which) {
+            return;
+        }
+        log::info!(
+            target: "reims_vgpu::graphics",
+            "hardware video: the reads of a real picture (a diagnostic; the picture lands as it \
+             would have): {}",
+            self.read(frame, profile, luma, chroma)
+        );
+    }
+}
+
+impl RtCopier {
+    /// The reads of `frame`'s picture of `profile`, drawn into `luma` and `chroma`'s surface, in
+    /// order, in their line (module doc's "The reads of real pictures").
+    fn read(
+        &self,
+        frame: &Frame,
+        profile: Option<Profile>,
+        luma: &DrawnTarget<RtPlatform>,
+        chroma: &DrawnTarget<RtPlatform>,
+    ) -> String {
+        let ten_bit = frame.bit_depth() > 8;
+        let sample: u64 = if ten_bit { 2 } else { 1 };
+        let decoded = read_decode(frame, sample.to_usize());
+        let blit = || -> drawn_check::Read {
+            let reader = (*self.reader).as_ref().map_err(Clone::clone)?;
+            let plane = |target: &DrawnTarget<RtPlatform>, texel: u64| {
+                let width = target.texture.width().to_usize();
+                Ok::<_, String>((reader.copy_plane(&target.texture, texel)?, width))
+            };
+            Ok([plane(luma, sample)?, plane(chroma, 2 * sample)?])
+        };
+        let before = blit();
+        let targets = luma.planes.targets();
+        let (width, height) = targets.size();
+        let d3d = match &self.draw {
+            Some(draw) => (draw.read_back(targets)).map(|[y, uv]| {
+                [
+                    (y, width.to_usize()),
+                    (uv, width.div_ceil(2).to_usize()),
+                ]
+            }),
+            None => Err("no draws".to_owned()),
+        };
+        let after = blit();
+        let (x, y) = frame.crop_origin();
+        let (coded_width, coded_height) = frame.coded_size();
+        let profile = profile.and_then(Profile::name).unwrap_or("unnamed");
+        let picture = format!(
+            "picture {} of a session of {}x{} {}-bit {profile} pictures (cropped at ({x}, {y}) \
+             of {coded_width}x{coded_height}), into targets of {width}x{height}",
+            self.drawn,
+            frame.width(),
+            frame.height(),
+            frame.bit_depth(),
+        );
+        drawn_check::reads_line(&picture, ten_bit, [&decoded, &d3d, &before, &after])
+    }
+}
+
+/// `frame`'s crop as the CPU reads its decode back (`Frame::read_back`, as the CPU's copy does):
+/// the luma's samples and the chroma's pairs, of `sample` bytes each, rows tight.
+fn read_decode(frame: &Frame, sample: usize) -> drawn_check::Read {
+    let (width, height) = (frame.width().to_usize(), frame.height().to_usize());
+    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+    let (luma_row, chroma_row) = (width * sample, chroma_width * 2 * sample);
+    let mut luma = vec![0u8; luma_row * height];
+    let mut chroma = vec![0u8; chroma_row * chroma_height];
+    let y = PlaneRows {
+        bytes: &mut luma,
+        bytes_per_row: luma_row,
+        rows: height,
+        row_bytes: luma_row,
+    };
+    let uv = PlaneRows {
+        bytes: &mut chroma,
+        bytes_per_row: chroma_row,
+        rows: chroma_height,
+        row_bytes: chroma_row,
+    };
+    let back = frame.read_back().map_err(|error| error.to_string())?;
+    back.copy_into(y, uv).map_err(|error| error.to_string())?;
+    Ok([(luma, width), (chroma, chroma_width)])
 }
 
 /// A picture's GPU copy declined, and counted (module doc).
@@ -133,13 +273,12 @@ fn declined() -> DeviceWrite {
 /// The line of the draws' check (module doc's "The draws' check"): 8-bit and then 10-bit, each
 /// case's read of each plane by the Direct3D 11 device and by `device`, and the driver's answers
 /// of rt's import of the targets.
-fn check(device: &super::RtDevice, draw: &PlaneDraw) -> String {
-    let reader = Reader::new(device);
+fn check(device: &super::RtDevice, draw: &PlaneDraw, reader: &Result<Reader, String>) -> String {
     let depths: Vec<String> = [false, true]
         .into_iter()
         .map(|ten_bit| {
             let bits = if ten_bit { "10-bit" } else { "8-bit" };
-            check_depth(device, draw, &reader, ten_bit)
+            check_depth(device, draw, reader, ten_bit)
                 .unwrap_or_else(|why| format!("{bits}: not checked ({why})"))
         })
         .collect();
@@ -460,7 +599,10 @@ mod tests {
                 .find(|&(code, _)| code == DECLINED_CODE)
                 .map_or(0, |(_, n)| n)
         };
-        let copies = RtCopies { draw: None };
+        let copies = RtCopies {
+            draw: None,
+            reader: Arc::new(Err("no draws".to_owned())),
+        };
         assert!(copies.copier().is_ok());
         assert_eq!(copies.filler().err().as_deref(), Some(WHY));
         assert!(copies.plane_draws().is_none());

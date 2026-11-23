@@ -143,6 +143,8 @@ use super::decode::{
 };
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, Stream};
 
+#[cfg(windows)]
+use super::drawn::DrawnTarget;
 #[cfg(unix)]
 use super::video_host::Failed;
 use super::video_host::{
@@ -1300,6 +1302,11 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
             copier: self.copier.clone(),
             said: Arc::clone(&self.said),
             targets: self.targets.clone(),
+            #[cfg(windows)]
+            profile: match &self.codec {
+                Codec::H264(decoder) => decoder.profile(),
+                Codec::Hevc(decoder) => decoder.profile(),
+            },
         })))
     }
 
@@ -1531,6 +1538,9 @@ struct VaPicture<P: Platform> {
     /// The caches the video decodes into, where it does: the driver's video processing writes a
     /// picture decoded elsewhere into its output's cache through their memory.
     targets: Option<Arc<CacheTargets<P>>>,
+    /// The session's VA profile, which the reads of drawn pictures name (`GpuCopier::drawn`).
+    #[cfg(windows)]
+    profile: Option<Profile>,
 }
 
 /// A session's GPU copier, its pictures' to share, or why it has none.
@@ -1594,10 +1604,14 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
         // copied there by the CPU.
         #[cfg(windows)]
         let undrawn = match (&to.luma.drawn, &to.chroma.drawn) {
-            (Some(luma), Some(_)) => {
+            (Some(luma), Some(chroma)) => {
                 match luma.planes.draw(&self.frame, &mut || to.decode_done()) {
                     Ok(()) => {
                         luma.memory.external_writes_done()?;
+                        // A diagnostic's reads of some pictures, once their writes are said done.
+                        if let Ok(copier) = &self.copier {
+                            (copier.lock()).drawn(&self.frame, self.profile, luma, chroma);
+                        }
                         return Ok(());
                     }
                     Err(why) => Some(format!("not drawn into its cache's surface: {why}")),
@@ -1757,6 +1771,20 @@ pub(crate) trait GpuCopier<P: Platform>: Send {
         luma: &OutputPlane<P>,
         chroma: &OutputPlane<P>,
     ) -> Result<DeviceWrite, BackendError>;
+
+    /// `frame`, of the session's `profile`, was drawn into the cache's surface over Direct3D 11
+    /// textures under `luma` and `chroma`, and its writes said done (`graphics::drawn`): a
+    /// diagnostic may read it (`rt_windows`' module doc, "The reads of real pictures"), which
+    /// decides nothing. Nothing by default.
+    #[cfg(windows)]
+    fn drawn(
+        &mut self,
+        _frame: &Frame,
+        _profile: Option<Profile>,
+        _luma: &DrawnTarget<P>,
+        _chroma: &DrawnTarget<P>,
+    ) {
+    }
 }
 
 /// What one output plane holds of a picture: the bytes from one row to the next, and its crop,
