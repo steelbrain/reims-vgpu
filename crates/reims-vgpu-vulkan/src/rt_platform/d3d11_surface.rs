@@ -52,6 +52,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ash::vk;
 use metal2vulkan_runtime as rt;
 
 use crate::core::platform::resource::{D3d11PlaneDesc, ImportedSurface, ImportedSurfaceMemory};
@@ -175,6 +176,164 @@ pub(super) fn imported_surface(
         planes: made,
         memory: Arc::new(RtImportedMemory { surface }),
     })
+}
+
+/// The import's usages that rt's `d3d11_plane` wants (metal2vulkan-runtime at fd0771d944,
+/// `d3d11.rs`'s `WANTED`), each kept where the plane's view format holds it and the import takes
+/// it ([`import_answers`]).
+const WANTED: [vk::ImageUsageFlags; 5] = [
+    vk::ImageUsageFlags::SAMPLED,
+    vk::ImageUsageFlags::COLOR_ATTACHMENT,
+    vk::ImageUsageFlags::TRANSFER_SRC,
+    vk::ImageUsageFlags::TRANSFER_DST,
+    vk::ImageUsageFlags::STORAGE,
+];
+
+/// What the driver answers rt's import of each of `planes` on `device`, for the line of the
+/// draws' check at a video's open (reims-vgpu's `graphics::drawn_check`), which is a diagnostic:
+/// nothing decides by it. Each plane's image format and view format; the usage rt's
+/// `d3d11_plane` (metal2vulkan-runtime at fd0771d944) takes, by the same queries: each usage it
+/// wants that the view format's optimal features hold and the import takes with the pair of the
+/// two formats (none where they are one); and the formats the image lists. rt lists every format
+/// Metal views the plane's as, where the import takes them with that usage, else the pair. rt
+/// keeps its own list private, so that list is rebuilt here from metal2vulkan's
+/// `views_with_usage` and `direct_format`, said as such.
+pub fn import_answers(device: &RtObj<RtDevice>, planes: &[D3d11PlaneDesc<'_>]) -> String {
+    let rt_device = device.rt();
+    let raw = rt_device.raw();
+    let answers: Vec<String> = (planes.iter())
+        .map(|plane| plane_answers(&raw, plane).unwrap_or_else(|why| why))
+        .collect();
+    answers.join(", ")
+}
+
+/// The Vulkan format and its compatibility class that metal2vulkan maps `pf` to directly.
+fn direct(pf: rt::PixelFormat) -> Option<(vk::Format, Option<&'static str>)> {
+    let format = metal2vulkan::metal::format::direct_format(pf)?;
+    Some((
+        vk::Format::from_raw(format.as_raw()),
+        format.block().map(|block| block.class),
+    ))
+}
+
+/// [`import_answers`]' answers for `plane`; `Err` names a format it does not map.
+fn plane_answers(raw: &rt::RawDevice<'_>, plane: &D3d11PlaneDesc<'_>) -> Result<String, String> {
+    use metal2vulkan::metal::format::views_with_usage;
+    let image_pf = rt_format("element format", plane.image_format)?;
+    let view_pf = rt_format("pixel format", plane.pixel_format)?;
+    let unmapped = |pf: rt::PixelFormat| format!("{pf:?} maps to no Vulkan format");
+    let (format, _) = direct(image_pf).ok_or_else(|| unmapped(image_pf))?;
+    let (view, class) = direct(view_pf).ok_or_else(|| unmapped(view_pf))?;
+    let pair = match format == view {
+        true => Vec::new(),
+        false => vec![format, view],
+    };
+    // SAFETY: the physical device is the instance's.
+    let held =
+        unsafe { (raw.instance).get_physical_device_format_properties(raw.physical_device, view) }
+            .optimal_tiling_features;
+    let holds = |bit: vk::ImageUsageFlags| {
+        let feature = match bit {
+            vk::ImageUsageFlags::SAMPLED => vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT => vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+            vk::ImageUsageFlags::TRANSFER_SRC => vk::FormatFeatureFlags::TRANSFER_SRC,
+            vk::ImageUsageFlags::TRANSFER_DST => vk::FormatFeatureFlags::TRANSFER_DST,
+            _ => vk::FormatFeatureFlags::STORAGE_IMAGE,
+        };
+        held.contains(feature)
+    };
+    let takes = |usage, list: &[vk::Format]| imports(raw, format, usage, list);
+    let usage = (WANTED.iter())
+        .filter(|&&bit| holds(bit) && takes(bit, &pair))
+        .fold(vk::ImageUsageFlags::empty(), |all, &bit| all | bit);
+    let whole = !usage.is_empty() && takes(usage, &pair);
+    let mut listed = vec![view];
+    for &other in rt::PixelFormat::ALL {
+        if other == view_pf || !views_with_usage(view_pf, other) {
+            continue;
+        }
+        if let Some((other, other_class)) = direct(other)
+            && other_class == class
+            && !listed.contains(&other)
+        {
+            listed.push(other);
+        }
+    }
+    let mut full = vec![format];
+    for listed in listed {
+        if !full.contains(&listed) {
+            full.push(listed);
+        }
+    }
+    if full.len() == 1 {
+        full.clear();
+    }
+    let takes_full = full.len() > pair.len() && takes(usage, &full);
+    let list = match takes_full {
+        true => format!("Metal's views (rebuilt) {}", names(&full)),
+        false => format!(
+            "the pair {}, refused Metal's views (rebuilt) {}",
+            names(&pair),
+            names(&full)
+        ),
+    };
+    let whole = if whole { "" } else { " (refused together)" };
+    let usage = metal2vulkan::vk::ImageUsageFlags::from_raw(usage.as_raw());
+    Ok(format!(
+        "{} as {}: usage {usage:?}{whole}, listing {list}",
+        names(&[format]),
+        names(&[view])
+    ))
+}
+
+/// `formats` by their Vulkan names, in brackets where there are several or none.
+fn names(formats: &[vk::Format]) -> String {
+    let named: Vec<String> = (formats.iter())
+        .map(|format| format!("{:?}", metal2vulkan::vk::Format::from_raw(format.as_raw())))
+        .collect();
+    match named.as_slice() {
+        [one] => one.clone(),
+        _ => format!("[{}]", named.join(", ")),
+    }
+}
+
+/// Whether the driver imports a Direct3D 11 texture as an optimal 2D image of `format` and
+/// `usage`, mutable and listing `list` where it is not empty, as rt's `import_query` asks it.
+fn imports(
+    raw: &rt::RawDevice<'_>,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    list: &[vk::Format],
+) -> bool {
+    let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE);
+    let mut listed = vk::ImageFormatListCreateInfo::default().view_formats(list);
+    let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(usage)
+        .push_next(&mut external);
+    if !list.is_empty() {
+        info = info
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT)
+            .push_next(&mut listed);
+    }
+    let mut external_out = vk::ExternalImageFormatProperties::default();
+    let mut out = vk::ImageFormatProperties2::default().push_next(&mut external_out);
+    // SAFETY: the physical device is the instance's, which rt made with the handle's extension.
+    let answered = unsafe {
+        (raw.instance).get_physical_device_image_format_properties2(
+            raw.physical_device,
+            &info,
+            &mut out,
+        )
+    };
+    answered.is_ok()
+        && (external_out
+            .external_memory_properties
+            .external_memory_features)
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
 }
 
 #[cfg(test)]

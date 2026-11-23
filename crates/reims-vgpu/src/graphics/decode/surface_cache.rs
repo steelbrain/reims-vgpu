@@ -544,6 +544,8 @@ pub(crate) mod shapes;
 #[cfg(any(windows, test))]
 mod spares;
 
+#[cfg(windows)]
+pub(crate) use exported::drawn_planes;
 pub(crate) use exported::planes_line;
 
 use shapes::{Held, ShapeCounts, ShapeKey, ShapeTable};

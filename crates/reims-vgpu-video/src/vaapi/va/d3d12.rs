@@ -1,6 +1,7 @@
 //! Direct3D 12, on Windows, as much of it as the module needs: a device on the display's DXGI
 //! adapter, shared NV12 and P010 textures that the display's pools are made of, and copies
-//! between them.
+//! between them, and an upload of a picture's planes into one (the draws' check at a video's
+//! open, `super::d3d11`).
 //!
 //! A pool's surfaces on Windows are textures of ours, made here on the adapter's device with a
 //! shared heap (`D3D12_HEAP_FLAG_SHARED`), each opened by Mesa's VA driver (`vaon12`) through its
@@ -106,13 +107,17 @@ const DEVICE_CREATE_COMMAND_ALLOCATOR: usize = 9;
 const DEVICE_CREATE_COMMAND_LIST: usize = 12;
 const DEVICE_CREATE_COMMITTED_RESOURCE: usize = 27;
 const DEVICE_CREATE_SHARED_HANDLE: usize = 31;
+const DEVICE_GET_COPYABLE_FOOTPRINTS: usize = 38;
 pub(super) const DEVICE_CREATE_FENCE: usize = 36;
 const QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 pub(super) const QUEUE_SIGNAL: usize = 14;
 const ALLOCATOR_RESET: usize = 8;
 const LIST_CLOSE: usize = 9;
 const LIST_RESET: usize = 10;
+const LIST_COPY_TEXTURE_REGION: usize = 16;
 const LIST_COPY_RESOURCE: usize = 17;
+const RESOURCE_MAP: usize = 8;
+const RESOURCE_UNMAP: usize = 9;
 pub(super) const FENCE_GET_COMPLETED_VALUE: usize = 8;
 pub(super) const FENCE_SET_EVENT_ON_COMPLETION: usize = 9;
 
@@ -120,10 +125,17 @@ const DXGI_FORMAT_NV12: u32 = 103;
 const DXGI_FORMAT_P010: u32 = 104;
 const D3D_FEATURE_LEVEL_11_0: u32 = 0xb000;
 const D3D12_HEAP_TYPE_DEFAULT: u32 = 1;
+const D3D12_HEAP_TYPE_UPLOAD: u32 = 2;
+const D3D12_HEAP_FLAG_NONE: u32 = 0;
 const D3D12_HEAP_FLAG_SHARED: u32 = 0x1;
+const D3D12_RESOURCE_DIMENSION_BUFFER: u32 = 1;
 const D3D12_RESOURCE_DIMENSION_TEXTURE2D: u32 = 3;
+const D3D12_TEXTURE_LAYOUT_ROW_MAJOR: u32 = 1;
 const D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET: u32 = 0x1;
 const D3D12_RESOURCE_STATE_COMMON: u32 = 0;
+const D3D12_RESOURCE_STATE_GENERIC_READ: u32 = 0xac3;
+const D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX: u32 = 0;
+const D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT: u32 = 1;
 const D3D12_COMMAND_LIST_TYPE_COPY: u32 = 3;
 const GENERIC_ALL: u32 = 0x1000_0000;
 pub(super) const WAIT_OBJECT_0: u32 = 0;
@@ -152,6 +164,36 @@ struct ResourceDesc {
     sample_quality: u32,
     layout: u32,
     flags: u32,
+}
+
+/// `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`: where a subresource lies in a buffer, its rows
+/// `row_pitch` bytes apart.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PlacedFootprint {
+    offset: u64,
+    format: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    row_pitch: u32,
+}
+
+/// `D3D12_TEXTURE_COPY_LOCATION`: a resource, and its subresource or its placed footprint, whose
+/// union starts at byte 16. A subresource's index is the union's first four bytes, which a
+/// footprint of that `offset` holds, little-endian.
+#[repr(C)]
+struct CopyLocation {
+    resource: *mut c_void,
+    type_: u32,
+    footprint: PlacedFootprint,
+}
+
+/// `D3D12_RANGE`.
+#[repr(C)]
+struct Range {
+    begin: usize,
+    end: usize,
 }
 
 /// `D3D12_COMMAND_QUEUE_DESC`.
@@ -340,6 +382,8 @@ enum Completed {
 pub(crate) struct InFlight {
     copies: Copies,
     _textures: [Arc<SharedTexture>; 2],
+    /// An upload's buffer, which the copy reads.
+    _buffer: Option<Com>,
 }
 
 impl crate::core::device_wait::Unfinished for InFlight {
@@ -453,57 +497,12 @@ impl Device {
         width: u32,
         height: u32,
     ) -> Result<SharedTexture, String> {
-        let dxgi_format = match format {
-            SurfaceFormat::Nv12 => DXGI_FORMAT_NV12,
-            SurfaceFormat::P010 => DXGI_FORMAT_P010,
-            SurfaceFormat::Xyuv => return Err("no shared texture of XYUV".to_owned()),
-        };
-        let heap = HeapProperties {
-            type_: D3D12_HEAP_TYPE_DEFAULT,
-            cpu_page_property: 0,
-            memory_pool_preference: 0,
-            creation_node_mask: 0,
-            visible_node_mask: 0,
-        };
-        let desc = ResourceDesc {
-            dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            alignment: 0,
-            width: u64::from(width),
-            height,
-            depth_or_array_size: 1,
-            mip_levels: 1,
-            format: dxgi_format,
-            sample_count: 1,
-            sample_quality: 0,
-            layout: 0,
-            flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-        };
-        let mut resource = null_mut();
-        // SAFETY: the method is `CreateCommittedResource`, with valid descriptions, no clear
-        // value, and ID3D12Resource's IID.
-        let result = unsafe {
-            let create: unsafe extern "system" fn(
-                *mut c_void,
-                *const HeapProperties,
-                u32,
-                *const ResourceDesc,
-                u32,
-                *const c_void,
-                *const Guid,
-                *mut *mut c_void,
-            ) -> Hresult = self.device.method(DEVICE_CREATE_COMMITTED_RESOURCE);
-            create(
-                self.device.raw(),
-                &heap,
-                D3D12_HEAP_FLAG_SHARED,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                null(),
-                &IID_ID3D12_RESOURCE,
-                &mut resource,
-            )
-        };
-        let resource = Com::made("CreateCommittedResource", result, resource)?;
+        let resource = self.committed(
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_HEAP_FLAG_SHARED,
+            &texture_desc(format, (width, height))?,
+            D3D12_RESOURCE_STATE_COMMON,
+        )?;
         let mut handle = null_mut();
         // SAFETY: the method is `CreateSharedHandle`, of a resource of this device's in a shared
         // heap, with no security attributes and no name.
@@ -551,6 +550,172 @@ impl Device {
         to: &Arc<SharedTexture>,
         wait: Duration,
     ) -> Result<(), CopyError> {
+        let textures = [Arc::clone(from), Arc::clone(to)];
+        self.submit(textures, None, wait, |list| {
+            // SAFETY: the method is ID3D12GraphicsCommandList's `CopyResource`, between two
+            // resources of this device's, which are in the common state, promoted to the copy's
+            // states and back on a copy queue.
+            unsafe {
+                let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) =
+                    list.method(LIST_COPY_RESOURCE);
+                copy(list.raw(), to.resource.raw(), from.resource.raw());
+            }
+        })
+    }
+
+    /// Writes `planes` into `to`, the luma's bytes and the chroma's, each row after row with
+    /// nothing between them, through a buffer of the upload heap and the device's copy queue,
+    /// and returns once the copy is done, however long it takes. A copy sent and not seen done
+    /// is kept for good, as the GPU may still read its buffer.
+    pub(crate) fn upload(&self, to: &Arc<SharedTexture>, planes: [&[u8]; 2]) -> Result<(), String> {
+        let desc = texture_desc(to.format, to.size)?;
+        let mut footprints = [PlacedFootprint::default(); 2];
+        let mut rows = [0u32; 2];
+        let mut row_bytes = [0u64; 2];
+        let mut total = 0u64;
+        // SAFETY: the method is ID3D12Device's `GetCopyableFootprints`, of a valid description's
+        // two planes, writing two of each answer.
+        unsafe {
+            let footprints_of: unsafe extern "system" fn(
+                *mut c_void,
+                *const ResourceDesc,
+                u32,
+                u32,
+                u64,
+                *mut PlacedFootprint,
+                *mut u32,
+                *mut u64,
+                *mut u64,
+            ) = self.device.method(DEVICE_GET_COPYABLE_FOOTPRINTS);
+            footprints_of(
+                self.device.raw(),
+                &desc,
+                0,
+                2,
+                0,
+                footprints.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                row_bytes.as_mut_ptr(),
+                &mut total,
+            );
+        }
+        let buffer = self.committed(
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_HEAP_FLAG_NONE,
+            &ResourceDesc {
+                dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                width: total,
+                height: 1,
+                format: 0,
+                layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                flags: 0,
+                ..desc
+            },
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        )?;
+        let mut mapped = null_mut();
+        // SAFETY: the method is ID3D12Resource's `Map`, of a buffer's one subresource, read none.
+        let result = unsafe {
+            let map: unsafe extern "system" fn(
+                *mut c_void,
+                u32,
+                *const Range,
+                *mut *mut c_void,
+            ) -> Hresult = buffer.method(RESOURCE_MAP);
+            map(buffer.raw(), 0, &Range { begin: 0, end: 0 }, &mut mapped)
+        };
+        check("ID3D12Resource::Map", result)?;
+        let written = (0..2).try_for_each(|n| {
+            let row = usize::try_from(row_bytes[n]).map_err(|_| "a row past memory")?;
+            let pitch = usize::try_from(footprints[n].row_pitch).map_err(|_| "a pitch")?;
+            let offset = usize::try_from(footprints[n].offset).map_err(|_| "an offset")?;
+            let count = usize::try_from(rows[n]).map_err(|_| "rows")?;
+            if planes[n].len() != row * count {
+                return Err(format!(
+                    "plane {n}'s {} bytes, not {count} rows of {row}",
+                    planes[n].len()
+                ));
+            }
+            for (r, bytes) in planes[n].chunks_exact(row.max(1)).enumerate() {
+                // SAFETY: the mapping holds `total` bytes, in which the footprint's rows lie.
+                unsafe {
+                    let at = mapped.cast::<u8>().add(offset + r * pitch);
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, row);
+                }
+            }
+            Ok(())
+        });
+        // SAFETY: the method is ID3D12Resource's `Unmap`, of the subresource mapped above, whose
+        // writes are all of it (a null range).
+        unsafe {
+            let unmap: unsafe extern "system" fn(*mut c_void, u32, *const Range) =
+                buffer.method(RESOURCE_UNMAP);
+            unmap(buffer.raw(), 0, null());
+        }
+        written?;
+        let raw = buffer.raw();
+        let copied = self.submit(
+            [Arc::clone(to), Arc::clone(to)],
+            Some(buffer),
+            Duration::MAX,
+            |list| {
+                for (n, footprint) in (0u32..).zip(footprints) {
+                    let into = CopyLocation {
+                        resource: to.resource.raw(),
+                        type_: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        footprint: PlacedFootprint {
+                            offset: u64::from(n),
+                            ..PlacedFootprint::default()
+                        },
+                    };
+                    let from = CopyLocation {
+                        resource: raw,
+                        type_: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        footprint,
+                    };
+                    // SAFETY: the method is ID3D12GraphicsCommandList's `CopyTextureRegion`, of
+                    // plane `n` of the buffer's footprints into the texture's, whole (no box);
+                    // the texture is in the common state, promoted to the copy's and back on a
+                    // copy queue, and the buffer in the upload heap's.
+                    unsafe {
+                        let copy: unsafe extern "system" fn(
+                            *mut c_void,
+                            *const CopyLocation,
+                            u32,
+                            u32,
+                            u32,
+                            *const CopyLocation,
+                            *const c_void,
+                        ) = list.method(LIST_COPY_TEXTURE_REGION);
+                        copy(list.raw(), &into, 0, 0, 0, &from, null());
+                    }
+                }
+            },
+        );
+        match copied {
+            Ok(()) => Ok(()),
+            Err(CopyError::Failed(why, None)) => Err(why),
+            Err(CopyError::Failed(why, Some(sent))) => {
+                std::mem::forget(sent);
+                Err(why)
+            }
+            Err(CopyError::Late(sent)) => {
+                std::mem::forget(sent);
+                Err("the upload was not seen done".to_owned())
+            }
+        }
+    }
+
+    /// Records `record`'s copies into the device's copy list, sends them, and waits for them
+    /// until `wait` has passed, as [`Self::copy`] does, `textures` and `buffer` kept with a copy
+    /// not seen done.
+    fn submit(
+        &self,
+        textures: [Arc<SharedTexture>; 2],
+        buffer: Option<Com>,
+        wait: Duration,
+        record: impl FnOnce(&Com),
+    ) -> Result<(), CopyError> {
         let taken = self.copies.lock().take();
         let mut copies = match taken {
             Some(copies) => copies,
@@ -558,9 +723,8 @@ impl Device {
         };
         // SAFETY: each method is the named one of its object's interface, called on objects of
         // this device's: the allocator and list are reset once the last copy's fence completed
-        // (the wait below; a copy not seen done takes the objects with it), the list records one
-        // copy between two resources of this device's, which are in the common state, promoted
-        // to the copy's states and back on a copy queue.
+        // (the wait below; a copy not seen done takes the objects with it), and `record` records
+        // the list's copies.
         let sent = unsafe {
             let reset: unsafe extern "system" fn(*mut c_void) -> Hresult =
                 copies.allocator.method(ALLOCATOR_RESET);
@@ -569,8 +733,6 @@ impl Device {
                 *mut c_void,
                 *mut c_void,
             ) -> Hresult = copies.list.method(LIST_RESET);
-            let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) =
-                copies.list.method(LIST_COPY_RESOURCE);
             let close: unsafe extern "system" fn(*mut c_void) -> Hresult =
                 copies.list.method(LIST_CLOSE);
             check(
@@ -584,7 +746,7 @@ impl Device {
                 )
             })
             .and_then(|()| {
-                copy(copies.list.raw(), to.resource.raw(), from.resource.raw());
+                record(&copies.list);
                 check("ID3D12GraphicsCommandList::Close", close(copies.list.raw()))
             })
         };
@@ -593,7 +755,8 @@ impl Device {
         copies.value += 1;
         let in_flight = |copies| InFlight {
             copies,
-            _textures: [Arc::clone(from), Arc::clone(to)],
+            _textures: textures,
+            _buffer: buffer,
         };
         // SAFETY: as above; the list is closed, the fence and event are the copies'.
         let done = unsafe {
@@ -633,6 +796,49 @@ impl Device {
             Ok(_) => Err(CopyError::Late(in_flight(copies))),
             Err(why) => Err(CopyError::Failed(why, Some(in_flight(copies)))),
         }
+    }
+
+    /// A committed resource of `desc` in a heap of `heap_type` and `heap_flags`, in `state`.
+    fn committed(
+        &self,
+        heap_type: u32,
+        heap_flags: u32,
+        desc: &ResourceDesc,
+        state: u32,
+    ) -> Result<Com, String> {
+        let heap = HeapProperties {
+            type_: heap_type,
+            cpu_page_property: 0,
+            memory_pool_preference: 0,
+            creation_node_mask: 0,
+            visible_node_mask: 0,
+        };
+        let mut resource = null_mut();
+        // SAFETY: the method is `CreateCommittedResource`, with valid descriptions, no clear
+        // value, and ID3D12Resource's IID.
+        let result = unsafe {
+            let create: unsafe extern "system" fn(
+                *mut c_void,
+                *const HeapProperties,
+                u32,
+                *const ResourceDesc,
+                u32,
+                *const c_void,
+                *const Guid,
+                *mut *mut c_void,
+            ) -> Hresult = self.device.method(DEVICE_CREATE_COMMITTED_RESOURCE);
+            create(
+                self.device.raw(),
+                &heap,
+                heap_flags,
+                desc,
+                state,
+                null(),
+                &IID_ID3D12_RESOURCE,
+                &mut resource,
+            )
+        };
+        Com::made("CreateCommittedResource", result, resource)
     }
 
     /// The objects of the device's copies.
@@ -716,6 +922,28 @@ impl Device {
             })
         }
     }
+}
+
+/// The description of a pool's texture of `format`, `size` big in luma samples.
+fn texture_desc(format: SurfaceFormat, size: (u32, u32)) -> Result<ResourceDesc, String> {
+    let format = match format {
+        SurfaceFormat::Nv12 => DXGI_FORMAT_NV12,
+        SurfaceFormat::P010 => DXGI_FORMAT_P010,
+        SurfaceFormat::Xyuv => return Err("no shared texture of XYUV".to_owned()),
+    };
+    Ok(ResourceDesc {
+        dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        alignment: 0,
+        width: u64::from(size.0),
+        height: size.1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    })
 }
 
 /// A DXGI factory, as `IDXGIFactory4`.

@@ -292,7 +292,7 @@ pub(crate) fn open_on_rt(
         return None;
     };
     let copies: Arc<dyn GpuCopies<reims_vgpu_vulkan::RtPlatform>> =
-        Arc::new(rt_windows::RtCopies::new(luid));
+        Arc::new(rt_windows::RtCopies::new(device, luid));
     let rules = PlatformRules {
         references: CachedReferences::Apart,
         encodes: false,
