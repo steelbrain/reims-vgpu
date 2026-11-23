@@ -60,7 +60,7 @@ use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdenti
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
-use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, SourceFrame};
+use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, SourceFrame, Stream};
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
@@ -121,6 +121,14 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// Whether [`Self::guest_decoder`] answers a decoder of each codec [`Self::caps`] decodes.
     fn guest_decodes(&self) -> bool {
         false
+    }
+    /// Why a decoder of `codec` from [`Self::guest_decoder`] decodes none of `stream`'s pictures,
+    /// a stream the codec crate's decoder takes, for VideoToolbox's session of it to be refused
+    /// at its start (`reims_vgpu_video::paravirt::Backend::declines`); `None` where it decodes
+    /// them. The default takes 4:2:0 streams alone, which every arm's caps answer for.
+    fn guest_declines(&self, _codec: u32, stream: &Stream) -> Option<String> {
+        (stream.chroma_format_idc != 1)
+            .then(|| "the host's video decodes 4:2:0 pictures alone".to_owned())
     }
     /// The encoders VideoToolbox's paravirtual encoder list names, whose source frames come in
     /// surfaces the guest lends ([`GuestEncoder`]): one for each codec the arm encodes so; none

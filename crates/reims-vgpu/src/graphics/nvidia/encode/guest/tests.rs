@@ -542,7 +542,8 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
                     let au = access_unit(encoder.codec, sets, &sample.data);
                     let picture = (decoder.decode(&au)).expect("a decode").expect("a picture");
                     let back = (picture.read_back((640, 360))).expect("a read back");
-                    let [y, _] = back.planes();
+                    let planes = back.planes();
+                    let y = &planes[0];
                     assert_eq!(y.rows, 360, "{profile:?}: frame {n}");
                     let mut squared = 0f64;
                     for row in 0..height {

@@ -280,7 +280,10 @@ pub(crate) fn write(
     if width == 0 || height == 0 {
         return Ok(declined("an empty frame"));
     }
-    if target.pixel_format().bytes_per_sample() != format.bytes_per_sample() {
+    // The driver's frames here are 4:2:0 (`super::hevc` decodes no 4:4:4).
+    if target.pixel_format().bytes_per_sample() != format.bytes_per_sample()
+        || target.pixel_format().is_4_4_4()
+    {
         return Ok(declined(format!(
             "a {} buffer for {} frames",
             target.pixel_format().fourcc(),

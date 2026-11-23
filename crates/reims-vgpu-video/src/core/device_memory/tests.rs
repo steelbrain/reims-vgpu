@@ -217,6 +217,38 @@ fn a_target_is_its_layout_checked_against_its_memory() -> Result<(), String> {
 }
 
 #[test]
+fn a_4_4_4_targets_chroma_is_a_pair_for_every_luma_sample() -> Result<(), String> {
+    let memory = Memory::new(64 * 48 + 128 * 48);
+    let mut layout = nv12(64, 48, [64, 128], [0, 64 * 48]);
+    layout.pixel_format = FourCc::new(*b"444f");
+    layout.planes[1].width = 64;
+    layout.planes[1].height = 48;
+    let target = GuestTarget::new(&layout, &memory)?;
+    assert_eq!(target.pixel_format(), PixelFormat::Yuv444FullRange);
+    let [_, chroma] = target.planes();
+    assert_eq!(
+        (chroma.offset, chroma.rows, chroma.row_bytes),
+        (64 * 48, 48, 128)
+    );
+    // Rows of 4:2:0's pairs, and 4:2:0's rows, hold no 4:4:4 chroma.
+    let mut narrow = layout.clone();
+    narrow.planes[1].bytes_per_row = 64;
+    assert!(
+        GuestTarget::new(&narrow, &memory)
+            .err()
+            .is_some_and(|e| e.contains("chroma"))
+    );
+    let mut low = layout;
+    low.planes[1].height = 24;
+    assert!(
+        GuestTarget::new(&low, &memory)
+            .err()
+            .is_some_and(|e| e.contains("chroma"))
+    );
+    Ok(())
+}
+
+#[test]
 fn a_target_past_its_memory_or_out_of_shape_is_refused() -> Result<(), String> {
     let memory = Memory::new(64 * 48 + 64 * 24);
     // The chroma plane's last row ends a byte past the memory.

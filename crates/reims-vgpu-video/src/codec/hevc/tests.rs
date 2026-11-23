@@ -155,6 +155,9 @@ struct SpsSpec {
     long_term: Option<Vec<(u32, bool)>>,
     scaling_list_enabled: bool,
     range_extension: bool,
+    /// `sps_range_extension()`'s nine flags, the first the most significant
+    /// of nine bits, when `range_extension`.
+    range_tools: u32,
     /// `sps_max_latency_increase_plus1`.
     latency_plus1: u32,
     /// The luma sizes in luma samples.
@@ -191,6 +194,7 @@ impl Default for SpsSpec {
             long_term: None,
             scaling_list_enabled: false,
             range_extension: false,
+            range_tools: 0,
             latency_plus1: 0,
             size: (64, 48),
             blocks: [0, 1, 0, 2, 1, 1],
@@ -291,8 +295,7 @@ fn sps(spec: &SpsSpec) -> Vec<u8> {
     w.bit(spec.range_extension);
     if spec.range_extension {
         w.bit(true).bit(false).bit(false).bit(false).u(4, 0);
-        // An empty sps_range_extension(): nine flags, all clear.
-        w.u(9, 0);
+        w.u(9, spec.range_tools);
     }
     w.nal(nal_type::SPS, 0)
 }
@@ -335,6 +338,10 @@ struct PpsSpec {
     /// `pps_slice_chroma_qp_offsets_present_flag`.
     slice_chroma_qp_offsets: bool,
     log2_parallel_merge_level_minus2: u32,
+    /// `transform_skip_enabled_flag`.
+    transform_skip: bool,
+    /// `pps_range_extension()`, when `pps_range_extension_flag`.
+    range_extension: Option<pps::PpsRangeExtension>,
 }
 
 fn pps(spec: &PpsSpec) -> Vec<u8> {
@@ -345,7 +352,9 @@ fn pps(spec: &PpsSpec) -> Vec<u8> {
         .bit(spec.output_flag_present);
     w.u(3, 0).bit(false).bit(true);
     w.ue(spec.l0_default_minus1).ue(spec.l1_default_minus1);
-    w.se(spec.init_qp_minus26).bit(false).bit(false);
+    w.se(spec.init_qp_minus26)
+        .bit(false)
+        .bit(spec.transform_skip);
     w.bit(spec.cu_qp_delta_depth.is_some());
     if let Some(depth) = spec.cu_qp_delta_depth {
         w.ue(depth);
@@ -364,7 +373,24 @@ fn pps(spec: &PpsSpec) -> Vec<u8> {
         .bit(spec.lists_modification);
     w.ue(spec.log2_parallel_merge_level_minus2)
         .bit(false)
-        .bit(false);
+        .bit(spec.range_extension.is_some());
+    if let Some(extension) = &spec.range_extension {
+        w.bit(true).bit(false).bit(false).bit(false).u(4, 0);
+        if spec.transform_skip {
+            w.ue(extension.log2_max_transform_skip_block_size_minus2.into());
+        }
+        w.bit(extension.cross_component_prediction_enabled_flag)
+            .bit(extension.chroma_qp_offset_list_enabled_flag);
+        if extension.chroma_qp_offset_list_enabled_flag {
+            w.ue(extension.diff_cu_chroma_qp_offset_depth.into())
+                .ue(extension.chroma_qp_offset_lists.len() as u32 - 1);
+            for &(cb, cr) in &extension.chroma_qp_offset_lists {
+                w.se(cb.into()).se(cr.into());
+            }
+        }
+        w.ue(extension.log2_sao_offset_scale_luma.into())
+            .ue(extension.log2_sao_offset_scale_chroma.into());
+    }
     w.nal(nal_type::PPS, 0)
 }
 
@@ -405,6 +431,9 @@ struct SliceSpec {
     /// entry, with weights and offsets of 0, in place of the default
     /// table, when the PPS weights.
     weights: Option<Vec<(bool, bool)>>,
+    /// `cu_chroma_qp_offset_enabled_flag`, when the PPS has chroma QP
+    /// offset lists.
+    cu_chroma_qp_offset: bool,
 }
 
 impl Default for SliceSpec {
@@ -427,6 +456,7 @@ impl Default for SliceSpec {
             slice_qp_delta: 0,
             chroma_qp_offsets: (0, 0),
             weights: None,
+            cu_chroma_qp_offset: false,
         }
     }
 }
@@ -495,7 +525,11 @@ fn slice(sps: &SpsSpec, pps: &PpsSpec, spec: &SliceSpec) -> Vec<u8> {
                 }
             }
         }
-        w.bit(true).bit(true); // SAO, luma and chroma
+        // SAO, luma's, and chroma's where there is chroma (ChromaArrayType 0 has none).
+        w.bit(true);
+        if sps.chroma_format_idc != 0 {
+            w.bit(true);
+        }
         if spec.slice_type != 2 {
             let b = spec.slice_type == 0;
             w.bit(spec.active.is_some());
@@ -567,6 +601,10 @@ fn slice(sps: &SpsSpec, pps: &PpsSpec, spec: &SliceSpec) -> Vec<u8> {
         w.se(spec.slice_qp_delta);
         if pps.slice_chroma_qp_offsets {
             w.se(spec.chroma_qp_offsets.0).se(spec.chroma_qp_offsets.1);
+        }
+        let lists = pps.range_extension.as_ref();
+        if lists.is_some_and(|e| e.chroma_qp_offset_list_enabled_flag) {
+            w.bit(spec.cu_chroma_qp_offset);
         }
         w.bit(true); // slice_loop_filter_across_slices_enabled_flag
     }
@@ -1690,16 +1728,42 @@ fn references_past_the_dpb_or_at_the_current_order_count_are_refused() {
 }
 
 #[test]
-fn what_radeonsi_cannot_decode_is_refused() {
+fn what_the_codec_does_not_build_for_is_refused() {
     let pps_spec = PpsSpec::default();
+    let range_extensions = |chroma_format_idc, bit_depth_minus8, range_tools| SpsSpec {
+        profile_idc: 4,
+        chroma_format_idc,
+        bit_depth_minus8,
+        range_extension: true,
+        range_tools,
+        ..SpsSpec::default()
+    };
     for (spec, why) in [
         (
             SpsSpec {
-                profile_idc: 4,
-                chroma_format_idc: 2,
+                profile_idc: 5,
+                chroma_format_idc: 3,
                 ..SpsSpec::default()
             },
-            "unsupported: profiles outside Main, Main 10 and Main Still Picture",
+            "unsupported: profiles outside Main, Main 10, Main Still Picture and the range \
+             extensions",
+        ),
+        (
+            range_extensions(2, 0, 0),
+            "unsupported: range extensions streams other than 4:4:4 at 8 bits",
+        ),
+        (
+            range_extensions(3, 2, 0),
+            "unsupported: range extensions streams other than 4:4:4 at 8 bits",
+        ),
+        (
+            range_extensions(0, 0, 0),
+            "unsupported: range extensions streams other than 4:4:4 at 8 bits",
+        ),
+        (
+            // extended_precision_processing_flag, the fifth.
+            range_extensions(3, 0, 1 << 4),
+            "unsupported: extended precision processing",
         ),
         (
             SpsSpec {
@@ -1737,6 +1801,178 @@ fn what_radeonsi_cannot_decode_is_refused() {
         assert_eq!(result.err().map(|e| e.to_string()).as_deref(), Some(why));
         assert!(d.accelerator().decoded.is_empty());
     }
+}
+
+#[test]
+fn a_range_extensions_444_stream_at_8_bits_decodes() -> Result<(), Error> {
+    // Every tool of the SPS's range extensions but extended precision
+    // (the fifth of nine flags), and the PPS's with chroma QP offset lists
+    // that the slice turns on.
+    let spec = SpsSpec {
+        profile_idc: 4,
+        chroma_format_idc: 3,
+        range_extension: true,
+        range_tools: 0b1_1110_1111,
+        ..SpsSpec::default()
+    };
+    let pps_spec = PpsSpec {
+        transform_skip: true,
+        range_extension: Some(pps::PpsRangeExtension {
+            log2_max_transform_skip_block_size_minus2: 1,
+            cross_component_prediction_enabled_flag: true,
+            chroma_qp_offset_list_enabled_flag: true,
+            diff_cu_chroma_qp_offset_depth: 1,
+            chroma_qp_offset_lists: vec![(-2, 3), (12, -12)],
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
+        }),
+        ..PpsSpec::default()
+    };
+    let parsed = sps::Sps::parse(&sps(&spec))?;
+    assert_eq!(
+        parsed.range_extension,
+        sps::SpsRangeExtension {
+            transform_skip_rotation_enabled_flag: true,
+            transform_skip_context_enabled_flag: true,
+            implicit_rdpcm_enabled_flag: true,
+            explicit_rdpcm_enabled_flag: true,
+            extended_precision_processing_flag: false,
+            intra_smoothing_disabled_flag: true,
+            high_precision_offsets_enabled_flag: true,
+            persistent_rice_adaptation_enabled_flag: true,
+            cabac_bypass_alignment_enabled_flag: true,
+        }
+    );
+    let parsed_pps = pps::Pps::parse(&pps(&pps_spec))?;
+    assert_eq!(
+        Some(&parsed_pps.range_extension),
+        pps_spec.range_extension.as_ref()
+    );
+    let idr = slice(
+        &spec,
+        &pps_spec,
+        &SliceSpec {
+            unit_type: nal_type::IDR_W_RADL,
+            cu_chroma_qp_offset: true,
+            ..SliceSpec::default()
+        },
+    );
+    let mut d = decoder();
+    let out = d.decode(&sample(&[sps(&spec), pps(&pps_spec), idr]), 3)?;
+    assert_eq!(d.accelerator().configured, [(64, 48, 8, 5)]);
+    assert_eq!(out.len(), 1);
+    // 4:4:4's conformance window counts luma samples: one row.
+    assert_eq!(
+        (out[0].bit_depth, out[0].crop, out[0].id),
+        (8, (0, 0, 64, 47), 3)
+    );
+    let header = &d.accelerator().decoded[0].headers[0];
+    assert!(header.cu_chroma_qp_offset_enabled_flag);
+    Ok(())
+}
+
+#[test]
+fn a_pps_of_the_range_extensions_is_held_to_its_sps() {
+    let spec = SpsSpec {
+        profile_idc: 4,
+        chroma_format_idc: 3,
+        range_extension: true,
+        ..SpsSpec::default()
+    };
+    let extension = pps::PpsRangeExtension::default();
+    for (pps_spec, why) in [
+        (
+            // MaxTbLog2SizeY is 4 in the default SPS: 2 + 2.
+            PpsSpec {
+                transform_skip: true,
+                range_extension: Some(pps::PpsRangeExtension {
+                    log2_max_transform_skip_block_size_minus2: 3,
+                    ..extension.clone()
+                }),
+                ..PpsSpec::default()
+            },
+            Error::OutOfRange("log2_max_transform_skip_block_size_minus2"),
+        ),
+        (
+            // Of 16-sample CTBs over 8-sample coding blocks: 1 at most.
+            PpsSpec {
+                range_extension: Some(pps::PpsRangeExtension {
+                    chroma_qp_offset_list_enabled_flag: true,
+                    diff_cu_chroma_qp_offset_depth: 2,
+                    chroma_qp_offset_lists: vec![(0, 0)],
+                    ..extension.clone()
+                }),
+                ..PpsSpec::default()
+            },
+            Error::OutOfRange("diff_cu_chroma_qp_offset_depth"),
+        ),
+        (
+            // 0 at 8 bits.
+            PpsSpec {
+                range_extension: Some(pps::PpsRangeExtension {
+                    log2_sao_offset_scale_chroma: 1,
+                    ..extension.clone()
+                }),
+                ..PpsSpec::default()
+            },
+            Error::OutOfRange("log2_sao_offset_scale_chroma"),
+        ),
+    ] {
+        let idr = slice(
+            &spec,
+            &pps_spec,
+            &SliceSpec {
+                unit_type: nal_type::IDR_W_RADL,
+                ..SliceSpec::default()
+            },
+        );
+        let mut d = decoder();
+        let result = d.decode(&sample(&[sps(&spec), pps(&pps_spec), idr]), 0);
+        assert_eq!(result.err(), Some(why));
+        assert!(d.accelerator().decoded.is_empty());
+    }
+    // A Main stream's PPS of the range extensions is refused as before.
+    let main = SpsSpec::default();
+    let pps_spec = PpsSpec {
+        range_extension: Some(extension),
+        ..PpsSpec::default()
+    };
+    let idr = slice(
+        &main,
+        &pps_spec,
+        &SliceSpec {
+            unit_type: nal_type::IDR_W_RADL,
+            ..SliceSpec::default()
+        },
+    );
+    let mut d = decoder();
+    let result = d.decode(&sample(&[sps(&main), pps(&pps_spec), idr]), 0);
+    assert_eq!(
+        result.err(),
+        Some(Error::Unsupported("the range extensions"))
+    );
+}
+
+#[test]
+fn a_444_sps_whose_vui_does_not_read_is_refused() -> Result<(), Error> {
+    let spec = SpsSpec {
+        profile_idc: 4,
+        chroma_format_idc: 3,
+        range_extension: true,
+        vui_hrd: true,
+        ..SpsSpec::default()
+    };
+    let mut unit = sps(&spec);
+    // The range extensions (18 bits), the trailing bits and some of the
+    // HRD's last CPB.
+    unit.truncate(unit.len() - 6);
+    let parsed = sps::Sps::parse(&unit)?;
+    assert!(parsed.vui.is_none());
+    assert_eq!(
+        check_supported(&parsed),
+        Err(Error::Unsupported("range extensions an SPS's VUI hides"))
+    );
+    Ok(())
 }
 
 #[test]

@@ -91,7 +91,14 @@ NVIDIA parser is used: the codec module parses every stream, as for VA-API.
 | HEVC | 4:2:0 8, 10, 12-bit | 144x144 to 8192x8192 | NV12; P016 above 8 |
 
 Each has 2 decode engines. NVDEC also lists H.264 at 10 bits and 4:2:2,
-and HEVC 4:2:2 and 4:4:4, which the device does not offer.
+and HEVC 4:2:2 and 4:4:4, which the device's caps do not offer; HEVC
+4:4:4 at 8 bits is decoded for VideoToolbox's paravirtual decoders
+([devices.md](devices.md)).
+
+The RTX 3090 (620.70.06, `nvidia-probe`, 2026-11-22) answers HEVC 4:4:4 at
+8 bits from 144x144 to 8192x8192, 262,144 macroblocks, into `Yuv444`
+alone, and at 10 and 12 bits into `Yuv444_16Bit` alone; HEVC 4:2:0 at 8
+bits into NV12 alone, and at 10 and 12 into NV12 and P016.
 
 NVENC (`NvEncGetEncodeCaps`): H.264 Baseline, Main, High and High 10 among
 others, 145x49 to 4096x4096, 7 B-frames; HEVC Main, Main 10 and the range
@@ -207,6 +214,15 @@ the model.
 - **H.264.** Slices as Annex B, each after a three-byte start code, with
   `pSliceDataOffsets`; the scaling lists in raster order; the DPB by
   surface index with `FrameIdx` and both fields' order counts.
+- **HEVC 4:4:4** (the range extensions' 4:4:4 at 8 bits, the codec module's
+  one stream of theirs) decodes at `cudaVideoChromaFormat_444` into
+  `cudaVideoSurfaceFormat_YUV444`, three planes, luma, Cb and Cr, each the
+  picture's size, the second after the luma's rows rounded up to even, as
+  the 4:2:0 chroma lies, and the third as far after the second
+  (`Mapped::of`). The range extensions' fields of `CUVIDHEVCPICPARAMS` take
+  the SPS's and PPS's range extensions, the chroma QP offset lists'
+  entries among them. A picture of three planes reads back with three
+  copies (`AnnexBPicture::read_back`); a write of two planes refuses it.
 - **HEVC.** The references by surface index with their order counts and
   long-term flags; `RefPicSetStCurrBefore`, `StCurrAfter` and `LtCurr` as
   indices into them, in the order 8.3.2 derives them, which the codec
@@ -249,7 +265,12 @@ DPB names it follows NVIDIA's parser, measured on 2026-10-24:
 ### What it refuses
 
 - What the codec module refuses (interlaced H.264, HEVC's range
-  extensions), as unsupported.
+  extensions but 4:4:4 at 8 bits: [vaapi.md](vaapi.md), "What it
+  refuses"), as unsupported.
+- An HEVC 4:4:4 stream, as unsupported, where the decoder's caller lands
+  4:2:0 pictures alone ("HEVC 4:4:4: its caller lands 4:2:0 pictures
+  alone"), as a host video session's decoders do; VideoToolbox's
+  paravirtual decoders land them (`AnnexBDecoder::lands_4_4_4`, below).
 - A stream past NVDEC's sizes, as unsupported, or under them, as too small
   (`Error::TooSmall`). The device's caps give the guest NVDEC's own sizes
   ([bugs.md](bugs.md), D14).

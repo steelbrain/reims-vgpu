@@ -33,7 +33,7 @@ use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::paravirt::status::{self, OsStatus};
 use reims_vgpu_video::paravirt::{
     Backend, BackendDecoder, BackendEncoder, Codec, Decoded, DecoderConfig, EncoderBackend,
-    EncoderConfig, LentSurface, SourceFrame, TileLimits, TileRegion,
+    EncoderConfig, LentSurface, SourceFrame, Stream, TileLimits, TileRegion,
 };
 use reims_vgpu_vulkan::core::num::ToUsize as _;
 use reims_vgpu_vulkan::core::platform::{Handle as _, Platform};
@@ -59,12 +59,22 @@ impl<P: Platform> VtBackend<P> {
     }
 }
 
+/// The device's number of `codec` (`RGFX_VIDEO_CODEC_*`).
+fn codec_of(codec: Codec) -> u32 {
+    match codec {
+        Codec::H264 => RGFX_VIDEO_CODEC_H264,
+        Codec::Hevc => RGFX_VIDEO_CODEC_HEVC,
+    }
+}
+
 impl<P: Platform> Backend for VtBackend<P> {
+    /// The arm's answer ([`GraphicsVideo::guest_declines`]).
+    fn declines(&self, stream: &Stream) -> Option<String> {
+        self.video.guest_declines(codec_of(stream.codec), stream)
+    }
+
     fn open(&self, config: &DecoderConfig) -> Result<Box<dyn BackendDecoder>, OsStatus> {
-        let codec = match config.codec {
-            Codec::H264 => RGFX_VIDEO_CODEC_H264,
-            Codec::Hevc => RGFX_VIDEO_CODEC_HEVC,
-        };
+        let codec = codec_of(config.codec);
         let decoder =
             (self.video.guest_decoder(codec)).ok_or(status::COULD_NOT_FIND_VIDEO_DECODER)?;
         // Tiles as large and small as the arm decodes pictures of the codec, where it lands parts.
@@ -427,17 +437,21 @@ pub(super) fn layout_of(record: &RgfxVtSurface) -> Result<SurfaceLayout, String>
 
 /// The part of a surface laid out as `layout` that a tile's `region` lands in: each plane from the
 /// region's first row and column, `region.width` by `region.height` luma samples (half, rounded
-/// up, of a 4:2:0 chroma plane's, of pairs), with the surface's rows. A region past the surface,
-/// or one from an odd column or row, is refused, as is a surface of a format other than the
-/// 4:2:0 ones: a tile session starts only on a stream of 4:2:0 pictures, which the arm decodes
-/// (`reims_vgpu_video::paravirt`'s decoder refuses the rest at the session's `dsts`), and its
-/// `TDrs` names their format.
+/// up, of a 4:2:0 chroma plane's, of pairs; as many of a 4:4:4 one's), with the surface's rows.
+/// A region past the surface, or one from an odd column or row, is refused, as is a surface of a
+/// format other than the 4:2:0 and 4:4:4 ones a picture lands in: a tile session starts only on
+/// a stream of pictures the arm decodes (`reims_vgpu_video::paravirt`'s decoder refuses the rest
+/// at the session's `dsts`), and its `TDrs` names their format.
 fn region_layout(layout: &SurfaceLayout, region: TileRegion) -> Result<SurfaceLayout, String> {
     let format = layout.pixel_format;
-    let sample = if [*b"420v", *b"420f"].map(FourCc::new).contains(&format) {
-        1
-    } else if [*b"x420", *b"xf20"].map(FourCc::new).contains(&format) {
-        2
+    let one_of = |formats: [&[u8; 4]; 2]| formats.map(|f| FourCc::new(*f)).contains(&format);
+    // Bytes a sample, and whether chroma has a pair for every two columns and rows.
+    let (sample, half) = if one_of([b"420v", b"420f"]) {
+        (1, true)
+    } else if one_of([b"x420", b"xf20"]) {
+        (2, true)
+    } else if one_of([b"444v", b"444f"]) {
+        (1, false)
     } else {
         return Err(format!("tiles in '{format}'"));
     };
@@ -452,10 +466,12 @@ fn region_layout(layout: &SurfaceLayout, region: TileRegion) -> Result<SurfaceLa
     let [luma, chroma] = layout.planes[..] else {
         return Err(format!("a surface of {} planes", layout.planes.len()));
     };
-    // A 4:2:0 chroma row holds a Cb/Cr pair for every two columns, and stands for two rows.
-    let moved = |plane: PlaneLayout, rows: u32, width: u32, height: u32| -> Option<PlaneLayout> {
+    // A 4:2:0 chroma row holds a Cb/Cr pair for every two columns, and stands for two rows; a
+    // 4:4:4 one a pair for every column, a row for a row.
+    let moved = |plane: PlaneLayout, (columns, rows): (u32, u32), per_column: usize, size| {
         let down = plane.bytes_per_row.checked_mul(rows.to_usize())?;
-        let across = region.x.to_usize().checked_mul(sample)?;
+        let across = columns.to_usize().checked_mul(per_column)?;
+        let (width, height) = size;
         Some(PlaneLayout {
             offset: plane.offset.checked_add(down)?.checked_add(across)?,
             width,
@@ -463,11 +479,21 @@ fn region_layout(layout: &SurfaceLayout, region: TileRegion) -> Result<SurfaceLa
             ..plane
         })
     };
-    let (half_width, half_height) = (region.width.div_ceil(2), region.height.div_ceil(2));
-    let planes = [
-        moved(luma, region.y, region.width, region.height),
-        moved(chroma, region.y / 2, half_width, half_height),
-    ];
+    let whole = (region.width, region.height);
+    let planes = if half {
+        let halves = (region.width.div_ceil(2), region.height.div_ceil(2));
+        let at = (region.x / 2, region.y / 2);
+        [
+            moved(luma, (region.x, region.y), sample, whole),
+            moved(chroma, at, 2 * sample, halves),
+        ]
+    } else {
+        let at = (region.x, region.y);
+        [
+            moved(luma, at, sample, whole),
+            moved(chroma, at, 2 * sample, whole),
+        ]
+    };
     let [Some(luma), Some(chroma)] = planes else {
         return Err("a tile past 2^64 bytes".to_owned());
     };
@@ -610,6 +636,44 @@ mod tests {
         let mut odd = nv12();
         odd.pixel_format = u32::from_be_bytes(*b"BGRA");
         assert!(region_layout(&layout_of(&odd).unwrap(), region).is_err());
+    }
+
+    /// A 4:4:4 surface's chroma has a Cb and Cr pair for every luma sample: its region is from
+    /// the region's row, two bytes a column across, as many columns and rows as luma's.
+    #[test]
+    fn a_tiles_region_of_a_4_4_4_surface_moves_its_chroma_a_pair_a_column() {
+        let mut full = nv12();
+        full.pixel_format = u32::from_be_bytes(*b"444f");
+        full.planes[1].bytes_per_row = 128;
+        full.planes[1].width = 64;
+        full.planes[1].height = 48;
+        let layout = layout_of(&full).unwrap();
+        let region = TileRegion {
+            source_x: 0,
+            source_y: 0,
+            width: 23,
+            height: 15,
+            x: 40,
+            y: 32,
+        };
+        let part = region_layout(&layout, region).unwrap();
+        assert_eq!(
+            part.planes,
+            vec![
+                PlaneLayout {
+                    offset: 0x400 + 32 * 64 + 40,
+                    bytes_per_row: 64,
+                    width: 23,
+                    height: 15,
+                },
+                PlaneLayout {
+                    offset: 0x1000 + 32 * 128 + 80,
+                    bytes_per_row: 128,
+                    width: 23,
+                    height: 15,
+                },
+            ]
+        );
     }
 
     /// An encode the arm refuses for its source or settings is a parameter error to the guest,

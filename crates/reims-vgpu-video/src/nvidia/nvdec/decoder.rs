@@ -138,7 +138,8 @@ impl Slices<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DecoderSpec {
     pub(crate) codec: NvdecCodec,
-    /// 4:2:0, or monochrome, which NVDEC writes as 4:2:0.
+    /// 4:2:0, monochrome, which NVDEC writes as 4:2:0, or 4:4:4, which it writes in three
+    /// planes.
     pub(crate) chroma: ChromaFormat,
     /// Bits a sample: 8, 10 or 12.
     pub(crate) bit_depth: u32,
@@ -340,10 +341,15 @@ pub(crate) const KEPT_BYTES: u64 = 512 << 20;
 #[cfg(test)]
 pub(crate) static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The bytes of `spec`'s decode surfaces: 4:2:0 at one byte a sample, two
-/// past 8 bits.
+/// The bytes of `spec`'s decode surfaces: 4:2:0's, or 4:4:4's three planes, at one byte a
+/// sample, two past 8 bits.
 fn surface_bytes(spec: &DecoderSpec) -> u64 {
-    let samples = u64::from(spec.width) * u64::from(spec.height) * 3 / 2;
+    let planes = if spec.chroma == ChromaFormat::Yuv444 {
+        6
+    } else {
+        3
+    };
+    let samples = u64::from(spec.width) * u64::from(spec.height) * planes / 2;
     let bytes = if spec.bit_depth > 8 { 2 } else { 1 };
     u64::from(spec.surfaces) * samples * bytes
 }
@@ -423,8 +429,8 @@ pub(crate) struct Decoder {
 
 impl Decoder {
     /// A decoder on `gpu` for `spec`, once NVDEC says it decodes it: the
-    /// codec at 4:2:0 and the bit depth, within its sizes and macroblock
-    /// count.
+    /// codec at the chroma format and the bit depth, within its sizes and
+    /// macroblock count, into the output format of both.
     pub(crate) fn new(gpu: Arc<Gpu>, spec: &DecoderSpec) -> Result<Self, Error> {
         if let Some(made) = take_kept(&gpu, spec) {
             #[cfg(test)]
@@ -461,11 +467,13 @@ impl Decoder {
             )));
         }
         // 8 bits decode into NV12; deeper into P016, whose samples are
-        // P010's for 10 bits: the value in the high bits.
-        let output = if spec.bit_depth > 8 {
-            SurfaceFormat::P016
-        } else {
-            SurfaceFormat::Nv12
+        // P010's for 10 bits: the value in the high bits. 4:4:4 into its
+        // three planes, of 8 bits or of 16 the same way.
+        let output = match (spec.chroma, spec.bit_depth > 8) {
+            (ChromaFormat::Yuv444, false) => SurfaceFormat::Yuv444,
+            (ChromaFormat::Yuv444, true) => SurfaceFormat::Yuv444_16Bit,
+            (_, true) => SurfaceFormat::P016,
+            (_, false) => SurfaceFormat::Nv12,
         };
         if !caps.output_formats.contains(&output) {
             return Err(Error::Unsupported(format!(
@@ -827,8 +835,9 @@ impl Staging {
 /// ([`Picture::read_back`]), held there until dropped.
 pub(crate) struct PictureReadBack<'a> {
     staging: crate::core::sync::MutexGuard<'a, Staging>,
-    /// The luma and the chroma, where they lie in `staging`.
-    planes: [StagedPlane; 2],
+    /// The luma and the chroma, where they lie in `staging`: the chroma's interleaved plane, or
+    /// Cb's and Cr's ([`Picture::plane_count`]).
+    planes: Vec<StagedPlane>,
 }
 
 /// Where a plane lies in the staging memory: `rows` rows of `row_bytes`
@@ -859,12 +868,14 @@ impl StagedPlane {
 
 impl PictureReadBack<'_> {
     /// The luma and the chroma as they lie in the staging memory: each
-    /// one's bytes, its rows' bytes, packed, and its rows.
-    pub(crate) fn planes(&self) -> [(&[u8], usize, u32); 2] {
-        self.planes.map(|plane| {
-            let bytes = &self.staging.bytes()[plane.offset..plane.offset + plane.len()];
-            (bytes, plane.row_bytes, plane.rows)
-        })
+    /// plane's bytes, its rows' bytes, packed, and its rows.
+    pub(crate) fn planes(&self) -> Vec<(&[u8], usize, u32)> {
+        (self.planes.iter())
+            .map(|plane| {
+                let bytes = &self.staging.bytes()[plane.offset..plane.offset + plane.len()];
+                (bytes, plane.row_bytes, plane.rows)
+            })
+            .collect()
     }
 }
 
@@ -912,18 +923,32 @@ impl Picture {
         *self.size.lock()
     }
 
-    /// Bytes a sample of the output: 1 for NV12, 2 for P016.
+    /// Bytes a sample of the output: 1 for NV12 and 4:4:4's 8 bits, 2 for P016 and 4:4:4's 16.
     pub(crate) fn bytes_per_sample(&self) -> usize {
-        if self.inner.output == SurfaceFormat::P016 {
-            2
-        } else {
-            1
+        match self.inner.output {
+            SurfaceFormat::P016 | SurfaceFormat::Yuv444_16Bit | SurfaceFormat::P216 => 2,
+            SurfaceFormat::Nv12 | SurfaceFormat::Yuv444 | SurfaceFormat::Nv16 => 1,
         }
+    }
+
+    /// The planes its output has: 2, luma then interleaved chroma (NV12, P016), or 3, luma,
+    /// Cb and Cr, each as large (4:4:4's).
+    pub(crate) fn plane_count(&self) -> usize {
+        if self.planar() { 3 } else { 2 }
+    }
+
+    /// Whether its output is 4:4:4's three planes.
+    fn planar(&self) -> bool {
+        matches!(
+            self.inner.output,
+            SurfaceFormat::Yuv444 | SurfaceFormat::Yuv444_16Bit
+        )
     }
 
     /// Waits for the picture's decode, and copies `crop` of it into the
     /// decoder's staging memory: luma, then chroma (interleaved Cb and Cr,
-    /// half as tall), each row packed. Every call into the driver a copy
+    /// half as tall, or 4:4:4's Cb and Cr planes, [`Self::plane_count`]),
+    /// each row packed. Every call into the driver a copy
     /// needs is made here: the map, the copies and the unmap, each wait
     /// bounded (module docs). What it returns holds the crop for the CPU's
     /// copies alone ([`PictureReadBack::planes`]), and holds the staging
@@ -945,34 +970,37 @@ impl Picture {
         // with them where they are not done by its deadline (below).
         let mapped = unsafe {
             self.with_mapped(crop, deadline, on_failed, |mapped| {
-                let luma = StagedPlane {
-                    offset: 0,
-                    row_bytes: mapped.row_bytes[0],
-                    rows: mapped.rows[0],
-                };
-                let chroma = StagedPlane {
-                    offset: luma.len(),
-                    row_bytes: mapped.row_bytes[1],
-                    rows: mapped.rows[1],
-                };
-                let needed = chroma.offset + chroma.len();
-                staging.make_room(&inner.gpu, needed);
+                let mut planes = Vec::with_capacity(mapped.rows.len());
+                let mut offset = 0;
+                for (&row_bytes, &rows) in mapped.row_bytes.iter().zip(&mapped.rows) {
+                    let plane = StagedPlane {
+                        offset,
+                        row_bytes,
+                        rows,
+                    };
+                    offset += plane.len();
+                    planes.push(plane);
+                }
+                staging.make_room(&inner.gpu, offset);
                 let pageable = staging.is_pageable();
-                let (luma_bytes, chroma_bytes) = staging.bytes_mut().split_at_mut(chroma.offset);
-                let into = |plane: StagedPlane, bytes: &mut [u8]| {
+                let mut rest = staging.bytes_mut();
+                let mut destinations = Vec::with_capacity(planes.len());
+                for &plane in &planes {
+                    let (bytes, after) = std::mem::take(&mut rest).split_at_mut(plane.len());
+                    rest = after;
                     let to = plane.host(bytes);
-                    Destination {
+                    destinations.push(Destination {
                         at: Memory::Host(to.bytes.as_mut_ptr()),
                         len: to.bytes.len(),
                         bytes_per_row: to.bytes_per_row,
                         rows: to.rows,
-                    }
-                };
+                    });
+                }
                 let copies = Copies {
-                    planes: mapped.planes(into(luma, luma_bytes), into(chroma, chroma_bytes)),
+                    planes: mapped.planes(destinations),
                     pageable,
                 };
-                (copies, [luma, chroma])
+                (copies, planes)
             })
         };
         let planes = match mapped {
@@ -990,7 +1018,8 @@ impl Picture {
     }
 
     /// Waits for the picture's decode, and copies `crop` of it straight
-    /// into `luma` and `chroma`, as much as fits: host memory the caller
+    /// into `destinations`, a plane each ([`Self::plane_count`]: luma and
+    /// chroma, or luma, Cb and Cr), as much as fits: host memory the caller
     /// registered with CUDA (`crate::nvidia::zero_copy`), which the GPU writes by
     /// DMA, or memory of the GPU's own, another API's imported on the
     /// picture's GPU (`crate::nvidia::external`), which a copy within the GPU
@@ -1012,18 +1041,24 @@ impl Picture {
     pub(crate) unsafe fn write_into(
         &self,
         crop: Crop,
-        luma: Destination,
-        chroma: Destination,
+        destinations: Vec<Destination>,
         written: Vec<Box<dyn Any + Send>>,
         deadline: &wait::Deadline,
         on_failed: OnFailed,
     ) -> Result<Result<(), Error>, Error> {
+        if destinations.len() != self.plane_count() {
+            return Ok(Err(Error::Unsupported(format!(
+                "{} planes of a picture of {}",
+                destinations.len(),
+                self.plane_count()
+            ))));
+        }
         // SAFETY: the caller's destinations, registered with CUDA, which
         // `written` keeps, as the function's contract says.
         let mapped = unsafe {
             self.with_mapped(crop, deadline, on_failed, |mapped| {
                 let copies = Copies {
-                    planes: mapped.planes(luma, chroma),
+                    planes: mapped.planes(destinations),
                     pageable: false,
                 };
                 (copies, ())
@@ -1112,6 +1147,7 @@ impl Picture {
             size,
             crop,
             self.bytes_per_sample(),
+            self.planar(),
         )?;
         let (copies, planned) = plan(&mapped);
         let copied = match copies.pageable.then(|| inner.caller()).flatten() {
@@ -1410,38 +1446,44 @@ impl Drop for MappedFrame<'_> {
 
 /// Where a mapped picture's crop lies on the GPU ([`Picture::with_mapped`]):
 /// each plane's source (address, pitch, x in bytes, first row), and its
-/// rows' bytes and count, held to the surface.
+/// rows' bytes and count, held to the surface: two planes, or 4:4:4's three.
 #[derive(Debug, PartialEq, Eq)]
 struct Mapped {
-    planes: [(c_ulonglong, usize, usize, usize); 2],
-    row_bytes: [usize; 2],
-    rows: [u32; 2],
+    planes: Vec<(c_ulonglong, usize, usize, usize)>,
+    row_bytes: Vec<usize>,
+    rows: Vec<u32>,
 }
 
 impl Mapped {
     /// Where `crop` of a picture mapped at `size` lies, its surface at
     /// `address` with rows `pitch` bytes apart and samples of `bytes`
     /// bytes: the crop cut to the picture, and each plane's rows to the
-    /// pitch. The chroma follows the luma's rows, their count rounded up to
-    /// even, as NVDEC lays a mapped frame out; an odd width's last chroma
-    /// pair covers its last column. `Err` is a surface past the address
-    /// space, which no map gives.
+    /// pitch. A plane follows the one before's rows, their count rounded up
+    /// to even, as NVDEC lays a mapped frame out: the chroma after the luma,
+    /// half as tall, where an odd width's last chroma pair covers its last
+    /// column; or, where `planar`, Cb after the luma and Cr after Cb, each
+    /// as large. `Err` is a surface past the address space, which no map
+    /// gives.
     fn of(
         address: c_ulonglong,
         pitch: u32,
         (width, height): (u32, u32),
         crop: Crop,
         bytes: usize,
+        planar: bool,
     ) -> Result<Self, Error> {
-        let chroma = u64::from(height)
-            .checked_next_multiple_of(2)
-            .and_then(|rows| rows.checked_mul(u64::from(pitch)))
-            .and_then(|offset| address.checked_add(offset))
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "a picture of {width}x{height} mapped at {address:#x}, {pitch} bytes a row"
-                ))
-            })?;
+        let plane_at = |n: u64| {
+            u64::from(height)
+                .checked_next_multiple_of(2)
+                .and_then(|rows| rows.checked_mul(u64::from(pitch)))
+                .and_then(|plane| plane.checked_mul(n))
+                .and_then(|offset| address.checked_add(offset))
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "a picture of {width}x{height} mapped at {address:#x}, {pitch} bytes a row"
+                    ))
+                })
+        };
         let pitch = usize::try_from(pitch).unwrap_or(0);
         let crop = Crop {
             width: crop.width.min(width.saturating_sub(crop.x)),
@@ -1452,38 +1494,44 @@ impl Mapped {
         let x_bytes = samples(crop.x);
         let within = |row_bytes: usize| row_bytes.min(pitch.saturating_sub(x_bytes));
         let y = usize::try_from(crop.y).unwrap_or(0);
+        if planar {
+            let row = within(samples(crop.width));
+            return Ok(Self {
+                planes: vec![
+                    (address, pitch, x_bytes, y),
+                    (plane_at(1)?, pitch, x_bytes, y),
+                    (plane_at(2)?, pitch, x_bytes, y),
+                ],
+                row_bytes: vec![row; 3],
+                rows: vec![crop.height; 3],
+            });
+        }
         Ok(Self {
-            planes: [
+            planes: vec![
                 (address, pitch, x_bytes, y),
-                (chroma, pitch, x_bytes, y / 2),
+                (plane_at(1)?, pitch, x_bytes, y / 2),
             ],
-            row_bytes: [
+            row_bytes: vec![
                 within(samples(crop.width)),
                 within(samples(crop.width).next_multiple_of(2 * bytes.max(1))),
             ],
-            rows: [crop.height, crop.height.div_ceil(2)],
+            rows: vec![crop.height, crop.height.div_ceil(2)],
         })
     }
 }
 
 impl Mapped {
-    /// The copies of its two planes into `luma` and `chroma`.
-    fn planes(&self, luma: Destination, chroma: Destination) -> [PlaneCopy; 2] {
-        let [luma_from, chroma_from] = self.planes;
-        [
-            PlaneCopy {
-                from: luma_from,
-                row_bytes: self.row_bytes[0],
-                rows: self.rows[0],
-                to: luma,
-            },
-            PlaneCopy {
-                from: chroma_from,
-                row_bytes: self.row_bytes[1],
-                rows: self.rows[1],
-                to: chroma,
-            },
-        ]
+    /// The copies of its planes into `destinations`, one each, in order.
+    fn planes(&self, destinations: Vec<Destination>) -> Vec<PlaneCopy> {
+        (self.planes.iter().zip(&self.row_bytes).zip(&self.rows))
+            .zip(destinations)
+            .map(|(((&from, &row_bytes), &rows), to)| PlaneCopy {
+                from,
+                row_bytes,
+                rows,
+                to,
+            })
+            .collect()
     }
 }
 
@@ -1499,10 +1547,10 @@ struct PlaneCopy {
 }
 
 /// A picture's copies out ([`Picture::with_mapped`]): the
-/// luma's, then the chroma's, and whether the memory is pageable, which a
-/// copy into returns only once done.
+/// luma's, then the chroma's (or Cb's and Cr's), and whether the memory is
+/// pageable, which a copy into returns only once done.
 struct Copies {
-    planes: [PlaneCopy; 2],
+    planes: Vec<PlaneCopy>,
     pageable: bool,
 }
 
@@ -1718,30 +1766,47 @@ pub(crate) mod tests {
 
     #[test]
     fn a_mapped_pictures_chroma_follows_its_luma_rows_rounded_to_even() -> Result<(), Error> {
-        let mapped = Mapped::of(0x1000, 2048, (641, 361), crop(0, 0, 641, 361), 1)?;
+        let mapped = Mapped::of(0x1000, 2048, (641, 361), crop(0, 0, 641, 361), 1, false)?;
         assert_eq!(mapped.planes[0], (0x1000, 2048, 0, 0));
         assert_eq!(mapped.planes[1], (0x1000 + 2048 * 362, 2048, 0, 0));
         // An odd width's last chroma pair covers its last column.
         assert_eq!(mapped.row_bytes, [641, 642]);
         assert_eq!(mapped.rows, [361, 181]);
-        let deep = Mapped::of(0, 4096, (1920, 1080), crop(0, 0, 1920, 1080), 2)?;
+        let deep = Mapped::of(0, 4096, (1920, 1080), crop(0, 0, 1920, 1080), 2, false)?;
         assert_eq!(deep.planes[1].0, 4096 * 1080);
         assert_eq!(deep.row_bytes, [3840, 3840]);
         Ok(())
     }
 
     #[test]
+    fn a_mapped_4_4_4_pictures_cb_and_cr_follow_its_luma_each_as_large() -> Result<(), Error> {
+        let mapped = Mapped::of(0x1000, 1024, (513, 361), crop(2, 4, 500, 300), 1, true)?;
+        assert_eq!(
+            mapped.planes,
+            [
+                (0x1000, 1024, 2, 4),
+                (0x1000 + 1024 * 362, 1024, 2, 4),
+                (0x1000 + 2 * 1024 * 362, 1024, 2, 4),
+            ]
+        );
+        assert_eq!(mapped.row_bytes, [500, 500, 500]);
+        assert_eq!(mapped.rows, [300, 300, 300]);
+        Ok(())
+    }
+
+    #[test]
     fn a_crop_is_cut_to_the_picture_and_its_rows_to_the_pitch() -> Result<(), Error> {
         // H.264's 1920x1088 coded picture shown as 1920x1080 from (0, 4).
-        let mapped = Mapped::of(0, 2048, (1920, 1088), crop(0, 4, 1920, 1080), 1)?;
+        let mapped = Mapped::of(0, 2048, (1920, 1088), crop(0, 4, 1920, 1080), 1, false)?;
         assert_eq!((mapped.planes[0].3, mapped.planes[1].3), (4, 2));
         assert_eq!(mapped.rows, [1080, 540]);
         // A crop past the picture keeps what is in it.
-        let mapped = Mapped::of(0, 64, (64, 32), crop(8, 30, 100, 100), 1)?;
-        assert_eq!((mapped.planes[0].2, mapped.rows), (8, [2, 1]));
+        let mapped = Mapped::of(0, 64, (64, 32), crop(8, 30, 100, 100), 1, false)?;
+        assert_eq!(mapped.planes[0].2, 8);
+        assert_eq!(mapped.rows, [2, 1]);
         assert_eq!(mapped.row_bytes, [56, 56]);
         // A pitch shorter than the rows holds them to it.
-        let mapped = Mapped::of(0, 40, (64, 32), crop(16, 0, 64, 32), 1)?;
+        let mapped = Mapped::of(0, 40, (64, 32), crop(16, 0, 64, 32), 1, false)?;
         assert_eq!(mapped.row_bytes, [24, 24]);
         Ok(())
     }
@@ -1839,8 +1904,18 @@ pub(crate) mod tests {
 
     #[test]
     fn a_surface_past_the_address_space_is_an_error_not_a_wrap() {
-        assert!(Mapped::of(u64::MAX - 10, 4096, (64, 64), crop(0, 0, 64, 64), 1).is_err());
-        assert!(Mapped::of(0, u32::MAX, (u32::MAX, u32::MAX), crop(0, 0, 1, 1), 2).is_ok());
+        assert!(Mapped::of(u64::MAX - 10, 4096, (64, 64), crop(0, 0, 64, 64), 1, false).is_err());
+        assert!(
+            Mapped::of(
+                0,
+                u32::MAX,
+                (u32::MAX, u32::MAX),
+                crop(0, 0, 1, 1),
+                2,
+                false
+            )
+            .is_ok()
+        );
     }
 
     /// A 4K HEVC decoder's spec at `bit_depth` with `surfaces`.

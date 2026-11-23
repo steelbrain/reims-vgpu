@@ -1114,12 +1114,27 @@ said:
 
 With `Error::HevcBitstream(hevc::Error::Unsupported(..))`, before
 anything reaches the GPU:
-- profiles other than Main, Main 10 and Main Still Picture, unless the
-  compatibility flags name one of them;
-- chroma other than 4:2:0, bit depths above 10, and luma and chroma of
-  different depths;
-- the range and screen content extensions (`sps_range_extension_flag`,
-  `sps_scc_extension_flag` and the PPS's).
+- profiles other than Main, Main 10, Main Still Picture and the range
+  extensions (`general_profile_idc` 4), unless the compatibility flags
+  name one of them;
+- in the Main profiles, chroma other than 4:2:0, bit depths above 10, and
+  the range extensions (`sps_range_extension_flag` and the PPS's);
+- in the range extensions, every stream but 4:4:4 at 8 bits (Main 4:4:4's,
+  Main 4:4:4 Intra's and Main 4:4:4 Still Picture's), and of those, separate
+  colour planes, extended precision processing, which A.3.5 allows only in
+  its 16-bit profiles, and an SPS whose VUI does not read, which hides its
+  extensions (`check_range_extensions`);
+- luma and chroma of different depths, and the screen content extensions
+  (`sps_scc_extension_flag` and the PPS's).
+
+The codec module decodes the 4:4:4 streams it takes with their tools: the
+SPS's nine range extension flags and the PPS's transform skip size,
+cross-component prediction, chroma QP offset lists and SAO offset scales,
+each held to 7.4.3.3.2's ranges, and a slice's
+`cu_chroma_qp_offset_enabled_flag`. This module's accelerator refuses them
+with `Error::Unsupported("HEVC: VA-API decodes 4:2:0 here, not the range
+extensions' 4:4:4")` (`profile_for`): its pictures and surfaces are
+4:2:0's. NVDEC decodes them ([nvidia.md](nvidia.md), "What it refuses").
 
 Parameter sets, slice headers and pictures past the standard's ranges
 are refused with `OutOfRange`, or the variant that names what they break
@@ -1143,8 +1158,8 @@ as ffmpeg's own VA-API decode did (kvz-720p-ref15 from its tenth picture
 on, on the Radeon 780M, 2026-10-24; "Testing HEVC"). Each picture after
 it is refused until an IRAP picture.
 
-x265's streams of Main 4:2:2 10, Main 4:4:4 and Main 12 are refused
-so. `HevcDecoder::new` checks the `hvcC` record's first SPS, the driver's
+x265's streams of Main 4:2:2 10 and Main 12 are refused so, and its Main
+4:4:4 streams by the accelerator. `HevcDecoder::new` checks the `hvcC` record's first SPS, the driver's
 profile and its largest size, so that a session the driver cannot serve
 fails when it is made.
 

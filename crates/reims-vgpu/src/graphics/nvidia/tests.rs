@@ -698,6 +698,61 @@ fn a_read_back_picture_is_copied_into_the_surfaces_planes_at_their_pitch() {
     );
 }
 
+/// A 4:4:4 picture read back, luma, Cb and Cr, lands its luma as it lies and its Cb and Cr
+/// interleaved into the surface's chroma plane, Cb first, a pair a luma sample, at the plane's
+/// pitch and as far as its rows hold them; Cb and Cr whose rows lie past the surface are
+/// refused, with nothing written, and so are two planes.
+#[test]
+fn a_4_4_4_pictures_cb_and_cr_are_interleaved_into_the_surfaces_chroma_plane() {
+    let luma: Vec<u8> = (0..4 * 3).collect();
+    let (cb, cr): (Vec<u8>, Vec<u8>) = ((100..100 + 4 * 3).collect(), (200..200 + 4 * 3).collect());
+    let plane = |bytes| ReadPlane {
+        bytes,
+        bytes_per_row: 4,
+        rows: 3,
+    };
+    let read = [plane(&luma), plane(&cb), plane(&cr)];
+    let planes = [
+        TargetPlane {
+            offset: 0,
+            bytes_per_row: 8,
+            rows: 3,
+            row_bytes: 4,
+        },
+        TargetPlane {
+            offset: 32,
+            bytes_per_row: 10,
+            rows: 3,
+            row_bytes: 6,
+        },
+    ];
+    let mut surface = vec![UNTOUCHED; 64];
+    interleave_planes(&read, &planes, &mut surface, 1).expect("a copy");
+    let mut expected = vec![UNTOUCHED; 64];
+    for row in 0..3 {
+        expected[row * 8..][..4].copy_from_slice(&luma[row * 4..][..4]);
+        for x in 0..3 {
+            expected[32 + row * 10 + 2 * x] = cb[row * 4 + x];
+            expected[32 + row * 10 + 2 * x + 1] = cr[row * 4 + x];
+        }
+    }
+    assert_eq!(surface, expected);
+    let mut short = vec![UNTOUCHED; 57];
+    let refused = interleave_planes(&read, &planes, &mut short, 1);
+    assert_eq!(
+        refused,
+        Err("a plane at 32 of 3 rows 10 bytes apart past the surface's 57 bytes".to_owned())
+    );
+    assert!(
+        short.iter().all(|&b| b == UNTOUCHED),
+        "written when refused"
+    );
+    assert_eq!(
+        interleave_planes(&read[..2], &planes, &mut surface, 1),
+        Err("2 planes read back for 3".to_owned())
+    );
+}
+
 /// A VideoToolbox decoder sees a stream that does not decode, or a picture NVDEC failed, as bad
 /// data; what NVDEC does not decode as unsupported; a skipped leading picture as skipped; and the
 /// rest, a picture too small among them, as its malfunction.

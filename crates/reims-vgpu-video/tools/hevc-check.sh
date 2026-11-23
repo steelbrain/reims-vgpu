@@ -15,8 +15,9 @@
 # record and length-prefixed samples, as VideoToolbox hands them over) and
 # from its Annex B form, in display order; every frame's MD5, over NV12
 # for Main and P010 for Main 10, must equal ffmpeg's. Decode order must
-# give the same frames. Streams the decoder must refuse (4:2:2, 4:4:4,
-# 12-bit) must fail with "unsupported".
+# give the same frames. Streams the decoder must refuse (4:2:2 and 12-bit,
+# which the codec crate refuses, and 4:4:4, which it takes and the VA
+# accelerator refuses) must fail with their refusal.
 #
 # x265's own reconstruction (--recon) is a second reference. ffmpeg n9.0.2's
 # software decode differs from it on some CTB-16 streams with SAO and
@@ -306,14 +307,15 @@ bits_of() {
 }
 
 # What the decoder refuses, cleanly, before any slice reaches the GPU:
-# x265's name|size|frames|bits|chroma|options, and kvazaar's
+# x265's name|size|frames|bits|chroma|options|what the refusal says, and kvazaar's
 # name|size|frames|source filter|options|what the refusal says. kvazaar
 # takes tile columns of 64 samples, one CTB, which radeonsi decodes wrongly
 # with no error, and the codec crate refuses columns under 128.
+rext='^hevc-framemd5: unsupported: range extensions streams other than 4:4:4 at 8 bits'
 refusals=(
-  "main422-10|640x360|10|10|422|--preset fast --profile main422-10"
-  "main444-8|640x360|10|8|444|--preset fast --profile main444-8"
-  "main12|640x360|10|12|420|--preset fast --profile main12"
+  "main422-10|640x360|10|10|422|--preset fast --profile main422-10|$rext"
+  "main444-8|640x360|10|8|444|--preset fast --profile main444-8|^hevc-framemd5: the driver cannot: HEVC: VA-API decodes 4:2:0 here"
+  "main12|640x360|10|12|420|--preset fast --profile main12|$rext"
 )
 kvazaar_refusals=(
   "kvz-720p-tiles-col64|1280x720|10|testsrc2|--preset fast --gop 8 --level 5.1 --tiles-width-split 64,128,1216|ColumnWidthInLumaSamples is out of range"
@@ -426,7 +428,7 @@ for entry in "${crafted[@]}"; do
   made+=("$name|$bits")
 done
 for entry in "${refusals[@]}"; do
-  IFS='|' read -r name size frames bits csp opts <<<"$entry"
+  IFS='|' read -r name size frames bits csp opts _ <<<"$entry"
   encode "$name" "$size" "$frames" "$bits" testsrc2 "$opts" "$csp" || failed=1
 done
 for entry in "${kvazaar_refusals[@]}" "${kvazaar_partial[@]}"; do
@@ -513,9 +515,9 @@ fi
 
 # A stream to refuse that was not made has failed already.
 for entry in "${refusals[@]}"; do
-  IFS='|' read -r name _ <<<"$entry"
+  IFS='|' read -r name _ _ _ _ _ why <<<"$entry"
   [[ -s $out/$name.mp4 ]] || continue
-  refused "$name" "$out/$name.mp4" '^hevc-framemd5: unsupported: profiles outside Main'
+  refused "$name" "$out/$name.mp4" "$why"
 done
 for entry in "${kvazaar_refusals[@]}"; do
   IFS='|' read -r name _ _ _ _ why <<<"$entry"

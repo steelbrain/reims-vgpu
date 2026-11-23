@@ -76,6 +76,18 @@ struct FakeDecoder {
     tiles: Option<TileLimits>,
 }
 
+impl FakeBackend {
+    /// One whose decoders land every picture, and no tiles, recording what no test reads.
+    fn landing() -> Self {
+        Self {
+            calls: Calls::default(),
+            regions: Regions::default(),
+            result: Ok(Decoded::Landed),
+            tiles: None,
+        }
+    }
+}
+
 impl Backend for FakeBackend {
     fn open(&self, _config: &DecoderConfig) -> Result<Box<dyn BackendDecoder>, OsStatus> {
         Ok(Box::new(FakeDecoder {
@@ -84,6 +96,20 @@ impl Backend for FakeBackend {
             result: self.result,
             tiles: self.tiles,
         }))
+    }
+}
+
+/// A fake backend whose arm decodes 4:4:4 streams as well as 4:2:0 ones.
+struct FourFourFour(FakeBackend);
+
+impl Backend for FourFourFour {
+    fn open(&self, config: &DecoderConfig) -> Result<Box<dyn BackendDecoder>, OsStatus> {
+        self.0.open(config)
+    }
+
+    fn declines(&self, stream: &Stream) -> Option<String> {
+        (!matches!(stream.chroma_format_idc, 1 | 3))
+            .then(|| "the arm decodes 4:2:0 and 4:4:4 pictures alone".to_owned())
     }
 }
 
@@ -143,14 +169,29 @@ impl Guest {
 
     /// A session of `codec` on a backend whose decoders decode `tiles`.
     fn of(codec: Codec, result: Result<Decoded, OsStatus>, tiles: Option<TileLimits>) -> Self {
+        Self::on(codec, result, tiles, false)
+    }
+
+    /// [`Guest::of`], on an arm that decodes 4:4:4 streams too where `four_four_four`.
+    fn on(
+        codec: Codec,
+        result: Result<Decoded, OsStatus>,
+        tiles: Option<TileLimits>,
+        four_four_four: bool,
+    ) -> Self {
         let calls = Calls::default();
         let regions = Regions::default();
-        let backend = Arc::new(FakeBackend {
+        let fake = FakeBackend {
             calls: Arc::clone(&calls),
             regions: Arc::clone(&regions),
             result,
             tiles,
-        });
+        };
+        let backend: Arc<dyn Backend> = if four_four_four {
+            Arc::new(FourFourFour(fake))
+        } else {
+            Arc::new(fake)
+        };
         let (fourcc, profiles, max_level) = match codec {
             Codec::H264 => (*b"avc1", vec![66, 77, 100], 52),
             Codec::Hevc => (*b"hvc1", vec![1, 2, 3], 156),
@@ -893,10 +934,16 @@ fn hvcc_of(sps: &[u8]) -> Vec<u8> {
 /// names `format` for its buffers, or, where it is `None`, that each is refused at its start:
 /// the decoder session `kVTVideoDecoderUnsupportedDataFormatErr` without `Dpba`, the tile
 /// session `kVTUnimplementedErr` without `TDrs`, and neither decodes after.
-fn starts_in(codec: Codec, record: &[u8], format: Option<&[u8; 4]>, what: &str) {
+fn starts_in(
+    codec: Codec,
+    record: &[u8],
+    four_four_four: bool,
+    format: Option<&[u8; 4]>,
+    what: &str,
+) {
     let named =
         format.map(|f| Value::Array(vec![Value::Integer(i64::from(u32::from_be_bytes(*f)))]));
-    let guest = Guest::of(codec, Ok(Decoded::Landed), Some(TILES));
+    let guest = Guest::on(codec, Ok(Decoded::Landed), Some(TILES), four_four_four);
     guest.start(record);
     if let Some(named) = &named {
         let (_, dpba) = guest.next_of(b"Dpba");
@@ -917,7 +964,7 @@ fn starts_in(codec: Codec, record: &[u8], format: Option<&[u8; 4]>, what: &str) 
     }
     assert!(guest.quiet(), "{what}");
 
-    let guest = Guest::of(codec, Ok(Decoded::Landed), Some(TILES));
+    let guest = Guest::on(codec, Ok(Decoded::Landed), Some(TILES), four_four_four);
     guest.start_tiles(record);
     if let Some(named) = &named {
         let (_, tdrs) = guest.next_of(b"TDrs");
@@ -947,39 +994,44 @@ fn starts_in(codec: Codec, record: &[u8], format: Option<&[u8; 4]>, what: &str) 
 }
 
 #[test]
-fn each_hevc_stream_lands_in_its_4_2_0_format_or_is_refused_at_its_start() {
+fn each_hevc_stream_lands_in_its_format_or_is_refused_at_its_start() {
     // general_profile_idc, chroma_format_idc, the depths past 8, the range extensions, the
-    // VUI's range, and the format the pictures land in. Apple's HEIC images hold 4:2:0 items
-    // of Main Still Picture and Main, and 4:4:4 thumbnails and monochrome alpha items of the
-    // range extensions' profile (read with ffprobe on an M3 Max's own, macOS 27.0.1); no
-    // arm here decodes the last two, so their sessions are refused at their start, not at
-    // each tile.
-    for (profile, chroma, deeper, range_extension, full_range, format) in [
-        (1, 1, 0, false, None, Some(b"420v")),
-        (1, 1, 0, false, Some(true), Some(b"420f")),
-        (3, 1, 0, false, Some(true), Some(b"420f")),
-        (2, 1, 2, false, Some(false), Some(b"x420")),
-        (2, 1, 2, false, Some(true), Some(b"xf20")),
-        (4, 3, 0, true, Some(true), None),
-        (4, 3, 2, true, None, None),
-        (4, 2, 0, true, Some(true), None),
-        (4, 2, 2, true, None, None),
-        (4, 0, 0, true, Some(true), None),
-        (1, 3, 0, false, Some(true), None),
-        (2, 2, 2, false, None, None),
-        (1, 0, 0, false, None, None),
-        (2, 1, 4, false, None, None),
-        (4, 1, 0, true, None, None),
+    // VUI's range, and the format the pictures land in, on an arm of 4:2:0 alone and on one of
+    // 4:4:4 too. Apple's HEIC images hold 4:2:0 items of Main Still Picture and Main, and 4:4:4
+    // thumbnails and monochrome alpha items of the range extensions' profile (read with ffprobe
+    // on an M3 Max's own, macOS 27.0.1): the thumbnails land where the arm decodes 4:4:4, and
+    // the rest of the range extensions' streams nowhere, each refused at its start, not at each
+    // tile.
+    for (profile, chroma, deeper, range_extension, full_range, format, with_444) in [
+        (1, 1, 0, false, None, Some(b"420v"), Some(b"420v")),
+        (1, 1, 0, false, Some(true), Some(b"420f"), Some(b"420f")),
+        (3, 1, 0, false, Some(true), Some(b"420f"), Some(b"420f")),
+        (2, 1, 2, false, Some(false), Some(b"x420"), Some(b"x420")),
+        (2, 1, 2, false, Some(true), Some(b"xf20"), Some(b"xf20")),
+        (4, 3, 0, true, Some(true), None, Some(b"444f")),
+        (4, 3, 0, true, None, None, Some(b"444v")),
+        (4, 3, 2, true, None, None, None),
+        (4, 2, 0, true, Some(true), None, None),
+        (4, 2, 2, true, None, None, None),
+        (4, 0, 0, true, Some(true), None, None),
+        (1, 3, 0, false, Some(true), None, None),
+        (2, 2, 2, false, None, None, None),
+        (1, 0, 0, false, None, None, None),
+        (2, 1, 4, false, None, None, None),
+        (4, 1, 0, true, None, None, None),
     ] {
         let sps =
             crate::codec::hevc::tests::sps_of(profile, chroma, deeper, range_extension, full_range);
         let what = format!("profile {profile}, chroma {chroma}, 8+{deeper} bits, {full_range:?}");
-        starts_in(Codec::Hevc, &hvcc_of(&sps), format, &what);
+        starts_in(Codec::Hevc, &hvcc_of(&sps), false, format, &what);
+        let what = format!("{what}, on an arm of 4:4:4");
+        starts_in(Codec::Hevc, &hvcc_of(&sps), true, with_444, &what);
     }
 }
 
-/// What a record's refusal says of its stream: `None` where the host decodes it.
-fn undecoded_of(codec: Codec, record: Vec<u8>) -> Option<Undecoded> {
+/// What a session on `backend` refuses of a record's stream, the codec's refusal or the arm's:
+/// `None` where both take it.
+fn undecoded_on(backend: &dyn Backend, codec: Codec, record: Vec<u8>) -> Option<Undecoded> {
     let config = DecoderConfig {
         codec,
         width: 64,
@@ -987,36 +1039,41 @@ fn undecoded_of(codec: Codec, record: Vec<u8>) -> Option<Undecoded> {
         record,
     };
     read_record(&config)
-        .map(|record| record.undecoded)
         .ok()
-        .flatten()
+        .and_then(|record| undecoded(backend, &record))
 }
 
 #[test]
 fn a_refused_stream_is_named_by_its_profile_chroma_format_depths_and_size() {
     // Apple's HEIC images' 4:4:4 thumbnails and monochrome alpha items are of the range
-    // extensions' profile, as the HEVC test of the formats above notes.
+    // extensions' profile, as the HEVC test of the formats above notes: the codec takes the
+    // thumbnails, and an arm of 4:2:0 alone declines them.
+    let arm = FakeBackend::landing();
     let thumbnail = crate::codec::hevc::tests::sps_of(4, 3, 0, true, Some(true));
-    let refused = undecoded_of(Codec::Hevc, hvcc_of(&thumbnail)).expect("refused");
+    let refused = undecoded_on(&arm, Codec::Hevc, hvcc_of(&thumbnail)).expect("refused");
     assert_eq!(
         refused.to_string(),
-        "unsupported: profiles outside Main, Main 10 and Main Still Picture (HEVC \
-         general_profile_idc 4, chroma_format_idc 3, luma 8 bits, chroma 8 bits, 64x48)"
+        "the arm decodes 4:2:0 pictures alone (HEVC general_profile_idc 4, chroma_format_idc 3, \
+         luma 8 bits, chroma 8 bits, 64x48)"
     );
     assert_eq!(
         refused.kind(),
         "HEVC profile four chroma format three, luma eight bits, chroma eight bits"
     );
-    let alpha = crate::codec::hevc::tests::sps_of(4, 0, 2, true, None);
-    let refused = undecoded_of(Codec::Hevc, hvcc_of(&alpha)).expect("refused");
-    assert!(
-        refused.to_string().ends_with(
-            "(HEVC general_profile_idc 4, chroma_format_idc 0, luma 10 bits, chroma 10 bits, \
-             64x48)"
-        ),
-        "{refused}"
+    let four_four_four = FourFourFour(FakeBackend::landing());
+    assert_eq!(
+        undecoded_on(&four_four_four, Codec::Hevc, hvcc_of(&thumbnail)),
+        None
     );
-    let high = undecoded_of(Codec::H264, avcc(&high_sps(244, 3, 2), 4)).expect("refused");
+    let alpha = crate::codec::hevc::tests::sps_of(4, 0, 2, true, None);
+    let refused = undecoded_on(&four_four_four, Codec::Hevc, hvcc_of(&alpha)).expect("refused");
+    assert_eq!(
+        refused.to_string(),
+        "unsupported: range extensions streams other than 4:4:4 at 8 bits (HEVC \
+         general_profile_idc 4, chroma_format_idc 0, luma 10 bits, chroma 10 bits, 64x48)"
+    );
+    let high =
+        undecoded_on(&four_four_four, Codec::H264, avcc(&high_sps(244, 3, 2), 4)).expect("refused");
     assert!(
         high.to_string().ends_with(
             "(H.264 profile_idc 244, chroma_format_idc 3, luma 10 bits, chroma 10 bits, 64x48)"
@@ -1029,7 +1086,7 @@ fn a_refused_stream_is_named_by_its_profile_chroma_format_depths_and_size() {
     );
     // A stream the host decodes names nothing.
     let main = crate::codec::hevc::tests::sps_of(1, 1, 0, false, None);
-    assert_eq!(undecoded_of(Codec::Hevc, hvcc_of(&main)), None);
+    assert_eq!(undecoded_on(&arm, Codec::Hevc, hvcc_of(&main)), None);
 }
 
 #[test]
@@ -1037,9 +1094,10 @@ fn each_kind_of_refused_stream_has_a_kind_of_its_own_whatever_its_size() {
     // The logger reads a kind up to its first digit, quote, backquote or `;`
     // (`reims_vgpu_vulkan::core::logging::class`): none is in a kind, so the whole of it tells
     // the streams apart.
+    let arm = FakeBackend::landing();
     let kind_of = |profile, chroma, deeper| {
         let sps = crate::codec::hevc::tests::sps_of(profile, chroma, deeper, true, None);
-        let kind = undecoded_of(Codec::Hevc, hvcc_of(&sps))
+        let kind = undecoded_on(&arm, Codec::Hevc, hvcc_of(&sps))
             .expect("refused")
             .kind();
         assert!(
@@ -1059,10 +1117,13 @@ fn each_kind_of_refused_stream_has_a_kind_of_its_own_whatever_its_size() {
         assert!(!kinds[..i].contains(kind), "{kind}");
     }
     let sps = crate::codec::hevc::tests::sps_of(4, 3, 0, true, None);
-    let small = undecoded_of(Codec::Hevc, hvcc_of(&sps)).expect("refused");
+    let small = undecoded_on(&arm, Codec::Hevc, hvcc_of(&sps)).expect("refused");
     let large = Undecoded {
-        width: 4032,
-        height: 3024,
+        stream: Stream {
+            width: 4032,
+            height: 3024,
+            ..small.stream
+        },
         ..small.clone()
     };
     assert_eq!(small.kind(), large.kind());
@@ -1083,9 +1144,11 @@ fn each_h264_stream_lands_in_its_4_2_0_format_or_is_refused_at_its_start() {
         (244, 3, 2, None),
     ] {
         let what = format!("profile {profile}, chroma {chroma}, 8+{deeper} bits");
+        // On an arm of 4:4:4 too: the codec refuses H.264's.
         starts_in(
             Codec::H264,
             &avcc(&high_sps(profile, chroma, deeper), 4),
+            true,
             format,
             &what,
         );

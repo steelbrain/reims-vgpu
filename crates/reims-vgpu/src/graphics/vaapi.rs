@@ -103,7 +103,7 @@ use reims_vgpu_graphics::wire::{
 };
 #[cfg(unix)]
 use reims_vgpu_video::codec::PictureRole;
-use reims_vgpu_video::core::backend::{BackendError as VideoError, DeviceWrite};
+use reims_vgpu_video::core::backend::{BackendError as VideoError, DeviceWrite, PixelFormat};
 #[cfg(unix)]
 use reims_vgpu_video::core::device_memory::{
     DeviceImports, DmaBufError, MemoryIdentity, SurfaceDmaBuf,
@@ -1318,6 +1318,13 @@ impl VaGuestDecoder {
             frame
                 .crop_within(x, y, width, height)
                 .map_err(video_error)?;
+        }
+        // The driver's pictures are 4:2:0 here (the arm declines 4:4:4 streams at their start).
+        let format = output.layout.pixel_format;
+        if PixelFormat::from_fourcc(format).is_some_and(PixelFormat::is_4_4_4) {
+            return Err(VideoError::Unsupported(format!(
+                "a 4:2:0 picture for a '{format}' surface"
+            )));
         }
         let declined = match GuestTarget::new(&output.layout, output.memory) {
             Ok(target) => match frame.write_to_guest(&target, &self.imports) {

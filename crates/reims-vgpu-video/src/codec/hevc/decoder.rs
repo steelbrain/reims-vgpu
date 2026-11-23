@@ -13,7 +13,7 @@ use super::hvcc::DecoderConfiguration;
 use super::nal::{
     NalUnit, is_bla, is_idr, is_irap, is_radl, is_rasl, is_sub_layer_non_reference, nal_type,
 };
-use super::pps::Pps;
+use super::pps::{Pps, PpsRangeExtension};
 use super::scaling::ScalingLists;
 use super::slice::{SliceHeader, SliceType};
 use super::sps::Sps;
@@ -133,9 +133,10 @@ pub trait Accelerator {
 /// Main, Main 10 and Main Still Picture streams of the base layer are
 /// decoded: 4:2:0 at 8 or 10 bits, with tiles, wavefront parallel
 /// processing, dependent slice segments, scaling lists, weighted
-/// prediction and long-term references. Other chroma formats and bit
-/// depths, and the range and screen content extensions, are refused with
-/// [`Error::Unsupported`].
+/// prediction and long-term references; and the range extensions' streams
+/// at 4:4:4 and 8 bits, with their tools but extended precision. Other
+/// chroma formats and bit depths, and the screen content extensions, are
+/// refused with [`Error::Unsupported`] ([`check_supported`]).
 ///
 /// Errors follow Apple's HEVC decoder: after a sample that does not
 /// decode, each picture is refused with [`Error::Unrecovered`] until an
@@ -762,45 +763,85 @@ fn same_but_vui(a: &Sps, b: &Sps) -> bool {
 /// Whether [`Decoder`] takes `sps`'s stream: a profile of the Main family
 /// (Main, Main 10, Main Still Picture, or a stream compatible with one),
 /// 4:2:0 at 8 or 10 bits alike for luma and chroma, without the range or
-/// screen content extensions.
+/// screen content extensions; or a stream of the range extensions' profiles
+/// (A.3.5) at 4:4:4 and 8 bits, with their tools but extended precision.
+/// Whether the host's decoder takes it is the accelerator's to say, from its
+/// driver's answers: this is what the codec builds for.
 pub fn check_supported(sps: &Sps) -> Result<(), Error> {
     let ptl = &sps.profile_tier_level;
-    if !matches!(ptl.general_profile_idc, 1..=3) && !(1..=3).any(|p| ptl.compatible_with(p)) {
+    let main = matches!(ptl.general_profile_idc, 1..=3) || (1..=3).any(|p| ptl.compatible_with(p));
+    let range_extensions = ptl.general_profile_idc == 4 || ptl.compatible_with(4);
+    if !main && !range_extensions {
         return Err(Error::Unsupported(
-            "profiles outside Main, Main 10 and Main Still Picture",
+            "profiles outside Main, Main 10, Main Still Picture and the range extensions",
         ));
     }
-    // A.3.2 to A.3.4: CTBs of 16 to 64 in the Main profiles; the syntax
-    // also has 8.
+    // A.3.2 to A.3.5: CTBs of 16 to 64 in the Main and range extensions
+    // profiles; the syntax also has 8.
     if !(4..=6).contains(&sps.ctb_log2_size()) {
         return Err(Error::OutOfRange("CtbLog2SizeY"));
-    }
-    if sps.chroma_format_idc != 1 {
-        return Err(Error::Unsupported("chroma formats other than 4:2:0"));
-    }
-    if sps.bit_depth_luma_minus8 > 2 || sps.bit_depth_chroma_minus8 > 2 {
-        return Err(Error::Unsupported("bit depths above 10"));
     }
     if sps.bit_depth_luma_minus8 != sps.bit_depth_chroma_minus8 {
         return Err(Error::Unsupported(
             "luma and chroma of different bit depths",
         ));
     }
+    if sps.sps_scc_extension_flag {
+        return Err(Error::Unsupported("screen content coding"));
+    }
+    if range_extensions && sps.chroma_format_idc == 3 {
+        return check_range_extensions(sps);
+    }
+    if !main {
+        return Err(Error::Unsupported(
+            "range extensions streams other than 4:4:4 at 8 bits",
+        ));
+    }
+    if sps.chroma_format_idc != 1 {
+        return Err(Error::Unsupported("chroma formats other than 4:2:0"));
+    }
+    if sps.bit_depth_luma_minus8 > 2 {
+        return Err(Error::Unsupported("bit depths above 10"));
+    }
     if sps.sps_range_extension_flag {
         return Err(Error::Unsupported("the range extensions"));
     }
-    if sps.sps_scc_extension_flag {
-        return Err(Error::Unsupported("screen content coding"));
+    Ok(())
+}
+
+/// [`check_supported`] for a 4:4:4 stream of the range extensions' profiles:
+/// 8 bits, its three planes coded together, its SPS read to its range
+/// extensions, and every tool of theirs but extended precision processing,
+/// which A.3.5 allows only in its 16-bit profiles.
+fn check_range_extensions(sps: &Sps) -> Result<(), Error> {
+    if sps.bit_depth_luma_minus8 != 0 {
+        return Err(Error::Unsupported(
+            "range extensions streams other than 4:4:4 at 8 bits",
+        ));
+    }
+    if sps.separate_colour_plane_flag {
+        return Err(Error::Unsupported("separate colour planes"));
+    }
+    if sps.extensions_unread {
+        return Err(Error::Unsupported("range extensions an SPS's VUI hides"));
+    }
+    if sps.range_extension.extended_precision_processing_flag {
+        return Err(Error::Unsupported("extended precision processing"));
     }
     Ok(())
 }
 
 /// Whether [`Decoder`] takes `pps` for pictures of `sps`: without the
-/// range or screen content extensions, and with what the PPS's ranges take
-/// from the SPS within them.
+/// screen content extensions, with the range extensions only for an SPS of
+/// theirs ([`check_supported`]), and with what the PPS's ranges take from
+/// the SPS within them.
 fn check_pps_supported(pps: &Pps, sps: &Sps) -> Result<(), Error> {
     if pps.pps_range_extension_flag {
-        return Err(Error::Unsupported("the range extensions"));
+        // 4:2:0: a Main family SPS, the one of 4:2:0 `check_supported` takes.
+        if sps.chroma_format_idc == 1 {
+            return Err(Error::Unsupported("the range extensions"));
+        }
+        check_pps_range_extension(&pps.range_extension, sps)?;
     }
     if pps.pps_scc_extension_flag {
         return Err(Error::Unsupported("screen content coding"));
@@ -834,6 +875,33 @@ fn check_pps_supported(pps: &Pps, sps: &Sps) -> Result<(), Error> {
         }) {
             return Err(Error::OutOfRange("ColumnWidthInLumaSamples"));
         }
+    }
+    Ok(())
+}
+
+/// 7.4.3.3.2's ranges of a PPS's range extensions that the SPS sets.
+fn check_pps_range_extension(extension: &PpsRangeExtension, sps: &Sps) -> Result<(), Error> {
+    // MaxTbLog2SizeY (7-12), less 2, as the PPS's field is.
+    let max_tb_log2_minus2 = (sps.log2_min_luma_transform_block_size_minus2)
+        .saturating_add(sps.log2_diff_max_min_luma_transform_block_size);
+    if extension.log2_max_transform_skip_block_size_minus2 > max_tb_log2_minus2 {
+        return Err(Error::OutOfRange(
+            "log2_max_transform_skip_block_size_minus2",
+        ));
+    }
+    if extension.cross_component_prediction_enabled_flag && sps.chroma_array_type() != 3 {
+        return Err(Error::OutOfRange("cross_component_prediction_enabled_flag"));
+    }
+    if extension.diff_cu_chroma_qp_offset_depth > sps.log2_diff_max_min_luma_coding_block_size {
+        return Err(Error::OutOfRange("diff_cu_chroma_qp_offset_depth"));
+    }
+    // 0 to Max(0, BitDepth - 10).
+    let scale = |minus8: u8| minus8.saturating_sub(2);
+    if extension.log2_sao_offset_scale_luma > scale(sps.bit_depth_luma_minus8) {
+        return Err(Error::OutOfRange("log2_sao_offset_scale_luma"));
+    }
+    if extension.log2_sao_offset_scale_chroma > scale(sps.bit_depth_chroma_minus8) {
+        return Err(Error::OutOfRange("log2_sao_offset_scale_chroma"));
     }
     Ok(())
 }

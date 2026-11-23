@@ -3,6 +3,7 @@
 use std::num::NonZeroU32;
 
 use super::Error;
+use super::bits::BitReader;
 use super::nal::{NalUnit, payload_reader};
 use super::scaling::ScalingLists;
 use super::sps::Sps;
@@ -100,6 +101,68 @@ pub struct Pps {
     pub(crate) pps_3d_extension_flag: bool,
     /// `pps_scc_extension_flag`.
     pub(crate) pps_scc_extension_flag: bool,
+    /// The range extensions' tools, all off without `pps_range_extension_flag`.
+    pub range_extension: PpsRangeExtension,
+}
+
+/// `pps_range_extension()` (7.3.2.3.2), each tool off where the PPS has none. Its ranges that
+/// depend on the SPS are checked when a picture uses the PPS.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsRangeExtension {
+    /// `log2_max_transform_skip_block_size_minus2`, 0 without `transform_skip_enabled_flag`.
+    pub log2_max_transform_skip_block_size_minus2: u8,
+    /// `cross_component_prediction_enabled_flag`.
+    pub cross_component_prediction_enabled_flag: bool,
+    /// `chroma_qp_offset_list_enabled_flag`.
+    pub chroma_qp_offset_list_enabled_flag: bool,
+    /// `diff_cu_chroma_qp_offset_depth`.
+    pub diff_cu_chroma_qp_offset_depth: u8,
+    /// `cb_qp_offset_list[]` and `cr_qp_offset_list[]`, one pair an entry: up to 6
+    /// (`chroma_qp_offset_list_len_minus1` + 1), none without the list.
+    pub chroma_qp_offset_lists: Vec<(i8, i8)>,
+    /// `log2_sao_offset_scale_luma`.
+    pub log2_sao_offset_scale_luma: u8,
+    /// `log2_sao_offset_scale_chroma`.
+    pub log2_sao_offset_scale_chroma: u8,
+}
+
+impl PpsRangeExtension {
+    /// `pps_range_extension()`, of a PPS with `transform_skip_enabled_flag`.
+    fn parse(r: &mut BitReader<'_>, transform_skip_enabled_flag: bool) -> Result<Self, Error> {
+        // 7.4.3.3.2: the bound past which no SPS's MaxTbLog2SizeY (5 at most) takes it.
+        let log2_max_transform_skip_block_size_minus2 = if transform_skip_enabled_flag {
+            r.ue_u8(3, "log2_max_transform_skip_block_size_minus2")?
+        } else {
+            0
+        };
+        let cross_component_prediction_enabled_flag = r.bit()?;
+        let chroma_qp_offset_list_enabled_flag = r.bit()?;
+        let mut diff_cu_chroma_qp_offset_depth = 0;
+        let mut chroma_qp_offset_lists = Vec::new();
+        if chroma_qp_offset_list_enabled_flag {
+            // At most log2_diff_max_min_luma_coding_block_size, 3 in every SPS this reads.
+            diff_cu_chroma_qp_offset_depth = r.ue_u8(3, "diff_cu_chroma_qp_offset_depth")?;
+            let len_minus1 = r.ue_u8(5, "chroma_qp_offset_list_len_minus1")?;
+            for _ in 0..=len_minus1 {
+                let cb = r.se_i8(-12, 12, "cb_qp_offset_list")?;
+                let cr = r.se_i8(-12, 12, "cr_qp_offset_list")?;
+                chroma_qp_offset_lists.push((cb, cr));
+            }
+        }
+        // 0 to Max(0, BitDepth - 10), 6 at most (16 bits); checked against the SPS's depths
+        // when a picture uses the PPS.
+        let log2_sao_offset_scale_luma = r.ue_u8(6, "log2_sao_offset_scale_luma")?;
+        let log2_sao_offset_scale_chroma = r.ue_u8(6, "log2_sao_offset_scale_chroma")?;
+        Ok(Self {
+            log2_max_transform_skip_block_size_minus2,
+            cross_component_prediction_enabled_flag,
+            chroma_qp_offset_list_enabled_flag,
+            diff_cu_chroma_qp_offset_depth,
+            chroma_qp_offset_lists,
+            log2_sao_offset_scale_luma,
+            log2_sao_offset_scale_chroma,
+        })
+    }
 }
 
 impl Pps {
@@ -222,12 +285,18 @@ impl Pps {
             pps_multilayer_extension_flag: false,
             pps_3d_extension_flag: false,
             pps_scc_extension_flag: false,
+            range_extension: PpsRangeExtension::default(),
         };
         if r.bit()? {
             pps.pps_range_extension_flag = r.bit()?;
             pps.pps_multilayer_extension_flag = r.bit()?;
             pps.pps_3d_extension_flag = r.bit()?;
             pps.pps_scc_extension_flag = r.bit()?;
+            r.skip(4)?; // pps_extension_4bits
+            if pps.pps_range_extension_flag {
+                pps.range_extension =
+                    PpsRangeExtension::parse(&mut r, pps.transform_skip_enabled_flag)?;
+            }
         }
         Ok(pps)
     }

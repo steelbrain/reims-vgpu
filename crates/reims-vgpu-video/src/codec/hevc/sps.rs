@@ -101,6 +101,47 @@ pub struct Pcm {
     pub loop_filter_disabled_flag: bool,
 }
 
+/// `sps_range_extension()` (7.3.2.2.2): the range extensions' coding tools, each off where the
+/// SPS has none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpsRangeExtension {
+    /// `transform_skip_rotation_enabled_flag`.
+    pub transform_skip_rotation_enabled_flag: bool,
+    /// `transform_skip_context_enabled_flag`.
+    pub transform_skip_context_enabled_flag: bool,
+    /// `implicit_rdpcm_enabled_flag`.
+    pub implicit_rdpcm_enabled_flag: bool,
+    /// `explicit_rdpcm_enabled_flag`.
+    pub explicit_rdpcm_enabled_flag: bool,
+    /// `extended_precision_processing_flag`.
+    pub extended_precision_processing_flag: bool,
+    /// `intra_smoothing_disabled_flag`.
+    pub intra_smoothing_disabled_flag: bool,
+    /// `high_precision_offsets_enabled_flag`.
+    pub high_precision_offsets_enabled_flag: bool,
+    /// `persistent_rice_adaptation_enabled_flag`.
+    pub persistent_rice_adaptation_enabled_flag: bool,
+    /// `cabac_bypass_alignment_enabled_flag`.
+    pub cabac_bypass_alignment_enabled_flag: bool,
+}
+
+impl SpsRangeExtension {
+    /// `sps_range_extension()`.
+    fn parse(r: &mut BitReader<'_>) -> Result<Self, Error> {
+        Ok(Self {
+            transform_skip_rotation_enabled_flag: r.bit()?,
+            transform_skip_context_enabled_flag: r.bit()?,
+            implicit_rdpcm_enabled_flag: r.bit()?,
+            explicit_rdpcm_enabled_flag: r.bit()?,
+            extended_precision_processing_flag: r.bit()?,
+            intra_smoothing_disabled_flag: r.bit()?,
+            high_precision_offsets_enabled_flag: r.bit()?,
+            persistent_rice_adaptation_enabled_flag: r.bit()?,
+            cabac_bypass_alignment_enabled_flag: r.bit()?,
+        })
+    }
+}
+
 /// What this decoder keeps of the VUI (E.2.1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Vui {
@@ -192,6 +233,11 @@ pub struct Sps {
     pub(crate) sps_3d_extension_flag: bool,
     /// `sps_scc_extension_flag`.
     pub(crate) sps_scc_extension_flag: bool,
+    /// The range extensions' tools, all off without `sps_range_extension_flag`.
+    pub range_extension: SpsRangeExtension,
+    /// Whether the extension flags went unread, after a VUI that does not read: the SPS's
+    /// range extensions are then unknown.
+    pub(crate) extensions_unread: bool,
     /// What decoding derives from the fields above.
     pub(crate) derived: Derived,
 }
@@ -459,15 +505,22 @@ impl Sps {
             sps_multilayer_extension_flag: false,
             sps_3d_extension_flag: false,
             sps_scc_extension_flag: false,
+            range_extension: SpsRangeExtension::default(),
+            extensions_unread: false,
             derived,
         };
         if r.bit()? {
             // A VUI that does not read (one cut short, say) is left out,
             // as are the extension flags after it: nothing decoding needs
-            // is in either but the range, which then defaults to video.
+            // is in either but the range, which then defaults to video,
+            // and the range extensions, which are then unknown
+            // (`extensions_unread`).
             match parse_vui(&mut r, sps_max_sub_layers_minus1) {
                 Ok(vui) => sps.vui = Some(vui),
-                Err(_) => return Ok(sps),
+                Err(_) => {
+                    sps.extensions_unread = true;
+                    return Ok(sps);
+                }
             }
         }
         if r.bit()? {
@@ -475,6 +528,17 @@ impl Sps {
             sps.sps_multilayer_extension_flag = r.bit()?;
             sps.sps_3d_extension_flag = r.bit()?;
             sps.sps_scc_extension_flag = r.bit()?;
+            // sps_extension_4bits, then the range extensions' tools; ones cut short are unknown,
+            // as after a VUI that does not read.
+            let range_extension = r.skip(4).and_then(|()| {
+                (sps.sps_range_extension_flag)
+                    .then(|| SpsRangeExtension::parse(&mut r))
+                    .transpose()
+            });
+            match range_extension {
+                Ok(read) => sps.range_extension = read.unwrap_or_default(),
+                Err(_) => sps.extensions_unread = true,
+            }
         }
         Ok(sps)
     }

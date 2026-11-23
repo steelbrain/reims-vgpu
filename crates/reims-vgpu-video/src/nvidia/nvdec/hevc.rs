@@ -11,12 +11,18 @@
 //! lists go in coding (up-right diagonal) order, which
 //! dynlink_cuviddec.h names ("scaling lists (diag order)") and the codec
 //! crate keeps them in.
+//!
+//! The range extensions' streams the codec crate decodes, 4:4:4 at 8 bits,
+//! decode into NVDEC's three planes ([`NvdecHevc::four_four_four`]), their
+//! tools and chroma QP offset lists in the picture parameters' range
+//! extension fields.
 
 use std::ffi::{c_int, c_ushort};
 use std::sync::Arc;
 
 use crate::codec::PictureRole;
 use crate::codec::hevc::nal::{is_idr, is_irap};
+use crate::codec::hevc::pps::Pps;
 use crate::codec::hevc::sps::Sps;
 use crate::codec::hevc::{Accelerator, PictureParams, SliceParams};
 
@@ -34,6 +40,9 @@ pub(crate) struct NvdecHevc {
     decoder: Option<Decoder>,
     /// The sample being decoded, for its slices to go to NVDEC in place.
     pub(crate) in_place: InPlace,
+    /// Whether its caller lands 4:4:4 pictures, three planes each: a 4:4:4
+    /// stream's configure is refused without it.
+    pub(crate) four_four_four: bool,
 }
 
 impl NvdecHevc {
@@ -42,6 +51,7 @@ impl NvdecHevc {
             gpu,
             decoder: None,
             in_place: InPlace::default(),
+            four_four_four: false,
         }
     }
 
@@ -50,11 +60,17 @@ impl NvdecHevc {
     }
 }
 
-/// The decoder `sps`'s pictures need, with a DPB of `dpb_size` pictures.
+/// The decoder `sps`'s pictures need, with a DPB of `dpb_size` pictures: 4:4:4
+/// where the SPS's `chroma_format_idc` is 3, else 4:2:0, the one other the codec
+/// crate decodes.
 pub(crate) fn spec(sps: &Sps, dpb_size: usize) -> DecoderSpec {
     DecoderSpec {
         codec: NvdecCodec::Hevc,
-        chroma: ChromaFormat::Yuv420,
+        chroma: if sps.chroma_format_idc == 3 {
+            ChromaFormat::Yuv444
+        } else {
+            ChromaFormat::Yuv420
+        },
         bit_depth: u32::from(sps.bit_depth_luma_minus8) + 8,
         width: sps.pic_width_in_luma_samples,
         height: sps.pic_height_in_luma_samples,
@@ -68,7 +84,13 @@ impl Accelerator for NvdecHevc {
 
     fn configure(&mut self, sps: &Sps, dpb_size: usize) -> Result<(), Error> {
         self.decoder = None;
-        self.decoder = Some(Decoder::new(Arc::clone(&self.gpu), &spec(sps, dpb_size))?);
+        let spec = spec(sps, dpb_size);
+        if spec.chroma == ChromaFormat::Yuv444 && !self.four_four_four {
+            return Err(Error::Unsupported(
+                "HEVC 4:4:4: its caller lands 4:2:0 pictures alone".to_owned(),
+            ));
+        }
+        self.decoder = Some(Decoder::new(Arc::clone(&self.gpu), &spec)?);
         Ok(())
     }
 
@@ -222,6 +244,8 @@ fn picture_parameters(
     (h.RefPicSetStCurrAfter, h.NumPocStCurrAfter) = current_set(after)?;
     (h.RefPicSetLtCurr, h.NumPocLtCurr) = current_set(long_term)?;
 
+    range_extensions(&mut h, sps, pps);
+
     if let Some(lists) = &p.scaling_lists {
         h.ScalingList4x4 = lists.list_4x4;
         h.ScalingList8x8 = lists.list_8x8;
@@ -234,6 +258,38 @@ fn picture_parameters(
     }
     out.CodecSpecific.hevc = h;
     Ok(out)
+}
+
+/// The range extensions' fields of `h`, from `sps`'s and `pps`'s extensions,
+/// each 0 where its extension is absent, as the codec crate parses them.
+fn range_extensions(h: &mut ffi::CUVIDHEVCPICPARAMS, sps: &Sps, pps: &Pps) {
+    let flag = u8::from;
+    let s = &sps.range_extension;
+    h.sps_range_extension_flag = flag(sps.sps_range_extension_flag);
+    h.transform_skip_rotation_enabled_flag = flag(s.transform_skip_rotation_enabled_flag);
+    h.transform_skip_context_enabled_flag = flag(s.transform_skip_context_enabled_flag);
+    h.implicit_rdpcm_enabled_flag = flag(s.implicit_rdpcm_enabled_flag);
+    h.explicit_rdpcm_enabled_flag = flag(s.explicit_rdpcm_enabled_flag);
+    h.extended_precision_processing_flag = flag(s.extended_precision_processing_flag);
+    h.intra_smoothing_disabled_flag = flag(s.intra_smoothing_disabled_flag);
+    h.high_precision_offsets_enabled_flag = flag(s.high_precision_offsets_enabled_flag);
+    h.persistent_rice_adaptation_enabled_flag = flag(s.persistent_rice_adaptation_enabled_flag);
+    h.cabac_bypass_alignment_enabled_flag = flag(s.cabac_bypass_alignment_enabled_flag);
+    let p = &pps.range_extension;
+    h.pps_range_extension_flag = flag(pps.pps_range_extension_flag);
+    h.log2_max_transform_skip_block_size_minus2 = p.log2_max_transform_skip_block_size_minus2;
+    h.cross_component_prediction_enabled_flag = flag(p.cross_component_prediction_enabled_flag);
+    h.chroma_qp_offset_list_enabled_flag = flag(p.chroma_qp_offset_list_enabled_flag);
+    h.diff_cu_chroma_qp_offset_depth = p.diff_cu_chroma_qp_offset_depth;
+    h.chroma_qp_offset_list_len_minus1 = narrow(p.chroma_qp_offset_lists.len().saturating_sub(1));
+    for ((cb, cr), &(cb_offset, cr_offset)) in (h.cb_qp_offset_list.iter_mut())
+        .zip(h.cr_qp_offset_list.iter_mut())
+        .zip(&p.chroma_qp_offset_lists)
+    {
+        (*cb, *cr) = (cb_offset, cr_offset);
+    }
+    h.log2_sao_offset_scale_luma = p.log2_sao_offset_scale_luma;
+    h.log2_sao_offset_scale_chroma = p.log2_sao_offset_scale_chroma;
 }
 
 #[cfg(test)]

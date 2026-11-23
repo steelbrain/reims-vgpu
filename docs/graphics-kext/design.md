@@ -1863,12 +1863,19 @@ Stages:
       on a stream whose pictures the host decodes none of, and a decoder
       session's `dsta` on one is refused with
       `kVTVideoDecoderUnsupportedDataFormatErr`: the arms decode 4:2:0
-      pictures alone, of 8 bits, or 10 in HEVC, in the profiles and tools
-      the codec's `check_supported` takes. A stream of 4:4:4, 4:2:2 or
-      monochrome pictures (a HEIC image's 4:4:4 thumbnail, or its alpha
-      item) is then refused at the session's start, not at each tile or
-      frame, and every tile a session takes lands in the 4:2:0 format its
-      `TDrs` names. The refusal's warning names the stream: its codec, its
+      pictures, of 8 bits, or 10 in HEVC, in the profiles and tools the
+      codec's `check_supported` takes, and NVDEC also HEVC's 4:4:4 at 8
+      bits (the range extensions' Main 4:4:4 streams) where its caps
+      answer HEVC 4:4:4 at that depth and the stream's size, each picture
+      landing in the 4:4:4 format its `TDrs` names ('444v', '444f'), its Cb
+      and Cr interleaved by the CPU (`graphics::nvidia`'s module doc). A
+      stream the codec refuses (4:2:2, monochrome, a HEIC image's alpha
+      item, a 4:4:4 stream past 8 bits), or one the arm declines (4:4:4 on
+      VA-API, and on an NVIDIA GPU whose caps lack it: the arm's
+      `guest_declines`), is then refused at the session's start, not at
+      each tile or frame, and every tile a session takes lands in the
+      format its `TDrs` names. The refusal's warning names the stream and
+      why: the codec's refusal or the arm's decline, its codec, its
       profile (HEVC's `general_profile_idc`, H.264's `profile_idc`), its
       `chroma_format_idc`, its luma and chroma bit depths and its coded
       size, written for the first stream of each codec, profile, chroma

@@ -13,14 +13,16 @@
 //!   a stream whose pictures the host decodes none of, are refused with
 //!   `kVTVideoDecoderUnsupportedDataFormatErr`, an H.264 SPS that lets pictures be fields with
 //!   `kVTVideoDecoderMalfunctionErr`, and the backend refuses what it does not decode, each with
-//!   no `Dpba`. The host decodes 4:2:0 pictures alone, at 8 bits, and HEVC's at 10 too, in the
-//!   profiles and tools the codec's `check_supported` takes, which every arm's decode of a picture
-//!   checks: a stream of 4:4:4, 4:2:2 or monochrome pictures (a HEIC image's 4:4:4 thumbnail,
-//!   its alpha), or of deeper samples, is refused at its start, not at each frame, with a warning
-//!   that names the stream's profile, chroma format, bit depths and size ([`Undecoded`]). A started
-//!   session sends `Dpba`, the attributes the guest's output buffers are to have (the 4:2:0
-//!   format of its depth and range), before its reply. A second `dsta` is answered
-//!   `kVTVideoDecoderBadDataErr`, and the session goes on as the first left it.
+//!   no `Dpba`. The host decodes 4:2:0 pictures at 8 bits, HEVC's at 10 too, and HEVC's 4:4:4
+//!   pictures at 8 where the arm does, in the profiles and tools the codec's `check_supported`
+//!   takes, which every arm's decode of a picture checks: a stream of 4:2:2 or monochrome
+//!   pictures (a HEIC image's alpha), of deeper samples, or of 4:4:4 ones the arm declines
+//!   ([`Backend::declines`]; a HEIC image's 4:4:4 thumbnail where the arm decodes no 4:4:4) is
+//!   refused at its start, not at each frame, with a warning that names why, and the stream's
+//!   profile, chroma format, bit depths and size ([`Undecoded`]). A started session sends `Dpba`,
+//!   the attributes the guest's output buffers are to have (the two-plane format of its chroma,
+//!   depth and range: `420v`, `420f`, `x420`, `xf20`, `444v` or `444f`), before its reply. A second
+//!   `dsta` is answered `kVTVideoDecoderBadDataErr`, and the session goes on as the first left it.
 //! - **`dfrm`** decodes one sample: the host asks the guest for an output buffer (`Dbuf`, waiting
 //!   [`BUFFER_REPLY_WAIT`]), which lends the buffer's surface; the backend decodes the sample's
 //!   access unit into it and returns once the picture is there; the host emits the frame
@@ -38,8 +40,8 @@
 //!   the guest's output buffers are to have (`,cba`) and the tiles it decodes (`,trd`); else it
 //!   answers `kVTUnimplementedErr`, and the guest's VideoToolbox decodes the image in software.
 //!   It answers the same for a stream whose pictures the host decodes none of (as `dsta` refuses
-//!   it), so a session's tiles land only in the 4:2:0 format `TDrs` names, laid out as the
-//!   guest lent each buffer.
+//!   it), so a session's tiles land only in the format `TDrs` names, laid out as the guest lent
+//!   each buffer.
 //!   `dtil` decodes one tile's sample (`,sbf`, in fragments as `dfrm`'s) into the one surface it
 //!   lends: the `,tcd` columns and rows of the tile's picture from `,tco` land at `,obp` in it
 //!   ([`TileRegion`]). The host emits the tile (`TDem`: its `,til`, status, info flags and the
@@ -181,6 +183,32 @@ pub trait Backend: Send + Sync {
     /// A decoder of `config`, on the session's thread at its `dsta`, or the status the guest sees
     /// for a configuration it does not decode.
     fn open(&self, config: &DecoderConfig) -> Result<Box<dyn BackendDecoder>, OsStatus>;
+
+    /// Why the arm decodes none of the pictures of a stream of `stream`, one the codec takes, so
+    /// that its session is refused at its start as one the codec refuses is, not at each picture
+    /// or tile; `None` where it decodes them. The default takes 4:2:0 streams alone.
+    fn declines(&self, stream: &Stream) -> Option<String> {
+        (stream.chroma_format_idc != 1).then(|| "the arm decodes 4:2:0 pictures alone".to_owned())
+    }
+}
+
+/// What a stream's SPS says it is: what a refusal of it names ([`Backend::declines`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stream {
+    /// The stream's codec.
+    pub codec: Codec,
+    /// HEVC's `general_profile_idc`, H.264's `profile_idc`.
+    pub profile: u8,
+    /// `chroma_format_idc`.
+    pub chroma_format_idc: u8,
+    /// `BitDepthY`.
+    pub luma_bits: u8,
+    /// `BitDepthC`.
+    pub chroma_bits: u8,
+    /// The coded picture's width, in luma samples.
+    pub width: u32,
+    /// The coded picture's height, in luma samples.
+    pub height: u32,
 }
 
 /// One open decoder, called on its session's thread, one call at a time.
@@ -382,7 +410,7 @@ impl Worker {
     /// none of.
     fn open(&mut self, config: &DecoderConfig) -> Result<(), OsStatus> {
         let record = read_record(config)?;
-        if let Some(undecoded) = &record.undecoded {
+        if let Some(undecoded) = undecoded(&*self.backend, &record) {
             log::warn!(
                 kind:% = undecoded.kind();
                 "hardware video: a decoder session of a stream the host does not decode, \
@@ -518,7 +546,7 @@ impl Worker {
     fn open_tiles(&mut self, config: &DecoderConfig) -> Result<(), OsStatus> {
         self.tiles = None;
         let record = read_record(config)?;
-        if let Some(undecoded) = &record.undecoded {
+        if let Some(undecoded) = undecoded(&*self.backend, &record) {
             log::warn!(
                 kind:% = undecoded.kind();
                 "hardware video: a tile session of a stream the host does not decode, \
@@ -986,13 +1014,17 @@ fn config_from_format(format: &SerializedFormatDescription) -> Option<DecoderCon
     })
 }
 
-/// The CoreVideo format a configuration's pictures land in: 8 or 10 bits, video or full range.
+/// The CoreVideo format a configuration's pictures land in: 4:2:0 at 8 or 10 bits, or 4:4:4 at 8,
+/// video or full range, two planes each.
 fn pixel_format(record: &Record) -> [u8; 4] {
-    match (record.ten_bit, record.full_range) {
-        (false, false) => *b"420v",
-        (false, true) => *b"420f",
-        (true, false) => *b"x420",
-        (true, true) => *b"xf20",
+    let four_four_four = record.stream.chroma_format_idc == 3;
+    match (four_four_four, record.ten_bit, record.full_range) {
+        (true, _, false) => *b"444v",
+        (true, _, true) => *b"444f",
+        (false, false, false) => *b"420v",
+        (false, false, true) => *b"420f",
+        (false, true, false) => *b"x420",
+        (false, true, true) => *b"xf20",
     }
 }
 
@@ -1023,38 +1055,28 @@ struct Record {
     ten_bit: bool,
     /// Whether the samples use the full range.
     full_range: bool,
-    /// Why the host's decoders take none of the stream's pictures, where they take none, and the
-    /// stream its SPS describes.
+    /// The stream its SPS describes.
+    stream: Stream,
+    /// Why the codec takes none of the stream's pictures, where it takes none.
     undecoded: Option<Undecoded>,
 }
 
 /// A stream whose pictures the host's decoders take none of: what the codec's `check_supported`
-/// refuses of its SPS (a profile, chroma format, bit depths or tools outside 4:2:0 at 8 bits, or
-/// HEVC's at 8 or 10), which every arm's decode of each picture checks, and what the SPS says the
-/// stream is, which the refusal's line names.
+/// refuses of its SPS (a profile, chroma format, bit depths or tools outside 4:2:0 at 8 bits,
+/// HEVC's at 8 or 10, and HEVC's 4:4:4 at 8), which every arm's decode of each picture checks, or
+/// what the arm declines of it ([`Backend::declines`]), and what the SPS says the stream is,
+/// which the refusal's line names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Undecoded {
-    /// What `check_supported` refuses.
+    /// What `check_supported` refuses, or the arm declines.
     why: String,
-    codec: Codec,
-    /// HEVC's `general_profile_idc`, H.264's `profile_idc`.
-    profile: u8,
-    /// `chroma_format_idc`.
-    chroma_format_idc: u8,
-    /// `BitDepthY`.
-    luma_bits: u8,
-    /// `BitDepthC`.
-    chroma_bits: u8,
-    /// The coded picture's width and height, in luma samples.
-    width: u32,
-    height: u32,
+    stream: Stream,
 }
 
-impl Undecoded {
-    /// HEVC's: `sps`'s, refused for `why`.
-    fn of_hevc(sps: &HevcSps, why: String) -> Self {
+impl Stream {
+    /// HEVC's: `sps`'s.
+    fn of_hevc(sps: &HevcSps) -> Self {
         Self {
-            why,
             codec: Codec::Hevc,
             profile: sps.profile_tier_level.general_profile_idc,
             chroma_format_idc: sps.chroma_format_idc,
@@ -1065,10 +1087,9 @@ impl Undecoded {
         }
     }
 
-    /// H.264's: `sps`'s, refused for `why`.
-    fn of_h264(sps: &H264Sps, why: String) -> Self {
+    /// H.264's: `sps`'s.
+    fn of_h264(sps: &H264Sps) -> Self {
         Self {
-            why,
             codec: Codec::H264,
             profile: sps.profile_idc,
             chroma_format_idc: sps.chroma_format_idc,
@@ -1078,30 +1099,33 @@ impl Undecoded {
             height: sps.coded_height(),
         }
     }
+}
 
+impl Undecoded {
     /// The kind of its refusal's line (docs/conventions.md, "Each degradation is logged once per
     /// boot, then counted"): the stream's codec, profile, chroma format and bit depths, so that
     /// the first stream of each is named, and the rest counted. They are spelled out, as the
     /// logger reads a kind up to its first digit; the size is left out, so that images of one
     /// kind at many sizes make one.
     fn kind(&self) -> String {
-        let codec = match self.codec {
+        let codec = match self.stream.codec {
             Codec::H264 => "AVC",
             Codec::Hevc => "HEVC",
         };
         format!(
             "{codec} profile {} chroma format {}, luma {} bits, chroma {} bits",
-            spelled(self.profile.into()),
-            spelled(self.chroma_format_idc.into()),
-            spelled(self.luma_bits.into()),
-            spelled(self.chroma_bits.into()),
+            spelled(self.stream.profile.into()),
+            spelled(self.stream.chroma_format_idc.into()),
+            spelled(self.stream.luma_bits.into()),
+            spelled(self.stream.chroma_bits.into()),
         )
     }
 }
 
 impl std::fmt::Display for Undecoded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (codec, profile) = match self.codec {
+        let stream = &self.stream;
+        let (codec, profile) = match stream.codec {
             Codec::H264 => ("H.264", "profile_idc"),
             Codec::Hevc => ("HEVC", "general_profile_idc"),
         };
@@ -1109,12 +1133,12 @@ impl std::fmt::Display for Undecoded {
             f,
             "{} ({codec} {profile} {}, chroma_format_idc {}, luma {} bits, chroma {} bits, {}x{})",
             self.why,
-            self.profile,
-            self.chroma_format_idc,
-            self.luma_bits,
-            self.chroma_bits,
-            self.width,
-            self.height
+            stream.profile,
+            stream.chroma_format_idc,
+            stream.luma_bits,
+            stream.chroma_bits,
+            stream.width,
+            stream.height
         )
     }
 }
@@ -1130,6 +1154,18 @@ fn spelled(n: u32) -> String {
     words.join("-")
 }
 
+/// Why the host decodes none of `record`'s stream's pictures on `backend`, where it decodes none:
+/// what the codec refuses of it, else what the arm declines.
+fn undecoded(backend: &dyn Backend, record: &Record) -> Option<Undecoded> {
+    (record.undecoded.clone()).or_else(|| {
+        let why = backend.declines(&record.stream)?;
+        Some(Undecoded {
+            why,
+            stream: record.stream,
+        })
+    })
+}
+
 /// Reads `config`'s record, or the status a session on it is refused with: a record that does
 /// not read, and 3-byte NAL unit lengths, which ISO/IEC 14496-15 does not allow,
 /// `kVTVideoDecoderUnsupportedDataFormatErr`; an H.264 SPS that lets pictures be fields
@@ -1138,7 +1174,7 @@ fn spelled(n: u32) -> String {
 /// ([`Record::undecoded`]).
 fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
     let unsupported = status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT;
-    let (length_size, units, ten_bit, full_range, undecoded) = match config.codec {
+    let (length_size, units, ten_bit, full_range, stream, undecoded) = match config.codec {
         Codec::H264 => {
             let record =
                 avcc::DecoderConfiguration::parse(&config.record).map_err(|_| unsupported)?;
@@ -1156,11 +1192,21 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
                 .chain(&record.picture_parameter_sets)
                 .copied()
                 .collect();
-            let undecoded = (h264::check_supported(&sps).err())
-                .map(|error| Undecoded::of_h264(&sps, error.to_string()));
+            let stream = Stream::of_h264(&sps);
+            let undecoded = (h264::check_supported(&sps).err()).map(|error| Undecoded {
+                why: error.to_string(),
+                stream,
+            });
             let ten_bit = sps.bit_depth_luma_minus8 > 0;
             let full_range = sps.is_full_range();
-            (record.length_size, units, ten_bit, full_range, undecoded)
+            (
+                record.length_size,
+                units,
+                ten_bit,
+                full_range,
+                stream,
+                undecoded,
+            )
         }
         Codec::Hevc => {
             let record =
@@ -1178,13 +1224,17 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
                 .vui
                 .as_ref()
                 .is_some_and(|vui| vui.video_full_range_flag);
-            let undecoded = (hevc::check_supported(&sps).err())
-                .map(|error| Undecoded::of_hevc(&sps, error.to_string()));
+            let stream = Stream::of_hevc(&sps);
+            let undecoded = (hevc::check_supported(&sps).err()).map(|error| Undecoded {
+                why: error.to_string(),
+                stream,
+            });
             (
                 record.length_size,
                 record.nal_units,
                 sps.bit_depth_luma_minus8 > 0,
                 full,
+                stream,
                 undecoded,
             )
         }
@@ -1202,6 +1252,7 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
         parameter_sets,
         ten_bit,
         full_range,
+        stream,
         undecoded,
     })
 }

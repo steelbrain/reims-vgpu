@@ -56,6 +56,13 @@
 //!   output's pages above, else read back and copied by the CPU, each reason logged once a
 //!   decoder. So every decode codec of the caps has one, and the device offers `VT_MESSAGES`
 //!   where NVDEC decodes H.264 or HEVC.
+//!   - **HEVC's 4:4:4 at 8 bits**, the range extensions' streams the codec crate decodes, has a
+//!     paravirtual session where NVDEC decodes HEVC at 4:4:4 and that depth into its three
+//!     planes, at the stream's size; elsewhere the session is refused at its start, the reason
+//!     named (`GraphicsVideo::guest_declines`), and the guest decodes in software. The picture
+//!     lands in the surface's 4:4:4 formats ('444v', '444f'), its luma as it lies and its Cb and
+//!     Cr interleaved into the surface's second plane by the CPU, from the picture read back:
+//!     the write of two planes refuses a picture of three, and that reason is logged.
 //! - **VideoToolbox's paravirtual encoders** (`encode`'s `guest`): an arm64 guest's encode, of
 //!   each codec NVENC encodes a profile of, on an NVENC encoder of its own, each source frame read
 //!   from the IOSurface its kext lent: copied by the GPU into memory NVENC reads, as an x86
@@ -80,9 +87,9 @@ use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::nvidia::{
     AnnexBCodec, AnnexBDecoder, AnnexBPicture, ChromaFormat, DecodeCapabilities, DevicePlane,
     EncodeProfileSupport, Gpu, GpuSelector, ImportedBuffer, MemoryPlane, NvdecCodec, ReadPlane,
-    decode_capabilities, encode_profiles,
+    SurfaceFormat, decode_capabilities, encode_profiles,
 };
-use reims_vgpu_video::paravirt::{Encoder, EncoderConfig};
+use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, Stream};
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
@@ -408,6 +415,52 @@ fn supported(gpu: &Gpu, codec: NvdecCodec, bit_depth: u32) -> Option<DecodeCapab
     }
 }
 
+/// Why NVDEC's decoders take none of `stream`'s pictures, an HEVC stream at 4:4:4: NVDEC's caps
+/// of HEVC at 4:4:4 and the stream's depth, which are to say it decodes it, into its three
+/// planes (`SurfaceFormat::Yuv444` at 8 bits, `Yuv444_16Bit` past), at the stream's size; `None`
+/// where they do.
+fn declines_4_4_4(gpu: &Gpu, stream: &Stream) -> Option<String> {
+    let bits = u32::from(stream.luma_bits);
+    let caps = match decode_capabilities(gpu, NvdecCodec::Hevc, ChromaFormat::Yuv444, bits) {
+        Ok(caps) => caps,
+        Err(error) => {
+            return Some(format!(
+                "{NAME}'s caps of HEVC 4:4:4 at {bits} bits: {error}"
+            ));
+        }
+    };
+    let output = if bits > 8 {
+        SurfaceFormat::Yuv444_16Bit
+    } else {
+        SurfaceFormat::Yuv444
+    };
+    let (width, height) = (stream.width, stream.height);
+    if !caps.supported {
+        Some(format!("{NAME} does not decode HEVC 4:4:4 at {bits} bits"))
+    } else if !caps.output_formats.contains(&output) {
+        Some(format!(
+            "{NAME} writes HEVC 4:4:4 at {bits} bits as {:?}, not {output:?}",
+            caps.output_formats
+        ))
+    } else if width < caps.min_width || height < caps.min_height {
+        Some(format!(
+            "{NAME} decodes HEVC 4:4:4 from {}x{}, not {width}x{height}",
+            caps.min_width, caps.min_height
+        ))
+    } else if width > caps.max_width
+        || height > caps.max_height
+        || u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16))
+            > u64::from(caps.max_macroblocks)
+    {
+        Some(format!(
+            "{NAME} decodes HEVC 4:4:4 up to {}x{} ({} macroblocks), not {width}x{height}",
+            caps.max_width, caps.max_height, caps.max_macroblocks
+        ))
+    } else {
+        None
+    }
+}
+
 /// The caps of `codec`'s decode at the least of the sizes NVDEC answers in `answered`, at least
 /// one; its profiles, formats, level and DPB are the caller's.
 fn decode_caps(codec: u32, answered: &[DecodeCapabilities]) -> RgfxVideoCodecCaps {
@@ -507,10 +560,23 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
             RGFX_VIDEO_CODEC_HEVC if video.hevc.is_some() => AnnexBCodec::Hevc,
             _ => return None,
         };
+        let mut decoder = AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime);
+        decoder.lands_4_4_4();
         Some(Box::new(NvGuestDecoder {
-            decoder: AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime),
+            decoder,
             said: Vec::new(),
         }))
+    }
+
+    /// 4:2:0 streams, and HEVC's at 4:4:4 where NVDEC decodes them ([`declines_4_4_4`]).
+    fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
+        match stream.chroma_format_idc {
+            1 => None,
+            3 if codec == RGFX_VIDEO_CODEC_HEVC => declines_4_4_4(&self.0.gpu, stream),
+            _ => Some(format!(
+                "{NAME}'s decoders land 4:2:0 pictures, and HEVC's 4:4:4, alone"
+            )),
+        }
     }
 }
 
@@ -620,10 +686,12 @@ impl<P: Platform> NvdecPicture<P> {
             row_bytes: plane.bytes_per_row,
             rows: usize::try_from(plane.rows).unwrap_or(0),
         };
-        let [luma, chroma] = read.planes();
+        let [luma, chroma] = &read.planes()[..] else {
+            return Err("a 4:4:4 picture for a 4:2:0 output".into());
+        };
         // SAFETY: each plane's rows lie in the decoder's staging memory, packed, which `read`
         // holds through the copy and which lies apart from the output's planes.
-        unsafe { to.copy_rows(source(&luma), source(&chroma)) }
+        unsafe { to.copy_rows(source(luma), source(chroma)) }
     }
 
     /// Writes the picture into `to`'s planes' device caches by a copy within the GPU, where both
@@ -871,6 +939,14 @@ impl NvGuestDecoder {
                 output.layout.pixel_format
             )));
         }
+        let four_four_four = picture.four_four_four();
+        if target.pixel_format().is_4_4_4() != four_four_four {
+            let chroma = if four_four_four { "4:4:4" } else { "4:2:0" };
+            return Err(VideoError::Unsupported(format!(
+                "a {chroma} picture for a '{}' surface",
+                output.layout.pixel_format
+            )));
+        }
         let size = (target.width(), target.height());
         let planes = target.planes();
         let [luma, chroma] = planes.map(|plane| MemoryPlane {
@@ -904,7 +980,13 @@ impl NvGuestDecoder {
         // the surface lent, its pages wired, until the host's `rels`, sent once this returns.
         let surface =
             unsafe { std::slice::from_raw_parts_mut(view.first.as_ptr().add(view.offset), length) };
-        copy_planes(&read.planes(), &planes, surface).map_err(VideoError::Malfunction)?;
+        let read = read.planes();
+        if four_four_four {
+            interleave_planes(&read, &planes, surface, sample)
+        } else {
+            copy_planes(&read, &planes, surface)
+        }
+        .map_err(VideoError::Malfunction)?;
         drop(view);
         Ok(true)
     }
@@ -924,42 +1006,128 @@ impl Drop for NvGuestDecoder {
 
 /// Copies the rows `read` holds, luma then chroma, into `planes` of `surface`, the surface's
 /// bytes from its first: each row as far as the plane's rows hold it, as many rows as both have.
-/// `Err` says where a plane's rows lie past the surface; nothing is written then.
+/// `Err` says where a plane's rows lie past the surface, or that `read` is not two planes;
+/// nothing is written then.
 fn copy_planes(
-    read: &[ReadPlane<'_>; 2],
+    read: &[ReadPlane<'_>],
     planes: &[TargetPlane; 2],
     surface: &mut [u8],
 ) -> Result<(), String> {
-    let span = |read: &ReadPlane<'_>, plane: &TargetPlane| {
-        let rows = usize::try_from(read.rows.min(plane.rows)).unwrap_or(usize::MAX);
-        let row_bytes = read.bytes_per_row.min(plane.row_bytes);
-        let end = match rows.checked_sub(1) {
-            None => Some(plane.offset),
-            Some(past) => (past.checked_mul(plane.bytes_per_row))
-                .and_then(|bytes| bytes.checked_add(plane.offset))
-                .and_then(|bytes| bytes.checked_add(row_bytes)),
-        };
-        let sourced = rows
-            .checked_mul(read.bytes_per_row)
-            .is_some_and(|bytes| bytes <= read.bytes.len());
-        match end {
-            Some(end) if end <= surface.len() && sourced => Ok((rows, row_bytes)),
-            _ => Err(format!(
-                "a plane at {} of {rows} rows {} bytes apart past the surface's {} bytes",
-                plane.offset,
-                plane.bytes_per_row,
-                surface.len()
-            )),
-        }
+    let [luma, chroma] = read else {
+        return Err(format!("{} planes read back for 2", read.len()));
     };
-    let spans = [span(&read[0], &planes[0])?, span(&read[1], &planes[1])?];
-    for ((read, plane), (rows, row_bytes)) in read.iter().zip(planes).zip(spans) {
-        for row in 0..rows {
-            let from = &read.bytes[row * read.bytes_per_row..][..row_bytes];
-            surface[plane.offset + row * plane.bytes_per_row..][..row_bytes].copy_from_slice(from);
+    let spans = [
+        plane_span(luma, &planes[0], surface.len())?,
+        plane_span(chroma, &planes[1], surface.len())?,
+    ];
+    for ((read, plane), (rows, row_bytes)) in [luma, chroma].into_iter().zip(planes).zip(spans) {
+        copy_rows(read, plane, surface, rows, row_bytes);
+    }
+    Ok(())
+}
+
+/// Copies the rows a 4:4:4 picture's `read` holds, luma, Cb and Cr, into `planes` of `surface`
+/// as [`copy_planes`] does: the luma as it lies, and Cb and Cr interleaved into the chroma plane,
+/// a Cb and a Cr sample of `sample` bytes for each luma sample, Cb first, as the surface's 4:4:4
+/// formats lay it ('444v', '444f'). `Err` says where a plane's rows lie past the surface or past
+/// what was read back, or that `read` is not three planes; nothing is written then.
+fn interleave_planes(
+    read: &[ReadPlane<'_>],
+    planes: &[TargetPlane; 2],
+    surface: &mut [u8],
+    sample: usize,
+) -> Result<(), String> {
+    let [luma, cb, cr] = read else {
+        return Err(format!("{} planes read back for 3", read.len()));
+    };
+    let (pair, chroma) = (2 * sample.max(1), &planes[1]);
+    let luma_span = plane_span(luma, &planes[0], surface.len())?;
+    let samples = cb.bytes_per_row.min(cr.bytes_per_row) / sample.max(1);
+    let (rows, row_bytes) = span(
+        cb.rows.min(cr.rows),
+        samples.saturating_mul(pair),
+        chroma,
+        surface.len(),
+    )?;
+    if !holds(cb, rows) || !holds(cr, rows) {
+        return Err(format!("{rows} rows of Cb and Cr past what was read back"));
+    }
+    copy_rows(luma, &planes[0], surface, luma_span.0, luma_span.1);
+    let pairs = row_bytes / pair;
+    for row in 0..rows {
+        let to = &mut surface[chroma.offset + row * chroma.bytes_per_row..][..pairs * pair];
+        let cb = cb.bytes[row * cb.bytes_per_row..].chunks_exact(pair / 2);
+        let cr = cr.bytes[row * cr.bytes_per_row..].chunks_exact(pair / 2);
+        for ((to, cb), cr) in to.chunks_exact_mut(pair).zip(cb).zip(cr) {
+            let (to_cb, to_cr) = to.split_at_mut(pair / 2);
+            to_cb.copy_from_slice(cb);
+            to_cr.copy_from_slice(cr);
         }
     }
     Ok(())
+}
+
+/// The rows and each one's bytes that a copy of `read` writes into `plane` ([`span`]), where
+/// `read` holds them; `Err` where they lie past the surface's `surface` bytes.
+fn plane_span(
+    read: &ReadPlane<'_>,
+    plane: &TargetPlane,
+    surface: usize,
+) -> Result<(usize, usize), String> {
+    let (rows, row_bytes) = span(read.rows, read.bytes_per_row, plane, surface)?;
+    if !holds(read, rows) {
+        return Err(format!(
+            "a plane at {} of {rows} rows {} bytes apart past the surface's {surface} bytes",
+            plane.offset, plane.bytes_per_row
+        ));
+    }
+    Ok((rows, row_bytes))
+}
+
+/// The rows of `plane`, of a surface of `surface` bytes, that a copy of `rows` rows of
+/// `row_bytes` each writes, as many as both have, and each one's bytes, as far as the plane's
+/// rows hold it; `Err` where they lie past the surface.
+fn span(
+    rows: u32,
+    row_bytes: usize,
+    plane: &TargetPlane,
+    surface: usize,
+) -> Result<(usize, usize), String> {
+    let rows = usize::try_from(rows.min(plane.rows)).unwrap_or(usize::MAX);
+    let row_bytes = row_bytes.min(plane.row_bytes);
+    let end = match rows.checked_sub(1) {
+        None => Some(plane.offset),
+        Some(past) => (past.checked_mul(plane.bytes_per_row))
+            .and_then(|bytes| bytes.checked_add(plane.offset))
+            .and_then(|bytes| bytes.checked_add(row_bytes)),
+    };
+    match end {
+        Some(end) if end <= surface => Ok((rows, row_bytes)),
+        _ => Err(format!(
+            "a plane at {} of {rows} rows {} bytes apart past the surface's {surface} bytes",
+            plane.offset, plane.bytes_per_row
+        )),
+    }
+}
+
+/// Whether `read`'s bytes hold `rows` of its rows.
+fn holds(read: &ReadPlane<'_>, rows: usize) -> bool {
+    (rows.checked_mul(read.bytes_per_row)).is_some_and(|bytes| bytes <= read.bytes.len())
+}
+
+/// Copies `rows` of `read`'s rows, `row_bytes` of each, into `plane` of `surface`, a span
+/// [`plane_span`] answered.
+fn copy_rows(
+    read: &ReadPlane<'_>,
+    plane: &TargetPlane,
+    surface: &mut [u8],
+    rows: usize,
+    row_bytes: usize,
+) {
+    for row in 0..rows {
+        let from = &read.bytes[row * read.bytes_per_row..][..row_bytes];
+        surface[plane.offset + row * plane.bytes_per_row..][..row_bytes].copy_from_slice(from);
+    }
 }
 
 /// What a VideoToolbox decoder sees of `error`: a stream that does not decode, or whose picture

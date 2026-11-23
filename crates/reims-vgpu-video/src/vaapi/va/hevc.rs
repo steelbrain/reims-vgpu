@@ -209,18 +209,25 @@ impl VaHevc {
 }
 
 /// The VA profile and surface format for `sps`'s stream: Main at 8 bits,
-/// Main 10 at 10 (`check_supported` has refused the rest).
-fn profile_for(sps: &Sps) -> (Profile, SurfaceFormat) {
-    if sps.bit_depth_luma_minus8 == 0 {
+/// Main 10 at 10, of 4:2:0 (`check_supported` has refused other depths);
+/// none for the range extensions' 4:4:4, whose pictures this module does
+/// not land.
+fn profile_for(sps: &Sps) -> Result<(Profile, SurfaceFormat), Error> {
+    if sps.chroma_format_idc != 1 {
+        return Err(Error::Unsupported(
+            "HEVC: VA-API decodes 4:2:0 here, not the range extensions' 4:4:4".into(),
+        ));
+    }
+    Ok(if sps.bit_depth_luma_minus8 == 0 {
         (Profile::HEVC_MAIN, SurfaceFormat::Nv12)
     } else {
         (Profile::HEVC_MAIN10, SurfaceFormat::P010)
-    }
+    })
 }
 
 /// The VA profile, when the driver decodes `sps`'s stream at its size.
 fn select_profile(display: &Display, sps: &Sps) -> Result<Profile, Error> {
-    let (profile, format) = profile_for(sps);
+    let (profile, format) = profile_for(sps)?;
     let name = profile.name().unwrap_or("HEVC");
     if !display.supports(profile, Entrypoint::VLD) {
         return Err(Error::Unsupported(format!(
@@ -263,7 +270,7 @@ impl Accelerator for VaHevc {
     fn configure(&mut self, sps: &Sps, _dpb_size: usize) -> Result<(), Error> {
         self.session = None;
         let profile = select_profile(&self.display, sps)?;
-        let (_, format) = profile_for(sps);
+        let (_, format) = profile_for(sps)?;
         let (width, height) = (
             sps.pic_width_in_luma_samples,
             sps.pic_height_in_luma_samples,

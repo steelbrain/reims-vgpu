@@ -26,6 +26,10 @@
 //!   ([`AnnexBDecoder::copy_failed_pictures`]), is written or read back as
 //!   NVDEC left it, telling its status, and the pictures after it decode, as
 //!   a Mac's hardware decoders hand them on.
+//! - **A 4:4:4 picture** (HEVC's range extensions, where the caller lands
+//!   them, [`AnnexBDecoder::lands_4_4_4`]) decodes into three planes, luma,
+//!   Cb and Cr, each as large, which it reads back; its writes, of two
+//!   planes, refuse it.
 //! - **A picture holds its decode surface** until it drops: the decoder has
 //!   [`AnnexBDecoder::SPARE_PICTURES`] surfaces beyond its references and
 //!   the picture being decoded, and a decode with none free is
@@ -56,7 +60,8 @@ use crate::nvidia::wait::Deadline;
 pub enum AnnexBCodec {
     /// H.264, of the profiles the codec crate decodes.
     H264,
-    /// HEVC, Main and Main 10.
+    /// HEVC, Main and Main 10, and the range extensions' 4:4:4 at 8 bits
+    /// where the caller lands them ([`AnnexBDecoder::lands_4_4_4`]).
     Hevc,
 }
 
@@ -139,6 +144,16 @@ impl AnnexBDecoder {
     /// ([`AnnexBPicture::copied_failed`]).
     pub fn copy_failed_pictures(&mut self) {
         self.failed = OnFailed::Copy;
+    }
+
+    /// Has an HEVC stream's 4:4:4 pictures decoded, each in three planes,
+    /// which the caller reads back ([`AnnexBPicture::four_four_four`]);
+    /// without it, a 4:4:4 stream's decoder is refused when its SPS is
+    /// taken. An H.264 decoder is left as it is.
+    pub fn lands_4_4_4(&mut self) {
+        if let Codec::Hevc(decoder) = &mut self.codec {
+            decoder.accelerator_mut().four_four_four = true;
+        }
     }
 
     /// Takes parameter sets (H.264's SPS and PPS, HEVC's VPS, SPS and PPS),
@@ -332,15 +347,17 @@ pub struct ReadPlane<'a> {
 pub struct ReadBack<'a>(PictureReadBack<'a>);
 
 impl ReadBack<'_> {
-    /// The luma and the chroma (interleaved Cb and Cr, half as tall).
-    pub fn planes(&self) -> [ReadPlane<'_>; 2] {
-        self.0
-            .planes()
+    /// The luma and the chroma (interleaved Cb and Cr, half as tall), or a
+    /// 4:4:4 picture's luma, Cb and Cr, each as large
+    /// ([`AnnexBPicture::four_four_four`]).
+    pub fn planes(&self) -> Vec<ReadPlane<'_>> {
+        (self.0.planes().into_iter())
             .map(|(bytes, bytes_per_row, rows)| ReadPlane {
                 bytes,
                 bytes_per_row,
                 rows,
             })
+            .collect()
     }
 }
 
@@ -362,6 +379,18 @@ impl AnnexBPicture {
     /// sample's high bits, as P010's).
     pub fn bytes_per_sample(&self) -> usize {
         self.picture.bytes_per_sample()
+    }
+
+    /// Whether it is a 4:4:4 picture, in three planes, luma, Cb and Cr, each
+    /// as large ([`AnnexBDecoder::lands_4_4_4`]): its read back has the
+    /// three, and its writes, of two planes, refuse it.
+    pub fn four_four_four(&self) -> bool {
+        self.picture.plane_count() == 3
+    }
+
+    /// The refusal of a write of two planes, where it is 4:4:4.
+    fn refuse_two_planes(&self) -> Option<String> {
+        (self.four_four_four()).then(|| "a 4:4:4 picture's three planes into two".to_owned())
     }
 
     /// NVDEC's status of its decode, where NVDEC answered it failed and a
@@ -445,6 +474,9 @@ impl AnnexBPicture {
         chroma: MemoryPlane<'_>,
         hold: Box<dyn Any + Send>,
     ) -> Result<Result<(), String>, Error> {
+        if let Some(why) = self.refuse_two_planes() {
+            return Ok(Err(why));
+        }
         let gpu = self.picture.gpu();
         let mut written: Vec<Box<dyn Any + Send>> = vec![hold];
         let mut destinations = Vec::with_capacity(2);
@@ -473,9 +505,6 @@ impl AnnexBPicture {
             });
             written.push(Box::new(registration));
         }
-        let [luma, chroma] = destinations[..] else {
-            return Ok(Err("not two planes".to_owned()));
-        };
         let deadline = Deadline::default();
         // SAFETY: each destination is a plane's rows alone, in a view its
         // registration keeps mapped and pinned, which the caller lets the
@@ -484,8 +513,7 @@ impl AnnexBPicture {
         let copied = unsafe {
             (self.picture).write_into(
                 self.crop_at(size),
-                luma,
-                chroma,
+                destinations,
                 written,
                 &deadline,
                 self.on_failed,
@@ -518,6 +546,9 @@ impl AnnexBPicture {
         chroma: DevicePlane<'_>,
         hold: Box<dyn Any + Send>,
     ) -> Result<Result<(), String>, Error> {
+        if let Some(why) = self.refuse_two_planes() {
+            return Ok(Err(why));
+        }
         let gpu = self.picture.gpu();
         let mut written: Vec<Box<dyn Any + Send>> = vec![hold];
         let mut destinations = Vec::with_capacity(2);
@@ -544,9 +575,6 @@ impl AnnexBPicture {
             });
             written.push(Box::new(Arc::clone(plane.buffer)));
         }
-        let [luma, chroma] = destinations[..] else {
-            return Ok(Err("not two planes".to_owned()));
-        };
         let deadline = Deadline::default();
         // SAFETY: each destination is a plane's rows alone, in a buffer imported on the
         // picture's GPU and mapped in its context, which the caller lets the GPU write and
@@ -554,8 +582,7 @@ impl AnnexBPicture {
         let copied = unsafe {
             (self.picture).write_into(
                 self.crop_at(size),
-                luma,
-                chroma,
+                destinations,
                 written,
                 &deadline,
                 self.on_failed,

@@ -194,6 +194,8 @@ pub struct SliceHeader {
     pub slice_cb_qp_offset: i8,
     /// `slice_cr_qp_offset`.
     pub slice_cr_qp_offset: i8,
+    /// `cu_chroma_qp_offset_enabled_flag`, of a PPS with `chroma_qp_offset_list_enabled_flag`.
+    pub cu_chroma_qp_offset_enabled_flag: bool,
     /// `slice_deblocking_filter_disabled_flag` (the PPS's when absent).
     pub slice_deblocking_filter_disabled_flag: bool,
     /// `slice_beta_offset_div2` (the PPS's when absent).
@@ -506,6 +508,9 @@ impl SliceHeader {
                 return Err(Error::OutOfRange("pps_cr_qp_offset + slice_cr_qp_offset"));
             }
         }
+        // The SCC extension's slice_act_*_qp_offset come first, in a PPS this decoder refuses.
+        let cu_chroma_qp_offset_enabled_flag =
+            pps.range_extension.chroma_qp_offset_list_enabled_flag && r.bit()?;
         let override_deblocking = pps.deblocking_filter_override_enabled_flag && r.bit()?;
         let mut slice_deblocking_filter_disabled_flag = pps.pps_deblocking_filter_disabled_flag;
         let mut slice_beta_offset_div2 = pps.pps_beta_offset_div2;
@@ -559,6 +564,7 @@ impl SliceHeader {
             slice_qp_delta,
             slice_cb_qp_offset,
             slice_cr_qp_offset,
+            cu_chroma_qp_offset_enabled_flag,
             slice_deblocking_filter_disabled_flag,
             slice_beta_offset_div2,
             slice_tc_offset_div2,

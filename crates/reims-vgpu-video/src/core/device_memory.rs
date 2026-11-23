@@ -268,7 +268,8 @@ pub struct TargetPlane {
     /// Its rows.
     pub rows: u32,
     /// The bytes of each row a frame as wide as the surface fills: its
-    /// samples, an interleaved Cb and Cr pair for every two luma samples.
+    /// samples, an interleaved Cb and Cr pair for every two luma samples
+    /// (4:2:0) or for every one (4:4:4).
     pub row_bytes: usize,
 }
 
@@ -277,7 +278,7 @@ pub struct TargetPlane {
 ///
 /// What [`GuestTarget::new`] checks, so that a device that writes a plane's
 /// rows writes inside the surface's allocation and nowhere else: a 4:2:0
-/// format in two planes, luma then interleaved chroma, in ascending order
+/// or 4:4:4 format in two planes, luma then interleaved chroma, in ascending order
 /// without overlapping, each row at least as long as the plane's samples,
 /// and the last row of each ending inside the memory. A backend checks besides what
 /// its driver takes (pitches, alignments, sizes) and how far its device
@@ -320,11 +321,14 @@ impl<'a> GuestTarget<'a> {
         };
         let sample = format.bytes_per_sample();
         let width = usize::try_from(layout.width).map_err(|_| "too wide".to_owned())?;
-        let row_bytes = [
-            width.checked_mul(sample),
-            width.div_ceil(2).checked_mul(2 * sample),
-        ];
-        let rows = [layout.height, layout.height.div_ceil(2)];
+        // A Cb and Cr pair for every two columns and two rows of 4:2:0, every one of 4:4:4.
+        let (pairs, chroma_rows) = if format.is_4_4_4() {
+            (width, layout.height)
+        } else {
+            (width.div_ceil(2), layout.height.div_ceil(2))
+        };
+        let row_bytes = [width.checked_mul(sample), pairs.checked_mul(2 * sample)];
+        let rows = [layout.height, chroma_rows];
         let length = memory.length();
         let mut planes = [TargetPlane {
             offset: 0,

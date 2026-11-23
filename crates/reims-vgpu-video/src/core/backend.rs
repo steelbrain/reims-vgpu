@@ -17,6 +17,10 @@ pub enum PixelFormat {
     P010VideoRange,
     /// The same, full range: `xf20`.
     P010FullRange,
+    /// 8-bit 4:4:4, Y then interleaved CbCr as wide and tall, video range: `444v`.
+    Yuv444VideoRange,
+    /// The same, full range: `444f`.
+    Yuv444FullRange,
 }
 
 impl PixelFormat {
@@ -27,6 +31,8 @@ impl PixelFormat {
             Self::Nv12FullRange => *b"420f",
             Self::P010VideoRange => *b"x420",
             Self::P010FullRange => *b"xf20",
+            Self::Yuv444VideoRange => *b"444v",
+            Self::Yuv444FullRange => *b"444f",
         })
     }
 
@@ -38,6 +44,8 @@ impl PixelFormat {
             Self::Nv12FullRange,
             Self::P010VideoRange,
             Self::P010FullRange,
+            Self::Yuv444VideoRange,
+            Self::Yuv444FullRange,
         ]
         .into_iter()
         .find(|known| known.fourcc() == format)
@@ -46,9 +54,17 @@ impl PixelFormat {
     /// The bytes one sample takes: 1 for 8-bit formats, 2 for 10-bit ones.
     pub const fn bytes_per_sample(self) -> usize {
         match self {
-            Self::Nv12VideoRange | Self::Nv12FullRange => 1,
+            Self::Nv12VideoRange
+            | Self::Nv12FullRange
+            | Self::Yuv444VideoRange
+            | Self::Yuv444FullRange => 1,
             Self::P010VideoRange | Self::P010FullRange => 2,
         }
+    }
+
+    /// Whether its chroma is as wide and tall as its luma (4:4:4), not half each way (4:2:0).
+    pub const fn is_4_4_4(self) -> bool {
+        matches!(self, Self::Yuv444VideoRange | Self::Yuv444FullRange)
     }
 }
 
@@ -93,6 +109,10 @@ mod tests {
         assert_eq!(
             PixelFormat::from_fourcc(FourCc::new(*b"xf20")),
             Some(PixelFormat::P010FullRange)
+        );
+        assert_eq!(
+            PixelFormat::from_fourcc(FourCc::new(*b"444f")),
+            Some(PixelFormat::Yuv444FullRange)
         );
         assert_eq!(PixelFormat::from_fourcc(FourCc::new(*b"BGRA")), None);
     }
