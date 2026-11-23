@@ -19,19 +19,25 @@
 //! **The draws' check**, a diagnostic: where the draws are made, the open draws a picture of
 //! known samples into a pair of targets of its own, imported as a cache's are, and writes one
 //! line of what the Direct3D 11 device and the device each read of each plane, and what the
-//! driver answers of rt's import (`graphics::drawn_check`, [`check`]). Nothing decides by it.
+//! driver answers of rt's import (`graphics::drawn_check`, [`check`]). The device reads each
+//! plane twice, sampled by a draw and copied by a blit, the draw's target cleared to -1 and the
+//! host's bytes set to all ones first, so that a read that wrote nothing shows. Nothing decides
+//! by it.
 
 use std::sync::Arc;
 
 use reims_vgpu_video::core::backend::DeviceWrite;
 use reims_vgpu_video::vaapi::{Frame, GuestWrites, PlaneDraw};
 use reims_vgpu_vulkan::RtPlatform;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_vulkan::core::platform::resource::{Library as _, Texture as _};
-use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Library as _, Texture as _};
+use reims_vgpu_vulkan::core::platform::types::{
+    ClearColor, CommandBufferStatus, MtlOrigin, MtlSize,
+};
 use reims_vgpu_vulkan::core::platform::values::{
     ColorAttachmentSet, RenderPipelineDesc, TextureDesc,
 };
@@ -162,8 +168,13 @@ fn check_depth(
         let read = match draw.draw(&texture, case.origin, &targets, case.extent) {
             Err(why) => format!("not drawn ({why})"),
             Ok(()) => {
-                let sampled = (made.memory.external_writes_done()).and_then(|()| match reader {
+                let done = made.memory.external_writes_done();
+                let sampled = (done.clone()).and_then(|()| match reader {
                     Ok(reader) => reader.read(&made.planes),
+                    Err(why) => Err(why.clone()),
+                });
+                let copied = done.and_then(|()| match reader {
+                    Ok(reader) => reader.copy(&made.planes, ten_bit),
                     Err(why) => Err(why.clone()),
                 });
                 let back = draw.read_back(&targets);
@@ -183,8 +194,15 @@ fn check_depth(
                         }
                         Err(why) => format!("not read ({why})"),
                     };
+                    let blit = match &copied {
+                        Ok(bytes) => {
+                            let got = drawn_check::from_bytes(ten_bit, plane, &bytes[plane]);
+                            drawn_check::compare(plane, &want, &got)
+                        }
+                        Err(why) => format!("not copied ({why})"),
+                    };
                     let name = if plane == 0 { "luma" } else { "chroma" };
-                    format!("{name} Direct3D {d3d}, rt {rt}")
+                    format!("{name} Direct3D {d3d}, rt sampled {rt}, rt copied {blit}")
                 };
                 format!("{}, {}", side(0), side(1))
             }
@@ -204,12 +222,21 @@ const READ_USAGE: u64 = 0x4;
 /// `MTLPrimitiveTypeTriangle`.
 const TRIANGLE: u64 = 3;
 
+/// The reader's clear colour, which no sample reads as.
+const UNREAD: ClearColor = ClearColor {
+    red: -1.0,
+    green: -1.0,
+    blue: -1.0,
+    alpha: -1.0,
+};
+
 /// `MTLLoadActionClear` and `MTLStoreActionStore`.
 const LOAD_CLEAR: u64 = 2;
 const STORE_STORE: u64 = 1;
 
-/// The device's reads of a plane through its texture, sampled as the guest's shaders sample it:
-/// a draw of each texel into a texture of [`READ_FORMAT`] that the host reads back.
+/// The device's reads of a plane through its texture: sampled as the guest's shaders sample it,
+/// a draw of each texel into a texture of [`READ_FORMAT`] cleared to [`UNREAD`] that the host
+/// reads back; and copied by a blit into a buffer (module doc's "The draws' check").
 struct Reader {
     platform: Arc<RtPlatform>,
     device: super::RtDevice,
@@ -292,6 +319,7 @@ impl Reader {
                 texture: Some(Some(&out)),
                 load_action: Some(LOAD_CLEAR),
                 store_action: Some(STORE_STORE),
+                clear_color: Some(UNREAD),
                 ..ColorAttachmentSet::default()
             },
         )
@@ -324,7 +352,7 @@ impl Reader {
         }
         let row = usize::try_from(width * 16).map_err(|_| "a plane too wide")?;
         let rows = usize::try_from(height).map_err(|_| "a plane too tall")?;
-        let mut bytes = vec![0u8; row * rows];
+        let mut bytes = vec![0xffu8; row * rows];
         self.platform.read_pixels(&out, &mut bytes, row);
         let (texels, _) = bytes.as_chunks::<16>();
         Ok((texels.iter())
@@ -333,6 +361,78 @@ impl Reader {
                 std::array::from_fn(|c| words.get(c).map_or(f32::NAN, |w| f32::from_le_bytes(*w)))
             })
             .collect())
+    }
+
+    /// What a blit copies of each of `planes` into a buffer, rows tight, of 16-bit samples where
+    /// `ten_bit`; `Err` says why it copied none.
+    fn copy(
+        &self,
+        planes: &[<RtPlatform as Platform>::Texture],
+        ten_bit: bool,
+    ) -> Result<[Vec<u8>; 2], String> {
+        let [luma, chroma] = planes else {
+            return Err(format!("a surface of {} planes", planes.len()));
+        };
+        let sample = if ten_bit { 2 } else { 1 };
+        Ok([
+            self.copy_plane(luma, sample)?,
+            self.copy_plane(chroma, 2 * sample)?,
+        ])
+    }
+
+    /// What a blit copies of `plane`, of `texel` bytes a texel ([`Self::copy`]); the buffer is
+    /// set to all ones first.
+    fn copy_plane(
+        &self,
+        plane: &<RtPlatform as Platform>::Texture,
+        texel: u64,
+    ) -> Result<Vec<u8>, String> {
+        let (width, height) = (plane.width(), plane.height());
+        let row = width * texel;
+        let length = row * height;
+        let raised = |what: &str, raise: &dyn std::fmt::Display| format!("{what}: {raise}");
+        let buffer = (self.device.new_buffer_of_length(OnFault::Return, length, 0))
+            .map_err(|raise| raised("the buffer", &raise))?
+            .ok_or("no buffer to copy into")?;
+        let size = usize::try_from(length).map_err(|_| "a plane too large")?;
+        let contents: *mut u8 = buffer.contents().as_ptr();
+        // SAFETY: the Shared buffer's contents are mapped, `length` bytes, and no work of the
+        // device's uses it yet.
+        unsafe { contents.write_bytes(0xff, size) };
+        let cb = (self.queue.command_buffer(OnFault::Return))
+            .map_err(|raise| raised("the command buffer", &raise))?
+            .ok_or("no command buffer")?;
+        let encoder = (cb.blit_encoder(OnFault::Return))
+            .map_err(|raise| raised("the encoder", &raise))?
+            .ok_or("no blit encoder")?;
+        let cmds = [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: plane,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin { x: 0, y: 0, z: 0 },
+                source_size: MtlSize {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                destination_buffer: &buffer,
+                destination_offset: 0,
+                destination_bytes_per_row: row,
+                destination_bytes_per_image: length,
+            },
+            BlitCmd::EndEncoding,
+        ];
+        for cmd in cmds {
+            (encoder.encode(OnFault::Return, cmd)).map_err(|raise| raised("the copy", &raise))?;
+        }
+        (cb.commit(OnFault::Return)).map_err(|raise| raised("the commit", &raise))?;
+        (cb.wait_until_completed(OnFault::Return)).map_err(|raise| raised("the wait", &raise))?;
+        if cb.status() != CommandBufferStatus::COMPLETED {
+            return Err(format!("the copy's command buffer ended {:?}", cb.status()));
+        }
+        // SAFETY: as above; the copy's work is done.
+        Ok(unsafe { std::slice::from_raw_parts(contents, size) }.to_vec())
     }
 }
 
