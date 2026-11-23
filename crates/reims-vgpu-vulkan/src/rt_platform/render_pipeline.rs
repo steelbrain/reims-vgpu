@@ -427,9 +427,10 @@ fn make(
     if let Err(error) = &made {
         super::diag::keep_refused_render(WITH_DESCRIPTOR, error, descriptor);
     }
+    let fragment = descriptor.fragment.as_ref().and_then(stage_function);
     let stages = [
         ("vertex", stage_function(&descriptor.vertex)),
-        ("fragment", descriptor.fragment.as_ref().and_then(stage_function)),
+        ("fragment", fragment),
     ];
     let functions: Named = (stages.into_iter())
         .filter_map(|(role, f)| f.map(|f| (role, f)))
