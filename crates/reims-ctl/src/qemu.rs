@@ -1395,7 +1395,10 @@ mod tests {
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(has(
             &a,
-            &["-drive", "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2"]
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2"
+            ]
         ));
         assert!(!a.iter().any(|x| x.contains("no-flush")), "{a:?}");
         vm.config.q35.as_mut().unwrap().installer = Some("/isos/BaseSystem.img".into());
@@ -1408,7 +1411,11 @@ mod tests {
             ]
         ));
         // Only the system disk: the installer's overlay and OpenCore's image keep theirs.
-        assert_eq!(a.iter().filter(|x| x.contains("no-flush")).count(), 1, "{a:?}");
+        assert_eq!(
+            a.iter().filter(|x| x.contains("no-flush")).count(),
+            1,
+            "{a:?}"
+        );
         vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Nvme;
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(has(
