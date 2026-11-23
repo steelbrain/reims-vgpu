@@ -199,7 +199,9 @@ What the drivers answered (**measured**, libva 2.24.1, 2026-11-07):
 XYUV's answer (**measured**, libva 2.24.1, 2026-11-23): radeonsi (Mesa
 26.2.6) on the Radeon 780M has none, `no XYUV image: vaCreateImage failed:
 invalid VAImageFormat (0x16)`, and lists no HEVC Main 4:4:4 decoder either,
-so its 4:4:4 streams are refused before any picture lands.
+so its 4:4:4 streams are refused before any picture lands. iHD 26.3.5 on
+the Iris Xe answers XYUV as it answers NV12 and P010: 64 bytes, whole rows
+(U26).
 
 The check has not run on NVIDIA's VA-API driver, which wrote nothing
 into an import and answered success (U16); its byte comparison fails
@@ -1129,6 +1131,14 @@ said:
   check passed XYUV ("The import check"), and declined otherwise. The
   graphics arm writes the frame so into a scratch of its device's, whose
   GPU then splits it into the guest's surface (`graphics::vaapi::xyuv`).
+  On iHD, which writes rows of whole 64 bytes alone, a picture whose row of
+  pixels is not (1366 wide: 5464 bytes) is declined and split by the CPU.
+  What it saves (**measured**, the Iris Xe of an i9-13900H, iHD 26.3.5,
+  2026-11-23, `xyuv`'s ignored test over 40 pictures of x265's main444-360p
+  and main444-720p-fade, each byte-equal to the CPU's split): the calling
+  thread's CPU time a picture, from the driver's write to the pass's end,
+  0.57 ms median and 0.87 ms mean, against 12.1 ms and 10.0 ms for the read
+  back and the CPU's split; its wall time 2.1 ms median against 13.2 ms.
   Else `ReadBack::copy_4_4_4_into` reads it back through `vaGetImage` (an
   XYUV image: there is no staged copy back of XYUV, which has no host
   surface) and splits it on the CPU into two planes, luma and each pixel's
