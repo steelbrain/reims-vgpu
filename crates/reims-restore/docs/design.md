@@ -353,7 +353,10 @@ Data out and has the first boot make it, by EACS:
   under HVF **[measured]**.
 - EACS deletes `/<G>/LocalPolicy/*` in iSCPreboot and `boop-storage-nonces` and
   `boop-storage-misc` from NVRAM **[measured]**, and only the restore can sign the macOS
-  LocalPolicy, so Ambrosia then stops ("LocalPolicy holds no single policy").
+  LocalPolicy, so Ambrosia then stops ("LocalPolicy holds no single policy"). The first boot
+  of 27.2.1 (26B131) under KVM left no `/<G>/` in iSCPreboot at all, and Ambrosia stopped at
+  `can't read the boot objects: APFS: no "<G>" in directory 0x2`; `finish-eacs` then readied
+  the VM as for the other **[measured, M1 Pro under KVM]**.
 - The restore keeps the iBoot system container's partition as it wrote it (`isc.pre-eacs`,
   sparse) and the auxiliary storage (`aux.pre-eacs`). `pipeline::finish_eacs`, after that boot,
   writes the partition back and puts the two NVRAM entries back into each bank, keeping what the

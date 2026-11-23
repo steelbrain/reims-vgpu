@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+What an arm64 guest's configuration adds under KVM, on an arm64 Linux host: Kernel > Patch alone.
+`make config-bundle KVM=1` (tools/stage-config.py's patches) and reims-ctl, for a VM whose
+accelerator is KVM (crates/reims-ctl/src/prebuilt.rs), append it to the configuration's
+Kernel > Patch.
+
+macOS's kernel sets up each redistributor of its GIC with a pre-indexed store,
+`str w9, [x8, #128]!`, to GICR_IGROUPR0 of the redistributor's SGI frame, then a plain one to
+GICR_ISENABLER0. A pre-indexed store traps with no instruction syndrome (ISV=0), and the
+redistributor is KVM's in-kernel vGIC, so neither KVM nor QEMU's ISV=0 emulator can complete it:
+the guest takes an external abort and panics early in its boot. The patch writes the same
+values to the same two registers with plain stores:
+
+  Find    mov w9, #0x81ffffff; str w9, [x8, #128]!; mov w9, #0x8000000; str w9, [x8, #128]
+  Replace mov w9, #0x81ffffff; str w9, [x8, #128];  mov w9, #0x8000000; str w9, [x8, #256]
+
+x8 then keeps its value instead of growing by 128, and the next instruction, `mrs x8,
+icc_sre_el1`, overwrites it (read in the kernelcaches below). The four instructions are in
+com.apple.kernel's __TEXT_EXEC once in each VirtualMac2,1 kernelcache of macOS 13.6, 14.0,
+14.6.1, 15.0, 15.6.1, 26.0, 26.6.2, 27.0.1 and 27.2.1 (measured, 2026-11-23), so Expect is 1: a
+kernel they are no longer in stops at Ambrosia with a named error instead of booting unpatched.
+-->
+<plist version="1.0">
+<dict>
+	<key>Kernel</key>
+	<dict>
+		<key>Patch</key>
+		<array>
+			<dict>
+				<key>Identifier</key>
+				<string>com.apple.kernel</string>
+				<key>Find</key>
+				<data>CcCvEgkNCLgJAKFSCYEAuQ==</data>
+				<key>Replace</key>
+				<data>CcCvEgmBALkJAKFSCQEBuQ==</data>
+				<key>Expect</key>
+				<integer>1</integer>
+			</dict>
+		</array>
+	</dict>
+</dict>
+</plist>

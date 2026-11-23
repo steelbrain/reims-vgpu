@@ -2452,6 +2452,49 @@ for x86-64 guests alone. `scripts/install-ctl.sh` builds that
 needs a crypto library, and on a Mac with `--enable-hvf`, signing it with
 HVF's entitlement.
 
+Under KVM the VM's bundle also carries `firmware/ambrosia/kvm.plist`'s
+`Kernel` > `Patch`, after the VM's own (`crates/reims-ctl/src/prebuilt.rs`).
+macOS's kernel sets up each GIC redistributor with a pre-indexed store,
+`str w9, [x8, #128]!`, to `GICR_IGROUPR0` of its SGI frame, then a plain
+store to `GICR_ISENABLER0`. A pre-indexed store traps with no instruction
+syndrome (ISV=0), and the redistributor is KVM's in-kernel vGIC, so neither
+KVM nor QEMU's ISV=0 emulator completes it: the guest takes an external
+abort and panics early in its boot. The patch writes the same values to the
+same two registers with two plain stores; `x8` keeps its value rather than
+growing by 128, and the next instruction overwrites it (**read**, in the
+kernelcaches below).
+Those four instructions are in `com.apple.kernel`'s `__TEXT_EXEC` once in
+each VirtualMac2,1 kernelcache of macOS 13.6, 14.0, 14.6.1, 15.0, 15.6.1,
+26.0, 26.6.2, 27.0.1 and 27.2.1 (**measured**, 2026-11-23), so the patch
+sets `Expect` to 1: a kernel they are no longer in stops at Ambrosia with
+`boot failed: Kernel.Patch for com.apple.kernel replaced 0 matches, not
+the 1 it requires`, rather than at the abort.
+HVF and TCG take the store as it is, and their VMs' bundles have no such
+patch.
+
+**Measured** 2026-11-23 under KVM on an M1 Pro (10 cores, 32 GB) with
+Fedora Asahi Remix 45 (kernel `7.3.4-401.asahi.fc45`, 16 KiB pages; KVM's
+IPA size limit 42 bits; Mesa 26.2.7's Honeykrisp), `scripts/install-ctl.sh`
+run on this tree (`5347f649f` with the patch, `vendor/qemu` `c3e40185`,
+Ambrosia 0.1.3) in a Fedora 45 container that has the host's `/dev/kvm`,
+`/dev/udmabuf` and `/dev/dri`:
+- `reims-ctl create macos --ipsw latest --cpus 4 --memory 8G` restored macOS
+  27.2.1 (26B131). Its first boot ran the kernel and made the Data volume by
+  EACS: within 48 s of QEMU's start it wrote the iBoot system container,
+  NVRAM and 342 MiB of the main container, and reset the VM, at which
+  Ambrosia stopped ([reims-restore's design](../crates/reims-restore/docs/design.md),
+  "The Data volume, by EACS").
+- After `reims-restore finish-eacs`, the next start showed Setup Assistant's
+  first page, composited on the GPU, 75 s after QEMU started. The VM was then
+  set up and used at its desktop (Finder, the Dock, Terminal, Safari, and
+  Homebrew installing over the network), and QEMU logged no
+  `reims-vgpu: fatal` line in its first 13 minutes.
+- The bundle QEMU loaded held `kvm.plist`'s patch once. `reims-ctl` gives
+  QEMU no serial port, so Ambrosia's `patch for com.apple.kernel: 1
+  replaced` line was not read; `Expect` stops a boot whose patch replaced
+  any other number.
+- `check-boot.sh -k` has not run: its guest probes build on a Mac.
+
 ### arm64 guests: the device on Ambrosia
 
 `firmware/ambrosia` is the device's driver module for Ambrosia
@@ -2611,6 +2654,11 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   -q <qemu-system-aarch64 with the device> ~/.local/share/reims-ctl/vms/macos-26
 ```
 
+On an arm64 Linux host the same check runs under KVM: `config-bundle KVM=1`
+adds `kvm.plist`'s patch (above) to the bundle, and `check-boot.sh -k`
+boots it with `-accel kvm`, and stops before the boot where the bundle
+lacks the patch.
+
 - **The bundle.** `config-bundle` writes `build/Config.cpio`: the module's
   `config.plist` with a `Kernel` > `Add` entry for each kext, Graft first,
   `Graphics` > `DisplayNode` set to the list `reims-display0` to
@@ -2657,7 +2705,7 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   `cp --reflink=always` on Linux) in its log directory and removes them at
   the end, with 8 GiB, 4 CPUs, the device, `REIMS_VGPU_WINDOW=0` and
   `REIMS_VGPU_LOG=info`, and forwards SSH from port 10090 (`-p`). Under TCG
-  the guest's RAM is a shared memfd, as `reims-ctl` gives its VMs on Linux:
+  and KVM the guest's RAM is a shared memfd, as `reims-ctl` gives its VMs on Linux:
   `-machine vmapple,...,memory-backend=ram,dump-guest-core=off` and
   `-object memory-backend-memfd,id=ram,size=8G,share=on`. Under HVF the RAM
   stays QEMU's own, which the device maps with no file on macOS ("The
