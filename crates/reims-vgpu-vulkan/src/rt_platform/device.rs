@@ -222,6 +222,19 @@
 //! amount, [`EXTENDED_VIEW_DISPATCHES_CODE`], so a boot's line says whether its kernels wrote
 //! textures through such views.
 //!
+//! **Its storage textures' levels.** A function that writes or reads a `write` or `read_write`
+//! texture at a level other than the constant 0, or asks it its level count, reads what it needs
+//! of the texture's levels from words rt pushes at each dispatch or draw: the texture's level
+//! count, and for a write or read the first element of the texture's run of level elements, 16
+//! single-level storage views of its levels that set 1's storage-texture array holds past its
+//! textures. A texture of more than one level takes its run at its first such bind and holds it
+//! until it is released and its work retired; a dispatch or draw that finds every one of the
+//! 4,096 runs held is rt's refusal (`Limit::LevelElements`), which records nothing. rt counts the
+//! dispatches and draws whose push carried those words (`Metrics::level_field_commands`; a refused
+//! one counts none), and the counts line carries them as an amount, [`LEVEL_FIELD_COMMANDS_CODE`],
+//! so a boot's line says whether its functions took that path. The runs held reach the counts line
+//! at their highest (`level_elements`, below).
+//!
 //! **Its Direct3D 11 planes' hand-overs.** On Windows, each submission whose command buffers keep
 //! a plane of a Direct3D 11 surface (`super::d3d11_surface`), or whose uploads copy into or out of
 //! one, acquires those planes from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own
@@ -252,12 +265,13 @@
 //! bytes of their memory (`resolve_image_bytes`). Two are the compiled kernels alive (`kernels`),
 //! each the translation of one compute pipeline content with its shader modules and their
 //! `VkPipeline`s, which lives while a state or the device's map of compiled contents holds it, and
-//! that map's entries, compute and render together, at most 1,024 (`kernel_entries`). The last two
-//! are those kernels' `VkPipeline`s, each of one workgroup size, threadgroup memory lengths,
+//! that map's entries, compute and render together, at most 1,024 (`kernel_entries`). The last
+//! three are those kernels' `VkPipeline`s, each of one workgroup size, threadgroup memory lengths,
 //! imageblock size and tiles, of which a module keeps the 8 it made first and the 56 dispatched
 //! last past them, beside those that work not yet retired held at its last make
-//! (`kernel_variants`), and the variants of sampler states bound with LOD clamps of their own, at
-//! most 4,000 (`lod_clamp_variants`). A gauge rises and falls, so the counts line carries the
+//! (`kernel_variants`), the variants of sampler states bound with LOD clamps of their own, at
+//! most 4,000 (`lod_clamp_variants`), and the runs of level elements textures hold, at most 4,096
+//! (`level_elements`, above). A gauge rises and falls, so the counts line carries the
 //! highest each reached at a look, `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it
 //! ([`note_gauges`]): the in-run highest, to within the looks. The gauges' thread looks every 5 s
 //! from the process's first device's open on, whether or not its lines are in the log
@@ -486,6 +500,11 @@ pub const EXTENDED_VIEW_DISPATCHES_CODE: &str = "rt-extended-view-dispatches";
 /// (`Metrics::d3d11_plane_submissions`), an amount on the counts line ([`fold_metrics`]).
 pub const D3D11_PLANE_SUBMISSIONS_CODE: &str = "rt-d3d11-plane-submissions";
 
+/// The code of the dispatches and draws whose push carried a storage texture's level count or the
+/// first of its level elements (`Metrics::level_field_commands`), an amount on the counts line
+/// ([`fold_metrics`]).
+pub const LEVEL_FIELD_COMMANDS_CODE: &str = "rt-level-field-commands";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -533,8 +552,12 @@ pub const KERNEL_VARIANTS_MOST_CODE: &str = "rt-kernel-variants-most";
 /// own, at a look (`Gauges::lod_clamp_variants`, [`note_gauges`]).
 pub const LOD_CLAMP_VARIANTS_MOST_CODE: &str = "rt-lod-clamp-variants-most";
 
+/// The code of the most runs of level elements textures held, each a texture's single-level
+/// storage views, at a look (`Gauges::level_elements`, [`note_gauges`]).
+pub const LEVEL_ELEMENTS_MOST_CODE: &str = "rt-level-elements-most";
+
 /// The gauges the counts line carries at their highest ([`highest_gauges`]).
-const HIGHEST_GAUGES: usize = 11;
+const HIGHEST_GAUGES: usize = 12;
 
 /// The highest of each of [`highest_gauges`]'s gauges a look saw, in its order, over the
 /// process's devices.
@@ -556,10 +579,11 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// compiled contents a state's make dropped, the resolves of multisample attachments, the copies
 /// out of resolve images and their bytes, the whole grids and the ragged grids that ran a
 /// partial-threadgroups variant, the dispatches that wrote a view through its image's extended
-/// storage usage, the submissions that handed Direct3D 11 planes over, the main pipelines the
-/// states' finishes made and their nanoseconds, the first-use waits for an unfinished main
-/// pipeline and their nanoseconds, and the over-copies of a kind rt kept none of.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 32;
+/// storage usage, the submissions that handed Direct3D 11 planes over, the dispatches and draws
+/// that pushed a storage texture's level fields, the main pipelines the states' finishes made and
+/// their nanoseconds, the first-use waits for an unfinished main pipeline and their nanoseconds,
+/// and the over-copies of a kind rt kept none of.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 33;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -590,13 +614,14 @@ static OVER_COPY_KINDS_LOGGED: crate::core::sync::Mutex<Vec<rt::OverCopyKind>> =
 /// skipped past their bound, its reaper's looks at the cache skipped, its creations before the
 /// seed, its emulated-SIMD-group dispatches, its dropped makes, its resolves, its resolve copies,
 /// its whole and ragged grids on a partial-threadgroups variant, its dispatches that wrote views
-/// through an extended usage, its submissions that handed Direct3D 11 planes over, its states'
-/// finishes and their waits and its over-copies of a kind rt kept none of rose by since the last
-/// fold ([`folded_counts`]), so the counts line carries their totals, then its maxima
-/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest, and logs its
-/// over-copies' kinds the process had not logged ([`note_over_copy_kinds`]) (the module's docs).
-/// Nothing of rt's before the device is made. First it counts the dispatches the rt platform's
-/// compute encoders encoded since the last fold (`super::compute::fold_dispatches`).
+/// through an extended usage, its submissions that handed Direct3D 11 planes over, its dispatches
+/// and draws that pushed level fields, its states' finishes and their waits and its over-copies of
+/// a kind rt kept none of rose by since the last fold ([`folded_counts`]), so the counts line
+/// carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
+/// ([`note_gauges`]) at their highest, and logs its over-copies' kinds the process had not logged
+/// ([`note_over_copy_kinds`]) (the module's docs). Nothing of rt's before the device is made.
+/// First it counts the dispatches the rt platform's compute encoders encoded since the last fold
+/// (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
     super::compute::fold_dispatches();
     let (metrics, gauges, kinds) = {
@@ -653,8 +678,9 @@ pub(super) fn note_gauges(g: &rt::Gauges) {
 /// ([`PIPELINE_CACHE_MOST_CODE`]), the resolve images ([`RESOLVE_IMAGES_MOST_CODE`]) and their
 /// memory ([`RESOLVE_IMAGE_BYTES_MOST_CODE`]), the compiled kernels alive ([`KERNELS_MOST_CODE`])
 /// and the entries of the map of compiled contents ([`KERNEL_ENTRIES_MOST_CODE`]), the kernels'
-/// `VkPipeline`s ([`KERNEL_VARIANTS_MOST_CODE`]), and the sampler states' LOD clamp variants
-/// ([`LOD_CLAMP_VARIANTS_MOST_CODE`]).
+/// `VkPipeline`s ([`KERNEL_VARIANTS_MOST_CODE`]), the sampler states' LOD clamp variants
+/// ([`LOD_CLAMP_VARIANTS_MOST_CODE`]), and the runs of level elements textures hold
+/// ([`LEVEL_ELEMENTS_MOST_CODE`]).
 fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
     [
         (PREPROCESS_USED_MOST_CODE, g.preprocess_used_bytes),
@@ -668,6 +694,7 @@ fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
         (KERNEL_ENTRIES_MOST_CODE, g.kernel_entries),
         (KERNEL_VARIANTS_MOST_CODE, g.kernel_variants),
         (LOD_CLAMP_VARIANTS_MOST_CODE, g.lod_clamp_variants),
+        (LEVEL_ELEMENTS_MOST_CODE, g.level_elements),
     ]
 }
 
@@ -782,7 +809,8 @@ fn over_copy_kind_line(
 /// ragged grids ([`PARTIAL_VARIANT_RAGGED_GRIDS_CODE`]) that ran a partial-threadgroups variant,
 /// the dispatches that wrote a view through its image's extended storage usage
 /// ([`EXTENDED_VIEW_DISPATCHES_CODE`]), the submissions that handed Direct3D 11 planes over
-/// ([`D3D11_PLANE_SUBMISSIONS_CODE`]), the main pipelines the states' finishes made
+/// ([`D3D11_PLANE_SUBMISSIONS_CODE`]), the dispatches and draws that pushed a storage texture's
+/// level fields ([`LEVEL_FIELD_COMMANDS_CODE`]), the main pipelines the states' finishes made
 /// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), the
 /// first-use waits for an unfinished main pipeline ([`UNFINISHED_WAITS_CODE`]) and their
 /// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]), and the over-copies of a kind rt kept none of
@@ -835,6 +863,7 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         ),
         (EXTENDED_VIEW_DISPATCHES_CODE, m.extended_view_dispatches),
         (D3D11_PLANE_SUBMISSIONS_CODE, m.d3d11_plane_submissions),
+        (LEVEL_FIELD_COMMANDS_CODE, m.level_field_commands),
         (FINISHED_PIPELINES_CODE, m.finished_pipelines),
         (FINISHED_PIPELINE_NS_CODE, m.finished_pipeline_nanos),
         (UNFINISHED_WAITS_CODE, m.first_use_unfinished_waits),
@@ -2438,9 +2467,10 @@ mod tests {
     /// contents a state's make dropped, the resolves of multisample attachments, the copies out of
     /// resolve images and their bytes, the whole grids and the ragged grids that ran a
     /// partial-threadgroups variant, the dispatches that wrote a view through its image's extended
-    /// storage usage, the submissions that handed Direct3D 11 planes over, the main pipelines the
-    /// states' finishes made and their nanoseconds, the first-use waits for an unfinished main
-    /// pipeline and their nanoseconds, and the over-copies of a kind rt kept none of.
+    /// storage usage, the submissions that handed Direct3D 11 planes over, the dispatches and draws
+    /// that pushed a storage texture's level fields, the main pipelines the states' finishes made
+    /// and their nanoseconds, the first-use waits for an unfinished main pipeline and their
+    /// nanoseconds, and the over-copies of a kind rt kept none of.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2481,6 +2511,7 @@ mod tests {
             PARTIAL_VARIANT_RAGGED_GRIDS_CODE,
             EXTENDED_VIEW_DISPATCHES_CODE,
             D3D11_PLANE_SUBMISSIONS_CODE,
+            LEVEL_FIELD_COMMANDS_CODE,
             FINISHED_PIPELINES_CODE,
             FINISHED_PIPELINE_NS_CODE,
             UNFINISHED_WAITS_CODE,
@@ -2524,6 +2555,7 @@ mod tests {
         m.partial_variant_ragged_grids = 2;
         m.extended_view_dispatches = 1;
         m.d3d11_plane_submissions = 3;
+        m.level_field_commands = 5;
         m.finished_pipelines = 2;
         m.finished_pipeline_nanos = 12_000_000;
         m.first_use_unfinished_waits = 1;
@@ -2562,6 +2594,7 @@ mod tests {
         m.partial_variant_ragged_grids = 9;
         m.extended_view_dispatches = 4;
         m.d3d11_plane_submissions = 12;
+        m.level_field_commands = 8;
         m.finished_pipelines = 5;
         m.finished_pipeline_nanos = 12_000_000 + 6_750_000;
         m.first_use_unfinished_waits = 3;
@@ -2576,7 +2609,7 @@ mod tests {
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
                 28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 9, 4,
-                12, 5, 18_750_000, 3, 1_300_000, 4
+                12, 8, 5, 18_750_000, 3, 1_300_000, 4
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
@@ -2636,15 +2669,15 @@ mod tests {
         assert_eq!(count() - before, 5_000_000);
     }
 
-    /// Eleven of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by
+    /// Twelve of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by
     /// its rise over the highest a look saw, so that one that falls leaves its count as it was and
     /// one that rises past it raises it, the pipeline cache's data falling as its reaper replaces
     /// a full cache with a fresh one, the resolve images as their textures drop, the compiled
     /// kernels as their states drop while the map of compiled contents stays full, their
-    /// `VkPipeline`s as work retires past the 64 a module keeps, and the LOD clamp variants as
-    /// their sampler states drop.
+    /// `VkPipeline`s as work retires past the 64 a module keeps, the LOD clamp variants as their
+    /// sampler states drop, and the runs of level elements as their textures drop.
     #[test]
-    fn eleven_gauges_count_at_their_highest() {
+    fn twelve_gauges_count_at_their_highest() {
         let codes = [
             PREPROCESS_USED_MOST_CODE,
             PREPROCESS_IDLE_MOST_CODE,
@@ -2657,6 +2690,7 @@ mod tests {
             KERNEL_ENTRIES_MOST_CODE,
             KERNEL_VARIANTS_MOST_CODE,
             LOD_CLAMP_VARIANTS_MOST_CODE,
+            LEVEL_ELEMENTS_MOST_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -2675,6 +2709,7 @@ mod tests {
         g.kernel_entries = 1_024;
         g.kernel_variants = 90;
         g.lod_clamp_variants = 12;
+        g.level_elements = 6;
         let mut highest = [0; HIGHEST_GAUGES];
         raise_to(&mut highest, highest_gauges(&g));
         g.preprocess_used_bytes = 12 << 20;
@@ -2686,12 +2721,14 @@ mod tests {
         g.kernels = 1_030;
         g.kernel_variants = 64;
         g.lod_clamp_variants = 3;
+        g.level_elements = 2;
         raise_to(&mut highest, highest_gauges(&g));
         g.pipeline_cache_bytes = 31 << 20;
         raise_to(&mut highest, highest_gauges(&g));
         g.resolve_images = 3;
         g.kernels = 1_150;
         g.lod_clamp_variants = 40;
+        g.level_elements = 9;
         raise_to(&mut highest, highest_gauges(&g));
         assert_eq!(
             highest,
@@ -2706,7 +2743,8 @@ mod tests {
                 1_150,
                 1_024,
                 90,
-                40
+                40,
+                9
             ]
         );
         let after = counts();
