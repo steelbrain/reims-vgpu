@@ -101,9 +101,14 @@ nil. Among rt's gaps (`rt-refused-gap`),
 nothing encoded: a blit copy to or from a texture buffer (`Gap::TextureCopy`), and a copy
 between regions of two textures over one buffer whose bytes meet where rt cannot cut the copy
 into ordered slabs, or between two textures whose memory meets where one is placed in a heap
-(`Gap::OverlappingCopy`). Three forms of a kernel's `[[stage_in]]` are gaps too, each named by
-its form in the boot diagnostics' gaps line (`reims-vgpu: rt-diag gaps:`, written beside every
-counts line) and in its first refusal's line: a stage-in region read from a buffer
+(`Gap::OverlappingCopy`). rt makes no texture over a buffer but a 2D texture of one level,
+sample and slice, or a texture buffer (`Gap::TextureOverBuffer`), so a linear texture
+(`newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`) of any other shape, a 2D
+array among them, answers nil without asking rt, counted nowhere (`rt_platform/buffer.rs`,
+"Linear textures"): a `Managed` 2D array on unified memory is two copies there, logged once
+(`graphics/decode/managed.rs`). Three forms of a kernel's `[[stage_in]]` are gaps too, each
+named by its form in the boot diagnostics' gaps line (`reims-vgpu: rt-diag gaps:`, written
+beside every counts line) and in its first refusal's line: a stage-in region read from a buffer
 (`setStageInRegionWithIndirectBuffer:indirectBufferOffset:`, `StageIn-IndirectRegion`), which
 encodes nothing and leaves the encoder's region the one set before it, or none; and, as the
 compute pipeline state is made, nil and an `NSError`, a `[[stage_in]]` attribute the kernel reads

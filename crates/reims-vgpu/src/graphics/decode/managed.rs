@@ -279,8 +279,9 @@ impl<P: Platform> Refill<P> {
 /// Whether a texture over a buffer can have the shape `create` names: a one-level, one-sample 2D
 /// texture or 2D array of a pixel format the guest calls linear, the shapes the platform's two
 /// creators over a buffer make (`newTextureWithDescriptor:offset:bytesPerRow:` a 2D texture, the
-/// linear SPI a 2D array too). Neither makes a texture of more than one level, a cube, a 3D
-/// texture or one of a block-compressed format, as Metal's do not.
+/// linear SPI a 2D array too; the Vulkan platform's makes none, and a 2D array is two copies
+/// there, logged). Neither makes a texture of more than one level, a cube, a 3D texture or one of
+/// a block-compressed format, as Metal's do not.
 fn in_place_shape(create: &RgfxManagedTextureCreate) -> bool {
     let d = &create.desc;
     let shaped = match d.texture_type {
@@ -807,9 +808,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 return Ok(None);
             };
             // A 2D array by the linear SPI, which lays each slice at its rows' bytes rounded up
-            // to 128 (`RgfxTexture.mm`'s rgfxBufferSlicePitch, measured on the M3 Max; the
-            // Vulkan platform's runtime alike): the layout's slices, whose rows are multiples of
-            // 256 bytes.
+            // to 128 (`RgfxTexture.mm`'s rgfxBufferSlicePitch, measured on the M3 Max): the
+            // layout's slices, whose rows are multiples of 256 bytes. The Vulkan platform makes
+            // no linear 2D array and answers nil, so there the texture is a copy of its own.
             match m.desc.texture_type {
                 TEXTURE_TYPE_2D_ARRAY => cpu.new_linear_texture(
                     &descriptor,
@@ -3277,16 +3278,17 @@ mod tests {
 
     /// A one-level `Managed` 2D array on unified memory shows the guest its CPU copy's bytes where
     /// the layout puts its slices: the GPU reads them once the guest's `replaceRegion:` sent them,
-    /// and its writes land there once the guest synchronizes. It lies over the copy where rt holds
-    /// such a texture over a buffer in place; where rt cannot, it refuses the texture over the
-    /// buffer, counted under rt's code (`rt-refused-gap`; measured on a Radeon 780M's RADV), and
-    /// the texture is a copy of its own, which the `replaceRegion:` fills.
+    /// and its writes land there once the guest synchronizes. On the Vulkan platform, which makes
+    /// no linear 2D array, it is a copy of its own, which the `replaceRegion:` fills: the platform
+    /// answers the decoder's ask of a linear 2D array over the copy nil without asking rt, so no
+    /// refusal of rt's is counted (`rt-refused-gap`).
     #[test]
     fn on_vulkan_a_managed_2d_array_shows_its_cpu_copy() {
         let refused = crate::platform::counted("rt-refused-gap");
         let (in_place, answers) = managed_array_in_place_on::<reims_vgpu_vulkan::RtPlatform>();
+        assert!(!in_place, "a copy of its own");
         let counted = crate::platform::counted("rt-refused-gap") - refused;
-        assert_eq!(counted, u64::from(!in_place), "in place: {in_place}");
+        assert_eq!(counted, 0, "no refusal of rt's");
         check_managed_array_in_place(in_place, answers);
     }
 }

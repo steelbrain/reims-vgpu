@@ -173,13 +173,20 @@
 //! length of 0 or past rt's longest buffer, an option value Metal has none of, a Memoryless
 //! buffer, option bit 24 on a buffer the device makes, a Private no-copy buffer, a deallocator of a
 //! buffer that is not no-copy, a texture over a plane past 0 of a surface without planes. What rt
-//! refuses is nil, counted under rt's kind. A Private buffer of bytes, which a copy on the GPU
+//! refuses is nil, counted under rt's kind, but for a linear texture of a shape rt makes no
+//! texture over a buffer of (below). A Private buffer of bytes, which a copy on the GPU
 //! fills, is unbuilt ([`Unbuilt::Buffer`]), and so is a texture over a surface's plane of a format
 //! that reads beside the plane ([`Unbuilt::IosurfaceTexture`]).
 //!
 //! **Tiled textures** (`newTiledTextureWithDescriptor:offset:bytesPerRow:`): of a 2D texture of
 //! more than one level, a copy of the bytes, taken at its first use (`super::tiled`); of any other,
 //! the texture over the bytes `newTextureWithDescriptor:offset:bytesPerRow:` makes.
+//!
+//! **Linear textures** (`newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`): the
+//! texture over the bytes `newTextureWithDescriptor:offset:bytesPerRow:` makes, of a shape rt makes
+//! over a buffer (`over_buffer_shape`). Of any other, a 2D array among them, nil, without asking
+//! rt, which refuses each there as its gap, and counted nowhere: the answer is the one rt's refusal
+//! gave, so its callers answer as before.
 //!
 //! **Deferred memory** ([`deferred_of_length`],
 //! `GpuDevice::new_deferred_buffer_of_length`). A deferred buffer is a Private one of the host's
@@ -229,6 +236,7 @@ use crate::core::sync::Mutex;
 use crate::gpu::device::descriptor_options;
 
 use super::copied::Kind;
+use super::descriptor::rt_texture_descriptor;
 use super::device::RtDevice;
 use super::diag::{Call, ImportPath, InBuffer, Made, Shape};
 use super::texture::{self, RtTexture, refused_metal};
@@ -2565,6 +2573,22 @@ impl RtBuffer {
     }
 }
 
+/// Whether rt makes a texture of `desc`'s shape over a buffer (rt's `Buffer::new_texture`): a
+/// texture buffer, or a 2D texture of one level, sample and slice. rt refuses any other shape
+/// there as its gap (`Gap::TextureOverBuffer`). A descriptor rt's has no value of answers yes, so
+/// that its make refuses it as Metal's, counted, as before ([`rt_texture_descriptor`]).
+fn over_buffer_shape(desc: &TextureDesc) -> bool {
+    let Ok(d) = rt_texture_descriptor(desc) else {
+        return true;
+    };
+    let one = d.mipmap_level_count == 1 && d.sample_count == 1 && d.array_length == 1;
+    match d.texture_type {
+        rt::TextureType::TextureBuffer => true,
+        rt::TextureType::Type2D => one,
+        _ => false,
+    }
+}
+
 /// The bytes of a buffer of `length` bytes that a texture of `desc` over it from `offset`, rows
 /// `bytes_per_row` apart, lies over: its image, each slice of a 2D array's a 128-byte multiple
 /// apart, a texture buffer's from its offset's 16-byte boundary, as the Vulkan platform reads one.
@@ -2732,8 +2756,11 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         self.deferred.is_none() || self.rt.get().is_some()
     }
 
-    /// As `newTextureWithDescriptor:offset:bytesPerRow:`: rt makes a texture over a buffer of one
-    /// image alone (2D, one level), whose `bytes_per_image` reads nothing.
+    /// As `newTextureWithDescriptor:offset:bytesPerRow:`, of a shape rt makes over a buffer
+    /// (`over_buffer_shape`: a 2D texture of one level, sample and slice, or a texture buffer),
+    /// whose `bytes_per_image` reads nothing. Nil for any other shape, a 2D array among them,
+    /// without asking rt, which refuses each there, and counted nowhere (the module's docs,
+    /// "Linear textures").
     fn new_linear_texture(
         &self,
         descriptor: &RtObj<TextureFields>,
@@ -2751,6 +2778,9 @@ impl Buffer<RtPlatform> for RtObj<RtBuffer> {
         );
         let recorded_answer = crate::recorder::run(|| -> RaiseResult<Option<RtObj<RtTexture>>> {
             let _ = bytes_per_image;
+            if !over_buffer_shape(&descriptor.desc()) {
+                return Ok(None);
+            }
             let sel = "newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:";
             Ok(self.texture(sel, descriptor, offset, bytes_per_row))
         });
@@ -3259,6 +3289,50 @@ mod tests {
             .new_texture(on, &descriptor, 0, 256)
             .expect("never a raise");
         assert!(texture.is_some());
+    }
+
+    /// Linear textures (`newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:`) over a
+    /// Shared buffer on the GPU the test holds: a 2D texture of one level made; a 2D array of 2
+    /// slices, the shape a one-level `Managed` 2D array on unified memory asks, and a 2D texture
+    /// of 2 levels, which rt makes no texture over a buffer of, nil without asking rt: no refusal
+    /// counted under any of rt's kinds, and no `TextureOverBuffer` gap in the boot diagnostics.
+    #[test]
+    fn a_linear_texture_is_a_2d_one_of_one_level_alone_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let buffer = device.new_buffer_of_length(OnFault::Return, 64 * 64 * 4, 0);
+        let buffer = buffer.expect("never a raise").expect("a buffer");
+        let linear = |desc: &TextureDesc| {
+            let descriptor = platform.texture_descriptor(desc);
+            let made = buffer.new_linear_texture(&descriptor, 0, 256, 256 * desc.height);
+            made.expect("never a raise")
+        };
+        let refusals = || {
+            let counts = crate::answer::degradation_counts().into_iter();
+            let rt_s = counts.filter(|(code, _)| code.starts_with("rt-refused-"));
+            let gaps = crate::rt_platform::diag::gaps_named("TextureOverBuffer");
+            (rt_s.collect::<Vec<_>>(), gaps)
+        };
+        let before = refusals();
+        let plain = TextureDesc {
+            width: 64,
+            height: 4,
+            ..TextureDesc::default()
+        };
+        assert!(linear(&plain).is_some(), "a 2D texture of one level");
+        let array = TextureDesc {
+            texture_type: 3,
+            array_length: 2,
+            ..TextureDesc::default()
+        };
+        let levels = TextureDesc {
+            mipmap_level_count: 2,
+            ..plain
+        };
+        for desc in [array, levels] {
+            assert!(linear(&desc).is_none(), "{desc:?}");
+        }
+        assert_eq!(refusals(), before, "nothing counted");
     }
 
     /// A buffer descriptor of `length` bytes and `options`, over `contents` where given,
