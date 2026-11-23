@@ -144,6 +144,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | the window opens at the `resolution` property's size, 1920x1080 without it | `9bf62d84` |
 | the `displays` property, 1 to 4 (1 by default, others refused at realize): display i is head i, with a console, a window under `-display none` and a cursor of its own; console i reads display i (`rvg_graphics_device_read_display_at`), so QMP's `screendump` of head i saves it ("The reims-graphics device", below) | `010bf827` |
 | file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is, so transparent huge pages can back it where the host allows them ("Linux hosts: huge pages for guest RAM", below) | `5e83e90dc2` |
+| a shared file-backed backend's preallocated RAM collapsed into huge pages with `MADV_COLLAPSE` on Linux, 2 MiB at a time, before any device is realized, so the guest runs on huge pages at every `shmem_enabled` but `deny` ("Linux hosts: huge pages for guest RAM", below) | `53e76630` |
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `83de566436` |
 | QMP's `screendump` in PPM, its default format, writes rows of width × 3 bytes. Upstream's wrote each row with its line buffer's stride, which pixman rounds up to 4 bytes, so a display whose width is not a multiple of 4 (a window of 3662 × 2039 pixels) read back sheared, its colours rotating from row to row; PNG's rows were right. `tests/qtest/display-screendump-test.c` dumps `bochs-display` at widths of 64, 66 and 67 | `e1360002ad` |
 | QMP's and HMP's `screendump` copy the console's surface under the BQL, then encode and write the copy on a thread of the pool with the BQL let go (`thread_pool_submit_co`), so a vCPU that touches a device the BQL guards no longer waits out the encode: a PNG of 2880x1620 takes about 120 ms on a Mac mini 2018 ("The reims-graphics device", below) | `500d30fb` |
@@ -687,10 +688,52 @@ QEMU maps file-backed guest RAM, the memfd of `reims-ctl`'s VMs among it, at
 a 2 MiB-aligned address (`system/physmem.c`), as it maps anonymous RAM.
 The kernel backs a shmem mapping with a transparent huge page only where the
 mapping's address keeps the file's offset in one, so at the 4 KiB alignment
-before, the guest ran on 4 KiB pages alone. Whether huge pages back it now
-is the host's choice: `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
-at `advise` (CachyOS ships it), with QEMU's `MADV_HUGEPAGE`, or at `always`
-or `within_size`; at `never` or `deny`, upstream's default, nothing changes.
+before, the guest ran on 4 KiB pages alone.
+
+A fault, the prealloc's among them ("Linux hosts: guest RAM resident from the
+start", below), allocates a huge page for shmem only where
+`/sys/kernel/mm/transparent_hugepage/shmem_enabled` lets it: at `advise`
+(CachyOS ships it), with QEMU's `MADV_HUGEPAGE`, or at `always` or
+`within_size`. At `never`, upstream's default, it allocates 4 KiB pages. So
+once the prealloc of a shared file-backed backend (`reims-ctl`'s memfd) has
+run, and before any device is realized, QEMU collapses the backend's RAM into
+huge pages with `madvise(MADV_COLLAPSE)` (Linux 6.1), 2 MiB at a time
+(`host_memory_backend_collapse`, `backends/hostmem.c`). For a shmem file the
+kernel takes the call at every `shmem_enabled` but `deny`: a collapse the
+caller asks for sets the sysfs setting aside (`shmem_allowable_huge_orders`
+and `shmem_huge_global_enabled` in `mm/shmem.c`, read in Linux 6.13 and 7.3).
+It copies a range on 4 KiB pages onto a new huge page, maps that at 2 MiB in
+QEMU's page tables, and leaves a range already on one as it is. A range it
+cannot collapse (no free 2 MiB page after reclaim and compaction: ENOMEM)
+stays on its pages. At `deny`, or on a kernel before 6.1, every range fails
+with EINVAL, and the guest runs on the pages the prealloc gave. QEMU logs one
+line per backend with how much of it is on huge pages, the time taken and the
+first failure:
+
+```
+qemu-system-x86_64: info: memory backend 'ram': 8524922880 of 8589934592 bytes on huge pages after MADV_COLLAPSE, in 11 ms; first failure: Cannot allocate memory
+```
+
+Measured on um790 (Radeon RX 7900 XTX; CachyOS, Linux 7.3.3; transparent
+huge pages `enabled` always, `defrag` defer+madvise; macos-26.7.2, 8 GiB,
+8 vCPUs, one boot to the desktop each; 2026-11-23):
+- at `advise`, the host's own setting, the prealloc's faults had put most of
+  the RAM on huge pages: after the collapse 7.94 GiB was on them, in 11 ms,
+  and 62 MiB stayed on 4 KiB pages (ENOMEM). QEMU reached its first vCPU
+  thread 0.59 s after its start. At the desktop 7.99 GiB of the RAM was
+  mapped at 2 MiB in QEMU (`ShmemPmdMapped` in `smaps_rollup`), and KVM
+  mapped the guest with 4,054 pages of 2 MiB and 44,747 of 4 KiB;
+- at `never`, the collapse put all 8 GiB on huge pages in 2.15 s, and QEMU
+  reached its first vCPU thread 2.61 s after its start. At the desktop all
+  8 GiB was mapped at 2 MiB, and KVM had 4,062 pages of 2 MiB and 43,898 of
+  4 KiB;
+- at `never` without the collapse (`c3e40185`, the commit before it), QEMU
+  reached its first vCPU thread 0.48 s after its start. At the desktop none of
+  the RAM was mapped at 2 MiB, and KVM had 2,102,206 pages of 4 KiB and none
+  of 2 MiB.
+
+`deny` was not booted. Each boot reached the desktop with no `reims-vgpu:
+fatal` line.
 
 Measured on msi-5080 (macos-26, 16 GiB, a drag and a UFO test,
 2026-10-27): KVM maps about 10 GiB of the guest at 2 MiB, none
