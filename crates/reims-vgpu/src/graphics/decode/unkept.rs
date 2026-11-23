@@ -26,6 +26,13 @@
 //! the views of pages blocks ([`Kind::PagesView`]), the views a device cache's copies use
 //! ([`Kind::CacheView`]) and the display's scanout ([`Kind::Scanout`]).
 //!
+//! **Destroys in flight.** An object made at the platform's own address, a pin it did not keep or
+//! none, whose `OBJECT_DESTROY` drops the decoder's handle while a command buffer of its context
+//! is posted on a ring or begun and not yet complete, is counted under its kind's code
+//! ([`Codes::destroyed_in_flight`]): a diagnostic, an upper bound on the handles let go of at an
+//! address a command buffer still running may use. Its [`Live`] says whether it lies there, so a
+//! destroy reads nothing more of the object.
+//!
 //! On a platform that places a pinned object anywhere (`ApiPlatform::PINS_IN_BLOCKS` false, the
 //! default, the fake platform's) no pin or object is counted here, and none of its makes imports through a counted path.
 
@@ -102,6 +109,10 @@ pub(crate) struct Codes {
     pub(crate) imports: MadeCodes,
     /// rt's refusals of the kind's makes, `rt-refused-making-<kind>`.
     pub(crate) refused: &'static str,
+    /// The kind's objects at the platform's own address whose `OBJECT_DESTROY` dropped them while
+    /// a command buffer of their context was posted or running,
+    /// `destroys-at-rt-address-in-flight-<kind>`: a diagnostic, no degradation.
+    pub(crate) destroyed_in_flight: &'static str,
 }
 
 /// The codes of the kind named `$kind`.
@@ -118,6 +129,7 @@ macro_rules! codes {
                 live_most: concat!("rt-imports-", $kind, "-live-most"),
             },
             refused: concat!("rt-refused-making-", $kind),
+            destroyed_in_flight: concat!("destroys-at-rt-address-in-flight-", $kind),
         }
     };
 }
@@ -192,29 +204,49 @@ pub(crate) const TEXTURE_PICKS: &str = "rt-texture-address-guest-pick";
 /// An object made of a kind, live while this lives ([`made`]): its decoder entry holds it, and
 /// its drop counts the object gone.
 #[derive(Debug)]
-pub(crate) struct Live(MadeCodes);
+pub(crate) struct Live {
+    /// Its kind's objects made.
+    made: MadeCodes,
+    /// Its kind's [`Codes::destroyed_in_flight`], where it lies at the platform's own address.
+    destroyed_in_flight: Option<&'static str>,
+}
+
+impl Live {
+    /// The code its `OBJECT_DESTROY` counts where a command buffer of its context is posted or
+    /// running then ([`Codes::destroyed_in_flight`]): `Some` where it lies at the platform's own
+    /// address, a pin the platform did not keep or none.
+    pub(crate) fn destroyed_in_flight(&self) -> Option<&'static str> {
+        self.destroyed_in_flight
+    }
+}
 
 impl Drop for Live {
     fn drop(&mut self) {
-        count_gone(self.0);
+        count_gone(self.made);
     }
 }
 
 /// Counts an object of `kind` made at `made`, which the guest pinned at `pin` where the decoder
 /// passed it to the platform, where `on` (the platform places pinned objects only in its known
 /// blocks): one more made and live, and a pin the platform did not keep. The object's [`Live`]
-/// where `on`, which its entry holds.
+/// where `on`, which its entry holds: at the platform's own address where it had no pin or one
+/// not kept.
 pub(crate) fn made(on: bool, kind: Kind, pin: Option<u64>, made: u64) -> Option<Live> {
     if !on {
         return None;
     }
     let codes = kind.codes();
-    if let Some(pin) = pin.filter(|&pin| pin != made) {
+    let unkept = pin.filter(|&pin| pin != made);
+    if let Some(pin) = unkept {
         count_kind(codes.unpinned);
         unkept_said(kind, pin, made);
     }
     count_made(codes.made);
-    Some(Live(codes.made))
+    let own = pin.is_none() || unkept.is_some();
+    Some(Live {
+        made: codes.made,
+        destroyed_in_flight: own.then_some(codes.destroyed_in_flight),
+    })
 }
 
 /// The kinds whose first pin not kept was said ([`unkept_said`]), a bit each.
@@ -261,6 +293,7 @@ mod tests {
                     c.imports.made,
                     c.imports.live_most,
                     c.refused,
+                    c.destroyed_in_flight,
                 ]
             })
             .collect();
@@ -272,6 +305,11 @@ mod tests {
             assert!(c.made.made.starts_with("rt-made-"), "{kind:?}");
             assert!(c.imports.made.starts_with("rt-imports-"), "{kind:?}");
             assert!(c.refused.starts_with("rt-refused-making-"), "{kind:?}");
+            assert!(
+                c.destroyed_in_flight
+                    .starts_with("destroys-at-rt-address-in-flight-"),
+                "{kind:?}"
+            );
             assert_eq!(c.imports.live_most, format!("{}-live-most", c.imports.made));
             assert_eq!(c.made.live_most, format!("{}-live-most", c.made.made));
         }
@@ -286,5 +324,21 @@ mod tests {
         assert_eq!(Kind::of_heap(0x20), Kind::Private);
         assert_eq!(Kind::managed(true), Kind::ManagedUnified);
         assert_eq!(Kind::managed(false), Kind::Managed);
+    }
+
+    /// An object made at the platform's own address, with no pin or a pin not kept, counts its
+    /// destroy in flight under its kind's code; one at its pin does not, and none is counted where
+    /// the platform places pins anywhere.
+    #[test]
+    fn an_object_at_the_platform_s_own_address_names_its_destroy_s_code() {
+        let code = |pin, at| {
+            let live = made(true, Kind::Buffer, pin, at)?;
+            live.destroyed_in_flight()
+        };
+        let ours = Some(Kind::Buffer.codes().destroyed_in_flight);
+        assert_eq!(code(None, 0x1000), ours, "no pin");
+        assert_eq!(code(Some(0x2000), 0x1000), ours, "a pin not kept");
+        assert_eq!(code(Some(0x1000), 0x1000), None, "at its pin");
+        assert!(made(false, Kind::Buffer, None, 0x1000).is_none());
     }
 }

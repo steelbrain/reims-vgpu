@@ -10868,6 +10868,49 @@ mod tests {
         drop(device);
     }
 
+    /// An `OBJECT_DESTROY` of an object at the platform's own address (no pin, where the platform
+    /// places pins only in its blocks) is counted under its kind's code while a command buffer of
+    /// its context is posted on a ring and not yet committed, or committed and not yet complete,
+    /// and not with none in flight (`unkept`, "Destroys in flight").
+    #[test]
+    fn a_destroy_at_the_platform_s_address_counts_only_while_a_buffer_runs() {
+        use super::super::unkept;
+
+        let (p, dec) = setup();
+        dec.set_pins_in_blocks();
+        let device = p.device();
+        let published = buffers_published(&dec);
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut walker = dec.sender(Some(0), super::super::Sinks::default());
+        let code = unkept::Kind::Buffer.codes().destroyed_in_flight;
+        let before = crate::platform::counted(code);
+        let counted = || crate::platform::counted(code) - before;
+        for obj_id in 20..24 {
+            assert_eq!(
+                ring0.decode(&device, &buffer_create(obj_id)).unwrap(),
+                Ok(())
+            );
+        }
+        assert_eq!(ring0.decode(&device, &destroy(20)).unwrap(), Ok(()));
+        assert_eq!(counted(), 0, "none in flight");
+
+        // Buffer 1 is on queue 1's ring, not yet taken.
+        published.store(1, Ordering::SeqCst);
+        assert_eq!(ring0.decode(&device, &destroy(21)).unwrap(), Ok(()));
+        assert_eq!(counted(), 1, "a buffer posted");
+        let message = command_buffer_message(100, 1, &render_ops());
+        assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
+        walker.end_message();
+        assert_eq!(p.world().committed().len(), 1);
+        assert_eq!(ring0.decode(&device, &destroy(22)).unwrap(), Ok(()));
+        assert_eq!(counted(), 2, "a buffer committed and not complete");
+
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(ring0.decode(&device, &destroy(23)).unwrap(), Ok(()));
+        assert_eq!(counted(), 2, "none in flight once it completed");
+        drop(device);
+    }
+
     /// A context's close during a walk of its command buffer drops its objects at once, the walk
     /// naming them as at its begin; they are let go of once it ends, and a drain the close begins
     /// is answered once the buffer's completion handler has run.

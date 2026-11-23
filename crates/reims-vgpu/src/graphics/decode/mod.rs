@@ -52,7 +52,8 @@
 //! - each context's table ([`tables`]): read at a message's first naming of an object, and
 //!   written to take or close a view and at each make and removal. A message sees the table as of
 //!   its view ([`tables::View`]).
-//! - each context's drain: a command buffer joins it as it is begun.
+//! - each context's drain: a command buffer joins it as it is begun. A destroy of an object at
+//!   the platform's own address takes it alone, holding no other, to read its holds ([`unkept`]).
 //! - `surfaces`: the IOSurfaces' names (the textures over each one's plane 0, and their copies'
 //!   writers), which presents read.
 //! - `libraries`: the library chunks, makes and cache, on ring 0 and the compile pool. Held across
@@ -5379,16 +5380,25 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// surface names are forgotten. A
     /// buffer over a block's surface view is let go of on the surface worker, where it may be the
     /// last hold of the view's mapping ([`surface_pages`]), and a video session on the video worker
-    /// ([`video::SessionHold`]).
+    /// ([`video::SessionHold`]). An object at the platform's own address is counted where a
+    /// command buffer of its context is posted or running ([`unkept`], "Destroys in flight").
     fn remove(&self, obj_id: u64) {
         let Some(context) = self.context_state(context_of(obj_id)) else {
             return;
         };
         self.saw(&context, obj_id, None);
         let pending = self.uncommitted(context.id);
-        let Some((texture, removed)) = context.remove_after(obj_id, pending) else {
+        let posted = !pending.is_empty();
+        let Some((retired, removed)) = context.remove_after(obj_id, pending) else {
             return;
         };
+        // A buffer posted and not yet committed, or one begun and not yet complete, which holds
+        // the context's drain (`Drain`), read under its lock alone.
+        if let Some(code) = retired.in_flight
+            && (posted || Arc::strong_count(&context.drain.lock()) > 1)
+        {
+            reims_vgpu_vulkan::answer::count_kind(code);
+        }
         if let Some(removed) = removed {
             let Entry {
                 managed,
@@ -5416,7 +5426,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 drop_refused(obj_id, shown_view);
             }
         }
-        if texture {
+        if retired.texture {
             self.forget_surface_texture(obj_id);
         }
     }

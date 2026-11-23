@@ -426,6 +426,16 @@ impl<P: Platform> Drop for Owned<P> {
     }
 }
 
+/// What a removal of an entry tells of it ([`Context::remove_after`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Retired {
+    /// Whether it was a texture.
+    pub(crate) texture: bool,
+    /// The code its destroy counts where a command buffer of its context is posted or running,
+    /// where it lies at the platform's own address ([`super::unkept::Live::destroyed_in_flight`]).
+    pub(crate) in_flight: Option<&'static str>,
+}
+
 /// An entry removed from the table, owned by whoever lets it go.
 pub(crate) struct Removed<P: Platform> {
     id: u64,
@@ -864,21 +874,26 @@ impl<P: Platform> Context<P> {
     /// [`Self::remove_after`] with no command buffer to wait for.
     #[cfg(test)]
     pub(crate) fn remove(&self, id: u64) -> Option<(bool, Option<Removed<P>>)> {
-        self.remove_after(id, Vec::new())
+        let (retired, removed) = self.remove_after(id, Vec::new())?;
+        Some((retired.texture, removed))
     }
 
-    /// Removes `id`'s entry, where it has one: whether it was a texture, and it, to let go of
+    /// Removes `id`'s entry, where it has one: what it was ([`Retired`]), and it, to let go of
     /// where no view needs it and every command buffer of `pending` is committed (the module doc,
     /// "After the buffers posted before it").
     pub(crate) fn remove_after(
         &self,
         id: u64,
         pending: Vec<Pending>,
-    ) -> Option<(bool, Option<Removed<P>>)> {
+    ) -> Option<(Retired, Option<Removed<P>>)> {
         let mut t = self.tables.write();
-        let texture = matches!(t.live.get(&id)?.entry().handle, ObjHandle::Texture(_));
+        let entry = t.live.get(&id)?.entry();
+        let retired = Retired {
+            texture: matches!(entry.handle, ObjHandle::Texture(_)),
+            in_flight: entry.live.as_ref().and_then(|l| l.destroyed_in_flight()),
+        };
         let removed = t.retire_live(id, &mut self.views.lock(), pending)?;
-        Some((texture, removed))
+        Some((retired, removed))
     }
 
     /// Removes every entry, in the table's order: those to let go of now, where no view needs
