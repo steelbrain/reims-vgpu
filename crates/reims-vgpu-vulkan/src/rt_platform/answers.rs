@@ -21,8 +21,11 @@
 //!   (`crate::gpu::identity::closed`), not the runtime's `supportsFamily:`;
 //! - the shader features of the runtime's family audit are Metal's answers where rt's translator
 //!   lowers them, Vulkan's feature where one decides them (BC compression, barycentrics, 32-bit
-//!   float filtering and MSAA), and no for what rt has none of (dynamic libraries, function
-//!   pointers, ray tracing);
+//!   float filtering and MSAA), and no for what rt has none of (dynamic libraries, ray tracing);
+//! - `supportsFunctionPointers` is rt's (its `Device::supports_function_pointers`), whose compute
+//!   pipeline states make function handles and visible function tables
+//!   (`super::function_table`), and `supportsFunctionPointersFromRender` no: rt makes no render
+//!   stage's tables;
 //! - no sparse tile answers: rt has no sparse textures;
 //! - no rasterization rate map layer count (`max_rasterization_rate_layer_count` 0, and so the
 //!   identity's `largest_rasterization_rate_map_layer_count`): rt makes no rate map (its
@@ -183,6 +186,9 @@ pub struct Facts {
     /// rt's floor's `maxIndirectCommandsTokenCount`, where the device enables
     /// `VK_EXT_device_generated_commands` (`super::icb`); none where it does not.
     pub indirect_tokens: Option<u32>,
+    /// rt's `supportsFunctionPointers`: whether its compute pipeline states make function handles
+    /// and visible function tables (`super::function_table`).
+    pub function_pointers: bool,
 }
 
 /// The registry ID the rt platform gives the device of `uuid`, its `deviceUUID`: its two halves'
@@ -398,7 +404,7 @@ pub fn identity(
             supports_dynamic_libraries: Some(false),
             supports_render_dynamic_libraries: Some(false),
             supports_raytracing: Some(false),
-            supports_function_pointers: Some(false),
+            supports_function_pointers: Some(facts.function_pointers),
             supports_function_pointers_from_render: Some(false),
             supports_raytracing_from_render: Some(false),
             ..IdentityFlags::default()
@@ -443,6 +449,7 @@ pub(crate) mod tests {
             linear_alignment_largest: 16,
             linear_alignment_bgra8: Some(16),
             indirect_tokens: Some(128),
+            function_pointers: true,
         }
     }
 
@@ -580,6 +587,8 @@ pub(crate) mod tests {
         assert_eq!(id.formats.len(), SDK_PIXEL_FORMATS.len());
         assert_eq!(id.flags.supports_raytracing, Some(false));
         assert_eq!(id.flags.supports_dynamic_libraries, Some(false));
+        assert_eq!(id.flags.supports_function_pointers, Some(true));
+        assert_eq!(id.flags.supports_function_pointers_from_render, Some(false));
         assert_eq!(id.flags.has_unified_memory, Some(true));
         assert_eq!(id.sizes.max_buffer_length, Some(1 << 31));
         assert_eq!(id.sizes.max_argument_buffer_sampler_count, Some(3999));
@@ -589,6 +598,20 @@ pub(crate) mod tests {
             id.architecture_name.as_deref(),
             Some("vulkan_1002_15bf_abababababababababababababababab")
         );
+    }
+
+    /// `supportsFunctionPointers` is rt's answer, on every device, and the render stages' no.
+    #[test]
+    fn function_pointers_are_rt_s_answer() {
+        for answer in [true, false] {
+            let facts = Facts {
+                function_pointers: answer,
+                ..roomy()
+            };
+            let id = identity(&facts, &caps(&facts), |_| None, |_| None);
+            assert_eq!(id.flags.supports_function_pointers, Some(answer));
+            assert_eq!(id.flags.supports_function_pointers_from_render, Some(false));
+        }
     }
 
     /// The device amplifies one view, as rt draws: `maxVertexAmplificationCount` and the identity's

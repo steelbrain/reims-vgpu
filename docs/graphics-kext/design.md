@@ -309,8 +309,8 @@ Stages:
      one at start (IconRendering, RenderBox) get a working archive, not the
      base class's, which needs a target architecture the device has none of.
    - Where the lane's own device can do less than the host GPU, it answers
-     no (Metal4, ray tracing, function pointers, dynamic libraries and the
-     rest). One table in `crates/reims-vgpu/src/graphics/device_info.rs`
+     no (Metal4, ray tracing, function pointers and dynamic libraries in
+     render pipelines, and the rest). One table in `crates/reims-vgpu/src/graphics/device_info.rs`
      lists each such answer with what it waits on.
    - The guest's architecture, which the host names in the device's config
      (`guest_arch`, from QEMU's target), decides one answer:

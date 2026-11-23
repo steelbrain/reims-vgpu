@@ -1169,6 +1169,7 @@ fn facts(
             .minimum_linear_texture_alignment(rt::PixelFormat::BGRA8Unorm)
             .ok(),
         indirect_tokens: floor.indirect_commands.map(|limits| limits.tokens),
+        function_pointers: device.supports_function_pointers(),
     }
 }
 
