@@ -848,7 +848,7 @@ mod tests {
             shaders
                 .function_names()
                 .iter()
-                .any(|n| n == "displayMirrorTile")
+                .any(|n| n == "displayPresentVertex")
         );
 
         let library = device.new_library(NUMBERED).expect("never a raise");

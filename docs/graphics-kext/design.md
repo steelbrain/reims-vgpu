@@ -1257,11 +1257,11 @@ Stages:
         - The runtime's GPU copies the presented texture into a buffer of
           its own memory, as rows of the mirror's pitch.
         - It compares that copy with the frame it sent last, in 64 x 64
-          tiles (`displayMirrorTile`, the display's shaders). It copies
-          each tile that differs into the mirror, and a tile that changed
-          nothing crosses no link. The copy then stands for the frame sent.
-          A mirror made again (its first sync, a frame of another format
-          or size) sends every tile.
+          tiles (`displayMirrorTile`, a kernel of the display's shaders,
+          since deleted). It copies each tile that differs into the mirror,
+          and a tile that changed nothing crosses no link. The copy then
+          stands for the frame sent. A mirror made again (its first sync,
+          a frame of another format or size) sends every tile.
         - The compositor's GPU draws from a linear texture over its import
           of the mirror, through the draw the runtime's device would make:
           the same bytes, so the same pixels.
@@ -1413,7 +1413,8 @@ Stages:
           - The sync's command buffer copies the presented texture into
             the runtime's buffer and compares it with the frame sent last,
             as above, but only lists the tiles that differ
-            (`displayMirrorTileList`). It writes nothing into host memory.
+            (`displayMirrorTileList`, since deleted). It writes nothing into
+            host memory.
           - The render thread commits it at once, then waits for it, for
             the last draw that read the mirror and for the last copy into
             it. Then it copies the listed tiles into the mirror on the copy
