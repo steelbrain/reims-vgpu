@@ -180,19 +180,22 @@ mod linux {
             Err(why) => format!("none ({why})"),
         };
         println!(
-            "import writes: NV12 {}; P010 {}",
+            "import writes: NV12 {}; P010 {}; XYUV {}",
             said(writes.nv12()),
-            said(writes.p010())
+            said(writes.p010()),
+            said(writes.xyuv())
         );
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-        for (n, (open, [nv12, p010])) in opens.iter().enumerate() {
+        for (n, (open, [nv12, p010, xyuv])) in opens.iter().enumerate() {
             println!(
-                "open {}: {:.2} ms, the import check {:.2} ms of it (NV12 {:.2}, P010 {:.2})",
+                "open {}: {:.2} ms, the import check {:.2} ms of it (NV12 {:.2}, P010 {:.2}, \
+                 XYUV {:.2})",
                 n + 1,
                 ms(*open),
-                ms(*nv12 + *p010),
+                ms(*nv12 + *p010 + *xyuv),
                 ms(*nv12),
-                ms(*p010)
+                ms(*p010),
+                ms(*xyuv)
             );
         }
         Ok(())

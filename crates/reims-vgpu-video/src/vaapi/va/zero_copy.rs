@@ -65,6 +65,13 @@
 //! driver's do (docs/video/bugs.md, U16), fails the display's check, and is
 //! lent no guest buffer.
 //!
+//! A 4:4:4 frame, an XYUV surface's, is written the same way into a buffer of
+//! one plane of its packed pixels ([`PackedTarget`], `Frame::write_4_4_4_to`),
+//! where the display's check passed XYUV: each strip a dma-buf of its rows, and
+//! a linear one-plane surface over it (`DRM_FORMAT_XYUV8888`). reims-vgpu's
+//! VA-API arm writes so into a scratch of its runtime device's, whose GPU then
+//! splits the pixels into the two planes of the guest's 4:4:4 surface.
+//!
 //! A frame's decode and its runs are waited for until one deadline
 //! (`super::wait`). Runs past it may still write the guest's pages: the
 //! frame fails as a malfunction, never declined to the CPU's copy, which
@@ -77,7 +84,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Weak};
 
 use crate::core::backend::DeviceWrite;
-use crate::core::device_memory::{DeviceImports, GuestTarget, TargetPlane};
+use crate::core::device_memory::{DeviceImports, DeviceMemory, GuestTarget, TargetPlane};
 #[cfg(unix)]
 use crate::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use crate::core::runtime::MonoTime;
@@ -175,20 +182,146 @@ struct Variant {
     size: (u32, u32),
     format: SurfaceFormat,
     /// Each plane's offset in the mapping and its bytes from one row to the
-    /// next: luma's, then chroma's.
+    /// next: luma's, then chroma's, or a packed plane's and (0, 0).
     planes: [(usize, usize); 2],
 }
 
 impl Variant {
-    /// The import `target` takes for `format` frames of `size`.
-    fn of(target: &GuestTarget<'_>, format: SurfaceFormat, size: (u32, u32)) -> Self {
+    /// The import `planes` take for `format` frames of `size`.
+    fn of(planes: &ImportPlanes<'_>, format: SurfaceFormat, size: (u32, u32)) -> Self {
+        let place = |plane: &TargetPlane| (plane.offset, plane.bytes_per_row);
         Self {
             size,
             format,
-            planes: target
-                .planes()
-                .map(|plane| (plane.offset, plane.bytes_per_row)),
+            planes: [
+                place(&planes.first),
+                planes.chroma.as_ref().map_or((0, 0), place),
+            ],
         }
+    }
+}
+
+/// A buffer a frame of a 4:4:4 stream is written into as its XYUV surface holds it
+/// (`Frame::write_4_4_4_to`): one plane of packed pixels, four bytes each, Cr, Cb, Y and a byte
+/// that holds nothing, in that order in memory, at its offset in its memory and its rows its
+/// bytes a row apart, checked against the memory as [`GuestTarget`]'s planes are: each row holds
+/// its pixels, and the last ends inside the memory.
+pub struct PackedTarget<'a> {
+    memory: &'a dyn DeviceMemory,
+    plane: TargetPlane,
+    width: u32,
+    height: u32,
+}
+
+impl std::fmt::Debug for PackedTarget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackedTarget")
+            .field("identity", &self.memory.identity())
+            .field("length", &self.memory.length())
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("plane", &self.plane)
+            .finish()
+    }
+}
+
+impl<'a> PackedTarget<'a> {
+    /// The bytes of a pixel.
+    pub const PIXEL_BYTES: usize = 4;
+
+    /// `width` by `height` pixels at `offset` of `memory`, rows `bytes_per_row` apart, checked
+    /// (type docs); `Err` says why not.
+    pub fn new(
+        memory: &'a dyn DeviceMemory,
+        offset: usize,
+        bytes_per_row: usize,
+        (width, height): (u32, u32),
+    ) -> Result<Self, String> {
+        let row_bytes = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(Self::PIXEL_BYTES))
+            .ok_or("rows too long")?;
+        if bytes_per_row < row_bytes {
+            return Err(format!(
+                "{bytes_per_row} bytes a row hold no {row_bytes} bytes of pixels"
+            ));
+        }
+        let end = usize::try_from(height)
+            .ok()
+            .and_then(|height| bytes_per_row.checked_mul(height))
+            .and_then(|bytes| bytes.checked_add(offset))
+            .ok_or("past the address space")?;
+        let length = memory.length();
+        if end > length {
+            return Err(format!("ends at {end}, past the memory's {length} bytes"));
+        }
+        Ok(Self {
+            memory,
+            plane: TargetPlane {
+                offset,
+                bytes_per_row,
+                rows: height,
+                row_bytes,
+            },
+            width,
+            height,
+        })
+    }
+
+    /// Its width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Its height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Its plane.
+    pub fn plane(&self) -> TargetPlane {
+        self.plane
+    }
+}
+
+/// What an import is made over: a buffer's memory, its size, and the planes of its frames'
+/// format in it, a [`GuestTarget`]'s luma and interleaved chroma, or a [`PackedTarget`]'s one.
+#[derive(Clone, Copy)]
+pub(crate) struct ImportPlanes<'a> {
+    memory: &'a dyn DeviceMemory,
+    size: (u32, u32),
+    /// Luma, or the packed pixels.
+    first: TargetPlane,
+    chroma: Option<TargetPlane>,
+}
+
+impl<'a> From<&GuestTarget<'a>> for ImportPlanes<'a> {
+    fn from(target: &GuestTarget<'a>) -> Self {
+        let [luma, chroma] = target.planes();
+        Self {
+            memory: target.memory(),
+            size: (target.width(), target.height()),
+            first: luma,
+            chroma: Some(chroma),
+        }
+    }
+}
+
+impl<'a> From<&PackedTarget<'a>> for ImportPlanes<'a> {
+    fn from(target: &PackedTarget<'a>) -> Self {
+        Self {
+            memory: target.memory,
+            size: (target.width, target.height),
+            first: target.plane,
+            chroma: None,
+        }
+    }
+}
+
+impl ImportPlanes<'_> {
+    /// Its planes, first to last.
+    fn each(&self) -> impl Iterator<Item = &TargetPlane> {
+        std::iter::once(&self.first).chain(self.chroma.as_ref())
     }
 }
 
@@ -257,6 +390,49 @@ pub(crate) fn write(
     frame: &Frame,
     target: &GuestTarget<'_>,
     imports: &GuestImports,
+    size: (u32, u32),
+    decoded_now: &mut dyn FnMut(),
+) -> Result<DeviceWrite, Error> {
+    let format = frame.surface.format();
+    // The driver's 4:2:0 frames, NV12 and P010, into two planes; a 4:4:4 one, XYUV, is
+    // written whole into a packed buffer alone (`write_packed`).
+    if format == SurfaceFormat::Xyuv
+        || target.pixel_format().bytes_per_sample() != format.bytes_per_sample()
+        || target.pixel_format().is_4_4_4()
+    {
+        return Ok(declined(format!(
+            "a {} buffer for {} frames",
+            target.pixel_format().fourcc(),
+            format.name()
+        )));
+    }
+    write_planes(frame, ImportPlanes::from(target), imports, size, decoded_now)
+}
+
+/// [`write()`] for a 4:4:4 frame, an XYUV surface's, into `target`, a buffer of its packed
+/// pixels (`Frame::write_4_4_4_to`).
+pub(crate) fn write_packed(
+    frame: &Frame,
+    target: &PackedTarget<'_>,
+    imports: &GuestImports,
+    size: (u32, u32),
+    decoded_now: &mut dyn FnMut(),
+) -> Result<DeviceWrite, Error> {
+    let format = frame.surface.format();
+    if format != SurfaceFormat::Xyuv {
+        return Ok(declined(format!(
+            "a buffer of packed 4:4:4 pixels for {} frames",
+            format.name()
+        )));
+    }
+    write_planes(frame, ImportPlanes::from(target), imports, size, decoded_now)
+}
+
+/// [`write()`] and [`write_packed`], once the buffer's format is the frame's.
+fn write_planes(
+    frame: &Frame,
+    target: ImportPlanes<'_>,
+    imports: &GuestImports,
     (width, height): (u32, u32),
     decoded_now: &mut dyn FnMut(),
 ) -> Result<DeviceWrite, Error> {
@@ -280,20 +456,9 @@ pub(crate) fn write(
     if width == 0 || height == 0 {
         return Ok(declined("an empty frame"));
     }
-    // The driver's frames here are 4:2:0 (`super::hevc` decodes no 4:4:4).
-    if target.pixel_format().bytes_per_sample() != format.bytes_per_sample()
-        || target.pixel_format().is_4_4_4()
-    {
-        return Ok(declined(format!(
-            "a {} buffer for {} frames",
-            target.pixel_format().fourcc(),
-            format.name()
-        )));
-    }
     let alignment = write.alignment;
-    let planes = target.planes();
-    if let Some(plane) = planes
-        .iter()
+    if let Some(plane) = target
+        .each()
         .find(|plane| plane.bytes_per_row % alignment != 0)
     {
         return Ok(declined(format!(
@@ -301,7 +466,8 @@ pub(crate) fn write(
             plane.bytes_per_row
         )));
     }
-    let samples = usize::try_from(width).unwrap_or(usize::MAX) * format.bytes_per_sample();
+    let samples = (usize::try_from(width).unwrap_or(usize::MAX))
+        .saturating_mul(format.first_plane_bytes_per_pixel());
     if write.whole_rows && !samples.is_multiple_of(alignment) {
         return Ok(declined(format!(
             "rows of {samples} bytes of samples: the driver writes rows of whole {alignment} \
@@ -320,10 +486,10 @@ pub(crate) fn write(
     // The import is of the frame's size and format and the buffer's planes:
     // one buffer given frames of another size gets another, and so does
     // another buffer in the same mapping.
-    let memory = target.memory();
+    let memory = target.memory;
     let import = match imports.imports.get_or_make(
         &memory.identity(),
-        Variant::of(target, format, (width, height)),
+        Variant::of(&target, format, (width, height)),
         || {
             let contexts = Some(&imports.contexts);
             GuestImport::new(
@@ -380,7 +546,7 @@ impl GuestImport {
     /// are (the import check's); `Err` says why not, for the log.
     fn new(
         display: &Display,
-        target: &GuestTarget<'_>,
+        target: ImportPlanes<'_>,
         format: SurfaceFormat,
         (width, height): (u32, u32),
         write: ImportWrite,
@@ -434,16 +600,15 @@ impl GuestImport {
                 return Err(format!("no video processing into the buffer: {error}"));
             }
         };
-        let [luma, chroma] = target.planes();
+        let places: Vec<String> = (target.each())
+            .map(|plane| format!("at {} in rows of {}", plane.offset, plane.bytes_per_row))
+            .collect();
         log::debug!(
-            "a guest buffer imported for {} frames of {width}x{height} in {} strips, planes at \
-             {} and {} of its mapping, rows of {} and {}",
+            "a guest buffer imported for {} frames of {width}x{height} in {} strips, its planes \
+             {} of its mapping",
             format.name(),
             strips.len(),
-            luma.offset,
-            chroma.offset,
-            luma.bytes_per_row,
-            chroma.bytes_per_row
+            places.join(" and "),
         );
         Ok(Self {
             display: display.clone_ref(),
@@ -547,11 +712,11 @@ impl GuestImport {
 pub(crate) fn trial(
     display: &Display,
     source: &super::surface::Surface,
-    target: &GuestTarget<'_>,
+    target: ImportPlanes<'_>,
     write: ImportWrite,
     strips: Option<usize>,
 ) -> Result<(), String> {
-    let (width, height) = (target.width(), target.height());
+    let (width, height) = target.size;
     let format = source.format();
     let import = GuestImport::new(
         display,
@@ -591,25 +756,26 @@ enum Cut {
 
 /// `target`'s rows imported in `count` strips for `format` frames of
 /// `size` (module docs): each an even number of the frame's rows, a dma-buf
-/// of their luma rows and their chroma rows, and a linear VA surface over it
-/// at the guest's own pitches, as `write` says the driver takes it.
+/// of their rows of each plane (luma and chroma, or packed pixels), and a
+/// linear VA surface over it at the buffer's own pitches, as `write` says the
+/// driver takes it.
 #[cfg(unix)]
 fn strips(
     display: &Display,
-    target: &GuestTarget<'_>,
+    target: ImportPlanes<'_>,
     format: SurfaceFormat,
     (width, height): (u32, u32),
     count: usize,
     write: ImportWrite,
 ) -> Result<Vec<Strip>, Cut> {
     let refused = |why: &str| Cut::Refused(why.to_owned());
-    let memory = target.memory();
-    let [luma, chroma] = target.planes();
+    let memory = target.memory;
+    let first = target.first;
     let count = u32::try_from(count).map_err(|_| refused("too many strips"))?;
-    // With rows of whole alignments, each strip's luma plane at a page's start: its rows a
-    // multiple of those after which a luma row starts a page again.
+    // With rows of whole alignments, each strip's first plane at a page's start: its rows a
+    // multiple of those after which a row of it starts a page again.
     let unit = if write.whole_rows {
-        u32::try_from(PAGE / gcd(luma.bytes_per_row, PAGE)).unwrap_or(u32::MAX)
+        u32::try_from(PAGE / gcd(first.bytes_per_row, PAGE)).unwrap_or(u32::MAX)
     } else {
         1
     };
@@ -626,19 +792,22 @@ fn strips(
                     .checked_mul(usize::try_from(rows).ok()?)?,
             ))
         };
-        let ranges = range(&luma, top, rows).zip(range(&chroma, top / 2, rows / 2));
-        let Some((luma_rows, chroma_rows)) = ranges else {
+        // A chroma plane's rows are half the luma's.
+        let ranges: Option<Vec<(usize, usize)>> = std::iter::once(range(&first, top, rows))
+            .chain((target.chroma.as_ref()).map(|chroma| range(chroma, top / 2, rows / 2)))
+            .collect();
+        let Some(ranges) = ranges else {
             destroy(display, &made);
             return Err(refused("a buffer past the address space"));
         };
-        let strip = match memory.dma_buf_of(&[luma_rows, chroma_rows]) {
+        let strip = match memory.dma_buf_of(&ranges) {
             Ok(dma_buf) => Strip::new(
                 display,
                 format,
                 (width, rows),
                 top,
                 dma_buf,
-                [luma, chroma],
+                (first, target.chroma),
                 write,
             )
             .map_err(Cut::Refused),
@@ -708,7 +877,7 @@ fn destroy(display: &Display, strips: &[Strip]) {
 #[cfg(windows)]
 fn strips(
     _display: &Display,
-    _target: &GuestTarget<'_>,
+    _target: ImportPlanes<'_>,
     _format: SurfaceFormat,
     _size: (u32, u32),
     _count: usize,
@@ -721,11 +890,11 @@ fn strips(
 
 #[cfg(unix)]
 impl Strip {
-    /// A linear VA surface of `size` over `dma_buf`, the strip's luma rows
-    /// and its chroma rows, at `planes`' pitches, as `write` says the driver
-    /// takes it: each plane at its alignment from the dma-buf's first byte,
-    /// and the luma plane at that byte where it says whole rows; `Err` says
-    /// why not.
+    /// A linear VA surface of `size` over `dma_buf`, the strip's rows of its
+    /// planes, luma then chroma or packed pixels alone, at their pitches, as
+    /// `write` says the driver takes it: each plane at its alignment from the
+    /// dma-buf's first byte, and the first plane at that byte where it says
+    /// whole rows; `Err` says why not.
     #[allow(clippy::too_many_arguments)]
     fn new(
         display: &Display,
@@ -733,40 +902,49 @@ impl Strip {
         (width, rows): (u32, u32),
         top: u32,
         dma_buf: SurfaceDmaBuf,
-        [luma, chroma]: [TargetPlane; 2],
+        (luma, chroma): (TargetPlane, Option<TargetPlane>),
         write: ImportWrite,
     ) -> Result<Self, String> {
         let past = || "a buffer past 4 GiB".to_owned();
-        let drm_format = match format {
-            SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
-            SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
-            SurfaceFormat::Xyuv => return Err("no import of XYUV into two planes".to_owned()),
+        let drm_format = match (format, chroma) {
+            (SurfaceFormat::Nv12, Some(_)) => ffi::DRM_FORMAT_NV12,
+            (SurfaceFormat::P010, Some(_)) => ffi::DRM_FORMAT_P010,
+            (SurfaceFormat::Xyuv, None) => ffi::DRM_FORMAT_XYUV8888,
+            (format, chroma) => {
+                return Err(format!(
+                    "no import of {} in {} planes",
+                    format.name(),
+                    1 + usize::from(chroma.is_some())
+                ));
+            }
         };
         let alignment = write.alignment;
-        let (Some(&luma_at), Some(&chroma_at)) = (dma_buf.offsets.first(), dma_buf.offsets.get(1))
-        else {
+        let planes = 1 + usize::from(chroma.is_some());
+        let Some(offsets) = dma_buf.offsets.get(..planes) else {
             return Err("the host's dma-buf holds no planes".to_owned());
         };
-        if [luma_at, chroma_at]
-            .iter()
-            .any(|at| at % alignment as u64 != 0)
-        {
+        if offsets.iter().any(|at| at % alignment as u64 != 0) {
+            let into: Vec<String> = (offsets.iter())
+                .map(|at| (at % 4096).to_string())
+                .collect();
             return Err(format!(
-                "planes {} and {} bytes into their first page: the driver imports planes \
-                 {alignment} bytes apart alone",
-                luma_at % 4096,
-                chroma_at % 4096
+                "planes {} bytes into their first page: the driver imports planes {alignment} \
+                 bytes apart alone",
+                into.join(" and ")
             ));
         }
+        let luma_at = offsets[0];
         if write.whole_rows && luma_at != 0 {
             return Err(format!(
-                "a luma plane {} bytes into its first page: the driver writes a luma plane at a \
-                 page's start alone, its chroma plane whole rows after it",
+                "a first plane {} bytes into its first page: the driver writes a first plane at \
+                 a page's start alone, a chroma plane whole rows after it",
                 luma_at % 4096
             ));
         }
+        let chroma_at = offsets.get(1).copied().unwrap_or(0);
         let luma_pitch = luma.bytes_per_row as u64;
-        if write.whole_rows
+        if let Some(chroma) = chroma
+            && write.whole_rows
             && (luma_pitch == 0
                 || chroma.bytes_per_row != luma.bytes_per_row
                 || !chroma_at.is_multiple_of(luma_pitch))
@@ -783,6 +961,7 @@ impl Strip {
             return Err(past());
         };
         let pitch = |bytes: usize| u32::try_from(bytes).unwrap_or(u32::MAX);
+        let chroma_pitch = chroma.map_or(0, |chroma| pitch(chroma.bytes_per_row));
         let mut descriptor = ffi::VADRMPRIMESurfaceDescriptor {
             fourcc: format.fourcc(),
             width,
@@ -798,10 +977,10 @@ impl Strip {
         };
         descriptor.layers[0] = ffi::VADRMPRIMESurfaceLayer {
             drm_format,
-            num_planes: 2,
+            num_planes: u32::try_from(planes).unwrap_or(2),
             object_index: [0, 0, 0, 0],
             offset: [luma_at, chroma_at, 0, 0],
-            pitch: [pitch(luma.bytes_per_row), pitch(chroma.bytes_per_row), 0, 0],
+            pitch: [pitch(luma.bytes_per_row), chroma_pitch, 0, 0],
         };
         let mut attributes = [
             ffi::VASurfaceAttrib::zeroed(),
@@ -1092,7 +1271,7 @@ mod tests {
             let size = (layout.width, layout.height);
             GuestImport::new(
                 &display,
-                &target,
+                ImportPlanes::from(&target),
                 format,
                 size,
                 write,

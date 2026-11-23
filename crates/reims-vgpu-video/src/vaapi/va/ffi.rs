@@ -119,10 +119,11 @@ pub(crate) const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = 0x0008;
 pub(crate) const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// `I915_FORMAT_MOD_Y_TILED` (drm_fourcc.h): `fourcc_mod_code(INTEL, 2)`.
 pub(crate) const I915_FORMAT_MOD_Y_TILED: u64 = (0x01 << 56) | 2;
-/// `DRM_FORMAT_NV12` and `DRM_FORMAT_P010` (drm_fourcc.h): the same codes
-/// as VA's fourccs.
+/// `DRM_FORMAT_NV12`, `DRM_FORMAT_P010` and `DRM_FORMAT_XYUV8888`
+/// (drm_fourcc.h): the same codes as VA's fourccs.
 pub(crate) const DRM_FORMAT_NV12: u32 = VA_FOURCC_NV12;
 pub(crate) const DRM_FORMAT_P010: u32 = VA_FOURCC_P010;
+pub(crate) const DRM_FORMAT_XYUV8888: u32 = VA_FOURCC_XYUV;
 
 // VAGenericValueType.
 pub(crate) const VAGenericValueTypeInteger: VAGenericValueType = 1;
@@ -1246,6 +1247,7 @@ mod tests {
             DRM_FORMAT_MOD_LINEAR,
             DRM_FORMAT_NV12,
             DRM_FORMAT_P010,
+            DRM_FORMAT_XYUV8888,
             VAGenericValueTypeInteger,
             VAGenericValueTypePointer,
             VAPictureParameterBufferType,

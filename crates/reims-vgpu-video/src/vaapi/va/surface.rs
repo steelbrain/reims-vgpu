@@ -104,6 +104,15 @@ impl SurfaceFormat {
         }
     }
 
+    /// The bytes a pixel takes in its first plane: a luma sample, or a packed pixel's four.
+    pub(crate) fn first_plane_bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Nv12 => 1,
+            Self::P010 => 2,
+            Self::Xyuv => 4,
+        }
+    }
+
     /// Its planes: luma and chroma, or one of packed pixels.
     pub(crate) fn planes(self) -> u32 {
         match self {

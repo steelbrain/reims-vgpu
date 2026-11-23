@@ -2,31 +2,35 @@
 //! by a trial run as the display opens ([`learn`]), so that what the backend lends a driver
 //! follows what the driver does, not its name.
 //!
-//! Two paths have the driver's video processing write frames into memory of ours or the
+//! Three paths have the driver's video processing write frames into memory of ours or the
 //! guest's, imported over a dma-buf as a linear VA surface:
 //! - the staged copy back (`super::readback`);
-//! - the writes into a guest's decode outputs in place (`super::zero_copy`).
+//! - the writes into a guest's decode outputs in place (`super::zero_copy`);
+//! - the writes of a 4:4:4 frame's XYUV pixels into a buffer of them
+//!   (`super::zero_copy::PackedTarget`), which reims-vgpu's VA-API arm makes of its runtime
+//!   device's memory.
 //!
 //! A driver may refuse such an import. Or it may take the import and its runs, answer success,
 //! and write the wrong bytes or none: NVIDIA's VA-API driver (libva-nvidia-driver 0.0.18) wrote
 //! nothing and answered success (docs/video/bugs.md, U16).
 //!
-//! So for each of the decoders' formats, NV12 and P010, the display runs one copy the way zero
-//! copy runs it, through zero copy's own import ([`super::zero_copy::trial`]: one dma-buf of both
-//! planes), into memory of its own laid out as a guest's buffer is:
+//! So for each of the decoders' formats, NV12, P010 and XYUV, the display runs one copy the way
+//! zero copy runs it, through zero copy's own import ([`super::zero_copy::trial`]: one dma-buf of
+//! both planes, or of XYUV's one), into memory of its own laid out as a guest's buffer is:
 //! - A picture holding every sample value is put into a surface of the decoders' kind by
 //!   `vaPutImage`.
 //! - One video-processing run copies it into the import.
 //! - Every byte of the memory is checked: each plane's samples, and every byte around them, row
-//!   padding included, left as it was.
+//!   padding included, left as it was. An XYUV pixel's fourth byte holds nothing, and may be
+//!   anything.
 //!
 //! This is tried at each alignment of rows and planes, 64, 128 and 256 bytes, in turn. Each pitch
 //! is an odd multiple of its alignment, each row's samples a part of one, and each plane starts
 //! an odd multiple of the alignment into its page, so a driver that takes only a larger
 //! alignment refuses the import or misplaces the picture. Where the run at an alignment answers
 //! success and writes the picture wrong, a second run there tries rows of whole alignments, the
-//! luma plane at the dma-buf's first byte and the chroma plane whole rows after it, a row past
-//! the luma's last. The first that passes is the format's
+//! luma plane (XYUV's one) at the dma-buf's first byte and the chroma plane whole rows after it,
+//! a row past the luma's last. The first that passes is the format's
 //! ([`ImportWrites::of`], an [`ImportWrite`]). Where none passes, the driver is lent no import of
 //! that format, and its frames come back through `vaGetImage`, with why in the log.
 //!
@@ -67,6 +71,9 @@ use super::ffi;
 use super::host_memory::HostMemory;
 use super::image::Image;
 use super::surface::{SurfaceFormat, SurfacePool};
+use super::zero_copy::PackedTarget;
+#[cfg(unix)]
+use super::zero_copy::ImportPlanes;
 
 /// The alignments tried, least first: of each row, and of each plane's first byte from its
 /// dma-buf's.
@@ -111,22 +118,24 @@ impl ImportWrite {
 pub struct ImportWrites {
     nv12: Result<ImportWrite, String>,
     p010: Result<ImportWrite, String>,
-    /// How long each format's trials took: NV12's, then P010's.
-    took: [Duration; 2],
+    xyuv: Result<ImportWrite, String>,
+    /// How long each format's trials took: NV12's, P010's, then XYUV's.
+    took: [Duration; 3],
 }
 
 impl ImportWrites {
-    /// No import of either format, for `why`.
+    /// No import of any format, for `why`.
     pub(crate) fn none(why: &str) -> Self {
         Self {
             nv12: Err(why.to_owned()),
             p010: Err(why.to_owned()),
-            took: [Duration::ZERO; 2],
+            xyuv: Err(why.to_owned()),
+            took: [Duration::ZERO; 3],
         }
     }
 
-    /// The answers `nv12` and `p010`, as a stand-in driver's check would give them: for a host's
-    /// tests of what it makes of them.
+    /// The answers `nv12` and `p010`, as a stand-in driver's check would give them, and none of
+    /// XYUV ([`ImportWrites::with_xyuv`] gives one): for a host's tests of what it makes of them.
     pub fn of_answers(
         nv12: Result<ImportWrite, String>,
         p010: Result<ImportWrite, String>,
@@ -134,8 +143,15 @@ impl ImportWrites {
         Self {
             nv12,
             p010,
-            took: [Duration::ZERO; 2],
+            xyuv: Err("no answer of XYUV was given".to_owned()),
+            took: [Duration::ZERO; 3],
         }
+    }
+
+    /// These answers with `xyuv` for XYUV's, as a stand-in driver's check would give it.
+    #[must_use]
+    pub fn with_xyuv(self, xyuv: Result<ImportWrite, String>) -> Self {
+        Self { xyuv, ..self }
     }
 
     /// What of an import of `format` the driver takes and its video processing writes right;
@@ -144,9 +160,7 @@ impl ImportWrites {
         match format {
             SurfaceFormat::Nv12 => self.nv12.clone(),
             SurfaceFormat::P010 => self.p010.clone(),
-            SurfaceFormat::Xyuv => {
-                Err("the import check checks NV12 and P010 imports alone".into())
-            }
+            SurfaceFormat::Xyuv => self.xyuv.clone(),
         }
     }
 
@@ -160,13 +174,18 @@ impl ImportWrites {
         self.p010.clone()
     }
 
-    /// How long the trial runs took, both formats'.
-    pub fn took(&self) -> Duration {
-        self.took[0] + self.took[1]
+    /// [`ImportWrites::of`] XYUV, the format of HEVC Main 4:4:4's frames at 8 bits.
+    pub fn xyuv(&self) -> Result<ImportWrite, String> {
+        self.xyuv.clone()
     }
 
-    /// How long each format's trial runs took: NV12's, then P010's.
-    pub fn took_each(&self) -> [Duration; 2] {
+    /// How long the trial runs took, every format's.
+    pub fn took(&self) -> Duration {
+        self.took.iter().sum()
+    }
+
+    /// How long each format's trial runs took: NV12's, P010's, then XYUV's.
+    pub fn took_each(&self) -> [Duration; 3] {
         self.took
     }
 }
@@ -178,21 +197,25 @@ pub(crate) fn learn(_display: &Display) -> ImportWrites {
     ImportWrites::none("this host makes no dma-buf to import")
 }
 
-/// Runs the trial for both formats on `display`, on this thread (module docs).
+/// Runs the trial for each format on `display`, on this thread (module docs).
 #[cfg(unix)]
 pub(crate) fn learn(display: &Display) -> ImportWrites {
     let clock = display.runtime();
-    let start = clock.now();
-    let nv12 = learn_format(display, SurfaceFormat::Nv12);
-    let between = clock.now();
-    let p010 = learn_format(display, SurfaceFormat::P010);
+    let mut took = [Duration::ZERO; 3];
+    let mut timed = |n: usize, format: SurfaceFormat| {
+        let start = clock.now();
+        let answer = learn_format(display, format);
+        took[n] = clock.now().saturating_duration_since(start);
+        answer
+    };
+    let nv12 = timed(0, SurfaceFormat::Nv12);
+    let p010 = timed(1, SurfaceFormat::P010);
+    let xyuv = timed(2, SurfaceFormat::Xyuv);
     let writes = ImportWrites {
         nv12,
         p010,
-        took: [
-            between.saturating_duration_since(start),
-            clock.now().saturating_duration_since(between),
-        ],
+        xyuv,
+        took,
     };
     let said = |format: &str, answer: &Result<ImportWrite, String>| match answer {
         Ok(ImportWrite {
@@ -206,10 +229,12 @@ pub(crate) fn learn(display: &Display) -> ImportWrites {
         Err(why) => format!("no {format}: {why}"),
     };
     log::info!(
-        "VA-API at {}: video processing writes imports of {}, and of {}, as checked in {:.1} ms",
+        "VA-API at {}: video processing writes imports of {}, of {}, and of {}, as checked in \
+         {:.1} ms",
         display.path(),
         said("NV12", &writes.nv12),
         said("P010", &writes.p010),
+        said("XYUV", &writes.xyuv),
         writes.took().as_secs_f64() * 1e3
     );
     writes
@@ -269,18 +294,19 @@ struct Picture {
 }
 
 impl Picture {
-    /// The rows of `plane`: luma's, then chroma's half.
+    /// The rows of `plane`: luma's, then chroma's half; XYUV's one plane's, and none of a second.
     fn rows(self, plane: usize) -> usize {
-        to_usize(if plane == 0 {
-            self.height
-        } else {
-            self.height.div_ceil(2)
+        to_usize(match (plane, self.format) {
+            (0, _) => self.height,
+            (_, SurfaceFormat::Xyuv) => 0,
+            _ => self.height.div_ceil(2),
         })
     }
 
-    /// The bytes of a row of samples, the same in both planes of 4:2:0.
+    /// The bytes of a row of samples, the same in both planes of 4:2:0; of XYUV's pixels, four
+    /// bytes each.
     fn row_bytes(self) -> usize {
-        to_usize(self.width.next_multiple_of(2)) * self.format.bytes_per_sample()
+        to_usize(self.width.next_multiple_of(2)) * self.format.first_plane_bytes_per_pixel()
     }
 
     /// Where the opening's trial at `alignment` lays its planes out in its memory: each plane's
@@ -302,7 +328,7 @@ impl Picture {
     /// The picture cut to rows of whole `alignment`s: as wide as that leaves of it, from its
     /// first column.
     fn whole(self, alignment: usize) -> Self {
-        let bytes = self.format.bytes_per_sample();
+        let bytes = self.format.first_plane_bytes_per_pixel();
         let row = self.row_bytes() / alignment * alignment;
         Self {
             width: u32::try_from(row / bytes).unwrap_or(0),
@@ -399,9 +425,10 @@ fn fill(picture: Picture, bytes: &mut [u8], planes: [(usize, usize); 2]) -> Resu
     Ok(())
 }
 
-/// The trial picture's sample at `column` (in samples: a chroma row's Cb and Cr alternate) of
-/// `row` of `plane`, as its bytes hold it: 8-bit values for NV12, 10-bit ones in a sample's high
-/// bits for P010. Across the opening's trial picture every value of the format turns up.
+/// The trial picture's sample at `column` (in samples: a chroma row's Cb and Cr alternate, and an
+/// XYUV pixel's Cr, Cb, Y and fourth byte) of `row` of `plane`, as its bytes hold it: 8-bit
+/// values for NV12 and XYUV, 10-bit ones in a sample's high bits for P010. Across the opening's
+/// trial picture every value of the format turns up.
 fn sample(format: SurfaceFormat, plane: usize, column: usize, row: usize) -> u16 {
     let (a, b, c) = if plane == 0 { (3, 5, 7) } else { (7, 11, 101) };
     let value = column * a + row * b + c;
@@ -471,7 +498,8 @@ fn samples_wrong(picture: Picture, bytes: &[u8], planes: [(usize, usize); 2]) ->
     compare(picture, bytes, &expected, planes)
 }
 
-/// Where `bytes` differs from `expected`, `picture` laid out in both at `planes`.
+/// Where `bytes` differs from `expected`, `picture` laid out in both at `planes`: an XYUV
+/// pixel's fourth byte, which holds nothing, may be anything.
 fn compare(
     picture: Picture,
     bytes: &[u8],
@@ -484,6 +512,11 @@ fn compare(
             continue;
         }
         let place = place_of(picture, planes, at);
+        if picture.format == SurfaceFormat::Xyuv
+            && place.is_some_and(|(_, _, byte)| byte % PackedTarget::PIXEL_BYTES == 3)
+        {
+            continue;
+        }
         let wrong = found.get_or_insert(Wrong {
             at,
             got: *got,
@@ -543,7 +576,15 @@ fn trial_in(
     let fourcc = match picture.format {
         SurfaceFormat::Nv12 => FourCc::new(*b"420v"),
         SurfaceFormat::P010 => FourCc::new(*b"x420"),
-        SurfaceFormat::Xyuv => return Err("no trial of XYUV imports".to_owned()),
+        SurfaceFormat::Xyuv => {
+            let [(offset, pitch), _] = planes;
+            let size = (picture.width, picture.height);
+            let target = PackedTarget::new(&memory, offset, pitch, size)?;
+            let target = ImportPlanes::from(&target);
+            super::zero_copy::trial(display, &source.surface, target, write, strips)?;
+            let held = memory.memory.lock();
+            return Ok(wrong(picture, held.bytes(), planes));
+        }
     };
     let plane = |n: usize| PlaneLayout {
         offset: planes[n].0,
@@ -563,7 +604,8 @@ fn trial_in(
         bytes_per_row: 0,
     };
     let target = GuestTarget::new(&layout, &memory)?;
-    super::zero_copy::trial(display, &source.surface, &target, write, strips)?;
+    let target = ImportPlanes::from(&target);
+    super::zero_copy::trial(display, &source.surface, target, write, strips)?;
     let held = memory.memory.lock();
     Ok(wrong(picture, held.bytes(), planes))
 }
@@ -627,7 +669,14 @@ fn to_usize(value: u32) -> usize {
 mod tests {
     use super::*;
 
-    const FORMATS: [SurfaceFormat; 2] = [SurfaceFormat::Nv12, SurfaceFormat::P010];
+    const FORMATS: [SurfaceFormat; 3] = [
+        SurfaceFormat::Nv12,
+        SurfaceFormat::P010,
+        SurfaceFormat::Xyuv,
+    ];
+
+    /// The formats of two planes, luma and interleaved chroma.
+    const TWO_PLANES: [SurfaceFormat; 2] = [SurfaceFormat::Nv12, SurfaceFormat::P010];
 
     fn opening(format: SurfaceFormat) -> Picture {
         Picture {
@@ -731,13 +780,15 @@ mod tests {
             for alignment in ALIGNMENTS {
                 let (mut bytes, planes) = written(picture, alignment);
                 assert_eq!(wrong(picture, &bytes, planes), None);
-                // A sample wrong, a padding byte written where rows have padding, and a byte
-                // before the luma plane and the last after the chroma plane written.
-                let mut cases = vec![
-                    (planes[1].0 + 3, Some((1, 0, 3))),
-                    (0, None),
-                    (bytes.len() - 1, None),
-                ];
+                // A sample wrong (a chroma one where there is a chroma plane), a padding byte
+                // written where rows have padding, and a byte before the luma plane and the last
+                // after the chroma plane written.
+                let mut cases = vec![(0, None), (bytes.len() - 1, None)];
+                if picture.rows(1) > 0 {
+                    cases.push((planes[1].0 + 3, Some((1, 0, 3))));
+                } else {
+                    cases.push((planes[0].0 + 6, Some((0, 0, 6))));
+                }
                 if planes[0].1 > picture.row_bytes() {
                     cases.push((planes[0].0 + picture.row_bytes(), None));
                 }
@@ -762,7 +813,73 @@ mod tests {
             let bytes = vec![UNTOUCHED; size];
             let found = wrong(picture, &bytes, planes).unwrap();
             assert_eq!(found.outside, 0);
-            assert!(found.count > picture.row_bytes() * picture.rows(0));
+            // An XYUV pixel's fourth byte may be anything: three of its four are checked.
+            let checked = match format {
+                SurfaceFormat::Xyuv => picture.row_bytes() / 4 * 3,
+                _ => picture.row_bytes(),
+            };
+            assert!(found.count > checked * picture.rows(0) * 9 / 10, "{format:?}");
+        }
+    }
+
+    /// An XYUV picture is one plane of four bytes a pixel, its rows the picture's, and its trial
+    /// layouts hold no chroma rows.
+    #[test]
+    fn the_xyuv_trial_is_one_plane_of_four_bytes_a_pixel() {
+        let picture = opening(SurfaceFormat::Xyuv);
+        assert_eq!(picture.row_bytes(), to_usize(WIDTH) * 4);
+        assert_eq!((picture.rows(0), picture.rows(1)), (to_usize(HEIGHT), 0));
+        let whole = picture.whole(64);
+        assert_eq!(whole.row_bytes() % 64, 0);
+        assert_eq!(whole.row_bytes(), whole.width as usize * 4);
+        let (planes, size) = picture.layout(64);
+        let mut bytes = vec![UNTOUCHED; size];
+        fill(picture, &mut bytes, planes).unwrap();
+        // Nothing past the one plane's rows is written.
+        let end = planes[0].0 + planes[0].1 * picture.rows(0);
+        assert!(bytes[end..].iter().all(|&b| b == UNTOUCHED));
+        assert!(bytes[..planes[0].0].iter().all(|&b| b == UNTOUCHED));
+    }
+
+    /// An XYUV pixel's fourth byte holds nothing: a run may leave any value there, and still
+    /// passes; any of its other three wrong fails it.
+    #[test]
+    fn an_xyuv_pixels_fourth_byte_may_be_anything() {
+        let picture = opening(SurfaceFormat::Xyuv);
+        for alignment in ALIGNMENTS {
+            let (mut bytes, planes) = written(picture, alignment);
+            for pixel in [0, 1, 81] {
+                bytes[planes[0].0 + planes[0].1 + pixel * 4 + 3] ^= 0xff;
+            }
+            assert_eq!(wrong(picture, &bytes, planes), None, "{alignment}");
+            for byte in 0..3 {
+                let at = planes[0].0 + 5 * 4 + byte;
+                bytes[at] ^= 0x01;
+                let found = wrong(picture, &bytes, planes).expect("a wrong byte");
+                assert_eq!((found.at, found.place), (at, Some((0, 0, 20 + byte))));
+                bytes[at] ^= 0x01;
+            }
+        }
+    }
+
+    /// The answer of each format is its own trial's: XYUV's among them.
+    #[test]
+    fn each_formats_answer_is_its_own_trials() {
+        let whole = ImportWrite {
+            alignment: 64,
+            whole_rows: true,
+        };
+        let writes = ImportWrites::of_answers(Ok(ImportWrite::at(256)), Err("no P010".into()));
+        assert_eq!(writes.of(SurfaceFormat::Nv12), Ok(ImportWrite::at(256)));
+        assert_eq!(writes.of(SurfaceFormat::P010), Err("no P010".into()));
+        assert!(writes.of(SurfaceFormat::Xyuv).is_err());
+        let writes = writes.with_xyuv(Ok(whole));
+        assert_eq!(writes.of(SurfaceFormat::Xyuv), Ok(whole));
+        assert_eq!(writes.xyuv(), Ok(whole));
+        assert_eq!(writes.of(SurfaceFormat::Nv12), Ok(ImportWrite::at(256)));
+        let none = ImportWrites::none("no dma-buf");
+        for format in FORMATS {
+            assert_eq!(none.of(format), Err("no dma-buf".into()));
         }
     }
 
@@ -877,13 +994,15 @@ mod tests {
         let Ok(write) = write else { return false };
         let a = write.alignment;
         let [(luma, pitch), (chroma, _)] = planes;
+        // XYUV's one plane: what lies past it is no plane.
+        let one = picture.format == SurfaceFormat::Xyuv;
         pitch.is_multiple_of(a)
             && luma.is_multiple_of(a)
-            && chroma.is_multiple_of(a)
+            && (one || chroma.is_multiple_of(a))
             && (!write.whole_rows
                 || (picture.row_bytes().is_multiple_of(a)
                     && luma.is_multiple_of(PAGE)
-                    && (chroma - luma).is_multiple_of(pitch)))
+                    && (one || (chroma - luma).is_multiple_of(pitch))))
     }
 
     /// Every decoder shape copied back the staged way, and written through zero copy's import at
@@ -937,7 +1056,8 @@ mod tests {
                             lent_wrong.push(format!("{shape} {what}: {}", said(&answer)));
                         }
                     };
-                let staged_used = lent.is_ok();
+                // No staged copy back is of XYUV (`readback.rs`'s `HostFormat`).
+                let staged_used = lent.is_ok() && format != SurfaceFormat::Xyuv;
                 let answer = staged(&display, &source, (coded_width, coded_height), picture);
                 check("staged".to_owned(), staged_used, answer);
                 let probe = ImportWrite::at(ALIGNMENTS[0]);
@@ -998,7 +1118,7 @@ mod tests {
         let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
         let display = Display::open(&node, Arc::new(GatedRuntime)).expect("a display");
         let mut failed = Vec::new();
-        for format in FORMATS {
+        for format in TWO_PLANES {
             let lent = display.writes_imports(format);
             eprintln!("{node} {}: the check answered {lent:?}", format.name());
             let alignment = lent.as_ref().map_or(ALIGNMENTS[0], |write| write.alignment);

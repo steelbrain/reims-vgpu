@@ -425,6 +425,7 @@ int main(void)
     C(DRM_FORMAT_MOD_LINEAR);
     C(DRM_FORMAT_NV12);
     C(DRM_FORMAT_P010);
+    C(DRM_FORMAT_XYUV8888);
     C(VAGenericValueTypeInteger);
     C(VAGenericValueTypePointer);
     C(VAPictureParameterBufferType);

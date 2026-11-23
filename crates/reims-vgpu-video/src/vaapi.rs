@@ -11,8 +11,9 @@ mod va;
 pub use va::{
     Capabilities, ConfigCapabilities, Display, Entrypoint, Error, ExportedPlane, Fourcc, Frame,
     FrameHold, GuestWrites, H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrite,
-    ImportWrites, LoadError, PlaneRows, Profile, ReadBack, ReadbackTimes, ReadbackWay,
-    SurfaceCapabilities, SurfaceExport, proc_filter_name, read_back_by, rt_format_names,
+    ImportWrites, LoadError, PackedTarget, PlaneRows, Profile, ReadBack, ReadbackTimes,
+    ReadbackWay, SurfaceCapabilities, SurfaceExport, proc_filter_name, read_back_by,
+    rt_format_names,
 };
 
 /// A pool's surface on Windows, a shared Direct3D 12 texture, which a frame names

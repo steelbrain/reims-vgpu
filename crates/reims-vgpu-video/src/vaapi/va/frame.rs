@@ -13,6 +13,7 @@ use super::export::SurfaceExport;
 use super::readback::ReadbackTimes;
 use super::surface::{Rect, Surface, SurfaceFormat, SurfaceReadBack};
 use super::wait::{self, Deadline};
+use super::zero_copy::PackedTarget;
 
 /// A decoded frame: its surface, held until the frame is dropped, and
 /// what the decoder knows of it.
@@ -415,6 +416,33 @@ impl Frame {
         );
         wait::by(&self.deadline, || {
             super::zero_copy::write(self, target, &writes.0, size, decoded)
+        })
+    }
+
+    /// Writes the frame, a 4:4:4 one ([`Frame::is_4_4_4`]), into `target` as its XYUV surface
+    /// holds it, by video-processing runs from its surface as [`Frame::write_to_guest`] writes a
+    /// 4:2:0 frame (`super::zero_copy`), once its decode is done: `target`'s whole width and
+    /// height from the crop's first sample, which the decoded (coded) picture holds.
+    /// [`DeviceWrite::Declined`] with why where the driver or the buffer's layout takes none, or
+    /// the target reaches past the decoded picture, and nothing was written.
+    pub fn write_4_4_4_to(
+        &self,
+        target: &PackedTarget<'_>,
+        writes: &GuestWrites,
+    ) -> Result<DeviceWrite, Error> {
+        let rect = self.rect;
+        let (coded_width, coded_height) = self.surface.size();
+        let size = (target.width(), target.height());
+        if size.0 > coded_width.saturating_sub(rect.x) || size.1 > coded_height.saturating_sub(rect.y)
+        {
+            return Ok(DeviceWrite::Declined(format!(
+                "a buffer of {}x{} from ({}, {}) of a decoded picture of {coded_width}x\
+                 {coded_height}",
+                size.0, size.1, rect.x, rect.y
+            )));
+        }
+        wait::by(&self.deadline, || {
+            super::zero_copy::write_packed(self, target, &writes.0, size, &mut || {})
         })
     }
 }
