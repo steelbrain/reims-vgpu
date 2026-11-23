@@ -48,6 +48,16 @@
 //! imported block is counted under its import's cause too, so the imported ones are an axis of
 //! their own and no cause.
 //!
+//! **Its over-copies' kinds.** rt keeps the first 256 kinds of texture each device over-copied,
+//! in the order it first copied them: the cause, and the texture's pixel format, size and usage
+//! (`Counters::over_copy_kinds`). The counts' folds read the kinds a device added since the last
+//! ([`fold_metrics`], and [`follow`]'s of the device before the next), and each kind the process
+//! had not logged goes to the log at info once ([`note_over_copy_kinds`]), by its fields
+//! ([`over_copy_kind_line`]): a kind two devices copied is logged once, at the first fold that
+//! read it. A copy of a kind rt did not keep, the 256 being full, is counted as an amount,
+//! [`OVER_COPIES_UNKEPT_KIND_CODE`] (rt's `Metrics::over_copies_unkept_kind`): where it is not
+//! 0, some kinds were not logged.
+//!
 //! **Its command buffers held for room.** rt keeps on its `VkQueue` only what the queue has room
 //! for, and holds a command buffer scheduled behind a group it could not join until there is room
 //! (rt's `Metrics::held_for_room`). The counts line carries how many as an amount too,
@@ -205,26 +215,31 @@
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
-//! the texture blocks held whole (`texture_block_held_bytes`), and the Private blocks taken and
-//! not given back (`private_take_bytes`). A fifth is the size of the data in the device's
+//! the texture blocks held whole (`texture_block_held_bytes`), and the Private blocks taken and not
+//! given back (`private_take_bytes`). A fifth is the size of the data in the device's
 //! `VkPipelineCache` (`pipeline_cache_bytes`), which rt measures at its seed and when its reaper
-//! last looked, once creation was quiet, and which falls when the reaper replaces a cache past
-//! 128 MiB with a fresh one. Two more are the resolve images a device holds (`resolve_images`) and
-//! the bytes of their memory (`resolve_image_bytes`). The last two are the compiled kernels alive
-//! (`kernels`), each the translation of one compute pipeline content with its shader modules and
-//! their `VkPipeline`s, which lives while a state or the device's map of compiled contents holds
-//! it, and that map's entries, compute and render together, at most 1,024 (`kernel_entries`). A
-//! gauge rises and falls, so the counts line carries the highest each reached at a look,
-//! `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it ([`note_gauges`]): the
-//! in-run highest, to within the looks. The gauges' thread looks every 5 s from the process's
-//! first device's open on, whether or not its lines are in the log (`super::gauge_log`); so do
-//! the counts' folds ([`fold_metrics`]: a guest device's reset, after its objects dropped, and
-//! the process's exit), and the let-go of a device once every handle but the platform's is gone,
-//! before rt's quiesce and teardown of it (`RtPlatform::let_go_of_device`), since the teardown
-//! sets every gauge to zero and the counts line of an exit after a let-go, as at a host's quit,
-//! comes after it. A value rt held between two looks is not seen. The trace's `rtcounts` carries
-//! the two kernel gauges as they are at each of its events (`super::command`), at most one each
-//! 50 ms while command buffers commit or complete, so a traced run shows them over time.
+//! last looked, once creation was quiet, and which falls when the reaper replaces a cache past 128
+//! MiB with a fresh one. Two more are the resolve images a device holds (`resolve_images`) and the
+//! bytes of their memory (`resolve_image_bytes`). Two are the compiled kernels alive (`kernels`),
+//! each the translation of one compute pipeline content with its shader modules and their
+//! `VkPipeline`s, which lives while a state or the device's map of compiled contents holds it, and
+//! that map's entries, compute and render together, at most 1,024 (`kernel_entries`). The last two
+//! are those kernels' `VkPipeline`s, each of one workgroup size, threadgroup memory lengths,
+//! imageblock size and tiles, of which a module keeps the 8 it made first and the 56 dispatched
+//! last past them, beside those that work not yet retired held at its last make
+//! (`kernel_variants`), and the variants of sampler states bound with LOD clamps of their own, at
+//! most 4,000 (`lod_clamp_variants`). A gauge rises and falls, so the counts line carries the
+//! highest each reached at a look, `rt-<gauge>-most` ([`highest_gauges`]), as an amount risen to it
+//! ([`note_gauges`]): the in-run highest, to within the looks. The gauges' thread looks every 5 s
+//! from the process's first device's open on, whether or not its lines are in the log
+//! (`super::gauge_log`); so do the counts' folds ([`fold_metrics`]: a guest device's reset, after
+//! its objects dropped, and the process's exit), and the let-go of a device once every handle but
+//! the platform's is gone, before rt's quiesce and teardown of it (`RtPlatform::let_go_of_device`),
+//! since the teardown sets every gauge to zero and the counts line of an exit after a let-go, as at
+//! a host's quit, comes after it. A value rt held between two looks is not seen. The trace's
+//! `rtcounts` carries the compiled kernels and the map's entries as they are at each of its events
+//! (`super::command`), at most one each 50 ms while command buffers commit or complete, so a traced
+//! run shows them over time.
 
 use std::sync::{Arc, OnceLock};
 
@@ -281,6 +296,11 @@ pub const OVER_COPIES_IMPORTED_CODE: &str = "rt-over-copies-imported";
 
 /// The code of their bytes (`Metrics::over_copy_bytes_imported`).
 pub const OVER_COPY_BYTES_IMPORTED_CODE: &str = "rt-over-copy-bytes-imported";
+
+/// The code of the over-copies of a kind rt kept none of, its 256 kinds being full
+/// (`Metrics::over_copies_unkept_kind`), an amount on the counts line ([`fold_metrics`]): the
+/// copies whose kind [`note_over_copy_kinds`] cannot log.
+pub const OVER_COPIES_UNKEPT_KIND_CODE: &str = "rt-over-copies-unkept-kind";
 
 /// The code of the command buffers rt held for room on its `VkQueue` (`Metrics::held_for_room`),
 /// an amount on the counts line ([`fold_metrics`]).
@@ -459,8 +479,17 @@ pub const KERNELS_MOST_CODE: &str = "rt-kernels-most";
 /// a look (`Gauges::kernel_entries`, [`note_gauges`]).
 pub const KERNEL_ENTRIES_MOST_CODE: &str = "rt-kernel-entries-most";
 
+/// The code of the most `VkPipeline`s of compiled kernels' modules at a look
+/// (`Gauges::kernel_variants`, [`note_gauges`]): those each module keeps for later dispatches and
+/// those past them that work not yet retired held.
+pub const KERNEL_VARIANTS_MOST_CODE: &str = "rt-kernel-variants-most";
+
+/// The code of the most variants of sampler states, each a state bound with LOD clamps of its
+/// own, at a look (`Gauges::lod_clamp_variants`, [`note_gauges`]).
+pub const LOD_CLAMP_VARIANTS_MOST_CODE: &str = "rt-lod-clamp-variants-most";
+
 /// The gauges the counts line carries at their highest ([`highest_gauges`]).
-const HIGHEST_GAUGES: usize = 9;
+const HIGHEST_GAUGES: usize = 11;
 
 /// The highest of each of [`highest_gauges`]'s gauges a look saw, in its order, over the
 /// process's devices.
@@ -481,9 +510,9 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// creations made before its seed, the dispatches that ran an emulated-SIMD-group module, the
 /// compiled contents a state's make dropped, the resolves of multisample attachments, the copies
 /// out of resolve images and their bytes, the whole grids that ran a partial-threadgroups variant,
-/// the main pipelines the states' finishes made and their nanoseconds, and the first-use waits for
-/// an unfinished main pipeline and their nanoseconds.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 28;
+/// the main pipelines the states' finishes made and their nanoseconds, the first-use waits for an
+/// unfinished main pipeline and their nanoseconds, and the over-copies of a kind rt kept none of.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 29;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -495,11 +524,17 @@ static METRICS_HIGHEST: crate::core::sync::Mutex<[u64; HIGHEST_METRICS]> =
     crate::core::sync::Mutex::new([0; HIGHEST_METRICS]);
 
 /// The counters of the device the process made last ([`open`]), which [`fold_metrics`] reads,
-/// with what it folded so far of each of their metrics, in [`folded_counts`]'s order.
-type Folding = Option<(rt::Counters, [u64; FOLDED_METRICS])>;
+/// with what it folded so far of each of their metrics, in [`folded_counts`]'s order, and how
+/// many of its over-copies' kinds it read ([`note_over_copy_kinds`]).
+type Folding = Option<(rt::Counters, [u64; FOLDED_METRICS], usize)>;
 
 /// The process's [`Folding`], once a device is made.
 static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::new(None);
+
+/// The over-copies' kinds the process logged ([`note_over_copy_kinds`]), over its devices, in the
+/// order logged: at most rt's 256 of each device.
+static OVER_COPY_KINDS_LOGGED: crate::core::sync::Mutex<Vec<rt::OverCopyKind>> =
+    crate::core::sync::Mutex::new(Vec::new());
 
 /// Counts by code (`crate::answer::count_kind_by`) what rt's over-copy metrics of the process's
 /// device, its command buffers held for room, its cache writes, its translations, its pipelines'
@@ -507,24 +542,27 @@ static COUNTERS: crate::core::sync::Mutex<Folding> = crate::core::sync::Mutex::n
 /// first-use waits, its exported blocks addressed, its pipeline caches replaced and cache writes
 /// skipped past their bound, its reaper's looks at the cache skipped, its creations before the
 /// seed, its emulated-SIMD-group dispatches, its dropped makes, its resolves, its resolve copies,
-/// its whole grids on a partial-threadgroups variant, its states' finishes and their waits rose by
-/// since the last fold ([`folded_counts`]), so the counts line carries their totals, then its
-/// maxima ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest (the
-/// module's docs). Nothing of rt's before the device is made. First it counts the dispatches the rt
-/// platform's compute encoders encoded since the last fold (`super::compute::fold_dispatches`).
+/// its whole grids on a partial-threadgroups variant, its states' finishes and their waits and its
+/// over-copies of a kind rt kept none of rose by since the last fold ([`folded_counts`]), so the
+/// counts line carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
+/// ([`note_gauges`]) at their highest, and logs its over-copies' kinds the process had not logged
+/// ([`note_over_copy_kinds`]) (the module's docs). Nothing of rt's before the device is made. First
+/// it counts the dispatches the rt platform's compute encoders encoded since the last fold
+/// (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
     super::compute::fold_dispatches();
-    let (metrics, gauges) = {
+    let (metrics, gauges, kinds) = {
         let mut latest = COUNTERS.lock();
-        let Some((counters, folded)) = latest.as_mut() else {
+        let Some((counters, folded, read)) = latest.as_mut() else {
             return;
         };
         let metrics = counters.metrics();
         fold(folded, folded_counts(&metrics));
-        (metrics, counters.gauges())
+        (metrics, counters.gauges(), unread_kinds(counters, read))
     };
     note_highest_metrics(&metrics);
     note_gauges(&gauges);
+    note_over_copy_kinds(kinds);
 }
 
 /// Looks at `m`, the metrics of the process's device now: counts each of [`highest_metrics`]'s by
@@ -565,9 +603,10 @@ pub(super) fn note_gauges(g: &rt::Gauges) {
 /// ([`PREPROCESS_IDLE_MOST_CODE`]), the texture blocks held ([`TEXTURE_BLOCK_HELD_MOST_CODE`]),
 /// the Private blocks taken ([`PRIVATE_TAKE_MOST_CODE`]), the pipeline cache's data
 /// ([`PIPELINE_CACHE_MOST_CODE`]), the resolve images ([`RESOLVE_IMAGES_MOST_CODE`]) and their
-/// memory ([`RESOLVE_IMAGE_BYTES_MOST_CODE`]), and the compiled kernels alive
-/// ([`KERNELS_MOST_CODE`]) and the entries of the map of compiled contents
-/// ([`KERNEL_ENTRIES_MOST_CODE`]).
+/// memory ([`RESOLVE_IMAGE_BYTES_MOST_CODE`]), the compiled kernels alive ([`KERNELS_MOST_CODE`])
+/// and the entries of the map of compiled contents ([`KERNEL_ENTRIES_MOST_CODE`]), the kernels'
+/// `VkPipeline`s ([`KERNEL_VARIANTS_MOST_CODE`]), and the sampler states' LOD clamp variants
+/// ([`LOD_CLAMP_VARIANTS_MOST_CODE`]).
 fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
     [
         (PREPROCESS_USED_MOST_CODE, g.preprocess_used_bytes),
@@ -579,6 +618,8 @@ fn highest_gauges(g: &rt::Gauges) -> [(&'static str, u64); HIGHEST_GAUGES] {
         (RESOLVE_IMAGE_BYTES_MOST_CODE, g.resolve_image_bytes),
         (KERNELS_MOST_CODE, g.kernels),
         (KERNEL_ENTRIES_MOST_CODE, g.kernel_entries),
+        (KERNEL_VARIANTS_MOST_CODE, g.kernel_variants),
+        (LOD_CLAMP_VARIANTS_MOST_CODE, g.lod_clamp_variants),
     ]
 }
 
@@ -594,18 +635,81 @@ fn raise_to<const N: usize>(highest: &mut [u64; N], now: [(&'static str, u64); N
 }
 
 /// Makes `counters`, those of a device just made, the ones [`fold_metrics`] reads. What the
-/// device before it rose by since the last fold is folded first, and its maxima and gauges looked
-/// at ([`note_highest_metrics`], [`note_gauges`]), so that the counts line keeps its totals after
-/// a let-go (`RtPlatform::let_go_of_device`) and adds the new device's.
+/// device before it rose by since the last fold is folded first, its maxima and gauges looked at
+/// ([`note_highest_metrics`], [`note_gauges`]) and its over-copies' kinds read
+/// ([`note_over_copy_kinds`]), so that the counts line keeps its totals after a let-go
+/// (`RtPlatform::let_go_of_device`) and adds the new device's.
 fn follow(counters: rt::Counters) {
     let mut latest = COUNTERS.lock();
-    if let Some((before, folded)) = latest.as_mut() {
+    let mut kinds = Vec::new();
+    if let Some((before, folded, read)) = latest.as_mut() {
         let metrics = before.metrics();
         fold(folded, folded_counts(&metrics));
         note_highest_metrics(&metrics);
         note_gauges(&before.gauges());
+        kinds = unread_kinds(before, read);
     }
-    *latest = Some((counters, [0; FOLDED_METRICS]));
+    *latest = Some((counters, [0; FOLDED_METRICS], 0));
+    drop(latest);
+    note_over_copy_kinds(kinds);
+}
+
+/// The over-copies' kinds `counters` names past the first `read` (`rt::Counters::over_copy_kinds`),
+/// which a fold has not read, in the order rt first copied them; `read` then counts them too.
+fn unread_kinds(counters: &rt::Counters, read: &mut usize) -> Vec<rt::OverCopyKind> {
+    let kinds = counters.over_copy_kinds(*read);
+    *read += kinds.len();
+    kinds
+}
+
+/// Logs at info, once a process, each of `kinds`, a device's over-copies' kinds a fold had not
+/// read, that the process had not logged ([`first_seen`], [`over_copy_kind_line`]): a diagnostic,
+/// which names no guest object, only what rt keeps of the kind.
+fn note_over_copy_kinds(kinds: Vec<rt::OverCopyKind>) {
+    if kinds.is_empty() {
+        return;
+    }
+    let new = first_seen(&mut OVER_COPY_KINDS_LOGGED.lock(), kinds);
+    for kind in new {
+        let line = over_copy_kind_line(
+            kind.cause,
+            kind.pixel_format,
+            [kind.width, kind.height],
+            kind.usage,
+        );
+        log::info!(target: TARGET, "{line}");
+    }
+}
+
+/// Of `kinds`, in their order, those not in `logged` and not before them in `kinds`, each then
+/// added to `logged`.
+fn first_seen<K: PartialEq + Copy>(logged: &mut Vec<K>, kinds: Vec<K>) -> Vec<K> {
+    let mut new = Vec::new();
+    for kind in kinds {
+        if !logged.contains(&kind) {
+            logged.push(kind);
+            new.push(kind);
+        }
+    }
+    new
+}
+
+/// The line of an over-copy's kind ([`note_over_copy_kinds`]), by its fields: the cause rt gives
+/// it (`rt::OverCause`), then the texture's pixel format by its Metal name and value, its width
+/// by its height in texels, and its usage's bits as its descriptor stated them.
+fn over_copy_kind_line(
+    cause: rt::OverCause,
+    pixel_format: rt::PixelFormat,
+    [width, height]: [u32; 2],
+    usage: rt::TextureUsage,
+) -> String {
+    format!(
+        "rt's first over-copy of a kind: cause {cause:?}, pixel format {} ({}), {width} by \
+         {height}, usage {:#x}",
+        pixel_format.name(),
+        pixel_format.as_raw(),
+        usage.as_raw()
+    )
 }
 
 /// The metrics of `m` the counts line carries, each with its code: the over-copy metrics
@@ -628,9 +732,10 @@ fn follow(counters: rt::Counters) {
 /// the copies out of resolve images ([`RESOLVE_COPIES_CODE`]) and their bytes
 /// ([`RESOLVE_COPY_BYTES_CODE`]), the whole grids that ran a partial-threadgroups variant
 /// ([`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`]), the main pipelines the states' finishes made
-/// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), and the
+/// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), the
 /// first-use waits for an unfinished main pipeline ([`UNFINISHED_WAITS_CODE`]) and their
-/// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]).
+/// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]), and the over-copies of a kind rt kept none of
+/// ([`OVER_COPIES_UNKEPT_KIND_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -677,6 +782,7 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (FINISHED_PIPELINE_NS_CODE, m.finished_pipeline_nanos),
         (UNFINISHED_WAITS_CODE, m.first_use_unfinished_waits),
         (UNFINISHED_WAIT_NS_CODE, m.first_use_unfinished_wait_nanos),
+        (OVER_COPIES_UNKEPT_KIND_CODE, m.over_copies_unkept_kind),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -720,19 +826,19 @@ pub(super) fn over_copy_counts(m: &rt::Metrics) -> [(&'static str, u64); OVER_CO
 
 /// rt's metrics of the process's device now (`super::diag`); `None` before it is made.
 pub(super) fn metrics() -> Option<rt::Metrics> {
-    (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.metrics())
+    (COUNTERS.lock().as_ref()).map(|(counters, ..)| counters.metrics())
 }
 
 /// rt's gauges of the process's device now (`super::diag`); `None` before it is made.
 pub(super) fn gauges() -> Option<rt::Gauges> {
-    (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.gauges())
+    (COUNTERS.lock().as_ref()).map(|(counters, ..)| counters.gauges())
 }
 
 /// rt's last ended makes of compute kernels' pipelines for a dispatch's variant, of the process's
 /// device, oldest first (`rt::Counters::variant_makes`, `super::overlap`); `None` before it is
 /// made.
 pub(super) fn variant_makes() -> Option<Vec<rt::VariantMake>> {
-    (COUNTERS.lock().as_ref()).map(|(counters, _)| counters.variant_makes(0))
+    (COUNTERS.lock().as_ref()).map(|(counters, ..)| counters.variant_makes(0))
 }
 
 /// Counts the rise of each metric of `now` ([`folded_counts`]) over `folded` under its code, and
@@ -2273,8 +2379,9 @@ mod tests {
     /// made before its seed, the dispatches that ran an emulated-SIMD-group module, the compiled
     /// contents a state's make dropped, the resolves of multisample attachments, the copies out of
     /// resolve images and their bytes, the whole grids that ran a partial-threadgroups variant, the
-    /// main pipelines the states' finishes made and their nanoseconds, and the first-use waits for
-    /// an unfinished main pipeline and their nanoseconds.
+    /// main pipelines the states' finishes made and their nanoseconds, the first-use waits for an
+    /// unfinished main pipeline and their nanoseconds, and the over-copies of a kind rt kept none
+    /// of.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2316,6 +2423,7 @@ mod tests {
             FINISHED_PIPELINE_NS_CODE,
             UNFINISHED_WAITS_CODE,
             UNFINISHED_WAIT_NS_CODE,
+            OVER_COPIES_UNKEPT_KIND_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -2355,6 +2463,7 @@ mod tests {
         m.finished_pipeline_nanos = 12_000_000;
         m.first_use_unfinished_waits = 1;
         m.first_use_unfinished_wait_nanos = 400_000;
+        m.over_copies_unkept_kind = 1;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -2389,6 +2498,7 @@ mod tests {
         m.finished_pipeline_nanos = 12_000_000 + 6_750_000;
         m.first_use_unfinished_waits = 3;
         m.first_use_unfinished_wait_nanos = 400_000 + 900_000;
+        m.over_copies_unkept_kind = 4;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -2398,7 +2508,7 @@ mod tests {
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
                 28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 5,
-                18_750_000, 3, 1_300_000
+                18_750_000, 3, 1_300_000, 4
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
@@ -2458,13 +2568,15 @@ mod tests {
         assert_eq!(count() - before, 5_000_000);
     }
 
-    /// Nine of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by
+    /// Eleven of rt's gauges go to the counts at their highest ([`note_gauges`]): each counted by
     /// its rise over the highest a look saw, so that one that falls leaves its count as it was and
     /// one that rises past it raises it, the pipeline cache's data falling as its reaper replaces
-    /// a full cache with a fresh one, the resolve images as their textures drop, and the compiled
-    /// kernels as their states drop while the map of compiled contents stays full.
+    /// a full cache with a fresh one, the resolve images as their textures drop, the compiled
+    /// kernels as their states drop while the map of compiled contents stays full, their
+    /// `VkPipeline`s as work retires past the 64 a module keeps, and the LOD clamp variants as
+    /// their sampler states drop.
     #[test]
-    fn nine_gauges_count_at_their_highest() {
+    fn eleven_gauges_count_at_their_highest() {
         let codes = [
             PREPROCESS_USED_MOST_CODE,
             PREPROCESS_IDLE_MOST_CODE,
@@ -2475,6 +2587,8 @@ mod tests {
             RESOLVE_IMAGE_BYTES_MOST_CODE,
             KERNELS_MOST_CODE,
             KERNEL_ENTRIES_MOST_CODE,
+            KERNEL_VARIANTS_MOST_CODE,
+            LOD_CLAMP_VARIANTS_MOST_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -2491,6 +2605,8 @@ mod tests {
         g.resolve_image_bytes = 8 << 20;
         g.kernels = 1_100;
         g.kernel_entries = 1_024;
+        g.kernel_variants = 90;
+        g.lod_clamp_variants = 12;
         let mut highest = [0; HIGHEST_GAUGES];
         raise_to(&mut highest, highest_gauges(&g));
         g.preprocess_used_bytes = 12 << 20;
@@ -2500,11 +2616,14 @@ mod tests {
         g.resolve_images = 1;
         g.resolve_image_bytes = 4 << 20;
         g.kernels = 1_030;
+        g.kernel_variants = 64;
+        g.lod_clamp_variants = 3;
         raise_to(&mut highest, highest_gauges(&g));
         g.pipeline_cache_bytes = 31 << 20;
         raise_to(&mut highest, highest_gauges(&g));
         g.resolve_images = 3;
         g.kernels = 1_150;
+        g.lod_clamp_variants = 40;
         raise_to(&mut highest, highest_gauges(&g));
         assert_eq!(
             highest,
@@ -2517,12 +2636,45 @@ mod tests {
                 3,
                 8 << 20,
                 1_150,
-                1_024
+                1_024,
+                90,
+                40
             ]
         );
         let after = counts();
         let rose: Vec<u64> = (after.iter().zip(before)).map(|(a, b)| a - b).collect();
         assert_eq!(rose, highest);
+    }
+
+    /// Each over-copy's kind is logged once a process ([`first_seen`]): a kind a fold read before,
+    /// of this device or another, is not logged again, nor one twice in one read; the rest go in
+    /// rt's order.
+    #[test]
+    fn each_over_copy_kind_is_logged_once_a_process() {
+        let mut logged = Vec::new();
+        assert_eq!(first_seen(&mut logged, vec![3, 1, 3]), [3, 1]);
+        assert_eq!(first_seen(&mut logged, vec![]), [0; 0]);
+        assert_eq!(first_seen(&mut logged, vec![1, 4, 2, 4, 3]), [4, 2]);
+        assert_eq!(logged, [3, 1, 4, 2]);
+    }
+
+    /// An over-copy's kind's line names each of its fields ([`over_copy_kind_line`]): the cause by
+    /// its name in rt, the pixel format by its Metal name and value, the size in texels and the
+    /// usage's bits.
+    #[test]
+    fn an_over_copy_kind_s_line_names_its_fields() {
+        let usage = rt::TextureUsage::SHADER_READ | rt::TextureUsage::RENDER_TARGET;
+        let line = over_copy_kind_line(
+            rt::OverCause::Pitch,
+            rt::PixelFormat::BGRA8Unorm,
+            [1920, 1080],
+            usage,
+        );
+        assert_eq!(
+            line,
+            "rt's first over-copy of a kind: cause Pitch, pixel format MTLPixelFormatBGRA8Unorm \
+             (80), 1920 by 1080, usage 0x5"
+        );
     }
 
     /// The heaviest render stage past the kernels' bound goes to the counts at its highest
