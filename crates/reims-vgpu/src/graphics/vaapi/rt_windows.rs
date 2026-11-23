@@ -20,10 +20,11 @@
 //! known samples into a pair of targets of its own, imported as a cache's are, and writes one
 //! line of what the Direct3D 11 device and the device each read of each plane, and what the
 //! driver answers of rt's import (`graphics::drawn_check`, [`check`]). The device reads each
-//! plane three ways: sampled by a draw from the plane's texture, which rt makes at no index,
-//! sampled from a view of it in its own format, as the guest's textures over a plane are views,
-//! and copied by a blit; the draws' target is cleared to -1 and the host's bytes set to all ones
-//! first, so that a read that wrote nothing shows. Nothing decides by it.
+//! plane two ways: sampled by a draw from a view of the plane in its own format, as the guest's
+//! textures over a plane are views of it, and copied by a blit. rt makes each plane at no index,
+//! to be reached through its views alone, so a draw that binds the plane itself samples nil and
+//! reads zeros. The draw's target is cleared to -1 and the host's bytes set to all ones first, so
+//! that a read that wrote nothing shows. Nothing decides by it.
 
 use std::sync::Arc;
 
@@ -171,11 +172,7 @@ fn check_depth(
             Ok(()) => {
                 let done = made.memory.external_writes_done();
                 let sampled = (done.clone()).and_then(|()| match reader {
-                    Ok(reader) => reader.read(&made.planes, false),
-                    Err(why) => Err(why.clone()),
-                });
-                let viewed = (done.clone()).and_then(|()| match reader {
-                    Ok(reader) => reader.read(&made.planes, true),
+                    Ok(reader) => reader.read(&made.planes),
                     Err(why) => Err(why.clone()),
                 });
                 let copied = done.and_then(|()| match reader {
@@ -192,14 +189,13 @@ fn check_depth(
                         }
                         Err(why) => format!("not read ({why})"),
                     };
-                    let floats = |reads: &Result<[Vec<[f32; 4]>; 2], String>| match reads {
+                    let rt = match &sampled {
                         Ok(read) => {
                             let got = drawn_check::from_floats(ten_bit, plane, &read[plane]);
                             drawn_check::compare(plane, &want, &got)
                         }
                         Err(why) => format!("not read ({why})"),
                     };
-                    let (rt, view) = (floats(&sampled), floats(&viewed));
                     let blit = match &copied {
                         Ok(bytes) => {
                             let got = drawn_check::from_bytes(ten_bit, plane, &bytes[plane]);
@@ -208,10 +204,7 @@ fn check_depth(
                         Err(why) => format!("not copied ({why})"),
                     };
                     let name = if plane == 0 { "luma" } else { "chroma" };
-                    format!(
-                        "{name} Direct3D {d3d}, rt sampled {rt}, rt sampled through a view \
-                         {view}, rt copied {blit}"
-                    )
+                    format!("{name} Direct3D {d3d}, rt sampled {rt}, rt copied {blit}")
                 };
                 format!("{}, {}", side(0), side(1))
             }
@@ -243,9 +236,9 @@ const UNREAD: ClearColor = ClearColor {
 const LOAD_CLEAR: u64 = 2;
 const STORE_STORE: u64 = 1;
 
-/// The device's reads of a plane through its texture: sampled as the guest's shaders sample it,
-/// a draw of each texel into a texture of [`READ_FORMAT`] cleared to [`UNREAD`] that the host
-/// reads back; and copied by a blit into a buffer (module doc's "The draws' check").
+/// The device's reads of a plane: sampled through a view of it as the guest's shaders sample
+/// one, a draw of each texel into a texture of [`READ_FORMAT`] cleared to [`UNREAD`] that the
+/// host reads back; and copied by a blit into a buffer (module doc's "The draws' check").
 struct Reader {
     platform: Arc<RtPlatform>,
     device: super::RtDevice,
@@ -289,23 +282,20 @@ impl Reader {
     }
 
     /// What the device samples of each of `planes`, texel by texel, row after row, through a
-    /// view of each in its own format where `view`; `Err` says why it read none.
+    /// view of each in its own format (module doc's "The draws' check"); `Err` says why it read
+    /// none.
     fn read(
         &self,
         planes: &[<RtPlatform as Platform>::Texture],
-        view: bool,
     ) -> Result<[Vec<[f32; 4]>; 2], String> {
         let [luma, chroma] = planes else {
             return Err(format!("a surface of {} planes", planes.len()));
         };
         let read = |plane: &<RtPlatform as Platform>::Texture| {
-            if !view {
-                return self.read_plane(plane);
-            }
             match plane.new_texture_view(plane.pixel_format()) {
-                Ok(Some(viewed)) => self.read_plane(&viewed),
-                Ok(None) => Err("no view".to_owned()),
-                Err(raise) => Err(format!("the view: {raise}")),
+                Ok(Some(view)) => self.read_plane(&view),
+                Ok(None) => Err("no view of the plane".to_owned()),
+                Err(raise) => Err(format!("the plane's view: {raise}")),
             }
         };
         Ok([read(luma)?, read(chroma)?])
