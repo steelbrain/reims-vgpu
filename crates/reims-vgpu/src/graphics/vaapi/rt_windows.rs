@@ -22,9 +22,10 @@
 //! driver answers of rt's import (`graphics::drawn_check`, [`check`]). The device reads each
 //! plane two ways: sampled by a draw from a view of the plane in its own format, as the guest's
 //! textures over a plane are views of it, and copied by a blit. rt makes each plane at no index,
-//! to be reached through its views alone, so a draw that binds the plane itself samples nil and
-//! reads zeros. The draw's target is cleared to -1 and the host's bytes set to all ones first, so
-//! that a read that wrote nothing shows. Nothing decides by it.
+//! to be reached through its views alone, so it refuses a draw's bind of the plane itself
+//! (`Refusal::TextureWithoutIndex`), which a slot would read as nil. The draw's target is
+//! cleared to -1 and the host's bytes set to all ones first, so that a read that wrote nothing
+//! shows. Nothing decides by it.
 
 use std::sync::Arc;
 

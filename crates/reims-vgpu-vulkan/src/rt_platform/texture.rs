@@ -14,11 +14,13 @@
 //! of the platform's own indices. The guest's textures over the plane are its views, each at the
 //! guest's index (`newTextureViewWithPixelFormat:resourceIndex:`). Copies, uploads and readbacks
 //! reach the image as any texture. Its `resourceIndex`, `uniqueIdentifier` and the index in its
-//! `gpuResourceID` are 0, and a slot that binds it reads Metal's nil texture. A recording holds
-//! it, placed or not, as the device's `newTextureWithDescriptor:` of a descriptor whose
-//! `m2v.textureDescriptor` record marks it outside the guest's texture indices
-//! (`crate::recorder::outside_descriptor`), so the views, copies and commands that name it name
-//! its stream id. A surface's plane (`super::surface`, `super::d3d11_surface`), which the guest's
+//! `gpuResourceID` are 0, which a shader reads as Metal's nil texture, and where its usage
+//! reaches shaders, a bind of it to a function's texture slot is rt's refusal
+//! (`Refusal::TextureWithoutIndex`), which binds nothing, counted (`rt-refused-ours`): no slot
+//! reaches it but through a view. A recording holds it, placed or not, as the device's
+//! `newTextureWithDescriptor:` of a descriptor whose `m2v.textureDescriptor` record marks it
+//! outside the guest's texture indices (`crate::recorder::outside_descriptor`), so the views,
+//! copies and commands that name it name its stream id. A surface's plane (`super::surface`, `super::d3d11_surface`), which the guest's
 //! textures over the plane are views of in the same way, is recorded so too (`surface_plane`).
 //!
 //! **Placed images for views.** A shape's image may be placed instead
