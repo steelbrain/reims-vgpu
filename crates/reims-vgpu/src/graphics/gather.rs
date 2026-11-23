@@ -170,7 +170,9 @@ pub(crate) fn gathers(
         // And reads whole words: the word that holds the last row's last sample of each source
         // component lies in the source.
         let samples = row_bytes / components;
-        let span = (samples - 1).checked_mul(source.step).and_then(|s| s.checked_add(1));
+        let span = (samples - 1)
+            .checked_mul(source.step)
+            .and_then(|s| s.checked_add(1));
         let reach = (from.into_iter().map(|at| source.planes[at]).max())
             .and_then(|first| first.checked_add((rows - 1).checked_mul(source.pitch)?))
             .and_then(|last| last.checked_add(span?))

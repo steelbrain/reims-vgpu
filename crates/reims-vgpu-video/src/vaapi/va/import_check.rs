@@ -71,9 +71,9 @@ use super::ffi;
 use super::host_memory::HostMemory;
 use super::image::Image;
 use super::surface::{SurfaceFormat, SurfacePool};
-use super::zero_copy::PackedTarget;
 #[cfg(unix)]
 use super::zero_copy::ImportPlanes;
+use super::zero_copy::PackedTarget;
 
 /// The alignments tried, least first: of each row, and of each plane's first byte from its
 /// dma-buf's.
@@ -818,7 +818,10 @@ mod tests {
                 SurfaceFormat::Xyuv => picture.row_bytes() / 4 * 3,
                 _ => picture.row_bytes(),
             };
-            assert!(found.count > checked * picture.rows(0) * 9 / 10, "{format:?}");
+            assert!(
+                found.count > checked * picture.rows(0) * 9 / 10,
+                "{format:?}"
+            );
         }
     }
 

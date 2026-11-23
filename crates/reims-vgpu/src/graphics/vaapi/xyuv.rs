@@ -175,8 +175,12 @@ impl<P: Platform> XyuvGathers<P> {
             return declined("no scratch");
         };
         let length = scratch.pitch * scratch.rows;
-        let passes = match gathers(Planar::xyuv(scratch.pitch, length), crop, planes, surface.length())
-        {
+        let passes = match gathers(
+            Planar::xyuv(scratch.pitch, length),
+            crop,
+            planes,
+            surface.length(),
+        ) {
             Ok(passes) => passes,
             Err(why) => return Ok(Gathered::Declined(why)),
         };
@@ -196,7 +200,6 @@ impl<P: Platform> XyuvGathers<P> {
                 )));
             }
             Err(error) => {
-                drop(target);
                 self.failed.extend(self.scratch.take());
                 return Err(error);
             }
@@ -233,12 +236,15 @@ impl<P: Platform> XyuvGathers<P> {
             None => (pitch, rows),
         };
         let length = pitch.checked_mul(rows).ok_or("a scratch past 2^64 bytes")?;
-        let made = self.gatherer.device().new_dma_buf_buffer_of_length_padding_unobserved(
-            OnFault::Return,
-            length,
-            STORAGE_PRIVATE,
-            Some(0),
-        );
+        let made = self
+            .gatherer
+            .device()
+            .new_dma_buf_buffer_of_length_padding_unobserved(
+                OnFault::Return,
+                length,
+                STORAGE_PRIVATE,
+                Some(0),
+            );
         let buffer = match made {
             Ok(Some(buffer)) => buffer,
             Ok(None) => return Err("the device makes no scratch of a dma-buf".to_owned()),

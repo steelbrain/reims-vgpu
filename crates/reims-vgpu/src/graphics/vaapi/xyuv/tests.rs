@@ -117,7 +117,12 @@ fn a_scratch_the_device_exports_no_dma_buf_of_ends_the_route() {
     let mut gathers = route_on(&platform, Ok(WHOLE_ROWS)).expect("a route");
     let mark = platform.call_log().mark();
     assert!(gathers.scratch_for((640, 360)).is_err());
-    assert!(platform.call_log().sels_since(mark).contains(&DMA_BUF_BUFFER));
+    assert!(
+        platform
+            .call_log()
+            .sels_since(mark)
+            .contains(&DMA_BUF_BUFFER)
+    );
     assert!(gathers.scratch.is_none());
 }
 
@@ -151,6 +156,7 @@ fn thread_cpu() -> Duration {
 /// Where the import check refused XYUV, the route is none and the test says so.
 #[test]
 #[ignore = "needs a VA-API GPU and HEVC 4:4:4 streams: run on the VA-API host"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
 fn a_4_4_4_picture_written_by_the_gpu_is_the_cpus_split() {
     use reims_vgpu_video::vaapi::Display;
     use reims_vgpu_vulkan::RtPlatform;
@@ -226,8 +232,8 @@ fn a_4_4_4_picture_written_by_the_gpu_is_the_cpus_split() {
                 plane(chroma_at, chroma_pitch, 2 * width),
             ];
             let (cpu_at, wall_at) = (thread_cpu(), std::time::Instant::now());
-            let gathered = (gathers.land(frame, &writes, &planes, Some(&surface)))
-                .expect("the frame's write");
+            let gathered =
+                (gathers.land(frame, &writes, &planes, Some(&surface))).expect("the frame's write");
             let (gpu_cpu, gpu_wall) = (thread_cpu() - cpu_at, wall_at.elapsed());
             match gathered {
                 Gathered::Written => {}

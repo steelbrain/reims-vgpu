@@ -1553,8 +1553,8 @@ impl<P: Platform> VaGuestDecoder<P> {
             Ok(target) => target.planes(),
             Err(why) => return Ok(Err(why)),
         };
-        let gathered = (route.land(frame, &self.imports, &planes, output.buffer))
-            .map_err(video_error)?;
+        let gathered =
+            (route.land(frame, &self.imports, &planes, output.buffer)).map_err(video_error)?;
         Ok(gathered.written())
     }
 

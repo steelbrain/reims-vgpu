@@ -406,7 +406,13 @@ pub(crate) fn write(
             format.name()
         )));
     }
-    write_planes(frame, ImportPlanes::from(target), imports, size, decoded_now)
+    write_planes(
+        frame,
+        ImportPlanes::from(target),
+        imports,
+        size,
+        decoded_now,
+    )
 }
 
 /// [`write()`] for a 4:4:4 frame, an XYUV surface's, into `target`, a buffer of its packed
@@ -425,7 +431,13 @@ pub(crate) fn write_packed(
             format.name()
         )));
     }
-    write_planes(frame, ImportPlanes::from(target), imports, size, decoded_now)
+    write_planes(
+        frame,
+        ImportPlanes::from(target),
+        imports,
+        size,
+        decoded_now,
+    )
 }
 
 /// [`write()`] and [`write_packed`], once the buffer's format is the frame's.
@@ -924,9 +936,7 @@ impl Strip {
             return Err("the host's dma-buf holds no planes".to_owned());
         };
         if offsets.iter().any(|at| at % alignment as u64 != 0) {
-            let into: Vec<String> = (offsets.iter())
-                .map(|at| (at % 4096).to_string())
-                .collect();
+            let into: Vec<String> = (offsets.iter()).map(|at| (at % 4096).to_string()).collect();
             return Err(format!(
                 "planes {} bytes into their first page: the driver imports planes {alignment} \
                  bytes apart alone",

@@ -433,7 +433,8 @@ impl Frame {
         let rect = self.rect;
         let (coded_width, coded_height) = self.surface.size();
         let size = (target.width(), target.height());
-        if size.0 > coded_width.saturating_sub(rect.x) || size.1 > coded_height.saturating_sub(rect.y)
+        if size.0 > coded_width.saturating_sub(rect.x)
+            || size.1 > coded_height.saturating_sub(rect.y)
         {
             return Ok(DeviceWrite::Declined(format!(
                 "a buffer of {}x{} from ({}, {}) of a decoded picture of {coded_width}x\

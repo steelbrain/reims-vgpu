@@ -119,9 +119,19 @@ fn an_xyuv_source_short_of_the_crops_pixels_is_refused() {
     let narrow = gathers(Planar::xyuv(252, 252 * 48), (64, 48), &planes, surface);
     assert!(narrow.expect_err("a refusal").contains("past its source"));
     // The last row's last pixel's luma byte, 2 into it, in a word past the source.
-    let short = gathers(Planar::xyuv(256, 256 * 47 + 254), (64, 48), &planes, surface);
+    let short = gathers(
+        Planar::xyuv(256, 256 * 47 + 254),
+        (64, 48),
+        &planes,
+        surface,
+    );
     assert!(short.expect_err("a refusal").contains("past its source"));
-    let at_end = gathers(Planar::xyuv(256, 256 * 47 + 256), (64, 48), &planes, surface);
+    let at_end = gathers(
+        Planar::xyuv(256, 256 * 47 + 256),
+        (64, 48),
+        &planes,
+        surface,
+    );
     assert!(at_end.is_ok());
 }
 
