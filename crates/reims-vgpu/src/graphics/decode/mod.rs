@@ -69,8 +69,9 @@
 //!   lock here, nor the reset gate alone (the worker takes the gate shared, recursively).
 //! - the commit order ([`sequencer`]), and the contexts closed ([`ClosedContexts`]).
 //! - `surface_order` ([`surface_order::SurfaceOrder`]), the queues' surface timelines: a leaf,
-//!   taken under no other lock and holding none, by a command buffer that holds `SURFACE_ORDER`
-//!   (or is waited for) while its waits and its signal are encoded, and at a queue's make and end.
+//!   taken under no other lock (but `surface_caches`, by a release's answer, below) and holding
+//!   none, by a command buffer that holds `SURFACE_ORDER` (or is waited for) while its waits and
+//!   its signal are encoded, and at a queue's make and end.
 //! - `completed_ahead` ([`surface_order::CompletedAhead`]), the decodes completed ahead of their
 //!   ends, by block: a leaf, taken alone where a decode's command buffer enters it and leaves it,
 //!   and by a command buffer that uses a block, before its waits are encoded, where it holds any.
@@ -82,6 +83,16 @@
 //! an object lies in the block), `libraries`, `contexts`, a context's table, then the compiles'
 //! pending set (`super::compile`, asked under the table's lock as a compiled pipeline is stored);
 //! and `surface_views` before `surface_caches`.
+//!
+//! A release's answer reads what was in flight ([`InFlightRead`]) on the thread that gives it,
+//! where a drain's last hold goes: no lock here is held there, but `surface_caches`' where a
+//! `BLOCK_RELEASE`'s write-back that copies nothing ends under it holding the drain last. The
+//! read takes `contexts`, each context's drain under it in turn (as a drain's begin and a command
+//! buffer's take of its drain do), and `closing` under it (as a close does), lets go of them, then
+//! takes `surface_order` alone. So `surface_caches` comes before `contexts` there, and nothing
+//! that holds `contexts`, a drain's lock or `closing` takes `surface_caches`, `surface_order` or
+//! the trail's; and a drain's answers never run under those three, as a drain is handed back for
+//! the caller to drop with no lock held ([`GraphicsDecoder::drain_context`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -895,13 +906,52 @@ pub(crate) type EachTableObject<'a, P> = dyn for<'o> FnMut(u32, u64, bool, Table
 /// A decoder's tables, held weakly, for the walk at its device's loss (`super::fault_walk`).
 pub(crate) struct TableWalk<P: Platform>(Weak<Shared<P>>);
 
-/// The thread a decoder's state is let go of on where the walk at its device's loss held it last
-/// ([`TableWalk::each`]).
+/// The thread a decoder's state is let go of on where a hold of it taken off the decoder's own
+/// threads was the last: the walk at its device's loss ([`TableWalk::each`]), or a release
+/// answer's read of what was in flight ([`InFlightRead::read`]).
 pub(crate) const TABLES_LET_GO: &str = "reims-vgpu.graphics-tables-let-go";
 
 /// That thread's stack: a std thread's, as the decoder's workers have, which let go of the same
 /// objects.
 const TABLES_LET_GO_STACK: usize = 2 << 20;
+
+/// Lets go of `shared`, a hold of the decoder's state upgraded from a weak one on a thread that
+/// may be rt's completion thread: where the decoder went meanwhile, so the hold is the last, the
+/// state is let go of on a thread of its own ([`TABLES_LET_GO`]), not on this one, as a drop
+/// there of the decoder's objects that waited for a command buffer's completion would hang it. A
+/// refused thread ends the process, as the platform's threads do.
+fn let_go_off_thread<P: Platform>(shared: Arc<Shared<P>>) {
+    if let Some(last) = Arc::into_inner(shared) {
+        let threads = last.platform.threads().handle();
+        reims_vgpu_vulkan::core::rt::spawn_named(
+            &*threads,
+            TABLES_LET_GO,
+            TABLES_LET_GO_STACK,
+            Box::new(last),
+            || {},
+        );
+    }
+}
+
+/// A read, at a release's answer, of what of the guest's work was in flight then, for the
+/// trail's entry of the answer ([`crate::trail::InFlight`]): made where the release is asked
+/// ([`GraphicsDecoder::in_flight_read`]), and read in the answer, once. It holds the decoder's
+/// state weakly, so an answer that waits on a command buffer keeps none of it.
+pub(crate) struct InFlightRead<P: Platform> {
+    shared: Weak<Shared<P>>,
+    /// The releasing context.
+    context: u32,
+}
+
+impl<P: Platform> InFlightRead<P> {
+    /// What was in flight now ([`Shared::in_flight`]); `None` where the decoder is gone.
+    pub(crate) fn read(self) -> Option<crate::trail::InFlight> {
+        let shared = self.shared.upgrade()?;
+        let in_flight = shared.in_flight(self.context);
+        let_go_off_thread(shared);
+        Some(in_flight)
+    }
+}
 
 impl<P: Platform> TableWalk<P> {
     /// Whether the decoder's state is still there.
@@ -930,16 +980,7 @@ impl<P: Platform> TableWalk<P> {
             return (0, Vec::new(), false);
         };
         let walked = Self::each_of(&shared, bound, f);
-        if let Some(last) = Arc::into_inner(shared) {
-            let threads = last.platform.threads().handle();
-            reims_vgpu_vulkan::core::rt::spawn_named(
-                &*threads,
-                TABLES_LET_GO,
-                TABLES_LET_GO_STACK,
-                Box::new(last),
-                || {},
-            );
-        }
+        let_go_off_thread(shared);
         walked
     }
 
@@ -1187,6 +1228,36 @@ impl<P: Platform> Shared<P> {
     pub(crate) fn listener(&self) -> &P::SharedEventListener {
         self.listener
             .get_or_init(|| self.platform.new_shared_event_listener())
+    }
+
+    /// What of the guest's work is in flight as context `context`'s release is answered
+    /// ([`crate::trail::InFlight`]): the holds on every other context's current drain but its
+    /// state's own (each command buffer begun since its last drain began, and its earlier drains,
+    /// which their buffers hold, through the one each holds of the next, [`Drain`]), and on each
+    /// other closed context's last drain (`closing`); and `context`'s queues with a
+    /// command buffer posted and not yet committed ([`GraphicsDecoder::uncommitted`]). Once a
+    /// release, and nothing per command buffer: the states' lock, each drain's lock under it in
+    /// turn and the closed contexts' under it, then the surface order's alone.
+    fn in_flight(&self, context: u32) -> crate::trail::InFlight {
+        use reims_vgpu_vulkan::core::num::ToU64 as _;
+
+        let others = {
+            let contexts = self.contexts.lock();
+            let open: usize = (contexts.iter())
+                .filter(|&(&id, _)| id != context)
+                .map(|(_, state)| Arc::strong_count(&state.drain.lock()).saturating_sub(1))
+                .sum();
+            let closed: usize = (self.closing.lock().iter())
+                .filter(|&(&id, _)| id != context)
+                .map(|(_, drain)| drain.strong_count())
+                .sum();
+            open.saturating_add(closed)
+        };
+        let uncommitted = self.surface_order.lock().uncommitted(context);
+        crate::trail::InFlight {
+            others: others.to_u64(),
+            uncommitted: uncommitted.len().to_u64(),
+        }
     }
 }
 
@@ -1495,6 +1566,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// (`super::fault_walk`).
     pub(crate) fn table_walk(&self) -> TableWalk<P> {
         TableWalk(Arc::downgrade(&self.shared))
+    }
+
+    /// The read, at the answer of context `context`'s release, of what was in flight then
+    /// ([`InFlightRead`]).
+    pub(crate) fn in_flight_read(&self, context: u32) -> InFlightRead<P> {
+        InFlightRead {
+            shared: Arc::downgrade(&self.shared),
+            context,
+        }
     }
 
     /// A new decoder for `platform` over its `region`, with no objects. The first one made turns

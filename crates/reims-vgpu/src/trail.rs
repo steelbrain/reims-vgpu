@@ -15,14 +15,27 @@
 //!   freed by the platform, which it does once the command buffers that used it completed
 //!   (`graphics::decode::surface_pages`);
 //! - a `BLOCK_RELEASE` asked, and its answer, OK or refused, with how long it waited;
+//! - a `POOL_GIVE`'s and a `PRIVATE_GIVE`'s answer OK, with the block's offset in the pool or
+//!   GPU address and its length;
 //! - a piece of the Shared pool mapped into the guest at its guest-physical address, and sent
 //!   back to the source (`pool`);
 //! - the scanout set, at its region offset with its span, or blanked;
 //! - the display's hold of the block of a surface it shows begun, and ended (`DisplayHold`).
 //!
+//! **What was in flight at a release's answer** ([`InFlight`]). A release's answer OK (a
+//! `BLOCK_RELEASE`'s, a `POOL_GIVE`'s, a `PRIVATE_GIVE`'s) comes once every command buffer the
+//! decoder began for the releasing context has finished, and the guest may then reuse the
+//! block's memory. Its entry says what could still reach memory then: the holds of the other
+//! contexts' work on their drains (`graphics::decode::Drain`), 0 where no command buffer of
+//! another context was in flight, and the releasing context's queues with a command buffer
+//! posted on their rings and not yet committed, which its drain does not wait for. It is read as
+//! the answer is given, on the thread that gives it (the last command buffer's completion
+//! thread, often), once a release: nothing is read per command buffer
+//! (`graphics::decode::InFlightRead`).
+//!
 //! Recording an event takes the trail's lock once and copies the entry into a ring of [`LEN`]
 //! entries, the runs inline: no allocation but the ring's own, once, and no lookup the event's
-//! site did not make already.
+//! site did not make already, but a release answer's read of what was in flight.
 //!
 //! **When it is written.** At a device reset whose reset dropped live objects (the
 //! `the device was reset: N objects of M contexts dropped` line, N above 0, which follows the
@@ -58,8 +71,20 @@ pub(crate) enum Kind {
     ImportFreed,
     /// A `BLOCK_RELEASE` asked, of a block of `size` bytes.
     ReleaseAsked { size: u64 },
-    /// A `BLOCK_RELEASE` answered, refused or OK, `waited_us` after it was asked.
-    ReleaseAnswered { refused: bool, waited_us: u64 },
+    /// A `BLOCK_RELEASE` answered, refused or OK, `waited_us` after it was asked; one answered OK
+    /// with what was in flight then, where the decoder was there to read it.
+    ReleaseAnswered {
+        refused: bool,
+        waited_us: u64,
+        in_flight: Option<InFlight>,
+    },
+    /// A `POOL_GIVE` or `PRIVATE_GIVE` of `block`, of `length` bytes, answered OK, with what was
+    /// in flight then, where the decoder was there to read it.
+    GiveAnswered {
+        block: Given,
+        length: u64,
+        in_flight: Option<InFlight>,
+    },
     /// A piece of the Shared pool mapped into the guest.
     PoolMapped,
     /// A piece of the Shared pool sent back to the source.
@@ -70,6 +95,40 @@ pub(crate) enum Kind {
     HoldBegun { size: u64 },
     /// The display's hold of `size` bytes of a block ended.
     HoldEnded { size: u64 },
+}
+
+/// The block a give named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Given {
+    /// A block of the Shared pool, at its offset in the pool (`POOL_GIVE`).
+    Pool { pool_offset: u64 },
+    /// A Private block, at its GPU address (`PRIVATE_GIVE`).
+    Private { gpu_address: u64 },
+}
+
+/// What of the guest's work was in flight as a release was answered (the module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InFlight {
+    /// The holds on the other contexts' drains, each one's current drain and a closed one's last,
+    /// but for each context's own hold of its current drain: one a command buffer of theirs begun
+    /// and not through its completion handler, a message of theirs being carried out, a range
+    /// message waiting for its commit, or a release's or close's work waiting on one; and one
+    /// where an earlier drain of the context, which such a hold keeps, holds it. 0 where no
+    /// command buffer of another context was in flight; past 0, holds, not command buffers.
+    pub(crate) others: u64,
+    /// The releasing context's queues on whose rings a command buffer was posted and is not yet
+    /// committed (a queue counts once, however many it has).
+    pub(crate) uncommitted: u64,
+}
+
+impl fmt::Display for InFlight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "in flight: {} holds in other contexts, {} of its queues uncommitted",
+            self.others, self.uncommitted
+        )
+    }
 }
 
 /// Guest-physical runs, `(address, length)` each: the first [`RUNS`], with how many there are and
@@ -192,11 +251,38 @@ impl fmt::Display for Entry {
             Kind::ImportTaken => write!(f, ": a cached view's import taken")?,
             Kind::ImportFreed => write!(f, ": the import of a view made for it freed")?,
             Kind::ReleaseAsked { size } => write!(f, ": release asked, {size:#x} bytes")?,
-            Kind::ReleaseAnswered { refused, waited_us } => write!(
-                f,
-                ": release answered {} after {waited_us} us",
-                if refused { "REFUSED" } else { "OK" }
-            )?,
+            Kind::ReleaseAnswered {
+                refused,
+                waited_us,
+                in_flight,
+            } => {
+                let answer = if refused { "REFUSED" } else { "OK" };
+                write!(f, ": release answered {answer} after {waited_us} us")?;
+                if let Some(in_flight) = in_flight {
+                    write!(f, "; {in_flight}")?;
+                }
+            }
+            Kind::GiveAnswered {
+                block,
+                length,
+                in_flight,
+            } => {
+                match block {
+                    Given::Pool { pool_offset } => write!(
+                        f,
+                        ": Shared pool give answered OK, {length:#x} bytes at pool offset \
+                         {pool_offset:#x}"
+                    )?,
+                    Given::Private { gpu_address } => write!(
+                        f,
+                        ": Private give answered OK, {length:#x} bytes at GPU address \
+                         {gpu_address:#x}"
+                    )?,
+                }
+                if let Some(in_flight) = in_flight {
+                    write!(f, "; {in_flight}")?;
+                }
+            }
             Kind::PoolMapped => write!(f, ": a Shared pool piece mapped into the guest")?,
             Kind::PoolBack => write!(f, ": a Shared pool piece goes back to the source")?,
             Kind::Scanout { .. } if offset.is_none() => write!(f, ": the scanout blanked")?,
@@ -362,6 +448,64 @@ mod tests {
         );
     }
 
+    /// A release's answer OK says what was in flight as it was given: the holds of other
+    /// contexts' work, and the context's queues with a buffer posted past their commits; a
+    /// refused one, or one answered with no decoder to read, says nothing of it. A give's answer
+    /// names its block by its offset in the Shared pool or its GPU address, with its length
+    #[test]
+    fn a_release_answer_s_entry_says_what_was_in_flight() {
+        let in_flight = Some(InFlight {
+            others: 3,
+            uncommitted: 1,
+        });
+        let line = |at_ms, kind, offset| {
+            let held = Held::at(Some(2), offset);
+            Entry { at_ms, kind, held }.to_string()
+        };
+        let answered = |refused, in_flight| Kind::ReleaseAnswered {
+            refused,
+            waited_us: 15,
+            in_flight,
+        };
+        assert_eq!(
+            line(1, answered(false, in_flight), Some(0x8000)),
+            "trail: 1, context 2, at 0x8000: release answered OK after 15 us; in flight: 3 holds \
+             in other contexts, 1 of its queues uncommitted"
+        );
+        assert_eq!(
+            line(2, answered(true, None), Some(0x8000)),
+            "trail: 2, context 2, at 0x8000: release answered REFUSED after 15 us"
+        );
+        let none = Some(InFlight {
+            others: 0,
+            uncommitted: 0,
+        });
+        let pool = Kind::GiveAnswered {
+            block: Given::Pool {
+                pool_offset: 0x20_0000,
+            },
+            length: 0x1_0000,
+            in_flight: none,
+        };
+        assert_eq!(
+            line(3, pool, None),
+            "trail: 3, context 2: Shared pool give answered OK, 0x10000 bytes at pool offset \
+             0x200000; in flight: 0 holds in other contexts, 0 of its queues uncommitted"
+        );
+        let private = Kind::GiveAnswered {
+            block: Given::Private {
+                gpu_address: 0x1_0000_0000,
+            },
+            length: 0x4000,
+            in_flight: None,
+        };
+        assert_eq!(
+            line(4, private, None),
+            "trail: 4, context 2: Private give answered OK, 0x4000 bytes at GPU address \
+             0x100000000"
+        );
+    }
+
     /// The trail is written at info under its own target, a line that counts the entries and
     /// then one line an entry, the oldest first, each beginning `trail:`; written, it is empty,
     /// and an empty trail writes nothing
@@ -374,6 +518,7 @@ mod tests {
         let answered = Kind::ReleaseAnswered {
             refused: false,
             waited_us: 40,
+            in_flight: None,
         };
         trail.lock().push(entry(2, answered));
         let logs = reims_vgpu_vulkan::core::testkit::logs::capture();

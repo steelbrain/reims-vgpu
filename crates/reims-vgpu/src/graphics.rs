@@ -2284,18 +2284,21 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let refused = trail::Kind::ReleaseAnswered {
                 refused: true,
                 waited_us: marks.waited_us(),
+                in_flight: None,
             };
             trail::record(refused, block);
             answer.answer(RGFX_STATUS_REFUSED);
             return;
         }
-        // Once no display shows or draws a surface over the block.
+        // Once no display shows or draws a surface over the block, with what was in flight then.
         let m = Arc::clone(&marks);
+        let in_flight = decoder.in_flight_read(release.context);
         let answer: DrainAnswer = Box::new(move || {
             let split = m.split();
             let answered = trail::Kind::ReleaseAnswered {
                 refused: false,
                 waited_us: m.waited_us(),
+                in_flight: in_flight.read(),
             };
             trail::record(answered, block);
             answering(split, || answer.answer(RGFX_STATUS_OK));
@@ -2417,10 +2420,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             Give::Given(carve) => {
                 let given = host_time();
-                let length = give.length;
+                let (context, pool_offset, length) = (give.context, give.pool_offset, give.length);
                 let ledger = ledger.clone();
+                let in_flight = decoder.in_flight_read(context);
                 let drain = decoder.drain_context(
-                    give.context,
+                    context,
                     false,
                     Box::new(move || {
                         let drained = host_time();
@@ -2432,6 +2436,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                             freed: host_time(),
                             bytes: length,
                         };
+                        let answered = trail::Kind::GiveAnswered {
+                            block: trail::Given::Pool { pool_offset },
+                            length,
+                            in_flight: in_flight.read(),
+                        };
+                        trail::record(answered, trail::Held::at(Some(context), None));
                         answering(split, || answer.answer(RGFX_STATUS_OK));
                     }),
                 );
@@ -2498,8 +2508,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             PrivateGive::Given(block) => {
                 let given = host_time();
                 let blocks = self.private_blocks.clone();
+                let (context, gpu_address, length) = (give.context, give.gpu_address, give.length);
+                let in_flight = decoder.in_flight_read(context);
                 let drain = decoder.drain_context(
-                    give.context,
+                    context,
                     false,
                     Box::new(move || {
                         let drained = host_time();
@@ -2519,6 +2531,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                             released: host_time(),
                             freed,
                         };
+                        let answered = trail::Kind::GiveAnswered {
+                            block: trail::Given::Private { gpu_address },
+                            length,
+                            in_flight: in_flight.read(),
+                        };
+                        trail::record(answered, trail::Held::at(Some(context), None));
                         answering(split, || answer.answer(RGFX_STATUS_OK));
                     }),
                 );

@@ -10818,6 +10818,56 @@ mod tests {
         drop(device);
     }
 
+    /// A release's read of what was in flight (`decode::InFlightRead`) counts the holds on the
+    /// other contexts' drains, an open context's and a closed one's alike, and none on the
+    /// releasing context's own: one for a command buffer committed and not complete, through the
+    /// drain it holds and the later ones that drain holds, and none once it completed; and the
+    /// releasing context's queues with a buffer posted on their rings and not yet committed
+    #[test]
+    fn a_release_s_read_counts_other_contexts_holds_and_its_own_uncommitted_queues() {
+        use crate::trail::InFlight;
+
+        let (p, dec) = setup();
+        let device = p.device();
+        let published = buffers_published(&dec);
+        let ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut walker = dec.sender(Some(0), super::super::Sinks::default());
+        let read = |context| ring0.in_flight_read(context).read();
+        let counts = |others, uncommitted| {
+            Some(InFlight {
+                others,
+                uncommitted,
+            })
+        };
+        assert_eq!(read(0), counts(0, 0));
+        assert_eq!(read(1), counts(0, 0));
+
+        // Buffer 1 is on queue 1's ring, not yet taken: context 0's own queue is uncommitted.
+        published.store(1, Ordering::SeqCst);
+        assert_eq!(read(0), counts(0, 1));
+        assert_eq!(read(1), counts(0, 0), "another context's queue");
+        let message = command_buffer_message(100, 1, &render_ops());
+        assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
+        walker.end_message();
+        assert_eq!(p.world().committed().len(), 1);
+        // Committed and in flight: a hold for context 1's release, none for context 0's own.
+        assert_eq!(read(1), counts(1, 0));
+        assert_eq!(read(0), counts(0, 0));
+
+        // Drained: the buffer holds the earlier drain, which holds the context's new one.
+        drop(ring0.drain_context(0, false, Box::new(|| ())));
+        assert_eq!(read(1), counts(1, 0), "after a drain");
+        // Closed: its last drain, which the closed contexts keep weakly, is held so still.
+        assert!(ring0.drop_context(&device, 0) > 0);
+        drop(ring0.drain_context(0, true, Box::new(|| ())));
+        assert_eq!(ring0.context_states(), 0);
+        assert_eq!(read(1), counts(1, 0), "after the close");
+
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(read(1), counts(0, 0), "held past the buffer's completion");
+        drop(device);
+    }
+
     /// A context's close during a walk of its command buffer drops its objects at once, the walk
     /// naming them as at its begin; they are let go of once it ends, and a drain the close begins
     /// is answered once the buffer's completion handler has run.
