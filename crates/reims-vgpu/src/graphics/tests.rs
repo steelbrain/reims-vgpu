@@ -22,6 +22,7 @@ mod full_ring;
 mod prepass;
 mod settle;
 mod stage;
+mod trail;
 
 /// A graphics device on the testkit's platform, with no window, raising through `raised`.
 fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {

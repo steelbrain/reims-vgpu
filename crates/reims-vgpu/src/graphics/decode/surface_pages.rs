@@ -340,6 +340,7 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 
 use crate::platform::ViewImports;
 use crate::pool::HostAddresses;
+use crate::trail;
 
 use super::tables::BytesKeep;
 use super::worker::{Settle, Worker};
@@ -806,6 +807,8 @@ pub(crate) struct Unmade<P: Platform> {
     /// Whether the platform keeps no view of a surface's pages, so none is made
     /// ([`PagesRefusal::Unviewed`]).
     unviewed: bool,
+    /// The block and the runs the trail names the view's import by ([`crate::trail`]).
+    held: trail::Held,
 }
 
 impl<P: Platform> Unmade<P> {
@@ -835,12 +838,10 @@ impl<P: Platform> Unmade<P> {
         if !self.import {
             return Ok(Ok((view, None)));
         }
-        Ok(
-            match buffer_over(device, &view, 0, view.length(), 0, None)? {
-                Some(import) => Ok((view, Some(import))),
-                None => Err(PagesRefusal::NoBuffer),
-            },
-        )
+        match import_over(device, &view, self.held)? {
+            Some(import) => Ok(Ok((view, Some(import)))),
+            None => Ok(Err(PagesRefusal::NoBuffer)),
+        }
     }
 }
 
@@ -1437,6 +1438,11 @@ impl<P: Platform> SurfaceViews<P> {
         let Some(host) = in_order(memory, &key) else {
             return false;
         };
+        let held = trail::Held::over(
+            Some(pages.context),
+            Some(pages.block_offset),
+            key.iter().copied(),
+        );
         let unmade = Unmade {
             memory: Arc::clone(memory),
             lease: Arc::clone(lease),
@@ -1445,6 +1451,7 @@ impl<P: Platform> SurfaceViews<P> {
             length: pages.length,
             import: !self.staged,
             unviewed: self.surfaces_unviewed,
+            held,
         };
         let block = ByRuns {
             runs: host,
@@ -1500,6 +1507,11 @@ impl<P: Platform> SurfaceViews<P> {
         let hit = (self.cache.iter()).position(|c| c.runs == key && (c.import.is_some() || staged));
         if let Some(cached) = hit.and_then(|at| self.cache.remove(at)) {
             let view = Arc::clone(&cached.view);
+            if cached.import.is_some() {
+                let (context, block) = (Some(pages.context), Some(pages.block_offset));
+                let held = trail::Held::over(context, block, key.iter().copied());
+                trail::record(trail::Kind::ImportTaken, held);
+            }
             self.cache.push_back(cached);
             self.counts.reused += 1;
             return Found::Done(Ok(view));
@@ -1750,7 +1762,7 @@ impl<P: Platform> SurfaceViews<P> {
         block_size: u64,
         context: Option<u32>,
     ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
-        let (runs, length, copies, imports, (access, why)) = {
+        let (runs, length, copies, imports, (access, why), owner) = {
             let mut v = views.lock();
             let Some(p) = (v.private.get(&block))
                 .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
@@ -1762,6 +1774,7 @@ impl<P: Platform> SurfaceViews<P> {
             }
             let (runs, length) = (p.runs.clone(), p.length);
             let (access, why) = (p.access, p.why);
+            let owner = p.context;
             if let Some(view) = v.take_cached(block, &runs, access) {
                 return Ok(Some(view));
             }
@@ -1775,6 +1788,7 @@ impl<P: Platform> SurfaceViews<P> {
                 v.over_copies(access.read_only()),
                 v.known_imports.clone(),
                 (access, why),
+                owner,
             )
         };
         let clock = platform.clock();
@@ -1786,9 +1800,10 @@ impl<P: Platform> SurfaceViews<P> {
             Ok(view) => {
                 let mapped = clock.now_mono();
                 // The platform's copies of the pages count by the guest's why, where it gave one.
+                let held = trail::Held::over(Some(owner), Some(block), runs.iter().copied());
                 let import = pages_why_as(why, || match &imports {
-                    Some(imports) => known_import_over(imports, device, &view, access),
-                    None => buffer_over(device, &view, 0, view.length(), 0, None),
+                    Some(imports) => known_import_over(imports, device, &view, access, held),
+                    None => import_over(device, &view, held),
                 })?;
                 match import {
                     Some(import) => {
@@ -1869,13 +1884,17 @@ impl<P: Platform> SurfaceViews<P> {
         self.cache.push_back(cached);
         // A read-only block's buffers lie over copies of its pages, never in the import.
         let imported = import.is_some() && !copies;
+        let mut context = None;
         if let Some(p) = self.private.get_mut(&block) {
             p.view = Some((Arc::clone(&view), import));
             p.known = known;
+            context = Some(p.context);
         }
         self.counts.private_reused += 1;
         if imported {
             self.cover(block);
+            let held = trail::Held::over(context, Some(block), runs.iter().copied());
+            trail::record(trail::Kind::ImportTaken, held);
         }
         Some(view)
     }
@@ -2203,10 +2222,14 @@ fn make_view<P: Platform>(
     };
     let mapped = clock.now_mono();
     let import = match import {
-        true => match buffer_over(device, &view, 0, view.length(), 0, None)? {
-            Some(import) => Some(import),
-            None => return Ok(Err(PagesRefusal::NoBuffer)),
-        },
+        true => {
+            let (context, block) = (Some(pages.context), Some(pages.block_offset));
+            let held = trail::Held::over(context, block, key.iter().copied());
+            match import_over(device, &view, held)? {
+                Some(import) => Some(import),
+                None => return Ok(Err(PagesRefusal::NoBuffer)),
+            }
+        }
         false => None,
     };
     let imported = clock.now_mono();
@@ -2319,6 +2342,34 @@ pub(crate) fn buffer_over<P: Platform>(
     options: u64,
     pin: Option<u64>,
 ) -> RaiseResult<Option<P::Buffer>> {
+    over(device, view, (offset, length), options, pin, None)
+}
+
+/// The buffer over the whole of `view` that holds the runtime's import of its pages
+/// ([`buffer_over`]), its making and its free each an event of the trail naming `held`, the
+/// block it is made for and the view's runs ([`crate::trail`]).
+fn import_over<P: Platform>(
+    device: &P::Device,
+    view: &Arc<SurfaceView<P>>,
+    held: trail::Held,
+) -> RaiseResult<Option<P::Buffer>> {
+    let made = over(device, view, (0, view.length()), 0, None, Some(held))?;
+    if made.is_some() {
+        trail::record(trail::Kind::ImportMade, held);
+    }
+    Ok(made)
+}
+
+/// [`buffer_over`]'s buffer over the `length` bytes at `offset`, whose free is an event of the
+/// trail naming `freed`, where given.
+fn over<P: Platform>(
+    device: &P::Device,
+    view: &Arc<SurfaceView<P>>,
+    (offset, length): (u64, u64),
+    options: u64,
+    pin: Option<u64>,
+    freed: Option<trail::Held>,
+) -> RaiseResult<Option<P::Buffer>> {
     debug_assert!(
         offset
             .checked_add(length)
@@ -2335,7 +2386,12 @@ pub(crate) fn buffer_over<P: Platform>(
             pinned_gpu_address: pin,
             contents: Some(bytes),
             no_copy: true,
-            deallocator: Some(Box::new(move |_, _| drop(keep))),
+            deallocator: Some(Box::new(move |_, _| {
+                if let Some(held) = freed {
+                    trail::record(trail::Kind::ImportFreed, held);
+                }
+                drop(keep);
+            })),
             zero_from: None,
         })
     })
@@ -2347,17 +2403,23 @@ pub(crate) fn buffer_over<P: Platform>(
 /// address, the view's import buffer: a range of that block, which the buffer's deallocator
 /// forgets as the buffer goes (each buffer pinned in the block holds the block of its own, at
 /// rt), the import holding the view until the platform frees it. The block is forgotten at once
-/// where the buffer is not made. A make of the view's ([`super::unkept::Kind::PagesView`]).
+/// where the buffer is not made. A make of the view's ([`super::unkept::Kind::PagesView`]). The
+/// buffer's making and the import's free are each an event of the trail naming `held`, the block
+/// it is made for and the view's runs ([`crate::trail`]).
 fn known_import_over<P: Platform>(
     imports: &ViewImports<P>,
     device: &P::Device,
     view: &Arc<SurfaceView<P>>,
     access: PagesAccess,
+    held: trail::Held,
 ) -> RaiseResult<Option<P::Buffer>> {
     let (first, length) = (view.base(), view.length());
     let keep = Arc::clone(view);
-    super::unkept::Kind::PagesView.making(|| {
-        let then = Box::new(move || drop(keep));
+    let made = super::unkept::Kind::PagesView.making(|| {
+        let then = Box::new(move || {
+            trail::record(trail::Kind::ImportFreed, held);
+            drop(keep);
+        });
         let Some((at, forget)) = imports(device, first, length, access, then) else {
             return Ok(None);
         };
@@ -2385,7 +2447,11 @@ fn known_import_over<P: Platform>(
             forget();
         }
         made
-    })
+    })?;
+    if made.is_some() {
+        trail::record(trail::Kind::ImportMade, held);
+    }
+    Ok(made)
 }
 
 impl<P: Platform> super::GraphicsDecoder<P> {

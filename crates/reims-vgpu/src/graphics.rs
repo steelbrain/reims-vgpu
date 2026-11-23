@@ -162,6 +162,7 @@ use crate::pool::{
     Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger, PoolRemoveFn,
     PrivateBlocks, PrivateGive, PrivateTakeAnswer, PrivateTakeError, TAKE_MAX,
 };
+use crate::trail;
 use crate::window::WindowLink;
 
 mod answers;
@@ -1599,6 +1600,12 @@ pub(crate) struct DisplayHold {
 
 impl Drop for DisplayHold {
     fn drop(&mut self) {
+        if let Some((at, size)) = self.span {
+            trail::record(
+                trail::Kind::HoldEnded { size },
+                trail::Held::at(None, Some(at)),
+            );
+        }
         for answer in self.answers.get_mut().drain(..) {
             answer();
         }
@@ -1761,10 +1768,15 @@ impl<P: Platform> Presented<P> {
             answers: Mutex::default(),
             queued,
         });
-        if span.is_some() {
+        if let Some((at, size)) = span {
             let mut holds = self.holds.lock();
             holds.retain(|h| h.strong_count() > 0);
             holds.push(Arc::downgrade(&hold));
+            drop(holds);
+            trail::record(
+                trail::Kind::HoldBegun { size },
+                trail::Held::at(None, Some(at)),
+            );
         }
         ShownTexture {
             texture,
@@ -2188,6 +2200,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// cancelled, the presents waiting are dropped, and the display shows the scanout in place of
     /// any surface. The device is then as one just made, to the guest: the ids it picks, the
     /// texture resource ids and samplers' ids it is handed, and what a library lookup finds.
+    /// Where it dropped live objects, the trail of the holds on the guest's memory is written
+    /// before its line, and emptied ([`crate::trail`]).
     fn reset(&self) {
         entry::run(|_| {
             let (contexts, dropped) = {
@@ -2227,6 +2241,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             for presented in &self.presented {
                 presented.reset();
             }
+            // A reset that dropped live objects is a guest's reboot after a panic, or the
+            // host's hard reset.
+            if dropped > 0 {
+                trail::write();
+            }
             log::info!(
                 target: "reims_vgpu::graphics",
                 "the device was reset: {dropped} objects of {} contexts dropped",
@@ -2247,6 +2266,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn release_block(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
         // Its waits' ends, for a slow answer's line (`slow_answers`).
         let marks = Arc::new(ReleaseMarks::asked());
+        let block = trail::Held::at(Some(release.context), Some(release.offset));
+        let size = release.size;
+        trail::record(trail::Kind::ReleaseAsked { size }, block);
         // After the no-copy buffers being made over it, which keep it.
         self.pages_buffers.wait(release.offset);
         marks.pages();
@@ -2259,6 +2281,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                  the block is kept",
                 release.context, release.size, release.offset
             );
+            let refused = trail::Kind::ReleaseAnswered {
+                refused: true,
+                waited_us: marks.waited_us(),
+            };
+            trail::record(refused, block);
             answer.answer(RGFX_STATUS_REFUSED);
             return;
         }
@@ -2266,6 +2293,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let m = Arc::clone(&marks);
         let answer: DrainAnswer = Box::new(move || {
             let split = m.split();
+            let answered = trail::Kind::ReleaseAnswered {
+                refused: false,
+                waited_us: m.waited_us(),
+            };
+            trail::record(answered, block);
             answering(split, || answer.answer(RGFX_STATUS_OK));
         });
         let answer = (self.presented.iter()).fold(answer, |answer, presented| {
@@ -4963,6 +4995,9 @@ impl Screen for SharedScreen {
     }
 
     fn scanout(&self, scanout: Option<Scanout>) {
+        let (offset, span) = scanout.map(|s| (s.offset, s.span())).unzip();
+        let (span, at) = (span.unwrap_or(0), trail::Held::at(None, offset));
+        trail::record(trail::Kind::Scanout { span }, at);
         self.screen.scanout(scanout);
     }
 

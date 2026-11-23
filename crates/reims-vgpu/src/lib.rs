@@ -36,6 +36,7 @@ mod pool;
 #[cfg(test)]
 mod rt_test_end;
 pub mod singleton;
+mod trail;
 mod video;
 mod window;
 

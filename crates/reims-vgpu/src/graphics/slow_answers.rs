@@ -410,6 +410,12 @@ impl ReleaseMarks {
         self.unshared.store(rt::host_time(), Ordering::Relaxed);
     }
 
+    /// The microseconds since it was asked, for the trail's answer ([`crate::trail`]).
+    pub(crate) fn waited_us(&self) -> u64 {
+        let waited = std::time::Duration::from_nanos(rt::host_time().saturating_sub(self.asked));
+        u64::try_from(waited.as_micros()).unwrap_or(u64::MAX)
+    }
+
     /// The split so far.
     pub(crate) fn split(&self) -> Split {
         let at = |mark: &AtomicU64| mark.load(Ordering::Relaxed);

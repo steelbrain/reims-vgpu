@@ -118,6 +118,7 @@ pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};
 use takes::{TAKE_ALIGN, TakeAnswer, Taken};
 
 use crate::Error;
+use crate::trail;
 
 /// The code of a block the source handed out whose mapping is not whole host pages from a host
 /// page, which goes back unmapped (the module doc's "The block source").
@@ -990,7 +991,10 @@ impl Pool {
             "pool: {} MiB at {physical_address:#x} mapped into the guest",
             p.block.len >> 20
         );
+        let len = p.block.len;
         drop(st);
+        let piece = trail::Held::over(None, None, [(physical_address, len)]);
+        trail::record(trail::Kind::PoolMapped, piece);
         // A take may wait for it.
         self.shared.wake();
         Ok(())
@@ -1204,6 +1208,8 @@ impl Shared {
                 MutexGuard::unlocked(&mut st, || {
                     log::info!("pool: the empty piece at {at:#x} goes back to the source");
                     if let Some((len, since)) = piece {
+                        let piece = trail::Held::over(None, None, [(at, len)]);
+                        trail::record(trail::Kind::PoolBack, piece);
                         let empty = since
                             .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
                         let empty = u64::try_from(empty.as_nanos()).unwrap_or(u64::MAX);
