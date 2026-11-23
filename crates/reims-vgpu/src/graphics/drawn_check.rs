@@ -246,7 +246,9 @@ impl PlaneRead<'_> {
         let at = (y * self.width + x) * self.texel;
         let mut word = [0; 4];
         if let Some(bytes) = self.bytes.get(at..at + self.texel) {
-            word.iter_mut().zip(bytes).for_each(|(to, from)| *to = *from);
+            word.iter_mut()
+                .zip(bytes)
+                .for_each(|(to, from)| *to = *from);
         }
         u32::from_le_bytes(word)
     }

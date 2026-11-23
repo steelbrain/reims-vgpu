@@ -215,12 +215,8 @@ impl RtCopier {
         let targets = luma.planes.targets();
         let (width, height) = targets.size();
         let d3d = match &self.draw {
-            Some(draw) => (draw.read_back(targets)).map(|[y, uv]| {
-                [
-                    (y, width.to_usize()),
-                    (uv, width.div_ceil(2).to_usize()),
-                ]
-            }),
+            Some(draw) => (draw.read_back(targets))
+                .map(|[y, uv]| [(y, width.to_usize()), (uv, width.div_ceil(2).to_usize())]),
             None => Err("no draws".to_owned()),
         };
         let after = blit();
