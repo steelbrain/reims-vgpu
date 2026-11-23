@@ -2124,9 +2124,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// the decoder's tables, with the surfaces' entries whose objects went with them, and lets go
     /// of them on the decoder's close worker, so the context's lane is done with the close, and
     /// the jobs of other lanes that wait for it go on, while the platform lets them go. `answer`
-    /// is given once they are let go of and every command buffer of the context the decoder
-    /// committed has finished: the kext then gives the context's blocks, texture resource ids and
-    /// GPU addresses out again.
+    /// is given once they are let go of and every command buffer of the context the decoder has
+    /// begun has finished: the kext then gives the context's blocks, texture resource ids and GPU
+    /// addresses out again. A command buffer posted on a ring and not yet begun is not waited for.
     fn close_context(&self, context: u32, answer: CompleteAnswer) {
         // Its waits' ends and its frees, for a slow answer's line (`slow_answers`).
         let marks = Arc::new(CloseMarks::asked());
@@ -2550,8 +2550,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     }
 
     /// `BLOCK_UNSHARE` (`Host::block_unshared`): the block's release, by its last holder, waits
-    /// for the command buffers the decoder committed for `unshare.context` before this, which may
-    /// still use the block ([`GraphicsDecoder::block_unshared`]).
+    /// for the command buffers the decoder began for `unshare.context` before this, which may
+    /// still use the block ([`GraphicsDecoder::block_unshared`]). A command buffer posted on a
+    /// ring and not yet begun is not waited for.
     fn unshare_block(&self, unshare: &RgfxBlockGrant) {
         let drain = self
             .decoder()

@@ -399,11 +399,12 @@ pub(crate) type FinishedSink = Arc<dyn Fn(u64) + Send + Sync>;
 /// a `BLOCK_RELEASE`'s).
 pub(crate) type DrainAnswer = Box<dyn FnOnce() + Send>;
 
-/// The command buffers one context committed since its last drain began: each holds a clone
-/// until its completion handler has run, and the answers waiting on them are given when the last
-/// clone goes ([`GraphicsDecoder::drain_context`]). A drain holds the one begun after it, so a
-/// later drain ends only after every earlier one: its answers wait for every buffer committed
-/// before it, those of the drains before it too.
+/// The command buffers of one context the decoder began since its last drain began: each takes a
+/// clone as its message is decoded and holds it until its completion handler has run, and the
+/// answers waiting on them are given when the last clone goes
+/// ([`GraphicsDecoder::drain_context`]). A drain holds the one begun after it, so a later drain
+/// ends only after every earlier one: its answers wait for every buffer begun before it, those of
+/// the drains before it too. A command buffer posted on a ring and not yet begun holds none.
 #[derive(Default)]
 pub(crate) struct Drain {
     /// Given when the drain drops.
