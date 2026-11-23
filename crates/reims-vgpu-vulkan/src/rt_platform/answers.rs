@@ -4,7 +4,8 @@
 //!
 //! **Metal's answers, as the Vulkan platform gives them.** rt answers the device-level questions
 //! only where they depend on the device (`hasUnifiedMemory`, `supportsTextureSampleCount:`,
-//! `minimumLinearTextureAlignmentForPixelFormat:`, `minimumTextureBufferAlignmentForPixelFormat:`);
+//! `minimumLinearTextureAlignmentForPixelFormat:`, `minimumTextureBufferAlignmentForPixelFormat:`,
+//! `maxThreadgroupMemoryLength`);
 //! the rest of a Metal device's answers are the consumer's. So each is the Vulkan platform's answer where that answer is the platform's own
 //! (its stand-ins, `crate::gpu::caps::stand_in`, and its fixed answers), and otherwise Metal's
 //! answer on an Apple M3 Max, recorded on 2026-11-07 ([`metal`]), held to the
@@ -14,8 +15,13 @@
 //!
 //! **Where the device's facts decide them**, the answers are these:
 //! - the counts the runtime clamped to its device's descriptor and stage limits are Metal's here,
-//!   and the device's Vulkan limits bound only sizes, layers, threadgroup memory, threads and
-//!   viewports;
+//!   and the device's Vulkan limits bound only sizes, layers, threads and viewports;
+//! - `maxThreadgroupMemoryLength` is rt's (its `Device::max_threadgroup_memory_length`): the
+//!   device's `maxComputeSharedMemorySize` less the 4-byte vote word a kernel's
+//!   partial-threadgroups variant may take beside its threadgroup memory, rounded down to 16, and
+//!   at most Metal's 32 KiB. A guest that sizes its threadgroup memory by it runs its ragged
+//!   grids, which rt refuses past it. On a device of 32,768 bytes it is 32,752, where a Mac
+//!   answers 32,768; on a device of more it is Metal's 32,768;
 //! - `gpuCoreCount` is none: Vulkan reports no core count;
 //! - the families beyond `caps`' are their closure under containment
 //!   (`crate::gpu::identity::closed`), not the runtime's `supportsFamily:`;
@@ -189,6 +195,8 @@ pub struct Facts {
     /// rt's `supportsFunctionPointers`: whether its compute pipeline states make function handles
     /// and visible function tables (`super::function_table`).
     pub function_pointers: bool,
+    /// rt's `maxThreadgroupMemoryLength` (its `Device::max_threadgroup_memory_length`).
+    pub max_threadgroup_memory_length: u32,
 }
 
 /// The registry ID the rt platform gives the device of `uuid`, its `deviceUUID`: its two halves'
@@ -232,9 +240,11 @@ fn bgra8_refused() -> Raise {
 /// one bounds them, with the Vulkan platform's own answers where they are its own (the module
 /// docs).
 ///
-/// - The Vulkan limits: 2D sizes to `maxImageDimension2D`, layers to `maxImageArrayLayers`,
-///   threadgroup memory to `maxComputeSharedMemorySize`, a threadgroup's threads to
-///   `maxComputeWorkGroupSize` and `maxComputeWorkGroupInvocations`, viewports to `maxViewports`.
+/// - The Vulkan limits: 2D sizes to `maxImageDimension2D`, layers to `maxImageArrayLayers`, a
+///   threadgroup's threads to `maxComputeWorkGroupSize` and `maxComputeWorkGroupInvocations`,
+///   viewports to `maxViewports`.
+/// - rt's: `maxThreadgroupMemoryLength` ([`Facts::max_threadgroup_memory_length`]), the device's
+///   `maxComputeSharedMemorySize` less rt's vote word, at most Metal's (the module docs).
 /// - The Vulkan platform's own: no buffer or heap over address ranges and no detach of a
 ///   resource's backing, which it does not build; the stand-ins; `supportsNativeHardwareFP16` as
 ///   the device's `shaderFloat16`.
@@ -264,10 +274,7 @@ pub fn caps(facts: &Facts) -> Arc<DeviceCaps> {
         ),
         max_texture_width_2d: held(metal::LIMITS.max_texture_width_2d, v.max_image_dimension2_d),
         max_texture_layers: held(metal::LIMITS.max_texture_layers, v.max_image_array_layers),
-        max_threadgroup_memory_length: held(
-            metal::LIMITS.max_threadgroup_memory_length,
-            v.max_compute_shared_memory_size,
-        ),
+        max_threadgroup_memory_length: u64::from(facts.max_threadgroup_memory_length),
         max_total_compute_threads_per_threadgroup: total,
         max_viewport_count: held(metal::LIMITS.max_viewport_count, v.max_viewports),
         device_linear_texture_alignment_bytes: facts.linear_alignment_largest,
@@ -450,6 +457,7 @@ pub(crate) mod tests {
             linear_alignment_bgra8: Some(16),
             indirect_tokens: Some(128),
             function_pointers: true,
+            max_threadgroup_memory_length: 32768,
         }
     }
 
@@ -496,14 +504,13 @@ pub(crate) mod tests {
         assert_eq!(caps.min_linear_alignment_bgra8(), Ok(16));
     }
 
-    /// A device's Vulkan limits bound the sizes, layers, threadgroup memory, threads and viewports
-    /// it answers; no fp16 arithmetic answers no native fp16.
+    /// A device's Vulkan limits bound the sizes, layers, threads and viewports it answers; no fp16
+    /// arithmetic answers no native fp16.
     #[test]
     fn vulkan_limits_bound_the_answers() {
         let mut facts = roomy();
         facts.limits.max_image_dimension2_d = 8192;
         facts.limits.max_image_array_layers = 256;
-        facts.limits.max_compute_shared_memory_size = 16384;
         facts.limits.max_compute_work_group_invocations = 512;
         facts.limits.max_compute_work_group_size = [1024, 1024, 64];
         facts.limits.max_viewports = 1;
@@ -515,12 +522,27 @@ pub(crate) mod tests {
             (8192, 8192)
         );
         assert_eq!(l.max_texture_layers, 256);
-        assert_eq!(l.max_threadgroup_memory_length, 16384);
         assert_eq!(l.max_total_compute_threads_per_threadgroup, 512);
         assert_eq!(caps.max_threads_per_threadgroup, MtlSize::new(512, 512, 64));
         assert_eq!(l.max_viewport_count, 1);
         assert_eq!(l.max_fragment_textures, metal::LIMITS.max_fragment_textures);
         assert!(!caps.flags.supports_native_hardware_fp16);
+    }
+
+    /// `maxThreadgroupMemoryLength` is rt's answer, not Metal's held to the device's shared
+    /// memory: on a device of 32,768 bytes, where rt answers 32,752, the guest is told 32,752,
+    /// where a Mac and Metal's 32 KiB held to the limit answer 32,768; on one of 16,384 bytes,
+    /// 16,368; on one of more than 32 KiB, Metal's 32,768.
+    #[test]
+    fn threadgroup_memory_is_rt_s_answer() {
+        for (shared, rt_answer) in [(32768, 32752), (16384, 16368), (65536, 32768)] {
+            let mut facts = roomy();
+            facts.limits.max_compute_shared_memory_size = shared;
+            facts.max_threadgroup_memory_length = rt_answer;
+            let told = caps(&facts).limits.max_threadgroup_memory_length;
+            assert_eq!(told, u64::from(rt_answer), "{shared} bytes");
+        }
+        assert_eq!(metal::LIMITS.max_threadgroup_memory_length, 32768);
     }
 
     /// The linear texture alignments are the largest of rt's per-format answers, and BGRA8's is

@@ -1361,6 +1361,7 @@ fn facts(
             .ok(),
         indirect_tokens: floor.indirect_commands.map(|limits| limits.tokens),
         function_pointers: device.supports_function_pointers(),
+        max_threadgroup_memory_length: device.max_threadgroup_memory_length(),
     }
 }
 
@@ -2774,9 +2775,10 @@ mod tests {
 
     /// The rt platform's device on the GPU the test holds: made once and answered at every ask,
     /// its registry ID opening it again; its answers bounded by its GPU, its texture-buffer
-    /// alignments rt's; its queues, events and fences made; the guest's texture indices granted,
-    /// twice without a refusal; a heap texture's size rt's, and a shape rt or Metal refuses a
-    /// counted raise, never 0 bytes at 0; every creator of an unbuilt piece nil and counted.
+    /// alignments and `maxThreadgroupMemoryLength` rt's; its queues, events and fences made; the
+    /// guest's texture indices granted, twice without a refusal; a heap texture's size rt's, and a
+    /// shape rt or Metal refuses a counted raise, never 0 bytes at 0; every creator of an unbuilt
+    /// piece nil and counted.
     #[test]
     fn the_device_and_its_answers_on_vulkan() {
         use crate::core::platform::device::GpuDevice as _;
@@ -2794,6 +2796,14 @@ mod tests {
         assert!(platform.open_device(caps.registry_id ^ 1).is_none());
         let limits = device.facts().limits;
         assert!(caps.limits.max_texture_width_2d <= u64::from(limits.max_image_dimension2_d));
+        // maxThreadgroupMemoryLength is rt's: the device's maxComputeSharedMemorySize less rt's
+        // 4-byte vote word, rounded down to 16, at most Metal's 32 KiB (rt's
+        // `Device::max_threadgroup_memory_length` docs); 32,752 on a device of 32,768 bytes.
+        let told = caps.limits.max_threadgroup_memory_length;
+        let shared = u64::from(limits.max_compute_shared_memory_size);
+        eprintln!("maxThreadgroupMemoryLength {told} of maxComputeSharedMemorySize {shared}");
+        assert_eq!(told, u64::from(device.rt().max_threadgroup_memory_length()));
+        assert_eq!(told, (shared.saturating_sub(4) / 16 * 16).min(32768));
         assert!(caps.sample_counts[0] == Ok(true));
         let page = SizeAndAlign {
             size: device.facts().page_size,
