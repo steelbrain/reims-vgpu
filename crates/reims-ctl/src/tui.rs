@@ -3677,7 +3677,10 @@ mod tests {
         assert_eq!(form(&app).choice("disk_controller"), "virtio");
         let mut vm = vm_row("t").vm.unwrap();
         apply_edit(&mut vm, form(&app), None).unwrap();
-        assert_eq!(vm.config.q35.unwrap().disk_controller, DiskController::Virtio);
+        assert_eq!(
+            vm.config.q35.unwrap().disk_controller,
+            DiskController::Virtio
+        );
         press(&mut app, [KeyCode::Right]);
         assert_eq!(form(&app).choice("disk_controller"), "ahci");
     }

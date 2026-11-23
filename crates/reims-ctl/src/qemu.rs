@@ -1504,7 +1504,10 @@ mod tests {
         for d in [DiskController::Nvme, DiskController::Virtio] {
             vm.config.q35.as_mut().unwrap().disk_controller = d;
             let a = invocation(&vm, &ctx(linux())).unwrap().args;
-            assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]), "{d:?}");
+            assert!(
+                has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]),
+                "{d:?}"
+            );
         }
         vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Ahci;
         // The VM's copy of a DMG, in its directory.
