@@ -597,17 +597,18 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     }
 
     /// rt's make ahead (`prepare_dispatch`) of the `VkPipeline` the dispatch would make at its
-    /// first use, at its threadgroup size, threadgroup memory lengths and grid tiles. A value past
-    /// rt's 32 bits makes nothing: the dispatch, or the length's set, refuses it
-    /// (`super::compute`). rt's one refusal here is of a kernel past its stage bound whose compile
-    /// the cache directory does not hold, and its fill starts (`super::stage`): the dispatch waits
-    /// for that fill in its walk.
+    /// first use, at its threadgroup size, threadgroup memory lengths and grid tiles, and the
+    /// imageblock size its encoder dispatches at ([`IMAGEBLOCK_SIZE`]). A value past rt's 32 bits
+    /// makes nothing: the dispatch, or the length's set, refuses it (`super::compute`). rt's one
+    /// refusal here is of a kernel past its stage bound whose compile the cache directory does not
+    /// hold, and its fill starts (`super::stage`): the dispatch waits for that fill in its walk.
     fn prepare_dispatch(&self, dispatch: Dispatch, threads: MtlSize, lengths: &[(u64, u64)]) {
         let Some(args) = RtDispatch::of(dispatch, threads, lengths) else {
             return;
         };
         let state = &self.rt;
-        let prepared = state.prepare_dispatch(args.dispatch, args.threads, &args.lengths);
+        let prepared =
+            state.prepare_dispatch(args.dispatch, args.threads, &args.lengths, IMAGEBLOCK_SIZE);
         if let Err(error) = prepared
             && let Some(stage) = stage_of(&error)
         {
@@ -628,7 +629,7 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
     ) -> Option<(rt::DispatchVariant, bool)> {
         let args = RtDispatch::of(dispatch, threads, lengths)?;
         self.rt
-            .dispatch_variant(args.dispatch, args.threads, &args.lengths)
+            .dispatch_variant(args.dispatch, args.threads, &args.lengths, IMAGEBLOCK_SIZE)
     }
 
     /// The driver's create of the state's main pipeline, which rt's make of the state (`make`)
@@ -648,6 +649,12 @@ impl ComputePipeline<RtPlatform> for RtObj<RtComputePipeline> {
 pub(super) fn finished(finish: Result<(), rt::Error>) -> Result<(), String> {
     finish.map_err(|error| error.to_string())
 }
+
+/// The imageblock size rt's make ahead and key of a dispatch take: 1 by 1, the size rt's compute
+/// encoder dispatches a kernel's explicit imageblock at where `setImageblockWidth:height:` set
+/// none, as Metal's does. The platform's encoders give rt no size (`super::compute`), so every
+/// dispatch runs at it.
+const IMAGEBLOCK_SIZE: [u32; 2] = [1, 1];
 
 /// A dispatch's arguments as rt's make ahead and key take them.
 struct RtDispatch {

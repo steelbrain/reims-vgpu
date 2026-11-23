@@ -33,11 +33,11 @@ reims-vgpu-graphics = { path = "crates/reims-vgpu-graphics" }
 reims-vgpu-video = { path = "crates/reims-vgpu-video" }
 # metal2vulkan's Metal types, for the Metal enums and descriptor values the runtime's calls take,
 # from metal2vulkan's public repository at the commit both name.
-metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "fd0771d944082fd392c4626d333053277dcb602b" }
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "f8181e2a6c8cd3607d8e2e4521ed9d387f8126d3" }
 # The Vulkan platform's runtime (architecture D1), metal2vulkan-runtime: a Metal-shaped API on
 # Vulkan, one path for every device, under reims-vgpu-vulkan's `rt_platform` and `seam` and
 # reims-vgpu's `pool::rt_blocks`.
-metal2vulkan-runtime = { git = "https://github.com/steelbrain/metal2vulkan", rev = "fd0771d944082fd392c4626d333053277dcb602b" }
+metal2vulkan-runtime = { git = "https://github.com/steelbrain/metal2vulkan", rev = "f8181e2a6c8cd3607d8e2e4521ed9d387f8126d3" }
 # The hashes of the Vulkan platform's metallib sources (reims-vgpu-vulkan/build.rs).
 sha2 = "0.10.9"
 # A display window's swapchain on Linux (reims-vgpu-vulkan/src/swapchain.rs), at the runtime's

@@ -24,9 +24,10 @@
 //!   before it, or none.
 //! - **Barriers**: `memoryBarrierWithScope:` and `memoryBarrierWithResources:count:` are rt's one
 //!   global barrier, whatever the scope or the resources.
-//! - **Nothing to record**: `setImageblockWidth:height:` (rt makes no kernel that reads an
-//!   imageblock) and `insertCompressedTextureReinterpretationFlush` (rt keeps no lossless
-//!   compression).
+//! - **Nothing to record**: `setImageblockWidth:height:`, whose size the encoder does not give rt,
+//!   so rt dispatches a kernel's explicit imageblock at 1 by 1, the size of an encoder that sets
+//!   none (`super::pipeline`'s `IMAGEBLOCK_SIZE`), and
+//!   `insertCompressedTextureReinterpretationFlush` (rt keeps no lossless compression).
 //! - **Each dispatch rt encodes is counted by its form**, with one relaxed add, for the counts
 //!   line, where rt counts none: direct (`dispatchThreads:threadsPerThreadgroup:` and
 //!   `dispatchThreadgroups:threadsPerThreadgroup:`, [`DISPATCHES_DIRECT_CODE`]) and indirect
