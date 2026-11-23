@@ -928,6 +928,7 @@ impl<P: Platform> Scratch<P> {
         Planar {
             planes: [0, plane, 2 * plane],
             pitch: self.pitch,
+            step: 1,
             length: 3 * plane,
         }
     }

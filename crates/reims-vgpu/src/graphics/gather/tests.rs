@@ -19,6 +19,7 @@ fn planar(pitch: u64, rows: u64) -> Planar {
     Planar {
         planes: [0, pitch * rows, 2 * pitch * rows],
         pitch,
+        step: 1,
         length: 3 * pitch * rows,
     }
 }
@@ -62,6 +63,66 @@ fn a_pictures_planes_gather_into_the_surfaces_at_their_words() {
             },
         ]
     );
+}
+
+/// An XYUV picture's pixels gather into a '444v' surface's planes: the luma from each pixel's
+/// third byte, the chroma's Cb from its second and Cr from its first, four bytes from one pixel
+/// to the next, as the CPU's split of an XYUV read back takes them (the VA crate's
+/// `split_xyuv`).
+#[test]
+fn an_xyuv_pictures_pixels_gather_into_the_surfaces_planes() {
+    let planes = [
+        target(0x400, 576, 513, 301),
+        target(0x2_c000, 1088, 1026, 301),
+    ];
+    let source = Planar::xyuv(2304, 2304 * 301);
+    let [luma, chroma] = gathers(source, (513, 301), &planes, 0x8_0000).expect("gathers");
+    assert_eq!(
+        luma,
+        GatherPlane {
+            first: 2,
+            second: 2,
+            source_pitch: 2304,
+            step: 4,
+            components: 1,
+            row_bytes: 513,
+            rows: 301,
+            row_words: 129,
+            out_first: 0x100,
+            pitch_words: 144,
+        }
+    );
+    assert_eq!(
+        chroma,
+        GatherPlane {
+            first: 1,
+            second: 0,
+            source_pitch: 2304,
+            step: 4,
+            components: 2,
+            row_bytes: 1026,
+            rows: 301,
+            row_words: 257,
+            out_first: 0xb000,
+            pitch_words: 272,
+        }
+    );
+}
+
+/// An XYUV source is refused where its rows hold fewer than the crop's pixels, four bytes each,
+/// or its last row's last pixel's word lies past it.
+#[test]
+fn an_xyuv_source_short_of_the_crops_pixels_is_refused() {
+    let surface = 0x3000;
+    let planes = [target(0, 64, 64, 48), target(0x1000, 128, 128, 48)];
+    assert!(gathers(Planar::xyuv(256, 256 * 48), (64, 48), &planes, surface).is_ok());
+    let narrow = gathers(Planar::xyuv(252, 252 * 48), (64, 48), &planes, surface);
+    assert!(narrow.expect_err("a refusal").contains("past its source"));
+    // The last row's last pixel's luma byte, 2 into it, in a word past the source.
+    let short = gathers(Planar::xyuv(256, 256 * 47 + 254), (64, 48), &planes, surface);
+    assert!(short.expect_err("a refusal").contains("past its source"));
+    let at_end = gathers(Planar::xyuv(256, 256 * 47 + 256), (64, 48), &planes, surface);
+    assert!(at_end.is_ok());
 }
 
 /// The rows and bytes gathered are the CPU's interleave's: as many rows as both the crop and the
@@ -115,11 +176,14 @@ fn a_gather_the_kernel_cannot_make_is_refused() {
         ..source
     };
     assert!(refused(good, narrow, (64, 48), surface).contains("past its source"));
+    let no_step = Planar { step: 0, ..source };
+    assert!(refused(good, no_step, (64, 48), surface).contains("past its source"));
     assert!(refused(good, source, (64, 0), surface).contains("an empty luma plane"));
     assert!(refused(good, source, (0, 48), surface).contains("an empty luma plane"));
     let far = Planar {
         planes: [0, 1 << 32, 2 << 32],
         pitch: 256,
+        step: 1,
         length: 3 << 32,
     };
     assert!(refused(good, far, (64, 48), surface).contains("a source's reach of"));
@@ -259,6 +323,96 @@ fn on_vulkan_the_kernel_gathers_a_4_4_4_picture_as_the_cpu_interleaves_it() {
                     let to = chroma_at + row * chroma_pitch + 2 * x;
                     want[to] = bytes[cb + row * pitch + x];
                     want[to + 1] = bytes[cr + row * pitch + x];
+                }
+            }
+            if let Some(at) = (0..length).find(|&at| written[at] != want[at]) {
+                panic!(
+                    "{what}: byte {at} is {:#04x}, not {:#04x} (it was {:#04x})",
+                    written[at], want[at], before[at]
+                );
+            }
+        }
+    });
+}
+
+/// On the host's GPU, the kernel writes an XYUV picture's pixels into a surface's two planes as
+/// the CPU's split of its read back writes them (the VA crate's `split_xyuv`), byte for byte: each
+/// luma row from the pixels' third bytes, each chroma row's Cb then Cr from their second and
+/// first, at the planes' offsets and pitches, and nothing else of the surface. Rows of 1 to 3
+/// bytes past a word and none, a crop narrower than the planes and one wider.
+#[test]
+fn on_vulkan_the_kernel_gathers_an_xyuv_picture_as_the_cpu_splits_it() {
+    use reims_vgpu_vulkan::RtPlatform;
+
+    let platform = crate::rt_test_end::platform();
+    crate::entry::run(|_| {
+        let device = platform.system_default_device().expect("an rt device");
+        let pipeline = Arc::new(GatherPipeline::<RtPlatform>::new(&device));
+        let mut gatherer = Gatherer::new(pipeline);
+        let device = gatherer.device().clone_ref();
+        let shared = |length: u64| {
+            (device.new_buffer_of_length(OnFault::Return, length, 0))
+                .expect("no raise")
+                .expect("a buffer")
+        };
+        let cases: [Case; 5] = [
+            ((64, 48), (64, 48), 0x400, 64, 128),
+            ((513, 37), (513, 37), 0x400, 576, 1088),
+            ((1366, 9), (1366, 9), 0x20, 1376, 2752),
+            ((7, 5), (7, 5), 0x40, 8, 16),
+            ((500, 30), (513, 37), 0x400, 576, 1088),
+        ];
+        for ((width, height), (columns, rows), luma_at, luma_pitch, chroma_pitch) in cases {
+            let what = format!(
+                "XYUV {width}x{height} into {columns}x{rows} from {luma_at} at {luma_pitch} and \
+                 {chroma_pitch}"
+            );
+            let chroma_at = (luma_at + luma_pitch * rows as usize).next_multiple_of(0x1000);
+            let length = chroma_at + chroma_pitch * rows as usize + 64;
+            let planes = [
+                target(luma_at, luma_pitch, columns as usize, rows),
+                target(chroma_at, chroma_pitch, 2 * columns as usize, rows),
+            ];
+            let pitch = (u64::from(width) * 4).next_multiple_of(256);
+            let source = Planar::xyuv(pitch, pitch * u64::from(height));
+            let gathered = gathers(source, (width, height), &planes, length as u64).expect(&what);
+            let bytes = pattern(source.length as usize, 3);
+            let before = pattern(length, 11)
+                .into_iter()
+                .map(|b| !b)
+                .collect::<Vec<_>>();
+            let source_buffer = shared(source.length);
+            let surface = shared(length as u64);
+            // SAFETY: the buffers' host bytes, which no GPU work reaches yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    source_buffer.contents().as_ptr::<u8>(),
+                    bytes.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    before.as_ptr(),
+                    surface.contents().as_ptr::<u8>(),
+                    before.len(),
+                );
+            }
+            gatherer
+                .gather(&source_buffer, &surface, &gathered)
+                .expect(&what);
+            // SAFETY: the surface's host bytes, which the GPU wrote and the wait saw done.
+            let written =
+                unsafe { std::slice::from_raw_parts(surface.contents().as_ptr::<u8>(), length) };
+            // The CPU's split: as many rows as both hold, each as far as both hold it.
+            let mut want = before.clone();
+            let (pitch, plane_rows) = (pitch as usize, height.min(rows) as usize);
+            let pixels = (width as usize).min(columns as usize);
+            for row in 0..plane_rows {
+                for x in 0..pixels {
+                    let pixel = &bytes[row * pitch + 4 * x..][..4];
+                    want[luma_at + row * luma_pitch + x] = pixel[2];
+                    let to = chroma_at + row * chroma_pitch + 2 * x;
+                    want[to] = pixel[1];
+                    want[to + 1] = pixel[0];
                 }
             }
             if let Some(at) = (0..length).find(|&at| written[at] != want[at]) {

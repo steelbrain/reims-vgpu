@@ -1,11 +1,14 @@
 //! A 4:4:4 picture written by the runtime device's GPU into the two planes of a surface the guest
 //! lent, on Linux ([`Gatherer`]): VideoToolbox's paravirtual decoders' pictures of HEVC's 4:4:4
-//! at 8 bits, which NVDEC decodes into three planes, luma, Cb and Cr (`super::nvidia`), land in a
-//! surface of CoreVideo's 4:4:4 formats ('444v', '444f'), whose second plane holds each pixel's
-//! Cb then Cr.
+//! at 8 bits, which NVDEC decodes into three planes, luma, Cb and Cr (`super::nvidia`), and
+//! VA-API's drivers into XYUV surfaces of packed pixels (`super::vaapi::xyuv`), land in a surface
+//! of CoreVideo's 4:4:4 formats ('444v', '444f'), whose second plane holds each pixel's Cb then
+//! Cr.
 //!
-//! - **The source** is a buffer of the device's that holds the picture's three planes, each in
-//!   rows at one pitch ([`Planar`]): NVDEC's decoder's scratch, which CUDA wrote.
+//! - **The source** is a buffer of the device's that holds the picture's samples, each component
+//!   in rows at one pitch, a step of bytes from one sample to the next ([`Planar`]): NVDEC's
+//!   decoder's scratch, which CUDA wrote, three planes of a byte a sample; or a VA-API decoder's,
+//!   which the driver's video processing wrote, one plane of XYUV's four bytes a pixel.
 //! - **The destination** is a Shared buffer of the device's over the surface's pages, the
 //!   surface's first byte its first, which VideoToolbox's decoder makes for a 4:4:4 surface and
 //!   keeps with its view of the pages (`super::vt`).
@@ -42,7 +45,7 @@ const GATHER_KERNEL: &str = "videoGather444";
 
 /// The code of a 4:4:4 picture the GPU wrote into a surface's two planes (the module doc),
 /// counted per picture by [`Gatherer::gather`].
-const GATHERED_CODE: &str = "video-pictures-gpu-gathered";
+pub(crate) const GATHERED_CODE: &str = "video-pictures-gpu-gathered";
 
 /// The threads of a dispatch's threadgroup, along a row.
 const GROUP_WIDTH: u64 = 64;
@@ -100,14 +103,29 @@ impl GatherPlane {
     }
 }
 
-/// Where a 4:4:4 picture's three planes lie in its source buffer: the first byte of each, luma,
-/// Cb and Cr, the bytes from one of a plane's rows to the next, the same for the three, and the
-/// buffer's bytes.
+/// Where a 4:4:4 picture's three components lie in its source buffer: the first byte of each in
+/// the first row, luma, Cb and Cr, the bytes from one row to the next, and from one sample of a
+/// component to the next, the same for the three, and the buffer's bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Planar {
     pub(crate) planes: [u64; 3],
     pub(crate) pitch: u64,
+    pub(crate) step: u64,
     pub(crate) length: u64,
+}
+
+impl Planar {
+    /// An XYUV picture's components in a buffer of `length` bytes, its one plane of rows `pitch`
+    /// apart from the buffer's first byte: each pixel four bytes, Cr, Cb, Y and one that holds
+    /// nothing, in that order (the VA crate's `PackedTarget`).
+    pub(crate) fn xyuv(pitch: u64, length: u64) -> Self {
+        Self {
+            planes: [2, 1, 0],
+            pitch,
+            step: 4,
+            length,
+        }
+    }
 }
 
 /// The dispatches that write a 4:4:4 picture of 8-bit samples, `size` its crop's samples as the
@@ -150,13 +168,17 @@ pub(crate) fn gathers(
             ));
         }
         // And reads whole words: the word that holds the last row's last sample of each source
-        // plane lies in the source.
+        // component lies in the source.
         let samples = row_bytes / components;
+        let span = (samples - 1).checked_mul(source.step).and_then(|s| s.checked_add(1));
         let reach = (from.into_iter().map(|at| source.planes[at]).max())
             .and_then(|first| first.checked_add((rows - 1).checked_mul(source.pitch)?))
-            .and_then(|last| last.checked_add(samples))
+            .and_then(|last| last.checked_add(span?))
             .map(|end| end.next_multiple_of(4));
-        if !reach.is_some_and(|reach| reach <= source.length) || samples > source.pitch {
+        let row_fits = samples
+            .checked_mul(source.step)
+            .is_some_and(|row| row <= source.pitch);
+        if !reach.is_some_and(|reach| reach <= source.length) || !row_fits || source.step == 0 {
             return Err(format!(
                 "a {which} plane whose rows of {samples} samples, {} apart, lie past its source's \
                  {} bytes",
@@ -168,7 +190,7 @@ pub(crate) fn gathers(
             first: narrow(source.planes[from[0]], "a first byte")?,
             second: narrow(source.planes[from[1]], "a first byte")?,
             source_pitch: narrow(source.pitch, "a pitch")?,
-            step: 1,
+            step: narrow(source.step, "a step")?,
             components: narrow(components, "components")?,
             row_bytes: narrow(row_bytes, "a row's bytes")?,
             rows: narrow(rows, "rows")?,
