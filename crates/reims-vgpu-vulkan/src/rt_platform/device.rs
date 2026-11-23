@@ -235,6 +235,15 @@
 //! so a boot's line says whether its functions took that path. The runs held reach the counts line
 //! at their highest (`level_elements`, below).
 //!
+//! **Its heap textures' moves.** A texture placed in a heap whose bytes another resource of that
+//! heap may have written since the texture's own last write (Vulkan's memory aliasing) has its
+//! image moved out of `VK_IMAGE_LAYOUT_UNDEFINED`, whole, before the next command that writes it:
+//! a dispatch's slot or declared write, a pass's attachment, a draw's write or a blit's
+//! destination. A heap buffer's use that may write it marks every heap texture over its bytes so,
+//! and a read before the texture's next write takes no move. rt counts those moves
+//! (`Metrics::heap_moves`), and the counts line carries them as an amount, [`HEAP_MOVES_CODE`], so
+//! a boot's line says whether its heap textures took them.
+//!
 //! **Its Direct3D 11 planes' hand-overs.** On Windows, each submission whose command buffers keep
 //! a plane of a Direct3D 11 surface (`super::d3d11_surface`), or whose uploads copy into or out of
 //! one, acquires those planes from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own
@@ -505,6 +514,11 @@ pub const D3D11_PLANE_SUBMISSIONS_CODE: &str = "rt-d3d11-plane-submissions";
 /// ([`fold_metrics`]).
 pub const LEVEL_FIELD_COMMANDS_CODE: &str = "rt-level-field-commands";
 
+/// The code of the heap textures' images moved out of `VK_IMAGE_LAYOUT_UNDEFINED` before a command
+/// that writes them, after another resource of their heap may have written their bytes
+/// (`Metrics::heap_moves`), an amount on the counts line ([`fold_metrics`]).
+pub const HEAP_MOVES_CODE: &str = "rt-heap-moves";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -580,10 +594,11 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// out of resolve images and their bytes, the whole grids and the ragged grids that ran a
 /// partial-threadgroups variant, the dispatches that wrote a view through its image's extended
 /// storage usage, the submissions that handed Direct3D 11 planes over, the dispatches and draws
-/// that pushed a storage texture's level fields, the main pipelines the states' finishes made and
-/// their nanoseconds, the first-use waits for an unfinished main pipeline and their nanoseconds,
-/// and the over-copies of a kind rt kept none of.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 33;
+/// that pushed a storage texture's level fields, the heap textures moved out of the undefined
+/// layout, the main pipelines the states' finishes made and their nanoseconds, the first-use
+/// waits for an unfinished main pipeline and their nanoseconds, and the over-copies of a kind rt
+/// kept none of.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 34;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -615,13 +630,13 @@ static OVER_COPY_KINDS_LOGGED: crate::core::sync::Mutex<Vec<rt::OverCopyKind>> =
 /// seed, its emulated-SIMD-group dispatches, its dropped makes, its resolves, its resolve copies,
 /// its whole and ragged grids on a partial-threadgroups variant, its dispatches that wrote views
 /// through an extended usage, its submissions that handed Direct3D 11 planes over, its dispatches
-/// and draws that pushed level fields, its states' finishes and their waits and its over-copies of
-/// a kind rt kept none of rose by since the last fold ([`folded_counts`]), so the counts line
-/// carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
-/// ([`note_gauges`]) at their highest, and logs its over-copies' kinds the process had not logged
-/// ([`note_over_copy_kinds`]) (the module's docs). Nothing of rt's before the device is made.
-/// First it counts the dispatches the rt platform's compute encoders encoded since the last fold
-/// (`super::compute::fold_dispatches`).
+/// and draws that pushed level fields, its heap textures' moves out of the undefined layout, its
+/// states' finishes and their waits and its over-copies of a kind rt kept none of rose by since
+/// the last fold ([`folded_counts`]), so the counts line carries their totals, then its maxima
+/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest, and logs its
+/// over-copies' kinds the process had not logged ([`note_over_copy_kinds`]) (the module's docs).
+/// Nothing of rt's before the device is made. First it counts the dispatches the rt platform's
+/// compute encoders encoded since the last fold (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
     super::compute::fold_dispatches();
     let (metrics, gauges, kinds) = {
@@ -810,7 +825,8 @@ fn over_copy_kind_line(
 /// the dispatches that wrote a view through its image's extended storage usage
 /// ([`EXTENDED_VIEW_DISPATCHES_CODE`]), the submissions that handed Direct3D 11 planes over
 /// ([`D3D11_PLANE_SUBMISSIONS_CODE`]), the dispatches and draws that pushed a storage texture's
-/// level fields ([`LEVEL_FIELD_COMMANDS_CODE`]), the main pipelines the states' finishes made
+/// level fields ([`LEVEL_FIELD_COMMANDS_CODE`]), the heap textures moved out of the undefined
+/// layout ([`HEAP_MOVES_CODE`]), the main pipelines the states' finishes made
 /// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), the
 /// first-use waits for an unfinished main pipeline ([`UNFINISHED_WAITS_CODE`]) and their
 /// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]), and the over-copies of a kind rt kept none of
@@ -864,6 +880,7 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (EXTENDED_VIEW_DISPATCHES_CODE, m.extended_view_dispatches),
         (D3D11_PLANE_SUBMISSIONS_CODE, m.d3d11_plane_submissions),
         (LEVEL_FIELD_COMMANDS_CODE, m.level_field_commands),
+        (HEAP_MOVES_CODE, m.heap_moves),
         (FINISHED_PIPELINES_CODE, m.finished_pipelines),
         (FINISHED_PIPELINE_NS_CODE, m.finished_pipeline_nanos),
         (UNFINISHED_WAITS_CODE, m.first_use_unfinished_waits),
@@ -2468,9 +2485,10 @@ mod tests {
     /// resolve images and their bytes, the whole grids and the ragged grids that ran a
     /// partial-threadgroups variant, the dispatches that wrote a view through its image's extended
     /// storage usage, the submissions that handed Direct3D 11 planes over, the dispatches and draws
-    /// that pushed a storage texture's level fields, the main pipelines the states' finishes made
-    /// and their nanoseconds, the first-use waits for an unfinished main pipeline and their
-    /// nanoseconds, and the over-copies of a kind rt kept none of.
+    /// that pushed a storage texture's level fields, the heap textures moved out of the undefined
+    /// layout, the main pipelines the states' finishes made and their nanoseconds, the first-use
+    /// waits for an unfinished main pipeline and their nanoseconds, and the over-copies of a kind
+    /// rt kept none of.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2512,6 +2530,7 @@ mod tests {
             EXTENDED_VIEW_DISPATCHES_CODE,
             D3D11_PLANE_SUBMISSIONS_CODE,
             LEVEL_FIELD_COMMANDS_CODE,
+            HEAP_MOVES_CODE,
             FINISHED_PIPELINES_CODE,
             FINISHED_PIPELINE_NS_CODE,
             UNFINISHED_WAITS_CODE,
@@ -2556,6 +2575,7 @@ mod tests {
         m.extended_view_dispatches = 1;
         m.d3d11_plane_submissions = 3;
         m.level_field_commands = 5;
+        m.heap_moves = 2;
         m.finished_pipelines = 2;
         m.finished_pipeline_nanos = 12_000_000;
         m.first_use_unfinished_waits = 1;
@@ -2595,6 +2615,7 @@ mod tests {
         m.extended_view_dispatches = 4;
         m.d3d11_plane_submissions = 12;
         m.level_field_commands = 8;
+        m.heap_moves = 6;
         m.finished_pipelines = 5;
         m.finished_pipeline_nanos = 12_000_000 + 6_750_000;
         m.first_use_unfinished_waits = 3;
@@ -2609,7 +2630,7 @@ mod tests {
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
                 28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 9, 4,
-                12, 8, 5, 18_750_000, 3, 1_300_000, 4
+                12, 8, 6, 5, 18_750_000, 3, 1_300_000, 4
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
