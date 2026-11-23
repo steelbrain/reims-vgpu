@@ -21,8 +21,10 @@
 //!   and the copies of what passes resolved into a texture's resolve image into the bytes of the
 //!   buffer the texture is in place over;
 //! - `counted`, more of what rt counted, by their fields' names: new textures' images zeroed,
-//!   their bytes and the barriers that moved them home after it; the acquires of another API's
-//!   writes; the barriers rt recorded; the bytes its commits' copy-ins copied from Managed
+//!   their bytes and the barriers that moved them home after it; heap textures' images moved out
+//!   of the undefined layout before a command that writes them, after another resource of their
+//!   heap may have written their bytes; the acquires of another API's writes; the barriers rt
+//!   recorded; the bytes its commits' copy-ins copied from Managed
 //!   buffers' bytes into their device copies; the releases of a texture or block an unsent upload
 //!   held, their bytes, and the sends of uploads they started; the sends of groups a queue held
 //!   behind its submissions in flight, and the GPU's nanoseconds from the end of the work submitted
@@ -121,6 +123,7 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         texture_clears,
         texture_clear_bytes,
         texture_clear_barriers,
+        heap_moves,
         external_acquires,
         barriers,
         managed_bytes_captured,
@@ -262,6 +265,8 @@ mod tests {
         now.texture_clears = 7;
         now.texture_clear_bytes = 1_000_000 + 524_288;
         now.texture_clear_barriers = 1;
+        before.heap_moves = 2;
+        now.heap_moves = 2 + 5;
         now.external_acquires = 2;
         now.barriers = 40 + 9;
         now.managed_bytes_captured = 1_000_000 + 98_304;
@@ -303,9 +308,9 @@ mod tests {
              buffers 12 in 1.7 ms on the GPU; bytes copied 6720: staging 64, attachment reads 512, \
              over-copies 4096 (dma-buf 4000, pitch 96), resolve copies 2048; counted \
              texture_clears 2, \
-             texture_clear_bytes 524288, texture_clear_barriers 1, external_acquires 2, barriers \
-             9, managed_bytes_captured 98304, held_releases 3, held_release_bytes 16842752, \
-             held_release_starts 1, held_starts 6, held_start_gap_nanos 250000, \
+             texture_clear_bytes 524288, texture_clear_barriers 1, heap_moves 5, external_acquires \
+             2, barriers 9, managed_bytes_captured 98304, held_releases 3, held_release_bytes \
+             16842752, held_release_starts 1, held_starts 6, held_start_gap_nanos 250000, \
              pipeline_creation_nanos 7250000, translation_nanos 3125000, untimed_command_buffers \
              4, stamps_not_available 1; gauges textures 12, \
              textures_copied_over 2, texture_block_bytes 20971520, texture_own_bytes 33554432, \
@@ -325,7 +330,7 @@ mod tests {
         assert!(
             part.ends_with(
                 "over-copies 0, resolve copies 0; counted texture_clears 0, texture_clear_bytes 0, \
-                 texture_clear_barriers 0, external_acquires 0, barriers 0, \
+                 texture_clear_barriers 0, heap_moves 0, external_acquires 0, barriers 0, \
                  managed_bytes_captured 0, held_releases 0, held_release_bytes 0, \
                  held_release_starts 0, held_starts 0, held_start_gap_nanos 0, \
                  pipeline_creation_nanos 0, translation_nanos 0, untimed_command_buffers 0, \
