@@ -192,6 +192,7 @@ mod completions;
 #[cfg(test)]
 mod composite_cost;
 mod compute;
+mod describe;
 #[cfg(test)]
 mod dispatch_cost;
 #[cfg(test)]
@@ -5588,6 +5589,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         pipeline_key::pipeline_key(message, |id| libraries.key_of(id))
     }
 
+    /// The key of the function `name`, specialised by `constants`, of library `library`
+    /// ([`describe::function_key`]): by the content key the device holds the library under,
+    /// where it holds one.
+    fn function_key(&self, library: u64, name: &str, constants: &[FunctionConstant]) -> String {
+        let held = self.shared.libraries.lock().key_of(library);
+        describe::function_key(held, library, name, constants)
+    }
+
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
         let library = |obj_id: u64| self.library_ref(obj_id);
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
@@ -5601,31 +5610,36 @@ impl<P: Platform> GraphicsDecoder<P> {
             let linked = self.linked_tail(message, m.linked_offset, m.linked_count)?;
             let libraries = self.pipeline_libraries(message, &m)?;
             let stage_input = stage_input(message, &m)?;
+            let fields = ComputeFields {
+                threadgroup_size_is_multiple_of_execution_width: m.flags
+                    & RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
+                    != 0,
+                max_total_threads_per_threadgroup: m.max_total_threads_per_threadgroup.into(),
+                max_call_stack_depth: m.max_call_stack_depth.into(),
+                support_indirect_command_buffers: m.flags & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
+                    != 0,
+                stage_input,
+                open_cl_mode: m.flags & RGFX_COMPUTE_PIPELINE_OPENCL_MODE != 0,
+            };
+            let what = describe::compute(
+                &fields,
+                &self.function_key(m.function_library_obj_id, name, &constants),
+                linked.len(),
+                libraries.preloaded.len().saturating_add(libraries.loaded.len()),
+            );
             return Ok(PipelineJob {
                 obj_id: m.obj_id,
                 seqno: m.header.seqno,
                 seen_from: self.table_clock(m.obj_id),
                 key: self.pipeline_key(message),
+                what,
                 shape: PipelineShape::Compute {
                     library,
                     name: name.to_owned(),
                     constants,
                     linked,
                     libraries,
-                    fields: ComputeFields {
-                        threadgroup_size_is_multiple_of_execution_width: m.flags
-                            & RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
-                            != 0,
-                        max_total_threads_per_threadgroup: m
-                            .max_total_threads_per_threadgroup
-                            .into(),
-                        max_call_stack_depth: m.max_call_stack_depth.into(),
-                        support_indirect_command_buffers: m.flags
-                            & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
-                            != 0,
-                        stage_input,
-                        open_cl_mode: m.flags & RGFX_COMPUTE_PIPELINE_OPENCL_MODE != 0,
-                    },
+                    fields,
                 },
             });
         }
@@ -5669,11 +5683,24 @@ impl<P: Platform> GraphicsDecoder<P> {
             self.linked_tail(message, m.vertex_linked_offset, m.vertex_linked_count)?;
         let fragment_linked =
             self.linked_tail(message, m.fragment_linked_offset, m.fragment_linked_count)?;
+        let fields = render_fields(message, &m)?;
+        let what = describe::render(
+            &fields,
+            &self.function_key(m.vertex_library_obj_id, vertex_name, &vertex_constants),
+            fragment
+                .as_ref()
+                .map(|(_, name, constants)| {
+                    self.function_key(m.fragment_library_obj_id, name, constants)
+                })
+                .as_deref(),
+            (vertex_linked.len(), fragment_linked.len()),
+        );
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
             seen_from: self.table_clock(m.obj_id),
             key: self.pipeline_key(message),
+            what,
             shape: PipelineShape::Render {
                 vertex_library,
                 vertex_name: vertex_name.to_owned(),
@@ -5682,7 +5709,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 label,
                 vertex_linked,
                 fragment_linked,
-                fields: render_fields(message, &m)?,
+                fields,
             },
         })
     }
@@ -5744,11 +5771,22 @@ impl<P: Platform> GraphicsDecoder<P> {
         let size = |[width, height, depth]: [u32; 3]| {
             MtlSize::new(width.into(), height.into(), depth.into())
         };
-        Ok(PipelineJob {
+        let key = |library: u64, stage: &Option<StageRef<P>>| {
+            stage
+                .as_ref()
+                .map(|(_, name, constants)| self.function_key(library, name, constants))
+        };
+        let (object_key, fragment_key) = (
+            key(m.object_library_obj_id, &object),
+            key(m.fragment_library_obj_id, &fragment),
+        );
+        let mesh_key = self.function_key(m.mesh_library_obj_id, &mesh.1, &mesh.2);
+        let mut job = PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
             seen_from: self.table_clock(m.obj_id),
             key: None,
+            what: String::new(),
             shape: PipelineShape::Mesh(Box::new(MeshShape {
                 object,
                 mesh,
@@ -5805,7 +5843,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                         != 0,
                 },
             })),
-        })
+        };
+        if let PipelineShape::Mesh(shape) = &job.shape {
+            job.what = describe::mesh(
+                &shape.fields,
+                object_key.as_deref(),
+                &mesh_key,
+                fragment_key.as_deref(),
+            );
+        }
+        Ok(job)
     }
 
     /// The `count` linked functions at byte `offset` of `message`: each one's library resolved
@@ -5902,6 +5949,9 @@ pub(crate) struct PipelineJob<P: Platform> {
     pub(crate) seen_from: u64,
     /// The create's key, which a made pipeline's reply carries ([`pipeline_key::pipeline_key`]).
     key: Option<PipelineKey>,
+    /// What its compile is handed with ([`describe`]): its kind, formats, layout and functions'
+    /// keys, never a name of the guest's.
+    what: String,
     /// The pipeline's functions and descriptor.
     shape: PipelineShape<P>,
 }
@@ -5910,6 +5960,12 @@ impl<P: Platform> PipelineJob<P> {
     /// The create's key, where it asked for one and could be keyed.
     pub(crate) fn key(&self) -> Option<PipelineKey> {
         self.key
+    }
+
+    /// What its compile is handed with ([`describe`]), which the compile's begin line and its
+    /// thread's record of it name (`crate::graphics::compile`, "The compile in flight").
+    pub(crate) fn what(&self) -> &str {
+        &self.what
     }
 
     /// Another job of the same compute pipeline create, its handles taken again, to make it once
@@ -5932,6 +5988,7 @@ impl<P: Platform> PipelineJob<P> {
             seqno: self.seqno,
             seen_from: self.seen_from,
             key: self.key,
+            what: self.what.clone(),
             shape: PipelineShape::Compute {
                 library: library.clone_ref(),
                 name: name.clone(),

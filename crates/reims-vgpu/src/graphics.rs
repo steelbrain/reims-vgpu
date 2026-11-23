@@ -136,6 +136,10 @@ use crate::error::Error;
 use crate::graphics::answers::PipelineAnswers;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending, Ticket};
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use crate::graphics::compile::{
+    IN_FLIGHT_BYTES, InFlight, THREAD_PREFIX as COMPILE_THREAD_PREFIX,
+};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::prepass::{Ahead, Prepass, WalkEnd};
 use crate::graphics::decode::shares::ListenSink;
@@ -3250,12 +3254,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
         };
         let of = CompileOf::new(CompileKind::Pipeline, job.obj_id);
+        let what = job.what().to_owned();
         let me = Arc::clone(self);
         let poster = poster.clone();
-        if let Err(compile) = self
-            .pool
-            .submit(of, Box::new(move || me.compile(job, ticket, poster, false)))
-        {
+        if let Err(compile) = self.pool.submit_described(
+            of,
+            what,
+            Box::new(move || me.compile(job, ticket, poster, false)),
+        ) {
             compile();
         }
     }
@@ -3336,6 +3342,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             });
             return;
         }
+        let what = again.what().to_owned();
         let me = Arc::clone(self);
         let settle = move || {
             if end == FillEnd::Filled && me.pending.live(creating.ticket) {
@@ -3352,7 +3359,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
         };
         let of = CompileOf::new(CompileKind::Pipeline, creating.obj_id);
-        if let Err(settle) = self.pool.submit(of, Box::new(settle)) {
+        if let Err(settle) = self.pool.submit_described(of, what, Box::new(settle)) {
             settle();
         }
     }

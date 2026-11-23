@@ -31,6 +31,14 @@
 //! ([`reims_vgpu_vulkan::core::trace`]), its hand-over, start and end as `cmphand`, `cmpstart`
 //! and `cmpend` events, each with the object's id.
 //!
+//! **The compile in flight.** As a thread starts a compile it logs a begin line at debug: the
+//! context, the kind and the object id its end line names, and the description it was handed with
+//! ([`CompilePool::submit_described`]): a pipeline's pixel formats, vertex layout and functions,
+//! each function by a key, never by its name (`decode::PipelineJob::what`). A begin with no end
+//! on a thread that died names the compile it died in. The thread also keeps the same text in a
+//! record of its own while the compile runs ([`InFlight`]), which the Windows fault lines read
+//! (`crate::faults`), so a crash's report names the compile at the warn level users run at.
+//!
 //! **Order.** A compile's thread settles it in two steps (`GraphicsControl::settle`). The
 //! reply: the platform's make of the state (the device's pipeline creator) made every answer the
 //! reply carries, and the reply is posted. The store, after it: the make's second step, the
@@ -101,6 +109,7 @@
 //! more asks a thread of the layer's own to hand back to Linux the heap the make's translation
 //! left free; the compile's thread only asks, and nothing the guest sees changes.
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -183,9 +192,79 @@ impl CompileOf {
     }
 }
 
+/// The prefix of the pool's threads' names, each `reims-vgpu.graphics-compile-<n>`.
+pub(crate) const THREAD_PREFIX: &str = "reims-vgpu.graphics-compile-";
+
+/// The bytes of a compile's description the thread's record of it keeps ([`InFlight`]): a
+/// longer one is cut at a character's boundary.
+pub(crate) const IN_FLIGHT_BYTES: usize = 1024;
+
+thread_local! {
+    /// The compile in flight on this thread ([`InFlight`]): its text's length, 0 where none runs,
+    /// and its bytes. Initialised by a constant and with no destructor, so once a thread has set
+    /// it, its read takes no lock and allocates nothing, as a fault handler's read must.
+    static IN_FLIGHT: (Cell<usize>, Cell<[u8; IN_FLIGHT_BYTES]>) =
+        const { (Cell::new(0), Cell::new([0; IN_FLIGHT_BYTES])) };
+}
+
+/// The calling thread's record of the compile it runs (the module docs, "The compile in
+/// flight"): set from the compile's text while held, cleared as it drops, a panic's unwind
+/// included.
+pub(crate) struct InFlight(());
+
+impl InFlight {
+    /// Records `text` as the compile in flight on the calling thread, cut to
+    /// [`IN_FLIGHT_BYTES`] at a character's boundary.
+    pub(crate) fn set(text: &str) -> InFlight {
+        let mut take = text.len().min(IN_FLIGHT_BYTES);
+        while !text.is_char_boundary(take) {
+            take = take.saturating_sub(1);
+        }
+        let mut bytes = [0u8; IN_FLIGHT_BYTES];
+        if let (Some(dst), Some(src)) = (bytes.get_mut(..take), text.as_bytes().get(..take)) {
+            dst.copy_from_slice(src);
+        }
+        let _ = IN_FLIGHT.try_with(|(len, buf)| {
+            len.set(0);
+            buf.set(bytes);
+            len.set(take);
+        });
+        InFlight(())
+    }
+
+    /// Copies the calling thread's compile in flight into `out`, cut to its length; how many
+    /// bytes it copied, 0 where none runs. It takes no lock and allocates nothing where the thread
+    /// has run a compile before, so a fault handler may call it on a compile thread
+    /// (`crate::faults`); on another thread it may allocate the record.
+    #[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) fn read(out: &mut [u8]) -> usize {
+        IN_FLIGHT
+            .try_with(|(len, buf)| {
+                let bytes = buf.get();
+                let n = len.get().min(out.len()).min(IN_FLIGHT_BYTES);
+                if let (Some(dst), Some(src)) = (out.get_mut(..n), bytes.get(..n)) {
+                    dst.copy_from_slice(src);
+                    n
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let _ = IN_FLIGHT.try_with(|(len, _)| len.set(0));
+    }
+}
+
 /// A compile waiting for a thread.
 struct Queued {
     of: CompileOf,
+    /// What it compiles, as its begin line and its thread's record name it, past its object
+    /// ([`CompilePool::submit_described`]); empty where it was handed over with none.
+    what: String,
     job: CompileJob,
     /// When it was handed over, and how many compiles were waiting then.
     handed: MonoTime,
@@ -365,7 +444,7 @@ impl CompilePool {
             #[cfg(test)]
             let gate = Arc::clone(&gate);
             let spawned = std::thread::Builder::new()
-                .name(format!("reims-vgpu.graphics-compile-{i}"))
+                .name(format!("{THREAD_PREFIX}{i}"))
                 .spawn(move || {
                     while let Some(queued) = next_compile(&shared) {
                         #[cfg(test)]
@@ -409,6 +488,17 @@ impl CompilePool {
     /// Hands `job`, the compile of `of`, to the threads, or gives it back where the pool has
     /// none.
     pub(crate) fn submit(&self, of: CompileOf, job: CompileJob) -> Result<(), CompileJob> {
+        self.submit_described(of, String::new(), job)
+    }
+
+    /// [`Self::submit`], with `what`, the compile's description, which its begin line and its
+    /// thread's record of it name past its object (the module docs, "The compile in flight").
+    pub(crate) fn submit_described(
+        &self,
+        of: CompileOf,
+        what: String,
+        job: CompileJob,
+    ) -> Result<(), CompileJob> {
         let mut state = self.shared.state.lock();
         if state.closed {
             return Err(job);
@@ -420,6 +510,7 @@ impl CompilePool {
         let joins = queue.is_empty();
         queue.of(of.kind).push_back(Queued {
             of,
+            what,
             job,
             handed,
             ahead,
@@ -519,31 +610,63 @@ fn next_compile(shared: &Shared) -> Option<Queued> {
     }
 }
 
-/// Runs a compile the pool took, logs its wait and its run time, and hands its run time to the
+/// What a compile of `kind` is called in its lines.
+fn kind_name(kind: CompileKind) -> &'static str {
+    match kind {
+        CompileKind::Library => "library",
+        CompileKind::Pipeline => "pipeline",
+        CompileKind::Prepass => "command buffer's dispatch made ahead",
+    }
+}
+
+/// A compile's text: its context, kind and object, then `what` where it has one.
+fn in_flight_text(of: CompileOf, what: &str) -> String {
+    let mut text = format!(
+        "context {}'s {} {:#x}",
+        of.context(),
+        kind_name(of.kind),
+        of.obj_id
+    );
+    if !what.is_empty() {
+        text.push_str(": ");
+        text.push_str(what);
+    }
+    text
+}
+
+/// Runs a compile the pool took: logs its begin and keeps its record while it runs (the module
+/// docs, "The compile in flight"), logs its wait and its run time, and hands its run time to the
 /// OS layer (the module docs, "After a heavy make").
 fn run(shared: &Shared, queued: Queued) {
     let Queued {
         of,
+        what,
         job,
         handed,
         ahead,
     } = queued;
     let started = (shared.now)();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    log::debug!(
+        target: LOG_TARGET,
+        "{}: begins after waiting {:.1} ms{}{what}",
+        in_flight_text(of, ""),
+        ms(started.saturating_duration_since(handed)),
+        if what.is_empty() { "" } else { ": " },
+    );
+    let text = in_flight_text(of, &what);
     trace::event("cmpstart", &[of.obj_id]);
+    let in_flight = InFlight::set(&text);
     job();
+    drop(in_flight);
     trace::event("cmpend", &[of.obj_id]);
     let ended = (shared.now)();
-    let ms = |d: Duration| d.as_secs_f64() * 1e3;
     log::debug!(
         target: LOG_TARGET,
         "context {}'s {} {:#x}: waited {:.1} ms, {ahead} compiles waiting when handed over; \
          compiled in {:.1} ms",
         of.context(),
-        match of.kind {
-            CompileKind::Library => "library",
-            CompileKind::Pipeline => "pipeline",
-            CompileKind::Prepass => "command buffer's dispatch made ahead",
-        },
+        kind_name(of.kind),
         of.obj_id,
         ms(started.saturating_duration_since(handed)),
         ms(ended.saturating_duration_since(started)),
@@ -1200,6 +1323,77 @@ mod tests {
         assert_eq!(
             started(&starts, 3),
             ["library 2", "pipeline 1", "pipeline 2"]
+        );
+    }
+
+    /// A thread's record of its compile holds the text it was set from, cut at a character's
+    /// boundary past [`IN_FLIGHT_BYTES`], and is empty once its holder drops
+    #[test]
+    fn the_compile_in_flight_is_held_while_its_record_lives() {
+        let mut out = [0u8; IN_FLIGHT_BYTES];
+        assert_eq!(InFlight::read(&mut out), 0, "nothing runs yet");
+        let held = InFlight::set("context 1's pipeline 0x10000000004: render colors [0:65]");
+        let n = InFlight::read(&mut out);
+        assert_eq!(
+            &out[..n],
+            b"context 1's pipeline 0x10000000004: render colors [0:65]"
+        );
+        let mut short = [0u8; 7];
+        assert_eq!(InFlight::read(&mut short), 7);
+        assert_eq!(&short, b"context");
+        drop(held);
+        assert_eq!(InFlight::read(&mut out), 0, "cleared as its holder drops");
+        // 'a' then two-byte characters: byte 1024 falls inside one, so the record keeps 1023.
+        let long = format!("a{}", "é".repeat(IN_FLIGHT_BYTES));
+        let held = InFlight::set(&long);
+        let n = InFlight::read(&mut out);
+        assert_eq!(n, IN_FLIGHT_BYTES - 1);
+        assert_eq!(std::str::from_utf8(&out[..n]).unwrap(), &long[..n]);
+        drop(held);
+    }
+
+    /// A compile reads, on its thread, its context, kind and object, and the description it was
+    /// handed over with, after a colon, or none where it was handed over without one
+    #[test]
+    fn a_compile_s_thread_names_the_compile_it_runs() {
+        let pool = pool(1);
+        let (tx, seen) = mpsc::channel::<String>();
+        let read = |tx: &mpsc::Sender<String>| {
+            let tx = tx.clone();
+            let job: CompileJob = Box::new(move || {
+                let mut out = [0u8; IN_FLIGHT_BYTES];
+                let n = InFlight::read(&mut out);
+                let name = std::thread::current().name().unwrap_or("").to_owned();
+                tx.send(format!("{name}|{}", String::from_utf8_lossy(&out[..n])))
+                    .unwrap();
+            });
+            job
+        };
+        let described = CompileOf::new(CompileKind::Pipeline, obj(1, 4));
+        assert!(
+            pool.submit_described(
+                described,
+                "render colors [0:65] depth 0 stencil 0 samples 1".to_owned(),
+                read(&tx)
+            )
+            .is_ok()
+        );
+        assert!(
+            pool.submit(CompileOf::new(CompileKind::Library, obj(3, 0xf)), read(&tx))
+                .is_ok()
+        );
+        let wait = Duration::from_secs(10);
+        assert_eq!(
+            seen.recv_timeout(wait).unwrap(),
+            format!(
+                "{THREAD_PREFIX}0|context 1's pipeline {:#x}: render colors [0:65] depth 0 \
+                 stencil 0 samples 1",
+                obj(1, 4)
+            )
+        );
+        assert_eq!(
+            seen.recv_timeout(wait).unwrap(),
+            format!("{THREAD_PREFIX}0|context 3's library {:#x}", obj(3, 0xf))
         );
     }
 

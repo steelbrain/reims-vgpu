@@ -86,6 +86,63 @@ fn a_fault_writes_its_module_offset_and_callers() {
             && l.ends_with(&format!("\"{TEST}\""))),
         "{stderr}"
     );
+    // A thread that is no compile thread names no compile.
+    assert!(!stderr.contains("the compile in flight"), "{stderr}");
+}
+
+/// A fault on a compile thread running a compile writes the thread's record of it after the
+/// thread's name: its object and kind, then its description. In a child, whose compile thread
+/// faults with the handler installed and its record set.
+#[test]
+fn a_fault_on_a_compile_thread_names_the_compile_in_flight() {
+    const TEST: &str = "faults::tests::a_fault_on_a_compile_thread_names_the_compile_in_flight";
+    const WHAT: &str = "context 1's pipeline 0x10000000004: render colors [0:65] depth 0 stencil 0 \
+                        samples 1 raster 1 topology 3 vertex none functions vertex k0011223344556677 \
+                        fragment k8899aabbccddeeff";
+    if std::env::var_os("RVG_FAULT_CHILD").is_some() {
+        // SAFETY: no precondition; the child writes no error report of the system's.
+        unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
+        install();
+        let thread = std::thread::Builder::new()
+            .name(format!("{}0", crate::graphics::COMPILE_THREAD_PREFIX))
+            .spawn(|| {
+                let _in_flight = crate::graphics::InFlight::set(WHAT);
+                store_at(0x28);
+            })
+            .unwrap();
+        let _ = thread.join();
+        unreachable!("the store faults");
+    }
+    let exe = std::env::current_exe().unwrap();
+    let out = Command::new(&exe)
+        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+        .env("RVG_FAULT_CHILD", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0xC000_0005_u32.cast_signed()),
+        "{out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let file = exe.file_name().unwrap().to_string_lossy();
+    let head = format!("reims-vgpu: exception 0xc0000005 at {file}+0x");
+    let lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with(&head)).collect();
+    let named = lines
+        .iter()
+        .position(|l| l.contains(": on thread "))
+        .unwrap_or_else(|| panic!("no thread's line: {stderr}"));
+    assert!(
+        lines[named].ends_with("\"reims-vgpu.graphics-compile-0\""),
+        "{stderr}"
+    );
+    let in_flight = lines
+        .get(named + 1)
+        .unwrap_or_else(|| panic!("no compile's line after the thread's: {stderr}"));
+    assert!(
+        in_flight.ends_with(&format!(": the compile in flight on this thread: {WHAT}")),
+        "{in_flight}"
+    );
 }
 
 /// Each site writes its lines once: a key is new once, and a full table lets every key write.

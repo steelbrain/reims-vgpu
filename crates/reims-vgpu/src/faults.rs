@@ -15,7 +15,12 @@
 //!   return addresses of up to [`CALLERS`] frames above it, unwound from the fault's context by
 //!   the modules' unwind tables (`RtlVirtualUnwind`);
 //! - `reims-vgpu: exception <code> at <module>+0x<offset>: on thread <id> "<name>"`, where the
-//!   thread has a name.
+//!   thread has a name;
+//! - `reims-vgpu: exception <code> at <module>+0x<offset>: the compile in flight on this thread:
+//!   <what>`, on a compile thread (`reims-vgpu.graphics-compile-<n>`) running a compile: the
+//!   thread's record of it (`crate::graphics::InFlight`), its object and kind and, for a
+//!   pipeline, its pixel formats, vertex layout and functions' keys, which a driver's fault in a
+//!   pipeline's make names no other way.
 //!
 //! The handler takes nothing: it answers `EXCEPTION_CONTINUE_SEARCH`, and the process goes on as
 //! it would have without it, ending where no handler takes the exception. It is the last of the
@@ -27,9 +32,11 @@
 //!
 //! Each line is one `WriteFile` to stderr, from a buffer on the faulting thread's stack, with no
 //! lock and no allocation of the library's: the module's name is the loader's
-//! (`GetModuleFileNameW`, under the loader lock), and the thread's name, read last, is allocated
-//! by the system. A fault inside the handler (a stack the unwind cannot read) is left to the
-//! process's other handlers, after the lines already written ([`Inside`]).
+//! (`GetModuleFileNameW`, under the loader lock), the thread's name is allocated by the system,
+//! and the compile in flight is copied from the thread's record of it, a thread local initialised
+//! by a constant and with no destructor, which the thread set before its compile. A fault inside
+//! the handler (a stack the unwind cannot read) is left to the process's other handlers, after
+//! the lines already written ([`Inside`]).
 //!
 //! The lines are diagnostics: the contract leaves crash messages free.
 
@@ -222,7 +229,40 @@ fn write_more(code: u32, at: usize, tid: u32, context: &CONTEXT) {
         write_wide(&mut line, name.get(..len).unwrap_or_default());
         let _ = write!(line, "\"");
         line.write_out();
+        let name = name.get(..len).unwrap_or_default();
+        if is_compile_thread(name) {
+            write_in_flight(code, at);
+        }
     }
+}
+
+/// Whether the thread named `name` is one of the graphics compile pool's
+/// (`reims-vgpu.graphics-compile-<n>`).
+fn is_compile_thread(name: &[u16]) -> bool {
+    let prefix = crate::graphics::COMPILE_THREAD_PREFIX.as_bytes();
+    name.len() >= prefix.len()
+        && name
+            .iter()
+            .zip(prefix)
+            .all(|(&unit, &byte)| unit == u16::from(byte))
+}
+
+/// The compile in flight's line (module docs), where the calling compile thread runs one.
+#[inline(never)]
+fn write_in_flight(code: u32, at: usize) {
+    let mut text = [0u8; crate::graphics::IN_FLIGHT_BYTES];
+    let len = crate::graphics::InFlight::read(&mut text);
+    if len == 0 {
+        return;
+    }
+    let mut line = Line::new();
+    let _ = write!(line, "reims-vgpu: exception 0x{code:08x} at ");
+    write_site(&mut line, at);
+    let _ = write!(line, ": the compile in flight on this thread: ");
+    let _ = line.write_str(
+        std::str::from_utf8(text.get(..len).unwrap_or_default()).unwrap_or("(not UTF-8)"),
+    );
+    line.write_out();
 }
 
 /// For an access violation or a page that could not be read in, `, a read of 0x<address>` (or a
