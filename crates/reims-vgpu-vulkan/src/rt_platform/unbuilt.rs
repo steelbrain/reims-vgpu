@@ -608,7 +608,7 @@ fn named() -> String {
 pub(super) fn named_keys() -> Vec<super::diag::KeyFunction> {
     NAMING.with(|n| {
         (n.borrow().iter())
-            .map(|(role, function)| super::diag::KeyFunction::of(*role, function))
+            .map(|(role, function)| super::diag::KeyFunction::of(role, function))
             .collect()
     })
 }
