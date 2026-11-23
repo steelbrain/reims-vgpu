@@ -191,7 +191,7 @@
 //! [`RESOLVES_CODE`]: on a device that resolves in place, where the copies and the images stay 0,
 //! it is what shows that a boot's resolves ran.
 //!
-//! **Its partial-threadgroups variant's whole grids.** A kernel that observes its threadgroup
+//! **Its partial-threadgroups variant's grids.** A kernel that observes its threadgroup
 //! partition runs every dispatch on its partial-threadgroups variant, whole grids
 //! (`dispatchThreads` of whole threadgroups, `dispatchThreadgroups`) and indirect dispatches
 //! among them, so rt makes one `VkPipeline` of a size for it, where Metal compiles one function.
@@ -201,7 +201,35 @@
 //! counts the dispatches of whole threadgroups, direct and indirect, that ran the variant
 //! (`Metrics::partial_variant_whole_grids`), and the counts line carries them as an amount,
 //! [`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`], so a boot's line says how often its whole grids took the
-//! variant.
+//! variant. A ragged grid, `dispatchThreads` of a grid that is not a whole number of
+//! threadgroups, runs only on the variant, its regions flagged so that each threadgroup runs only
+//! the grid's threads; one the variant cannot take is rt's refusal (`Gap::PartialThreadgroups`).
+//! rt counts the ragged grids that ran the variant apart (`Metrics::partial_variant_ragged_grids`;
+//! a refused one counts in neither), and the counts line carries them as an amount too,
+//! [`PARTIAL_VARIANT_RAGGED_GRIDS_CODE`], so a boot's line says how many of its ragged grids ran.
+//!
+//! **Its views written through an extended usage.** A texture made for shader writes whose own
+//! format the device does not store (an 8-bit sRGB format) is made, where the device's image
+//! format query takes it, with `VK_IMAGE_CREATE_EXTENDED_USAGE_BIT` and the storage usage for its
+//! views of a format it lists that the device does store (the sRGB format's unorm sibling), so a
+//! kernel writes the texture through such a view, as Metal does. Where the query does not take it,
+//! a dispatch that writes the view is rt's refusal, `Gap::StorageElement` of case `Unextended`.
+//! rt counts the dispatches whose kernel writes, at one of its texture slots, a view through the
+//! storage usage its texture's image took for that view's format alone
+//! (`Metrics::extended_view_dispatches`; a refused dispatch, a read-only slot, a write through the
+//! texture's own storage element and a draw count none), and the counts line carries them as an
+//! amount, [`EXTENDED_VIEW_DISPATCHES_CODE`], so a boot's line says whether its kernels wrote
+//! textures through such views.
+//!
+//! **Its Direct3D 11 planes' hand-overs.** On Windows, each submission whose command buffers keep
+//! a plane of a Direct3D 11 surface (`super::d3d11_surface`), or whose uploads copy into or out of
+//! one, acquires those planes from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own
+//! ahead of everything, after a global barrier from and to every stage, and releases them to that
+//! family in another after everything, so Direct3D 11 owns the planes' memory between rt's
+//! submissions. rt counts those submissions, a group that goes member by member once
+//! (`Metrics::d3d11_plane_submissions`), and the counts line carries them as an amount,
+//! [`D3D11_PLANE_SUBMISSIONS_CODE`], so a boot's line says how many of its submissions handed
+//! planes over. Off Windows no Direct3D 11 surface is made, and the amount stays 0.
 //!
 //! **Its compute dispatches.** rt counts no dispatch, so the rt platform's compute encoders count
 //! those they encode, by form, one relaxed add each (`super::compute`): the direct ones
@@ -441,6 +469,22 @@ pub const RESOLVE_COPY_BYTES_CODE: &str = "rt-resolve-copy-bytes";
 /// line ([`fold_metrics`]).
 pub const PARTIAL_VARIANT_WHOLE_GRIDS_CODE: &str = "rt-partial-variant-whole-grids";
 
+/// The code of the dispatches of a grid that ends in partial threadgroups, `dispatchThreads` of a
+/// grid that is not a whole number of threadgroups, that ran a kernel's partial-threadgroups
+/// variant (`Metrics::partial_variant_ragged_grids`), an amount on the counts line
+/// ([`fold_metrics`]).
+pub const PARTIAL_VARIANT_RAGGED_GRIDS_CODE: &str = "rt-partial-variant-ragged-grids";
+
+/// The code of the dispatches whose kernel writes, at one of its texture slots, a view through the
+/// storage usage its texture's image took for that view's format alone
+/// (`Metrics::extended_view_dispatches`), an amount on the counts line ([`fold_metrics`]).
+pub const EXTENDED_VIEW_DISPATCHES_CODE: &str = "rt-extended-view-dispatches";
+
+/// The code of the submissions that acquired planes of a Direct3D 11 surface from
+/// `VK_QUEUE_FAMILY_EXTERNAL` at their start and released them to it at their end
+/// (`Metrics::d3d11_plane_submissions`), an amount on the counts line ([`fold_metrics`]).
+pub const D3D11_PLANE_SUBMISSIONS_CODE: &str = "rt-d3d11-plane-submissions";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -509,10 +553,12 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// replaced, the cache's writes skipped past its bound, the reaper's looks at it skipped and the
 /// creations made before its seed, the dispatches that ran an emulated-SIMD-group module, the
 /// compiled contents a state's make dropped, the resolves of multisample attachments, the copies
-/// out of resolve images and their bytes, the whole grids that ran a partial-threadgroups variant,
-/// the main pipelines the states' finishes made and their nanoseconds, the first-use waits for an
-/// unfinished main pipeline and their nanoseconds, and the over-copies of a kind rt kept none of.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 29;
+/// out of resolve images and their bytes, the whole grids and the ragged grids that ran a
+/// partial-threadgroups variant, the dispatches that wrote a view through its image's extended
+/// storage usage, the submissions that handed Direct3D 11 planes over, the main pipelines the
+/// states' finishes made and their nanoseconds, the first-use waits for an unfinished main
+/// pipeline and their nanoseconds, and the over-copies of a kind rt kept none of.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 32;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -542,13 +588,14 @@ static OVER_COPY_KINDS_LOGGED: crate::core::sync::Mutex<Vec<rt::OverCopyKind>> =
 /// first-use waits, its exported blocks addressed, its pipeline caches replaced and cache writes
 /// skipped past their bound, its reaper's looks at the cache skipped, its creations before the
 /// seed, its emulated-SIMD-group dispatches, its dropped makes, its resolves, its resolve copies,
-/// its whole grids on a partial-threadgroups variant, its states' finishes and their waits and its
-/// over-copies of a kind rt kept none of rose by since the last fold ([`folded_counts`]), so the
-/// counts line carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
-/// ([`note_gauges`]) at their highest, and logs its over-copies' kinds the process had not logged
-/// ([`note_over_copy_kinds`]) (the module's docs). Nothing of rt's before the device is made. First
-/// it counts the dispatches the rt platform's compute encoders encoded since the last fold
-/// (`super::compute::fold_dispatches`).
+/// its whole and ragged grids on a partial-threadgroups variant, its dispatches that wrote views
+/// through an extended usage, its submissions that handed Direct3D 11 planes over, its states'
+/// finishes and their waits and its over-copies of a kind rt kept none of rose by since the last
+/// fold ([`folded_counts`]), so the counts line carries their totals, then its maxima
+/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest, and logs its
+/// over-copies' kinds the process had not logged ([`note_over_copy_kinds`]) (the module's docs).
+/// Nothing of rt's before the device is made. First it counts the dispatches the rt platform's
+/// compute encoders encoded since the last fold (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
     super::compute::fold_dispatches();
     let (metrics, gauges, kinds) = {
@@ -730,8 +777,11 @@ fn over_copy_kind_line(
 /// ([`EMULATED_SIMDGROUP_DISPATCHES_CODE`]), the compiled contents a state's make dropped
 /// ([`KERNEL_MAKES_DROPPED_CODE`]), the resolves of multisample attachments ([`RESOLVES_CODE`]),
 /// the copies out of resolve images ([`RESOLVE_COPIES_CODE`]) and their bytes
-/// ([`RESOLVE_COPY_BYTES_CODE`]), the whole grids that ran a partial-threadgroups variant
-/// ([`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`]), the main pipelines the states' finishes made
+/// ([`RESOLVE_COPY_BYTES_CODE`]), the whole grids ([`PARTIAL_VARIANT_WHOLE_GRIDS_CODE`]) and the
+/// ragged grids ([`PARTIAL_VARIANT_RAGGED_GRIDS_CODE`]) that ran a partial-threadgroups variant,
+/// the dispatches that wrote a view through its image's extended storage usage
+/// ([`EXTENDED_VIEW_DISPATCHES_CODE`]), the submissions that handed Direct3D 11 planes over
+/// ([`D3D11_PLANE_SUBMISSIONS_CODE`]), the main pipelines the states' finishes made
 /// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), the
 /// first-use waits for an unfinished main pipeline ([`UNFINISHED_WAITS_CODE`]) and their
 /// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]), and the over-copies of a kind rt kept none of
@@ -778,6 +828,12 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
             PARTIAL_VARIANT_WHOLE_GRIDS_CODE,
             m.partial_variant_whole_grids,
         ),
+        (
+            PARTIAL_VARIANT_RAGGED_GRIDS_CODE,
+            m.partial_variant_ragged_grids,
+        ),
+        (EXTENDED_VIEW_DISPATCHES_CODE, m.extended_view_dispatches),
+        (D3D11_PLANE_SUBMISSIONS_CODE, m.d3d11_plane_submissions),
         (FINISHED_PIPELINES_CODE, m.finished_pipelines),
         (FINISHED_PIPELINE_NS_CODE, m.finished_pipeline_nanos),
         (UNFINISHED_WAITS_CODE, m.first_use_unfinished_waits),
@@ -2379,10 +2435,11 @@ mod tests {
     /// cache's writes skipped past its bound, the reaper's looks at it skipped and the creations
     /// made before its seed, the dispatches that ran an emulated-SIMD-group module, the compiled
     /// contents a state's make dropped, the resolves of multisample attachments, the copies out of
-    /// resolve images and their bytes, the whole grids that ran a partial-threadgroups variant, the
-    /// main pipelines the states' finishes made and their nanoseconds, the first-use waits for an
-    /// unfinished main pipeline and their nanoseconds, and the over-copies of a kind rt kept none
-    /// of.
+    /// resolve images and their bytes, the whole grids and the ragged grids that ran a
+    /// partial-threadgroups variant, the dispatches that wrote a view through its image's extended
+    /// storage usage, the submissions that handed Direct3D 11 planes over, the main pipelines the
+    /// states' finishes made and their nanoseconds, the first-use waits for an unfinished main
+    /// pipeline and their nanoseconds, and the over-copies of a kind rt kept none of.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2420,6 +2477,9 @@ mod tests {
             RESOLVE_COPIES_CODE,
             RESOLVE_COPY_BYTES_CODE,
             PARTIAL_VARIANT_WHOLE_GRIDS_CODE,
+            PARTIAL_VARIANT_RAGGED_GRIDS_CODE,
+            EXTENDED_VIEW_DISPATCHES_CODE,
+            D3D11_PLANE_SUBMISSIONS_CODE,
             FINISHED_PIPELINES_CODE,
             FINISHED_PIPELINE_NS_CODE,
             UNFINISHED_WAITS_CODE,
@@ -2460,6 +2520,9 @@ mod tests {
         m.resolve_copies = 1;
         m.resolve_copy_bytes = 3_686_400;
         m.partial_variant_whole_grids = 6;
+        m.partial_variant_ragged_grids = 2;
+        m.extended_view_dispatches = 1;
+        m.d3d11_plane_submissions = 3;
         m.finished_pipelines = 2;
         m.finished_pipeline_nanos = 12_000_000;
         m.first_use_unfinished_waits = 1;
@@ -2495,6 +2558,9 @@ mod tests {
         m.resolve_copies = 4;
         m.resolve_copy_bytes = 4 * 3_686_400;
         m.partial_variant_whole_grids = 13;
+        m.partial_variant_ragged_grids = 9;
+        m.extended_view_dispatches = 4;
+        m.d3d11_plane_submissions = 12;
         m.finished_pipelines = 5;
         m.finished_pipeline_nanos = 12_000_000 + 6_750_000;
         m.first_use_unfinished_waits = 3;
@@ -2508,8 +2574,8 @@ mod tests {
             rose,
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
-                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 5,
-                18_750_000, 3, 1_300_000, 4
+                28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 9, 4,
+                12, 5, 18_750_000, 3, 1_300_000, 4
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);

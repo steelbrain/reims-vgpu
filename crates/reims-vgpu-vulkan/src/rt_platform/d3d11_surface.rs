@@ -16,9 +16,12 @@
 //! two-channel format.
 //!
 //! **The acquire.** `ImportedSurfaceMemory::external_writes_done` is rt's
-//! `Surface::external_writes_done`, the planes' acquire from `VK_QUEUE_FAMILY_EXTERNAL`. rt takes
-//! no keyed mutex, and the writer's textures have none. The writer waits for its write to be done
-//! on the GPU, and only then calls it.
+//! `Surface::external_writes_done`, which records nothing for a Direct3D 11 surface: each
+//! submission whose command buffers or uploads use a plane acquires it from
+//! `VK_QUEUE_FAMILY_EXTERNAL` at its start and releases it to that family at its end, so Direct3D
+//! 11 owns the planes' memory between rt's submissions (`super::device`, "Its Direct3D 11 planes'
+//! hand-overs"). rt takes no keyed mutex, and the writer's textures have none. The writer waits
+//! for its write to be done on the GPU, and only then calls it.
 //!
 //! **Refusals.** Where rt makes no surface, the call answers `None`, counted
 //! ([`D3D11_SURFACE_REFUSED_CODE`]). The process's first refusal also writes a line naming rt's
