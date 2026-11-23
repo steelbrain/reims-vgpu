@@ -386,3 +386,55 @@ kernel void videoEncodeFill(device const uint *source [[buffer(0)]],
     }
     input[video_fill_word_at(at.x, at.y, plane.pitch_words, plane.tiling)] = word;
 }
+
+// ---- A 4:4:4 picture into a surface's two planes ----
+
+// One plane of a surface that videoGather444 writes from a 4:4:4 picture (reims-vgpu's
+// graphics/gather.rs, `GatherPlane`, 40 bytes): in the source as bound, the byte of the first
+// sample of each component the plane takes in the picture's first row, `first` and `second`
+// (luma's twice, or Cb's and Cr's), the bytes from one of the picture's rows to the next, and
+// from one sample of a component to the next (1 in a plane of its own, 4 in XYUV), and the
+// components a pixel of the plane holds (1 for luma, 2 for a Cb/Cr pair); then the plane's bytes
+// written a row, its rows written, its words a row written, its first word in the destination as
+// bound, and its words from one row to the next.
+struct VideoGatherPlane {
+    uint first;
+    uint second;
+    uint source_pitch;
+    uint step;
+    uint components;
+    uint row_bytes;
+    uint rows;
+    uint row_words;
+    uint out_first;
+    uint pitch_words;
+};
+
+// Word `at.x` of row `at.y` of a surface's plane: each of its bytes within the row the sample of
+// its pixel and component, read from the picture's row by 32-bit loads, as videoEncodeFill reads.
+// A row's last word that holds 1 to 3 of its bytes keeps the plane's other bytes, read and written
+// back by the one thread that writes the word: the plane's rows are whole words apart, so no other
+// thread of the pass writes it.
+kernel void videoGather444(device const uint *source [[buffer(0)]],
+                           device uint *plane_out [[buffer(1)]],
+                           constant VideoGatherPlane &plane [[buffer(2)]],
+                           uint2 at [[thread_position_in_grid]]) {
+    if (at.x >= plane.row_words || at.y >= plane.rows) {
+        return;
+    }
+    uint row = at.y * plane.source_pitch;
+    uint x = at.x * 4;
+    uint bytes = min(4u, plane.row_bytes - x);
+    uint word = 0;
+    for (uint i = 0; i < bytes; i++) {
+        uint byte_x = x + i;
+        uint first = byte_x % plane.components == 0 ? plane.first : plane.second;
+        uint from = first + row + (byte_x / plane.components) * plane.step;
+        word |= video_fill_byte(source, from) << (i * 8);
+    }
+    uint to = plane.out_first + at.y * plane.pitch_words + at.x;
+    if (bytes < 4) {
+        word |= plane_out[to] & (0xffffffffu << (bytes * 8));
+    }
+    plane_out[to] = word;
+}
