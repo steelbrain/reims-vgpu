@@ -559,6 +559,11 @@ pub struct SetArgs {
 
 pub fn main(cli: Cli) -> Result<i32> {
     let host = Host::current();
+    // On Windows, the programs an update set aside go where nothing runs them now; not while the
+    // installer records its install, between its set-aside of reims-util and the put-back.
+    if !matches!(cli.command, Some(Cmd::RecordInstall { .. })) {
+        crate::os::remove_set_aside_programs();
+    }
     let cmd = match cli.command {
         None | Some(Cmd::Tui) => return crate::tui::run().map(|_| 0),
         Some(c) => c,

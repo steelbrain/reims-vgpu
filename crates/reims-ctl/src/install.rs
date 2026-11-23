@@ -446,6 +446,136 @@ mod tests {
         assert_eq!(left, [&builds[2], &builds[3], &builds[4]]);
     }
 
+    /// Runs `body` in bash with the installer's `set_aside` and `put_back` defined, in `dir`;
+    /// returns its standard output.
+    fn with_set_aside(dir: &Path, body: &str) -> String {
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let text =
+            std::fs::read_to_string(Path::new(&manifest).join("../../scripts/install-ctl.sh"))
+                .unwrap();
+        let functions: String = ["set_aside", "put_back"]
+            .iter()
+            .map(|f| script_function(&text, f))
+            .collect();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("set -euo pipefail\n{functions}{body}"))
+            .current_dir(dir)
+            // On Windows, MSYS2's bash, as the installer runs in.
+            .env("MSYSTEM", "CLANG64")
+            .env("CHERE_INVOKING", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The installer's set-aside of a program it is about to install over: the program renamed
+    /// to the first free `NAME.old-N` and a copy of it left at its path; after the install, the
+    /// original put back where the install failed and left the copy or nothing, and kept aside
+    /// where it wrote a new program; nothing for a program not installed yet.
+    #[test]
+    fn the_installer_sets_a_program_aside_and_puts_it_back_where_the_install_wrote_none() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let read = |n: &str| std::fs::read_to_string(d.join(n)).ok();
+        std::fs::write(d.join("prog.exe"), "one").unwrap();
+
+        // An install that failed and left the copy: the original goes back.
+        assert_eq!(with_set_aside(&d, "set_aside prog.exe"), "prog.exe.old-0");
+        assert_eq!(read("prog.exe").as_deref(), Some("one"));
+        assert_eq!(read("prog.exe.old-0").as_deref(), Some("one"));
+        with_set_aside(&d, "put_back prog.exe prog.exe.old-0");
+        assert_eq!(read("prog.exe").as_deref(), Some("one"));
+        assert_eq!(read("prog.exe.old-0"), None);
+
+        // An install that wrote a new program: the original stays aside, for a start to remove.
+        let aside = with_set_aside(
+            &d,
+            "a=$(set_aside prog.exe); echo two >prog.exe; \
+             put_back prog.exe \"$a\"; printf %s \"$a\"",
+        );
+        assert_eq!(aside, "prog.exe.old-0");
+        assert_eq!(read("prog.exe").as_deref(), Some("two\n"));
+        assert_eq!(read("prog.exe.old-0").as_deref(), Some("one"));
+
+        // An install that removed the program and failed: the original goes back, under the next
+        // free name while the last is still aside.
+        let aside = with_set_aside(
+            &d,
+            "a=$(set_aside prog.exe); rm prog.exe; \
+             put_back prog.exe \"$a\"; printf %s \"$a\"",
+        );
+        assert_eq!(aside, "prog.exe.old-1");
+        assert_eq!(read("prog.exe").as_deref(), Some("two\n"));
+        assert_eq!(read("prog.exe.old-1"), None);
+        assert_eq!(read("prog.exe.old-0").as_deref(), Some("one"));
+
+        // A program not installed yet: nothing set aside.
+        assert_eq!(with_set_aside(&d, "set_aside none.exe"), "");
+        assert!(!d.join("none.exe").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Windows refuses to replace a running program's file on NTFS, as cargo install renames its
+    /// new build over it ("Access is denied"; a ReFS Dev Drive allows it), and lets the
+    /// installer's set-aside rename it: the install then replaces the copy, the running program
+    /// keeps running the file set aside, and a start removes that file once the program has
+    /// ended.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_program_set_aside_on_windows_is_replaced_and_removed_once_it_ends() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-aside-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let prog = d.join("reims-ctl.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &prog).unwrap();
+        let mut running = std::process::Command::new(&prog)
+            .args(["--exact", "install::tests::idle_as_a_qemu"])
+            .env("REIMS_CTL_TEST_IDLE", "1")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let aside = with_set_aside(&d, "set_aside reims-ctl.exe");
+        // cargo install's rename of its new build over the program.
+        let new = d.join("reims-ctl.exe.new");
+        std::fs::write(&new, "new").unwrap();
+        let replaced = std::fs::rename(&new, &prog);
+        with_set_aside(&d, &format!("put_back reims-ctl.exe {aside}"));
+        let kept = std::fs::read(&prog).ok();
+        // The file set aside is the one the program runs: on NTFS, the same rename over it is
+        // refused.
+        let control = d.join("control.exe");
+        std::fs::write(&control, "control").unwrap();
+        let refused = std::fs::rename(&control, d.join(&aside));
+        crate::update::remove_set_aside(&d);
+        let still_running = running.try_wait().unwrap().is_none();
+        let _ = running.kill();
+        let _ = running.wait();
+        // Windows lets go of an ended program's file a moment after the process ends.
+        let start = std::time::Instant::now();
+        while d.join(&aside).exists() && start.elapsed() < std::time::Duration::from_secs(10) {
+            crate::update::remove_set_aside(&d);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let aside_after = d.join(&aside).exists();
+        let _ = std::fs::remove_dir_all(&d);
+        if let Err(e) = &refused {
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        }
+        assert_eq!(aside, "reims-ctl.exe.old-0");
+        replaced.unwrap();
+        assert_eq!(kept.as_deref(), Some(&b"new"[..]));
+        assert!(still_running, "the set-aside ended the running program");
+        assert!(!aside_after);
+    }
+
     /// The installer's --skip-qemu keeps the installed QEMU: with none installed it ends at
     /// once, before it builds or installs anything, saying what to do. On a host reims-ctl has
     /// no VMs for (an Intel Mac) it ends before that, saying where it runs them.

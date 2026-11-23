@@ -309,6 +309,10 @@ pub fn sound_devices() -> super::SoundDevices {
 /// reims-ctl gives it, which a Unix program never does itself.
 pub fn no_glob(_c: &mut Command) {}
 
+/// Nothing: macOS and Linux replace a running program's file like any other, and the installer
+/// sets no program aside here (`update::remove_set_aside`).
+pub fn remove_set_aside_programs() {}
+
 /// Runs `cmd` in the terminal to its end, as system(3) runs a command: Ctrl+C and Ctrl+\ reach
 /// the terminal's whole foreground process group, so this process ignores them until `cmd`
 /// exits, and `cmd` gets them as it would from a shell.

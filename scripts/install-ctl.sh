@@ -843,12 +843,50 @@ fi
 
 # ------------------------------------------------------------------ reims-ctl
 
+# set_aside FILE: FILE renamed beside itself to FILE.old-N, the first N free, and copied back to
+# FILE; prints FILE.old-N, and nothing where there is no FILE. For Windows, which on NTFS refuses
+# to replace or delete a program's file while the program runs ("Access is denied", os error 5),
+# and lets it be renamed: the processes running FILE keep running FILE.old-N, and FILE is a copy
+# none of them runs, which cargo install can replace. reims-ctl update runs this script from the
+# reims-ctl it replaces, and another reims-ctl or a reims-util may be running. FILE is never
+# missing, so an install stopped part way leaves the program in its place. The name keeps FILE's
+# .exe explicit, so MSYS2's mv adds none.
+set_aside() {
+  [[ -f $1 ]] || return 0
+  local n=0
+  while [[ -e $1.old-$n ]]; do n=$((n + 1)); done
+  mv "$1" "$1.old-$n" || return 1
+  if ! cp -p "$1.old-$n" "$1"; then
+    rm -f "$1"
+    mv "$1.old-$n" "$1"
+    return 1
+  fi
+  printf '%s' "$1.old-$n"
+}
+
+# put_back FILE OLD: after FILE's install, OLD, the original set_aside kept, renamed back over FILE
+# where the install left FILE as set_aside copied it (it failed, or kept the program). Where the
+# install wrote a new FILE, OLD stays: reims-ctl removes it as it starts, once nothing runs it
+# (crates/reims-ctl/src/update.rs, remove_set_aside).
+put_back() {
+  if [[ ! -e $1 ]] || cmp -s "$1" "$2"; then
+    mv -f "$2" "$1" || true
+  fi
+}
+
 say "Installing reims-ctl (cargo install)"
-(cd "$ROOT" && CARGO_TARGET_DIR="$CACHE/ctl-target" cargo install --locked --force --quiet --path crates/reims-ctl)
 BIN="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/reims-ctl"
+OLD_BIN=""
 if [[ $WINDOWS == 1 ]]; then
   BIN="$(cygpath -u "${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$USER_HOME/.cargo}}")/bin/reims-ctl.exe"
+  OLD_BIN=$(set_aside "$BIN") || die "could not rename $(shown "$BIN") aside for the install, as Windows needs for a program that may be running"
 fi
+(cd "$ROOT" && CARGO_TARGET_DIR="$CACHE/ctl-target" cargo install --locked --force --quiet --path crates/reims-ctl) || {
+  s=$?
+  [[ -z $OLD_BIN ]] || put_back "$BIN" "$OLD_BIN"
+  exit "$s"
+}
+[[ -z $OLD_BIN ]] || put_back "$BIN" "$OLD_BIN"
 [[ -x "$BIN" ]] || die "cargo install left no $(shown "$BIN")"
 # reims-restore beside it, where arm64 VMs run (every host but Windows): an arm64 VM's first boot
 # makes macOS's Data volume and resets the VM, and its finish-eacs makes the VM start again, as
@@ -860,9 +898,19 @@ if [[ $WINDOWS == 0 ]]; then
 fi
 if [[ $WINDOWS == 1 ]]; then
   # reims-ctl, a Windows program, takes Windows paths; its update runs this
-  # script in this bash.
+  # script in this bash. It installs reims-util beside itself where its commit
+  # is not the one reims-ctl names, while another reims-ctl may be running one
+  # (making an OpenCore image, downloading an installer): set aside as reims-ctl
+  # was.
+  UTIL="$(dirname "$BIN")/reims-util.exe"
+  OLD_UTIL=$(set_aside "$UTIL") || die "could not rename $(shown "$UTIL") aside for the install, as Windows needs for a program that may be running"
   "$BIN" __record-install --repo "$(cygpath -w "$ROOT")" ${QEMU_DIR:+--qemu "$(cygpath -w "$QEMU_DIR")"} \
-    --commit "$COMMIT" --shell "$(cygpath -w "$BASH")"
+    --commit "$COMMIT" --shell "$(cygpath -w "$BASH")" || {
+    s=$?
+    [[ -z $OLD_UTIL ]] || put_back "$UTIL" "$OLD_UTIL"
+    exit "$s"
+  }
+  [[ -z $OLD_UTIL ]] || put_back "$UTIL" "$OLD_UTIL"
 else
   "$BIN" __record-install --repo "$ROOT" ${QEMU_DIR:+--qemu "$QEMU_DIR"} --commit "$COMMIT"
 fi

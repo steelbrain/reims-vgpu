@@ -707,6 +707,18 @@ pub fn no_glob(c: &mut Command) {
     c.env("MSYS", msys);
 }
 
+/// Removes the reims-ctl and reims-util that scripts/install-ctl.sh set aside beside this
+/// reims-ctl as it installed new ones over them, where no process runs them any more
+/// (`update::remove_set_aside`).
+pub fn remove_set_aside_programs() {
+    if let Some(bin) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+    {
+        crate::update::remove_set_aside(&bin);
+    }
+}
+
 /// Runs `cmd` in the console to its end. Ctrl+C and Ctrl+Break reach every process attached to
 /// the console, so this one takes them as handled until `cmd` exits, and `cmd` gets them as it
 /// would from a shell: a handler is not inherited, as ignoring them would be.

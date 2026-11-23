@@ -2,6 +2,12 @@
 //! builds and installs the new reims-ctl and QEMU. The new QEMU goes beside the old one, so
 //! running VMs keep theirs; the new reims-ctl replaces this binary, so restart it afterwards.
 //!
+//! Windows refuses to replace a program's file while it runs, as this one does through the
+//! update, so there the script first renames the installed reims-ctl and reims-util beside
+//! themselves (`NAME.old-N`, which the processes running them keep) and copies them back, and the
+//! install replaces the copies. reims-ctl removes the files set aside as it starts, once no
+//! process runs them ([`remove_set_aside`]).
+//!
 //! The checkout's branch is the channel an update follows: master is stable, and development
 //! gets changes first. Choosing a channel checks its branch out before the script runs, so the
 //! script that builds is that branch's own, and later updates stay on it.
@@ -256,10 +262,37 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
     (o.status.success() && !out.is_empty()).then_some(out)
 }
 
+/// Removes the programs in `bin` that scripts/install-ctl.sh set aside on Windows before it
+/// installed new ones over them (its `set_aside`: reims-ctl's and reims-util's files, each
+/// renamed `NAME.old-N`). One a process still runs stays where Windows refuses to delete it (as
+/// NTFS does), for a later start. Other files stay.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn remove_set_aside(bin: &Path) {
+    const PROGRAMS: [&str; 2] = ["reims-ctl.exe", "reims-util.exe"];
+    let Ok(entries) = std::fs::read_dir(bin) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let set_aside = name.to_str().is_some_and(|name| {
+            PROGRAMS.iter().any(|&p| {
+                name.strip_prefix(p)
+                    .and_then(|n| n.strip_prefix(".old-"))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        });
+        if set_aside {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 /// The binary to run after an update, from the path this process was started from
-/// (`std::env::current_exe`). The update installs the new reims-ctl over that path (cargo install
-/// --force writes it anew), so it names the new binary. On Linux the path is read from
-/// /proc/self/exe, which names a file replaced since as "PATH (deleted)": PATH is the new one.
+/// (`std::env::current_exe`), read before the update, which on Windows renames this running
+/// binary aside ([`remove_set_aside`]). The update installs the new reims-ctl over that path
+/// (cargo install --force writes it anew), so it names the new binary. On Linux the path is read
+/// from /proc/self/exe, which names a file replaced since as "PATH (deleted)": PATH is the new
+/// one.
 pub fn restart_path(exe: PathBuf) -> PathBuf {
     if exe.exists() {
         return exe;
@@ -290,6 +323,44 @@ mod tests {
         std::fs::write(&named, "").unwrap();
         assert_eq!(restart_path(named.clone()), named);
         assert_eq!(restart_path(d.join("gone")), d.join("gone"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A start removes what the installer set aside, reims-ctl's and reims-util's `NAME.old-N`,
+    /// and leaves the programs themselves and every other file, a near name's among them.
+    #[test]
+    fn a_start_removes_the_programs_the_installer_set_aside() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-set-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let gone = [
+            "reims-ctl.exe.old-0",
+            "reims-ctl.exe.old-12",
+            "reims-util.exe.old-3",
+        ];
+        let kept = [
+            "reims-ctl.exe",
+            "reims-util.exe",
+            "reims-ctl.exe.old-",
+            "reims-ctl.exe.old-1x",
+            "reims-ctl.old-0",
+            "qemu.exe.old-0",
+            "reims-ctl.exe.old-0.txt",
+        ];
+        for n in gone.iter().chain(&kept) {
+            std::fs::write(d.join(n), n).unwrap();
+        }
+        remove_set_aside(&d);
+        let mut left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut want: Vec<_> = kept.iter().map(|n| n.to_string()).collect();
+        want.sort();
+        assert_eq!(left, want);
+        // A directory that is not there is no error.
+        remove_set_aside(&d.join("none"));
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -95,11 +95,11 @@ fn stop_restores() {
 /// one, or the same where the install was already up to date.
 fn run_update(channel: Option<Channel>) -> Result<()> {
     println!("Updating reims-ctl and its QEMU…\n");
+    let exe = update::restart_path(std::env::current_exe()?);
     match update::update(channel)? {
         update::Outcome::Updated => println!("\nUpdated. Starting the new reims-ctl…"),
         update::Outcome::Current => println!("\nStarting reims-ctl again…"),
     }
-    let exe = update::restart_path(std::env::current_exe()?);
     let err = crate::os::exec(std::process::Command::new(&exe));
     Err(err).with_context(|| format!("run {}", exe.display()))
 }
