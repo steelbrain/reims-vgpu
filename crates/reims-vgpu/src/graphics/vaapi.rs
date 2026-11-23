@@ -81,9 +81,10 @@
 //!   (`Frame::write_to_guest`, the first way above) where the import check takes the surface's
 //!   layout and memory, else read back and copied by the CPU into the surface's pages. An HEVC
 //!   4:4:4 stream at 8 bits decodes where the driver's Main 4:4:4 decoder takes it
-//!   (`declines_4_4_4`) into XYUV surfaces, which the CPU reads back and splits into the
-//!   surface's two planes, luma and interleaved Cb and Cr (`444v` and `444f`); every other
-//!   stream that is not 4:2:0 is refused at its session's start.
+//!   (`declines_4_4_4`) into XYUV surfaces, split into the surface's two planes, luma and
+//!   interleaved Cb and Cr (`444v` and `444f`): on Linux by the runtime device's GPU where the
+//!   import check passed XYUV (`xyuv`), else read back and split by the CPU; every other stream
+//!   that is not 4:2:0 is refused at its session's start.
 //! - **VideoToolbox's paravirtual encoders** (`encode::VaGuestEncoder`, `super::vt`): an arm64
 //!   guest's encoder reads each source frame from the IOSurface its kext lent: written by the
 //!   runtime device's GPU from a buffer over its pages into an input of the encoder's, as an x86
@@ -146,6 +147,8 @@ use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, Stream};
 #[cfg(windows)]
 use super::drawn::DrawnTarget;
 #[cfg(unix)]
+use super::gather::GatherPipeline;
+#[cfg(unix)]
 use super::video_host::Failed;
 use super::video_host::{
     BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
@@ -159,6 +162,8 @@ mod fill;
 mod gpu_copy;
 #[cfg(windows)]
 mod rt_windows;
+#[cfg(unix)]
+mod xyuv;
 
 /// The backend's name in the session's log lines.
 const NAME: &str = "VA-API";
@@ -371,6 +376,10 @@ struct VaapiVideo<P: Platform> {
     /// The driver's HEVC Main 4:4:4 decoder, where it lists one: what VideoToolbox's sessions of
     /// 4:4:4 streams decode on ([`declines_4_4_4`]).
     hevc_4_4_4: Option<ConfigCapabilities>,
+    /// The kernel that writes VideoToolbox's 4:4:4 pictures into their surfaces (`xyuv`), made at
+    /// its first use and kept for the device's decoders.
+    #[cfg(unix)]
+    gathers: Arc<GatherPipeline<P>>,
 }
 
 impl<P: Platform> VaapiVideo<P> {
@@ -403,12 +412,13 @@ impl<P: Platform> VaapiVideo<P> {
         let writes_imports = display.import_writes();
         log::info!(
             "hardware video: {NAME} at {at}: {}, opened in {:.2} ms on thread {:?}; in place: NV12 \
-             {:?}, P010 {:?}",
+             {:?}, P010 {:?}, XYUV {:?}",
             display.vendor(),
             runtime.elapsed_since(started).as_secs_f64() * 1e3,
             std::thread::current().name().unwrap_or("unnamed"),
             writes_imports.nv12(),
             writes_imports.p010(),
+            writes_imports.xyuv(),
         );
         let imports = Arc::new(GuestWrites::new(&display));
         let targets = CacheTargets::new(
@@ -430,6 +440,8 @@ impl<P: Platform> VaapiVideo<P> {
             copies,
             targets,
             hevc_4_4_4,
+            #[cfg(unix)]
+            gathers: Arc::new(GatherPipeline::new(device)),
         })
     }
 
@@ -567,6 +579,10 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
             next_id: 0,
             imports: Arc::clone(&self.imports),
             said: Vec::new(),
+            #[cfg(unix)]
+            gathers: xyuv::route(&self.writes_imports, &self.gathers, self.display.runtime()),
+            #[cfg(windows)]
+            _platform: std::marker::PhantomData,
         }))
     }
 }
@@ -1323,17 +1339,24 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
 /// A decoder of VideoToolbox's paravirtual path ([`GuestDecoder`]), whose pictures land in the
 /// surface the guest lent: written there by the driver's video processing where its import check
 /// takes the surface's layout and memory (the module doc's first way, `Frame::write_to_guest`),
-/// else read back and copied by the CPU into the surface's pages.
-struct VaGuestDecoder {
+/// a 4:4:4 one by the runtime device's GPU where the check passed XYUV (`xyuv`), else read back
+/// and copied by the CPU into the surface's pages.
+struct VaGuestDecoder<P: Platform> {
     codec: Codec,
     /// The id the next access unit is tagged with.
     next_id: u64,
     imports: Arc<GuestWrites>,
     /// The reasons its pictures were copied by the CPU, each logged once.
     said: Vec<String>,
+    /// Its 4:4:4 pictures' way into their surfaces by the GPU (`xyuv::route`); `Err` says why
+    /// there is none, or why it ended.
+    #[cfg(unix)]
+    gathers: Result<xyuv::XyuvGathers<P>, String>,
+    #[cfg(windows)]
+    _platform: std::marker::PhantomData<fn() -> P>,
 }
 
-impl VaGuestDecoder {
+impl<P: Platform> VaGuestDecoder<P> {
     /// The frames of `bytes`, in decode order.
     fn frames(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, VideoError> {
         let id = self.next_id;
@@ -1357,7 +1380,7 @@ impl VaGuestDecoder {
     }
 }
 
-impl<P: Platform> GuestDecoder<P> for VaGuestDecoder {
+impl<P: Platform> GuestDecoder<P> for VaGuestDecoder<P> {
     fn decode(
         &mut self,
         parameter_sets: &[u8],
@@ -1365,6 +1388,12 @@ impl<P: Platform> GuestDecoder<P> for VaGuestDecoder {
         output: &GuestOutput<'_, P>,
     ) -> Result<bool, VideoError> {
         self.land(parameter_sets, au, output, None)
+    }
+
+    /// Where the display's import check passed XYUV, and the route has not ended (`xyuv`).
+    #[cfg(unix)]
+    fn lands_4_4_4_by_gpu(&self) -> bool {
+        (self.gathers.as_ref()).is_ok_and(xyuv::XyuvGathers::takes_pictures)
     }
 
     /// The crop narrows to the region, which then lands as a whole picture does, by the driver's
@@ -1384,10 +1413,10 @@ impl<P: Platform> GuestDecoder<P> for VaGuestDecoder {
     }
 }
 
-impl VaGuestDecoder {
+impl<P: Platform> VaGuestDecoder<P> {
     /// Decodes `au` after `parameter_sets`, and lands its picture, or `region` of it (`x`, `y`,
     /// `width`, `height`), in `output`.
-    fn land<P: Platform>(
+    fn land(
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
@@ -1418,8 +1447,8 @@ impl VaGuestDecoder {
                 .crop_within(x, y, width, height)
                 .map_err(video_error)?;
         }
-        // A 4:4:4 stream's pictures are XYUV, which the CPU splits into the surface's two
-        // planes; a 4:2:0 one's are NV12 or P010, which land as they are.
+        // A 4:4:4 stream's pictures are XYUV, which the GPU or the CPU splits into the surface's
+        // two planes; a 4:2:0 one's are NV12 or P010, which land as they are.
         let four_four_four = frame.is_4_4_4();
         let format = output.layout.pixel_format;
         if PixelFormat::from_fourcc(format).is_some_and(PixelFormat::is_4_4_4) != four_four_four {
@@ -1429,7 +1458,10 @@ impl VaGuestDecoder {
             )));
         }
         let declined = if four_four_four {
-            "a 4:4:4 picture's XYUV samples into two planes".to_owned()
+            match self.gather(&frame, output)? {
+                Ok(()) => return Ok(true),
+                Err(why) => format!("a 4:4:4 picture's XYUV samples into two planes: {why}"),
+            }
         } else {
             match GuestTarget::new(&output.layout, output.memory) {
                 Ok(target) => match frame.write_to_guest(&target, &self.imports) {
@@ -1503,6 +1535,37 @@ impl VaGuestDecoder {
         .map_err(video_error)?;
         drop(view);
         Ok(true)
+    }
+
+    /// Writes `frame`, a 4:4:4 one, into `output`'s surface by the GPU (`xyuv`). The outer `Err`
+    /// is the frame's; the inner says why it was not written so, for the CPU's split.
+    #[cfg(unix)]
+    fn gather(
+        &mut self,
+        frame: &Frame,
+        output: &GuestOutput<'_, P>,
+    ) -> Result<Result<(), String>, VideoError> {
+        let route = match &mut self.gathers {
+            Ok(route) => route,
+            Err(why) => return Ok(Err(why.clone())),
+        };
+        let planes = match GuestTarget::new(&output.layout, output.memory) {
+            Ok(target) => target.planes(),
+            Err(why) => return Ok(Err(why)),
+        };
+        let gathered = (route.land(frame, &self.imports, &planes, output.buffer))
+            .map_err(video_error)?;
+        Ok(gathered.written())
+    }
+
+    /// On Windows, which makes no dma-buf of the driver's to write: the CPU splits each picture.
+    #[cfg(windows)]
+    fn gather(
+        &mut self,
+        _frame: &Frame,
+        _output: &GuestOutput<'_, P>,
+    ) -> Result<Result<(), String>, VideoError> {
+        Ok(Err("this host makes no dma-buf".to_owned()))
     }
 }
 

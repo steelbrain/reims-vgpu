@@ -489,7 +489,7 @@ fn a_picture_copied_by_the_gpu_from_its_scratch_is_the_cpus_copy() {
             pictures += 1;
             true
         };
-        let refused = each_picture(&display, &streams, PICTURES, &mut each);
+        let refused = each_picture(&display, &streams, PICTURES, false, &mut each);
         eprintln!(
             "{pictures} pictures of {} streams copied by the GPU as by the CPU; declined: \
              {declined:?}; refused: {refused:?}",

@@ -629,7 +629,7 @@ fn a_picture_written_into_a_dma_buf_cache_by_video_processing_is_the_cpus_copy()
             pictures += 1;
             true
         };
-        let refused = each_picture(&display, &streams, PICTURES, &mut each);
+        let refused = each_picture(&display, &streams, PICTURES, false, &mut each);
         eprintln!(
             "{pictures} pictures of {} streams written into dma-buf caches as by the CPU; \
              declined: {declined:?}; refused: {refused:?}",
@@ -821,7 +821,7 @@ fn a_picture_written_into_a_dma_buf_caches_surface_by_video_processing_is_the_cp
             pictures += 1;
             true
         };
-        let refused = each_picture(&display, &streams, PICTURES, &mut each);
+        let refused = each_picture(&display, &streams, PICTURES, false, &mut each);
         eprintln!(
             "{pictures} pictures of {} streams written into dma-buf caches' surfaces as by the \
              CPU; declined: {declined:?}; refused: {refused:?}",
@@ -853,12 +853,14 @@ pub(super) fn va_streams() -> Vec<std::path::PathBuf> {
 
 /// Decodes each of `streams` on `display`, in decode order, and hands each frame to `each` with
 /// its stream and its access unit's id, until `each` answered `true` (written) for `most` of the
-/// stream's frames or the stream ends. A stream the decoder refuses is left at its refusal, which
-/// is answered.
+/// stream's frames or the stream ends. With `four_four_four`, an HEVC decoder decodes 4:4:4
+/// streams too (`HevcDecoder::lands_4_4_4`). A stream the decoder refuses is left at its refusal,
+/// which is answered.
 pub(super) fn each_picture(
     display: &Display,
     streams: &[std::path::PathBuf],
     most: usize,
+    four_four_four: bool,
     each: &mut dyn FnMut(&std::path::Path, u64, &Frame) -> bool,
 ) -> Vec<String> {
     use reims_vgpu_video::codec::{h264, hevc};
@@ -867,7 +869,10 @@ pub(super) fn each_picture(
     for stream in streams {
         let file = std::fs::read(stream).expect("a stream");
         let (units, mut decoder) = if stream.to_string_lossy().ends_with(".265") {
-            let decoder = HevcDecoder::new_annex_b(display);
+            let mut decoder = HevcDecoder::new_annex_b(display);
+            if four_four_four {
+                decoder.lands_4_4_4();
+            }
             (hevc::nal::access_units(&file), Codec::Hevc(decoder))
         } else {
             let decoder = H264Decoder::new_annex_b(display);
