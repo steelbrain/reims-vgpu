@@ -922,7 +922,7 @@ impl From<rt::Error> for Unopened {
 }
 
 /// Makes the process's rt device (the module's docs), on a host of pages of `page_size` bytes,
-/// and logs it.
+/// and logs it, then the answers rt chose its forms on there ([`RtForms`]).
 pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     let instance = crate::os::rt_instance(&crate::os::rt_instance_extensions())?;
     let listed = instance.physical_devices()?;
@@ -1037,6 +1037,11 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         instance.extensions(),
         device.extensions()
     );
+    log::info!(
+        target: TARGET,
+        "{}",
+        RtForms::of(floor, &device, facts.unified_memory)
+    );
     let caps = answers::caps(&facts);
     let gpu = format!(
         "{} ({:04x}:{:04x})",
@@ -1063,6 +1068,72 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         loss,
         stage_fills,
     }))
+}
+
+/// The answers on which rt chose between its forms on a device, which [`open`] logs after the
+/// device's line, so that a log tells which form a refusal met: `rt capabilities: <field>
+/// <value>, …; profile: max_compute_shared_memory_size <bytes>, push_window <bytes>, subgroups
+/// <its Debug>; unified_memory <bool>`. A diagnostic: the guest sees nothing of it.
+struct RtForms<'a> {
+    /// rt's floor answers (`PhysicalDevice::check`), each by its field's name.
+    floor: [(&'static str, bool); 10],
+    /// The translator's profile's `limits().max_compute_shared_memory_size`.
+    max_compute_shared_memory_size: u32,
+    /// The profile's `push_window()`.
+    push_window: u32,
+    /// The profile's `subgroups()`.
+    subgroups: &'a dyn std::fmt::Debug,
+    /// rt's `has_unified_memory()`.
+    unified_memory: bool,
+}
+
+impl<'a> RtForms<'a> {
+    /// The answers of `device`, of rt's floor answers `floor`, whose `has_unified_memory()` is
+    /// `unified_memory`: read from what rt keeps, with no call into the driver.
+    fn of(floor: &rt::floor::Capabilities, device: &'a rt::Device, unified_memory: bool) -> Self {
+        // Each name is its field's, so the line says the name rt's code reads.
+        macro_rules! named {
+            ($($field:ident),*) => { [$((stringify!($field), floor.$field)),*] };
+        }
+        let profile = device.translator().profile();
+        RtForms {
+            floor: named!(
+                float16,
+                storage_read_without_format,
+                buffer_int64_atomics,
+                shared_int64_atomics,
+                float64,
+                maximal_reconvergence,
+                subgroup_uniform_control_flow,
+                texel_offset_operand,
+                attachment_reads,
+                feedback_loop
+            ),
+            max_compute_shared_memory_size: profile.limits().max_compute_shared_memory_size,
+            push_window: profile.push_window(),
+            subgroups: profile.subgroups(),
+            unified_memory,
+        }
+    }
+}
+
+impl std::fmt::Display for RtForms<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("rt capabilities: ")?;
+        for (at, (name, value)) in self.floor.iter().enumerate() {
+            let comma = if at == 0 { "" } else { ", " };
+            write!(f, "{comma}{name} {value}")?;
+        }
+        write!(
+            f,
+            "; profile: max_compute_shared_memory_size {}, push_window {}, subgroups {:?}; \
+             unified_memory {}",
+            self.max_compute_shared_memory_size,
+            self.push_window,
+            self.subgroups,
+            self.unified_memory
+        )
+    }
 }
 
 /// The options a device on `physical`, one of `instance`'s, is opened with both in the VM's
@@ -2130,6 +2201,39 @@ mod tests {
         let ceiling = crate::os::compile_helper::Limits::of_host().memory;
         assert_ne!(ceiling, 0);
         assert_eq!(options.stage_memory_ceiling, ceiling);
+    }
+
+    /// The line of the answers rt chose its forms on gives each floor answer by its name, in
+    /// order, then the profile's, then whether memory is unified, on one line.
+    #[test]
+    fn the_forms_line_names_each_answer() {
+        let forms = RtForms {
+            floor: [
+                ("float16", true),
+                ("storage_read_without_format", false),
+                ("buffer_int64_atomics", true),
+                ("shared_int64_atomics", false),
+                ("float64", true),
+                ("maximal_reconvergence", false),
+                ("subgroup_uniform_control_flow", true),
+                ("texel_offset_operand", false),
+                ("attachment_reads", true),
+                ("feedback_loop", false),
+            ],
+            max_compute_shared_memory_size: 65536,
+            push_window: 256,
+            subgroups: &[32_u32, 64],
+            unified_memory: false,
+        };
+        assert_eq!(
+            forms.to_string(),
+            "rt capabilities: float16 true, storage_read_without_format false, \
+             buffer_int64_atomics true, shared_int64_atomics false, float64 true, \
+             maximal_reconvergence false, subgroup_uniform_control_flow true, \
+             texel_offset_operand false, attachment_reads true, feedback_loop false; profile: \
+             max_compute_shared_memory_size 65536, push_window 256, subgroups [32, 64]; \
+             unified_memory false"
+        );
     }
 
     /// Only Vulkan's `INTEGRATED_GPU` is an integrated GPU: a discrete, virtual, CPU or other
