@@ -21,7 +21,7 @@ crate's tests run strict.
 
 Where the device computes a value, the value is the device's. The bounds below were measured
 before the platform ran on rt, on the drivers each names, against Metal's answers; none has been
-measured again on rt.
+measured again on rt, except a row that names its rt run.
 
 | The device's answer | Bound against Metal's |
 |---|---|
@@ -36,6 +36,7 @@ measured again on rt.
 | The device's decode of a 16-bit float texel (`R16Float`, `RG16Float`, `RGBA16Float`, `RGBX16Float`) that a `half` or `float` read answers | a NaN texel reads as the decode's NaN, where Metal hands back the texel's own code; RADV's reads keep the texel's bits; every other value the texel's |
 | The device's lines at width 1, which cover the pixel the driver chooses where a line runs through a vertex two pixels' diamonds share, as Vulkan's open diamond leaves it | such a pixel, and the rest of a line that runs along such vertices, a row or a column from Metal's lower pixel: NVIDIA covers the other pixel, lavapipe leaves out a strip's first pixel where it starts on one; RADV and ANV not measured |
 | The device's `AVERAGE` resolve of a multisampled colour attachment whose format has Metal's resolve rule | at 2 and 4 samples a unorm, snorm or packed 16-bit channel within one code of Metal's and an sRGB one within two (NVIDIA at 4 samples; one elsewhere) on RADV, ANV, NVIDIA and lavapipe, each rounding an 8-bit tie down; a float channel in its last bits, unbounded; wholly at a NaN or infinite sample |
+| The device's copy of 32-bit float depth values into a `Depth32Float` texture or `Depth32Float_Stencil8`'s depth (`replaceRegion:`, a Managed texture's upload, a blit copy from a buffer), rt's static note `PrecisionNote::RestrictedDepthUpload` | within [0, 1] exact, but a device may store a denormal or -0.0 as +0.0; outside [0, 1] the device's: RADV and ANV (Mesa 26.2.6, the 780M and Iris Xe) clamp to [0, 1] and store a NaN as +0.0, NVIDIA (620.70.06, the RTX 3090) keeps every bit, and a comparison reads what was stored; Metal keeps all 16 probe values bit for bit and compares them unclamped (M3 Max, Radeon Pro 5300M, UHD 630); measured on rt by metal2vulkan at 64be1d50ae |
 
 ## What the platform has not built, and what rt refuses
 

@@ -8,9 +8,12 @@
 //! - **A plane's copy**: a copy between a buffer and a texture of the blit option of one plane
 //!   (`MTLBlitOptionDepthFromDepthStencil`, `MTLBlitOptionStencilFromDepthStencil`) is rt's copy
 //!   of that aspect alone, 4 bytes a texel of `Depth32Float_Stencil8`'s depth and 1 of a stencil.
-//!   rt refuses a copy into a 32-bit float depth (`Gap::FloatDepthUpload`), and a plane option of
-//!   a format without its aspect, no option of a format of depth and stencil both and a plane
-//!   option of a multisample texture (`Gap::TextureBytes`), each counted (`rt-refused-gap`).
+//!   A copy into a 32-bit float depth is the device's copy into the depth aspect, under rt's
+//!   static note `PrecisionNote::RestrictedDepthUpload`: a value within [0, 1] is kept exactly,
+//!   except that a device may store a denormal or -0.0 as +0.0, and a value outside [0, 1] is the
+//!   device's, where Metal keeps it. rt refuses a plane option of a format without its aspect, no
+//!   option of a format of depth and stencil both and a plane option of a multisample texture
+//!   (`Gap::TextureBytes`), each counted (`rt-refused-gap`).
 //! - **`synchronizeTexture:slice:level:`** synchronizes the whole texture, rt's one form: the
 //!   other slices' and levels' bytes the host reads take the GPU's too, which for a Managed
 //!   texture whose host writes reached the GPU (`replaceRegion`, `didModifyRange`) are the
