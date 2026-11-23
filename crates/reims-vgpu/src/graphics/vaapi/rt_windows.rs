@@ -200,9 +200,24 @@ impl RtCopier {
         luma: &DrawnTarget<RtPlatform>,
         chroma: &DrawnTarget<RtPlatform>,
     ) -> String {
+        let sample = if frame.bit_depth() > 8 { 2 } else { 1 };
+        let decoded = read_decode(frame, sample);
+        self.read_drawn(&decoded, frame, profile, luma, chroma)
+    }
+
+    /// [`Self::read`]'s reads after the decode's, `decoded`, in order: the planes by the device's
+    /// blit, the targets by the Direct3D 11 device and the planes by the blit again, in their line
+    /// with `decoded`.
+    fn read_drawn(
+        &self,
+        decoded: &drawn_check::Read,
+        frame: &Frame,
+        profile: Option<Profile>,
+        luma: &DrawnTarget<RtPlatform>,
+        chroma: &DrawnTarget<RtPlatform>,
+    ) -> String {
         let ten_bit = frame.bit_depth() > 8;
         let sample: u64 = if ten_bit { 2 } else { 1 };
-        let decoded = read_decode(frame, sample.to_usize());
         let blit = || -> drawn_check::Read {
             let reader = (*self.reader).as_ref().map_err(Clone::clone)?;
             let plane = |target: &DrawnTarget<RtPlatform>, texel: u64| {
@@ -231,7 +246,7 @@ impl RtCopier {
             frame.height(),
             frame.bit_depth(),
         );
-        drawn_check::reads_line(&picture, ten_bit, [&decoded, &d3d, &before, &after])
+        drawn_check::reads_line(&picture, ten_bit, [decoded, &d3d, &before, &after])
     }
 }
 
@@ -607,5 +622,120 @@ mod tests {
             assert_eq!(declined(), DeviceWrite::Declined(WHY.to_owned()));
             assert_eq!(counted(), before + n);
         }
+    }
+
+    /// The reads of a real picture (module doc) show a texel that differs between two of them:
+    /// the first picture of the H.264 stream `RVG_VA_H264` names, drawn into targets of its crop
+    /// imported as a cache's are, read by the CPU (`read_decode`), and then one luma texel planted
+    /// in the targets, by a draw of its block of the picture's own samples with that one changed,
+    /// before the other reads (`RtCopier::read_drawn`). The line counts that texel, its box and
+    /// both its values in the decode against Direct3D, and no texel in the other pairs or in the
+    /// chroma. Run holding the GPU, on vaon12 on the rt device's adapter.
+    #[test]
+    #[ignore = "needs vaon12 on the rt device's GPU and RVG_VA_H264: run on the Windows host"]
+    fn a_texel_planted_after_the_decodes_read_differs_between_the_decode_and_direct3d_alone() {
+        use reims_vgpu_video::codec::h264::nal;
+        use reims_vgpu_video::core::device_memory::MemoryLife;
+        use reims_vgpu_video::vaapi::{Display, H264Decoder};
+
+        use crate::graphics::drawn::DrawnPlanes;
+
+        /// The plant's block, from the targets' first texel, in luma samples each way.
+        const BLOCK: usize = 16;
+        /// The planted luma texel's column and row.
+        const AT: (usize, usize) = (9, 6);
+
+        let platform = Arc::new(RtPlatform::new());
+        crate::entry::run(|_| {
+            let device = platform.system_default_device().expect("an rt device");
+            let luid = device.host_gpu().luid.expect("the device's DXGI adapter");
+            let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+            let display = Display::open_adapter(Some(luid), runtime).expect("a VA display");
+            let path = std::env::var_os("RVG_VA_H264").expect("RVG_VA_H264: an Annex B stream");
+            let file = std::fs::read(&path).expect("the stream");
+            let mut decoder = H264Decoder::new_annex_b(&display);
+            let mut frames = Vec::new();
+            for (id, unit) in (0u64..).zip(nal::access_units(&file)) {
+                frames.extend(decoder.decode(unit, id).expect("a decode"));
+                if !frames.is_empty() {
+                    break;
+                }
+            }
+            if frames.is_empty() {
+                frames.extend(decoder.flush().expect("the flush"));
+            }
+            let frame = frames.first().expect("a picture");
+            let ten_bit = frame.bit_depth() > 8;
+            let sample = if ten_bit { 2 } else { 1 };
+            let (width, height) = (frame.width().to_usize(), frame.height().to_usize());
+            assert!(width >= BLOCK && height >= BLOCK, "a picture of {width}x{height}");
+
+            let draw = Arc::new(PlaneDraw::new(Some(luid)).expect("the plane draws"));
+            let size = (frame.width(), frame.height());
+            let planes = Arc::new(DrawnPlanes::new(&draw, size, ten_bit).expect("the targets"));
+            let descs = crate::graphics::decode::drawn_planes(planes.targets());
+            let made = (device.import_d3d11_surface(OnFault::Return, &descs))
+                .expect("no raise")
+                .expect("a surface over the targets");
+            let life = MemoryLife::new();
+            let target = |n: usize| DrawnTarget::<RtPlatform> {
+                memory: Arc::clone(&made.memory),
+                planes: Arc::clone(&planes),
+                identity: life.identity(),
+                texture: made.planes[n].clone_ref(),
+            };
+            let (luma, chroma) = (target(0), target(1));
+            (planes.draw(frame, &mut || {})).expect("the picture's draw");
+
+            let decoded = read_decode(frame, sample);
+            let [(y_bytes, _), (uv_bytes, _)] = decoded.as_ref().expect("the decode's read");
+            let rows = |bytes: &[u8], row: usize, take: usize, n: usize| -> Vec<u8> {
+                (0..n)
+                    .flat_map(|y| bytes[y * row..y * row + take].iter().copied())
+                    .collect()
+            };
+            let block_luma = rows(y_bytes, width * sample, BLOCK * sample, BLOCK);
+            let block_chroma = rows(
+                uv_bytes,
+                width.div_ceil(2) * 2 * sample,
+                BLOCK * sample,
+                BLOCK / 2,
+            );
+            let mut planted = block_luma.clone();
+            let at = (AT.1 * BLOCK + AT.0) * sample;
+            // The sample's top bit, which a P010 sample holds too.
+            planted[at + sample - 1] ^= 0x80;
+            let texel = |bytes: &[u8]| {
+                let mut word = [0; 4];
+                word[..sample].copy_from_slice(&bytes[at..at + sample]);
+                u32::from_le_bytes(word)
+            };
+            let (was, now) = (texel(&block_luma), texel(&planted));
+            let block = u32::try_from(BLOCK).expect("a block");
+            let picture = (draw.picture((block, block), ten_bit, [&planted, &block_chroma]))
+                .expect("the plant's picture");
+            (draw.draw(&picture, (0, 0), planes.targets(), (block, block)))
+                .expect("the plant's draw");
+            (made.memory.external_writes_done()).expect("the writes said done");
+
+            let copier = RtCopier {
+                draw: Some(Arc::clone(&draw)),
+                reader: Arc::new(Reader::new(&device)),
+                drawn: 1,
+            };
+            let line = copier.read_drawn(&decoded, frame, decoder.profile(), &luma, &chroma);
+            eprintln!("rt_windows: the reads' line: {line}");
+            let n = width * height;
+            let c = width.div_ceil(2) * height.div_ceil(2);
+            let (x, y) = AT;
+            let want = format!(
+                "; luma: decode against Direct3D: 1 of {n} differ, in ({x}, {y})-({x}, {y}), \
+                 first ({x}, {y}) {was:#x}/{now:#x}, Direct3D against rt: 0 of {n} differ, rt \
+                 against rt again: 0 of {n} differ; chroma: decode against Direct3D: 0 of {c} \
+                 differ, Direct3D against rt: 0 of {c} differ, rt against rt again: 0 of {c} \
+                 differ; the decoded luma: "
+            );
+            assert!(line.contains(&want), "the line: {line}\nwanted in it: {want}");
+        });
     }
 }
