@@ -186,8 +186,8 @@ mod tests {
 
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_FUNCTION_TABLE_SET, RGFX_CMD_LIBRARY_CREATE, RGFX_LIBRARY_BYTES_OFFSET,
-        RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_PIPELINE_REFUSED, RgfxComputePipelineCreate,
-        RgfxLibraryCreate, RgfxLinkedFunction,
+        RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_PIPELINE_OK, RGFX_PIPELINE_REFUSED,
+        RgfxComputePipelineCreate, RgfxLibraryCreate, RgfxLinkedFunction,
     };
     use reims_vgpu_vulkan::core::platform::Handle as _;
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
@@ -468,29 +468,26 @@ mod tests {
         (answers, replies.lock().clone())
     }
 
-    /// On the rt platform the pipelines of kernels that call through the guest's visible function
-    /// tables are refused, each answered refused and counted under rt's code: `table_kernel`'s,
-    /// which reads an input rt's compute encoder does not supply yet (`rt-refused-gap`), and
-    /// `table_arg_kernel`'s, which holds its table in an argument buffer, a resource bound
-    /// through a descriptor, which rt's translator makes none of (`rt-refused-translation`). (On
-    /// the AMD Radeon Pro 5300M they call the functions their pipelines link through a table the
-    /// guest made and set, bound at a buffer index or held by its resource id in an argument
-    /// buffer: measured, macOS 26.7.1, oracle_fnptr, 11 22 13 26 15 16 and, with useResource:,
-    /// 20 12 24 14 28 30.)
+    /// On the rt platform the pipeline of a kernel that calls through a visible function table
+    /// the encoder binds at a buffer index is made: `table_kernel`'s, linking the functions the
+    /// guest's tables would hold. The pipeline of a kernel that holds its table in an argument
+    /// buffer is refused, answered refused and counted under rt's code: `table_arg_kernel`'s,
+    /// a resource bound through a descriptor, which rt's translator makes none of
+    /// (`rt-refused-translation`). (On the AMD Radeon Pro 5300M both call the functions their
+    /// pipelines link through a table the guest made and set, bound at a buffer index or held by
+    /// its resource id in an argument buffer: measured, macOS 26.7.1, oracle_fnptr, 11 22 13 26
+    /// 15 16 and, with useResource:, 20 12 24 14 28 30.)
     #[test]
-    fn on_vulkan_rt_refuses_the_kernels_that_call_through_the_guest_s_tables() {
+    fn on_vulkan_rt_makes_a_table_kernel_and_refuses_one_holding_its_table_in_an_argument_buffer() {
         let counted = || ["rt-refused-gap", "rt-refused-translation"].map(crate::platform::counted);
         let before = counted();
         let (answers, replies) = table_pipelines::<reims_vgpu_vulkan::RtPlatform>();
-        assert_eq!(
-            answers,
-            [Err(DecodeError::Refused), Err(DecodeError::Refused)]
-        );
+        assert_eq!(answers, [Ok(()), Err(DecodeError::Refused)]);
         assert_eq!(
             replies,
-            [(100, RGFX_PIPELINE_REFUSED), (101, RGFX_PIPELINE_REFUSED)]
+            [(100, RGFX_PIPELINE_OK), (101, RGFX_PIPELINE_REFUSED)]
         );
         let after = counted();
-        assert_eq!([after[0] - before[0], after[1] - before[1]], [1, 1]);
+        assert_eq!([after[0] - before[0], after[1] - before[1]], [0, 1]);
     }
 }

@@ -1101,8 +1101,10 @@ mod tests {
         assert_eq!(read(&stencil_out, 16), written);
         assert_eq!((counted(gap), counted(unbuilt)), before);
 
-        // A depth in, and PVRTC rows: nothing copied, counted.
-        let depth_in = buffer(&[0; 64]);
+        // A depth in, the device's copy into the depth plane (a value within [0, 1] kept exactly
+        // on every device); then PVRTC rows: not copied, counted.
+        let half: Vec<u8> = (0..16).flat_map(|_| 0.5f32.to_le_bytes()).collect();
+        let depth_in = buffer(&half);
         let (depth_out, stencil_out) = (buffer(&[0xee; 64]), buffer(&[0xee; 16]));
         let cmds = vec![
             plane(true, &depth_in, &both, depth),
@@ -1111,12 +1113,9 @@ mod tests {
             plane(false, &stencil_out, &both, stencil),
         ];
         assert_eq!(blit(&queue, cmds), done);
-        assert_eq!(read(&depth_out, 64), quarter);
+        assert_eq!(read(&depth_out, 64), half);
         assert_eq!(read(&stencil_out, 16), written);
-        assert_eq!(
-            (counted(gap), counted(unbuilt)),
-            (before.0 + 1, before.1 + 1)
-        );
+        assert_eq!((counted(gap), counted(unbuilt)), (before.0, before.1 + 1));
     }
 
     /// Blits on the GPU the test holds: buffer fills, a pattern of one byte value among them,
