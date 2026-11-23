@@ -50,6 +50,18 @@
 //! stays dark and WindowServer waits on the GPU for good. Without S3, macOS's sleep stops at a
 //! dark wake, from which input wakes the display (docs/qemu.md).
 //!
+//! While the installer is attached, the system disk drops the guest's flushes (`cache.no-flush=on`,
+//! which with QEMU's other cache settings at their defaults is its `cache=unsafe`). An install
+//! writes a whole system and syncs it as it goes, and each guest flush is a flush of the image file
+//! to the host's disk (`fdatasync` on Linux, `FlushFileBuffers` on Windows), which the write waits
+//! behind. The writes still reach the image file as they come, and the host's OS writes them to its
+//! disk in its own time. A host crash or power loss while the installer is attached can damage the
+//! system disk, and the install then starts over. `reims-ctl eject` takes the installer out at the
+//! VM's next start, and from that start the guest's flushes reach the host's disk again. Measured
+//! with `qemu-img bench` on a new 128 GiB qcow2 image as [`crate::create`] makes it, 512 MiB of 64
+//! KiB writes with a flush after each MiB (2026-11-22): on Windows 11's NTFS, 3.7 s with the
+//! flushes against 0.37 s without; on Linux's btrfs (`compress=zstd:1`), 2.4 s against 0.09 s.
+//!
 //! A VM's graphics ([`Graphics`]) are one of two, each at slot 4 with the id `gfx`, which the
 //! terminal viewer's screendumps name:
 //! - reims-vgpu's own GPU device, `reims-graphics-pci`, with the option ROM reims-ctl carries as
@@ -336,11 +348,16 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         ),
     ]);
     push(&["-device", "ide-hd,bus=sata.2,drive=opencore,bootindex=1"]);
-    let disk = format!(
+    let mut disk = format!(
         "id=disk,if=none,format={},file={}",
         c.disk_format.as_str(),
         optp(&vm.disk())
     );
+    // An install's flushes, which the module's doc measures, are dropped while the installer is
+    // attached.
+    if q.installer.is_some() {
+        disk.push_str(",cache.no-flush=on");
+    }
     match q.disk_controller {
         // `discard=unmap` passes the guest's TRIMs to the image, which frees their space. QEMU's
         // NVMe controller needs a serial, and without an address takes slot 3, virtio-net's.
@@ -1368,6 +1385,40 @@ mod tests {
         vm.config.q35.as_mut().unwrap().installer = Some("/isos/BaseSystem.img".into());
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
+    }
+
+    /// The system disk drops the guest's flushes while the installer is attached, on SATA and on
+    /// NVMe, and keeps them once it is ejected.
+    #[test]
+    fn the_disk_drops_flushes_only_while_the_installer_is_attached() {
+        let mut vm = q35_vm();
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(
+            &a,
+            &["-drive", "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2"]
+        ));
+        assert!(!a.iter().any(|x| x.contains("no-flush")), "{a:?}");
+        vm.config.q35.as_mut().unwrap().installer = Some("/isos/BaseSystem.img".into());
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(
+            &a,
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2,cache.no-flush=on"
+            ]
+        ));
+        // Only the system disk: the installer's overlay and OpenCore's image keep theirs.
+        assert_eq!(a.iter().filter(|x| x.contains("no-flush")).count(), 1, "{a:?}");
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Nvme;
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(
+            &a,
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2,cache.no-flush=on,\
+                 discard=unmap"
+            ]
+        ));
     }
 
     #[test]
