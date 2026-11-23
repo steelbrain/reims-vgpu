@@ -356,11 +356,13 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
         "pick Reinstall macOS"
     };
     let name = vm.name();
-    // Disk Utility names a disk by its model and "Media": ide-hd's model is QEMU HARDDISK, and
-    // QEMU's NVMe controller's QEMU NVMe Ctrl.
+    // Disk Utility names a disk by its model and "Media": ide-hd's model is QEMU HARDDISK,
+    // QEMU's NVMe controller's QEMU NVMe Ctrl, and on virtio-blk, which has no model, macOS's
+    // AppleVirtIO names the disk Apple Inc. VirtIO Block.
     let media = match q.disk_controller {
         DiskController::Ahci => "QEMU HARDDISK Media",
         DiskController::Nvme => "QEMU NVMe Ctrl Media",
+        DiskController::Virtio => "Apple Inc. VirtIO Block Media",
     };
     let network_off = if offline && vm.config.network.enabled {
         format!(
@@ -1665,7 +1667,8 @@ mod tests {
     }
 
     /// An x86-64 VM with an installer has install steps, which name the disk to erase as Disk
-    /// Utility names it on the disk's controller, and on NVMe install there as on SATA.
+    /// Utility names it on the disk's controller, and on NVMe and virtio install there as on
+    /// SATA.
     #[test]
     fn install_steps_name_the_disk_on_its_controller() {
         let config = r#"
@@ -1699,6 +1702,12 @@ mod tests {
             "{steps}"
         );
         assert!(!steps.contains("--disk-controller"), "{steps}");
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Virtio;
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.contains("erase it (Apple Inc. VirtIO Block Media) as APFS"),
+            "{steps}"
+        );
         vm.config.q35.as_mut().unwrap().installer = None;
         assert_eq!(install_steps(&vm), None);
     }

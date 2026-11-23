@@ -37,9 +37,9 @@
 //! interrupt transfers under GPU load and its input freezes, with the host's USB devices the VM's
 //! settings give it beside them ([`crate::usb`]); fixed PCI addresses (the AHCI controller, which
 //! holds OpenCore's image, the installer and, on SATA, the system disk, at slot 2, where
-//! OpenCore's boot entries name it; on NVMe, the system disk's controller at slot 10,
-//! [`DiskController`]); `isa-applesmc` with Apple's SMC key, [`OSK`];
-//! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs;
+//! OpenCore's boot entries name it; on NVMe, the system disk's controller at slot 10, and on
+//! virtio, its virtio-blk device at slot 6, [`DiskController`]); `isa-applesmc` with Apple's SMC
+//! key, [`OSK`]; VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs;
 //! `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
 //! crash's core takes the process tens of seconds to end. QEMU refuses the
 //! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`, and
@@ -372,6 +372,13 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             &disk,
             "-device",
             &format!("ide-hd,bus=sata.{},drive=disk,rotation_rate=1", q.disk_port),
+        ]),
+        // SATA's drive options, at the first slot no other device takes.
+        DiskController::Virtio => push(&[
+            "-drive",
+            &disk,
+            "-device",
+            "virtio-blk-pci,drive=disk,addr=0x6",
         ]),
     }
     // The installer, on port 4, past OpenCore's, or on 5 past an AHCI disk on 4.
@@ -1387,6 +1394,52 @@ mod tests {
         assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
     }
 
+    /// A disk moved to virtio is a virtio-blk device of its own, off the AHCI controller, with
+    /// SATA's drive options.
+    #[test]
+    fn a_disk_on_virtio_is_a_device_of_its_own() {
+        let mut vm = q35_vm();
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Virtio;
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(
+            &a,
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2",
+                "-device",
+                "virtio-blk-pci,drive=disk,addr=0x6",
+            ]
+        ));
+        assert!(
+            !a.iter().any(|x| x.ends_with("drive=disk,rotation_rate=1")),
+            "{a:?}"
+        );
+        // No other device takes its slot.
+        let mut slots: Vec<&str> = a
+            .iter()
+            .flat_map(|x| x.split(','))
+            .filter_map(|o| o.strip_prefix("addr="))
+            .collect();
+        assert!(slots.contains(&"0x6"), "{a:?}");
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n, "{a:?}");
+        // The installer stays on AHCI, on port 4, and the disk drops its flushes meanwhile.
+        vm.config.q35.as_mut().unwrap().installer = Some("/isos/BaseSystem.img".into());
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
+        assert!(has(
+            &a,
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2,cache.no-flush=on",
+                "-device",
+                "virtio-blk-pci,drive=disk,addr=0x6",
+            ]
+        ));
+    }
+
     /// The system disk drops the guest's flushes while the installer is attached, on SATA and on
     /// NVMe, and keeps them once it is ejected.
     #[test]
@@ -1447,6 +1500,13 @@ mod tests {
         q.disk_port = 4;
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(has(&a, &["-device", "ide-hd,bus=sata.5,drive=installer"]));
+        // On port 4 again where the disk is on a controller of its own, whatever its AHCI port.
+        for d in [DiskController::Nvme, DiskController::Virtio] {
+            vm.config.q35.as_mut().unwrap().disk_controller = d;
+            let a = invocation(&vm, &ctx(linux())).unwrap().args;
+            assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]), "{d:?}");
+        }
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Ahci;
         // The VM's copy of a DMG, in its directory.
         let q = vm.config.q35.as_mut().unwrap();
         q.installer = Some("installer.img".into());

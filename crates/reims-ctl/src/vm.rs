@@ -163,15 +163,25 @@ pub enum DiskController {
     /// An NVMe controller of its own, at slot 10. macOS's Recovery and installer find a new disk
     /// on it as on SATA, and an installed macOS finds its APFS container on either controller.
     Nvme,
+    /// A virtio-blk device of its own, at slot 6, which macOS's AppleVirtIO drives. An installed
+    /// macOS 26 starts from its APFS container there (docs/qemu.md, "x86-64 macOS guests: the
+    /// disk on virtio"); whether macOS 11 to 15 do, and whether macOS's Recovery and installer
+    /// find a new disk on it, was not checked.
+    Virtio,
 }
 
 impl DiskController {
-    pub const ALL: [DiskController; 2] = [DiskController::Ahci, DiskController::Nvme];
+    pub const ALL: [DiskController; 3] = [
+        DiskController::Ahci,
+        DiskController::Nvme,
+        DiskController::Virtio,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
             DiskController::Ahci => "ahci",
             DiskController::Nvme => "nvme",
+            DiskController::Virtio => "virtio",
         }
     }
 
@@ -179,6 +189,7 @@ impl DiskController {
         match self {
             DiskController::Ahci => "SATA",
             DiskController::Nvme => "NVMe",
+            DiskController::Virtio => "virtio",
         }
     }
 
@@ -186,7 +197,7 @@ impl DiskController {
         DiskController::ALL
             .into_iter()
             .find(|d| d.id() == s.trim())
-            .with_context(|| format!("the disk controller is ahci or nvme, not {s:?}"))
+            .with_context(|| format!("the disk controller is ahci, nvme or virtio, not {s:?}"))
     }
 
     fn is_ahci(&self) -> bool {
@@ -443,9 +454,9 @@ pub struct Q35 {
     #[serde(default = "default_cpu_flags")]
     pub cpu_flags: String,
     /// The system disk's controller: SATA for every VM reims-ctl makes, which its settings may
-    /// move to NVMe, before macOS is installed or after. OpenCore's saved boot entry names the
-    /// controller and the port, so after an installed VM's move an attached installer may boot
-    /// instead.
+    /// move to NVMe, before macOS is installed or after, or to virtio. OpenCore's saved boot
+    /// entry names the controller and the port, so after an installed VM's move an attached
+    /// installer may boot instead.
     #[serde(default, skip_serializing_if = "DiskController::is_ahci")]
     pub disk_controller: DiskController,
     /// The system disk's AHCI port, on [`DiskController::Ahci`]: 3, after OpenCore's 2.
@@ -1321,6 +1332,8 @@ pub(crate) mod tests {
             let q = toml::from_str::<VmConfig>(&named).unwrap().q35.unwrap();
             assert_eq!(q.disk_controller, d);
         }
+        let e = DiskController::parse("sata").unwrap_err().to_string();
+        assert!(e.contains("ahci, nvme or virtio"), "{e}");
     }
 
     /// What an older reims-ctl saved for apple-gfx alone (video acceleration, HiDPI and the

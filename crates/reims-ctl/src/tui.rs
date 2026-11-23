@@ -1823,9 +1823,10 @@ impl App {
                 "Disk controller",
                 options.to_vec(),
                 q.disk_controller.id(),
-                "SATA or NVMe: macOS's installers and macOS find the disk on either. Once macOS \
-                 is installed, eject the installer before a move, or OpenCore may start it \
-                 instead.",
+                "SATA, NVMe or virtio. macOS's installers and macOS find the disk on SATA or \
+                 NVMe. On virtio an installed macOS 26 starts; other releases and the installers \
+                 have not been tried there. Once macOS is installed, eject the installer before \
+                 a move, or OpenCore may start it instead.",
             ));
             fields.push(
                 Field::path(
@@ -2764,7 +2765,7 @@ of its own. A VM runs reims-vgpu's own GPU device unless its settings choose ano
   K           kill it: power it off at once
   e           edit its settings: CPUs, memory, displays, resolution, borderless, GPU,
               audio, network, logs, extra QEMU arguments (they apply at its next start), its
-              disk controller (SATA or NVMe), its installer image, its boot selection
+              disk controller (SATA, NVMe or virtio), its installer image, its boot selection
               (OpenCore's picker, which makes it a new OpenCore image) and
               graphics: reims-vgpu, its own GPU device, on one to four displays, each in a
               window whose size the guest follows, with the macOS drivers reims-ctl puts in
@@ -3671,6 +3672,14 @@ mod tests {
         let mut vm = vm_row("t").vm.unwrap();
         apply_edit(&mut vm, form(&app), None).unwrap();
         assert_eq!(vm.config.q35.unwrap().disk_controller, DiskController::Nvme);
+        // virtio is the next, and SATA again after it.
+        press(&mut app, [KeyCode::Right]);
+        assert_eq!(form(&app).choice("disk_controller"), "virtio");
+        let mut vm = vm_row("t").vm.unwrap();
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert_eq!(vm.config.q35.unwrap().disk_controller, DiskController::Virtio);
+        press(&mut app, [KeyCode::Right]);
+        assert_eq!(form(&app).choice("disk_controller"), "ahci");
     }
 
     /// A VM's edit form shows the resolution and borderless on reims-vgpu, and hides them on

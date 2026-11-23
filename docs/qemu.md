@@ -998,7 +998,7 @@ without one and wrote 14 MiB.
 `reims-ctl` gives a VM its system disk as an image file in the VM's
 directory (qcow2 for a new disk), on QEMU's defaults (`cache=writeback`,
 `aio=threads`), on AHCI unless the VM's settings choose NVMe, which adds
-`discard=unmap`. On AHCI
+`discard=unmap`, or virtio. On AHCI
 the guest's flush (FLUSH CACHE EXT) is not queued: an x86-64 macOS 26.7.2
 guest started no other disk command while one ran, over 1,069 to 1,368
 flushes a boot. On NVMe it went on reading and writing during its flushes
@@ -2101,8 +2101,8 @@ status port about 33,000 times a second until its timeout.
 ### x86-64 macOS guests: the disk on NVMe
 
 A VM whose settings choose NVMe has its system disk on QEMU's `nvme`
-device of its own at slot 10, with `discard=unmap` on its drive; every
-other VM has it on ICH9's AHCI controller (`crates/reims-ctl/src/qemu.rs`):
+device of its own at slot 10, with `discard=unmap` on its drive; a VM on
+SATA has it on ICH9's AHCI controller (`crates/reims-ctl/src/qemu.rs`):
 
 ```sh
 -drive id=disk,if=none,format=qcow2,file=disk.qcow2,discard=unmap \
@@ -2170,6 +2170,42 @@ disk"):
 **Unknown**: whether NVMe without `discard=unmap` waits as it does with it
 there, and how NVMe and AHCI compare on a host whose SSD shows no waits
 (`homelab-um870-1`'s, above).
+
+### x86-64 macOS guests: the disk on virtio
+
+A VM whose settings choose virtio has its system disk on QEMU's
+`virtio-blk-pci` device of its own at slot 6, the first slot no other device
+of the machine takes, with SATA's drive options: no `discard=unmap`, which
+the NVMe waits above follow, and no iothread. OpenCore's image and the
+installer stay on AHCI (`crates/reims-ctl/src/qemu.rs`):
+
+```sh
+-drive id=disk,if=none,format=qcow2,file=disk.qcow2 \
+-device virtio-blk-pci,drive=disk,addr=0x6
+```
+
+macOS's AppleVirtIO (`com.apple.driver.AppleVirtIO`) drives it as an
+`AppleVirtIOBlockStorageDevice`, a solid-state disk. Disk Utility names the
+disk `Apple Inc. VirtIO Block Media`, the name of its IOMedia and
+`diskutil info`'s Device / Media Name: virtio-blk has no model for the name
+to come from.
+
+**Measured** on 2026-11-23, with the guest set, option ROM, library and QEMU
+of `aed8655a6`, on the RTX 3090 of `homelab-um870-1` and 8 GiB of guest RAM:
+installed macOS 26.7.2 (25G332), booted from a `snapshot=on` overlay of its
+disk with the disk moved from SATA to virtio, answered SSH 15 s after QEMU
+started, as the same boot on SATA did (job m3-max-70320; neither a timing
+run), and presented its desktop on Metal 3 with ReimsGraphics loaded. It
+shut down from inside with QEMU exiting 0 and no fatal line (job
+m3-max-70333). Its `disk0` was the virtio disk (137.4 GB, internal, solid
+state), with the APFS container it started from on it. The guest's NVRAM
+still named the disk's SATA path as its boot device (`efi-boot-device-data`:
+`PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x3,0x0,0x0)/HD(2,GPT,…)`), and with no
+installer attached OpenCore started macOS from the virtio disk.
+
+**Unknown**: whether macOS 11 to 15 start from a disk on virtio, whether
+macOS's Recovery and installers find a new disk there, and how virtio's disk
+waits on btrfs compare with AHCI's and NVMe's.
 
 ### x86-64 macOS guests: VMware SVGA
 

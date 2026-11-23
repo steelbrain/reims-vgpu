@@ -512,8 +512,9 @@ pub struct SetArgs {
     /// macOS shows its desktop. VMware SVGA has one
     #[arg(long, value_name = "N")]
     pub displays: Option<u32>,
-    /// The system disk's controller: ahci (SATA) or nvme. Once macOS is installed, eject the
-    /// installer before a move, or OpenCore may start it
+    /// The system disk's controller: ahci (SATA), nvme or virtio (virtio-blk, tried with an
+    /// installed macOS 26 alone). Once macOS is installed, eject the installer before a move, or
+    /// OpenCore may start it
     #[arg(long)]
     pub disk_controller: Option<String>,
     /// The size each of reims-vgpu's windows opens at, WIDTHxHEIGHT in the desktop's points
