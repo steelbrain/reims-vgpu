@@ -285,8 +285,8 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// platform would otherwise share one between command queues, lest another queue's long command
     /// buffer hold theirs back. Made so: WindowServer's in the graphics lane
     /// (`RGFX_QUEUE_UNSHARED`), so that no other process's work queues on the GPU ahead of its
-    /// frames; and the host's own: a graphics display's window sink's and its mirror's, whose draws
-    /// and syncs are on a present's path; the IOSurface device caches' transfer queue, whose fills
+    /// frames; and the host's own: a graphics display's window sink's, whose draws are on a
+    /// present's path; the IOSurface device caches' transfer queue, whose fills
     /// a present of a surface and a frame drawn from a cache wait for; those caches' rounds' queue,
     /// on which the later rounds of a copy out longer than the two pieces it circulates go, each
     /// once the host has moved the round before it out of its piece; and the decoder's release
