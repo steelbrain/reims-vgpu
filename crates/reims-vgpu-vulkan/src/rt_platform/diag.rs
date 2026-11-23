@@ -47,6 +47,12 @@
 //!   into it (any thread but rt's own block maker), by the site in rt that made them (rt's
 //!   `SiteAllocations`, eight sites): for each, the calls, the bytes they asked for and the
 //!   longest call since the device was made; the site of the longest call comes first.
+//! - **Consumer allocations and block-maker waits.** rt's `vkAllocateMemory` calls on the
+//!   platform's threads, inside its calls into rt (rt's `consumer_allocations`): their count,
+//!   their milliseconds in all and the longest call since the device was made; and the calls that
+//!   waited for rt's block-maker thread to make one of the fixed-size internals it makes ahead
+//!   (the zero source, a parameter ring block or the staging region; rt's `maker_waits`), with
+//!   the longest wait since the device was made ([`allocations_line`]).
 //! - **Memory.** The textures rt cleared at their make and the bytes it cleared (rt's
 //!   `texture_clears`, `texture_clear_bytes`), and the Private memory it holds now, allocated and
 //!   idle, with its blocks (rt's `Gauges`): what a placed shape's image skips (`texture`, "Placed
@@ -1442,6 +1448,20 @@ fn timed_parts_line(m: &rt::Metrics) -> String {
     format!("reims-vgpu: rt-diag timed take parts: {}", all.join(", "))
 }
 
+/// The line of rt's consumer allocations and block-maker waits in `m` (the module's docs).
+fn allocations_line(m: &rt::Metrics) -> String {
+    let ms = |nanos: u64| nanos as f64 / 1e6;
+    format!(
+        "reims-vgpu: rt-diag consumer allocations: {} calls, {:.3} ms in all, longest {:.3} ms; \
+         block-maker waits {}, longest {:.3} ms",
+        m.consumer_allocations,
+        ms(m.consumer_allocation_nanos),
+        ms(m.consumer_allocation_max_nanos),
+        m.maker_waits,
+        ms(m.maker_wait_max_nanos),
+    )
+}
+
 /// The line of rt's pipeline makes in `m` (the module's docs, "rt's pipeline makes").
 fn pipelines_line(m: &rt::Metrics) -> String {
     let ms = |nanos: u64| nanos as f64 / 1e6;
@@ -2319,6 +2339,7 @@ pub fn write() {
             "reims-vgpu: rt-diag allocation sites, longest call first: {}",
             all.join(", ")
         );
+        let _ = writeln!(out, "{}", allocations_line(&m));
         let _ = writeln!(out, "{}", timed_parts_line(&m));
         let _ = writeln!(out, "{}", pipelines_line(&m));
         // The textures rt cleared at their make, which placed images skip
@@ -2943,6 +2964,28 @@ mod tests {
              0 over 5 ms longest 0.000 ms of 0 bytes, maker-makes 0 calls 0 over 5 ms longest \
              0.000 ms of 0 bytes, zero-writes 2 calls 0 over 5 ms longest 0.001 ms of 4096 bytes, \
              long-take-zero-writes 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes"
+        );
+    }
+
+    /// rt's consumer allocations' line gives their calls, their milliseconds in all and the
+    /// longest, and the block-maker waits with the longest.
+    #[test]
+    fn the_allocations_line_gives_consumer_allocations_and_maker_waits() {
+        let mut m = rt::Metrics::default();
+        m.consumer_allocations = 12;
+        m.consumer_allocation_nanos = 45_120_000;
+        m.consumer_allocation_max_nanos = 18_300_000;
+        m.maker_waits = 2;
+        m.maker_wait_max_nanos = 450_000;
+        assert_eq!(
+            allocations_line(&m),
+            "reims-vgpu: rt-diag consumer allocations: 12 calls, 45.120 ms in all, longest \
+             18.300 ms; block-maker waits 2, longest 0.450 ms"
+        );
+        assert_eq!(
+            allocations_line(&rt::Metrics::default()),
+            "reims-vgpu: rt-diag consumer allocations: 0 calls, 0.000 ms in all, longest 0.000 \
+             ms; block-maker waits 0, longest 0.000 ms"
         );
     }
 
