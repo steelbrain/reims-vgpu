@@ -1873,8 +1873,10 @@ Stages:
       4:4:4 format its `TDrs` names ('444v', '444f'), its Cb and Cr
       interleaved from NVDEC's three planes by the runtime device's GPU
       where CUDA imports the device's exportable buffers, else by the CPU,
-      and from VA-API's XYUV samples by the CPU (`graphics::nvidia`'s,
-      `graphics::gather`'s and `graphics::vaapi`'s module docs). A
+      and from VA-API's XYUV samples by the runtime device's GPU where the
+      display's import check passed XYUV, else by the CPU
+      (`graphics::nvidia`'s, `graphics::gather`'s, `graphics::vaapi`'s and
+      `graphics::vaapi::xyuv`'s module docs). A
       stream the codec refuses (4:2:2, monochrome, a HEIC image's alpha
       item, a 4:4:4 stream past 8 bits), or one the arm declines (4:4:4 on
       a VA driver without that decoder, radeonsi's, and on an NVIDIA GPU

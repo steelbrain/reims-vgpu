@@ -157,34 +157,37 @@ Both report the same for the codecs the crate drives:
 
 ## The import check
 
-Both ways the crate has a driver's video processing write memory imported
-as a linear surface, the staged copy back and zero copy, rest on what the
-driver does with such an import, and a driver may take the import and its
-run, answer success, and write the wrong bytes or none ([bugs.md](bugs.md),
-U16, U26). So each display learns it as it opens, on the opening thread,
-from a trial run of each of the decoders' formats, NV12 and P010
-(`src/vaapi/va/import_check.rs`, `learn`):
+The three ways the crate has a driver's video processing write memory
+imported as a linear surface, the staged copy back, zero copy and the
+writes of a 4:4:4 frame's XYUV pixels into a buffer of them
+(`PackedTarget`, "The HEVC decoder", "Surfaces, formats and readback"),
+rest on what the driver does with such an import, and a driver may take
+the import and its run, answer success, and write the wrong bytes or none
+([bugs.md](bugs.md), U16, U26). So each display learns it as it opens, on
+the opening thread, from a trial run of each of the decoders' formats,
+NV12, P010 and XYUV (`src/vaapi/va/import_check.rs`, `learn`):
 - a picture holding every sample value of its format, 328x64, is put
   into a surface of the decoders' kind by `vaPutImage`;
 - one video-processing run copies it into memory of the check's own,
   imported as zero copy imports a caller's pages (one dma-buf of both
-  planes);
+  planes, or of XYUV's one);
 - every byte of that memory is compared: each plane's samples, and every
-  byte around them, the rows' padding included, left as it was.
+  byte around them, the rows' padding included, left as it was. An XYUV
+  pixel's fourth byte holds nothing, and may be anything.
 
 It tries rows and plane starts 64, 128 and 256 bytes apart, in turn. Each
 pitch is an odd multiple of its alignment and each plane starts an odd
 multiple of it into its page, so a driver that takes only a larger
 alignment refuses the import or misplaces the picture. Where a run
 answers success and writes the picture wrongly, a second run at that
-alignment tries rows of whole alignments, the luma plane at the dma-buf's
-first byte and the chroma plane whole rows after it. The first that
-passes is the format's `ImportWrite`: its alignment, and whether it
-writes whole rows alone. Where none passes, the driver is lent no import
-of that format, and its frames come back through `vaGetImage` ("The copy
-back"). The graphics arm logs both answers as its display opens, as `in
-place: NV12 Ok(ImportWrite { alignment: 256, whole_rows: false }), P010
-...`.
+alignment tries rows of whole alignments, the luma plane (XYUV's one) at
+the dma-buf's first byte and the chroma plane whole rows after it. The
+first that passes is the format's `ImportWrite`: its alignment, and
+whether it writes whole rows alone. Where none passes, the driver is lent
+no import of that format, and its frames come back through `vaGetImage`
+("The copy back"). The graphics arm logs the three answers as its display
+opens, as `in place: NV12 Ok(ImportWrite { alignment: 256, whole_rows:
+false }), P010 ..., XYUV ...`.
 
 What the drivers answered (**measured**, libva 2.24.1, 2026-11-07):
 
@@ -192,6 +195,11 @@ What the drivers answered (**measured**, libva 2.24.1, 2026-11-07):
 |---|---|
 | radeonsi (Mesa 26.2.6), Radeon 780M (Phoenix, 1002:15bf and 1002:1900) and RX 7900 XTX | 256 bytes |
 | iHD 26.3.5, Iris Xe of an i9-13900H | 64 bytes, whole rows ([bugs.md](bugs.md), U26) |
+
+XYUV's answer (**measured**, libva 2.24.1, 2026-11-23): radeonsi (Mesa
+26.2.6) on the Radeon 780M has none, `no XYUV image: vaCreateImage failed:
+invalid VAImageFormat (0x16)`, and lists no HEVC Main 4:4:4 decoder either,
+so its 4:4:4 streams are refused before any picture lands.
 
 The check has not run on NVIDIA's VA-API driver, which wrote nothing
 into an import and answered success (U16); its byte comparison fails
@@ -1113,14 +1121,20 @@ said:
   surfaces (`VAProfileHEVCMain444`, `VA_RT_FORMAT_YUV444`): one plane of
   four bytes a pixel, Cr, Cb, Y and a byte unused, in memory order, as DRM's
   `XYUV8888` and ffmpeg's VUYX. iHD lists AYUV and XYUV for the profile
-  (2026-11-22); XYUV is the one without alpha. `Frame::is_4_4_4` says so,
-  and `ReadBack::copy_4_4_4_into` reads a frame back through `vaGetImage`
-  (an XYUV image: the import check, which checks NV12 and P010 imports, has
-  no answer for XYUV, so no staged copy back is made) and splits it on the
-  CPU into two planes, luma and each pixel's Cb then Cr, as CoreVideo's
-  `444v` and `444f` and ffmpeg's NV24 lay them out. A decode's target
-  (`super::target`), the in-place write into a guest's surface and the
-  zero-copy import take no XYUV: the frame lands by that read back alone.
+  (2026-11-22); XYUV is the one without alpha. `Frame::is_4_4_4` says so.
+  A frame lands two ways. `Frame::write_4_4_4_to` has the driver's video
+  processing write its crop's even width and height, from the crop's first
+  pixel, into a `PackedTarget`: one plane of XYUV pixels in a caller's
+  memory, imported as zero copy imports a caller's pages, where the import
+  check passed XYUV ("The import check"), and declined otherwise. The
+  graphics arm writes the frame so into a scratch of its device's, whose
+  GPU then splits it into the guest's surface (`graphics::vaapi::xyuv`).
+  Else `ReadBack::copy_4_4_4_into` reads it back through `vaGetImage` (an
+  XYUV image: there is no staged copy back of XYUV, which has no host
+  surface) and splits it on the CPU into two planes, luma and each pixel's
+  Cb then Cr, as CoreVideo's `444v` and `444f` and ffmpeg's NV24 lay them
+  out. A decode's target (`super::target`) and the two-plane in-place write
+  into a guest's surface (`Frame::write_to_guest`) take no XYUV.
 
 ### What it refuses
 
