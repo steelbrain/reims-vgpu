@@ -594,7 +594,18 @@ device must be on. **Measured** (2026-11-21): 32 pictures of 8 streams,
 H.264, HEVC and HEVC Main10 at 640x360 to 3840x2160, equal on the
 Radeon RX 550 and on the Radeon 780M (radeonsi and RADV, Mesa 26.2.6);
 the copier, which declined rows that end inside a word then, declined
-the pictures of a 1366x768 and a 642x362 stream.
+the pictures of a 1366x768 and a 642x362 stream. **Measured** again
+(2026-11-22, streams of ffmpeg's `testsrc2`): 52 pictures of 13 streams,
+H.264 at 426x240 to 1920x1080 (1366x768, 854x480, 642x362 and 426x240
+among them), HEVC at 854x480 to 1920x1080 and HEVC Main10 at 1280x720 to
+1920x1080, equal on the same two GPUs, none declined. The copier of the
+day before copied 28 of them and declined the NV12 pictures at 1366, 854,
+642 and 426 wide. A 1080p NV12 picture's copy took 4.19 ms on average on
+the RX 550 (3.94 before) and 2.85 ms on the 780M (3.02 before). In cold
+boots the same day, Safari playing 1366x768 and 854x480 clips, every
+picture landed by the hardware in its cache's exported surface, on the
+RX 550 in the copy form and on the 780M in place, so the copier ran in
+neither.
 
 ## Waiting for the GPU
 
