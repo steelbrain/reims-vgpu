@@ -291,12 +291,12 @@ impl Reader {
         let [luma, chroma] = planes else {
             return Err(format!("a surface of {} planes", planes.len()));
         };
-        let read = |plane: &<RtPlatform as Platform>::Texture| {
-            match plane.new_texture_view(plane.pixel_format()) {
-                Ok(Some(view)) => self.read_plane(&view),
-                Ok(None) => Err("no view of the plane".to_owned()),
-                Err(raise) => Err(format!("the plane's view: {raise}")),
-            }
+        let read = |plane: &<RtPlatform as Platform>::Texture| match plane
+            .new_texture_view(plane.pixel_format())
+        {
+            Ok(Some(view)) => self.read_plane(&view),
+            Ok(None) => Err("no view of the plane".to_owned()),
+            Err(raise) => Err(format!("the plane's view: {raise}")),
         };
         Ok([read(luma)?, read(chroma)?])
     }
