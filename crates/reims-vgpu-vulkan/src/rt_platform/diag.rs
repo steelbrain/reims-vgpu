@@ -15,6 +15,14 @@
 //!   (`Error::Translation`), by the feature it refused, `Translation-<feature>` (the feature's
 //!   variant), or the translator's error's variant where it refused no feature, which the counts
 //!   line holds as one `rt-refused-translation`.
+//! - **Refusals by key.** Each refusal the two lines above count, by its kind there, the functions
+//!   its site names (a refused dispatch's kernel, a refused draw's or a refused state's functions:
+//!   each by its role, its library's file, `<its SHA-256's first 16 hex digits>.metallib`, and its
+//!   index, never its name), and, of a `PartialThreadgroups`, the grid and the threadgroup it
+//!   asked for, or, of a `StorageElement`, the function's texture slot, the texture's pixel
+//!   format, rt's case and the texture's backing ([`RefusalKeys`], which gives the line's form):
+//!   the 64 keys of the most refusals with their counts, and the rest in one tail. A log names
+//!   every function refused this way, where a first line names one a kind.
 //! - **Attachment reads through a texture.** Each draw rt refused as one
 //!   (`Gap::Draw { kind: AttachmentRead }`), by its class ([`attachment_read`]): for each texture
 //!   slot of the draw's state whose texture's image a target of the pass renders, the slot's stage
@@ -1029,6 +1037,8 @@ static REFUSALS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 /// that no helper has compiled under `StageUnfilled`, a draw's by its draw kind; a
 /// refusal of Metal's and a limit under their variant, `Refused-<variant>` and `Limit-<variant>`;
 /// the translator's under the feature it refused, `Translation-<feature>`; any other error not.
+/// Each one counted is counted under its key too ([`RefusalKey::of`], with the functions its site
+/// names, `super::unbuilt::named_keys`), for the refusal-keys line ([`RefusalKeys`]).
 pub fn refusal(error: &rt::Error) {
     let Some(name) = refusal_name(error) else {
         return;
@@ -1037,7 +1047,9 @@ pub fn refusal(error: &rt::Error) {
         rt::Error::Unsupported(_) | rt::Error::StageUnfilled(_) => &GAPS,
         _ => &REFUSALS,
     };
+    let key = RefusalKey::of(name.clone(), error, super::unbuilt::named_keys());
     *map.lock().entry(name).or_insert(0) += 1;
+    KEYS.lock().add(key, KEYS_KEPT);
 }
 
 /// The kind [`refusal`] counts rt's `error` under: a gap's kind, a kernel's past the stage bound
@@ -1081,6 +1093,209 @@ pub fn refusal_name(error: &rt::Error) -> Option<String> {
 fn variant(debug: &str) -> &str {
     let end = debug.find(|c: char| !c.is_alphanumeric());
     &debug[..end.unwrap_or(debug.len())]
+}
+
+// ----- Refusals by key.
+
+/// The most keys the refusal-keys line names ([`RefusalKeys::line`]).
+const KEYS_SHOWN: usize = 64;
+
+/// The most keys the process keeps ([`RefusalKeys::add`]): a few hundred bytes each at most.
+const KEYS_KEPT: usize = 4096;
+
+/// The refusals [`refusal`] counted, by key.
+static KEYS: Mutex<RefusalKeys> = Mutex::new(RefusalKeys::new());
+
+/// A function a refusal's site names (`super::unbuilt::naming_functions`), as its refusal's key
+/// holds it: its role (`kernel`, `vertex`, `fragment`; `object` and `mesh` of a mesh state), the
+/// first 8 bytes of its library's SHA-256, and its index in the library. Never its name, which is
+/// the guest's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct KeyFunction {
+    role: &'static str,
+    library: [u8; 8],
+    index: u32,
+}
+
+impl KeyFunction {
+    /// The function `f` in the role `role`.
+    pub(super) fn of(role: &'static str, f: &metal2vulkan::library::Function) -> KeyFunction {
+        let mut library = [0; 8];
+        library.copy_from_slice(&f.library().content_hash()[..8]);
+        KeyFunction {
+            role,
+            library,
+            index: f.index(),
+        }
+    }
+}
+
+/// The fields of rt's error a refusal's key holds where its kind carries them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum KeyFields {
+    /// None: every kind but the two below.
+    None,
+    /// `Gap::PartialThreadgroups`: the grid and the threadgroup the dispatch asked for, in threads.
+    Threads {
+        grid: [u32; 3],
+        threadgroup: [u32; 3],
+    },
+    /// `Gap::StorageElement`: the function's texture slot (`None` for a texture `useResource`
+    /// declared written), the texture's pixel format by its number, and the case and the backing
+    /// by their variants' names in rt.
+    Storage {
+        slot: Option<u32>,
+        format: u32,
+        case: String,
+        backing: String,
+    },
+}
+
+/// What the refusal-keys line counts a refusal of rt's under: its kind as [`refusal_name`] gives
+/// it, the functions its site names ([`KeyFunction`]) in their roles' order there, and the fields
+/// of rt's error its kind carries ([`KeyFields`]). A refusal whose site names no function (a
+/// texture's make, a command buffer's commit) holds none, and a pipeline state's stage made from
+/// compiled code, which has no library, is not among a site's functions
+/// (`super::unbuilt::stage_function`): such a key holds what the refusal has, its kind and fields.
+/// No name of the guest's is in it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RefusalKey {
+    kind: String,
+    functions: Vec<KeyFunction>,
+    fields: KeyFields,
+}
+
+impl RefusalKey {
+    /// The key of rt's `error`, counted under `kind` ([`refusal_name`]), at a site naming
+    /// `functions`.
+    fn of(kind: String, error: &rt::Error, functions: Vec<KeyFunction>) -> RefusalKey {
+        let fields = match *error {
+            rt::Error::Unsupported(rt::Gap::PartialThreadgroups {
+                threads_per_grid,
+                threads_per_threadgroup,
+                ..
+            }) => KeyFields::Threads {
+                grid: threads_per_grid,
+                threadgroup: threads_per_threadgroup,
+            },
+            rt::Error::Unsupported(rt::Gap::StorageElement {
+                slot,
+                pixel_format,
+                case,
+                backing,
+                ..
+            }) => KeyFields::Storage {
+                slot,
+                format: pixel_format.as_raw(),
+                case: variant(&format!("{case:?}")).to_owned(),
+                backing: variant(&format!("{backing:?}")).to_owned(),
+            },
+            _ => KeyFields::None,
+        };
+        RefusalKey {
+            kind,
+            functions,
+            fields,
+        }
+    }
+}
+
+/// A key as the refusal-keys line names it: its kind; each function as ` <role>
+/// <library>.metallib #<index>`, the library's file as the first lines of each kind name it
+/// ([`function_name`], with no name); then ` grid <x>x<y>x<z> threadgroup <x>x<y>x<z>` of a
+/// `PartialThreadgroups`, or ` slot <n>` (` no slot` for a texture `useResource` declared written)
+/// and ` format <n> <case> <backing>` of a `StorageElement`.
+impl std::fmt::Display for RefusalKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.kind)?;
+        for function in &self.functions {
+            let file = hash_file(&function.library);
+            write!(f, " {} {file} #{}", function.role, function.index)?;
+        }
+        match &self.fields {
+            KeyFields::None => Ok(()),
+            KeyFields::Threads {
+                grid: [gx, gy, gz],
+                threadgroup: [tx, ty, tz],
+            } => write!(f, " grid {gx}x{gy}x{gz} threadgroup {tx}x{ty}x{tz}"),
+            KeyFields::Storage {
+                slot,
+                format,
+                case,
+                backing,
+            } => {
+                match slot {
+                    Some(slot) => write!(f, " slot {slot}")?,
+                    None => f.write_str(" no slot")?,
+                }
+                write!(f, " format {format} {case} {backing}")
+            }
+        }
+    }
+}
+
+/// The refusals [`refusal`] counted, by key ([`RefusalKey`]): the refusal-keys line, written at
+/// exit beside the gaps and refusals lines that count them by kind ([`write()`]), so a log names
+/// every kernel refused, not only the first of each kind. Its form ([`RefusalKeys::line`]):
+///
+/// `reims-vgpu: rt-diag refusal-keys: <key>: <count>, <key>: <count>, ...`, then, past
+/// [`KEYS_SHOWN`] keys, `; and <n> more refusals under <m> further keys`
+///
+/// Each key as it displays ([`RefusalKey`]), in the order of their counts, largest first, and in
+/// the keys' order among equal counts; for example `PartialThreadgroups kernel
+/// a9b148922f05fcc2.metallib #429 grid 1920x1080x1 threadgroup 16x16x1: 480`. The process keeps
+/// at most [`KEYS_KEPT`] keys; a refusal under a key past them is counted in the tail alone, which
+/// then reads `under more than <m> further keys`. Nothing is written for a process with no
+/// refusal. Counted on the refusal's path alone: a call rt does not refuse costs nothing here.
+struct RefusalKeys {
+    /// Each key's refusals.
+    counts: BTreeMap<RefusalKey, u64>,
+    /// The refusals under keys past the kept ones.
+    unkept: u64,
+}
+
+impl RefusalKeys {
+    /// None counted.
+    const fn new() -> RefusalKeys {
+        RefusalKeys {
+            counts: BTreeMap::new(),
+            unkept: 0,
+        }
+    }
+
+    /// Counts a refusal under `key`, kept where the table holds it or has fewer than `kept` keys.
+    fn add(&mut self, key: RefusalKey, kept: usize) {
+        if let Some(n) = self.counts.get_mut(&key) {
+            *n += 1;
+        } else if self.counts.len() < kept {
+            self.counts.insert(key, 1);
+        } else {
+            self.unkept += 1;
+        }
+    }
+
+    /// The line naming the first `shown` keys (the type's docs); `None` with no refusal counted.
+    fn line(&self, shown: usize) -> Option<String> {
+        if self.counts.is_empty() && self.unkept == 0 {
+            return None;
+        }
+        let mut keys: Vec<(&RefusalKey, u64)> = self.counts.iter().map(|(k, &n)| (k, n)).collect();
+        keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let named: Vec<String> = (keys.iter().take(shown))
+            .map(|(key, n)| format!("{key}: {n}"))
+            .collect();
+        let mut line = format!("reims-vgpu: rt-diag refusal-keys: {}", named.join(", "));
+        let further = keys.len().saturating_sub(shown);
+        let more = keys.iter().skip(shown).map(|(_, n)| n).sum::<u64>() + self.unkept;
+        if more != 0 {
+            let past = if self.unkept != 0 { "more than " } else { "" };
+            let _ = write!(
+                line,
+                "; and {more} more refusals under {past}{further} further keys"
+            );
+        }
+        Some(line)
+    }
 }
 
 // ----- Attachment reads through a texture.
@@ -1673,9 +1888,13 @@ fn append(path: &Path, text: &str) -> std::io::Result<()> {
 
 /// The file `library`'s AIR is kept in: its SHA-256's first 16 hex digits.
 fn air_file(library: &rt::Library) -> String {
-    let hash: String = (library.content_hash().iter().take(8))
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    hash_file(&library.content_hash()[..8])
+}
+
+/// The file of a library whose SHA-256 starts with the bytes `hash`: their hex digits, then
+/// `.metallib`.
+fn hash_file(hash: &[u8]) -> String {
+    let hash: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     format!("{hash}.metallib")
 }
 
@@ -2211,6 +2430,9 @@ pub fn write() {
         let _ = writeln!(out, "reims-vgpu: rt-diag refusals: {}", all.join(", "));
     }
     drop(refusals);
+    if let Some(line) = KEYS.lock().line(KEYS_SHOWN) {
+        let _ = writeln!(out, "{line}");
+    }
     let presenters = PRESENTERS.lock().clone();
     for ((class, process), n) in &by_process(&READS, &presenters) {
         let _ = writeln!(
@@ -2843,6 +3065,163 @@ mod tests {
             assert!(!keys.keys().any(|k| k.contains("Quiesced")));
             assert!(!keys.keys().any(|k| k.contains("a_function")));
         }
+    }
+
+    /// A refusal's key holds its kind, each function its site names by its role, its library's
+    /// file and its index, and the fields its kind carries: a `PartialThreadgroups`'s grid and
+    /// threadgroup, a `StorageElement`'s slot (none for a texture `useResource` declared written),
+    /// pixel format, case and backing; another kind's, none. The line gives each key with its
+    /// count, largest first, and no function's name.
+    #[test]
+    fn a_refusal_s_key_holds_its_functions_and_its_kind_s_fields() {
+        let library = rt::Library::from_metallib(crate::gpu::shaders::METALLIB).expect("shaders");
+        let f0 = library.function_at(0).expect("a function");
+        let f1 = library.function_at(1).expect("a second function");
+        let file = air_file(&library);
+        let partial = rt::Error::Unsupported(rt::Gap::PartialThreadgroups {
+            threads_per_grid: [1920, 1080, 1],
+            threads_per_threadgroup: [16, 16, 1],
+            site: rt::PartialThreadgroupsSite::SimdGroups { width: 64 },
+        });
+        let storage = |slot| {
+            rt::Error::Unsupported(rt::Gap::StorageElement {
+                slot,
+                pixel_format: rt::PixelFormat::RGBA8Unorm,
+                case: rt::StorageElementCase::WriteWithoutFormat,
+                backing: rt::TextureBacking::Buffer,
+            })
+        };
+        let format = rt::PixelFormat::RGBA8Unorm.as_raw();
+        let committed = rt::Error::Refused(rt::Refusal::Committed);
+        let key = |error: &rt::Error, functions| {
+            RefusalKey::of(refusal_name(error).expect("a name"), error, functions)
+        };
+        let kernel = vec![KeyFunction::of("kernel", &f0)];
+        let draw = vec![
+            KeyFunction::of("vertex", &f0),
+            KeyFunction::of("fragment", &f1),
+        ];
+        let mut keys = RefusalKeys::new();
+        for _ in 0..3 {
+            keys.add(key(&partial, kernel.clone()), KEYS_KEPT);
+        }
+        for _ in 0..2 {
+            keys.add(key(&storage(Some(3)), draw.clone()), KEYS_KEPT);
+        }
+        keys.add(key(&storage(None), kernel), KEYS_KEPT);
+        keys.add(key(&committed, Vec::new()), KEYS_KEPT);
+        let line = keys.line(KEYS_SHOWN).expect("a line");
+        assert_eq!(
+            line,
+            format!(
+                "reims-vgpu: rt-diag refusal-keys: PartialThreadgroups kernel {file} #0 grid \
+                 1920x1080x1 threadgroup 16x16x1: 3, StorageElement vertex {file} #0 fragment \
+                 {file} #1 slot 3 format {format} WriteWithoutFormat Buffer: 2, \
+                 Refused-Committed: 1, StorageElement kernel {file} #0 no slot format {format} \
+                 WriteWithoutFormat Buffer: 1"
+            )
+        );
+        for f in [&f0, &f1] {
+            let name = f.info().name.to_string();
+            assert!(!line.contains(&name), "{name} in {line}");
+        }
+    }
+
+    /// The refusal-keys line names the 64 keys of the most refusals, and the rest in one tail of
+    /// their refusals and keys; 64 keys have no tail. A refusal under a key past the kept ones is
+    /// in the tail alone, which then says there are more keys than it counts.
+    #[test]
+    fn the_refusal_keys_line_is_bounded_with_a_tail() {
+        let key = |x| {
+            let error = rt::Error::Unsupported(rt::Gap::PartialThreadgroups {
+                threads_per_grid: [x, 1, 1],
+                threads_per_threadgroup: [64, 1, 1],
+                site: rt::PartialThreadgroupsSite::Translator,
+            });
+            RefusalKey::of("PartialThreadgroups".to_owned(), &error, Vec::new())
+        };
+        let named = |line: &str| -> Vec<String> {
+            let head = line.split("; ").next().expect("a head");
+            let keys = head.strip_prefix("reims-vgpu: rt-diag refusal-keys: ");
+            keys.expect("the line's start")
+                .split(", ")
+                .map(str::to_owned)
+                .collect()
+        };
+        // Grids 1 to 64 refused twice, 65 to 70 once.
+        let mut keys = RefusalKeys::new();
+        for x in 1..=70 {
+            let times = if x <= 64 { 2 } else { 1 };
+            for _ in 0..times {
+                keys.add(key(x), KEYS_KEPT);
+            }
+        }
+        let line = keys.line(KEYS_SHOWN).expect("a line");
+        assert!(
+            line.ends_with("; and 6 more refusals under 6 further keys"),
+            "{line}"
+        );
+        let shown = named(&line);
+        assert_eq!(shown.len(), 64, "{line}");
+        assert_eq!(
+            shown[0],
+            "PartialThreadgroups grid 1x1x1 threadgroup 64x1x1: 2"
+        );
+        assert_eq!(
+            shown[63],
+            "PartialThreadgroups grid 64x1x1 threadgroup 64x1x1: 2"
+        );
+        let mut full = RefusalKeys::new();
+        for x in 1..=64 {
+            full.add(key(x), KEYS_KEPT);
+        }
+        let line = full.line(KEYS_SHOWN).expect("a line");
+        assert!(!line.contains("; and"), "{line}");
+        assert_eq!(named(&line).len(), 64, "{line}");
+        // 66 keys kept: 67 to 70 and 70 again past them.
+        let mut kept = RefusalKeys::new();
+        for x in (1..=70).chain([70, 1]) {
+            kept.add(key(x), 66);
+        }
+        assert_eq!((kept.counts.len(), kept.unkept), (66, 5));
+        let line = kept.line(KEYS_SHOWN).expect("a line");
+        assert!(
+            line.ends_with("; and 7 more refusals under more than 2 further keys"),
+            "{line}"
+        );
+        assert_eq!(
+            named(&line)[0],
+            "PartialThreadgroups grid 1x1x1 threadgroup 64x1x1: 2"
+        );
+    }
+
+    /// A process with no refusal has no refusal-keys line. A refusal counted is keyed by the
+    /// functions its site names (`super::super::unbuilt::naming_functions`), or by none where it
+    /// names none; an error that is no refusal is not keyed.
+    #[test]
+    fn refusals_are_keyed_by_the_functions_their_site_names() {
+        assert_eq!(RefusalKeys::new().line(KEYS_SHOWN), None);
+        let library = rt::Library::from_metallib(crate::gpu::shaders::METALLIB).expect("shaders");
+        let f = library.function_at(0).expect("a function");
+        let error = rt::Error::Unsupported(rt::Gap::PartialThreadgroups {
+            threads_per_grid: [7, 9, 11],
+            threads_per_threadgroup: [3, 5, 1],
+            site: rt::PartialThreadgroupsSite::Translator,
+        });
+        let kind = || "PartialThreadgroups".to_owned();
+        let named = RefusalKey::of(kind(), &error, vec![KeyFunction::of("kernel", &f)]);
+        let bare = RefusalKey::of(kind(), &error, Vec::new());
+        let count = |key: &RefusalKey| KEYS.lock().counts.get(key).copied().unwrap_or(0);
+        let before = (count(&named), count(&bare));
+        let site = vec![("kernel", f.clone())];
+        crate::rt_platform::unbuilt::naming_functions(site, || refusal(&error));
+        refusal(&error);
+        refusal(&error);
+        let after = (count(&named), count(&bare));
+        assert_eq!(after, (before.0 + 1, before.1 + 2));
+        refusal(&rt::Error::Quiesced);
+        let keys = KEYS.lock();
+        assert!(!keys.counts.keys().any(|k| k.kind.contains("Quiesced")));
     }
 
     /// A draw rt refused as reading a colour attachment through its texture is counted by each

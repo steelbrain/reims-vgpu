@@ -149,7 +149,12 @@ line counts the translator's refusals by the feature each refused, `Translation-
 error's variant where it refused none (`Translation-Cancelled`), all of them one code,
 `rt-refused-translation`; the process's first of each has a line naming the feature, what it
 needs and the attachment it is at, and no function's or symbol's name (`rt_platform/diag.rs`,
-`refusal_name`; `rt_platform/unbuilt.rs`, `refusal_detail`).
+`refusal_name`; `rt_platform/unbuilt.rs`, `refusal_detail`). Their refusal-keys line, beside the
+gaps and refusals lines, counts each refusal those two count by its kind and the functions its
+site names, each by its role, its library's hash and its index, never its name, and a
+`PartialThreadgroups` by its grid and threadgroup too, a `StorageElement` by its slot, pixel
+format, case and backing: the 64 keys of the most refusals, and the rest in one tail
+(`rt_platform/diag.rs`, `RefusalKeys`).
 
 A render, compute or blit pass whose encoder the platform makes none of (on rt, a pass it
 refuses, as a resolve it builds none of, counted as above) is skipped whole: the decoder drops

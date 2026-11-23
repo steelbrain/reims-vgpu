@@ -31,8 +31,12 @@
 //! names the functions it runs ([`naming_functions`]), the first line of each kind written there
 //! names them, each by its role, its library's file, its index and its name, as the boot
 //! diagnostics name a refused state's AIR, so the user's log says which of the guest's functions rt
-//! refused; no `NSError`, and no line past the first of its kind, names them. A texture rt makes
-//! none of for its pixel format (`Gap::TextureFormat`) is counted under its format's own code
+//! refused; no `NSError`, and no line past the first of its kind, names them. The boot
+//! diagnostics' refusal-keys line counts every refusal of rt's they count by the functions its
+//! site names, each by its role, its library's file and its index, with no name
+//! ([`named_keys`], `super::diag::RefusalKeys`), so the log names every function refused, not
+//! only the first of each kind. A texture rt makes none of for its pixel format
+//! (`Gap::TextureFormat`) is counted under its format's own code
 //! instead, `rt-refused-texture-format-<n>` ([`rt_refused_texture`]), so a boot's counts line gives
 //! each format number with its count. A pipeline state's imageblock length rt refuses
 //! (`Gap::ImageblockLength`) is counted apart from rt's other gaps too,
@@ -595,6 +599,17 @@ fn named() -> String {
             let _ = write!(out, "{split}{role} {name}");
         }
         out
+    })
+}
+
+/// The functions [`naming_functions`] names on this thread as the boot diagnostics' refusal keys
+/// hold them (`super::diag::KeyFunction`): each by its role, its library's hash and its index, and
+/// no name; none where none is named.
+pub(super) fn named_keys() -> Vec<super::diag::KeyFunction> {
+    NAMING.with(|n| {
+        (n.borrow().iter())
+            .map(|(role, function)| super::diag::KeyFunction::of(*role, function))
+            .collect()
     })
 }
 
