@@ -1378,10 +1378,6 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            pool.submit(CompileOf::new(CompileKind::Library, obj(3, 0xf)), read(&tx))
-                .is_ok()
-        );
         let wait = Duration::from_secs(10);
         assert_eq!(
             seen.recv_timeout(wait).unwrap(),
@@ -1390,6 +1386,12 @@ mod tests {
                  stencil 0 samples 1",
                 obj(1, 4)
             )
+        );
+        // Handed over once the first has run: a library make queued beside a pipeline's goes
+        // first.
+        assert!(
+            pool.submit(CompileOf::new(CompileKind::Library, obj(3, 0xf)), read(&tx))
+                .is_ok()
         );
         assert_eq!(
             seen.recv_timeout(wait).unwrap(),
