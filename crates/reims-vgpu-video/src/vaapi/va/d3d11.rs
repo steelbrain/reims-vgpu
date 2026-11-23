@@ -6,8 +6,8 @@
 //! imports only as a whole (its plane views refused), while it imports a Direct3D 11 texture of
 //! one plane exactly (measured 2026-11-19, Intel UHD 630, Vulkan driver 101.2145). So each
 //! picture is drawn, once its decode is done, by the GPU into two textures of the native
-//! Direct3D 11 device on the decode's adapter, shared by NT handle with a keyed mutex: the luma
-//! as `R8_UNORM` (`R16_UNORM` for 10-bit samples) and the chroma's Cb and Cr samples packed into
+//! Direct3D 11 device on the decode's adapter, shared by NT handle with no keyed mutex
+//! (`D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`): the luma as `R8_UNORM` (`R16_UNORM` for 10-bit samples) and the chroma's Cb and Cr samples packed into
 //! one texel, `Cb | Cr << 8` as `R16_UINT` (`<< 16`, `R32_UINT`), which reads as `RG8Unorm`
 //! (`RG16Unorm`) in a view of the same bits. The draws run on a Direct3D 11 device over a
 //! Direct3D 12 device of ours (D3D11On12), which opens each pool texture by its NT handle and
@@ -16,12 +16,18 @@
 //! the targets hold what the CPU's copy writes, at their first texel, and nothing past it.
 //!
 //! A picture's targets are made without the [`PlaneDraw`]'s lock, as both devices' methods are
-//! free-threaded (neither is made single-threaded). A draw takes both targets' keyed mutexes
-//! (key 0), records its writes and the mutexes' release behind them, and submits them with the
+//! free-threaded (neither is made single-threaded); the draws' device opens each by its NT handle
+//! (`OpenSharedResource1`) at its make. A draw records its writes and submits them with the
 //! queue's fence signalled after them, under the lock; it then waits on its caller's thread for
 //! the fence without the lock, so that another picture's draw is recorded while the GPU
 //! writes. Once the wait returns the importer may read the targets: the caller says so to it
-//! (`external_writes_done`). The importer takes no keyed mutex.
+//! (`external_writes_done`). Nothing else orders the writes before the reads: the flush, the
+//! fence's wait and then the importer's acquire do, and no device takes a keyed mutex.
+//!
+//! A driver may refuse the draws' device's open of a target shared so. [`PlaneDraw::targets`]
+//! then answers the call that refused and its HRESULT (`OpenSharedResource1 failed:
+//! 0x80070057`, as `super::d3d12`'s calls write theirs), and makes no targets of another kind in
+//! their place: the caller lands those pictures by the CPU's copy.
 //!
 //! What a picture's draw would otherwise pay the first time is made with the [`PlaneDraw`], at a
 //! decoder's open: the devices, the shaders, compiled by `D3DCompile` at run time, and the
@@ -46,8 +52,8 @@
 //!
 //! A target's bytes are undefined at its make. Its owner may say they are to read zeros wherever
 //! no draw writes them ([`PlaneTargets::owe_zeros`]): the next draw whose extent leaves part of
-//! them unwritten then clears both to zeros first, in the same hold of their keyed mutexes and
-//! the same wait, and a draw that writes them whole clears nothing; where no draw is to come,
+//! them unwritten then clears both to zeros first, in the same submission and the same wait,
+//! and a draw that writes them whole clears nothing; where no draw is to come,
 //! [`PlaneDraw::zero_owed`] clears them alone. Either way they owe no zeros after, nor once their
 //! owner says another device wrote them whole ([`PlaneTargets::written`]). The zeros are a
 //! clear of each target's render target view to 0, which every target format stores as zero
@@ -64,7 +70,10 @@
 //! Vulkan, 600 pictures of 1080p and 4K NV12 and 4K P010 matched `vaGetImage`'s exactly; a draw,
 //! its flush and the wait took 1.48 ms at the mean for a 1080p picture, 3.74 ms for a 4K NV12
 //! one and 3.87 ms for a 4K P010 one, and the first picture of a device with no pipelines made
-//! 24.8 ms.
+//! 24.8 ms. With targets shared with no keyed mutex (2026-11-23, the same GPU and driver, job
+//! m3-max-70852), 360 pictures of 1080p NV12 and 4K P010 read back by the native device matched
+//! `vaGetImage`'s exactly, and a draw, its flush and the wait took 1.511 ms at the mean for a
+//! 1080p picture and 3.970 ms for a 4K P010 one.
 //!
 //! The binding is written by hand, as `super::d3d12`'s, whose COM objects it shares: the
 //! functions are loaded from `d3d11.dll` and `d3dcompiler_47.dll`, and each method is called
@@ -110,12 +119,6 @@ const IID_IDXGI_RESOURCE1: Guid = guid(
     0x4a41,
     [0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1],
 );
-const IID_IDXGI_KEYED_MUTEX: Guid = guid(
-    0x9d8e_1289,
-    0xd7b3,
-    0x465f,
-    [0x81, 0x26, 0x25, 0x0e, 0x34, 0x9a, 0xf8, 0x5d],
-);
 
 // The vtable indices of the methods called (the SDK's `<interface>Vtbl` structures).
 const DEVICE_CREATE_BUFFER: usize = 3;
@@ -145,8 +148,6 @@ const CONTEXT_FLUSH: usize = 111;
 const ON12_CREATE_WRAPPED_RESOURCE: usize = 3;
 const ON12_RELEASE_WRAPPED_RESOURCES: usize = 4;
 const ON12_ACQUIRE_WRAPPED_RESOURCES: usize = 5;
-const KEYED_MUTEX_ACQUIRE_SYNC: usize = 8;
-const KEYED_MUTEX_RELEASE_SYNC: usize = 9;
 const RESOURCE1_CREATE_SHARED_HANDLE: usize = 13;
 const BLOB_GET_BUFFER_POINTER: usize = 3;
 const BLOB_GET_BUFFER_SIZE: usize = 4;
@@ -166,7 +167,7 @@ const D3D11_FEATURE_D3D11_OPTIONS: u32 = 5;
 const D3D11_BIND_CONSTANT_BUFFER: u32 = 0x4;
 const D3D11_BIND_SHADER_RESOURCE: u32 = 0x8;
 const D3D11_BIND_RENDER_TARGET: u32 = 0x20;
-const D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX: u32 = 0x100;
+const D3D11_RESOURCE_MISC_SHARED: u32 = 0x2;
 const D3D11_RESOURCE_MISC_SHARED_NTHANDLE: u32 = 0x800;
 const D3D11_SRV_DIMENSION_TEXTURE2D: u32 = 4;
 const D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST: u32 = 4;
@@ -450,15 +451,13 @@ struct Owed {
     made: u64,
 }
 
-/// One of [`PlaneTargets`]: a texture of the native device, shared by NT handle with a keyed
+/// One of [`PlaneTargets`]: a texture of the native device, shared by NT handle with no keyed
 /// mutex, and opened on the draws' device with a render target view.
 struct Target {
     /// The native device's texture, which [`PlaneDraw::read_back`] reads.
     native: Com,
     handle: Handle,
-    native_mutex: Com,
     _opened: Com,
-    mutex: Com,
     view: Com,
     size: (u32, u32),
 }
@@ -643,37 +642,21 @@ impl PlaneDraw {
         // The owed zeros are taken as the draw is recorded, under the state's lock, as
         // `zero_owed` takes them: no clear of theirs is recorded after a draw that wrote them.
         let owed = to.zeros_owed.swap(false, Ordering::AcqRel);
-        let clear = owed && !covers(to.size, extent);
-        let mutexes = [&luma_target.mutex, &chroma_target.mutex];
-        let mut held = 0;
-        let acquired = mutexes.iter().try_for_each(|mutex| {
-            acquire_sync(mutex)?;
-            held += 1;
-            Ok::<(), String>(())
-        });
-        let encoded = acquired.map(|()| {
-            if clear {
-                state.clear(&to.planes, [0.0; 4]);
-            }
-            let opened = &state.opened[at];
-            let shaders = &state.pixel[usize::from(to.ten_bit)];
-            let draws = [
-                (luma_target, &opened.views[0], &shaders[0], extent),
-                (chroma_target, &opened.views[1], &shaders[1], chroma),
-            ];
-            state.encode(&opened.wrapped, &draws);
-        });
-        // The targets are let go behind the draws, or where a call failed; the flush submits
-        // both, and the queue signals the fence after them.
-        let released: Vec<_> = (mutexes.iter().take(held))
-            .map(|mutex| release_sync(mutex))
-            .collect();
-        let signalled = encoded.and_then(|()| state.flush_and_signal());
+        if owed && !covers(to.size, extent) {
+            state.clear(&to.planes, [0.0; 4]);
+        }
+        let opened = &state.opened[at];
+        let shaders = &state.pixel[usize::from(to.ten_bit)];
+        let draws = [
+            (luma_target, &opened.views[0], &shaders[0], extent),
+            (chroma_target, &opened.views[1], &shaders[1], chroma),
+        ];
+        state.encode(&opened.wrapped, &draws);
+        // The flush submits the draws, and the queue signals the fence after them.
+        let signalled = state.flush_and_signal();
         drop(state);
         // The wait for the GPU's writes holds no lock (module doc).
-        let drawn = signalled
-            .and_then(|value| wait_for(&self.fence, value))
-            .and_then(|()| released.into_iter().collect());
+        let drawn = signalled.and_then(|value| wait_for(&self.fence, value));
         if drawn.is_err() && owed {
             to.owe_zeros();
         }
@@ -688,10 +671,8 @@ impl PlaneDraw {
         if !to.zeros_owed.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        holding(to, || {
-            state.clear(&to.planes, [0.0; 4]);
-            state.flush_and_wait()
-        })
+        state.clear(&to.planes, [0.0; 4]);
+        state.flush_and_wait()
     }
 
     /// Clears `to` to `colour`, as a target's format converts it, and returns once the GPU did:
@@ -699,10 +680,8 @@ impl PlaneDraw {
     #[cfg(test)]
     fn clear_to(&self, to: &PlaneTargets, colour: [f32; 4]) -> Result<(), String> {
         let mut state = self.state.lock();
-        holding(to, || {
-            state.clear(&to.planes, colour);
-            state.flush_and_wait()
-        })
+        state.clear(&to.planes, colour);
+        state.flush_and_wait()
     }
 
     /// A picture in a texture of a pool's kind, `size` big in luma samples, of 10-bit samples in
@@ -747,10 +726,9 @@ impl Makers {
             format,
             size,
             D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
-            D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+            D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
         )?;
         let handle = share(&native)?;
-        let native_mutex = native.query(&IID_IDXGI_KEYED_MUTEX, "IDXGIKeyedMutex")?;
         let device1 = &self.device;
         let mut out = null_mut();
         // SAFETY: the method is ID3D11Device1's `OpenSharedResource1`, of an NT handle of ours,
@@ -770,7 +748,6 @@ impl Makers {
             )
         };
         let opened = Com::made("OpenSharedResource1", result, out)?;
-        let mutex = opened.query(&IID_IDXGI_KEYED_MUTEX, "IDXGIKeyedMutex")?;
         let mut out = null_mut();
         // SAFETY: the method is ID3D11Device's `CreateRenderTargetView`, of a texture of the
         // device's, in its own format.
@@ -787,9 +764,7 @@ impl Makers {
         Ok(Target {
             native,
             handle,
-            native_mutex,
             _opened: opened,
-            mutex,
             view,
             size,
         })
@@ -921,7 +896,7 @@ impl State {
     }
 
     /// Records a clear of each of `targets` to `colour`, as its format converts it: 0 is zero bits
-    /// in each. The caller holds the targets' keyed mutexes.
+    /// in each.
     fn clear(&self, targets: &[Target], colour: [f32; 4]) {
         // SAFETY: the method is ID3D11DeviceContext's `ClearRenderTargetView`, of render target
         // views of the device's, from four floats; the context is called under the state's lock.
@@ -1105,8 +1080,8 @@ impl State {
         self.flush_and_wait()
     }
 
-    /// The bytes of `target`'s texels, of `texel` bytes each, read back by the native device
-    /// under its keyed mutex, row after row with nothing between them.
+    /// The bytes of `target`'s texels, of `texel` bytes each, read back by the native device once
+    /// its last draw's wait has returned, row after row with nothing between them.
     fn read_back(&self, target: &Target, texel: u32) -> Result<Vec<u8>, String> {
         let (width, height) = target.size;
         let staging = {
@@ -1125,7 +1100,6 @@ impl State {
             };
             texture_of(&self.native, &desc)?
         };
-        acquire_sync(&target.native_mutex)?;
         // SAFETY: the method is ID3D11DeviceContext's `CopyResource`, between textures of the
         // native device of one format and size.
         unsafe {
@@ -1137,7 +1111,6 @@ impl State {
                 target.native.raw(),
             );
         }
-        release_sync(&target.native_mutex)?;
         #[repr(C)]
         struct Mapped {
             data: *const u8,
@@ -1552,55 +1525,6 @@ fn completed(fence: &Com) -> u64 {
             fence.method(FENCE_GET_COMPLETED_VALUE);
         completed(fence.raw())
     }
-}
-
-/// Runs `work` holding both of `to`'s keyed mutexes on the draws' device (key 0), and lets go of
-/// those it took once `work` returns, or a take failed: `Err` where `work`, a take or a release
-/// failed, the first of them.
-fn holding(to: &PlaneTargets, work: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
-    let mutexes = to.planes.each_ref().map(|target| &target.mutex);
-    let mut held = 0;
-    let acquired = mutexes.iter().try_for_each(|mutex| {
-        acquire_sync(mutex)?;
-        held += 1;
-        Ok::<(), String>(())
-    });
-    let done = acquired.and_then(|()| work());
-    // The targets are let go once the GPU wrote them, or where a call failed.
-    let released: Vec<_> = (mutexes.iter().take(held))
-        .map(|mutex| release_sync(mutex))
-        .collect();
-    done?;
-    released.into_iter().collect()
-}
-
-/// Takes `mutex`, an `IDXGIKeyedMutex`, at key 0, however long its holder keeps it.
-fn acquire_sync(mutex: &Com) -> Result<(), String> {
-    // SAFETY: the method is IDXGIKeyedMutex's `AcquireSync`.
-    let result = unsafe {
-        let acquire: unsafe extern "system" fn(*mut c_void, u64, u32) -> Hresult =
-            mutex.method(KEYED_MUTEX_ACQUIRE_SYNC);
-        acquire(mutex.raw(), 0, INFINITE)
-    };
-    // `WAIT_ABANDONED` and `WAIT_TIMEOUT` are successes of other values.
-    match result {
-        0 => Ok(()),
-        other => Err(format!(
-            "IDXGIKeyedMutex::AcquireSync answered {:#010x}",
-            other.cast_unsigned()
-        )),
-    }
-}
-
-/// Lets go of `mutex`, an `IDXGIKeyedMutex` taken by [`acquire_sync`], at key 0.
-fn release_sync(mutex: &Com) -> Result<(), String> {
-    // SAFETY: the method is IDXGIKeyedMutex's `ReleaseSync`.
-    let result = unsafe {
-        let release: unsafe extern "system" fn(*mut c_void, u64) -> Hresult =
-            mutex.method(KEYED_MUTEX_RELEASE_SYNC);
-        release(mutex.raw(), 0)
-    };
-    check("IDXGIKeyedMutex::ReleaseSync", result)
 }
 
 #[cfg(test)]

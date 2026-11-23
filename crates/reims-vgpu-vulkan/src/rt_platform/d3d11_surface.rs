@@ -17,8 +17,8 @@
 //!
 //! **The acquire.** `ImportedSurfaceMemory::external_writes_done` is rt's
 //! `Surface::external_writes_done`, the planes' acquire from `VK_QUEUE_FAMILY_EXTERNAL`. rt takes
-//! no keyed mutex. The writer holds the textures' keyed mutexes across its write, waits for the
-//! write, releases them, and only then calls it.
+//! no keyed mutex, and the writer's textures have none. The writer waits for its write to be done
+//! on the GPU, and only then calls it.
 //!
 //! **Refusals.** Where rt makes no surface, the call answers `None`, counted
 //! ([`D3D11_SURFACE_REFUSED_CODE`]). The process's first refusal also writes a line naming rt's

@@ -324,6 +324,64 @@ fn a_picture_of_the_callers_samples_drawn_whole_reads_back_as_its_bytes() {
     }
 }
 
+const IID_IDXGI_KEYED_MUTEX: Guid = guid(
+    0x9d8e_1289,
+    0xd7b3,
+    0x465f,
+    [0x81, 0x26, 0x25, 0x0e, 0x34, 0x9a, 0xf8, 0x5d],
+);
+
+/// The misc flags of `texture`, an `ID3D11Texture2D` (`GetDesc`, its method 10).
+fn misc_flags(texture: &Com) -> u32 {
+    let mut desc = super::Texture2dDesc {
+        width: 0,
+        height: 0,
+        mip_levels: 0,
+        array_size: 0,
+        format: 0,
+        sample_count: 0,
+        sample_quality: 0,
+        usage: 0,
+        bind_flags: 0,
+        cpu_access_flags: 0,
+        misc_flags: 0,
+    };
+    // SAFETY: the method is ID3D11Texture2D's `GetDesc`, which writes the description.
+    unsafe {
+        let get: unsafe extern "system" fn(*mut c_void, *mut super::Texture2dDesc) =
+            texture.method(10);
+        get(texture.raw(), &mut desc);
+    }
+    desc.misc_flags
+}
+
+/// A picture's targets, of 8-bit samples and of 10-bit ones, are textures of the native device
+/// shared by NT handle with no keyed mutex (`D3D11_RESOURCE_MISC_SHARED` and
+/// `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`, 0x802), which the draws' device opens
+/// (`OpenSharedResource1`, as [`PlaneDraw::targets`] makes them): each answers those flags alone
+/// and no `IDXGIKeyedMutex`. Run holding the GPU, on the default adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn the_targets_are_shared_by_nt_handle_with_no_keyed_mutex() {
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    for ten_bit in [false, true] {
+        let to = draw.targets((64, 48), ten_bit).expect("the targets, opened");
+        for (plane, target) in ["luma", "chroma"].iter().zip(&to.planes) {
+            assert_eq!(
+                misc_flags(&target.native),
+                0x802,
+                "{ten_bit}: the {plane}'s flags"
+            );
+            assert!(
+                (target.native)
+                    .query(&IID_IDXGI_KEYED_MUTEX, "IDXGIKeyedMutex")
+                    .is_err(),
+                "{ten_bit}: the {plane}'s texture answers a keyed mutex"
+            );
+        }
+    }
+}
+
 /// [`PlaneDraw::zero_owed`] clears targets that owe zeros, and they owe none after; it keeps
 /// the bytes of targets that owe none, as of targets another device has since said it wrote
 /// whole ([`PlaneTargets::written`]). Run holding the GPU, on the default adapter.

@@ -311,8 +311,8 @@ pub struct D3d11PlaneDesc<'a> {
 /// which another API writes.
 #[cfg(windows)]
 pub trait ImportedSurfaceMemory: Send + Sync {
-    /// Says that the other API wrote the planes, waited for those writes and let go of the
-    /// textures' keyed mutexes, so that the device's later reads of the planes see the writes.
+    /// Says that the other API wrote the planes and waited for those writes to be done, so that
+    /// the device's later reads of the planes see the writes.
     /// `Err` says why the device will not see them.
     fn external_writes_done(&self) -> Result<(), String>;
 }

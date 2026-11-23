@@ -11,10 +11,11 @@
 //! VA-API decoded it into ([`DrawnPlanes::draw`]). The landing waits for the decode, tells of it
 //! done (`Landing::decode_done`), and then draws: a command buffer of the decode alone completes
 //! as the decode is done, with the draw running behind it, and every reader of the output waits
-//! for the draw (`decode`'s video module docs, "Completed at the decode"). The draw holds the
-//! targets' keyed mutexes across its write, waits for it on the landing's thread and releases
-//! them, and the landing then says the writes are done
-//! (`ImportedSurfaceMemory::external_writes_done`), before the session signals the decode.
+//! for the draw (`decode`'s video module docs, "Completed at the decode"). The draw submits its
+//! write and waits for it on the landing's thread, and the landing then says the writes are done
+//! (`ImportedSurfaceMemory::external_writes_done`), before the session signals the decode. The
+//! targets are shared with no keyed mutex: the wait and that acquire order the write before the
+//! platform's reads.
 //!
 //! A new cache's plane shapes owe a fill from its buffer, its make's zeros. A decode that takes
 //! the cache's first fill as met takes theirs as met too (`decode::surface_cache`'s

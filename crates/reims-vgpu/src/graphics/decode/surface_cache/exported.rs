@@ -61,7 +61,12 @@
 //! its pictures into (`graphics::drawn`), made at the ask and imported by the platform
 //! (`GpuDevice::import_d3d11_surface`), each plane the size of its plane shape with no rows of
 //! room below it: a decode's targets are then the planes' images and those textures
-//! (`Caches::drawn_targets`).
+//! (`Caches::drawn_targets`). Where the textures are not made (a driver refuses the draws'
+//! device's open of them, `OpenSharedResource1`, say), the ask makes no surface, counted as a
+//! surface the platform made none of, and the plane shapes take images of their own, where each
+//! picture lands by the CPU's copy (`graphics::vaapi`'s module doc, its third way). The first
+//! such miss of each picture size and depth is logged with the call that refused and its HRESULT
+//! (`DrawnAsk::make_for`). No other kind of textures is made in their place.
 //!
 //! The textures' bytes are undefined at their make, and the plane shapes owe a fill from the
 //! buffer, as any new shape does. A decode that takes a new cache's first fill as met, the
@@ -711,9 +716,17 @@ pub(super) struct DrawnAsk {
     ten_bit: bool,
 }
 
-/// Whether the process has logged a cache's Direct3D 11 textures that were not made.
+/// The picture sizes and depths (the luma plane's width and height, and whether its samples are
+/// 16 bits) of the caches whose Direct3D 11 textures the process logged not made
+/// ([`DrawnAsk::make_for`]), so that each is logged once, the first [`UNDRAWN_SIZES`] of them.
 #[cfg(windows)]
-static UNDRAWN_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UNDRAWN_SAID: reims_vgpu_vulkan::core::sync::Mutex<Vec<(u64, u64, bool)>> =
+    reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new());
+
+/// The most picture sizes and depths [`UNDRAWN_SAID`] logs: a guest that cycles through more
+/// adds no lines past them.
+#[cfg(windows)]
+const UNDRAWN_SIZES: usize = 16;
 
 /// The spare surfaces over Direct3D 11 textures made ahead (the module doc), by their ask and the
 /// device's recoveries they were made at.
@@ -809,7 +822,9 @@ impl DrawnAsk {
     }
 
     /// [`Self::make`] for the block at `block`'s cache: `None` where no surface was made, the
-    /// process's first miss of the textures logged, and each raise.
+    /// process's first miss of the textures of each picture size and depth logged with why (the
+    /// call that refused and its HRESULT), and each raise. The caller then keeps the plane
+    /// shapes in images of their own, where each picture lands by the CPU's copy.
     fn make_for<P: Platform>(
         &self,
         device: &P::Device,
@@ -819,12 +834,25 @@ impl DrawnAsk {
         match self.make::<P>(device, draw) {
             Ok(made) => Some(made),
             Err(Unmade::Textures(why)) => {
-                if !UNDRAWN_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let (width, height) = (self.keys[0].width, self.keys[0].height);
+                let size = (width, height, self.ten_bit);
+                let first = {
+                    let mut said = UNDRAWN_SAID.lock();
+                    let first = !said.contains(&size) && said.len() < UNDRAWN_SIZES;
+                    if first {
+                        said.push(size);
+                    }
+                    first
+                };
+                if first {
+                    let bits = if self.ten_bit { 10 } else { 8 };
                     log::warn!(
                         target: "reims_vgpu::graphics",
-                        "the IOSurface block at {block:#x}: no Direct3D 11 textures for its video \
-                         planes ({why}); they stay in images of their own, counted from here as \
-                         surfaces the platform made none of"
+                        "the IOSurface block at {block:#x}: no Direct3D 11 textures for its \
+                         {width}x{height} {bits}-bit video planes ({why}); they stay in images of \
+                         their own, where each picture lands by the CPU's copy, counted as \
+                         surfaces the platform made none of, as are later caches of that size \
+                         and depth whose textures are not made, unlogged"
                     );
                 }
                 None

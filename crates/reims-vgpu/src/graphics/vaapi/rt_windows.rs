@@ -36,7 +36,7 @@
 //! device that made them (`PlaneDraw::read_back`), and the planes by the blit again. One line says
 //! how each read of each plane differs from the next, and what the decoded luma holds. A read not
 //! made says why in its place, and the picture lands as it would have: nothing decides by it.
-//! Direct3D's acquire and copy may resolve the targets in place, which the second blit shows, so a
+//! Direct3D's copy may resolve the targets in place, which the second blit shows, so a
 //! picture read so may show right to the guest where its neighbours do not.
 
 use std::sync::Arc;
@@ -622,6 +622,33 @@ mod tests {
             assert_eq!(declined(), DeviceWrite::Declined(WHY.to_owned()));
             assert_eq!(counted(), before + n);
         }
+    }
+
+    /// The draws' check (module doc) over targets the rt platform imports, of 8-bit and of 10-bit
+    /// samples, drawn whole and short over zeros, reads each plane right three ways: by the
+    /// Direct3D 11 device, by the device's sampling and by its blit. Run holding the GPU, on the
+    /// rt device's adapter.
+    #[test]
+    #[ignore = "needs Direct3D 11 on the rt device's GPU: run on the Windows host"]
+    fn the_draws_check_reads_each_plane_right_three_ways() {
+        let platform = Arc::new(RtPlatform::new());
+        crate::entry::run(|_| {
+            let device = platform.system_default_device().expect("an rt device");
+            let luid = device.host_gpu().luid.expect("the device's DXGI adapter");
+            let draw = PlaneDraw::new(Some(luid)).expect("the plane draws");
+            let line = check(&device, &draw, &Reader::new(&device));
+            eprintln!("rt_windows: the draws' check: {line}");
+            for bits in ["8-bit", "10-bit"] {
+                for case in &drawn_check::CASES {
+                    let want = format!(
+                        "{bits} {}: luma Direct3D right, rt sampled right, rt copied right, \
+                         chroma Direct3D right, rt sampled right, rt copied right",
+                        case.name()
+                    );
+                    assert!(line.split("; ").any(|part| part == want), "{want} in {line}");
+                }
+            }
+        });
     }
 
     /// The reads of a real picture (module doc) show a texel that differs between two of them:
