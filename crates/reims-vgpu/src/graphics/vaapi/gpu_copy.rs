@@ -19,16 +19,20 @@
 //!   `Frame::write_to_guest`, as the first way writes a cache, through the scratch's memory as
 //!   [`CacheBytes`]), acquired (`Buffer::external_write_done`), then copied by the platform
 //!   library's `videoEncodeFill` kernel (`shaders.metal`, `fill`'s) on a queue of the copier's
-//!   own: one dispatch a plane, a thread a 32-bit word, each word a plain copy, as the plane's
-//!   coded row is its rows' bytes. Each plane's rows of the crop the CPU's copy writes
+//!   own: one dispatch a plane, a thread a 32-bit word, each word a plain copy but the last of a
+//!   row that ends inside it, a plane with no margin (`unit` 0): that word takes the row's bytes
+//!   and keeps the others, by an atomic AND and OR (an NV12 picture 1366 or 854 wide, whose rows
+//!   are 2 bytes past a word). Each plane's rows of the crop the CPU's copy writes
 //!   (`ReadBack::copy_into`) are copied into the plane's cache at its own first byte and pitch,
 //!   and nothing else of the cache; then the copy is waited for. A picture is copied so only
 //!   where that crop fills the planes' rows, every byte of them that the CPU's copy and its
-//!   staging's copy into the cache write: so the cache holds the same bytes either way.
+//!   staging's copy into the cache write, a blit of each row's bytes: so the cache holds the same
+//!   bytes either way.
 //! - **Refusals** ([`DeviceWrite::Declined`]) come before anything is written into the cache, and
 //!   the picture is copied by the CPU: a plane in the guest's pages or in its cache's surface, a
-//!   crop that does not fill the planes' rows, rows or a first byte or pitch that are not whole
-//!   32-bit words, the driver's video processing's decline of the scratch, a submission refused.
+//!   crop that does not fill the planes' rows, a first byte or pitch off a 32-bit word, a last
+//!   row whose last word ends past the buffer, the driver's video processing's decline of the
+//!   scratch, a submission refused.
 //!   The device's or the driver's refusal to make the scratch, and the device's of the kernel's
 //!   pipeline, are not tried again in the session. A copy that failed once submitted is an error,
 //!   and its scratch is kept out of use while the session lives, as the GPU may read it still.
@@ -130,8 +134,9 @@ impl ScratchLayout {
 /// The dispatches that copy a picture of `size` (its crop's luma samples), lying in a scratch
 /// laid out as `scratch`, into `outputs`, its luma and chroma planes (module doc): each plane's
 /// rows of the crop the CPU's copy writes, bound from the scratch's plane and the output plane's
-/// first bytes. `Err` says why none is made: a crop that does not fill the planes' rows, or rows
-/// that are not whole words.
+/// first bytes, with no margin, so that a row's last word keeps the bytes past the row. `Err`
+/// says why none is made: a crop that does not fill the planes' rows, a plane's first byte or
+/// pitch off a word, or a last row whose last word ends past the plane's buffer.
 fn plane_copies(
     scratch: ScratchLayout,
     (width, height): (u64, u64),
@@ -158,7 +163,6 @@ fn plane_copies(
     let narrow = |v: u64, what: &str| u32::try_from(v).map_err(|_| format!("{what} of {v}"));
     let plane = |output: Source,
                  (row_bytes, rows): (u64, u64),
-                 unit: u64,
                  from: u64,
                  which: &str|
      -> Result<PlaneFill, String> {
@@ -169,22 +173,22 @@ fn plane_copies(
                 output.height, output.row_bytes
             ));
         }
-        if !row_bytes.is_multiple_of(4)
-            || !output.offset.is_multiple_of(4)
-            || !output.bytes_per_row.is_multiple_of(4)
-        {
+        if !output.offset.is_multiple_of(4) || !output.bytes_per_row.is_multiple_of(4) {
             return Err(format!(
-                "a {which} plane at byte {} of rows of {row_bytes} bytes, {} apart: not whole \
-                 words",
+                "a {which} plane at byte {} of rows {} apart: not on words",
                 output.offset, output.bytes_per_row
             ));
         }
+        // The kernel writes whole words: a row's last, which may hold bytes past the row, lies in
+        // the buffer.
         let end = (rows - 1)
             .checked_mul(output.bytes_per_row)
-            .and_then(|last| output.offset.checked_add(last)?.checked_add(row_bytes));
+            .and_then(|last| {
+                (output.offset.checked_add(last)?).checked_add(row_bytes.next_multiple_of(4))
+            });
         if !end.is_some_and(|end| end <= output.length) {
             return Err(format!(
-                "a {which} plane whose rows end past its buffer of {}",
+                "a {which} plane whose rows' last word ends past its buffer of {}",
                 output.length
             ));
         }
@@ -196,8 +200,8 @@ fn plane_copies(
                 source_pitch: narrow(scratch.pitch, "a pitch")?,
                 row_bytes: narrow(row_bytes, "a row's bytes")?,
                 rows: narrow(rows, "rows")?,
-                unit: narrow(unit, "a unit")?,
-                coded_words: narrow(row_bytes / 4, "a row's words")?,
+                unit: 0,
+                coded_words: narrow(row_bytes.div_ceil(4), "a row's words")?,
                 coded_rows: narrow(rows, "rows")?,
                 pitch_words: narrow(output.bytes_per_row / 4, "a pitch's words")?,
                 tiling: TILING_LINEAR,
@@ -205,8 +209,8 @@ fn plane_copies(
         })
     };
     Ok([
-        plane(luma, crop[0], sample, 0, "luma")?,
-        plane(chroma, crop[1], 2 * sample, scratch.chroma_at, "chroma")?,
+        plane(luma, crop[0], 0, "luma")?,
+        plane(chroma, crop[1], scratch.chroma_at, "chroma")?,
     ])
 }
 

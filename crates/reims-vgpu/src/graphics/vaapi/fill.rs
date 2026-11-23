@@ -42,7 +42,8 @@
 //!
 //! The same kernel copies a decode session's pictures into their device caches from a scratch
 //! the driver's video processing wrote (`gpu_copy`, the copier [`DeviceFills`] makes), each word
-//! a plain copy of the scratch's.
+//! a plain copy of the scratch's, with no margin: the last word of a row that ends inside it takes
+//! the row's bytes alone, and keeps the cache's others.
 
 use std::os::fd::AsFd as _;
 use std::sync::{Arc, OnceLock};

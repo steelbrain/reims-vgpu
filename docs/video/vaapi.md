@@ -482,9 +482,12 @@ answers for its device, `rt_platform::HostGpu`). The arm
      whose layout the driver's import refuses, CoreVideo's 32 bytes into
      its memory or rows narrower than the driver's pitch, as radeonsi's
      (an RX 550's below 2048 bytes, a 780M's off a multiple of 256), is
-     still written on the GPU, with the bytes the CPU's copy writes. It
-     declines a plane in the guest's pages, and a crop that does not fill
-     the planes' rows in whole 32-bit words. Each picture copied so counts
+     still written on the GPU, with the bytes the CPU's copy writes. A row
+     that ends inside a 32-bit word, as an NV12 picture's do 2 bytes past
+     one at 1366, 854, 642 and 426 wide, has that word's other bytes kept,
+     by an atomic AND and OR. It declines a plane in the guest's pages, a
+     crop that does not fill the planes' rows, and a plane whose first byte
+     or pitch is off a word. Each picture copied so counts
      `video-pictures-gpu-copied`, and its crop's KiB
      `video-gpu-copied-kib`, and its session counts it landed `in a device
      cache, staged by the hardware and copied`. On Windows the platform's
@@ -590,8 +593,8 @@ the crop included. `RVG_VAAPI_NODE` names the GPU the runtime's default
 device must be on. **Measured** (2026-11-21): 32 pictures of 8 streams,
 H.264, HEVC and HEVC Main10 at 640x360 to 3840x2160, equal on the
 Radeon RX 550 and on the Radeon 780M (radeonsi and RADV, Mesa 26.2.6);
-the copier declined the pictures of a 1366x768 and a 642x362 stream,
-whose rows are not whole words.
+the copier, which declined rows that end inside a word then, declined
+the pictures of a 1366x768 and a 642x362 stream.
 
 ## Waiting for the GPU
 

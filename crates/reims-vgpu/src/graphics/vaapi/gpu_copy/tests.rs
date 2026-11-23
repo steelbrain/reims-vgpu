@@ -67,12 +67,13 @@ fn a_scratch_holds_the_pictures_even_size_at_a_pitch_on_256() {
 }
 
 /// A 1080p picture is copied from its scratch into CoreVideo's planes: each plane's crop rows
-/// whole, bound from the scratch's plane and the output's first byte, a plain word copy each, at
-/// the output's own pitch.
+/// whole, bound from the scratch's plane and the output's first byte, with no margin, at the
+/// output's own pitch. So is a picture whose rows end inside a word, 1366 wide: each row's last
+/// word holds its last 2 bytes.
 #[test]
 fn a_pictures_crop_is_copied_from_its_scratch_into_core_videos_planes() {
     let scratch = ScratchLayout::of(1920, 1080, 8).expect("a scratch");
-    let expected = |bound, at, rows, unit| PlaneFill {
+    let expected = |bound, at, rows| PlaneFill {
         bound,
         at,
         plane: FillPlane {
@@ -80,7 +81,7 @@ fn a_pictures_crop_is_copied_from_its_scratch_into_core_videos_planes() {
             source_pitch: 2048,
             row_bytes: 1920,
             rows,
-            unit,
+            unit: 0,
             coded_words: 480,
             coded_rows: rows,
             pitch_words: 480,
@@ -91,11 +92,38 @@ fn a_pictures_crop_is_copied_from_its_scratch_into_core_videos_planes() {
     assert_eq!(
         fills,
         [
-            expected(0, 32, 1080, 1),
-            expected(2048 * 1080, 32 + 1920 * 1088, 540, 2),
+            expected(0, 32, 1080),
+            expected(2048 * 1080, 32 + 1920 * 1088, 540),
         ]
     );
     assert_eq!(copied_kib(&fills), (1920 * 1080 + 1920 * 540) >> 10);
+    // CoreVideo's 1366x768 NV12: rows of 1,376 bytes, the chroma plane 768 rows after the luma.
+    let wxga = ScratchLayout::of(1366, 768, 8).expect("a scratch");
+    let chroma_at = 32 + 1376 * 768;
+    let length = chroma_at + 1376 * 384;
+    let outputs = [
+        plane(length, 32, 1376, 1366, 768),
+        plane(length, chroma_at, 1376, 1366, 384),
+    ];
+    let expected = |bound, at, rows| PlaneFill {
+        bound,
+        at,
+        plane: FillPlane {
+            first: 0,
+            source_pitch: 1536,
+            row_bytes: 1366,
+            rows,
+            unit: 0,
+            coded_words: 342,
+            coded_rows: rows,
+            pitch_words: 344,
+            tiling: TILING_LINEAR,
+        },
+    };
+    assert_eq!(
+        plane_copies(wxga, (1366, 768), outputs).expect("the copies"),
+        [expected(0, 32, 768), expected(1536 * 768, chroma_at, 384)]
+    );
     let p010 = ScratchLayout::of(1280, 720, 10).expect("a scratch");
     let chroma_at = 32 + 2560 * 736;
     let length = chroma_at + 2560 * 368;
@@ -112,14 +140,15 @@ fn a_pictures_crop_is_copied_from_its_scratch_into_core_videos_planes() {
             f.plane.pitch_words,
             f.plane.unit
         )),
-        [(0, 32, 2560, 640, 2), (2560 * 720, chroma_at, 2560, 640, 4)]
+        [(0, 32, 2560, 640, 0), (2560 * 720, chroma_at, 2560, 640, 0)]
     );
 }
 
-/// A picture is copied only where the CPU's copy's crop fills its planes' rows, in whole words
-/// within the planes' buffer: otherwise the copy declines, and the CPU's copy lands it.
+/// A picture is copied only where the CPU's copy's crop fills its planes' rows, from a first
+/// byte and at a pitch on words, each row's last word within the planes' buffer: otherwise the
+/// copy declines, and the CPU's copy lands it. Rows that end inside a word are copied.
 #[test]
-fn a_crop_that_does_not_fill_its_planes_rows_in_whole_words_is_declined() {
+fn a_crop_that_does_not_fill_its_planes_rows_on_words_is_declined() {
     let scratch = ScratchLayout::of(1920, 1080, 8).expect("a scratch");
     let [luma, chroma] = core_video_1080p();
     let declined = |outputs: [Source; 2], size: (u64, u64)| {
@@ -139,13 +168,15 @@ fn a_crop_that_does_not_fill_its_planes_rows_in_whole_words_is_declined() {
     declined([wider, chroma], (1920, 1080));
     // A smaller picture than its planes.
     declined([luma, chroma], (1280, 720));
-    // A first byte or a pitch off a word, and rows of bytes that are not whole words.
+    // A first byte or a pitch off a word.
     declined([Source { offset: 34, ..luma }, chroma], (1920, 1080));
     let off_word = Source {
         bytes_per_row: 1922,
         ..chroma
     };
     declined([luma, off_word], (1920, 1080));
+    // Rows that end inside a word are copied, each row's last word taking its last 2 bytes; but
+    // not where the last row's last word ends past the planes' buffer, though the row does not.
     let odd = ScratchLayout::of(1918, 1080, 8).expect("a scratch");
     let narrow = [
         Source {
@@ -157,7 +188,18 @@ fn a_crop_that_does_not_fill_its_planes_rows_in_whole_words_is_declined() {
             ..chroma
         },
     ];
-    assert!(plane_copies(odd, (1918, 1080), narrow).is_err());
+    let fills = plane_copies(odd, (1918, 1080), narrow).expect("the copies");
+    assert_eq!(
+        fills.map(|f| (f.plane.row_bytes, f.plane.coded_words, f.plane.unit)),
+        [(1918, 480, 0), (1918, 480, 0)]
+    );
+    let [narrow_luma, narrow_chroma] = narrow;
+    let ends_in_its_last_word = Source {
+        length: narrow_chroma.offset + 1920 * 539 + 1918,
+        ..narrow_chroma
+    };
+    let outputs = [narrow_luma, ends_in_its_last_word];
+    plane_copies(odd, (1918, 1080), outputs).expect_err("a decline");
     // Rows past the planes' buffer.
     let short = [
         luma,
@@ -179,12 +221,13 @@ fn pattern(length: usize) -> Vec<u8> {
 /// On the host's GPU, the kernel copies each plane's crop rows from a picture's scratch into its
 /// output's planes byte for byte, at the planes' own first bytes and pitches, CoreVideo's among
 /// them (each plane 32 bytes off a multiple of 256, rows of 1,920 bytes), and writes nothing else
-/// of the output's buffer: NV12 and P010, planes on words off 256 bytes.
+/// of the output's buffer: NV12 and P010, planes on words off 256 bytes, and NV12 rows that end
+/// inside a word, 2 bytes past it (1366, 854 and 426 wide), whose last word keeps the output's
+/// other 2 bytes as they were, each byte of the output before the copy its own.
 #[test]
 fn on_rt_the_kernel_copies_a_pictures_crop_from_its_scratch_and_nothing_else() {
     use reims_vgpu_vulkan::RtPlatform;
 
-    const UNTOUCHED: u8 = 0xa5;
     let platform = crate::rt_test_end::platform();
     crate::entry::run(|_| {
         let device = platform.system_default_device().expect("an rt device");
@@ -204,20 +247,29 @@ fn on_rt_the_kernel_copies_a_pictures_crop_from_its_scratch_and_nothing_else() {
             ((1280, 720), 10, 32, 2560, 32 + 2560 * 736),
             ((64, 48), 8, 4, 68, 4 + 68 * 48 + 8),
             ((640, 360), 8, 0, 640, 640 * 368),
+            ((1366, 768), 8, 32, 1376, 32 + 1376 * 768),
+            ((854, 480), 8, 4, 856, 4 + 856 * 480 + 8),
+            ((426, 240), 8, 32, 432, 32 + 432 * 240),
+            ((1366, 768), 10, 32, 2736, 32 + 2736 * 768),
         ];
         for ((width, height), depth, luma_at, pitch, chroma_at) in cases {
             let what = format!("{width}x{height} at {depth} bits into {luma_at}, {chroma_at}");
             let scratch = ScratchLayout::of(width, height, depth).expect("a scratch");
             let row_bytes = u64::from(width) * scratch.sample;
+            let chroma_bytes = u64::from(width).div_ceil(2) * 2 * scratch.sample;
             let rows = u64::from(height);
             let length = chroma_at + pitch * rows.div_ceil(2) + 256;
             let outputs = [
                 plane(length, luma_at, pitch, row_bytes, rows),
-                plane(length, chroma_at, pitch, row_bytes, rows.div_ceil(2)),
+                plane(length, chroma_at, pitch, chroma_bytes, rows.div_ceil(2)),
             ];
             let size = (u64::from(width), rows);
             let fills = plane_copies(scratch, size, outputs).expect(&what);
             let bytes = pattern(scratch.length as usize);
+            let before: Vec<u8> = pattern(length as usize + 7)[7..]
+                .iter()
+                .map(|b| !b)
+                .collect();
             let source = shared(scratch.length);
             let output = shared(length);
             // SAFETY: the buffers' host bytes, which no GPU work reaches yet.
@@ -227,7 +279,11 @@ fn on_rt_the_kernel_copies_a_pictures_crop_from_its_scratch_and_nothing_else() {
                     source.contents().as_ptr::<u8>(),
                     bytes.len(),
                 );
-                std::ptr::write_bytes(output.contents().as_ptr::<u8>(), UNTOUCHED, length as usize);
+                std::ptr::copy_nonoverlapping(
+                    before.as_ptr(),
+                    output.contents().as_ptr::<u8>(),
+                    before.len(),
+                );
             }
             let cb = (queue.command_buffer(OnFault::Return))
                 .expect("no raise")
@@ -250,7 +306,7 @@ fn on_rt_the_kernel_copies_a_pictures_crop_from_its_scratch_and_nothing_else() {
             let written = unsafe {
                 std::slice::from_raw_parts(output.contents().as_ptr::<u8>(), length as usize)
             };
-            let mut want = vec![UNTOUCHED; length as usize];
+            let mut want = before;
             for fill in &fills {
                 let p = &fill.plane;
                 for row in 0..u64::from(p.rows) {
@@ -277,10 +333,10 @@ fn on_rt_the_kernel_copies_a_pictures_crop_from_its_scratch_and_nothing_else() {
 /// rounded up to 16, as no driver writes them in place), is the CPU's copy of the same picture
 /// byte for byte, the cache read back by a blit: each plane's crop rows, and every other byte of
 /// the cache as its fill left it. The first [`PICTURES`] pictures of each H.264 and HEVC stream in
-/// `RVG_VA_STREAMS`'s directories, 8 and 10 bits; a picture the copier declines (rows of a width
-/// not on 4 bytes) is counted and named, and a stream the decoder refuses is left at its
-/// refusal. Each copied picture is counted under [`COPIED_CODE`], and the copier's time for it,
-/// from the driver's write to the copy's end, is printed by size and sample.
+/// `RVG_VA_STREAMS`'s directories, 8 and 10 bits; a picture the copier declines is counted and
+/// named, and a stream the decoder refuses is left at its refusal. Each copied picture is counted
+/// under [`COPIED_CODE`], and the copier's time for it, from the driver's write to the copy's end,
+/// is printed by size and sample.
 #[test]
 #[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
 fn a_picture_copied_by_the_gpu_from_its_scratch_is_the_cpus_copy() {
