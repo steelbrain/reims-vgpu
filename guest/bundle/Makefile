@@ -134,7 +134,7 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp src/RgfxKnownPipelines.cpp \
 	src/RgfxSlabs.cpp src/RgfxIcbSlotTable.cpp \
 	src/RgfxLibraryStream.cpp src/RgfxMetallibWriter.cpp src/RgfxGLLowering.cpp \
-	src/RgfxClMode.cpp src/RgfxLog.cpp src/RgfxFilePages.cpp src/RgfxMemoryShadow.cpp
+	src/RgfxClMode.cpp src/RgfxLog.cpp src/RgfxFilePages.cpp src/RgfxMemoryShadow.cpp src/RgfxFiles.cpp
 
 # The video driver AppleGVA loads from this bundle (C++, src/RgfxVideoDriver.cpp): bundle only.
 VIDEO_SRCS = src/RgfxVideoDriver.cpp src/RgfxVideoH264.cpp src/RgfxVideoH265.cpp
@@ -203,7 +203,7 @@ $(SER_TESTBIN): $(CORE_OBJ_ARCH) tests/serializer_tests.cpp tests/slab_tests.cpp
 SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm tests/archive_tests.mm \
 	tests/resource_tests.mm tests/queue_tests.mm \
 	tests/create_tests.mm tests/known_pipeline_tests.mm tests/icb_tests.mm tests/gl_tests.mm \
-	tests/gl_store_tests.mm tests/cl_mode_tests.mm tests/residency_tests.mm
+	tests/gl_store_tests.mm tests/cl_mode_tests.mm tests/residency_tests.mm tests/files_tests.mm
 
 $(SHELL_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(HEADERS) $(TESTHEADERS) Makefile
 	@mkdir -p $(@D)

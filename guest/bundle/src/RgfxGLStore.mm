@@ -1,10 +1,11 @@
 /*
- * RgfxGLStore: see RgfxGLStore.hpp. Our own ObjC++: its files are read and written through
- * Foundation, as the bundle writes an app's binary archive (tests/bundle_files_check.sh).
+ * RgfxGLStore: see RgfxGLStore.hpp. Its files are read and written through the bundle's own file
+ * calls (RgfxFiles.hpp), never Foundation's, so a sandbox that lists the system calls a process
+ * may make takes every call the store makes (tests/files_tests.mm).
  */
 #include "RgfxGLStore.hpp"
 
-#import <Foundation/Foundation.h>
+#include <dispatch/dispatch.h>
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -12,6 +13,8 @@
 #include <cerrno>
 #include <cstring>
 #include <tuple>
+
+#include "RgfxFiles.hpp"
 
 namespace {
 
@@ -22,8 +25,8 @@ constexpr size_t kHeader = sizeof kEntryMagic + 16; // magic, key length, value 
 constexpr size_t kHash = CC_SHA256_DIGEST_LENGTH;
 constexpr char kSuffix[] = ".rgl";
 constexpr size_t kNameLength = 2 * kHash + sizeof kSuffix - 1;
-// A file of the directory that is no entry (an atomic write's own, left by a process that ended
-// in it) goes at the next trim once it is this old.
+// A file of the directory that is no entry (a write's own file, RgfxWriteFileWhole's, left by a
+// process that ended in it) goes at the next trim once it is this old.
 constexpr double kStaleFile = 3600;
 
 void append(std::string &key, char tag, const void *bytes, size_t length)
@@ -76,25 +79,15 @@ void sha256(const uint8_t *p, size_t n, uint8_t out[kHash])
 	CC_SHA256_Final(out, &ctx);
 }
 
-std::string describe(const char *what, const std::string &path, NSError *error)
+std::string describe(const char *what, const std::string &path, int error)
 {
-	NSError *posix = error.userInfo[NSUnderlyingErrorKey];
-	std::string text = std::string(what) + " " + path + ": ";
-	if (error == nil)
-		return text + "no error";
-	text += error.localizedDescription.UTF8String ?: "?";
-	if ([posix.domain isEqualToString:NSPOSIXErrorDomain])
-		text += std::string(" (") + std::strerror(static_cast<int>(posix.code)) + ")";
-	return text;
+	return std::string(what) + " " + path + ": " + std::strerror(error);
 }
 
-// A read's error that says the file is not there (as against one the system refused).
-bool isMissing(NSError *error)
+// A call's errno that says the file is not there (as against one the system refused).
+bool isMissing(int error)
 {
-	if ([error.domain isEqualToString:NSCocoaErrorDomain] && error.code == NSFileReadNoSuchFileError)
-		return true;
-	NSError *posix = error.userInfo[NSUnderlyingErrorKey];
-	return [posix.domain isEqualToString:NSPOSIXErrorDomain] && (posix.code == ENOENT || posix.code == ENOTDIR);
+	return error == ENOENT || error == ENOTDIR;
 }
 
 } // namespace
@@ -261,134 +254,109 @@ bool RgfxGLStore::get(const std::string &key, std::vector<uint8_t> &value)
 {
 	if (off())
 		return false;
-	@autoreleasepool {
-		const std::string path = pathOf(key);
-		NSString *file = @(path.c_str());
-		NSError *error = nil;
-		NSData *data = [NSData dataWithContentsOfFile:file options:0 error:&error];
-		if (data == nil) {
-			if (!isMissing(error))
-				refuse(describe("could not read", path, error));
-			return false;
-		}
-		const uint8_t *bytes = static_cast<const uint8_t *>(data.bytes);
-		const size_t size = data.length;
-		uint64_t keyLength = 0, valueLength = 0;
-		std::string bad;
-		if (size < kHeader + kHash)
-			bad = "is shorter than an entry";
-		else {
-			std::memcpy(&keyLength, bytes + sizeof kEntryMagic, sizeof keyLength);
-			std::memcpy(&valueLength, bytes + sizeof kEntryMagic + 8, sizeof valueLength);
-			uint8_t h[kHash];
-			if (std::memcmp(bytes, kEntryMagic, sizeof kEntryMagic) != 0)
-				bad = "is no entry";
-			else if (keyLength > size || valueLength > size || kHeader + keyLength + valueLength + kHash != size)
-				bad = "is not as long as its lengths say";
-			else {
-				sha256(bytes, size - kHash, h);
-				if (std::memcmp(h, bytes + size - kHash, kHash) != 0)
-					bad = "does not hash to its hash";
-				else if (keyLength != key.size() || std::memcmp(bytes + kHeader, key.data(), key.size()) != 0)
-					bad = "holds another key";
-			}
-		}
-		if (!bad.empty()) {
-			[NSFileManager.defaultManager removeItemAtPath:file error:nil];
-			fail("the entry " + path + " " + bad + "; removed");
-			return false;
-		}
-		// Used now: past the cap the least recently used go first.
-		[NSFileManager.defaultManager setAttributes:@{NSFileModificationDate : [NSDate date]}
-		                               ofItemAtPath:file
-		                                      error:nil];
-		value.assign(bytes + kHeader + keyLength, bytes + kHeader + keyLength + valueLength);
-		return true;
+	const std::string path = pathOf(key);
+	std::vector<uint8_t> data;
+	if (const int error = RgfxReadFile(path, data)) {
+		if (!isMissing(error))
+			refuse(describe("could not read", path, error));
+		return false;
 	}
+	const uint8_t *bytes = data.data();
+	const size_t size = data.size();
+	uint64_t keyLength = 0, valueLength = 0;
+	std::string bad;
+	if (size < kHeader + kHash)
+		bad = "is shorter than an entry";
+	else {
+		std::memcpy(&keyLength, bytes + sizeof kEntryMagic, sizeof keyLength);
+		std::memcpy(&valueLength, bytes + sizeof kEntryMagic + 8, sizeof valueLength);
+		uint8_t h[kHash];
+		if (std::memcmp(bytes, kEntryMagic, sizeof kEntryMagic) != 0)
+			bad = "is no entry";
+		else if (keyLength > size || valueLength > size || kHeader + keyLength + valueLength + kHash != size)
+			bad = "is not as long as its lengths say";
+		else {
+			sha256(bytes, size - kHash, h);
+			if (std::memcmp(h, bytes + size - kHash, kHash) != 0)
+				bad = "does not hash to its hash";
+			else if (keyLength != key.size() || std::memcmp(bytes + kHeader, key.data(), key.size()) != 0)
+				bad = "holds another key";
+		}
+	}
+	if (!bad.empty()) {
+		RgfxRemoveFile(path);
+		fail("the entry " + path + " " + bad + "; removed");
+		return false;
+	}
+	// Used now: past the cap the least recently used go first. The entry's first byte, its magic's,
+	// written over itself (RgfxTouchFile).
+	RgfxTouchFile(path, static_cast<uint8_t>(kEntryMagic[0]));
+	value.assign(bytes + kHeader + keyLength, bytes + kHeader + keyLength + valueLength);
+	return true;
 }
 
 bool RgfxGLStore::put(const std::string &key, const std::vector<uint8_t> &value)
 {
 	if (off())
 		return false;
-	@autoreleasepool {
-		NSMutableData *data = [NSMutableData dataWithCapacity:kHeader + key.size() + value.size() + kHash];
-		const uint64_t lengths[2] = {key.size(), value.size()};
-		[data appendBytes:kEntryMagic length:sizeof kEntryMagic];
-		[data appendBytes:lengths length:sizeof lengths];
-		[data appendBytes:key.data() length:key.size()];
-		[data appendBytes:value.data() length:value.size()];
-		uint8_t h[kHash];
-		sha256(static_cast<const uint8_t *>(data.bytes), data.length, h);
-		[data appendBytes:h length:kHash];
+	std::vector<uint8_t> data;
+	data.reserve(kHeader + key.size() + value.size() + kHash);
+	const uint64_t lengths[2] = {key.size(), value.size()};
+	const uint8_t *l = reinterpret_cast<const uint8_t *>(lengths);
+	data.insert(data.end(), kEntryMagic, kEntryMagic + sizeof kEntryMagic);
+	data.insert(data.end(), l, l + sizeof lengths);
+	data.insert(data.end(), key.begin(), key.end());
+	data.insert(data.end(), value.begin(), value.end());
+	uint8_t h[kHash];
+	sha256(data.data(), data.size(), h);
+	data.insert(data.end(), h, h + kHash);
 
-		{
-			std::lock_guard<std::mutex> hold(lock_);
-			if (!made_) {
-				NSError *error = nil;
-				if (![NSFileManager.defaultManager createDirectoryAtPath:@(directory_.c_str())
-				                             withIntermediateDirectories:YES
-				                                              attributes:nil
-				                                                   error:&error]) {
-					if (failure_.empty())
-						failure_ = describe("could not make", directory_, error);
-					off_ = true;
-					return false;
-				}
-				made_ = true;
-			}
-		}
-		// Written to a file of its own and renamed into place (NSDataWritingAtomic): a reader sees
-		// the old entry or the new one, whole.
-		const std::string path = pathOf(key);
-		NSError *error = nil;
-		if (![data writeToFile:@(path.c_str()) options:NSDataWritingAtomic error:&error]) {
-			refuse(describe("could not write", path, error));
-			return false;
-		}
+	{
 		std::lock_guard<std::mutex> hold(lock_);
-		bytes_ += data.length;
-		if (!counted_ || bytes_ > cap_)
-			trim();
-		return true;
+		if (!made_) {
+			if (const int error = RgfxMakeDirectories(directory_)) {
+				if (failure_.empty())
+					failure_ = describe("could not make", directory_, error);
+				off_ = true;
+				return false;
+			}
+			made_ = true;
+		}
 	}
+	// Written to a file of its own and renamed into place (RgfxWriteFileWhole): a reader sees the
+	// old entry or the new one, whole.
+	const std::string path = pathOf(key);
+	if (const int error = RgfxWriteFileWhole(path, data.data(), data.size())) {
+		refuse(describe("could not write", path, error));
+		return false;
+	}
+	std::lock_guard<std::mutex> hold(lock_);
+	bytes_ += data.size();
+	if (!counted_ || bytes_ > cap_)
+		trim();
+	return true;
 }
 
 void RgfxGLStore::trim()
 {
-	NSFileManager *files = NSFileManager.defaultManager;
-	NSError *error = nil;
-	NSArray<NSURL *> *urls = [files contentsOfDirectoryAtURL:[NSURL fileURLWithPath:@(directory_.c_str())
-	                                                                   isDirectory:YES]
-	                              includingPropertiesForKeys:@[
-		                              NSURLIsRegularFileKey, NSURLFileSizeKey, NSURLContentModificationDateKey
-	                              ]
-	                                                 options:0
-	                                                   error:&error];
-	if (urls == nil) {
+	std::vector<RgfxDirectoryFile> files;
+	if (const int error = RgfxListFiles(directory_, files)) {
 		if (failure_.empty())
 			failure_ = describe("could not list", directory_, error);
 		return;
 	}
-	std::vector<std::tuple<double, uint64_t, NSURL *>> entries;
+	std::vector<std::tuple<double, uint64_t, std::string>> entries;
 	uint64_t total = 0;
-	const double now = [NSDate date].timeIntervalSinceReferenceDate;
-	for (NSURL *url in urls) {
-		NSDictionary<NSURLResourceKey, id> *v =
-		    [url resourceValuesForKeys:@[ NSURLIsRegularFileKey, NSURLFileSizeKey, NSURLContentModificationDateKey ]
-		                         error:nil];
-		if (![v[NSURLIsRegularFileKey] boolValue])
-			continue;
-		const double used = [v[NSURLContentModificationDateKey] timeIntervalSinceReferenceDate];
-		const uint64_t size = [v[NSURLFileSizeKey] unsignedLongLongValue];
-		const std::string name = url.lastPathComponent.UTF8String ?: "";
-		if (name.size() != kNameLength || name.compare(2 * kHash, std::string::npos, kSuffix) != 0) {
-			if (now - used > kStaleFile)
-				[files removeItemAtURL:url error:nil];
+	const double now = RgfxFileClockNow();
+	for (const RgfxDirectoryFile &f : files) {
+		const std::string path = directory_ + "/" + f.name;
+		if (f.name.size() != kNameLength || f.name.compare(2 * kHash, std::string::npos, kSuffix) != 0) {
+			if (now - f.modified > kStaleFile)
+				RgfxRemoveFile(path);
 			continue;
 		}
-		entries.emplace_back(used, size, url);
-		total += size;
+		entries.emplace_back(f.modified, f.size, path);
+		total += f.size;
 	}
 	counted_ = true;
 	bytes_ = total;
@@ -400,8 +368,8 @@ void RgfxGLStore::trim()
 	for (const auto &e : entries) {
 		if (bytes_ <= keep)
 			break;
-		NSError *gone = nil;
-		if ([files removeItemAtURL:std::get<2>(e) error:&gone] || isMissing(gone))
+		const int gone = RgfxRemoveFile(std::get<2>(e));
+		if (gone == 0 || isMissing(gone))
 			bytes_ -= std::get<1>(e);
 	}
 }

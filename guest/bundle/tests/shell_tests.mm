@@ -6137,6 +6137,25 @@ void test_dynamic_library_routing()
 	NSData *written = [NSData dataWithContentsOfURL:file];
 	CHECK(written.length == bytes.size());
 	CHECK(std::memcmp(written.bytes, bytes.data(), bytes.size()) == 0);
+
+	// A write the system refuses answers the error Foundation's atomic write answers for it (this
+	// Mac's Foundation the reference): in a directory the process may not write in.
+	NSString *ro = [dir stringByAppendingPathComponent:@"ro"];
+	CHECK(mkdir(ro.fileSystemRepresentation, 0755) == 0 && chmod(ro.fileSystemRepresentation, 0555) == 0);
+	NSURL *refused = [NSURL fileURLWithPath:[ro stringByAppendingPathComponent:@"lib.metallib"]];
+	NSError *ours = nil, *foundation = nil;
+	CHECK(![dylib serializeToURL:refused error:&ours]);
+	CHECK(![[NSData dataWithBytes:"x" length:1] writeToURL:refused options:NSDataWritingAtomic error:&foundation]);
+	NSError *ourCause = ours.userInfo[NSUnderlyingErrorKey], *theirCause = foundation.userInfo[NSUnderlyingErrorKey];
+	const bool same = [ours.domain isEqualToString:foundation.domain] && ours.code == foundation.code &&
+	                  [[NSSet setWithArray:ours.userInfo.allKeys] isEqualToSet:[NSSet setWithArray:foundation.userInfo.allKeys]] &&
+	                  [ours.userInfo[NSFilePathErrorKey] isEqual:foundation.userInfo[NSFilePathErrorKey]] &&
+	                  [ourCause.domain isEqualToString:theirCause.domain] && ourCause.code == theirCause.code;
+	if (!same)
+		std::fprintf(stderr, "the dynamic library's refused write answered %s\nFoundation's answered %s\n",
+		             ours.description.UTF8String, foundation.description.UTF8String);
+	CHECK(same);
+	CHECK(chmod(ro.fileSystemRepresentation, 0755) == 0);
 	[[NSFileManager defaultManager] removeItemAtPath:dir error:nil];
 }
 
@@ -22623,6 +22642,8 @@ void rgfxKnownPipelineTests();
 void rgfxIcbTests();
 void rgfxGLTests();
 void rgfxClModeTests();
+void rgfxFilesTests(const char *self);
+int rgfxFilesSandboxedCase(const char *directory, const char *name);
 
 // A block's arguments come from its own signature, and a creation's completion handler is called
 // with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
@@ -22684,6 +22705,8 @@ int main(int argc, char **argv)
 		return rgfxResidencyDiesCase(argv[2]);
 	if (argc == 3 && std::strcmp(argv[1], "--protocol-fair-share") == 0)
 		return rgfxProtocolFairShareCase(argv[2]);
+	if (argc == 4 && std::strcmp(argv[1], "--files-sandboxed") == 0)
+		return rgfxFilesSandboxedCase(argv[2], argv[3]);
 	// A measurement, run by hand: the guest's share of a buffer's scheduling and completion
 	// (tests/queue_tests.mm).
 	if (argc >= 2 && std::strcmp(argv[1], "--queue-timing") == 0)
@@ -22898,6 +22921,7 @@ int main(int argc, char **argv)
 		rgfxIcbTests();           // tests/icb_tests.mm
 		rgfxGLTests();            // tests/gl_tests.mm
 		rgfxClModeTests();        // tests/cl_mode_tests.mm
+		rgfxFilesTests(argv[0]);  // tests/files_tests.mm
 		test_gl_function_encoder_ends_the_process();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks.load());

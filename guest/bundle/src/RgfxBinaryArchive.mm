@@ -36,6 +36,7 @@
 #import "RgfxUnsupported.h"
 
 #include "RgfxBinaryArchiveFile.hpp"
+#include "RgfxFiles.hpp"
 
 NSErrorDomain const RgfxBinaryArchiveMissDomain = @"reims-graphics";
 
@@ -664,11 +665,9 @@ RGFX_LOG_UNRECOGNIZED
 {
 	// Metal answers a URL it cannot write to before it looks at what there is to write
 	// (measured: an empty archive to a missing directory answers Invalid URL).
-	BOOL directory = NO;
-	NSString *parent = url.URLByDeletingLastPathComponent.path;
-	if (url == nil || !url.isFileURL || parent == nil ||
-	    ![[NSFileManager defaultManager] fileExistsAtPath:parent isDirectory:&directory] ||
-	    !directory) {
+	// The bundle's own file calls from here on (RgfxFiles.hpp).
+	const char *parent = url.isFileURL ? url.URLByDeletingLastPathComponent.fileSystemRepresentation : nullptr;
+	if (parent == nullptr || !RgfxIsDirectory(parent)) {
 		if (error)
 			*error = invalidURL();
 		return NO;
@@ -688,8 +687,10 @@ RGFX_LOG_UNRECOGNIZED
 		}
 		bytes = rgfxWriteArchiveFile(kept);
 	}
-	NSData *data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
-	if (![data writeToURL:url atomically:YES]) {
+	// Written whole beside the file and renamed over it (RgfxWriteFileWhole), with the bundle's own
+	// file calls: a sandboxed app's profile takes each of them (RgfxFiles.hpp).
+	const char *path = url.fileSystemRepresentation;
+	if (path == nullptr || RgfxWriteFileWhole(path, bytes.data(), bytes.size()) != 0) {
 		if (error)
 			*error = invalidURL();
 		return NO;

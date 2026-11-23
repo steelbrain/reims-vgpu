@@ -15,12 +15,12 @@
  * the value's u64 lengths, the key, the value, and the SHA-256 of everything before it. A read
  * takes an entry only where it reads whole, its hash is the bytes' and its key is the one asked
  * for; any other entry is removed and the variant lowered again. A write goes to a file of its
- * own and is renamed into place (Foundation's atomic write), so no process reads half an entry.
+ * own and is renamed into place (RgfxWriteFileWhole), so no process reads half an entry.
  * RgfxGLLowerKept queues its writes on the store's own serial queue (putLater), so the app's
  * thread does not wait on an entry's hash, its write or a trim (measured: Heaven on macOS 26.7.2,
  * an RTX 3090, spent 39 ms of its main thread's time at one scene change of its first run in the
  * store's writes). A write the process ends before is lost alone: every entry is a file of its
- * own, renamed into place whole, and an atomic write's own file left behind goes at a later trim.
+ * own, renamed into place whole, and a write's own file left behind goes at a later trim.
  * The queued writes hold at most the cap's bytes; a write past them is dropped, and its variant
  * lowered again in a later run.
  * The entries' bytes are capped: past the cap the least recently used are dropped, oldest first,
@@ -32,8 +32,10 @@
  * off for the process, so a sandbox that refuses its directory reports one refusal, not one a
  * variant.
  *
- * Our own ObjC++ (RgfxGLStore.mm), through Foundation's file calls, as the bundle writes an app's
- * binary archive: it imports none of open(2)'s family (tests/bundle_files_check.sh).
+ * Its files go through the bundle's own file calls (RgfxFiles.hpp), as the bundle's other writes
+ * do, never through Foundation's: an app's sandbox may kill the process at a system call it does
+ * not list, and Foundation's atomic write makes one that WebKit's WebContent profile on macOS 11
+ * leaves out (tests/files_tests.mm, tests/bundle_files_check.sh).
  */
 #ifndef RGFX_GL_STORE_HPP_
 #define RGFX_GL_STORE_HPP_

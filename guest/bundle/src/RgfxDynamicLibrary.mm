@@ -5,8 +5,56 @@
 #import "RgfxDynamicLibrary.h"
 
 #import "RgfxLibrary.h"
+#include "RgfxFiles.hpp"
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
+
+#include <cerrno>
+
+namespace {
+
+// Foundation's error for a write that failed with `posix`: NSCocoaErrorDomain, its write code for
+// the errno, the file's path and the POSIX error under it (read from code: swift-corelibs-
+// foundation's _NSErrorWithErrno, for a write).
+NSError *writeError(int posix, NSString *path)
+{
+	NSInteger code;
+	switch (posix) {
+	case ENOENT:
+		code = NSFileNoSuchFileError;
+		break;
+	case EPERM:
+	case EACCES:
+		code = NSFileWriteNoPermissionError;
+		break;
+	case ENAMETOOLONG:
+		code = NSFileWriteInvalidFileNameError;
+		break;
+	case EDQUOT:
+	case ENOSPC:
+		code = NSFileWriteOutOfSpaceError;
+		break;
+	case EROFS:
+		code = NSFileWriteVolumeReadOnlyError;
+		break;
+	case EEXIST:
+		code = NSFileWriteFileExistsError;
+		break;
+	default:
+		code = NSFileWriteUnknownError;
+		break;
+	}
+	return [NSError errorWithDomain:NSCocoaErrorDomain
+	                           code:code
+	                       userInfo:@{
+		                       NSFilePathErrorKey : path ?: @"",
+		                       NSUnderlyingErrorKey : [NSError errorWithDomain:NSPOSIXErrorDomain
+		                                                                  code:posix
+		                                                              userInfo:nil]
+	                       }];
+}
+
+} // namespace
 
 @implementation RgfxDynamicLibrary {
 	RgfxLibrary *_library;
@@ -60,10 +108,12 @@
 	return _library.installName;
 }
 
-// The library's .metallib, written through a file beside `url` and a rename. A URL that is no file
-// URL, or in a directory that is not there, is Metal's "Invalid URL" (MTLDynamicLibraryDomain 1,
-// measured: the AMD Radeon Pro 5300M and the Intel UHD Graphics 630, macOS 26.7.1, oracle_fnptr),
-// and writes nothing; another failure to write is the write's own error.
+// The library's .metallib, written through a file beside `url` and a rename (RgfxWriteFileWhole,
+// with the bundle's own file calls, which a sandboxed app's profile takes: RgfxFiles.hpp). A URL
+// that is no file URL, or in a directory that is not there, is Metal's "Invalid URL"
+// (MTLDynamicLibraryDomain 1, measured: the AMD Radeon Pro 5300M and the Intel UHD Graphics 630,
+// macOS 26.7.1, oracle_fnptr), and writes nothing; another failure to write is Foundation's error
+// for the write's errno (writeError).
 - (BOOL)serializeToURL:(NSURL *)url error:(__autoreleasing NSError **)error
 {
 	auto invalid = ^BOOL(NSString *what) {
@@ -73,11 +123,8 @@
 			                         userInfo:@{NSLocalizedDescriptionKey : what}];
 		return NO;
 	};
-	BOOL isDirectory = NO;
-	NSString *directory = url.fileURL ? url.URLByDeletingLastPathComponent.path : nil;
-	if (directory == nil ||
-	    ![[NSFileManager defaultManager] fileExistsAtPath:directory isDirectory:&isDirectory] ||
-	    !isDirectory)
+	const char *directory = url.fileURL ? url.URLByDeletingLastPathComponent.fileSystemRepresentation : nullptr;
+	if (directory == nullptr || !RgfxIsDirectory(directory))
 		return invalid(@"Invalid URL");
 	dispatch_data_t source = [_library rgfxSource];
 	if (source == nil)
@@ -85,9 +132,15 @@
 	const void *bytes = nullptr;
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(source, &bytes, &size);
-	NSData *data = [NSData dataWithBytes:bytes length:size];
+	const char *path = url.fileSystemRepresentation;
+	const int failure = path != nullptr ? RgfxWriteFileWhole(path, bytes, size) : ENOENT;
 	(void)map;
-	return [data writeToURL:url options:NSDataWritingAtomic error:error];
+	if (failure != 0) {
+		if (error)
+			*error = writeError(failure, url.path);
+		return NO;
+	}
+	return YES;
 }
 
 @end
