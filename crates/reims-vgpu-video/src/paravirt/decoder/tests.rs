@@ -978,6 +978,97 @@ fn each_hevc_stream_lands_in_its_4_2_0_format_or_is_refused_at_its_start() {
     }
 }
 
+/// What a record's refusal says of its stream: `None` where the host decodes it.
+fn undecoded_of(codec: Codec, record: Vec<u8>) -> Option<Undecoded> {
+    let config = DecoderConfig {
+        codec,
+        width: 64,
+        height: 48,
+        record,
+    };
+    read_record(&config)
+        .map(|record| record.undecoded)
+        .ok()
+        .flatten()
+}
+
+#[test]
+fn a_refused_stream_is_named_by_its_profile_chroma_format_depths_and_size() {
+    // Apple's HEIC images' 4:4:4 thumbnails and monochrome alpha items are of the range
+    // extensions' profile, as the HEVC test of the formats above notes.
+    let thumbnail = crate::codec::hevc::tests::sps_of(4, 3, 0, true, Some(true));
+    let refused = undecoded_of(Codec::Hevc, hvcc_of(&thumbnail)).expect("refused");
+    assert_eq!(
+        refused.to_string(),
+        "unsupported: profiles outside Main, Main 10 and Main Still Picture (HEVC \
+         general_profile_idc 4, chroma_format_idc 3, luma 8 bits, chroma 8 bits, 64x48)"
+    );
+    assert_eq!(
+        refused.kind(),
+        "HEVC profile four chroma format three, luma eight bits, chroma eight bits"
+    );
+    let alpha = crate::codec::hevc::tests::sps_of(4, 0, 2, true, None);
+    let refused = undecoded_of(Codec::Hevc, hvcc_of(&alpha)).expect("refused");
+    assert!(
+        refused.to_string().ends_with(
+            "(HEVC general_profile_idc 4, chroma_format_idc 0, luma 10 bits, chroma 10 bits, \
+             64x48)"
+        ),
+        "{refused}"
+    );
+    let high = undecoded_of(Codec::H264, avcc(&high_sps(244, 3, 2), 4)).expect("refused");
+    assert!(
+        high.to_string().ends_with(
+            "(H.264 profile_idc 244, chroma_format_idc 3, luma 10 bits, chroma 10 bits, 64x48)"
+        ),
+        "{high}"
+    );
+    assert_eq!(
+        high.kind(),
+        "AVC profile two-four-four chroma format three, luma one-zero bits, chroma one-zero bits"
+    );
+    // A stream the host decodes names nothing.
+    let main = crate::codec::hevc::tests::sps_of(1, 1, 0, false, None);
+    assert_eq!(undecoded_of(Codec::Hevc, hvcc_of(&main)), None);
+}
+
+#[test]
+fn each_kind_of_refused_stream_has_a_kind_of_its_own_whatever_its_size() {
+    // The logger reads a kind up to its first digit, quote, backquote or `;`
+    // (`reims_vgpu_vulkan::core::logging::class`): none is in a kind, so the whole of it tells
+    // the streams apart.
+    let kind_of = |profile, chroma, deeper| {
+        let sps = crate::codec::hevc::tests::sps_of(profile, chroma, deeper, true, None);
+        let kind = undecoded_of(Codec::Hevc, hvcc_of(&sps))
+            .expect("refused")
+            .kind();
+        assert!(
+            !kind.contains(|c: char| c.is_ascii_digit() || "\"`;".contains(c)),
+            "{kind}"
+        );
+        kind
+    };
+    let kinds = [
+        kind_of(4, 3, 0),
+        kind_of(4, 0, 0),
+        kind_of(4, 2, 2),
+        kind_of(4, 3, 4),
+        kind_of(4, 1, 4),
+    ];
+    for (i, kind) in kinds.iter().enumerate() {
+        assert!(!kinds[..i].contains(kind), "{kind}");
+    }
+    let sps = crate::codec::hevc::tests::sps_of(4, 3, 0, true, None);
+    let small = undecoded_of(Codec::Hevc, hvcc_of(&sps)).expect("refused");
+    let large = Undecoded {
+        width: 4032,
+        height: 3024,
+        ..small.clone()
+    };
+    assert_eq!(small.kind(), large.kind());
+    assert_ne!(small.to_string(), large.to_string());
+}
+
 #[test]
 fn each_h264_stream_lands_in_its_4_2_0_format_or_is_refused_at_its_start() {
     // profile_idc, chroma_format_idc, the depths past 8, and the format the pictures land in:

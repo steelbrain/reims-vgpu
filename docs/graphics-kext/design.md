@@ -1868,7 +1868,11 @@ Stages:
       monochrome pictures (a HEIC image's 4:4:4 thumbnail, or its alpha
       item) is then refused at the session's start, not at each tile or
       frame, and every tile a session takes lands in the 4:2:0 format its
-      `TDrs` names. On arm64 macOS 26.6.2 under TCG on a 780M host
+      `TDrs` names. The refusal's warning names the stream: its codec, its
+      profile (HEVC's `general_profile_idc`, H.264's `profile_idc`), its
+      `chroma_format_idc`, its luma and chroma bit depths and its coded
+      size, written for the first stream of each codec, profile, chroma
+      format and depths in a boot, and counted for the rest. On arm64 macOS 26.6.2 under TCG on a 780M host
       (2026-11-21), sips's decodes of a 356x356 4:4:4 thumbnail and of a
       512x512 picture's monochrome alpha item each start a tile session
       that is refused so; VideoToolbox decodes them in software, within
