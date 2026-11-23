@@ -464,7 +464,10 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
     let arm64 = match vm.config.profile {
         Profile::VmappleArm64 => Some(qemu::Arm64Boot {
             ambrosia: crate::ambrosia::path(),
-            bundle: crate::prebuilt::ambrosia_bundle(&vm.ambrosia_config())?,
+            bundle: crate::prebuilt::ambrosia_bundle(
+                &vm.ambrosia_config(),
+                vm.config.profile.accel(host) == "kvm",
+            )?,
         }),
         Profile::Q35X86_64 => None,
     };
@@ -557,8 +560,11 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
             graphics_rom: graphics_rom(vm).unwrap_or_else(|_| crate::prebuilt::graphics_rom_path()),
             arm64: (vm.config.profile == Profile::VmappleArm64).then(|| qemu::Arm64Boot {
                 ambrosia: crate::ambrosia::path(),
-                bundle: crate::prebuilt::ambrosia_bundle_path(&vm.ambrosia_config())
-                    .unwrap_or_default(),
+                bundle: crate::prebuilt::ambrosia_bundle_path(
+                    &vm.ambrosia_config(),
+                    vm.config.profile.accel(host) == "kvm",
+                )
+                .unwrap_or_default(),
             }),
         }
     });

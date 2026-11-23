@@ -2,7 +2,7 @@
 # Boots one arm64 macOS guest on Ambrosia with a configuration bundle, ours by default, and checks
 # the boot as Ambrosia's done list has it: one line a check, then the verdict.
 #
-#   firmware/ambrosia/check-boot.sh -f AMBROSIA [-q QEMU] [-t] [-b BUNDLE] [-T TOOLS] [-p PORT]
+#   firmware/ambrosia/check-boot.sh -f AMBROSIA [-q QEMU] [-t | -k] [-b BUNDLE] [-T TOOLS] [-p PORT]
 #                                   [-o OUT] [-e ECID] VM_DIR
 #
 #   VM_DIR   the guest: disk.img, aux.img.trimmed (or aux.img, which a trimmed copy is made of),
@@ -18,6 +18,10 @@
 #            MESA_VK_DEVICE_SELECT names, else on the one GPU a potluck job holds (POTLUCK_GPUS);
 #            the script stops where neither names one GPU, as an --exclusive job holds every GPU
 #            of its node and the library would take its own pick among them (docs/lessons.md).
+#   -k       KVM, on an arm64 Linux host, in place of HVF. The bundle must carry kvm.plist's
+#            Kernel > Patch (make config-bundle KVM=1), without which macOS panics at its GIC's
+#            setup under KVM (kvm.plist says why); the script stops where it does not. Its limits
+#            and judgements are HVF's, its RAM TCG's.
 #   -b FILE  the configuration bundle; default build/Config.cpio (make config-bundle)
 #   -T DIR   the guest probes, bench, present_probe and sole_holder_probe; default
 #            build/guest-tools (make guest-tools, on a Mac)
@@ -28,7 +32,7 @@
 # The guest runs with 8 GiB and 4 CPUs, as Ambrosia's tested boots do, with QEMU's
 # REIMS_VGPU_WINDOW=0 (no window on the host) and REIMS_VGPU_LOG=info with the display's flips
 # (reims_vgpu::graphics::shown at debug), as the lane gate runs it.
-# Under TCG, for a Linux member, its RAM is a shared memfd, as reims-ctl's VMs on Linux have it. The
+# Under TCG and KVM, on Linux, its RAM is a shared memfd, as reims-ctl's VMs on Linux have it. The
 # device maps the memfd-backed main RAM in place and leaves out vmapple's firmware and configuration
 # regions, which have no file behind them and hold no IOSurface, so every surface still maps in place
 # (docs/qemu.md, "arm64 guests: the boot check of our configuration").
@@ -40,7 +44,8 @@
 #              ...", "boot failed: ...", docs/running.md in Ambrosia), this fails with its line,
 #              QEMU is stopped, and the guest's checks fail as not run.
 #   console    Ambrosia logged the module's early console.
-#   ssh        the guest took an SSH login within 90 s of QEMU's start under HVF, 450 s under TCG.
+#   ssh        the guest took an SSH login within 90 s of QEMU's start under HVF and KVM, 450 s under
+#              TCG.
 #              Under TCG every command the checks run in the guest, each SSH login the boot waits
 #              on, and the wait for the desktop have 5 times their HVF limits.
 #              A check whose reading in the guest printed nothing (its command failed or ran
@@ -64,7 +69,7 @@
 #              or unanswered (report.py's bar for the correctness boot). Under TCG it passes on OK,
 #              frames presented and at most 3 unanswered; its drops and rates are printed but not
 #              judged, as the emulated CPU sets the rate WindowServer composites at, and pacing is
-#              judged under HVF only. Beside the probe's line, the host's count of display flips
+#              judged under HVF and KVM only. Beside the probe's line, the host's count of display flips
 #              during the probe's call, WindowServer's own present rate, to read its drops against.
 #              A probe that falls short while Setup Assistant runs fails as unread, naming it: its
 #              full-screen window covers the probe's, whose frames are then never shown. A window
@@ -136,13 +141,14 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 die() { echo "check-boot: $*" >&2; exit 2; }
 usage() { sed -n '/^#   firmware\/ambrosia\/check-boot.sh/,/^#   -e ECID/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
-firmware= qemu=${QEMU:-} tcg=0 bundle=$here/build/Config.cpio tools=$here/build/guest-tools
+firmware= qemu=${QEMU:-} tcg=0 kvm=0 bundle=$here/build/Config.cpio tools=$here/build/guest-tools
 port=10090 out= ecid=
-while getopts f:q:tb:T:p:o:e:h opt; do
+while getopts f:q:tkb:T:p:o:e:h opt; do
   case $opt in
   f) firmware=$OPTARG ;;
   q) qemu=$OPTARG ;;
   t) tcg=1 ;;
+  k) kvm=1 ;;
   b) bundle=$OPTARG ;;
   T) tools=$OPTARG ;;
   p) port=$OPTARG ;;
@@ -153,6 +159,7 @@ while getopts f:q:tb:T:p:o:e:h opt; do
 done
 shift $((OPTIND - 1))
 [[ $# -eq 1 ]] || usage
+((tcg + kvm < 2)) || die "-t and -k each name the accelerator: give one"
 vm=$1
 GUEST_USER=${GUEST_USER:-aneesiqbal} GUEST_PASS=${GUEST_PASS:-aneesiqbal}
 
@@ -168,17 +175,41 @@ if ((tcg)); then
       die "the job holds several GPUs ($gpu), as an --exclusive job does: name one in MESA_VK_DEVICE_SELECT (vendor:device!)"
     export MESA_VK_DEVICE_SELECT="${gpu%%@*}!"
   fi
-  accel=(-accel tcg,thread=multi) limit=450 desktop_wait=300 slow=5
+  accel_name=TCG accel=(-accel tcg,thread=multi) limit=450 desktop_wait=300 slow=5
+  machine=",memory-backend=ram,dump-guest-core=off"
+  mem=(-m "$ram" -object "memory-backend-memfd,id=ram,size=$ram,share=on")
+elif ((kvm)); then
+  [[ $(uname -s) == Linux && $(uname -m) == aarch64 ]] || die "-k is KVM on an arm64 Linux host"
+  [[ -r /dev/kvm && -w /dev/kvm ]] || die "can't open /dev/kvm: join its group (usually kvm) and log in again"
+  accel_name=KVM accel=(-accel kvm) limit=90 desktop_wait=60 slow=1
   machine=",memory-backend=ram,dump-guest-core=off"
   mem=(-m "$ram" -object "memory-backend-memfd,id=ram,size=$ram,share=on")
 else
-  accel=(-accel hvf,kernel-irqchip=on) limit=90 desktop_wait=60 slow=1
+  accel_name=HVF accel=(-accel hvf,kernel-irqchip=on) limit=90 desktop_wait=60 slow=1
   machine= mem=(-m "$ram")
 fi
 
 [[ -n $firmware && -f $firmware ]] || die "no Ambrosia image: give its target/ambrosia.bin with -f"
 [[ -n $qemu && -x $qemu ]] || die "no QEMU: give our qemu-system-aarch64 with -q, or set QEMU"
 [[ -f $bundle ]] || die "no bundle $bundle: make config-bundle, or give one with -b"
+# Under KVM the bundle's config.plist, the first member of its newc archive, must carry each of
+# kvm.plist's patches.
+if ((kvm)) && ! python3 -I - "$bundle" "$here/kvm.plist" << 'EOF'
+import plistlib, sys
+data = open(sys.argv[1], "rb").read()
+if data[:6] != b"070701":
+    sys.exit(1)
+size, name_size = int(data[54:62], 16), int(data[94:102], 16)
+if data[110:110 + name_size] != b"config.plist\0":
+    sys.exit(1)
+at = (110 + name_size + 3) & ~3
+has = plistlib.loads(data[at:at + size]).get("Kernel", {}).get("Patch", [])
+wants = plistlib.load(open(sys.argv[2], "rb"))["Kernel"]["Patch"]
+sys.exit(0 if all(w in has for w in wants) else 1)
+EOF
+then
+  die "$bundle lacks kvm.plist's Kernel > Patch, which macOS needs under KVM: make config-bundle KVM=1"
+fi
 [[ -x $tools/bench && -x $tools/present_probe && -x $tools/sole_holder_probe ]] ||
   die "no guest probes in $tools: make guest-tools on a Mac (copy build/guest-tools to a Linux member), or give them with -T"
 [[ -f $vm/disk.img ]] || die "no disk.img in $vm"
@@ -822,7 +853,7 @@ fi
 # --- the verdict --------------------------------------------------------------------------------
 
 {
-  echo "check-boot: $(basename "$vm") on $( ((tcg)) && echo TCG || echo HVF), bundle $(basename "$bundle"), logs in $out"
+  echo "check-boot: $(basename "$vm") on $accel_name, bundle $(basename "$bundle"), logs in $out"
   if [[ -n $ssh_s ]]; then
     if [[ $gver =~ ^[0-9]+\.[0-9] ]]; then echo "check-boot: guest macOS $(echo $gver)"
     else echo "check-boot: guest macOS unread: $(echo "$gver" | tail -1)"; fi

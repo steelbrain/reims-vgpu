@@ -9,7 +9,8 @@
 //!   `guest/prebuilt-arm64e/set.toml` lists, and the device's driver module for Ambrosia, which
 //!   build.rs builds from `firmware/ambrosia/ReimsGraphicsModule.c`. Its QEMU loads them into
 //!   the guest as Ambrosia's configuration bundle ([`ambrosia_bundle`]), the bundle
-//!   `make -C firmware/ambrosia config-bundle` makes of the same files.
+//!   `make -C firmware/ambrosia config-bundle` makes of the same files; under KVM with
+//!   `firmware/ambrosia/kvm.plist`'s patches added, as `config-bundle KVM=1` adds them.
 //!
 //! Embedded, they are the ones of the commit reims-ctl was built from, however
 //! scripts/install-ctl.sh installed it (`cargo install --path`, with or without the QEMU of that
@@ -59,6 +60,12 @@ include!(concat!(env!("OUT_DIR"), "/set.rs"));
 /// The config.plist of the device's bundle for Ambrosia, `firmware/ambrosia/config.plist`: it
 /// names the module and the vtables Ambrosia hands Graft.
 pub static AMBROSIA_CONFIG: &[u8] = include_bytes!("../../../firmware/ambrosia/config.plist");
+
+/// What an arm64 VM's configuration adds under KVM, `firmware/ambrosia/kvm.plist`: its
+/// `Kernel > Patch` alone, which rewrites the pre-indexed store macOS's kernel sets up each GIC
+/// redistributor with, which KVM's in-kernel vGIC can't take (the file says why and where it was
+/// measured).
+pub static AMBROSIA_KVM: &[u8] = include_bytes!("../../../firmware/ambrosia/kvm.plist");
 
 /// Each kext of the arm64 guest's configuration, in `Kernel > Add` order, Graft before the two
 /// kexts that run on it: its bundle's name in the bundle and its `CFBundleIdentifier`, by which
@@ -133,8 +140,9 @@ fn content_file(dir: &Path, stem: &str, ext: &str, bytes: &[u8]) -> PathBuf {
 
 /// An arm64 VM's configuration bundle for Ambrosia, written there if it is not: QEMU loads it
 /// into the guest's memory, where Ambrosia reads it. It is ours, with the VM's own patches where
-/// it has them, its `vm_config` ([`crate::vm::Vm::ambrosia_config`]).
-pub fn ambrosia_bundle(vm_config: &Path) -> Result<PathBuf> {
+/// it has them, its `vm_config` ([`crate::vm::Vm::ambrosia_config`]), and where the VM runs on
+/// KVM (`kvm`), [`AMBROSIA_KVM`]'s after them.
+pub fn ambrosia_bundle(vm_config: &Path, kvm: bool) -> Result<PathBuf> {
     let (set, module) = carried_arm64();
     let set = set.context(
         "this reims-ctl was built without reims-vgpu's arm64 guest kexts \
@@ -144,7 +152,7 @@ pub fn ambrosia_bundle(vm_config: &Path) -> Result<PathBuf> {
         "this reims-ctl was built without the device's driver module for Ambrosia, which clang \
          builds as reims-ctl is built: install clang, then run reims-ctl update",
     )?;
-    let bundle = config_bundle(set, module, vm_patches(vm_config)?)?;
+    let bundle = config_bundle(set, module, patches(vm_config, kvm)?)?;
     file_in(&dir(), "Config", "cpio", &bundle)
 }
 
@@ -155,12 +163,37 @@ pub fn carries_arm64() -> bool {
 }
 
 /// Where [`ambrosia_bundle`] writes it, or None where this reims-ctl can't make one.
-pub fn ambrosia_bundle_path(vm_config: &Path) -> Option<PathBuf> {
+pub fn ambrosia_bundle_path(vm_config: &Path, kvm: bool) -> Option<PathBuf> {
     let (Some(set), Some(module)) = carried_arm64() else {
         return None;
     };
-    let bundle = config_bundle(set, module, vm_patches(vm_config).ok()?).ok()?;
+    let bundle = config_bundle(set, module, patches(vm_config, kvm).ok()?).ok()?;
     Some(content_file(&dir(), "Config", "cpio", &bundle))
+}
+
+/// The `Kernel > Patch` entries of an arm64 VM's bundle: its own ([`vm_patches`]), then, where
+/// it runs on KVM, [`kvm_patches`].
+fn patches(vm_config: &Path, kvm: bool) -> Result<Vec<plist::Value>> {
+    let mut patches = vm_patches(vm_config)?;
+    if kvm {
+        patches.extend(kvm_patches()?);
+    }
+    Ok(patches)
+}
+
+/// [`AMBROSIA_KVM`]'s `Kernel > Patch` entries.
+fn kvm_patches() -> Result<Vec<plist::Value>> {
+    let config = plist::Value::from_reader(std::io::Cursor::new(AMBROSIA_KVM))
+        .context("read firmware/ambrosia/kvm.plist")?;
+    match config
+        .as_dictionary()
+        .and_then(|d| d.get("Kernel"))
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|k| k.get("Patch"))
+    {
+        Some(plist::Value::Array(patches)) => Ok(patches.clone()),
+        _ => bail!("firmware/ambrosia/kvm.plist has no Kernel > Patch array"),
+    }
 }
 
 /// The `Kernel > Patch` entries of a VM's own configuration, `vm_config`
@@ -723,6 +756,71 @@ mod tests {
         assert!(e.to_string().contains("has Misc"), "{e:#}");
         std::fs::write(&file, b"not a bundle").unwrap();
         assert!(vm_patches(&file).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A VM on KVM boots with kvm.plist's patch for macOS's GIC setup, after the VM's own
+    /// patches; on HVF and TCG its bundle has none of it.
+    #[test]
+    fn a_vm_on_kvm_boots_with_the_gic_patch() {
+        let gic = kvm_patches().unwrap();
+        assert_eq!(gic.len(), 1);
+        let p = gic[0].as_dictionary().unwrap();
+        assert_eq!(p["Identifier"].as_string(), Some("com.apple.kernel"));
+        assert_eq!(
+            p["Find"].as_data(),
+            Some(
+                &[
+                    0x09, 0xc0, 0xaf, 0x12, 0x09, 0x0d, 0x08, 0xb8, 0x09, 0x00, 0xa1, 0x52, 0x09,
+                    0x81, 0x00, 0xb9
+                ][..]
+            )
+        );
+        assert_eq!(
+            p["Replace"].as_data(),
+            Some(
+                &[
+                    0x09, 0xc0, 0xaf, 0x12, 0x09, 0x81, 0x00, 0xb9, 0x09, 0x00, 0xa1, 0x52, 0x09,
+                    0x01, 0x01, 0xb9
+                ][..]
+            )
+        );
+        assert_eq!(p["Expect"].as_signed_integer(), Some(1));
+
+        let d = scratch("kvm-patches");
+        std::fs::create_dir_all(&d).unwrap();
+        let none = d.join("config.cpio");
+        assert!(patches(&none, false).unwrap().is_empty());
+        assert_eq!(patches(&none, true).unwrap(), gic);
+
+        let mut own = plist::Dictionary::new();
+        own.insert("Identifier".into(), "com.example.kext".into());
+        own.insert("Find".into(), plist::Value::Data(vec![1, 2, 3]));
+        own.insert("Replace".into(), plist::Value::Data(vec![4, 5, 6]));
+        let mut kernel = plist::Dictionary::new();
+        kernel.insert(
+            "Patch".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(own.clone())]),
+        );
+        let mut config = plist::Dictionary::new();
+        config.insert("Kernel".into(), plist::Value::Dictionary(kernel));
+        let file = d.join("restored.cpio");
+        std::fs::write(
+            &file,
+            reims_restore::anchors::config_bundle(&config).unwrap(),
+        )
+        .unwrap();
+        let mut want = vec![plist::Value::Dictionary(own)];
+        assert_eq!(patches(&file, false).unwrap(), want);
+        want.extend(gic);
+        assert_eq!(patches(&file, true).unwrap(), want);
+        let bundle =
+            members(&config_bundle(SET_ARM64E, b"m", patches(&file, true).unwrap()).unwrap());
+        let plist = plist::Value::from_reader(std::io::Cursor::new(&bundle[0].2)).unwrap();
+        let kernel = plist.as_dictionary().unwrap()["Kernel"]
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(kernel["Patch"], plist::Value::Array(want));
         std::fs::remove_dir_all(&d).unwrap();
     }
 

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Stage our configuration's bundle for Ambrosia, which the Makefile's config-bundle target packs.
 
-    stage-config.py OUT CONFIG MODULE GRAFT REIMS_GRAPHICS RGFXGATE
+    stage-config.py [--patches PATCHES] OUT CONFIG MODULE GRAFT REIMS_GRAPHICS RGFXGATE
     stage-config.py --identifiers
 
 OUT is written afresh: CONFIG, the config.plist that names the module, with a Kernel > Add entry
 for each kext and the displays' nodes (Graphics > DisplayNode) as OUT/config.plist; MODULE as
 OUT/Drivers/ReimsGraphics.elf; and each kext as OUT/Kexts/<its name>.kext. The entries list the
-kexts in KEXTS' order, Graft before the two kexts that run on it.
+kexts in KEXTS' order, Graft before the two kexts that run on it. With --patches, the Kernel > Patch
+of PATCHES, a property list of that alone (kvm.plist, for a guest under KVM), is appended to
+CONFIG's.
 
 Graphics > DisplayNode, the names in DISPLAY_NODES, has Ambrosia add /arm-io/<name> to the device
 tree, a display-subsystem node, for each display the module says the device drives, in order and as
@@ -113,6 +115,9 @@ def main(argv):
         for _, _, identifier in KEXTS:
             print(identifier)
         return 0
+    patches = None
+    if argv[1:2] == ["--patches"] and len(argv) > 2:
+        patches, argv = argv[2], argv[:1] + argv[3:]
     if len(argv) != 4 + len(KEXTS):
         print("usage: " + __doc__.strip().splitlines()[2].strip(), file=sys.stderr)
         return 2
@@ -130,6 +135,13 @@ def main(argv):
         plist = plistlib.load(f)
     plist.setdefault("Kernel", {})["Add"] = [{"BundlePath": f"Kexts/{name}"} for _, name, _ in KEXTS]
     plist.setdefault("Graphics", {})["DisplayNode"] = DISPLAY_NODES
+    if patches:
+        with open(patches, "rb") as f:
+            extra = plistlib.load(f)
+        if set(extra) != {"Kernel"} or set(extra["Kernel"]) != {"Patch"}:
+            print(f"stage-config: {patches} holds more than Kernel > Patch", file=sys.stderr)
+            return 1
+        plist["Kernel"].setdefault("Patch", []).extend(extra["Kernel"]["Patch"])
     if os.path.isdir(out):
         shutil.rmtree(out)
     os.makedirs(os.path.join(out, "Drivers"))

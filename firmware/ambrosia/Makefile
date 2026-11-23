@@ -19,7 +19,9 @@
 #                interface's revision 2 on and refuses before), and the kexts under Kexts/
 #                (tools/stage-config.py). Each must be given, and be a kext bundle
 #                with the identifier its role expects and an arm64e executable; where one
-#                is not, the target names it and why, and writes no bundle
+#                is not, the target names it and why, and writes no bundle. KVM=1 adds
+#                kvm.plist's Kernel > Patch, which a guest under KVM on an arm64 Linux host
+#                needs (kvm.plist says why), for check-boot.sh -k
 #   make guest-tools
 #                build/guest-tools: the lane gate's guest probes that check-boot.sh runs
 #                in an arm64 guest, built on a Mac for arm64 and macOS 13 and later from
@@ -61,9 +63,11 @@ bundle: $(BUILD)/ReimsGraphics.cpio
 
 # The kexts' builds live outside this tree, and make sees none of their changes, so the bundle is
 # staged afresh each time; a failed stage leaves no bundle behind.
+KVM =
 config-bundle: $(BUILD)/ReimsGraphics.elf
 	rm -f $(BUILD)/Config.cpio
-	python3 -I -B tools/stage-config.py $(BUILD)/config config.plist $(BUILD)/ReimsGraphics.elf \
+	python3 -I -B tools/stage-config.py $(if $(filter 1,$(KVM)),--patches kvm.plist) \
+		$(BUILD)/config config.plist $(BUILD)/ReimsGraphics.elf \
 		"$(GRAFT)" "$(REIMS_GRAPHICS)" "$(RGFXGATE)"
 	cd $(BUILD)/config && { echo config.plist; echo Drivers/ReimsGraphics.elf; \
 		find Kexts -type f | LC_ALL=C sort; } | cpio -o -H newc > ../Config.cpio
