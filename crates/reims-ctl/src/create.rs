@@ -782,7 +782,17 @@ pub fn installer_media(src: &Path, dir: &Path, progress: &mut dyn FnMut(&str)) -
     if !is_dmg(src)? {
         return Ok(src.to_path_buf());
     }
-    // Written beside the copy and renamed over it: a running VM may have it open.
+    // Written beside the copy and renamed over it: a running VM may have it open. On Windows its
+    // QEMU holds it so that nothing replaces it, and the rename would fail only after the
+    // conversion, which writes gigabytes for minutes.
+    let img = dir.join(INSTALLER_COPY);
+    if crate::os::held_against_delete(&img) {
+        bail!(
+            "{} is open in another process, the VM's QEMU while it runs, so a new copy cannot \
+             replace it: stop the VM first",
+            paths::tilde(&img)
+        );
+    }
     let part = dir.join(format!("{INSTALLER_COPY}.part"));
     let converted = convert_dmg(src, &part, progress);
     if let Err(e) = converted {
@@ -800,8 +810,12 @@ pub fn installer_media(src: &Path, dir: &Path, progress: &mut dyn FnMut(&str)) -
         }
         bail!("{e}");
     }
-    std::fs::rename(&part, dir.join(INSTALLER_COPY))
-        .with_context(|| format!("rename {}", part.display()))?;
+    // The rename can still fail, on Windows where the VM started during the conversion: the
+    // part is removed then.
+    if let Err(e) = std::fs::rename(&part, &img) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e).with_context(|| format!("rename {}", part.display()));
+    }
     Ok(PathBuf::from(INSTALLER_COPY))
 }
 

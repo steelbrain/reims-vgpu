@@ -1201,9 +1201,10 @@ fn show(vm: &Vm, host: Host) {
 
 /// Sets the installer, for the VM's next start. Returns what happened. A DMG is converted into
 /// the VM's directory first (`create::installer_media`), and the VM's copy of the installer it
-/// replaces is deleted. The installer is set in the VM's settings as they are once that is
-/// done, which `vm` becomes: a DMG takes seconds to convert, in which others may be saved (the
-/// interface's edit form or logs toggle, reims-ctl set).
+/// replaces is deleted, or what happened says it could not be (on Windows, while the VM runs).
+/// The installer is set in the VM's settings as they are once that is done, which `vm` becomes:
+/// a DMG takes seconds to convert, in which others may be saved (the interface's edit form or
+/// logs toggle, reims-ctl set).
 pub fn set_installer(
     vm: &mut Vm,
     path: Option<PathBuf>,
@@ -1243,17 +1244,25 @@ pub fn set_installer(
     let old = std::mem::replace(&mut q.installer, installer.clone());
     now.save()?;
     *vm = now;
+    // On Windows the VM's QEMU, while it runs, holds the copy so that it cannot be deleted.
+    let mut kept = String::new();
     if let Some(c) = copy(&old)
         && installer != old
+        && let Err(e) = std::fs::remove_file(&c)
+        && e.kind() != std::io::ErrorKind::NotFound
     {
-        let _ = std::fs::remove_file(c);
+        kept = format!("; its old copy {} could not be deleted: {e}", paths::tilde(&c));
+        if running {
+            kept.push_str(". Delete it once the VM stops");
+        }
     }
-    Ok(match (&path, running) {
+    let said = match (&path, running) {
         (Some(p), false) => format!("{name}: {} attached for the next start", paths::tilde(p)),
         (Some(_), true) => format!("{name}: the installer changes at the next start"),
         (None, false) => format!("{name}: installer removed"),
         (None, true) => format!("{name}: the installer goes at the next start"),
-    })
+    };
+    Ok(said + &kept)
 }
 
 /// Whether `a` and `b` name the same existing file.
@@ -2367,6 +2376,64 @@ mod tests {
                 assert!(file.is_file(), "{own} to {to:?}");
             }
         }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// On Windows a running VM's QEMU holds the VM's copy of its installer open without
+    /// FILE_SHARE_DELETE (block/file-win32.c), so that no new copy replaces it and it cannot be
+    /// deleted: a DMG is refused before its conversion, which writes gigabytes, and a change
+    /// that would delete the copy says that it stays.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_installer_copy_refuses_a_dmg_and_is_said_to_stay() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let d = std::env::temp_dir().join(format!("reims-ctl-held-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("vm")).unwrap();
+        let config = r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            installer = "installer.img"
+        "#;
+        let mut vm = Vm {
+            dir: d.join("vm"),
+            config: toml::from_str(config).unwrap(),
+        };
+        vm.save().unwrap();
+        let copy = d.join("vm").join(create::INSTALLER_COPY);
+        std::fs::write(&copy, [0u8; 4096]).unwrap();
+        // A UDIF image: it ends in a 512-byte trailer starting `koly`.
+        let dmg = d.join("BaseSystem.dmg");
+        let mut udif = vec![0u8; 4096];
+        udif[4096 - 512..4096 - 508].copy_from_slice(b"koly");
+        std::fs::write(&dmg, &udif).unwrap();
+        // Opened as QEMU opens a drive's file.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&copy)
+            .unwrap();
+        let installer = |vm: &Vm| vm.config.q35.as_ref().unwrap().installer.clone();
+        let mut quiet = |_: &str| {};
+        let e = set_installer(&mut vm, Some(dmg), &mut quiet).unwrap_err().to_string();
+        assert!(e.ends_with("so a new copy cannot replace it: stop the VM first"), "{e}");
+        assert!(!d.join("vm").join("installer.img.part").exists());
+        let saved = Vm::load(&d.join("vm")).unwrap();
+        assert_eq!(installer(&saved), Some(create::INSTALLER_COPY.into()));
+        // An eject takes it out of the settings, and says the copy stays.
+        let said = set_installer(&mut vm, None, &mut quiet).unwrap();
+        assert!(said.starts_with("t: installer removed; its old copy "), "{said}");
+        assert!(said.contains(" could not be deleted: "), "{said}");
+        assert_eq!(installer(&vm), None);
+        assert!(copy.is_file());
+        drop(held);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

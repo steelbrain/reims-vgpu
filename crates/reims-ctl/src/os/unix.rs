@@ -394,6 +394,13 @@ pub fn same_file_system(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Whether another process holds the file `p` open so that it can be neither deleted nor
+/// replaced: never here, where a file's name is removed or replaced while processes hold it
+/// open, and they keep the file they opened.
+pub fn held_against_delete(_p: &Path) -> bool {
+    false
+}
+
 /// The flag [`set_at_interrupt`] gave, for its signal handler.
 static INTERRUPT_FLAG: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicBool> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());

@@ -1046,6 +1046,23 @@ pub fn same_file_system(a: &Path, b: &Path) -> bool {
     matches!((volume(a), volume(b)), (Some(x), Some(y)) if x == y)
 }
 
+/// Whether another process holds the file `p` open so that it can be neither deleted nor
+/// replaced: opened without FILE_SHARE_DELETE, as QEMU opens a drive's file
+/// (block/file-win32.c), so that an open of it for delete access fails with a sharing violation.
+/// A file that does not exist is held by no one.
+pub fn held_against_delete(p: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let open = std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(p);
+    matches!(open, Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32))
+}
+
 /// The flag [`set_at_interrupt`] gave, for its console handler.
 static INTERRUPT_FLAG: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicBool> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
