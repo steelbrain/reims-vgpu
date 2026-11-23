@@ -174,8 +174,9 @@ pub fn out_of_host_memory_count() -> u64 {
 /// the spares made (`video-drawn-spares-made`) and dropped untaken (`video-drawn-spares-dropped`),
 /// and as its VA-API video on the rt platform on Linux copies a picture on the GPU into its
 /// output's device caches from a scratch the driver's video processing wrote
-/// (`video-pictures-gpu-copied`, and their crops' KiB, `video-gpu-copied-kib`), and as
-/// its video session's picture does not land after its command buffer
+/// (`video-pictures-gpu-copied`, and their crops' KiB, `video-gpu-copied-kib`), and as its
+/// NVDEC video on Linux writes a VideoToolbox decoder's 4:4:4 picture into its surface's two
+/// planes on the GPU (`video-pictures-gpu-gathered`), and as its video session's picture does not land after its command buffer
 /// completed at its decode, the session's next decode failing in its stead
 /// (`video-landing-failure-carried`); the rt platform's surfaces over Direct3D 11 textures on
 /// Windows, made (`rt-d3d11-surfaces`) and refused (`rt-refused-d3d11-surface`); and the objects

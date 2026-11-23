@@ -1870,8 +1870,10 @@ Stages:
       or the VA driver lists a Main 4:4:4 decoder of 4:4:4 render targets
       and XYUV surfaces at that size (iHD's), each picture landing in the
       4:4:4 format its `TDrs` names ('444v', '444f'), its Cb and Cr
-      interleaved by the CPU from NVDEC's three planes or VA-API's XYUV
-      samples (`graphics::nvidia`'s and `graphics::vaapi`'s module docs). A
+      interleaved from NVDEC's three planes by the runtime device's GPU
+      where CUDA imports the device's exportable buffers, else by the CPU,
+      and from VA-API's XYUV samples by the CPU (`graphics::nvidia`'s,
+      `graphics::gather`'s and `graphics::vaapi`'s module docs). A
       stream the codec refuses (4:2:2, monochrome, a HEIC image's alpha
       item, a 4:4:4 stream past 8 bits), or one the arm declines (4:4:4 on
       a VA driver without that decoder, radeonsi's, and on an NVIDIA GPU

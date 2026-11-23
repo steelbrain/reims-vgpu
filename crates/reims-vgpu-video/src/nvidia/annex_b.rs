@@ -147,7 +147,7 @@ impl AnnexBDecoder {
     }
 
     /// Has an HEVC stream's 4:4:4 pictures decoded, each in three planes,
-    /// which the caller reads back ([`AnnexBPicture::four_four_four`]);
+    /// which the caller writes or reads back ([`AnnexBPicture::four_four_four`]);
     /// without it, a 4:4:4 stream's decoder is refused when its SPS is
     /// taken. An H.264 decoder is left as it is.
     pub fn lands_4_4_4(&mut self) {
@@ -383,7 +383,8 @@ impl AnnexBPicture {
 
     /// Whether it is a 4:4:4 picture, in three planes, luma, Cb and Cr, each
     /// as large ([`AnnexBDecoder::lands_4_4_4`]): its read back has the
-    /// three, and its writes, of two planes, refuse it.
+    /// three, its writes of two planes refuse it, and
+    /// [`Self::write_4_4_4_into_device`] takes the three.
     pub fn four_four_four(&self) -> bool {
         self.picture.plane_count() == 3
     }
@@ -549,10 +550,47 @@ impl AnnexBPicture {
         if let Some(why) = self.refuse_two_planes() {
             return Ok(Err(why));
         }
+        // SAFETY: the caller's planes and hold, as this function's contract says.
+        unsafe { self.write_planes_into_device(size, vec![luma, chroma], hold) }
+    }
+
+    /// [`Self::write_into_device`] of a 4:4:4 picture ([`Self::four_four_four`]): `size` of the
+    /// crop into `planes`, its luma, Cb and Cr, each plane's rows alone, as much as fits, by one
+    /// `cuMemcpy2D` a plane within the GPU. The inner `Err` also says that the picture is not
+    /// 4:4:4.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::write_into_device`]'s, for each of the three planes.
+    pub unsafe fn write_4_4_4_into_device(
+        &self,
+        size: (u32, u32),
+        planes: [DevicePlane<'_>; 3],
+        hold: Box<dyn Any + Send>,
+    ) -> Result<Result<(), String>, Error> {
+        if !self.four_four_four() {
+            return Ok(Err("a 4:2:0 picture's two planes into three".to_owned()));
+        }
+        // SAFETY: the caller's planes and hold, as this function's contract says.
+        unsafe { self.write_planes_into_device(size, planes.into(), hold) }
+    }
+
+    /// The write of [`Self::write_into_device`] and [`Self::write_4_4_4_into_device`]: a plane
+    /// each of the picture's planes, in order.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::write_into_device`]'s, for each of `planes`.
+    unsafe fn write_planes_into_device(
+        &self,
+        size: (u32, u32),
+        planes: Vec<DevicePlane<'_>>,
+        hold: Box<dyn Any + Send>,
+    ) -> Result<Result<(), String>, Error> {
         let gpu = self.picture.gpu();
         let mut written: Vec<Box<dyn Any + Send>> = vec![hold];
-        let mut destinations = Vec::with_capacity(2);
-        for plane in [luma, chroma] {
+        let mut destinations = Vec::with_capacity(planes.len());
+        for plane in planes {
             // One GPU's imports share its primary context, which its decoders' copies run in.
             if plane.buffer.gpu().info().pci_bus_id != gpu.info().pci_bus_id {
                 return Ok(Err("a buffer imported on another GPU".to_owned()));

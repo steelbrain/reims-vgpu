@@ -544,9 +544,11 @@ fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
                 let params = params(profile, width, height);
                 let mut encoder =
                     NvencEncoder::new(Arc::clone(&video.gpu), &params).expect("an NVENC session");
-                let mut guest = NvGuestDecoder {
+                let mut guest = NvGuestDecoder::<RtPlatform> {
                     decoder: AnnexBDecoder::new(&video.gpu, codec, &runtime),
                     said: Vec::new(),
+                    gathers: Err("a 4:2:0 stream's".to_owned()),
+                    gathered: 0,
                 };
                 let mut reference = AnnexBDecoder::new(&video.gpu, codec, &runtime);
                 reference
@@ -559,6 +561,7 @@ fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
                 let output = GuestOutput {
                     layout: layout.clone(),
                     memory: &memory,
+                    buffer: None,
                 };
                 let mut pictures = 0;
                 for n in 0..7 {
@@ -581,6 +584,7 @@ fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
                             let output = GuestOutput {
                                 layout: wide.clone(),
                                 memory: &memory,
+                                buffer: None,
                             };
                             let refused = guest.decode(sets, &packet.data, &output);
                             let said = match &refused {

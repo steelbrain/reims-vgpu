@@ -115,7 +115,7 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// A decoder of `codec` (`RGFX_VIDEO_CODEC_*`, one of [`Self::caps`] in the decode
     /// direction) whose pictures land in surfaces the guest lends with VideoToolbox's paravirtual
     /// messages ([`GuestDecoder`]); `None` where the arm has none.
-    fn guest_decoder(&self, _codec: u32) -> Option<Box<dyn GuestDecoder>> {
+    fn guest_decoder(&self, _codec: u32) -> Option<Box<dyn GuestDecoder<P>>> {
         None
     }
     /// Whether [`Self::guest_decoder`] answers a decoder of each codec [`Self::caps`] decodes.
@@ -177,7 +177,7 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
 /// A decoder of one codec's Annex-B access units, in decode order, whose pictures land in
 /// surfaces the guest lent: VideoToolbox's paravirtual decoders' (`super::super::vt`), one call
 /// at a time.
-pub trait GuestDecoder: Send {
+pub trait GuestDecoder<P: Platform>: Send {
     /// Decodes `au`, NAL units in Annex-B form, after `parameter_sets` (Annex-B, where they
     /// changed; else empty), into `output`, and returns once the picture is there: `Ok(true)`, or
     /// `Ok(false)` for an access unit the stream's random access skips, `output` left as it was.
@@ -185,8 +185,15 @@ pub trait GuestDecoder: Send {
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
-        output: &GuestOutput<'_>,
+        output: &GuestOutput<'_, P>,
     ) -> Result<bool, reims_vgpu_video::core::backend::BackendError>;
+
+    /// Whether the device's GPU writes its 4:4:4 pictures into the surface, through a buffer of
+    /// the device's over the surface's pages ([`GuestOutput::buffer`]), which its caller then
+    /// makes for a 4:4:4 surface: false, the default, where none is to be made.
+    fn lands_4_4_4_by_gpu(&self) -> bool {
+        false
+    }
 
     /// Whether it lands a part of a picture ([`GuestDecoder::decode_region`]): false, the
     /// default, where it lands only whole pictures.
@@ -201,7 +208,7 @@ pub trait GuestDecoder: Send {
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
-        output: &GuestOutput<'_>,
+        output: &GuestOutput<'_, P>,
         region: [u32; 4],
     ) -> Result<bool, VideoError> {
         let _ = (parameter_sets, au, output, region);
@@ -264,11 +271,16 @@ pub struct GuestSource<'a, P: Platform> {
 }
 
 /// A surface the guest lent, as a [`GuestDecoder`] lands a picture in it.
-pub struct GuestOutput<'a> {
+pub struct GuestOutput<'a, P: Platform> {
     /// Its layout: its CoreVideo format, its size and its two planes.
     pub layout: SurfaceLayout,
     /// Its memory, the surface's first byte its first.
     pub memory: &'a dyn DeviceMemory,
+    /// A Shared buffer of the device's over its pages, the surface's first byte its first, for
+    /// the device's GPU to write them in place, where the decoder lands 4:4:4 pictures so
+    /// ([`GuestDecoder::lands_4_4_4_by_gpu`]) and the surface is 4:4:4; `None` otherwise, and
+    /// where the device made none.
+    pub buffer: Option<&'a P::Buffer>,
 }
 
 /// What the video crate's codec decoders refuse of `codec` beyond its entry

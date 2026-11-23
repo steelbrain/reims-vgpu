@@ -5,7 +5,10 @@
 //! for it ([`GuestSurface`]), through a view of the surface's guest RAM pages
 //! ([`LentViews::view`]), laid out as the kext read the surface ([`layout_of`]). The arm's decoder
 //! answers once the picture is there; the session then emits the frame, and lets go of the
-//! surface with a `rels`.
+//! surface with a `rels`. A decoder whose 4:4:4 pictures the device's GPU writes
+//! ([`GuestDecoder::lands_4_4_4_by_gpu`]) is handed, for a 4:4:4 surface, a Shared buffer of the
+//! device's over the surface's pages ([`LentViews::buffer_over`]), which the GPU writes them in
+//! place through.
 //!
 //! Its paravirtual encoders are the arm's too ([`VtEncoderBackend`]): each session's encoder is
 //! one of the arm's [`GuestEncoder`]s, which reads each source frame from the IOSurface the guest
@@ -17,7 +20,7 @@
 //! A decoder or encoder keeps the views of the last [`VIEWS_KEPT`] surfaces it used, by their
 //! runs, as VideoToolbox's pool lends the same few surfaces again and again: a view maps the
 //! guest's RAM, so a kept one never goes stale, and what the arm made of its memory (the driver's
-//! import of it) is kept with it, as is an encoder's buffer over it.
+//! import of it) is kept with it, as is a buffer over it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -27,7 +30,7 @@ use reims_vgpu_graphics::wire::{
     RgfxVtSurface,
 };
 use reims_vgpu_video::codec::encode::{Coded, FailedSample};
-use reims_vgpu_video::core::backend::BackendError as VideoError;
+use reims_vgpu_video::core::backend::{BackendError as VideoError, PixelFormat};
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::paravirt::status::{self, OsStatus};
@@ -50,12 +53,22 @@ const VIEWS_KEPT: usize = 8;
 pub(super) struct VtBackend<P: Platform> {
     video: Arc<dyn GraphicsVideo<P>>,
     views: LentViews<P>,
+    device: P::Device,
 }
 
 impl<P: Platform> VtBackend<P> {
-    /// The backend of `video`'s guest decoders, landing in views `views` makes.
-    pub(super) fn new(video: Arc<dyn GraphicsVideo<P>>, views: LentViews<P>) -> Self {
-        Self { video, views }
+    /// The backend of `video`'s guest decoders, landing in views `views` makes, and in buffers
+    /// of `device`'s over them where a decoder's GPU writes them.
+    pub(super) fn new(
+        video: Arc<dyn GraphicsVideo<P>>,
+        views: LentViews<P>,
+        device: P::Device,
+    ) -> Self {
+        Self {
+            video,
+            views,
+            device,
+        }
     }
 }
 
@@ -93,6 +106,7 @@ impl<P: Platform> Backend for VtBackend<P> {
         Ok(Box::new(VtDecoder {
             decoder,
             views: self.views.clone(),
+            device: self.device.clone_ref(),
             kept: VecDeque::new(),
             said: Vec::new(),
             tiles,
@@ -100,12 +114,14 @@ impl<P: Platform> Backend for VtBackend<P> {
     }
 }
 
-/// One session's decoder, and the views of the surfaces it landed in last.
+/// One session's decoder, and the views of the surfaces it landed in last, each with the buffer
+/// over its pages, or why there is none, once one was asked for.
 struct VtDecoder<P: Platform> {
-    decoder: Box<dyn GuestDecoder>,
+    decoder: Box<dyn GuestDecoder<P>>,
     views: LentViews<P>,
-    kept: Kept<()>,
-    /// The reasons a decode failed, each logged once.
+    device: P::Device,
+    kept: Kept<Option<Result<P::Buffer, String>>>,
+    /// The reasons a decode failed, or a view has no buffer, each logged once.
     said: Vec<String>,
     /// The tiles it decodes into regions of an output, where the arm lands parts of pictures.
     tiles: Option<TileLimits>,
@@ -205,18 +221,41 @@ impl<P: Platform> VtDecoder<P> {
             Some(Ok(layout)) => layout,
             Some(Err(why)) => return Err(self.failed(status::PARAMETER, why)),
         };
-        let view = match view_of(
+        let (view, buffer) = match view_of(
             &mut self.kept,
             &self.views,
             &surface.runs,
             surface.surface.length,
         ) {
-            Ok((view, ())) => view,
+            Ok(view) => view,
             Err(why) => return Err(self.failed(status::VIDEO_DECODER_MALFUNCTION, why)),
+        };
+        // A buffer over a 4:4:4 surface's pages, for a decoder whose GPU writes them.
+        let four_four_four =
+            PixelFormat::from_fourcc(layout.pixel_format).is_some_and(PixelFormat::is_4_4_4);
+        let buffer = match four_four_four && self.decoder.lands_4_4_4_by_gpu() {
+            false => None,
+            true => {
+                match buffer.get_or_insert_with(|| self.views.buffer_over(&self.device, view)) {
+                    Ok(buffer) => Some(&*buffer),
+                    Err(why) => {
+                        if !self.said.contains(why) {
+                            log::info!(
+                                target: "reims_vgpu::graphics::vt",
+                                "hardware video: a VideoToolbox picture lands with no buffer over its \
+                                 surface: {why}"
+                            );
+                            self.said.push(why.clone());
+                        }
+                        None
+                    }
+                }
+            }
         };
         let output = GuestOutput {
             layout,
             memory: &**view.memory(),
+            buffer,
         };
         let decoded = match region {
             None => self.decoder.decode(parameter_sets, access_unit, &output),

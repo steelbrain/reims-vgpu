@@ -179,7 +179,11 @@ repeats the ones code cites.
     on the rt platform on Linux (`video-pictures-gpu-copied`, a picture
     the GPU copied into its output's device caches from a scratch the
     driver's video processing wrote, and `video-gpu-copied-kib`, the KiB of
-    their crops: one GPU pass a picture that a Mac does not make) and its
+    their crops: one GPU pass a picture that a Mac does not make), its NVDEC
+    video's on Linux (`video-pictures-gpu-gathered`, a VideoToolbox
+    decoder's 4:4:4 picture the GPU wrote into its surface's two planes
+    from the decoder's scratch: one GPU pass a picture that a Mac does not
+    make) and its
     decodes' (`video-landing-failure-carried`, a picture whose copy or
     draw into its output's caches failed after its command buffer
     completed at its decode, the session's next decode failing in its

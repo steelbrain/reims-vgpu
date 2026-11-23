@@ -222,7 +222,12 @@ the model.
   (`Mapped::of`). The range extensions' fields of `CUVIDHEVCPICPARAMS` take
   the SPS's and PPS's range extensions, the chroma QP offset lists'
   entries among them. A picture of three planes reads back with three
-  copies (`AnnexBPicture::read_back`); a write of two planes refuses it.
+  copies (`AnnexBPicture::read_back`), and is written within the GPU into
+  three planes of imported buffers by three
+  (`AnnexBPicture::write_4_4_4_into_device`); a write of two planes refuses
+  it. VideoToolbox's paravirtual decoders write it so into a scratch of the
+  runtime device's, whose kernel then writes the guest's surface's two
+  planes (reims-vgpu's `graphics::nvidia` and `graphics::gather`).
 - **HEVC.** The references by surface index with their order counts and
   long-term flags; `RefPicSetStCurrBefore`, `StCurrAfter` and `LtCurr` as
   indices into them, in the order 8.3.2 derives them, which the codec

@@ -174,6 +174,8 @@ mod device_info;
 #[cfg(windows)]
 mod drawn;
 mod fault_walk;
+#[cfg(any(target_os = "linux", test))]
+mod gather;
 #[cfg(target_os = "linux")]
 mod nvidia;
 mod present;
@@ -912,7 +914,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 // surfaces the guest lends: each session decodes on the arm.
                 // Its encoders, where the arm encodes the source frames the guest lends.
                 if video.guest_decodes() {
-                    let backend = vt::VtBackend::new(Arc::clone(&video), decoder.lent_views());
+                    let backend = vt::VtBackend::new(
+                        Arc::clone(&video),
+                        decoder.lent_views(),
+                        gpu_device.clone_ref(),
+                    );
                     vt = paravirt::Host::with_backend(
                         vt_decoders(&caps),
                         Arc::new(backend),

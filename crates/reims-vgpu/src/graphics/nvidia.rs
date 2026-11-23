@@ -61,8 +61,17 @@
 //!     planes, at the stream's size; elsewhere the session is refused at its start, the reason
 //!     named (`GraphicsVideo::guest_declines`), and the guest decodes in software. The picture
 //!     lands in the surface's 4:4:4 formats ('444v', '444f'), its luma as it lies and its Cb and
-//!     Cr interleaved into the surface's second plane by the CPU, from the picture read back:
-//!     the write of two planes refuses a picture of three, and that reason is logged.
+//!     Cr interleaved into the surface's second plane, by the GPU where CUDA imports the device's
+//!     exportable buffers: one `cuMemcpy2D` a plane within the GPU into the decoder's scratch,
+//!     an exportable buffer of the device's that CUDA imported, made at the decoder's first
+//!     4:4:4 picture (and again for a larger one) as zeros, its three planes one after another
+//!     at one pitch, the width rounded up to 256 bytes; then the scratch said written
+//!     (`Buffer::external_write_done`), and the platform library's `videoGather444` kernel writes
+//!     the surface's two planes from it, through a Shared buffer over the surface's pages
+//!     (`super::gather`, counted as `video-pictures-gpu-gathered`). Where that is refused, the
+//!     picture is read back and interleaved by the CPU, the reason logged once a decoder: a
+//!     scratch the device or CUDA does not make, which the decoder does not ask again, no buffer
+//!     over the surface, a plane off a 32-bit word, the kernel's pipeline refused.
 //! - **VideoToolbox's paravirtual encoders** (`encode`'s `guest`): an arm64 guest's encode, of
 //!   each codec NVENC encodes a profile of, on an NVENC encoder of its own, each source frame read
 //!   from the IOSurface its kext lent: copied by the GPU into memory NVENC reads, as an x86
@@ -100,6 +109,7 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
 };
+use super::gather::{GatherPipeline, Gatherer, Planar, gathers};
 use super::video_host::{
     BackendError, DecodeOutput, Extent, Failed, HostDecoder, HostEncodeSession, HostPicture,
     HostVideoSession, Landing, OutputPlane, SourcePlane, picture_error,
@@ -131,6 +141,10 @@ const PROBE_BYTES: u64 = 3840 * 2160 * 3 / 2;
 
 /// The most imports of device caches kept at once: a few decoders' output pools.
 const MOST_IMPORTS: usize = 64;
+
+/// What the rows of a VideoToolbox decoder's scratch of 4:4:4 pictures are apart: the picture's
+/// width rounded up to a multiple of this, as a cache's rows are where the driver writes them.
+const SCRATCH_PITCH: u64 = 256;
 
 /// The video of each platform device, by its registry ID, while one lives: an `NvidiaVideo` of
 /// the device's platform.
@@ -196,6 +210,9 @@ struct NvidiaVideo<P: Platform> {
     /// where CUDA imports no exportable buffer of the device ([`imports_caches`]), and pictures
     /// land in the surfaces' pages.
     imports: Option<DeviceImports<ImportedBuffer>>,
+    /// The kernel that writes VideoToolbox's 4:4:4 pictures into their surfaces' two planes, for
+    /// the device's decoders (module doc).
+    gathers: Arc<GatherPipeline<P>>,
 }
 
 impl<P: Platform> NvidiaVideo<P> {
@@ -317,6 +334,7 @@ impl<P: Platform> NvidiaVideo<P> {
             encode,
             runtime: Arc::clone(runtime),
             imports,
+            gathers: Arc::new(GatherPipeline::new(device)),
         })
     }
 }
@@ -553,7 +571,7 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
         Ok(Box::new(encoder))
     }
 
-    fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder>> {
+    fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder<P>>> {
         let video = &self.0;
         let annex_b = match codec {
             RGFX_VIDEO_CODEC_H264 if video.h264.is_some() => AnnexBCodec::H264,
@@ -562,9 +580,19 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
         };
         let mut decoder = AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime);
         decoder.lands_4_4_4();
+        let gathers = match &video.imports {
+            Some(_) => Ok(Gathers {
+                gpu: Arc::clone(&video.gpu),
+                gatherer: Gatherer::new(Arc::clone(&video.gathers)),
+                scratch: None,
+            }),
+            None => Err("CUDA imports no exportable buffer of the device".to_owned()),
+        };
         Some(Box::new(NvGuestDecoder {
             decoder,
             said: Vec::new(),
+            gathers,
+            gathered: 0,
         }))
     }
 
@@ -862,14 +890,93 @@ impl<P: Platform> HostPicture<P> for NvdecPicture<P> {
 
 /// A decoder of VideoToolbox's paravirtual path ([`GuestDecoder`]), whose pictures land in the
 /// surface the guest lent (module doc): written there by the GPU where CUDA registers the view of
-/// its pages, else read back and copied by the CPU.
-struct NvGuestDecoder {
+/// its pages, a 4:4:4 one through its scratch and the device's kernel, else read back and copied
+/// by the CPU.
+struct NvGuestDecoder<P: Platform> {
     decoder: AnnexBDecoder,
     /// The reasons its pictures were copied by the CPU, each logged once.
     said: Vec<String>,
+    /// Its GPU writes of 4:4:4 pictures; `Err` says why it has none: CUDA imports no exportable
+    /// buffer of the device, or its scratch was refused.
+    gathers: Result<Gathers<P>, String>,
+    /// Its 4:4:4 pictures the GPU wrote so.
+    gathered: u64,
 }
 
-impl NvGuestDecoder {
+/// A VideoToolbox decoder's GPU writes of its 4:4:4 pictures (module doc): its gatherer, and its
+/// scratch, made at its first 4:4:4 picture and made again for a larger one.
+struct Gathers<P: Platform> {
+    gpu: Arc<Gpu>,
+    gatherer: Gatherer<P>,
+    scratch: Option<Scratch<P>>,
+}
+
+/// A decoder's scratch of 4:4:4 pictures (module doc): an exportable buffer of the device's that
+/// CUDA imported, the picture's luma, Cb and Cr planes in it one after another, each `rows` rows
+/// `pitch` bytes apart.
+struct Scratch<P: Platform> {
+    buffer: P::Buffer,
+    import: Arc<ImportedBuffer>,
+    pitch: u64,
+    rows: u64,
+}
+
+impl<P: Platform> Scratch<P> {
+    /// Where its planes lie.
+    fn planar(&self) -> Planar {
+        let plane = self.pitch * self.rows;
+        Planar {
+            planes: [0, plane, 2 * plane],
+            pitch: self.pitch,
+            length: 3 * plane,
+        }
+    }
+}
+
+impl<P: Platform> Gathers<P> {
+    /// Makes the decoder's scratch for a picture of `width` by `height`, where it has none as
+    /// large (module doc): `Err` says why none is made.
+    fn scratch_for(&mut self, (width, height): (u32, u32)) -> Result<(), String> {
+        let (pitch, rows) = (
+            u64::from(width).next_multiple_of(SCRATCH_PITCH),
+            u64::from(height),
+        );
+        if (self.scratch.as_ref()).is_some_and(|s| s.pitch >= pitch && s.rows >= rows) {
+            return Ok(());
+        }
+        let (pitch, rows) = match self.scratch.take() {
+            Some(kept) => (kept.pitch.max(pitch), kept.rows.max(rows)),
+            None => (pitch, rows),
+        };
+        let length = (pitch.checked_mul(rows))
+            .and_then(|plane| plane.checked_mul(3))
+            .ok_or("a scratch past 2^64 bytes")?;
+        let made = self.gatherer.device().new_exportable_buffer_of_length(
+            OnFault::Return,
+            length,
+            STORAGE_PRIVATE,
+            None,
+        );
+        let buffer = match made {
+            Ok(Some(buffer)) => buffer,
+            Ok(None) => return Err("the device makes no exportable scratch".to_owned()),
+            Err(raise) => return Err(format!("an exportable scratch's make: {raise}")),
+        };
+        self.gatherer
+            .zero(&buffer, length)
+            .map_err(|why| format!("the scratch's {why}"))?;
+        let import = Arc::new(import::<P>(&buffer, &self.gpu)?);
+        self.scratch = Some(Scratch {
+            buffer,
+            import,
+            pitch,
+            rows,
+        });
+        Ok(())
+    }
+}
+
+impl<P: Platform> NvGuestDecoder<P> {
     /// Logs, once a decoder, why a picture was copied by the CPU.
     fn copied_because(&mut self, why: String) {
         if !self.said.contains(&why) {
@@ -882,14 +989,19 @@ impl NvGuestDecoder {
     }
 }
 
-impl GuestDecoder for NvGuestDecoder {
+impl<P: Platform> GuestDecoder<P> for NvGuestDecoder<P> {
     fn decode(
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
-        output: &GuestOutput<'_>,
+        output: &GuestOutput<'_, P>,
     ) -> Result<bool, VideoError> {
         self.land(parameter_sets, au, output, None)
+    }
+
+    /// Where CUDA imports the device's exportable buffers, and its scratch was not refused.
+    fn lands_4_4_4_by_gpu(&self) -> bool {
+        self.gathers.is_ok()
     }
 
     /// The picture's crop narrows to the region, which then lands as a whole picture does, by
@@ -902,21 +1014,21 @@ impl GuestDecoder for NvGuestDecoder {
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
-        output: &GuestOutput<'_>,
+        output: &GuestOutput<'_, P>,
         region: [u32; 4],
     ) -> Result<bool, VideoError> {
         self.land(parameter_sets, au, output, Some(region))
     }
 }
 
-impl NvGuestDecoder {
+impl<P: Platform> NvGuestDecoder<P> {
     /// Decodes `au` after `parameter_sets`, and lands its picture, or `region` of it (`x`, `y`,
     /// `width`, `height`), in `output`.
     fn land(
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
-        output: &GuestOutput<'_>,
+        output: &GuestOutput<'_, P>,
         region: Option<[u32; 4]>,
     ) -> Result<bool, VideoError> {
         if !parameter_sets.is_empty() {
@@ -949,18 +1061,22 @@ impl NvGuestDecoder {
         }
         let size = (target.width(), target.height());
         let planes = target.planes();
-        let [luma, chroma] = planes.map(|plane| MemoryPlane {
-            memory: target.memory(),
-            offset: plane.offset,
-            bytes_per_row: plane.bytes_per_row,
-            row_bytes: plane.row_bytes,
-            rows: plane.rows,
-        });
-        // SAFETY: the planes are the surface's (`GuestTarget`'s check: apart, in order, each
-        // inside its memory), which the guest's kext holds lent, its pages wired, until the
-        // host's `rels`, sent once this returns, and which nothing of the host's writes
-        // meanwhile; the registration the write keeps holds the view of its pages mapped.
-        let written = unsafe { picture.write_into(size, luma, chroma, Box::new(())) };
+        let written = if four_four_four {
+            self.gather(&picture, size, &planes, output.buffer)
+        } else {
+            let [luma, chroma] = planes.map(|plane| MemoryPlane {
+                memory: target.memory(),
+                offset: plane.offset,
+                bytes_per_row: plane.bytes_per_row,
+                row_bytes: plane.row_bytes,
+                rows: plane.rows,
+            });
+            // SAFETY: the planes are the surface's (`GuestTarget`'s check: apart, in order, each
+            // inside its memory), which the guest's kext holds lent, its pages wired, until the
+            // host's `rels`, sent once this returns, and which nothing of the host's writes
+            // meanwhile; the registration the write keeps holds the view of its pages mapped.
+            unsafe { picture.write_into(size, luma, chroma, Box::new(())) }
+        };
         match written.map_err(video_error)? {
             Ok(()) => return Ok(true),
             Err(why) => self.copied_because(why),
@@ -990,9 +1106,79 @@ impl NvGuestDecoder {
         drop(view);
         Ok(true)
     }
+
+    /// Writes `picture`, a 4:4:4 one, into `planes` of the surface `buffer` lies over, by the GPU
+    /// (module doc): `size` of its crop copied within the GPU into the decoder's scratch, then
+    /// the kernel's pass from there into the surface. The outer `Err` is the picture's, as
+    /// `AnnexBPicture::write_4_4_4_into_device`'s; the inner says why it was not written so, for
+    /// the CPU to copy it: a refusal before anything was written, or a pass that failed.
+    fn gather(
+        &mut self,
+        picture: &AnnexBPicture,
+        size: (u32, u32),
+        planes: &[TargetPlane; 2],
+        buffer: Option<&P::Buffer>,
+    ) -> Result<Result<(), String>, reims_vgpu_video::nvidia::Error> {
+        let route = match &mut self.gathers {
+            Ok(route) => route,
+            Err(why) => return Ok(Err(why.clone())),
+        };
+        let Some(surface) = buffer else {
+            return Ok(Err("no buffer of the device's over the surface".to_owned()));
+        };
+        let sample = picture.bytes_per_sample();
+        if sample != 1 {
+            return Ok(Err(format!("a 4:4:4 picture of {sample}-byte samples")));
+        }
+        // What the write takes of the crop, as its read back does.
+        let (_, _, crop_width, crop_height) = picture.crop();
+        let crop = (size.0.min(crop_width), size.1.min(crop_height));
+        if let Err(why) = route.scratch_for(crop) {
+            self.gathers = Err(why.clone());
+            return Ok(Err(why));
+        }
+        let Some(scratch) = &route.scratch else {
+            return Ok(Err("no scratch".to_owned()));
+        };
+        let passes = match gathers(scratch.planar(), crop, planes, surface.length()) {
+            Ok(passes) => passes,
+            Err(why) => return Ok(Err(why)),
+        };
+        // Each plane of the scratch, its rows the crop's width.
+        let plane = |at: u64| {
+            Some(DevicePlane {
+                buffer: &scratch.import,
+                offset: usize::try_from(at).ok()?,
+                bytes_per_row: usize::try_from(scratch.pitch).ok()?,
+                row_bytes: usize::try_from(crop.0).ok()?,
+                rows: u32::try_from(scratch.rows).ok()?,
+            })
+        };
+        let [y, cb, cr] = scratch.planar().planes;
+        let (Some(y), Some(cb), Some(cr)) = (plane(y), plane(cb), plane(cr)) else {
+            return Ok(Err("a scratch past the host's address space".to_owned()));
+        };
+        // SAFETY: the scratch's planes lie apart, `pitch` times `rows` bytes each, in the
+        // decoder's own buffer, which nothing else writes: no guest message names it, and the
+        // kernel's last pass that read it was waited for; the import, which a late copy keeps,
+        // holds its memory.
+        let written = unsafe { picture.write_4_4_4_into_device(size, [y, cb, cr], Box::new(())) }?;
+        if let Err(why) = written {
+            return Ok(Err(why));
+        }
+        if let Err(why) = scratch.buffer.external_write_done() {
+            return Ok(Err(format!("the scratch's acquire: {why}")));
+        }
+        let source = scratch.buffer.clone_ref();
+        if let Err(why) = route.gatherer.gather(&source, surface, &passes) {
+            return Ok(Err(why));
+        }
+        self.gathered += 1;
+        Ok(Ok(()))
+    }
 }
 
-impl Drop for NvGuestDecoder {
+impl<P: Platform> Drop for NvGuestDecoder<P> {
     fn drop(&mut self) {
         let sent = self.decoder.bitstreams();
         log::info!(
@@ -1001,6 +1187,13 @@ impl Drop for NvGuestDecoder {
             sent.in_place,
             sent.gathered
         );
+        if self.gathered != 0 {
+            log::info!(
+                "hardware video: {NAME}: a VideoToolbox session's 4:4:4 pictures written by the \
+                 GPU into their surfaces' two planes: {}",
+                self.gathered
+            );
+        }
     }
 }
 

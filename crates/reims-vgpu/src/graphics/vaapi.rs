@@ -549,7 +549,7 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
 
     /// An HEVC decoder lands 4:4:4 pictures too, which [`Self::guest_declines`] lets through
     /// where the driver decodes them.
-    fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder>> {
+    fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder<P>>> {
         (self.caps.iter()).find(|c| c.codec == codec && c.direction == RGFX_VIDEO_DECODE)?;
         let codec = match codec {
             RGFX_VIDEO_CODEC_H264 => Codec::H264(H264Decoder::new_annex_b(&self.display)),
@@ -1350,12 +1350,12 @@ impl VaGuestDecoder {
     }
 }
 
-impl GuestDecoder for VaGuestDecoder {
+impl<P: Platform> GuestDecoder<P> for VaGuestDecoder {
     fn decode(
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
-        output: &GuestOutput<'_>,
+        output: &GuestOutput<'_, P>,
     ) -> Result<bool, VideoError> {
         self.land(parameter_sets, au, output, None)
     }
@@ -1370,7 +1370,7 @@ impl GuestDecoder for VaGuestDecoder {
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
-        output: &GuestOutput<'_>,
+        output: &GuestOutput<'_, P>,
         region: [u32; 4],
     ) -> Result<bool, VideoError> {
         self.land(parameter_sets, au, output, Some(region))
@@ -1380,11 +1380,11 @@ impl GuestDecoder for VaGuestDecoder {
 impl VaGuestDecoder {
     /// Decodes `au` after `parameter_sets`, and lands its picture, or `region` of it (`x`, `y`,
     /// `width`, `height`), in `output`.
-    fn land(
+    fn land<P: Platform>(
         &mut self,
         parameter_sets: &[u8],
         au: &[u8],
-        output: &GuestOutput<'_>,
+        output: &GuestOutput<'_, P>,
         region: Option<[u32; 4]>,
     ) -> Result<bool, VideoError> {
         if !parameter_sets.is_empty() {
