@@ -90,6 +90,8 @@
 //! primitives or patches, and of an unbuilt one, names the vertex and fragment functions of the
 //! pipeline state set (`super::unbuilt::naming_functions`).
 
+use std::cell::RefCell;
+
 use metal2vulkan::metal::{
     CullMode, DepthClipMode, IndexType, PrimitiveType, TriangleFillMode, Winding,
 };
@@ -99,7 +101,7 @@ use crate::core::platform::render::{RenderCmd, RenderEncoder};
 use crate::core::platform::types::{MtlScissorRect, MtlViewport};
 use crate::core::platform::{Handle, ObjId};
 use crate::core::raise::{OnFault, RaiseResult};
-use crate::core::sync::Mutex;
+use crate::core::sync::ReentrantMutex;
 
 use super::blit::{Stop, report};
 use super::command::{Kept, OpenMark};
@@ -117,8 +119,11 @@ const WIDE: Stop = Stop::Metal("a count, a base or an index past 32 bits");
 
 /// `id<MTLRenderCommandEncoder>` on metal2vulkan-runtime.
 pub struct RtRenderEncoder {
-    /// rt's encoder and what the encoder set.
-    open: Mutex<Open>,
+    /// rt's encoder and what the encoder set. Each command takes the lock; a run of commands one
+    /// thread sends ([`RenderEncoder::encoding`]) takes it once for the run, and its commands take
+    /// it again on the thread that holds it, with no atomic operation. A command another thread
+    /// sends meanwhile waits for the run to end.
+    open: ReentrantMutex<RefCell<Open>>,
     /// Its command buffer's mark of it open, until it ends.
     mark: OpenMark,
     /// What its command buffer keeps until it completes.
@@ -165,12 +170,12 @@ impl RtRenderEncoder {
             ..EncoderNames::new(EncoderKind::Render)
         };
         RtRenderEncoder {
-            open: Mutex::new(Open {
+            open: ReentrantMutex::new(RefCell::new(Open {
                 rt: Some(encoder),
                 pipeline: None,
                 seen: Seen::default(),
                 naming: Naming::new(kept.encoded(), names),
-            }),
+            })),
             mark,
             kept,
             targets,
@@ -941,7 +946,8 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             let primitive = drawn_primitive(&cmd);
             let execution = execution(&cmd);
             let draw = draws(&cmd);
-            let mut open = self.open.lock();
+            let held = self.open.lock();
+            let mut open = held.borrow_mut();
             if let Some(names) = open.naming.names() {
                 note_names(names, &cmd);
             }
@@ -979,12 +985,19 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
                 self.mark.end();
                 open.naming.end();
             }
-            drop(open);
+            drop((open, held));
             naming_functions(functions, || report(sel, stopped));
             Ok(())
         });
         crate::recorder::rec_done!(recorded_call, recorded_answer);
         recorded_answer
+    }
+
+    /// Holds the encoder for `run` ([`RtRenderEncoder`]'s `open`): the commands `run` sends take
+    /// its lock again on this thread, and another thread's wait for it to end.
+    fn encoding<T>(&self, run: impl FnOnce() -> T) -> T {
+        let _held = self.open.lock();
+        run()
     }
 
     /// 0, counted ([`Unbuilt::RenderPass`]): rt's pass has no tiles.
@@ -1226,6 +1239,78 @@ mod tests {
     /// `words`' little-endian bytes.
     fn words(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A run of `encoding` holds the encoder: the run's own commands go through and draw, and a
+    /// command another thread sends meanwhile waits for the run to end, then goes through.
+    #[test]
+    fn an_encoding_run_holds_the_encoder_on_vulkan() {
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let made = queue.command_buffer(on).expect("never a raise");
+        let made = made.expect("a command buffer");
+        let state = vdesc_state(&device, &function(&device, COLOR, "render_color"));
+        let buffer = triangle(&device);
+        let target = device.new_texture(
+            on,
+            &platform.texture_descriptor(&TextureDesc {
+                width: 4,
+                height: 4,
+                usage: 5,
+                ..TextureDesc::default()
+            }),
+        );
+        let target = target.expect("never a raise").expect("a render target");
+        let encoder = made.render_encoder(on, &pass(&target, 2)).expect("never a raise");
+        let encoder = encoder.expect("a render encoder");
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let other = encoder.encoding(|| {
+                let other = scope.spawn(|| {
+                    let rect = MtlScissorRect {
+                        x: 0,
+                        y: 0,
+                        width: 4,
+                        height: 4,
+                    };
+                    let answer = encoder.encode(on, RenderCmd::SetScissorRect { rect });
+                    sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                    answer
+                });
+                let draw = [
+                    RenderCmd::SetRenderPipelineState {
+                        pipeline_state: Some(&state),
+                    },
+                    RenderCmd::SetVertexBuffer {
+                        buffer: Some(&buffer),
+                        offset: 0,
+                        index: 0,
+                    },
+                    RenderCmd::DrawPrimitives {
+                        primitive_type: TRIANGLE,
+                        vertex_start: 0,
+                        vertex_count: 3,
+                    },
+                ];
+                for cmd in draw {
+                    assert_eq!(encoder.encode(on, cmd), Ok(()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(!sent.load(std::sync::atomic::Ordering::SeqCst));
+                other
+            });
+            assert_eq!(other.join().expect("the other thread's command"), Ok(()));
+        });
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(encoder.encode(on, RenderCmd::EndEncoding), Ok(()));
+        assert_eq!(made.commit(on), Ok(()));
+        assert_eq!(made.wait_until_completed(on), Ok(()));
+        assert_eq!(made.status(), CommandBufferStatus::COMPLETED);
+        let mut texels = [0u8; 64];
+        target.read_pixels(&mut texels, 16);
+        assert_eq!(texels, std::array::from_fn(|i| [0, 255, 0, 255][i % 4]));
     }
 
     /// Render encoders clear, load and store their pass's attachment, draw through a pipeline
