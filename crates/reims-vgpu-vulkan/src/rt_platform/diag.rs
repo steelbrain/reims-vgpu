@@ -117,8 +117,9 @@
 //!   longest, those over 1 ms and over 16 ms, and the longest one's releases by kind and bytes.
 //! - **rt's timed take parts.** rt's `Timed` metrics of its block takes and makes (`takes`,
 //!   `take_lock_waits`, `take_makes`, `take_maps`, `maker_makes`, `zero_writes`,
-//!   `long_take_zero_writes`): for each, its calls, those over 5 ms, and its longest call with
-//!   that call's bytes and whether it made an allocation of its own.
+//!   `long_take_zero_writes`): for each, its calls, those over 5 ms, its longest call with that
+//!   call's bytes and whether it made an allocation of its own, then the calls' milliseconds in
+//!   all and those over 1 ms and over 20 ms.
 //! - **rt's pipeline makes.** rt's `VkPipeline`s created, and the main pipelines its states'
 //!   finishes made (rt's `finish_pipeline`, `super::pipeline`), with their milliseconds; its
 //!   first-use waits (encoding calls that waited while the pipeline they needed was made), with
@@ -1651,12 +1652,16 @@ fn timed_parts_line(m: &rt::Metrics) -> String {
         .iter()
         .map(|(part, t)| {
             format!(
-                "{part} {} calls {} over 5 ms longest {:.3} ms of {} bytes{}",
+                "{part} {} calls {} over 5 ms longest {:.3} ms of {} bytes{} total {:.3} ms {} \
+                 over 1 ms {} over 20 ms",
                 t.count,
                 t.over_5_ms,
                 t.longest_nanos as f64 / 1e6,
                 t.longest_bytes,
-                if t.longest_made { " made" } else { "" }
+                if t.longest_made { " made" } else { "" },
+                t.total_nanos as f64 / 1e6,
+                t.over_1_ms,
+                t.over_20_ms
             )
         })
         .collect();
@@ -3325,7 +3330,8 @@ mod tests {
     }
 
     /// rt's timed take parts' line names each part with its longest call's bytes, and `made`
-    /// where that call made an allocation of its own.
+    /// where that call made an allocation of its own, then its calls' total and those over 1 ms
+    /// and over 20 ms.
     #[test]
     fn the_timed_take_parts_line_names_each_longest_call() {
         let mut m = rt::Metrics::default();
@@ -3334,17 +3340,24 @@ mod tests {
         m.takes.longest_nanos = 7_250_000;
         m.takes.longest_bytes = 1 << 20;
         m.takes.longest_made = true;
+        m.takes.total_nanos = 12_500_000;
+        m.takes.over_1_ms = 3;
         m.zero_writes.count = 2;
+        m.zero_writes.total_nanos = 2_000;
         m.zero_writes.longest_nanos = 1_000;
         m.zero_writes.longest_bytes = 4096;
         assert_eq!(
             timed_parts_line(&m),
             "reims-vgpu: rt-diag timed take parts: takes 9 calls 1 over 5 ms longest 7.250 ms \
-             of 1048576 bytes made, take-lock-waits 0 calls 0 over 5 ms longest 0.000 ms of 0 \
-             bytes, take-makes 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes, take-maps 0 calls \
-             0 over 5 ms longest 0.000 ms of 0 bytes, maker-makes 0 calls 0 over 5 ms longest \
-             0.000 ms of 0 bytes, zero-writes 2 calls 0 over 5 ms longest 0.001 ms of 4096 bytes, \
-             long-take-zero-writes 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes"
+             of 1048576 bytes made total 12.500 ms 3 over 1 ms 0 over 20 ms, take-lock-waits 0 \
+             calls 0 over 5 ms longest 0.000 ms of 0 bytes total 0.000 ms 0 over 1 ms 0 over 20 \
+             ms, take-makes 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes total 0.000 ms 0 over \
+             1 ms 0 over 20 ms, take-maps 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes total \
+             0.000 ms 0 over 1 ms 0 over 20 ms, maker-makes 0 calls 0 over 5 ms longest 0.000 ms \
+             of 0 bytes total 0.000 ms 0 over 1 ms 0 over 20 ms, zero-writes 2 calls 0 over 5 ms \
+             longest 0.001 ms of 4096 bytes total 0.002 ms 0 over 1 ms 0 over 20 ms, \
+             long-take-zero-writes 0 calls 0 over 5 ms longest 0.000 ms of 0 bytes total 0.000 ms \
+             0 over 1 ms 0 over 20 ms"
         );
     }
 
