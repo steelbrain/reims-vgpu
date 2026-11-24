@@ -3906,8 +3906,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let (poster, message, name, block, settles) = carry;
         Box::new(move || {
             // When the worker took it up, for its line: read only where the line is on.
-            let started = log::log_enabled!(target: TARGET, log::Level::Debug)
-                .then(|| self.pool.now());
+            let started =
+                log::log_enabled!(target: TARGET, log::Level::Debug).then(|| self.pool.now());
             let outcome = {
                 let _carried = self.reset_gate.read_recursive();
                 if poster.stale() {
