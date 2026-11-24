@@ -3,9 +3,11 @@
 //!
 //! Keys: Up and Down (or Tab and Shift-Tab) move between fields; Left and Right, or Space,
 //! change a choice or toggle; typing edits text; Tab in a path field completes it as a shell
-//! would, and moves on when there is nothing to complete; Enter moves on, and on the last field
-//! submits; Ctrl-S submits from anywhere; Esc cancels. While the work a submit started runs
-//! (`busy`), the form shows its step and takes only Esc, which closes it.
+//! would ([`complete`]; on Windows whatever the case typed, as its file systems match names),
+//! lists the names that match below the fields where several do and it can add nothing, and
+//! moves on when there is nothing to complete; Enter moves on, and on the last field submits;
+//! Ctrl-S submits from anywhere; Esc cancels. While the work a submit started runs (`busy`), the
+//! form shows its step and takes only Esc, which closes it.
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -117,6 +119,9 @@ pub struct Form {
     pub fields: Vec<Field>,
     pub focus: usize,
     pub error: Option<String>,
+    /// The names a path field's Tab found where several match ([`Completion::Several`]), until
+    /// the next key.
+    hint: Option<String>,
     /// The work its submit started, while that runs: the caller's id for it, and its step.
     pub busy: Option<(u64, String)>,
     pub submit: String,
@@ -135,6 +140,7 @@ impl Form {
             fields,
             focus: 0,
             error: None,
+            hint: None,
             busy: None,
             submit: submit.into(),
         }
@@ -246,6 +252,7 @@ impl Form {
         if self.busy.is_some() && !close {
             return Event::None;
         }
+        self.hint = None;
         if !self.visible().contains(&self.focus) {
             self.focus = self.visible().first().copied().unwrap_or(0);
         }
@@ -326,11 +333,18 @@ impl Form {
                     KeyCode::Home => *cursor = 0,
                     KeyCode::End => *cursor = text.chars().count(),
                     KeyCode::Tab => {
-                        if *path && let Some(done) = complete(text) {
-                            *text = done;
-                            *cursor = text.chars().count();
+                        let found = if *path {
+                            complete(text)
                         } else {
-                            self.move_focus(true);
+                            Completion::Nothing
+                        };
+                        match found {
+                            Completion::Done(done) => {
+                                *text = done;
+                                *cursor = text.chars().count();
+                            }
+                            Completion::Several(names) => self.hint = Some(several(&names)),
+                            Completion::Nothing => self.move_focus(true),
                         }
                     }
                     _ => {}
@@ -345,11 +359,13 @@ impl Form {
         let width = area.width.saturating_sub(4).clamp(area.width.min(40), 110);
         let help = &self.fields[self.focus].help;
         let help_lines = wrap_count(help, width.saturating_sub(4)) as u16;
-        // The running work's step, or the error, above the help, and a blank line.
-        let note = match (&self.busy, &self.error) {
-            (Some((_, step)), _) => Some((step, Style::new().fg(Color::Yellow))),
-            (None, Some(e)) => Some((e, Style::new().fg(Color::Red).bold())),
-            (None, None) => None,
+        // The running work's step, the error, or what Tab found, above the help, and a blank
+        // line.
+        let note = match (&self.busy, &self.error, &self.hint) {
+            (Some((_, step)), ..) => Some((step, Style::new().fg(Color::Yellow))),
+            (None, Some(e), _) => Some((e, Style::new().fg(Color::Red).bold())),
+            (None, None, Some(h)) => Some((h, Style::new())),
+            (None, None, None) => None,
         };
         let note_lines = note.map_or(0, |(n, _)| {
             wrap_count(n, width.saturating_sub(4)) as u16 + 1
@@ -486,71 +502,116 @@ fn wrap_count(s: &str, width: u16) -> usize {
         .max(1)
 }
 
-/// `text` completed as a path, as a shell's Tab would: the one match whole (a directory with
-/// its separator, `/`, on Windows `\`), or the matches' longest common prefix. None when nothing
-/// would change.
-pub fn complete(text: &str) -> Option<String> {
-    let typed = text.to_string();
-    let expanded = crate::paths::expand(&typed);
-    let exp = expanded.to_string_lossy().into_owned();
+/// What Tab finds for a path field's text ([`complete`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Completion {
+    /// The text completed: the one name that matches, whole (a directory's with its separator,
+    /// `/`, on Windows `\`), or the longest start the names that match share; or a drive or
+    /// other directory typed without its separator, with it (`C:` is `C:\`).
+    Done(String),
+    /// The names that match, sorted (a directory's with its separator), where several do and
+    /// they share no more than the text has.
+    Several(Vec<String>),
+    /// Nothing to complete: the text is empty, no name matches, or it names a file whole.
+    Nothing,
+}
+
+/// `text` completed as a path, as a shell's Tab would ([`Completion`]), matching names whatever
+/// their case on Windows, whose file systems ignore it: `c:\users\me\doc` completes to
+/// `c:\users\me\Documents\`.
+pub fn complete(text: &str) -> Completion {
+    complete_in(text, cfg!(windows))
+}
+
+/// [`complete`], matching names whatever their case where `fold_case`.
+fn complete_in(text: &str, fold_case: bool) -> Completion {
+    let typed = text.trim();
+    if typed.is_empty() {
+        return Completion::Nothing;
+    }
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    let expanded = crate::paths::expand(typed);
+    let name = expanded.file_name().map(|n| n.to_string_lossy().into_owned());
     let (dir, prefix) = if typed.ends_with('/') || typed.ends_with(std::path::MAIN_SEPARATOR) {
-        (PathBuf::from(&exp), String::new())
-    } else {
-        let p = Path::new(&exp);
-        let dir = p
+        (expanded, String::new())
+    } else if let Some(name) = name.filter(|n| typed.ends_with(n.as_str())) {
+        let dir = expanded
             .parent()
             .map(Path::to_path_buf)
             .filter(|d| !d.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("."));
-        (
-            dir,
-            p.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        )
+        (dir, name)
+    } else {
+        // No name typed last to complete, as in a drive (`C:`), `~`, `..` or `.`: a directory
+        // takes its separator.
+        return if expanded.is_dir() {
+            Completion::Done(format!("{typed}{sep}"))
+        } else {
+            Completion::Nothing
+        };
     };
-    let mut matches: Vec<(String, bool)> = std::fs::read_dir(&dir)
-        .ok()?
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Completion::Nothing;
+    };
+    let typed_len = prefix.chars().count();
+    let mut matches: Vec<(String, bool)> = entries
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            (name.starts_with(&prefix) && (!name.starts_with('.') || prefix.starts_with('.')))
-                .then(|| (name, e.path().is_dir()))
+            (shared_start(&name, &prefix, fold_case) == typed_len
+                && (!name.starts_with('.') || prefix.starts_with('.')))
+            .then(|| (name, e.path().is_dir()))
         })
         .collect();
-    if matches.is_empty() {
-        return None;
-    }
     matches.sort();
-    let completion = if matches.len() == 1 {
-        let (name, is_dir) = &matches[0];
-        format!(
-            "{name}{}",
-            if *is_dir {
-                std::path::MAIN_SEPARATOR_STR
-            } else {
-                ""
-            }
-        )
-    } else {
-        let first = &matches[0].0;
-        let mut n = first.len();
-        for (m, _) in &matches[1..] {
-            n = n.min(
-                first
-                    .bytes()
-                    .zip(m.bytes())
-                    .take_while(|(a, b)| a == b)
-                    .count(),
-            );
+    let shown = |(name, is_dir): &(String, bool)| {
+        if *is_dir {
+            format!("{name}{sep}")
+        } else {
+            name.clone()
         }
-        first[..n].to_string()
     };
-    let addition = completion.strip_prefix(&prefix)?;
-    if addition.is_empty() {
-        return None;
+    let completion = match &matches[..] {
+        [] => return Completion::Nothing,
+        [one] => shown(one),
+        [(first, _), rest @ ..] => {
+            let n = rest
+                .iter()
+                .map(|(m, _)| shared_start(first, m, fold_case))
+                .min()
+                .unwrap_or(0);
+            if n <= typed_len {
+                return Completion::Several(matches.iter().map(shown).collect());
+            }
+            first.chars().take(n).collect()
+        }
+    };
+    if completion == prefix {
+        return Completion::Nothing;
     }
-    Some(format!("{typed}{addition}"))
+    // The name typed, which the text ends with, gives way to the name found, whose case may
+    // differ.
+    let head = &typed[..typed.len() - prefix.len()];
+    Completion::Done(format!("{head}{completion}"))
+}
+
+/// How many characters `a` and `b` share from their start, whatever their case where
+/// `fold_case`.
+fn shared_start(a: &str, b: &str, fold_case: bool) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(x, y)| x == y || (fold_case && x.to_lowercase().eq(y.to_lowercase())))
+        .count()
+}
+
+/// What a path field's Tab shows where several names match: the first few, and how many more.
+fn several(names: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let mut list = names[..names.len().min(SHOWN)].join(", ");
+    if names.len() > SHOWN {
+        list.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    format!("{} names match: {list}. Type more of one, then Tab again.", names.len())
 }
 
 #[cfg(test)]
@@ -563,34 +624,159 @@ mod tests {
         std::fs::create_dir_all(d.join("opencore-dir")).unwrap();
         std::fs::write(d.join("opencore.qcow2"), b"").unwrap();
         std::fs::write(d.join("other.img"), b"").unwrap();
+        std::fs::write(d.join(".hidden"), b"").unwrap();
         let sep = std::path::MAIN_SEPARATOR;
         let base = format!("{}{sep}", d.display());
+        let done = Completion::Done;
         assert_eq!(
-            complete(&format!("{base}ot")),
-            Some(format!("{base}other.img"))
+            complete_in(&format!("{base}ot"), false),
+            done(format!("{base}other.img"))
         );
         assert_eq!(
-            complete(&format!("{base}op")),
-            Some(format!("{base}opencore"))
+            complete_in(&format!("{base}op"), false),
+            done(format!("{base}opencore"))
         );
         assert_eq!(
-            complete(&format!("{base}opencore-")),
-            Some(format!("{base}opencore-dir{sep}"))
+            complete_in(&format!("{base}opencore-"), false),
+            done(format!("{base}opencore-dir{sep}"))
         );
-        assert_eq!(complete(&format!("{base}zz")), None);
+        assert_eq!(complete_in(&format!("{base}zz"), false), Completion::Nothing);
+        assert_eq!(
+            complete_in(&format!("{base}other.img"), false),
+            Completion::Nothing,
+            "a file named whole has nothing to complete, so Tab moves on"
+        );
+        assert_eq!(complete_in("", false), Completion::Nothing);
+        assert_eq!(complete_in("  ", false), Completion::Nothing);
+        // Where several names match and share no more than was typed, Tab lists them, hiding
+        // names that start with `.` unless one was typed.
+        assert_eq!(
+            complete_in(&format!("{base}opencore"), false),
+            Completion::Several(vec![
+                format!("opencore-dir{sep}"),
+                "opencore.qcow2".to_owned()
+            ])
+        );
+        assert_eq!(complete_in(&base, false), done(format!("{base}o")));
+        assert_eq!(
+            complete_in(&format!("{base}o"), false),
+            Completion::Several(vec![
+                format!("opencore-dir{sep}"),
+                "opencore.qcow2".to_owned(),
+                "other.img".to_owned()
+            ])
+        );
+        assert_eq!(
+            complete_in(&format!("{base}."), false),
+            done(format!("{base}.{sep}")),
+            "`.` names a directory"
+        );
+        assert_eq!(
+            complete_in(&format!("{base}.h"), false),
+            done(format!("{base}.hidden"))
+        );
         // A directory typed with its separator lists what it holds.
         assert_eq!(
-            complete(&format!("{base}opencore-dir{sep}")),
-            None,
+            complete_in(&format!("{base}opencore-dir{sep}"), false),
+            Completion::Nothing,
             "an empty directory completes nothing"
         );
-        // On Windows a path typed with `/` completes there too, adding `\` after a directory.
-        #[cfg(windows)]
+        // A path whose last part is no name takes the directory's separator.
         assert_eq!(
-            complete(&format!("{}/opencore-", d.display())),
-            Some(format!("{}/opencore-dir\\", d.display()))
+            complete_in(&format!("{base}opencore-dir{sep}.."), false),
+            done(format!("{base}opencore-dir{sep}..{sep}"))
+        );
+        assert_eq!(complete_in("~", false), done(format!("~{sep}")));
+        // On Windows a path typed with `/` completes there too, adding `\` after a directory,
+        // and a drive takes its `\`.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                complete(&format!("{}/opencore-", d.display())),
+                done(format!("{}/opencore-dir\\", d.display()))
+            );
+            assert_eq!(complete("C:"), done("C:\\".to_owned()));
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Windows' file systems match names whatever their case, so its Tab does: `doc` finds
+    /// `Documents`.
+    #[test]
+    fn completes_paths_whatever_their_case_where_asked() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-case-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("Documents")).unwrap();
+        std::fs::create_dir_all(d.join("Downloads")).unwrap();
+        std::fs::write(d.join("other.img"), b"").unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let base = format!("{}{sep}", d.display());
+        let done = Completion::Done;
+        assert_eq!(
+            complete_in(&format!("{base}doc"), true),
+            done(format!("{base}Documents{sep}"))
+        );
+        assert_eq!(
+            complete_in(&format!("{base}OTHER.IMG"), true),
+            done(format!("{base}other.img")),
+            "a name typed whole in another case takes the name's own"
+        );
+        assert_eq!(
+            complete_in(&format!("{base}d"), true),
+            done(format!("{base}Do")),
+            "names that match whatever their case complete as far as they share"
+        );
+        assert_eq!(
+            complete_in(&format!("{base}do"), true),
+            Completion::Several(vec![format!("Documents{sep}"), format!("Downloads{sep}")])
+        );
+        assert_eq!(complete_in(&format!("{base}doc"), false), Completion::Nothing);
+        assert_eq!(
+            complete(&format!("{base}doc")),
+            complete_in(&format!("{base}doc"), cfg!(windows))
         );
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// Tab where several names match lists them below the fields and keeps the field, until the
+    /// next key; where nothing matches it moves on.
+    #[test]
+    fn tab_lists_the_names_that_match_and_keeps_the_field() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-tab-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for n in ["disk-a.img", "disk-b.img"] {
+            std::fs::write(d.join(n), b"").unwrap();
+        }
+        let sep = std::path::MAIN_SEPARATOR;
+        let mut f = Form::new(
+            "t",
+            "save",
+            vec![
+                Field::path("path", "Path", &format!("{}{sep}disk-", d.display()), ""),
+                Field::text("size", "Size", "", ""),
+            ],
+        );
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        f.handle_key(tab);
+        assert_eq!(f.focused_key(), "path");
+        assert_eq!(
+            f.hint.as_deref(),
+            Some("2 names match: disk-a.img, disk-b.img. Type more of one, then Tab again.")
+        );
+        f.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(f.hint, None);
+        f.handle_key(tab);
+        assert_eq!(f.focused_key(), "size");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn several_shows_the_first_names_and_how_many_more() {
+        let names: Vec<String> = (0..10).map(|i| format!("n{i}")).collect();
+        assert_eq!(
+            several(&names),
+            "10 names match: n0, n1, n2, n3, n4, n5, n6, n7 and 2 more. Type more of one, then \
+             Tab again."
+        );
     }
 
     #[test]
