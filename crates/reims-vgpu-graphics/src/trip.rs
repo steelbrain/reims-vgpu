@@ -2,9 +2,9 @@
 //! to rt, timed by stage: a diagnostic, off until [`turn_on`], which reims-vgpu calls where its
 //! log names its trip line's target at debug (`reims_vgpu::trip`).
 //!
-//! Each stage's spans go into a histogram of [`BUCKETS`] buckets with their sum, and each event
-//! counted into a count, all relaxed atomics: a stage costs two reads of the device's clock and
-//! three atomic adds, with nothing allocated and no lock taken. Off, each site costs one relaxed
+//! Each stage's spans go into a histogram of [`BUCKETS`] buckets with their sum and their longest,
+//! and each event counted into a count, all relaxed atomics: a stage costs two reads of the
+//! device's clock, three atomic adds and an atomic max, with nothing allocated and no lock taken. Off, each site costs one relaxed
 //! load. [`take`] reads every histogram and count since the take before, and zeroes them.
 //!
 //! The stages, each on the device's clock ([`crate::clock`]), which the guest's times map to:
@@ -253,10 +253,11 @@ impl Count {
     }
 }
 
-/// A stage's histogram and sum.
+/// A stage's histogram, sum and longest span.
 struct Hist {
     buckets: [AtomicU32; BUCKETS],
     sum: AtomicU64,
+    max: AtomicU64,
 }
 
 impl Hist {
@@ -264,12 +265,14 @@ impl Hist {
         Hist {
             buckets: [const { AtomicU32::new(0) }; BUCKETS],
             sum: AtomicU64::new(0),
+            max: AtomicU64::new(0),
         }
     }
 
     fn add(&self, ns: u64) {
         self.buckets[bucket(ns)].fetch_add(1, Relaxed);
         self.sum.fetch_add(ns, Relaxed);
+        self.max.fetch_max(ns, Relaxed);
     }
 
     /// Its spans since the take before, zeroed.
@@ -277,6 +280,7 @@ impl Hist {
         Spread {
             buckets: std::array::from_fn(|i| self.buckets[i].swap(0, Relaxed)),
             sum: self.sum.swap(0, Relaxed),
+            max: self.max.swap(0, Relaxed),
         }
     }
 }
@@ -591,6 +595,8 @@ pub struct Spread {
     pub buckets: [u32; BUCKETS],
     /// Their sum, in nanoseconds.
     pub sum: u64,
+    /// The longest of them, in nanoseconds.
+    pub max: u64,
 }
 
 impl Spread {
@@ -705,8 +711,8 @@ fn us(ns: u64) -> f64 {
     ns as f64 / 1e3
 }
 
-/// `spread` as `n sum_us p50_us p90_us [bucket:n,...]`, its buckets with spans by index
-/// ([`bucket_floor`]).
+/// `spread` as `n sum_us p50_us p90_us [bucket:n,...] max max_us`, its buckets with spans by
+/// index ([`bucket_floor`]) and its longest span.
 fn write_spread(f: &mut fmt::Formatter<'_>, spread: &Spread) -> fmt::Result {
     write!(
         f,
@@ -723,12 +729,12 @@ fn write_spread(f: &mut fmt::Formatter<'_>, spread: &Spread) -> fmt::Result {
             sep = ",";
         }
     }
-    f.write_char(']')
+    write!(f, "] max {:.1}", us(spread.max))
 }
 
 impl fmt::Display for Taken {
     /// `count=n ...`, then for each stage with spans `| name n sum_us p50_us p90_us
-    /// [bucket:n,...]` ([`write_spread`]), then for each idle bucket with command buffers
+    /// [bucket:n,...] max max_us` ([`write_spread`]), then for each idle bucket with command buffers
     /// `| idle d0|d1 bucket idle_us n pickup_sum_us pickup_p50_us pickup_p90_us [...]`, then for
     /// each depth with command buffers `| idle20 d0|d1 n idle_us mean_us p50_us p90_us
     /// [step:n,...]` ([`FineIdle`]).
@@ -804,12 +810,26 @@ mod tests {
         assert_eq!(bucket_floor(BUCKETS - 1), 1 << 31);
     }
 
+    /// A stage keeps its longest span exactly, until taken
+    #[test]
+    fn a_stage_keeps_its_longest_span() {
+        let hist = Hist::new();
+        hist.add(5_000);
+        hist.add(700_123);
+        hist.add(20);
+        let spread = hist.take();
+        assert_eq!(spread.n(), 3);
+        assert_eq!((spread.sum, spread.max), (705_143, 700_123));
+        assert_eq!(hist.take().max, 0, "taken once");
+    }
+
     /// A spread's quantiles fall in the buckets their ranks do
     #[test]
     fn quantiles_fall_in_their_ranks_buckets() {
         let mut spread = Spread {
             buckets: [0; BUCKETS],
             sum: 0,
+            max: 0,
         };
         assert_eq!(spread.quantile(0.5), 0);
         // Nine spans of 10 us and one of 100 us.
@@ -898,6 +918,7 @@ mod tests {
                 Spread {
                     buckets: [0; BUCKETS],
                     sum: 0,
+                    max: 0,
                 };
                 STAGES.len()
             ],
@@ -908,6 +929,7 @@ mod tests {
                     Spread {
                         buckets: [0; BUCKETS],
                         sum: 0,
+                        max: 0,
                     }
                 );
                 2 * IDLE_NAMES.len()
@@ -924,10 +946,14 @@ mod tests {
         taken.fine[0].sum = 230_000;
         taken.stages[Stage::Gap as usize].buckets[bucket(20_000)] = 2;
         taken.stages[Stage::Gap as usize].sum = 40_000;
+        taken.stages[Stage::Gap as usize].max = 20_500;
         let line = taken.to_string();
         assert!(line.starts_with("takes=3 serial=0 "), "{line}");
         assert!(line.contains(" | gap 2 40.0 "), "{line}");
-        assert!(line.contains(&format!("[{}:2]", bucket(20_000))), "{line}");
+        assert!(
+            line.contains(&format!("[{}:2] max 20.5 |", bucket(20_000))),
+            "{line}"
+        );
         assert!(line.contains(" | idle d1 325_400 350.0 1 150.0 "), "{line}");
         assert!(
             line.ends_with(" | idle20 d0 2 230.0 115.0 105.0 115.0 [5:2]"),
