@@ -1545,6 +1545,69 @@ says so, and `doctor` says which devices there are.
 guest listed an output and an input "Apple Virtual Sound Device", and
 `afplay` of a system sound exited 0 (no one listened at the host).
 
+On `dsound`, a guest's sound clicked: QEMU wrote audio into the part of
+DirectSound's buffer that DirectSound had already mixed. **Measured** on the
+mini (2026-11-24, job `m3-max-73329`, vendor/qemu `0c91b471`). The guest
+was a 26.7.2 x86-64 guest on reims-ctl's default `-audiodev`. It played a
+steady sine of 997 Hz and 1499 Hz for 200 s. The host's output was captured
+by WASAPI loopback, and a break in either tone's phase or amplitude counted
+as a click. There were 360 clicks in 194.5 s at rest (111 a minute). With
+the guest's browser drawing a busy page there were 555 in 193.4 s (172 a
+minute). QEMU's `virtio_snd_*`, `audio_*` and `dsound_*` traces showed why:
+- The guest posts one 85.33 ms period at a time (32,768 bytes, f32 stereo at
+  48 kHz), without waiting for completions. Its posts fall on a 41.67 ms
+  grid: 83.3 ms apart, and 125 ms apart about once in 21. Within 20 s they
+  drift 42 ms against the host's clock at rest, and 54 ms busy.
+- QEMU's audio timer, every 10 ms on the main loop, ran 10.9 ms apart at
+  the median. Its longest gap was 16.2 ms at rest and 30.2 ms busy.
+- dsound's buffer was 92.88 ms: 4096 frames at the mixing engine's
+  44.1 kHz. DirectSound's write cursor leads its play cursor by 30 ms (in
+  the traces after the change, below). A voice took all the space up to the
+  play cursor as free, and wrote at its own position even after the write
+  cursor had passed it.
+- The traces covered 908 of the clicks. 905 of them came within 0.2 s of a
+  period written with under 30 ms in the buffer ahead of the play cursor.
+  That is behind the write cursor, in audio DirectSound has already mixed.
+  The click kept the tone's level and caused no time shift. Its phase jumps
+  (2.4 rad at 997 Hz, 1.3 rad at 1499 Hz) match the same tone 92.88 ms
+  earlier, one turn of the buffer back (0.60 and 0.23 of a cycle).
+
+From vendor/qemu `0c0ac356` a dsound voice writes only past the write
+cursor (read from code: `audio/dsoundaudio.c`):
+- When the voice starts, it places its write position half its buffer past
+  the write cursor, with silence before it. It does the same again whenever
+  the audio written runs out before the write cursor, which gives a gap of
+  silence. The trace event `dsound_place_out` records each placement, and
+  `gap=1` marks a gap.
+- It counts its fill from the play cursor's advance, and never writes over
+  audio not yet played (`dsound_buffer_get_free`).
+- It clears what the play cursor has passed, so a gap plays silence rather
+  than the buffer's audio from a turn earlier.
+- The output buffer's default is now 185.76 ms, so the reserve is 92.88 ms.
+  That covers two measured amounts together. The first is how far the
+  buffer's fill at a period's arrival ranged in the runs below, 61 ms at
+  most. The second is a timer run up to 30 ms late, as in the busy run
+  before the change.
+reims-ctl's `-audiodev` is unchanged.
+
+**Measured** after the change, the same way (2026-11-24, job
+`m3-max-73497`, vendor/qemu `0c0ac356`): 0 clicks in 194.5 s at rest and 0
+in 194.0 s busy, with no gap. The write position stayed at least 73.5 ms
+past the write cursor at rest, and 82.9 ms busy. The added latency is about
+the reserve: 90 ms at the median. A period's first frame waited this long to
+play (ms, p0.1 / median / maximum):
+- rest: 105.5 / 134.2 / 165.5, against 16.4 / 44.4 / 72.4 before;
+- busy: 114.2 / 143.5 / 172.9, against 7.5 / 53.9 / 92.2 before.
+In both phases, at least 99% of the guest's periods completed before its
+next post (`latency_bytes` 0). Before the change, more than one in ten of
+the busy run's periods completed after the next post. A first run after
+the change (`m3-max-73465`) is not counted. The host was slow before QEMU
+started: 10 ms waits after `timeBeginPeriod(1)` took 24.4 ms at the median
+and 50.8 ms at p99. In the other two runs they took 10.1 ms at the median
+and 11.1 to 11.2 ms at p99. In that slow run, QEMU's timer ran up to
+137 ms late, the guest's posts came up to 334 ms apart, and the voice had 59
+gaps at rest.
+
 ## x86-64 macOS guests
 
 What `reims-ctl`'s q35 command gives an x86-64 macOS guest, and why
