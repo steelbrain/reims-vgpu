@@ -23,9 +23,9 @@
  * moved the cursor yet: the latest is where the host's pointer is.
  *
  * Where the point lies, and the rectangles the host is told:
- *  - on x86-64, each framebuffer holds its display's rectangle as WindowServer placed it
- *    (getBoundingRect), and a move of the cursor on any display tells the host each display's
- *    that changed (tellBounds);
+ *  - on x86-64, each framebuffer holds its display's virtual desktop rectangle as WindowServer
+ *    placed it (getBoundingRect), and a move of the cursor on any display tells the host each
+ *    virtual rectangle that changed (tellBounds);
  *  - on arm64, WindowServer tells the displays nothing of where it placed them, so the kext
  *    learns it from its own posts: a crossing posts at the display's pixel of the rectangle held
  *    for it, and again beside the other displays where the cursor did not reach it, at most
@@ -185,7 +185,7 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 	IOSimpleLockUnlock(me->interruptLock);
 	if (!me->hasStarted())
 		return;
-	// The display's mode and its rectangle in the global space.
+	// The display's scanout size and its virtual desktop rectangle.
 	ReimsGraphics *fb = me->copyDisplay(me->drivenIndex(at.display));
 	if (!fb)
 		return;
@@ -221,7 +221,7 @@ void ReimsGraphics::movePointer(thread_call_param_t self, thread_call_param_t)
 		      move == RgfxPointerMove::moved ? "moves" : "is dragged", globalX, globalY, posted);
 }
 
-// Each framebuffer holds its display's rectangle as WindowServer placed it (getBoundingRect).
+// The virtual rectangles used for both IOHIDSystem posts and DISPLAY_BOUNDS.
 void ReimsGraphics::displayPlaces(RgfxGlobalRect *rects, bool *placed)
 {
 	ReimsGraphics *fbs[RGFX_DISPLAYS_MAX];
@@ -232,7 +232,7 @@ void ReimsGraphics::displayPlaces(RgfxGlobalRect *rects, bool *placed)
 		fbs[i]->getBoundingRect(&bounds);
 		if (!bounds || display >= RGFX_DISPLAYS_MAX)
 			continue;
-		rects[display] = {bounds->minx, bounds->miny, bounds->maxx, bounds->maxy};
+		rects[display] = rgfxFramebufferDesktopBounds(bounds);
 		placed[display] = true;
 	}
 	releaseDisplays(fbs, n);
