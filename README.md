@@ -165,10 +165,11 @@ Each of the guest's displays opens in a window the library owns (`crates/reims-v
 guest's picture to capture the keyboard and the mouse:** shortcuts and system keys then go to the
 guest instead of the host, and the pointer stays inside the picture until you release it, so you
 can throw it at the guest's corners and edges without landing on another window. Keys reach the
-guest by position, so the guest's own layout applies, and the Super key is the guest's ⌘. While
-captured, the window grabs the whole keyboard (SDL3's window, on Wayland or X11), so the
-compositor's shortcuts, Super and Alt+Tab among them, reach the guest. **Ctrl+Alt+Super** together
-releases it.
+guest by position, so the guest's own layout applies, and the Super key (the Windows key on Windows)
+is the guest's ⌘. While captured, the window grabs the whole keyboard (SDL3's window, on Wayland or
+X11), so the compositor's shortcuts, Super and Alt+Tab among them, reach the guest; on Windows, the
+Windows key and Alt+Tab do too. **Ctrl+Alt+Super** together (**Ctrl+Alt+Win** on Windows) releases
+it.
 
 The title says when input is captured and how to release it. Losing focus releases capture too,
 and gives the host back its system keys and its pointer. Losing focus, releasing capture or closing the window sends a key-up for every key

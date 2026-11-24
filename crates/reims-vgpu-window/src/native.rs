@@ -21,11 +21,12 @@ mod sdl_thread;
 #[cfg(target_os = "windows")]
 mod windows;
 
-// What the OS adds under the SDL thread's windows: the GPU its compositor composites on.
+// What the OS adds under the SDL thread's windows: the GPU its compositor composites on, and its
+// names for the release chord's keys in the title.
 #[cfg(target_os = "linux")]
-use linux::compositor_device;
+use linux::{HOST_OS, compositor_device};
 #[cfg(target_os = "windows")]
-use windows::compositor_device;
+use windows::{HOST_OS, compositor_device};
 
 #[cfg(all(target_os = "macos", feature = "macos-sdl"))]
 pub(crate) use macos::sdl as sdl_os;

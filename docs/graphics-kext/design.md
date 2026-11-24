@@ -3967,8 +3967,9 @@ pixels of its mode, and the buttons held):
   - **Coming back.** A position back on the window's own display, out of
     reach of the shared edge, ends it: the window lets the host's pointer go at the
     guest's cursor's place in its image, and the pointer is the window's
-    again. Releasing capture (Ctrl+Alt+Super), losing the keyboard or the
-    window's end let the host's pointer go where it was held. Buttons
+    again. Releasing capture (Ctrl+Alt+Super, Ctrl+Alt+Win on Windows),
+    losing the keyboard or the window's end let the host's pointer go where
+    it was held. Buttons
     pressed and released while away go to the display the pointer is on.
   - **Compatibility.** A guest that did not take `DISPLAY_BOUNDS` (a kext
     built before it), or told no rectangles (the arm64e kext before the

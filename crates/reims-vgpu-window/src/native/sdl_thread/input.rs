@@ -25,8 +25,9 @@
 //! - **Keys** by position ([`super::keymap`]), one down and one up each: the host's repeats are
 //!   dropped, since the guest repeats a held key itself. With no menu of the host's to drive,
 //!   every key goes to the guest, captured or not, but what the compositor keeps for itself while
-//!   not captured. Pressing Ctrl, Alt and Super together while captured lifts every key held and
-//!   releases capture: the chord the title names.
+//!   not captured. Pressing Ctrl, Alt and SDL's GUI key together while captured lifts every key
+//!   held and releases capture: the chord the title names, as the host's OS names its keys
+//!   (`super::super::HOST_OS`): Ctrl+Alt+Super on Linux, Ctrl+Alt+Win on Windows.
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
 //!
@@ -53,8 +54,9 @@
 
 use std::sync::Arc;
 
+use super::super::HOST_OS;
 use crate::beyond::{Back, Beyond, Hold, point_of};
-use crate::capture::{Capture, UNCAPTURED_SUFFIX};
+use crate::capture::Capture;
 use crate::config::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, PointerBeyond,
     PointerMotion, ScrollEvent, WindowCallbacks,
@@ -67,9 +69,6 @@ use crate::scroll::POINTS_PER_LINE;
 /// How soon after the window gains the keyboard a click is the one that focused it, in
 /// nanoseconds of SDL's event clock: the compositor gives the keyboard and the click together.
 pub(crate) const FOCUS_CLICK_NS: u64 = 100_000_000;
-
-/// What the title ends with while captured: what capture is on and how to release it.
-const CAPTURED_SUFFIX: &str = " \u{2014} input captured (press Ctrl+Alt+Super to release)";
 
 /// What the window knows when an event reaches it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -285,13 +284,10 @@ impl Input {
         self.capture.pointer_confinement(image)
     }
 
-    /// What the title ends with: the release chord while captured, that a click captures while not.
+    /// What the title ends with: the release chord while captured, in the host's OS's names for
+    /// its keys, and that a click captures while not ([`Capture::title_suffix`]).
     pub(crate) fn title_suffix(&self) -> &'static str {
-        if self.is_captured() {
-            CAPTURED_SUFFIX
-        } else {
-            UNCAPTURED_SUFFIX
-        }
+        self.capture.title_suffix(HOST_OS)
     }
 
     /// What to send, taken.
@@ -651,6 +647,7 @@ mod tests {
     use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::*;
+    use crate::capture::{UNCAPTURED_SUFFIX, captured_suffix};
     use crate::game::SETTLE_NS;
     use crate::game::tests::Mouse;
 
@@ -769,13 +766,15 @@ mod tests {
         );
     }
 
-    /// Ctrl+Alt+Super while captured lifts every key and releases capture
+    /// Ctrl+Alt+Super (Ctrl+Alt+Win on Windows: SDL's GUI key) while captured lifts every key and
+    /// releases capture, and the title names it in the host's OS's names while captured
     #[test]
     fn ctrl_alt_super_releases_capture() {
         let mut input = focused();
         input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
         input.button_up(BUTTON_LEFT, &at((10.0, 10.0)));
         assert!(input.is_captured());
+        assert_eq!(input.title_suffix(), captured_suffix(HOST_OS));
         input.take();
         input.key(0xE0, true, false);
         input.key(0xE2, true, false);

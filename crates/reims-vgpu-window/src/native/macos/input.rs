@@ -54,7 +54,7 @@ use reims_vgpu_vulkan::os::msg;
 
 use super::hotkeys;
 use crate::beyond::{Hold, point_of};
-use crate::capture::{Capture, Route};
+use crate::capture::{Capture, HostOs, Route};
 use crate::config::{MomentumPhase, PointerMotion, ScrollEvent, ScrollPhase, WindowCallbacks};
 use crate::game::Game;
 use crate::geometry::{self, Rect};
@@ -861,9 +861,10 @@ impl InputState {
         self.logic.capture.window_resizable()
     }
 
-    /// What the window's title ends with in the current capture state.
+    /// What the window's title ends with in the current capture state, with the release chord
+    /// in macOS's symbols for its keys.
     pub(crate) fn title_suffix(&self) -> &'static str {
-        self.logic.capture.title_suffix()
+        self.logic.capture.title_suffix(HostOs::MacOs)
     }
 }
 

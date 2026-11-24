@@ -22,8 +22,19 @@
 //!   between the thread's events and jobs.
 //! - **The compositor's GPU**: Windows names none to a window's client ([`compositor_device`]),
 //!   so the window presents on the runtime's device, as a window does where Linux names none.
+//! - **The release chord's keys** ([`HOST_OS`]): the Windows keys are SDL's GUI keys, the keys
+//!   the chord holds with Ctrl and Alt, so the title names the chord Ctrl+Alt+Win. SDL gives the
+//!   left and right Windows keys (`VK_LWIN` and `VK_RWIN` in the keyboard grab's hook, scan codes
+//!   E0 5B and E0 5C otherwise) as `SDL_SCANCODE_LGUI` and `SDL_SCANCODE_RGUI`, the guest's left
+//!   and right ⌘ (read from SDL 3.4.18's code, `WIN_KeyboardHookProc` and
+//!   `scancodes_windows.h`).
 
 use sdl3_sys::everything::SDL_Window;
+
+use crate::capture::HostOs;
+
+/// The OS whose names the title gives the release chord's keys: Ctrl+Alt+Win (the module doc).
+pub(super) const HOST_OS: HostOs = HostOs::Windows;
 
 /// The GPU the compositor composites SDL's window on: none known on Windows (the module doc).
 ///

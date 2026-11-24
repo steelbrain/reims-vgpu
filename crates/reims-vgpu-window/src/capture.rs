@@ -9,8 +9,9 @@
 //! over it is over the window's resize edges too, where a click meant for the guest would drag
 //! the window smaller instead, and never larger, the hold keeping the pointer from going
 //! outward. The keyboard is never captured without the pointer,
-//! nor the pointer without the keyboard. Pressing ⌃⌥⌘ together releases both, and so does the
-//! window losing the keyboard. Uncaptured, a key with ⌘ held drives the host's menu and every
+//! nor the pointer without the keyboard. Pressing ⌃⌥⌘ together releases both (the same keys,
+//! named Ctrl+Alt+Super on Linux and Ctrl+Alt+Win on Windows: [`captured_suffix`]), and so does
+//! the window losing the keyboard. Uncaptured, a key with ⌘ held drives the host's menu and every
 //! other key goes to the guest, and the pointer goes where the person moves it.
 //!
 //! The click that makes the window key only brings it forward: the view does not take a first
@@ -43,9 +44,27 @@ pub struct Capture {
     captured: bool,
 }
 
-/// What the title says while captured.
-const CAPTURED_SUFFIX: &str =
-    " \u{2014} input captured (press \u{2303}\u{2325}\u{2318} to release)";
+/// The host's OS, whose names for the release chord's keys the title gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostOs {
+    /// macOS: ⌃⌥⌘.
+    MacOs,
+    /// Linux: Ctrl+Alt+Super.
+    Linux,
+    /// Windows: Ctrl+Alt+Win. The Windows key is SDL's GUI key there, as Super is on Linux, the
+    /// key the chord holds (`native/windows.rs`).
+    Windows,
+}
+
+/// What the title says while captured on `host`: that input is captured, and the release chord in
+/// the names `host` gives its keys.
+pub fn captured_suffix(host: HostOs) -> &'static str {
+    match host {
+        HostOs::MacOs => " \u{2014} input captured (press \u{2303}\u{2325}\u{2318} to release)",
+        HostOs::Linux => " \u{2014} input captured (press Ctrl+Alt+Super to release)",
+        HostOs::Windows => " \u{2014} input captured (press Ctrl+Alt+Win to release)",
+    }
+}
 
 /// What the title says while not captured, on every OS: that a click captures.
 pub(crate) const UNCAPTURED_SUFFIX: &str = " \u{2014} click to capture input";
@@ -113,11 +132,11 @@ impl Capture {
         self.captured && held.control && held.option && held.command
     }
 
-    /// The text the window's title ends with: what capture is on and how to release it while
-    /// captured, and that a click captures while not.
-    pub fn title_suffix(&self) -> &'static str {
+    /// The text the window's title ends with on `host`: what capture is on and how to release it
+    /// while captured ([`captured_suffix`]), and that a click captures while not.
+    pub fn title_suffix(&self, host: HostOs) -> &'static str {
         if self.captured {
-            CAPTURED_SUFFIX
+            captured_suffix(host)
         } else {
             UNCAPTURED_SUFFIX
         }
@@ -268,14 +287,44 @@ mod tests {
     #[test]
     fn the_title_says_whether_input_is_captured() {
         let mut capture = Capture::new();
-        assert_eq!(capture.title_suffix(), " \u{2014} click to capture input");
+        assert_eq!(
+            capture.title_suffix(HostOs::MacOs),
+            " \u{2014} click to capture input"
+        );
         capture.click_in_image(true);
-        assert!(capture.title_suffix().contains("captured"));
-        assert!(capture.title_suffix().contains("\u{2303}\u{2325}\u{2318}"));
+        assert!(capture.title_suffix(HostOs::MacOs).contains("captured"));
+        assert!(
+            capture
+                .title_suffix(HostOs::MacOs)
+                .contains("\u{2303}\u{2325}\u{2318}")
+        );
         capture.release();
-        assert_eq!(capture.title_suffix(), UNCAPTURED_SUFFIX);
+        assert_eq!(capture.title_suffix(HostOs::MacOs), UNCAPTURED_SUFFIX);
         capture.click_in_image(false);
         capture.resign_key();
-        assert_eq!(capture.title_suffix(), UNCAPTURED_SUFFIX);
+        assert_eq!(capture.title_suffix(HostOs::MacOs), UNCAPTURED_SUFFIX);
+    }
+
+    /// Captured, the title names the release chord's keys as the host's OS does: ⌃⌥⌘ on macOS,
+    /// Ctrl+Alt+Super on Linux and Ctrl+Alt+Win on Windows; not captured, it is the same on each
+    #[test]
+    fn the_title_names_the_release_chord_in_the_host_s_keys() {
+        let mut capture = Capture::new();
+        for host in [HostOs::MacOs, HostOs::Linux, HostOs::Windows] {
+            assert_eq!(capture.title_suffix(host), UNCAPTURED_SUFFIX, "{host:?}");
+        }
+        capture.click_in_image(true);
+        assert_eq!(
+            capture.title_suffix(HostOs::MacOs),
+            " \u{2014} input captured (press \u{2303}\u{2325}\u{2318} to release)"
+        );
+        assert_eq!(
+            capture.title_suffix(HostOs::Linux),
+            " \u{2014} input captured (press Ctrl+Alt+Super to release)"
+        );
+        assert_eq!(
+            capture.title_suffix(HostOs::Windows),
+            " \u{2014} input captured (press Ctrl+Alt+Win to release)"
+        );
     }
 }

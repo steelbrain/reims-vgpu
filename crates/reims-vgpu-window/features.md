@@ -570,9 +570,12 @@ runtime's own device. The switches above apply, and `resolution=` too.
   releases both; losing the keyboard releases; the window's end releases
   both, and the grab and the hold go with the capture before it hides; the
   title says whether input is captured, as on macOS, with Ctrl+Alt+Super to
-  release.
+  release. On a Windows host, where the same SDL window runs, the Windows
+  key is that Super key (SDL's GUI key), and the title names the chord
+  Ctrl+Alt+Win.
   `test: native::sdl_thread::input::a_click_in_the_image_captures_and_is_sent`,
   `test: native::sdl_thread::input::ctrl_alt_super_releases_capture`,
+  `test: capture::the_title_names_the_release_chord_in_the_host_s_keys`,
   `test: sdl::shell::the_end_lets_go_of_the_grab_and_the_holds`,
   `test: sdl::shell::the_pointer_is_held_over_the_image_in_whole_points`,
   `manual` (the grab and the hold)
