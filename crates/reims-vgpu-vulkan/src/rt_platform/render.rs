@@ -985,7 +985,8 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
                 self.mark.end();
                 open.naming.end();
             }
-            drop((open, held));
+            drop(open);
+            drop(held);
             naming_functions(functions, || report(sel, stopped));
             Ok(())
         });
