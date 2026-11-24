@@ -2707,7 +2707,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         if r#type == RGFX_CMD_COMMAND_BUFFER
             && let Some(queue) = poster.queue_obj_id()
         {
-            self.presents.buffer_seen(queue, message_identity(message).1);
+            self.presents
+                .buffer_seen(queue, message_identity(message).1);
         }
         // A pipeline create waits for its reply from its take, here (`create_waits`).
         if create_waits::is_create(r#type) {
@@ -3272,7 +3273,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     fn answer_command_buffer(&self, poster: &CompletionPoster, message: &[u8]) -> bool {
         // The host sees the buffer: the presents' late-show lines keep when (`present`).
         if let Some(queue) = poster.queue_obj_id() {
-            self.presents.buffer_seen(queue, message_identity(message).1);
+            self.presents
+                .buffer_seen(queue, message_identity(message).1);
         }
         if foreign_queue(poster, message) || !self.pending.none_named_by(message) {
             return false;

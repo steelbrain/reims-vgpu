@@ -188,7 +188,9 @@ impl<P: Platform> PresentQueue<P> {
 
     /// The platform's monotonic clock now, as the displays' answers read it.
     fn now(&self) -> Option<MonoTime> {
-        self.presented.first().map(|presented| presented.answers.now())
+        self.presented
+            .first()
+            .map(|presented| presented.answers.now())
     }
 
     /// The host sees the command buffer at `seqno` of queue `queue` now (its doorbell's answer or
@@ -202,7 +204,11 @@ impl<P: Platform> PresentQueue<P> {
             return;
         };
         let mut state = self.state.lock();
-        if state.finished.get(&queue).is_some_and(|&done| done >= seqno) {
+        if state
+            .finished
+            .get(&queue)
+            .is_some_and(|&done| done >= seqno)
+        {
             return;
         }
         let seen = state.late.seen.entry(queue).or_default();
