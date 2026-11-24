@@ -2091,6 +2091,7 @@ impl App {
         let mut s = Spec::new(&name);
         s.profile = Some(profile);
         let dir = f.text("dir");
+        create::check_dir(std::path::Path::new(&dir))?;
         s.dir = (!dir.is_empty()).then(|| paths::absolute(&dir));
         s.cpus = Some(f.text("cpus").parse().context("CPU cores: a number")?);
         s.memory_mib = Some(parse_size_mib(&f.text("memory")).context("memory")?);
@@ -2644,8 +2645,9 @@ fn place_fields() -> Vec<Field> {
             "Where its disks and settings go (Tab completes). Empty for the default.",
         )
         .placeholder(&format!(
-            "{}/<name>",
-            paths::tilde(&paths::default_vms_dir())
+            "default: {}/{}",
+            paths::tilde(&paths::default_vms_dir()),
+            create::NAME_PLACEHOLDER
         )),
         Field::text(
             "cpus",
@@ -3638,6 +3640,38 @@ mod tests {
         assert_eq!(f.busy, None);
         assert_eq!(f.error, Some(format!("the disk {disk} does not exist")));
         assert_eq!((f.text("name"), f.text("disk_path")), (name, disk));
+    }
+
+    /// The create form's storage directory typed in as its placeholder shows it, `<name>` and
+    /// all, is refused in the form, which says to name the folder or leave the field empty
+    #[test]
+    fn a_storage_directory_that_still_says_name_is_refused_in_the_form() {
+        let _env = crate::testenv::Env::new("tui-placeholder");
+        let mut app = App::with(Host {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        });
+        app.macos_versions = Some(Ok(Vec::new()));
+        press(&mut app, [KeyCode::Char('n'), KeyCode::Enter]);
+        press(&mut app, "mac".chars().map(KeyCode::Char));
+        for _ in 0..20 {
+            if form(&app).focused_key() == "dir" {
+                break;
+            }
+            press(&mut app, [KeyCode::Down]);
+        }
+        assert_eq!(form(&app).focused_key(), "dir");
+        press(&mut app, "~/vms/<name>".chars().map(KeyCode::Char));
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let f = form(&app);
+        assert_eq!(f.busy, None);
+        assert_eq!(
+            f.error.as_deref(),
+            Some(
+                "the storage directory still says <name>: replace <name> with a name for the \
+                 folder, or leave it empty for the default"
+            )
+        );
     }
 
     #[test]

@@ -139,6 +139,22 @@ pub fn default_dir(name: &str) -> PathBuf {
     paths::default_vms_dir().join(name)
 }
 
+/// What the create form's empty storage directory shows in place of the VM's name: its
+/// placeholder is the default, `default: <default vms dir>/<name>` (tui.rs, `place_fields`).
+pub const NAME_PLACEHOLDER: &str = "<name>";
+
+/// Refuses a storage directory that still says [`NAME_PLACEHOLDER`]: the placeholder typed in as
+/// it shows, where a name for the VM's folder was meant, which would make a folder named `<name>`.
+pub fn check_dir(dir: &Path) -> Result<()> {
+    if dir.to_string_lossy().contains(NAME_PLACEHOLDER) {
+        bail!(
+            "the storage directory still says {NAME_PLACEHOLDER}: replace {NAME_PLACEHOLDER} \
+             with a name for the folder, or leave it empty for the default"
+        );
+    }
+    Ok(())
+}
+
 /// Makes the VM, calling `progress` with each step, and registers it.
 pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<Vm> {
     create_with(
@@ -159,6 +175,9 @@ pub fn create_with(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vm> {
     check_name(&spec.name)?;
+    if let Some(dir) = &spec.dir {
+        check_dir(dir)?;
+    }
     if let Some(m) = &spec.mac {
         check_mac(m)?;
     }
@@ -942,6 +961,24 @@ mod tests {
     use super::*;
 
     /// A MAC QEMU would refuse stops a create before it makes anything.
+    /// A storage directory that still says `<name>`, the form's placeholder typed in, stops a
+    /// create at once with what to do; one that names a folder is not refused for it.
+    #[test]
+    fn a_storage_directory_that_still_says_name_is_refused() {
+        let env = crate::testenv::Env::new("create-placeholder");
+        let mut spec = Spec::new("t");
+        spec.dir = Some(env.root.join("vms").join("<name>"));
+        let e = create(spec, Host::current(), &mut |_| {}).unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "the storage directory still says <name>: replace <name> with a name for the \
+             folder, or leave it empty for the default"
+        );
+        assert!(!env.root.join("vms").exists());
+        assert!(check_dir(&env.root.join("vms").join("mac")).is_ok());
+        assert!(check_dir(&env.root.join("<name>").join("mac")).is_err());
+    }
+
     #[test]
     fn a_mac_qemu_refuses_stops_a_create_at_once() {
         let env = crate::testenv::Env::new("create-mac");
