@@ -2615,6 +2615,35 @@ second to fourth devices went on it (ports 4.1 to 4.3). A `usb-host`
 `device_add` without a bus went on `usb-bus.0`, and its `device_del` ended in
 `DEVICE_DELETED`.
 
+**Measured** 2026-11-24 on the same host under KVM, booting a reflink clone
+of a macOS 27.2.1 (26B131) guest with reims-ctl at `e5f868243`, given an
+iPhone (05ac:12a8, high speed), with QEMU (at `534a8ced3`) run in a rootless
+distrobox (Fedora 45), as that host runs it, and `usb_host_*` traced:
+- The guest lists the controller's 14 ports, `AppleUSB20XHCIPort` at
+  `port` 8 to 14 and `AppleUSB30XHCIPort` at 1 to 7, and keeps the keyboard
+  and the tablet on the first two, under `AppleUSBXHCIPCI`.
+- At the second start, the guest addressed the iPhone, read its
+  descriptors and strings, and listed it as an `IOUSBHostDevice` at
+  0x01a00000 (port 3), 480 Mb/s, with its serial number. Each of its
+  SET_CONFIGURATION 4 then failed, `libusb_set_configuration: -6 [BUSY]`,
+  about three a second: the host's usbmuxd keeps the iPhone's interface 1
+  claimed through usbfs, which `usb-host` does not detach as it does a
+  kernel driver (QEMU detached `cdc_ncm`). The iPhone stays unusable in the
+  guest while usbmuxd runs. This does not depend on the guest's
+  architecture.
+- Taken back while the VM ran (`reims-ctl usb --remove`), it left the
+  guest's USB tree within a second, and the host's drivers took it again.
+- QEMU in the container sees only the USB devices plugged in as it starts.
+  An iPhone reset re-enumerates as a new device (number 2 to 3 at the first
+  start, as QEMU took it from `ipheth`; 3 to 4 as `usb_host_close` reset
+  it): each time QEMU's `info usbhost` did not list the new number, though
+  its file was there and the user could open it, so QEMU did not open it
+  again, and the guest did not get it back when it was given again.
+  `info usbhost` drops a device once it is gone, but never lists a new one.
+  Why the arrivals never reach libusb there is **unknown**. In a container
+  like that one, a USB device given to a VM must be plugged in before the VM
+  starts, and keep its device number while the VM runs.
+
 macOS hosts give no VM USB devices: reims-ctl lists the host's devices from
 Linux's sysfs alone, and the Mac's QEMU is built without libusb.
 
