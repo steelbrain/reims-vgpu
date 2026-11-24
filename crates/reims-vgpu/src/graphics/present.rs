@@ -546,7 +546,10 @@ impl<P: Platform> PresentQueue<P> {
                     break;
                 };
                 if let Some(now) = now {
-                    let past = presented.answers.refreshes().saturating_sub(shown.taken.refreshes);
+                    let past = presented
+                        .answers
+                        .refreshes()
+                        .saturating_sub(shown.taken.refreshes);
                     let fill = shown.fill.as_ref().map(|_| FillSeen {
                         done: shown.fill_done,
                         block: match &shown.shows {
@@ -743,12 +746,15 @@ struct LastWriter {
     ran: Option<(MonoTime, MonoTime)>,
 }
 
-/// How far `t` lies from `from`: "<n> us after" or "<n> us before".
+/// How far `t` lies from `from`: `"<n> us after"` or `"<n> us before"`.
 fn apart(t: MonoTime, from: MonoTime) -> String {
     if t >= from {
         format!("{} us after", t.saturating_duration_since(from).as_micros())
     } else {
-        format!("{} us before", from.saturating_duration_since(t).as_micros())
+        format!(
+            "{} us before",
+            from.saturating_duration_since(t).as_micros()
+        )
     }
 }
 
@@ -805,9 +811,10 @@ impl Late {
             );
         }
         let filled = fill.map_or_else(String::new, |fill| {
-            let block = fill
-                .block
-                .map_or_else(|| "in no block".to_owned(), |b| format!("of a block of {b} bytes"));
+            let block = fill.block.map_or_else(
+                || "in no block".to_owned(),
+                |b| format!("of a block of {b} bytes"),
+            );
             let done = fill.done.map_or_else(
                 || "its end not seen".to_owned(),
                 |done| format!("seen done {} its take", apart(done, taken.at)),
