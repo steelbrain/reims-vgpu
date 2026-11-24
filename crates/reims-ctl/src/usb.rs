@@ -401,10 +401,11 @@ pub fn bus(profile: Profile) -> &'static str {
 /// switch its USB mode (vendor request 0xc052), which re-enumerates it once. With the guest's
 /// resets passed on as well it re-enumerated again at each, and after the second mode switch it
 /// left the bus until it was plugged in again; after the reset QEMU made as a VM stopped, the
-/// next VM's mode switch did the same. Unreset, it re-enumerated once at its first VM, and the
-/// next guest found it in the mode the last one set, asked no switch, and drove it (docs/qemu.md,
-/// "arm64 guests: USB passthrough"). Every other device keeps QEMU's defaults, with which a USB
-/// stick and an audio device were measured.
+/// next VM's mode switch did the same. Without the guest's resets, it re-enumerated once at its
+/// first boot, and across a guest restart, in which QEMU let go of nothing, the guest found it in
+/// the mode it had set, asked no switch, and drove it; a VM stopped and started again unreset is
+/// not measured (docs/qemu.md, "arm64 guests: USB passthrough"). Every other device keeps QEMU's
+/// defaults, with which a USB stick and an audio device were measured.
 pub fn never_reset(v: u16, p: u16) -> bool {
     v == 0x05ac && matches!(p, 0x1290..=0x12af | 0x1901..=0x1905 | 0x8600)
 }

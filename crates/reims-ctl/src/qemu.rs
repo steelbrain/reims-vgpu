@@ -103,7 +103,8 @@
 //! capabilities vmapple links in address order, without which macOS 27's virtio transport never
 //! starts the device (docs/qemu.md, "arm64 guests: audio").
 //!
-//! Either machine's xHCI controller has seven ports (`p2=7,p3=7`), each taking a USB 2 and a USB 3 device:
+//! The x86-64 VM's xHCI controller, and on Linux the arm64 VM's, has seven ports (`p2=7,p3=7`),
+//! each taking a USB 2 and a USB 3 device:
 //! the keyboard, the tablet, and up to [`crate::vm::USB_DEVICES_MAX`] host devices, at their
 //! own speeds. Its 14 ports are within the 15 macOS numbers on one controller. QEMU's default of
 //! four would leave two: where a device takes the last free port, QEMU chains a full-speed hub

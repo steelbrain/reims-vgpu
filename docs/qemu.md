@@ -2670,7 +2670,7 @@ does ("x86-64 macOS guests: USB passthrough", above): `usb-host` by
 was chosen beside a twin, attached at start and by QMP's `device_add` while
 the VM runs. The controller is `vmapple`'s own `qemu-xhci`, which the machine
 makes with its keyboard and tablet (hw/vmapple/vmapple.c,
-`vmapple_create_pcie`). It has no id, so its bus is named from its type,
+`create_pcie`). It has no id, so its bus is named from its type,
 `usb-bus.0`, and reims-ctl gives it the x86-64 VM's seven ports with
 `-global`:
 
@@ -2775,9 +2775,11 @@ installed, so that usbmuxd never started:
   `guest-reset=off` and vendor/qemu's `reset-on-close=off`, which leaves
   the device unreset as QEMU lets go of it (`usb::never_reset`), at a start
   and over QMP, for x86-64 VMs too.
+- A VM stopped and started again with `reset-on-close=off`, which leaves the
+  iPhone unreset as QEMU exits, is **unknown**: no run has stopped one.
 
 macOS hosts give no VM USB devices: reims-ctl lists the host's devices from
-Linux's sysfs alone, and the Mac's QEMU is built without libusb.
+Linux's sysfs alone.
 
 ### arm64 guests: the boot check of our configuration
 
