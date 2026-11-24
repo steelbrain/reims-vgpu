@@ -295,7 +295,7 @@ impl RtComputeEncoder {
                 e.set_compute_pipeline_state(state.rt())?;
                 let id = state.id();
                 if *pipeline != Some(id) {
-                    self.kept.keep(id, Box::new(state.clone_ref()));
+                    self.kept.keep(id, || Box::new(state.clone_ref()));
                     *pipeline = Some(id);
                     *kernel = state.kernel().cloned();
                 }

@@ -127,6 +127,7 @@ use std::sync::{Arc, OnceLock};
 
 use metal2vulkan_runtime as rt;
 
+use crate::core::collections::hasher::KeyBuild;
 use crate::core::platform::command::{
     CommandBuffer, CompletedHandler, CompletedInfo, EscapedCopies, KeptWhole, PartCut,
     ScheduledHandler, WorkNames, run_completed,
@@ -859,7 +860,7 @@ impl RtCommandBuffer {
 /// list of command buffers in flight (`super::fault`'s `Encoded`).
 #[derive(Clone, Default)]
 pub struct Kept(
-    Arc<Mutex<HashMap<ObjId, Box<dyn Send>>>>,
+    Arc<Mutex<HashMap<ObjId, Box<dyn Send>, KeyBuild>>>,
     Uses,
     Takes,
     Failed,
@@ -937,13 +938,14 @@ impl Kept {
         self.3.fail(ERROR_INTERNAL);
     }
 
-    /// Keeps `object`, whose identity is `id`, unless an object of that identity is kept.
-    pub fn keep(&self, id: ObjId, object: Box<dyn Send>) {
-        self.0.lock().entry(id).or_insert(object);
+    /// Keeps the object `object` makes, whose identity is `id`, unless an object of that identity
+    /// is kept: `object` runs only where none is.
+    pub fn keep(&self, id: ObjId, object: impl FnOnce() -> Box<dyn Send>) {
+        self.0.lock().entry(id).or_insert_with(object);
     }
 
     /// What is kept, taken: none is kept since.
-    fn take(&self) -> HashMap<ObjId, Box<dyn Send>> {
+    fn take(&self) -> HashMap<ObjId, Box<dyn Send>, KeyBuild> {
         std::mem::take(&mut *self.0.lock())
     }
 }
