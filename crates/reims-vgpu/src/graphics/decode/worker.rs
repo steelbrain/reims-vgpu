@@ -32,7 +32,8 @@
 //!   none. A view's mapping, let go of there wherever the view's last hold goes, is under a key of
 //!   its own (`surface_pages::TEARDOWN`), and so is a `Managed` buffer's CPU copy's buffer, which
 //!   the platform's release of its import of the bytes, which drops no handle of the platform's,
-//!   hands over (`managed`).
+//!   hands over (`managed`). The cached views the views' cache's age lets go of are under one
+//!   more of their own (`surface_pages::AGED`).
 //! - The let-go worker's (`reims-vgpu.graphics-let-go-<i>`) key is a block's offset: a block's
 //!   device cache is let go of there, at its release or once the block is named again without
 //!   one, in its block's order. Those drops are off the surface worker's threads: a session's

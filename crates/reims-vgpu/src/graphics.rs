@@ -639,6 +639,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 let memory = CoreMemoryMap::new(Arc::clone(&platform), &map.to_core())
                     .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
+                // The views' cache lets go of the views no block took for a while on a timer of
+                // its own, as the guest may make no new view (`decode::surface_pages`, "The
+                // cache", Age).
+                decoder.start_views_age();
             }
             // Every host keeps IOSurfaces' device caches where the kext asks (`SURFACE_CACHE`), as
             // a Mac's GPU keeps its own copy of each surface it uses, synced with the pages at the

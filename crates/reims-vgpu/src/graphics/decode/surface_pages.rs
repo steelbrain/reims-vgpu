@@ -11,30 +11,47 @@
 //! **The cache.** WindowServer lets a surface's last texture go and makes one again every frame,
 //! so the kext gives the surface a fresh block each time (measured on the msi 5080 host,
 //! macOS 26 guest, a window dragged: 975 fresh blocks in 30 s, 729 of them one 8 MiB surface's).
-//! The [`CACHED_VIEWS`] views made last are kept, by their runs, each with a platform buffer over
-//! the whole view that holds the runtime's import of its pages: a block over the same pages takes
+//! The views made or taken last are kept, by their runs, each with a platform buffer over the
+//! whole view that holds the runtime's import of its pages: a block over the same pages takes
 //! that view, and buffers over it the live import, with no mapping or import made again. A view
 //! maps the guest's pages themselves, so it never goes stale: the memory map's pages stay the
-//! guest's RAM while the device lives (`GraphicsConfig::memory_map`). A view costs a kernel
-//! mapping a run where the platform counts them, so the cached views no block holds (a video
-//! session's outputs once it ends) leave free the room the platform answers for them
-//! ([`HostVm::idle_views_leave`]; on Linux the views' budget's headroom, below the room
-//! [`HostVm::view_room`] answers): as a view is cached where the room is less, the oldest of
-//! them go until the mappings they hold ([`HostVm::view_mappings`]) cover what it lacks, or
-//! none is left. Where the room is plenty they stay however many mappings they hold, within
-//! [`CACHED_VIEWS`] and [`CACHED_BYTES`], so a block over the same pages takes its view again:
-//! a fixed number of their mappings let go of a guest's views over and over though the budget
-//! had room for them. **Measured** 2026-11-23 on an RTX 3090 host (Linux 7.3.3,
-//! `vm.max_map_count` 1,048,576), an 8 GiB x86-64 macOS 26 guest scrolling a browser's page on
-//! its own: blocks took the pages of scattered 10,000 KiB surfaces (2,151 to 2,500 runs) in
-//! turn about every 1.2 s, each such view made in 4.5 to 10.8 ms, and each of the step's 7
-//! such makes in its 595 presents put the present after it 1.96 to 2.07 times the step's median
-//! interval late; 3 of the 7 were of runs whose views a fixed bound of 8,192 mappings had let
-//! go of 2.1 to 2.3 s before, while the process held 24,772 mappings at most. **Measured**
-//! 2026-11-07 on the msi 5080 host (`vm.max_map_count` 65,530), an 8 GiB x86-64 macOS 26 guest
-//! decoding 1080p H.264, 4K HEVC and 1080p H.264 into views: 31 views made and none taken from the
-//! cache, which kept every one, ended sessions' among them, so the process's mappings only grew,
-//! from 3,220 at the desktop to 43,949, past the headroom.
+//! guest's RAM while the device lives (`GraphicsConfig::memory_map`). One policy bounds what the
+//! cache keeps, three ways:
+//! - **Count and bytes.** At most [`CACHED_VIEWS`] views, mapping at most [`CACHED_BYTES`]: as a
+//!   view is cached past either, the oldest go, whether a block holds them or not.
+//! - **Room.** A view costs a kernel mapping a run where the platform counts them, so the cached
+//!   views no block holds (a video session's outputs once it ends) leave free the room the
+//!   platform answers for them ([`HostVm::idle_views_leave`]; on Linux the views' budget's
+//!   headroom, below the room [`HostVm::view_room`] answers): as a view is cached where the room
+//!   is less, the oldest of them go until the mappings they hold ([`HostVm::view_mappings`])
+//!   cover what it lacks, or none is left. Where the room is plenty they stay however many
+//!   mappings they hold, within the other bounds, so a block over the same pages takes its view
+//!   again: a fixed number of their mappings let go of a guest's views over and over though the
+//!   budget had room for them. **Measured** 2026-11-23 on an RTX 3090 host (Linux 7.3.3,
+//!   `vm.max_map_count` 1,048,576), an 8 GiB x86-64 macOS 26 guest scrolling a browser's page on
+//!   its own: blocks took the pages of scattered 10,000 KiB surfaces (2,151 to 2,500 runs) in
+//!   turn about every 1.2 s, each such view made in 4.5 to 10.8 ms, and each of the step's 7
+//!   such makes in its 595 presents put the present after it 1.96 to 2.07 times the step's
+//!   median interval late; 3 of the 7 were of runs whose views a fixed bound of 8,192 mappings
+//!   had let go of 2.1 to 2.3 s before, while the process held 24,772 mappings at most.
+//!   **Measured** 2026-11-07 on the msi 5080 host (`vm.max_map_count` 65,530), an 8 GiB x86-64
+//!   macOS 26 guest decoding 1080p H.264, 4K HEVC and 1080p H.264 into views: 31 views made and
+//!   none taken from the cache, which kept every one, ended sessions' among them, so the
+//!   process's mappings only grew, from 3,220 at the desktop to 43,949, past the headroom.
+//! - **Age.** A view no block holds goes once it stayed so for [`CACHED_IDLE_FOR`], so a guest
+//!   that makes no new view, which no other bound acts on, still gives back the imports and
+//!   mappings of the views it no longer takes. A thread of its own looks at the cache every
+//!   [`AGE_LOOK`] while it keeps a view ([`age`]), off every guest message's thread: each look
+//!   marks the views it finds unheld and not yet marked, clears the mark of those a block holds
+//!   (a take clears it too), and lets go of those marked [`CACHED_IDLE_FOR`] or longer before,
+//!   on the surface worker ([`AGED`]), as a released block's views go. So a view goes no sooner
+//!   than [`CACHED_IDLE_FOR`] after it went unheld, which is no sooner than its last block's
+//!   release, and two looks later at most.
+//!   **Measured** 2026-11-23 on the RTX 3090 host and guest above, the desktop walked (app grid,
+//!   apps, window overview, window drag, browser scroll, autoscroll and video): of the 29 blocks
+//!   that took a pages block's view from the cache, the longest-waiting took one its last block
+//!   had released 7.95 s before, and every other one released 2.8 s before at most; the bound is
+//!   that and 2.05 s more.
 //!
 //! That bound holds once a view is cached, and the views of a session that just ended keep their
 //! mappings until then, so before a view is made, where the platform's room for views' mappings
@@ -75,11 +92,11 @@
 //! **The cache's debug lines** (target `reims_vgpu::graphics::surface_pages`, a diagnostic). Each
 //! pages block's view is logged as taken from the cache or made anew, and as kept in the cache or
 //! let go of at its block's release. Each view the cache lets go of is logged with what chose it
-//! (past [`CACHED_VIEWS`] views, past [`CACHED_BYTES`], the room the unheld views leave free, or
-//! room for a view being made) and the cache's load after it. Every line names the view's runs by
-//! one hash of them ([`runs_hash`]), so a view made anew that matches a view let go of before
-//! shows which bound made the guest's block over the same pages pay for its view again. The
-//! hash and the counts are computed only where the lines are on.
+//! (past [`CACHED_VIEWS`] views, past [`CACHED_BYTES`], the room the unheld views leave free, room
+//! for a view being made, or the age) and the cache's load after it. Every line names the view's
+//! runs by one hash of them ([`runs_hash`]), so a view made anew that matches a view let go of
+//! before shows which bound made the guest's block over the same pages pay for its view again.
+//! The hash and the counts are computed only where the lines are on.
 //!
 //! The runs are the guest's: each must be whole pages of the guest's (4 KiB) and of the host's
 //! from a page, lie in guest RAM, and the runs must sum to the surface's length; else the block
@@ -384,6 +401,20 @@ pub(crate) const CACHED_BYTES: u64 = 1 << 30;
 /// out.
 pub(crate) const CACHED_PAGES_BYTES: u64 = CACHED_BYTES / CACHED_VIEWS as u64;
 
+/// How long a cached view stays with no block holding it before the cache lets it go (the module
+/// doc, "The cache", Age), in the platform clock's nanoseconds: 10 s, the longest a block took a
+/// view after its last block's release in the walk the module doc gives, 7.95 s, and 2.05 s more.
+pub(crate) const CACHED_IDLE_FOR: u64 = 10_000_000_000;
+
+/// How often the age's thread looks at the cache while it keeps a view ([`age`]), in the
+/// platform clock's nanoseconds.
+pub(crate) const AGE_LOOK: u64 = 1_000_000_000;
+
+/// The surface worker's key of the cached views the age lets go of ([`SurfaceViews::age`]): no
+/// block's offset, nor [`TEARDOWN`], so they wait behind no block's jobs, and no view's mapping
+/// behind them.
+pub(super) const AGED: u64 = u64::MAX - 1;
+
 /// The target of the views' debug lines (the module doc, "The cache's debug lines").
 const VIEWS_TARGET: &str = "reims_vgpu::graphics::surface_pages";
 
@@ -402,6 +433,9 @@ enum LetGo {
     /// A view being made lacked the platform's room for its mappings
     /// ([`SurfaceViews::make_room_for`]).
     Room,
+    /// No block held it for [`CACHED_IDLE_FOR`] ([`SurfaceViews::age`]); its bound in the line is
+    /// that in milliseconds.
+    Age,
 }
 
 impl LetGo {
@@ -412,6 +446,7 @@ impl LetGo {
             Self::Bytes => "bytes",
             Self::Leave => "room left",
             Self::Room => "room",
+            Self::Age => "age",
         }
     }
 }
@@ -642,6 +677,9 @@ pub(crate) struct ViewCounts {
     /// Cached views no block held let go of as their mappings passed the platform's bound for
     /// them (the module doc).
     pub(crate) idle_returned: u64,
+    /// Cached views let go of as no block held them for [`CACHED_IDLE_FOR`] (the module doc,
+    /// "The cache", Age).
+    pub(crate) aged: u64,
     /// Cached blocks named by their runs, with no view (the module doc).
     pub(crate) by_runs: u64,
     /// Blocks that asked whether they need a device cache and stay in place (the module doc,
@@ -767,6 +805,10 @@ struct Cached<P: Platform> {
     /// (the module doc, "Addresses the host gives", "Unchanging pages"); `Writable` for every
     /// other import.
     access: PagesAccess,
+    /// When a look of the age's found the view with no block holding it, in the platform clock's
+    /// nanoseconds, where none has since it was cached or last taken, or found it held
+    /// ([`SurfaceViews::age`]).
+    unheld_since: Option<u64>,
 }
 
 impl<P: Platform> Cached<P> {
@@ -968,6 +1010,8 @@ pub(crate) struct SurfaceViews<P: Platform> {
     staged: bool,
     /// Whether the platform keeps no view of an IOSurface's pages ([`PagesRefusal::Unviewed`]).
     surfaces_unviewed: bool,
+    /// The age's timer, told as a view is cached ([`Self::set_age`]).
+    age: Option<Arc<age::ViewsAge>>,
 }
 
 /// What a `SURFACE_PAGES` found under the views' lock ([`SurfaceViews::surface_pages`]).
@@ -1017,7 +1061,14 @@ impl<P: Platform> SurfaceViews<P> {
             known_imports: None,
             staged: false,
             surfaces_unviewed: false,
+            age: None,
         }
+    }
+
+    /// Tells `timer` as each view is cached from now on, so it looks at the cache while it keeps
+    /// one (the module doc, "The cache", Age).
+    pub(crate) fn set_age(&mut self, timer: Arc<age::ViewsAge>) {
+        self.age = Some(timer);
     }
 
     /// The platform knows a pages block's view's import as a block, which `imports` makes
@@ -1577,7 +1628,8 @@ impl<P: Platform> SurfaceViews<P> {
         // where the caches' copies are staged, whose surfaces' views take none.
         let staged = self.staged;
         let hit = (self.cache.iter()).position(|c| c.runs == key && (c.import.is_some() || staged));
-        if let Some(cached) = hit.and_then(|at| self.cache.remove(at)) {
+        if let Some(mut cached) = hit.and_then(|at| self.cache.remove(at)) {
+            cached.unheld_since = None;
             let view = Arc::clone(&cached.view);
             if cached.import.is_some() {
                 let (context, block) = (Some(pages.context), Some(pages.block_offset));
@@ -1639,7 +1691,11 @@ impl<P: Platform> SurfaceViews<P> {
             import,
             known,
             access,
+            unheld_since: None,
         });
+        if let Some(age) = &self.age {
+            age.cached();
+        }
         let mut evicted = Vec::new();
         let mut bytes: u64 = self.cache.iter().map(|c| c.view.length()).sum();
         while self.cache.len() > CACHED_VIEWS || (bytes > CACHED_BYTES && self.cache.len() > 1) {
@@ -1752,6 +1808,42 @@ impl<P: Platform> SurfaceViews<P> {
             self.log_let_go(old, (LetGo::Room, short));
         }
         evicted
+    }
+
+    /// The age's look at the cache at `now`, in the platform clock's nanoseconds (the module doc,
+    /// "The cache", Age): each view no block holds is marked unheld from `now` where it is not
+    /// marked, each a block holds has its mark cleared, and those marked [`CACHED_IDLE_FOR`] or
+    /// longer before go, the oldest first, counted and logged, handed to the surface worker to let
+    /// go of there ([`AGED`]). Whether the cache still keeps a view, for which the next look is
+    /// due.
+    pub(crate) fn age(views: &Mutex<SurfaceViews<P>>, now: u64) -> bool {
+        let mut v = views.lock();
+        for cached in v.cache.iter_mut() {
+            if cached.idle() {
+                cached.unheld_since.get_or_insert(now);
+            } else {
+                cached.unheld_since = None;
+            }
+        }
+        let past = |c: &Cached<P>| {
+            (c.unheld_since).is_some_and(|at| now.saturating_sub(at) >= CACHED_IDLE_FOR)
+        };
+        let mut aged = Vec::new();
+        while let Some(old) = (v.cache.iter()).position(past).and_then(|at| v.cache.remove(at)) {
+            v.counts.aged += 1;
+            v.log_let_go(&old, (LetGo::Age, CACHED_IDLE_FOR / 1_000_000));
+            aged.push(old);
+        }
+        let more = !v.cache.is_empty();
+        let teardown = v.teardown.clone();
+        drop(v);
+        if !aged.is_empty() {
+            match teardown {
+                Some(worker) => worker.drop_later(AGED, 0, aged),
+                None => super::drop_refused(0, aged),
+            }
+        }
+        more
     }
 
     /// The cache's views, the bytes they map, and the mappings of those no block holds, a
@@ -2014,7 +2106,8 @@ impl<P: Platform> SurfaceViews<P> {
                 && (c.known || !known_only)
                 && c.access == asked
         })?;
-        let cached = self.cache.remove(at)?;
+        let mut cached = self.cache.remove(at)?;
+        cached.unheld_since = None;
         let view = Arc::clone(&cached.view);
         let import = cached.import.as_ref().map(|import| import.clone_ref());
         let known = cached.known && !copies;
@@ -3102,6 +3195,7 @@ impl<P: Platform> OwnPages<P> {
     }
 }
 
+pub(crate) mod age;
 #[cfg(test)]
 pub(super) mod costs;
 pub(crate) mod overlaps;
@@ -3687,6 +3781,155 @@ pub(super) mod tests {
         assert!(unheld[4].upgrade().is_some(), "the newest stays");
         assert_eq!(vm.view_room(), Some(5));
         assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 3);
+    }
+
+    /// A pages block's view of `runs`, at `block`, made by a buffer `obj_id` over it, that
+    /// buffer destroyed and the block released, its view then cached; the view, held weakly.
+    fn pages_cycle(
+        r: &mut Rig,
+        block: u64,
+        runs: &[(u64, u64)],
+        obj_id: u64,
+    ) -> std::sync::Weak<SurfaceView<FakePlatform>> {
+        let page = r.page;
+        let length = runs.iter().map(|&(_, pages)| pages).sum::<u64>() * page;
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        assert_eq!(
+            r.pages_flagged(block, 0, runs, length, private),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.pages_buffer(obj_id, 0, block, 0, page), Ok(()));
+        let view = Arc::downgrade(&r.private_view(block));
+        let m = RgfxObjectDestroy {
+            header: header(RGFX_CMD_OBJECT_DESTROY),
+            obj_id,
+        };
+        assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+        r.dec
+            .block_released(&r.device, block, 0, || (), Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+        view
+    }
+
+    /// The age's look at the decoder's views at `now`, in nanoseconds ([`SurfaceViews::age`]).
+    fn age_at(r: &Rig, now: u64) -> bool {
+        SurfaceViews::age(&r.dec.shared.surface_views, now)
+    }
+
+    /// The age: a cached view no block holds goes once a look finds it was unheld for
+    /// [`CACHED_IDLE_FOR`] since the first look that found it so, counted and let go of on the
+    /// surface worker; one a pages block took again within that stays, its age started anew at
+    /// the next look that finds it unheld, and goes once that one is as old
+    #[test]
+    fn a_cached_view_unheld_past_the_age_goes_and_one_taken_within_it_stays() {
+        let mut r = rig(64);
+        let taken = pages_cycle(&mut r, BLOCK, &[(1, 1), (3, 1)], 10);
+        let left = pages_cycle(&mut r, BLOCK + 0x8000, &[(5, 1), (7, 1)], 11);
+        let at = 1_000_000_000;
+        assert!(age_at(&r, at), "both unheld from here");
+        // A pages block over the first's runs takes its view, and goes.
+        let again = pages_cycle(&mut r, BLOCK + 0x10000, &[(1, 1), (3, 1)], 12);
+        assert!(again.ptr_eq(&taken), "taken from the cache");
+        assert_eq!(r.dec.views_of_surfaces().counts().private_reused, 1);
+        let five = 5_000_000_000;
+        assert!(age_at(&r, at + five), "unheld again from here");
+        assert!(age_at(&r, at + CACHED_IDLE_FOR - 1));
+        assert_eq!(r.dec.views_of_surfaces().len().1, 2, "none past the age yet");
+        assert!(age_at(&r, at + CACHED_IDLE_FOR), "the view taken again stays");
+        r.dec.surface_worker().flush();
+        assert!(left.upgrade().is_none(), "the view no block took went");
+        assert!(taken.upgrade().is_some(), "the view taken again stays");
+        assert_eq!(r.dec.views_of_surfaces().counts().aged, 1);
+        assert!(age_at(&r, at + five + CACHED_IDLE_FOR - 1));
+        assert!(
+            !age_at(&r, at + five + CACHED_IDLE_FOR),
+            "the cache keeps no view"
+        );
+        r.dec.surface_worker().flush();
+        assert!(taken.upgrade().is_none(), "past its age from its take");
+        let views = r.dec.views_of_surfaces();
+        assert_eq!((views.counts().aged, views.counts().idle_returned), (2, 0));
+        assert_eq!(views.len(), (0, 0));
+    }
+
+    /// A cached view a block holds never ages, however long it is held; its age starts at the
+    /// first look that finds it unheld, a block's take of it clears it, and it goes once a look
+    /// finds it unheld for [`CACHED_IDLE_FOR`] since the first look after that take
+    #[test]
+    fn a_cached_view_a_block_holds_never_ages() {
+        let mut r = rig(16);
+        let page = r.page;
+        let runs = [(0, 1), (2, 1)];
+        assert_eq!(r.pages(BLOCK, &runs, 2 * page), RGFX_STATUS_OK);
+        let view = Arc::downgrade(&r.view(BLOCK));
+        let at = 1_000_000_000;
+        assert!(age_at(&r, at));
+        assert!(age_at(&r, at + 100 * CACHED_IDLE_FOR), "held, it stays");
+        let release = |r: &mut Rig, block: u64| {
+            r.dec
+                .block_released(&r.device, block, 0, || (), Box::new(|| ()), no_raise());
+            r.dec.surface_worker().flush();
+        };
+        release(&mut r, BLOCK);
+        let unheld = at + 101 * CACHED_IDLE_FOR;
+        assert!(age_at(&r, unheld), "unheld from here");
+        assert!(age_at(&r, unheld + CACHED_IDLE_FOR - 1));
+        // A block over the same pages takes it, and goes.
+        assert_eq!(r.pages(BLOCK + 0x8000, &runs, 2 * page), RGFX_STATUS_OK);
+        assert!(view.ptr_eq(&Arc::downgrade(&r.view(BLOCK + 0x8000))));
+        release(&mut r, BLOCK + 0x8000);
+        let again = unheld + CACHED_IDLE_FOR;
+        assert!(age_at(&r, again), "taken, its age starts again here");
+        assert!(age_at(&r, again + CACHED_IDLE_FOR - 1));
+        assert!(view.upgrade().is_some());
+        assert!(!age_at(&r, again + CACHED_IDLE_FOR), "past its age");
+        r.dec.surface_worker().flush();
+        assert!(view.upgrade().is_none(), "let go of");
+        let counts = r.dec.views_of_surfaces().counts();
+        assert_eq!((counts.made, counts.reused, counts.aged), (1, 1, 1));
+    }
+
+    /// The age's timer: with no view cached no look is due; the first view cached sets one
+    /// [`AGE_LOOK`] on, and each look that leaves a view in the cache the next, so a view whose
+    /// block went goes [`CACHED_IDLE_FOR`] after the look that found it unheld with no view made
+    /// or block released meanwhile; once the cache keeps none no look is due
+    #[test]
+    fn the_age_s_timer_lets_go_of_a_view_no_block_takes() {
+        use std::time::Duration;
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.start_views_age();
+        assert_eq!(r.dec.views_age(), Some((None, 0)), "no view cached");
+        let p = Arc::clone(&r.p);
+        let clock = p.virtual_clock();
+        let start = clock.elapsed_nanos();
+        assert_eq!(r.pages(BLOCK, &[(0, 1)], page), RGFX_STATUS_OK);
+        let view = Arc::downgrade(&r.view(BLOCK));
+        assert_eq!(r.dec.views_age(), Some((Some(start + AGE_LOOK), 0)));
+        r.dec
+            .block_released(&r.device, BLOCK, 0, || (), Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+        let wait = |what: &str, done: &dyn Fn() -> bool| {
+            let mut looks = 0;
+            while !done() {
+                looks += 1;
+                assert!(looks < 20_000, "{what} within 20 s");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        clock.advance(Duration::from_nanos(AGE_LOOK));
+        wait("the first look", &|| {
+            r.dec.views_age().is_some_and(|(_, looks)| looks == 1)
+        });
+        assert!(view.upgrade().is_some(), "unheld from the first look");
+        clock.advance(Duration::from_nanos(CACHED_IDLE_FOR));
+        wait("the view's let-go", &|| {
+            r.dec.views_of_surfaces().counts().aged == 1
+        });
+        wait("no look due", &|| r.dec.views_age() == Some((None, 2)));
+        r.dec.surface_worker().flush();
+        assert!(view.upgrade().is_none(), "let go of");
+        assert_eq!(r.dec.views_of_surfaces().len(), (0, 0));
     }
 
     /// A block asking whether it needs a device cache whose view the platform has no room for,

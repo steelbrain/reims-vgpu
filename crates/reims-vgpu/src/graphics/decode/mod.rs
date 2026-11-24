@@ -1079,6 +1079,9 @@ pub(crate) struct Shared<P: Platform> {
     managed_at_copy: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
+    /// The timer of the views' cache's age, where it runs ([`GraphicsDecoder::start_views_age`]),
+    /// stopped as the decoder goes.
+    views_age: OnceLock<surface_pages::age::AgeStop>,
     /// The life of each block of the region a video decode's output lay in, by its offset, as the
     /// host's video devices take its memory: made at the first such decode and ended at the
     /// block's `BLOCK_RELEASE` ([`video`]).
@@ -1610,6 +1613,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             pins_in_blocks: AtomicBool::new(false),
             managed_at_copy: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
+            views_age: OnceLock::new(),
             block_lives: Mutex::new(HashMap::new()),
             views_logged_at: AtomicU64::new(made_at.as_nanos()),
             slow_answers: Arc::default(),
@@ -1798,6 +1802,52 @@ impl<P: Platform> GraphicsDecoder<P> {
         let teardown = Some(Arc::clone(&self.shared.surface_worker));
         *self.shared.surface_views.lock() =
             surface_pages::SurfaceViews::new(Some((memory, lease)), teardown);
+    }
+
+    /// Runs the views' cache's age bound on a timer of its own from now on, the platform's clock
+    /// its time (`surface_pages`'s module doc, "The cache", Age): set once, at the device's make,
+    /// after [`Self::set_guest_memory`] and before any view is made; a second is ignored. Where
+    /// the thread cannot be made the cache keeps its other bounds alone, logged.
+    pub(crate) fn start_views_age(&self) {
+        use surface_pages::age::{AgeStop, VIEWS_AGE_THREAD, ViewsAge};
+        let now: surface_cache::Now = {
+            let platform = Arc::clone(&self.platform);
+            Arc::new(move || platform.clock().now_mono())
+        };
+        let timer = Arc::new(ViewsAge::new(now));
+        if self.shared.views_age.set(AgeStop(Arc::clone(&timer))).is_err() {
+            return;
+        }
+        let spawned = {
+            let shared = Arc::downgrade(&self.shared);
+            let platform = Arc::clone(&self.platform);
+            let timer = Arc::clone(&timer);
+            std::thread::Builder::new()
+                .name(VIEWS_AGE_THREAD.into())
+                .spawn(move || {
+                    timer.run(platform.as_ref(), |now| {
+                        let shared = shared.upgrade()?;
+                        let views = &shared.surface_views;
+                        Some(surface_pages::SurfaceViews::age(views, now))
+                    });
+                })
+        };
+        if let Err(error) = spawned {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = "views-age";
+                "the IOSurface views' cache has no timer for its age ({error}): it keeps its \
+                 other bounds alone"
+            );
+            return;
+        }
+        self.shared.surface_views.lock().set_age(timer);
+    }
+
+    /// The views' cache's age timer's next look and the looks it made, where it runs
+    /// ([`Self::start_views_age`]; for the tests).
+    #[cfg(test)]
+    pub(crate) fn views_age(&self) -> Option<(Option<u64>, u64)> {
+        Some(self.shared.views_age.get()?.0.due_and_looks())
     }
 
     /// Sets the bytes deferred blocks' device caches may hold at once ([`surface_cache`], the
@@ -2172,12 +2222,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             log::info!(
                 target: "reims_vgpu::graphics",
                 "IOSurface pages in place: {} views made, {} taken from the cache, {} let go of \
-                 from it unheld for their mappings; {} pages blocks' views made, {} taken from \
-                 the cache; {} named by their runs; refused: {} for bad runs, {} not mapped, {} \
-                 kept unviewed by the platform; asked whether they need a device cache: {} in \
-                 place, {} in place while the device's verdict was pending, {} answered a cache, \
-                 {} of them for want of room for their views",
-                c.made, c.reused, c.idle_returned, c.private, c.private_reused, c.by_runs,
+                 from it unheld for their mappings, {} unheld past their age; {} pages blocks' \
+                 views made, {} taken from the cache; {} named by their runs; refused: {} for \
+                 bad runs, {} not mapped, {} kept unviewed by the platform; asked whether they \
+                 need a device cache: {} in place, {} in place while the device's verdict was \
+                 pending, {} answered a cache, {} of them for want of room for their views",
+                c.made, c.reused, c.idle_returned, c.aged, c.private, c.private_reused, c.by_runs,
                 c.bad_runs, c.not_mapped, c.unviewed, c.asked_in_place, c.asked_pending,
                 c.asked_cache, c.asked_room
             );
