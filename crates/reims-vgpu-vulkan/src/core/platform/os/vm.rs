@@ -109,12 +109,14 @@ pub trait HostVm: Send + Sync {
     fn protect_max(&self, addr: HostAddr, len: u64, prot: VmProt) -> Result<(), KernReturn>;
     /// `mach_vm_deallocate(task, addr, len)`. Every caller ignores the result.
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn;
-    /// No Mach counterpart: the most kernel mappings that views of guest pages no object holds
-    /// may keep, kept only to be taken again (the graphics device's cache of IOSurface views),
-    /// where each run of a view ([`HostVm::remap_runs_shared_overwrite`]) takes a mapping of its
-    /// own and the process has a budget of them. `None`, the default, where views take none that
-    /// is counted (Mach's).
-    fn idle_view_mappings(&self) -> Option<u64> {
+    /// No Mach counterpart: the room in kernel mappings ([`HostVm::view_room`]) that views of
+    /// guest pages no object holds, kept only to be taken again (the graphics device's cache of
+    /// IOSurface views), leave free, where each run of a view
+    /// ([`HostVm::remap_runs_shared_overwrite`]) takes a mapping of its own and the process has a
+    /// budget of them: as one is kept where the room is less, the oldest of them go until the
+    /// mappings they hold ([`HostVm::view_mappings`]) cover what it lacks. `None`, the default,
+    /// where views take none that is counted (Mach's).
+    fn idle_views_leave(&self) -> Option<u64> {
         None
     }
     /// No Mach counterpart: how many more kernel mappings views of guest pages may take, now,

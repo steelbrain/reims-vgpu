@@ -17,13 +17,24 @@
 //! maps the guest's pages themselves, so it never goes stale: the memory map's pages stay the
 //! guest's RAM while the device lives (`GraphicsConfig::memory_map`). A view costs a kernel
 //! mapping a run where the platform counts them, so the cached views no block holds (a video
-//! session's outputs once it ends) keep no more mappings, a mapping a run, than the platform
-//! answers for them ([`HostVm::idle_view_mappings`]; on Linux the views' budget's headroom): as
-//! a view is cached, the oldest of them go until the rest fit. **Measured** 2026-11-07 on the
-//! msi 5080 host (`vm.max_map_count` 65,530), an 8 GiB x86-64 macOS 26 guest decoding 1080p
-//! H.264, 4K HEVC and 1080p H.264 into views: 31 views made and none taken from the cache, which
-//! kept every one, ended sessions' among them, so the process's mappings only grew, from 3,220 at
-//! the desktop to 43,949, past the headroom.
+//! session's outputs once it ends) leave free the room the platform answers for them
+//! ([`HostVm::idle_views_leave`]; on Linux the views' budget's headroom, below the room
+//! [`HostVm::view_room`] answers): as a view is cached where the room is less, the oldest of
+//! them go until the mappings they hold ([`HostVm::view_mappings`]) cover what it lacks, or
+//! none is left. Where the room is plenty they stay however many mappings they hold, within
+//! [`CACHED_VIEWS`] and [`CACHED_BYTES`], so a block over the same pages takes its view again:
+//! a fixed number of their mappings let go of a guest's views over and over though the budget
+//! had room for them. **Measured** 2026-11-23 on an RTX 3090 host (Linux 7.3.3,
+//! `vm.max_map_count` 1,048,576), an 8 GiB x86-64 macOS 26 guest scrolling a browser's page on
+//! its own: blocks took the pages of scattered 10,000 KiB surfaces (2,151 to 2,500 runs) in
+//! turn about every 1.2 s, each such view made in 4.5 to 10.8 ms, and each of the step's 7
+//! such makes in its 595 presents put the present after it 1.96 to 2.07 times the step's median
+//! interval late; 3 of the 7 were of runs whose views a fixed bound of 8,192 mappings had let
+//! go of 2.1 to 2.3 s before, while the process held 24,772 mappings at most. **Measured**
+//! 2026-11-07 on the msi 5080 host (`vm.max_map_count` 65,530), an 8 GiB x86-64 macOS 26 guest
+//! decoding 1080p H.264, 4K HEVC and 1080p H.264 into views: 31 views made and none taken from the
+//! cache, which kept every one, ended sessions' among them, so the process's mappings only grew,
+//! from 3,220 at the desktop to 43,949, past the headroom.
 //!
 //! That bound holds once a view is cached, and the views of a session that just ended keep their
 //! mappings until then, so before a view is made, where the platform's room for views' mappings
@@ -57,15 +68,15 @@
 //! had been mapped through dma-bufs and gave back 0 to 3 mappings, and the view being made waited
 //! out the 20 ms for room that could not come.
 //!
-//! [`HostVm::idle_view_mappings`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::idle_view_mappings
+//! [`HostVm::idle_views_leave`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::idle_views_leave
 //! [`HostVm::view_room`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_room
 //! [`HostVm::view_mappings`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_mappings
 //!
 //! **The cache's debug lines** (target `reims_vgpu::graphics::surface_pages`, a diagnostic). Each
 //! pages block's view is logged as taken from the cache or made anew, and as kept in the cache or
 //! let go of at its block's release. Each view the cache lets go of is logged with what chose it
-//! (past [`CACHED_VIEWS`] views, past [`CACHED_BYTES`], past the unheld views' mappings, or room
-//! for a view being made) and the cache's load after it. Every line names the view's runs by
+//! (past [`CACHED_VIEWS`] views, past [`CACHED_BYTES`], the room the unheld views leave free, or
+//! room for a view being made) and the cache's load after it. Every line names the view's runs by
 //! one hash of them ([`runs_hash`]), so a view made anew that matches a view let go of before
 //! shows which bound made the guest's block over the same pages pay for its view again. The
 //! hash and the counts are computed only where the lines are on.
@@ -383,11 +394,11 @@ enum LetGo {
     Views,
     /// Past [`CACHED_BYTES`], the oldest first.
     Bytes,
-    /// Past the mappings the platform answers for the views no block holds
-    /// ([`HostVm::idle_view_mappings`]), the oldest of them first.
+    /// The platform's room for views' mappings short of what the views no block holds leave
+    /// free ([`HostVm::idle_views_leave`]), the oldest of them first.
     ///
-    /// [`HostVm::idle_view_mappings`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::idle_view_mappings
-    IdleMappings,
+    /// [`HostVm::idle_views_leave`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::idle_views_leave
+    Leave,
     /// A view being made lacked the platform's room for its mappings
     /// ([`SurfaceViews::make_room_for`]).
     Room,
@@ -399,7 +410,7 @@ impl LetGo {
         match self {
             Self::Views => "views",
             Self::Bytes => "bytes",
-            Self::IdleMappings => "idle mappings",
+            Self::Leave => "room left",
             Self::Room => "room",
         }
     }
@@ -1275,8 +1286,7 @@ impl<P: Platform> SurfaceViews<P> {
                 let on = (&*memory, lease, teardown);
                 match make_view(platform, device, pages, runs, on, &key, import)? {
                     Ok((view, import)) => {
-                        let idle_mappings = platform.vm().idle_view_mappings();
-                        let evicted = views.lock().keep(key, &view, import, idle_mappings);
+                        let evicted = views.lock().keep(key, &view, import, platform.vm());
                         drop(evicted);
                         Ok(view)
                     }
@@ -1347,7 +1357,7 @@ impl<P: Platform> SurfaceViews<P> {
             if !in_ram {
                 return Some(false);
             }
-            let old = v.released(pages.block_offset, platform.vm().idle_view_mappings());
+            let old = v.released(pages.block_offset, platform.vm());
             v.asked(Asked::Cache);
             v.laid_out(pages.block_offset, planes.to_vec());
             old
@@ -1597,26 +1607,31 @@ impl<P: Platform> SurfaceViews<P> {
         key: Vec<(u64, u64)>,
         view: &Arc<SurfaceView<P>>,
         import: Option<P::Buffer>,
-        idle_mappings: Option<u64>,
+        vm: &dyn reims_vgpu_vulkan::core::platform::os::vm::HostVm,
     ) -> Vec<Cached<P>> {
         self.counts.made += 1;
         let kinds = (false, PagesAccess::Writable);
-        self.cache_view(key, Arc::clone(view), import, kinds, idle_mappings)
+        self.cache_view(key, Arc::clone(view), import, kinds, vm)
     }
 
     /// Caches `view` of the runs `key`, with `import` over it where it has one, a block the
-    /// platform knows where `known` ([`ViewImports`]), asked as `access`, at the
-    /// back; what leaves the cache
-    /// past [`CACHED_VIEWS`] views or [`CACHED_BYTES`], the oldest first, and the oldest views no
-    /// block holds past `idle_mappings` mappings, a mapping a run (the module doc), is returned,
-    /// for the caller to let go of with no lock held.
+    /// platform knows where `known` ([`ViewImports`]), asked as `access`, at the back; what leaves
+    /// the cache past [`CACHED_VIEWS`] views or [`CACHED_BYTES`], the oldest first, and the oldest
+    /// views no block holds while `vm`'s room for views' mappings ([`HostVm::view_room`]) is short
+    /// of what they leave free ([`HostVm::idle_views_leave`]), until the mappings they hold
+    /// ([`HostVm::view_mappings`]) cover what it lacks (the module doc), is returned, for the
+    /// caller to let go of with no lock held.
+    ///
+    /// [`HostVm::view_room`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_room
+    /// [`HostVm::idle_views_leave`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::idle_views_leave
+    /// [`HostVm::view_mappings`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_mappings
     fn cache_view(
         &mut self,
         key: Vec<(u64, u64)>,
         view: Arc<SurfaceView<P>>,
         import: Option<P::Buffer>,
         (known, access): (bool, PagesAccess),
-        idle_mappings: Option<u64>,
+        vm: &dyn reims_vgpu_vulkan::core::platform::os::vm::HostVm,
     ) -> Vec<Cached<P>> {
         self.cache.push_back(Cached {
             runs: key,
@@ -1638,23 +1653,23 @@ impl<P: Platform> SurfaceViews<P> {
                 evicted.push(old);
             }
         }
-        if let Some(bound) = idle_mappings {
-            let mut mappings: u64 = (self.cache.iter())
-                .filter(|c| c.idle())
-                .map(|c| c.runs.len().to_u64())
-                .sum();
-            while mappings > bound {
-                let Some(at) = self.cache.iter().position(Cached::idle) else {
-                    break;
-                };
-                let Some(old) = self.cache.remove(at) else {
-                    break;
-                };
-                mappings -= old.runs.len().to_u64();
-                self.counts.idle_returned += 1;
-                self.log_let_go(&old, (LetGo::IdleMappings, bound));
-                evicted.push(old);
-            }
+        let short = match (vm.idle_views_leave(), vm.view_room()) {
+            (Some(leave), Some(room)) => leave.saturating_sub(room),
+            _ => 0,
+        };
+        let mut freed: u64 = 0;
+        while freed < short {
+            let Some(at) = self.cache.iter().position(Cached::idle) else {
+                break;
+            };
+            let Some(old) = self.cache.remove(at) else {
+                break;
+            };
+            let held = vm.view_mappings(old.view.base, old.view.length);
+            freed = freed.saturating_add(held.unwrap_or(0));
+            self.counts.idle_returned += 1;
+            self.log_let_go(&old, (LetGo::Leave, short));
+            evicted.push(old);
         }
         evicted
     }
@@ -2191,13 +2206,13 @@ impl<P: Platform> SurfaceViews<P> {
 
     /// The block at `offset` went (its `BLOCK_RELEASE`): its view goes once the buffers over it
     /// and the cache have let it go, a pages block's view of at most [`CACHED_PAGES_BYTES`] into
-    /// the cache where it is not there already (the module doc), its bounds kept with
-    /// `idle_mappings` as at a view's making ([`Self::cache_view`]); what the block held of its
-    /// view, and what left the cache, is returned, for the caller to let go of with no lock held.
+    /// the cache where it is not there already (the module doc), its bounds kept with `vm`'s
+    /// room as at a view's making ([`Self::cache_view`]); what the block held of its view, and
+    /// what left the cache, is returned, for the caller to let go of with no lock held.
     pub(crate) fn released(
         &mut self,
         offset: u64,
-        idle_mappings: Option<u64>,
+        vm: &dyn reims_vgpu_vulkan::core::platform::os::vm::HostVm,
     ) -> Option<Released<P>> {
         let view = self.by_block.remove(&offset).map(|(view, _)| view);
         let mut private = self.private.remove(&offset);
@@ -2231,7 +2246,7 @@ impl<P: Platform> SurfaceViews<P> {
                     false => PagesAccess::Writable,
                 };
                 let kinds = (p.known, access);
-                evicted = self.cache_view(p.runs.clone(), made, import, kinds, idle_mappings);
+                evicted = self.cache_view(p.runs.clone(), made, import, kinds, vm);
             }
         }
         (view.is_some() || private.is_some() || by_runs.is_some()).then_some(Released {
@@ -3541,14 +3556,16 @@ pub(super) mod tests {
         );
     }
 
-    /// The cached views no block holds keep no more mappings, a mapping a run, than the
-    /// platform answers for them: as a view is cached, the oldest of them go until the rest fit,
-    /// and a view its block holds stays, however old
+    /// The cached views no block holds leave free the room for views' mappings the platform
+    /// answers for them: while the room is not less they all stay, and as a view is cached where
+    /// it is, the oldest of them go until the mappings they hold cover what it lacks; a view its
+    /// block holds stays, however old
     #[test]
-    fn the_unheld_cached_views_keep_the_platform_s_mappings_at_most() {
+    fn the_unheld_cached_views_leave_the_platform_s_room() {
         let mut r = rig(64);
         let page = r.page;
-        r.p.fake_vm().set_idle_view_mappings(Some(4));
+        r.p.fake_vm().set_idle_views_leave(Some(7));
+        r.p.fake_vm().set_view_room(Some(64));
         let block = |i: u64| BLOCK + i * 0x8000;
         // The oldest, of three runs, its block held throughout.
         assert_eq!(
@@ -3571,21 +3588,105 @@ pub(super) mod tests {
         // The blocks' holds go on the surface worker.
         r.dec.surface_worker().flush();
         assert!(unheld.iter().all(|v| v.upgrade().is_some()), "cached");
-        // Five mappings unheld, past the four: the next view cached lets go of the oldest
-        // unheld one alone.
+        // Room to spare: the next view cached lets none go.
         assert_eq!(
             r.pages(block(4), &[(16, 1), (18, 1)], 2 * page),
             RGFX_STATUS_OK
         );
-        assert!(held.upgrade().is_some(), "the view its block holds stays");
-        assert!(unheld[0].upgrade().is_none(), "the oldest unheld view went");
-        assert!(
-            unheld[1..].iter().all(|v| v.upgrade().is_some()),
-            "the rest fit"
+        assert!(unheld.iter().all(|v| v.upgrade().is_some()), "all stay");
+        // Room for the next view, three short of the seven left free: the next view cached lets
+        // go of the two oldest unheld views, four mappings.
+        r.p.fake_vm().set_view_room(Some(4));
+        assert_eq!(
+            r.pages(block(5), &[(20, 1), (22, 1)], 2 * page),
+            RGFX_STATUS_OK
         );
+        assert!(held.upgrade().is_some(), "the view its block holds stays");
+        assert!(
+            unheld[..2].iter().all(|v| v.upgrade().is_none()),
+            "the two oldest unheld views went"
+        );
+        assert!(unheld[2].upgrade().is_some(), "the rest stays");
         let views = r.dec.views_of_surfaces();
-        assert_eq!(views.counts().idle_returned, 1);
-        assert_eq!(views.len(), (2, 4));
+        assert_eq!(views.counts().idle_returned, 2);
+        assert_eq!(views.len(), (3, 4));
+    }
+
+    /// Under a budget of views' mappings with room to spare, the cached views no block holds
+    /// stay, however many mappings they hold, and a block over the same pages takes its view
+    /// again with nothing mapped; once views fill the budget, a view made for a block lets the
+    /// unheld ones go first, the oldest first, torn down before it is mapped in the room they
+    /// gave back, then those past what they leave free as it is cached; the view a block holds
+    /// stays
+    #[test]
+    fn unheld_cached_views_give_way_to_a_block_s_view_at_the_budget() {
+        use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
+        let mut r = rig(64);
+        let page = r.page;
+        // Its address space, shared.
+        let vm = r.p.fake_vm().clone();
+        // The rig's own remaps, which the budget counts as Linux's counts every view's.
+        vm.set_view_budget(Some(1 << 20));
+        let base = (1 << 20) - vm.view_room().expect("a budget");
+        // Sixteen mappings for the views; the unheld ones leave four of them free.
+        vm.set_view_budget(Some(base + 16));
+        vm.set_idle_views_leave(Some(4));
+        let block = |i: u64| BLOCK + i * 0x8000;
+        // A view its block holds throughout, of two runs.
+        assert_eq!(
+            r.pages(block(0), &[(0, 1), (2, 1)], 2 * page),
+            RGFX_STATUS_OK
+        );
+        let held = Arc::downgrade(&r.view(block(0)));
+        // Five more of two runs each, whose blocks go: ten mappings unheld, four left.
+        let runs = |i: u64| [(4 + 4 * i, 1), (6 + 4 * i, 1)];
+        let mut unheld = Vec::new();
+        for i in 0..5 {
+            let at = block(1 + i);
+            assert_eq!(r.pages(at, &runs(i), 2 * page), RGFX_STATUS_OK);
+            unheld.push(Arc::downgrade(&r.view(at)));
+            r.dec
+                .block_released(&r.device, at, 0, || (), Box::new(|| ()), no_raise());
+        }
+        r.dec.surface_worker().flush();
+        assert!(unheld.iter().all(|v| v.upgrade().is_some()), "all stay");
+        assert_eq!(vm.view_room(), Some(4));
+        assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 0);
+
+        // A block over the oldest's pages takes its view again, nothing mapped.
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.pages(block(6), &runs(0), 2 * page), RGFX_STATUS_OK);
+        assert!(
+            !(r.p.call_log().sels_since(mark)).contains(&"mach_vm_allocate"),
+            "nothing mapped"
+        );
+        let again = unheld[0].upgrade().expect("cached");
+        assert!(Arc::ptr_eq(&again, &r.view(block(6))));
+        drop(again);
+
+        // A view of five runs adds up to seven mappings, three past the budget: the two oldest
+        // unheld views go, four mappings, torn down before it is mapped; cached with three of
+        // the four the unheld ones leave free, the next oldest goes too.
+        let mark = r.p.call_log().mark();
+        let five = [(40, 1), (42, 1), (44, 1), (46, 1), (48, 1)];
+        assert_eq!(r.pages(block(7), &five, 5 * page), RGFX_STATUS_OK);
+        r.dec.surface_worker().flush();
+        let sels = r.p.call_log().sels_since(mark);
+        let made_at = sels.iter().position(|&s| s == "mach_vm_allocate");
+        let torn_down: Vec<bool> = (sels.iter().enumerate())
+            .filter(|&(_, &s)| s == "mach_vm_deallocate")
+            .map(|(i, _)| Some(i) < made_at)
+            .collect();
+        assert_eq!(torn_down, [true, true, false], "two before, one after");
+        assert!(held.upgrade().is_some(), "the view its block holds stays");
+        assert!(unheld[0].upgrade().is_some(), "the view taken again stays");
+        assert!(
+            unheld[1..4].iter().all(|v| v.upgrade().is_none()),
+            "the three oldest unheld views went"
+        );
+        assert!(unheld[4].upgrade().is_some(), "the newest stays");
+        assert_eq!(vm.view_room(), Some(5));
+        assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 3);
     }
 
     /// A block asking whether it needs a device cache whose view the platform has no room for,
@@ -4999,8 +5100,8 @@ pub(super) mod tests {
 
     /// The views' debug lines name a pages block's runs by one hash: its view made anew, kept in
     /// the cache at its block's release, taken from the cache by a block over the same runs, and
-    /// let go of past the unheld views' mappings, with that bound named; blocks over other runs
-    /// have other hashes
+    /// let go of for the room the unheld views leave free, with that bound named; blocks over
+    /// other runs have other hashes
     #[test]
     fn the_views_debug_lines_name_a_view_s_runs_by_one_hash() {
         let mut r = rig(64);
@@ -5026,8 +5127,10 @@ pub(super) mod tests {
         cycle(&mut r, BLOCK, &[(5, 1), (1, 1)], 10);
         cycle(&mut r, BLOCK + 0x8000, &[(5, 1), (1, 1)], 11);
         cycle(&mut r, BLOCK + 0x10000, &[(8, 1), (10, 1)], 12);
-        // Four mappings unheld, past three: the next view cached lets go of the oldest.
-        r.p.fake_vm().set_idle_view_mappings(Some(3));
+        // Room for a view of one run, two short of the five the unheld views leave free: the
+        // next view cached lets go of the oldest, its two mappings.
+        r.p.fake_vm().set_view_room(Some(3));
+        r.p.fake_vm().set_idle_views_leave(Some(5));
         cycle(&mut r, BLOCK + 0x18000, &[(12, 1)], 13);
 
         // Each views' line: what it says of the view, and the hash it names.
@@ -5038,7 +5141,7 @@ pub(super) mod tests {
                     "taken from the cache",
                     "not in the cache, made anew",
                     "kept in the cache",
-                    "let go of (idle mappings, unheld)",
+                    "let go of (room left, unheld)",
                 ]
                 .into_iter()
                 .find(|what| line.contains(what))?;
@@ -5063,7 +5166,7 @@ pub(super) mod tests {
                 ("kept in the cache", second),
                 ("not in the cache, made anew", third.clone()),
                 ("kept in the cache", third),
-                ("let go of (idle mappings, unheld)", first),
+                ("let go of (room left, unheld)", first),
             ]
         );
         assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 1);

@@ -111,8 +111,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`UNCACHED_COPIED`]). [`RGFX_STATUS_REFUSED`].
     pub(super) fn refuse_uncached(&self, device: &P::Device, block: u64) -> u32 {
         self.uncache_surface(device, block);
-        let idle = self.platform.vm().idle_view_mappings();
-        let old = self.shared.surface_views.lock().released(block, idle);
+        let old = (self.shared.surface_views.lock()).released(block, self.platform.vm());
         drop(old);
         self.surface_caches
             .count_shapes(|c| c.uncached_refused += 1);

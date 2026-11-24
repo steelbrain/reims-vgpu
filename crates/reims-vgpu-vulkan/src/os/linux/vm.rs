@@ -1247,11 +1247,12 @@ impl HostVm for LinuxVm {
         KernReturn::SUCCESS
     }
 
-    /// The budget's headroom ([`budget::HEADROOM`]): what the budget keeps short of itself for
-    /// what has no way but mappings of its own. A view kept only to be taken again has another,
-    /// being made again, so the views no object holds take no more of the room below the budget
-    /// than that.
-    fn idle_view_mappings(&self) -> Option<u64> {
+    /// The budget's headroom ([`budget::HEADROOM`]), what the budget keeps short of itself for
+    /// what has no way but mappings of its own, kept again below the room ([`budget::room`]): a
+    /// view kept only to be taken again has another way, being made again, so the views no
+    /// object holds take of the room only what leaves that much of it, whatever number of
+    /// mappings that is.
+    fn idle_views_leave(&self) -> Option<u64> {
         Some(budget::HEADROOM)
     }
 

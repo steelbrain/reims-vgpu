@@ -141,10 +141,13 @@ impl Alias {
 struct VmState {
     areas: Vec<Area>,
     aliases: Vec<Alias>,
-    /// What [`HostVm::idle_view_mappings`] answers ([`FakeVm::set_idle_view_mappings`]).
-    idle_view_mappings: Option<u64>,
+    /// What [`HostVm::idle_views_leave`] answers ([`FakeVm::set_idle_views_leave`]).
+    idle_views_leave: Option<u64>,
     /// What [`HostVm::view_room`] answers ([`FakeVm::set_view_room`]).
     view_room: Option<u64>,
+    /// The budget [`HostVm::view_room`] answers the room under, less the remaps live, where no
+    /// room is set ([`FakeVm::set_view_budget`]).
+    view_budget: Option<u64>,
     /// What [`HostVm::view_mappings`] answers for the view at each first byte, in place of its
     /// remaps ([`FakeVm::set_view_mappings`]).
     view_mappings: std::collections::BTreeMap<u64, u64>,
@@ -187,15 +190,22 @@ impl FakeVm {
         }
     }
 
-    /// Has [`HostVm::idle_view_mappings`] answer `mappings` from now on (`None` at first, as
+    /// Has [`HostVm::idle_views_leave`] answer `mappings` from now on (`None` at first, as
     /// Mach's).
-    pub fn set_idle_view_mappings(&self, mappings: Option<u64>) {
-        self.state.lock().idle_view_mappings = mappings;
+    pub fn set_idle_views_leave(&self, mappings: Option<u64>) {
+        self.state.lock().idle_views_leave = mappings;
     }
 
     /// Has [`HostVm::view_room`] answer `mappings` from now on (`None` at first, as Mach's).
     pub fn set_view_room(&self, mappings: Option<u64>) {
         self.state.lock().view_room = mappings;
+    }
+
+    /// Has [`HostVm::view_room`] answer, where no room is set ([`FakeVm::set_view_room`]), the
+    /// room under a budget of `mappings`: the budget less the remaps live, a mapping each, as
+    /// Linux's budget counts views' runs (`None` at first, as Mach's).
+    pub fn set_view_budget(&self, mappings: Option<u64>) {
+        self.state.lock().view_budget = mappings;
     }
 
     /// Has [`HostVm::view_mappings`] answer `mappings` for the view whose first byte is `at`, as
@@ -478,22 +488,27 @@ impl HostVm for FakeVm {
         KernReturn::SUCCESS
     }
 
-    /// As set ([`FakeVm::set_idle_view_mappings`]); unlogged, as no Mach call answers it.
-    fn idle_view_mappings(&self) -> Option<u64> {
-        self.state.lock().idle_view_mappings
+    /// As set ([`FakeVm::set_idle_views_leave`]); unlogged, as no Mach call answers it.
+    fn idle_views_leave(&self) -> Option<u64> {
+        self.state.lock().idle_views_leave
     }
 
-    /// As set ([`FakeVm::set_view_room`]); unlogged, as no Mach call answers it.
+    /// As set ([`FakeVm::set_view_room`]), else the room under the budget set
+    /// ([`FakeVm::set_view_budget`]); unlogged, as no Mach call answers it.
     fn view_room(&self) -> Option<u64> {
-        self.state.lock().view_room
+        let g = self.state.lock();
+        let live = || g.aliases.len().to_u64();
+        g.view_room
+            .or_else(|| g.view_budget.map(|budget| budget.saturating_sub(live())))
     }
 
-    /// Where a view room is set ([`FakeVm::set_view_room`]), as views' mappings are counted
-    /// there: what [`FakeVm::set_view_mappings`] set for a view at `at`, else the remaps whose
-    /// destination meets its `len` bytes, a mapping each; unlogged, as no Mach call answers it.
+    /// Where a view room or a budget is set ([`FakeVm::set_view_room`],
+    /// [`FakeVm::set_view_budget`]), as views' mappings are counted there: what
+    /// [`FakeVm::set_view_mappings`] set for a view at `at`, else the remaps whose destination
+    /// meets its `len` bytes, a mapping each; unlogged, as no Mach call answers it.
     fn view_mappings(&self, at: HostAddr, len: u64) -> Option<u64> {
         let g = self.state.lock();
-        g.view_room?;
+        g.view_room.or(g.view_budget)?;
         if let Some(&n) = g.view_mappings.get(&at.addr().to_u64()) {
             return Some(n);
         }

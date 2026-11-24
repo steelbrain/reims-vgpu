@@ -2950,7 +2950,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             PagesInPlace::No(why) => {
                 v.asked(surface_pages::Asked::Cache);
-                let released = v.released(block, self.platform.vm().idle_view_mappings());
+                let released = v.released(block, self.platform.vm());
                 // The cache the block's cached `SURFACE_PAGES` makes copies out the texels alone.
                 v.laid_out(block, planes.to_vec());
                 drop(v);
@@ -3150,8 +3150,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.settle_surface(offset);
         settled();
         let (ran, trace, done) = self.timed("BLOCK_RELEASE", offset, asked, done);
-        let idle_mappings = self.platform.vm().idle_view_mappings();
-        let gone = (self.shared.surface_views.lock()).released(offset, idle_mappings);
+        let gone = (self.shared.surface_views.lock()).released(offset, self.platform.vm());
         if let Some(gone) = gone {
             self.shared.surface_worker.drop_later(offset, offset, gone);
         }
