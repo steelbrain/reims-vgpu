@@ -1380,6 +1380,7 @@ mod drawn_tests {
         let draw = Arc::new(PlaneDraw::new(None).expect("the plane draws"));
         for whole in [true, false] {
             let mut r = cached();
+            r.dec.hold_resource_ids(0, 1);
             let page = r.page;
             assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
             // Textures 21 and 22 over buffer 10, each over its plane of [`PLANES`], as a decode's
