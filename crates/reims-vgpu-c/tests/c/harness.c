@@ -138,7 +138,7 @@ static void check_graphics(void) {
                                NULL,
                                NULL};
     RvgGraphicsDeviceConfig c = {
-        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 2, 0, NULL, 0, 0};
+        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 2, 0, NULL, 0, 0, 0};
     RvgGraphicsDevice *d = NULL;
     graphics_destroyed = 0;
     graphics_raised = 0;
@@ -265,7 +265,7 @@ static void check_displays(void) {
     cb.ctx = &displays_destroyed;
     cb.destroy = on_graphics_destroy;
     RvgGraphicsDeviceConfig c = {
-        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 0, 2, NULL, 0, 0};
+        sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64, 0, 2, NULL, 0, 0, 0};
     RvgGraphicsDevice *d = NULL;
     displays_destroyed = 0;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
@@ -404,7 +404,7 @@ static void check_memory_files(void) {
     cb.ctx = &files_destroyed;
     cb.destroy = on_graphics_destroy;
     RvgGraphicsDeviceConfig c = {
-        sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64, 0, 0, NULL, 0, 0};
+        sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64, 0, 0, NULL, 0, 0, 0};
     files_destroyed = 0;
     RvgGraphicsDevice *d = NULL;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);

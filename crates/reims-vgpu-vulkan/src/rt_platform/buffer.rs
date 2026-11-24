@@ -2185,6 +2185,40 @@ fn dma_buf(
     }
 }
 
+/// A Shared block of host memory, for a pool whose host maps only ordinary memory into its guest
+/// (reims-vgpu's `pool::HostMemoryBlocks`): rt's import of a dma-buf of `memory`'s pages
+/// ([`dma_buf`]), all of them, whose host address the device keeps for the block from `memory`'s
+/// first byte ([`HostMappings`]) until rt frees the import. `memory` goes with the import's
+/// release, after rt freed it, the block's host address forgotten first, so no CPU or GPU access
+/// outlives it. Else why rt made no block, `memory` dropped.
+#[cfg(target_os = "linux")]
+pub fn import_host_block(
+    device: &RtObj<RtDevice>,
+    memory: crate::os::RegionMemory,
+    len: u64,
+) -> Result<rt::Block, String> {
+    let at = NonNull::new(memory.base()).ok_or("the memory has no address")?;
+    let release: Released = Box::new(move |mapped, id| {
+        Box::new(move || {
+            if let Some(id) = id.get() {
+                mapped.0.lock().remove(id);
+            }
+            drop(memory);
+        })
+    });
+    match dma_buf(device, "pool block", (at, len), release) {
+        // The memory's pages start its file, so the dma-buf starts at its first byte.
+        Ok((block, 0)) => Ok(block),
+        Ok((block, skip)) => {
+            let _ = device.rt().release_block(block);
+            Err(format!(
+                "the dma-buf of the memory starts {skip} bytes before it"
+            ))
+        }
+        Err(no) => Err(no.why()),
+    }
+}
+
 /// [`dma_buf`]'s import of `pages`, the `len` bytes of whole pages at their address, for `sel`,
 /// where one dma-buf does not hold them, as `too_large` says: rt's import of several dma-bufs of
 /// the files behind them, cut at rt's granule and the last padded, bound behind one buffer (rt's

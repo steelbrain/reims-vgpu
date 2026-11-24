@@ -62,6 +62,28 @@ impl ApiPlatform for RtPlatform {
         )))
     }
 
+    /// On Linux, memfds of the process's own imported into `device` as dma-bufs
+    /// (`pool::HostMemoryBlocks`), each known to `device` from its take until just before it goes
+    /// back, as rt's blocks are. None on macOS and Windows, whose hosts never ask for them.
+    fn host_memory_block_source(
+        &self,
+        device: &<Self as Platform>::Device,
+    ) -> Option<Arc<dyn crate::pool::BlockSource>> {
+        #[cfg(target_os = "linux")]
+        {
+            let known = Box::new(device.known_blocks().clone());
+            Some(Arc::new(crate::pool::HostMemoryBlocks::new(
+                device.clone_ref(),
+                known,
+            )))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = device;
+            None
+        }
+    }
+
     /// rt's import of a pages block's view ([`import_view`]).
     fn view_imports(&self) -> Option<ViewImports<RtPlatform>> {
         Some(Arc::new(import_view))

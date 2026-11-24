@@ -349,6 +349,13 @@ pub struct GraphicsConfig {
     /// `pool_remove`, a range [`PoolConfig::is_valid`] takes, and none of
     /// [`Self::memory_map`]'s ranges overlapping it: otherwise [`Error::InvalidArgument`].
     pub pool: Option<PoolConfig>,
+    /// The pool's blocks are memory of the process's own that the GPU imports
+    /// (`ApiPlatform::host_memory_block_source`; on Linux `crate::pool::HostMemoryBlocks`), for a
+    /// host whose hypervisor takes no cacheable mapping of the GPU's own memory as guest memory
+    /// (Linux's KVM on arm64 without stage-2 forced write-back). The guest's Private blocks keep
+    /// the GPU's memory. Nothing without [`Self::pool`]. [`Error::InvalidArgument`] on a platform
+    /// that makes no such blocks while its pool's blocks would be the GPU's.
+    pub pool_host_memory: bool,
 }
 
 /// The architecture of the macOS guest a graphics device serves ([`GraphicsConfig::guest_arch`]).
@@ -570,6 +577,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         entry::run(|_| {
             let count = display_count(&config)?;
             let pool_host = pool_host(&config)?;
+            let pool_host_memory = config.pool_host_memory;
             let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)
                 .map_err(|_| Error::HostResources)?;
             let region = (platform.graphics_region(size))
@@ -597,8 +605,30 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     Some(range) => {
                         let clock = Arc::clone(&platform);
                         let now = Box::new(move || clock.clock().now_mono());
-                        let source =
-                            (block_source.clone()).unwrap_or_else(|| Arc::new(HostBlocks::new()));
+                        let source: Arc<dyn crate::pool::BlockSource> = match (
+                            pool_host_memory,
+                            block_source.clone(),
+                        ) {
+                            // Host memory the GPU imports, where the host asks for it.
+                            (true, Some(_)) => {
+                                let Some(source) = platform.host_memory_block_source(&gpu_device)
+                                else {
+                                    log::warn!(
+                                        "pool: the host asks for blocks of host memory, which \
+                                         this platform makes none of: the device is refused"
+                                    );
+                                    return Err(Error::InvalidArgument);
+                                };
+                                log::info!(
+                                    "pool: the host asks for blocks of host memory: each of the \
+                                     pool's blocks is a memfd of the library's that the GPU imports"
+                                );
+                                source
+                            }
+                            (_, Some(source)) => source,
+                            // The process's own memory, whatever the host asked.
+                            (_, None) => Arc::new(HostBlocks::new()),
+                        };
                         Some(Pool::new(range, host, now, source)?)
                     }
                     None => None,
