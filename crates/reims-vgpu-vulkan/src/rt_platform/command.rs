@@ -860,13 +860,16 @@ impl RtCommandBuffer {
 /// list of command buffers in flight (`super::fault`'s `Encoded`).
 #[derive(Clone, Default)]
 pub struct Kept(
-    Arc<Mutex<HashMap<ObjId, Box<dyn Send>, KeyBuild>>>,
+    Arc<Mutex<KeptObjects>>,
     Uses,
     Takes,
     Failed,
     super::copied::Used,
     super::fault::Encoded,
 );
+
+/// The objects a command buffer keeps ([`Kept`]), by their identity, on the fixed hasher.
+type KeptObjects = HashMap<ObjId, Box<dyn Send>, KeyBuild>;
 
 /// The code of Metal's error a command buffer was failed with, 0 for none, the first set kept: by
 /// its caller for a deferred buffer's memory rt refused (`CommandBuffer::fail_out_of_memory`), or
@@ -945,7 +948,7 @@ impl Kept {
     }
 
     /// What is kept, taken: none is kept since.
-    fn take(&self) -> HashMap<ObjId, Box<dyn Send>, KeyBuild> {
+    fn take(&self) -> KeptObjects {
         std::mem::take(&mut *self.0.lock())
     }
 }
