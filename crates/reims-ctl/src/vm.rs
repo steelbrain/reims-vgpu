@@ -97,6 +97,27 @@ impl ImageFormat {
             ImageFormat::Raw
         })
     }
+
+    /// The bytes the guest's disk of the image at `path`, in this format, holds: a qcow2 image's
+    /// virtual size, from its header, or a raw image's length.
+    pub fn guest_bytes(self, path: &Path) -> Result<u64> {
+        match self {
+            ImageFormat::Qcow2 => {
+                use std::io::Read;
+                let mut h = [0u8; 32];
+                std::fs::File::open(path)
+                    .and_then(|mut f| f.read_exact(&mut h))
+                    .with_context(|| format!("read {}", path.display()))?;
+                if h[..4] != *b"QFI\xfb" {
+                    bail!("{} is not a qcow2 image", path.display());
+                }
+                Ok(u64::from_be_bytes(h[24..32].try_into()?))
+            }
+            ImageFormat::Raw => Ok(std::fs::metadata(path)
+                .with_context(|| format!("read {}", path.display()))?
+                .len()),
+        }
+    }
 }
 
 /// The guest's graphics device.

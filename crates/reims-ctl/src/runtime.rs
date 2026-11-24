@@ -21,7 +21,7 @@
 use crate::host::{Host, Os, Profile};
 use crate::qemu::{self, Ctx, Invocation};
 use crate::qmp;
-use crate::vm::{DEFAULT_STOP_TIMEOUT, DiskController, Graphics, Vm};
+use crate::vm::{DEFAULT_STOP_TIMEOUT, DiskController, Graphics, ImageFormat, Q35, Vm};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -344,9 +344,10 @@ pub fn map_count_note(n: u64, memory_mib: u64) -> Option<String> {
 /// details; None for other VMs. An offline installer, which reims-util names
 /// `…-offline-installer.img`, installs from its script; any other installer boots Recovery,
 /// whose Reinstall macOS installs it. They name the disk to erase as Disk Utility names it on the
-/// disk's controller ([`DiskController`]). An offline installer holds its release whole, so its
-/// steps say to install with the VM's network off, which keeps macOS's installer from
-/// downloading an update as it installs, and to turn the network back on afterwards.
+/// disk's controller ([`DiskController`]), and on SATA, where OpenCore's image and the installer
+/// have the same name, by its size too ([`sata_disk`]). An offline installer holds its release
+/// whole, so its steps say to install with the VM's network off, which keeps macOS's installer
+/// from downloading an update as it installs, and to turn the network back on afterwards.
 pub fn install_steps(vm: &Vm) -> Option<String> {
     let q = vm.config.q35.as_ref()?;
     let installer = q.installer.as_ref()?;
@@ -361,11 +362,12 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
     let name = vm.name();
     // Disk Utility names a disk by its model and "Media": ide-hd's model is QEMU HARDDISK,
     // QEMU's NVMe controller's QEMU NVMe Ctrl, and on virtio-blk, which has no model, macOS's
-    // AppleVirtIO names the disk Apple Inc. VirtIO Block.
+    // AppleVirtIO names the disk Apple Inc. VirtIO Block. Only the system disk is on NVMe or
+    // virtio.
     let media = match q.disk_controller {
-        DiskController::Ahci => "QEMU HARDDISK Media",
-        DiskController::Nvme => "QEMU NVMe Ctrl Media",
-        DiskController::Virtio => "Apple Inc. VirtIO Block Media",
+        DiskController::Ahci => sata_disk(vm, q, installer),
+        DiskController::Nvme => "QEMU NVMe Ctrl Media".to_string(),
+        DiskController::Virtio => "Apple Inc. VirtIO Block Media".to_string(),
     };
     let network_off = if offline && vm.config.network.enabled {
         format!(
@@ -388,6 +390,37 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
          quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
          (reims-ctl eject {name}){network_on}."
     ))
+}
+
+/// The system disk on SATA as the install steps name it: one of the disks Disk Utility names QEMU
+/// HARDDISK Media alike, ide-hd's all, with OpenCore's image and the installer beside it and the
+/// host's disks the VM is given ([`crate::disks`]). It is named by its size in whole decimal GB,
+/// about what Disk Utility shows (a 128 GiB disk is 137.44 GB there: docs/qemu.md, "x86-64
+/// macOS guests: the disk on NVMe"), and as the largest where it is larger than OpenCore's image
+/// and the installer and the VM is given no disk of the host's, whose sizes are not read here.
+fn sata_disk(vm: &Vm, q: &Q35, installer: &Path) -> String {
+    let bytes = |path: &Path, format: ImageFormat| format.guest_bytes(&vm.path(path)).ok();
+    let others = if vm.config.host_disks.is_empty() {
+        "the installer and OpenCore's"
+    } else {
+        "the installer, OpenCore's and the host's disks the VM is given"
+    };
+    let Some(disk) = bytes(&vm.config.disk, vm.config.disk_format) else {
+        return format!("one of the QEMU HARDDISK Media; the others are {others}");
+    };
+    let largest = vm.config.host_disks.is_empty()
+        && [
+            bytes(&q.opencore, q.opencore_format),
+            bytes(installer, ImageFormat::Raw),
+        ]
+        .iter()
+        .all(|other| other.is_some_and(|b| b < disk));
+    let gb = disk.saturating_add(500_000_000) / 1_000_000_000;
+    if largest {
+        format!("the largest QEMU HARDDISK Media, about {gb} GB; the others are {others}")
+    } else {
+        format!("the QEMU HARDDISK Media of about {gb} GB; the others are {others}")
+    }
 }
 
 /// Warnings about the host, or the guest's last boot, for a start that would still work. Each is
@@ -1677,7 +1710,7 @@ mod tests {
 
     /// An x86-64 VM with an installer has install steps, which name the disk to erase as Disk
     /// Utility names it on the disk's controller, and on NVMe and virtio install there as on
-    /// SATA.
+    /// SATA; on SATA, with no image to read its size from, as one of several.
     #[test]
     fn install_steps_name_the_disk_on_its_controller() {
         let config = r#"
@@ -1699,7 +1732,10 @@ mod tests {
         let steps = install_steps(&vm).unwrap();
         assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
         assert!(
-            steps.contains("erase it (QEMU HARDDISK Media) as APFS"),
+            steps.contains(
+                "erase it (one of the QEMU HARDDISK Media; the others are the installer and \
+                 OpenCore's) as APFS"
+            ),
             "{steps}"
         );
         let q = vm.config.q35.as_mut().unwrap();
@@ -1719,6 +1755,93 @@ mod tests {
         );
         vm.config.q35.as_mut().unwrap().installer = None;
         assert_eq!(install_steps(&vm), None);
+    }
+
+    /// On SATA, where Disk Utility names OpenCore's image, the installer and the host's disks
+    /// QEMU HARDDISK Media as it names the VM's disk, the install steps name the disk by its size
+    /// in whole decimal GB, as the largest where it is, and say what the others are; on NVMe and
+    /// virtio its name alone is the disk's.
+    #[test]
+    fn install_steps_name_the_sata_disk_by_its_size() {
+        let env = crate::testenv::Env::new("install-steps-sata");
+        let qcow2 = |name: &str, bytes: u64| {
+            let mut h = vec![0u8; 32];
+            h[..4].copy_from_slice(b"QFI\xfb");
+            h[7] = 3;
+            h[24..32].copy_from_slice(&bytes.to_be_bytes());
+            std::fs::write(env.root.join(name), h).unwrap();
+        };
+        let raw = |name: &str, bytes: u64| {
+            let f = std::fs::File::create(env.root.join(name)).unwrap();
+            f.set_len(bytes).unwrap();
+        };
+        let config = r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            installer = "installer.img"
+        "#;
+        let mut vm = Vm {
+            dir: env.root.clone(),
+            config: toml::from_str(config).unwrap(),
+        };
+        // A new VM's: the default 128 GiB disk, which Disk Utility shows as 137.44 GB.
+        qcow2("disk.qcow2", 128 << 30);
+        qcow2("opencore.qcow2", 64 << 20);
+        raw("installer.img", 16 << 20);
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.contains(
+                "open Disk Utility, erase it (the largest QEMU HARDDISK Media, about 137 GB; the \
+                 others are the installer and OpenCore's) as APFS and quit Disk Utility."
+            ),
+            "{steps}"
+        );
+        // A disk smaller than another of them: its size alone.
+        qcow2("disk.qcow2", 1 << 30);
+        qcow2("opencore.qcow2", 2 << 30);
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.contains(
+                "erase it (the QEMU HARDDISK Media of about 1 GB; the others are the installer \
+                 and OpenCore's) as APFS"
+            ),
+            "{steps}"
+        );
+        // The host's disks, whose sizes are not read, are QEMU HARDDISK Media too.
+        qcow2("disk.qcow2", 256 << 30);
+        qcow2("opencore.qcow2", 64 << 20);
+        vm.config.host_disks = vec![crate::vm::HostDiskChoice {
+            path: "/dev/disk/by-id/ata-x".into(),
+            name: String::new(),
+        }];
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.contains(
+                "erase it (the QEMU HARDDISK Media of about 275 GB; the others are the \
+                 installer, OpenCore's and the host's disks the VM is given) as APFS"
+            ),
+            "{steps}"
+        );
+        // NVMe and virtio: the disk's own name, as before.
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Nvme;
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.contains("erase it (QEMU NVMe Ctrl Media) as APFS"),
+            "{steps}"
+        );
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Virtio;
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.contains("erase it (Apple Inc. VirtIO Block Media) as APFS"),
+            "{steps}"
+        );
     }
 
     /// An x86-64 VM's install steps end with ejecting the installer.

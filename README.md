@@ -109,8 +109,9 @@ encode, so the guest encodes video in software there.
    reims-ctl create mac --macos 26.6.2 --offline --start   # one exact release, 13 to 20 GB
    ```
 
-   The VM boots into macOS Recovery. Open Disk Utility, erase the VM's disk (QEMU HARDDISK Media)
-   as APFS, and pick Reinstall macOS; with the offline installer, run
+   The VM boots into macOS Recovery. Open Disk Utility, erase the VM's disk (the largest QEMU
+   HARDDISK Media, about 137 GB on a new VM; the others are the installer and OpenCore's) as APFS,
+   and pick Reinstall macOS; with the offline installer, run
    `sh /Volumes/Installer/install-macos.sh` in Terminal instead. Once macOS is installed,
    `reims-ctl eject mac` takes the installer out. Downloads are kept for your next VM, in
    `~/.local/share/reims-ctl/installers` (delete them there to get the space back, once your VMs'
