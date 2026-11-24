@@ -531,7 +531,9 @@ fn complete_in(text: &str, fold_case: bool) -> Completion {
     }
     let sep = std::path::MAIN_SEPARATOR_STR;
     let expanded = crate::paths::expand(typed);
-    let name = expanded.file_name().map(|n| n.to_string_lossy().into_owned());
+    let name = expanded
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
     let (dir, prefix) = if typed.ends_with('/') || typed.ends_with(std::path::MAIN_SEPARATOR) {
         (expanded, String::new())
     } else if let Some(name) = name.filter(|n| typed.ends_with(n.as_str())) {
@@ -611,7 +613,10 @@ fn several(names: &[String]) -> String {
     if names.len() > SHOWN {
         list.push_str(&format!(" and {} more", names.len() - SHOWN));
     }
-    format!("{} names match: {list}. Type more of one, then Tab again.", names.len())
+    format!(
+        "{} names match: {list}. Type more of one, then Tab again.",
+        names.len()
+    )
 }
 
 #[cfg(test)]
@@ -640,7 +645,10 @@ mod tests {
             complete_in(&format!("{base}opencore-"), false),
             done(format!("{base}opencore-dir{sep}"))
         );
-        assert_eq!(complete_in(&format!("{base}zz"), false), Completion::Nothing);
+        assert_eq!(
+            complete_in(&format!("{base}zz"), false),
+            Completion::Nothing
+        );
         assert_eq!(
             complete_in(&format!("{base}other.img"), false),
             Completion::Nothing,
@@ -729,7 +737,10 @@ mod tests {
             complete_in(&format!("{base}do"), true),
             Completion::Several(vec![format!("Documents{sep}"), format!("Downloads{sep}")])
         );
-        assert_eq!(complete_in(&format!("{base}doc"), false), Completion::Nothing);
+        assert_eq!(
+            complete_in(&format!("{base}doc"), false),
+            Completion::Nothing
+        );
         assert_eq!(
             complete(&format!("{base}doc")),
             complete_in(&format!("{base}doc"), cfg!(windows))
