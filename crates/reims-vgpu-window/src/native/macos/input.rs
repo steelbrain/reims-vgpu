@@ -1535,6 +1535,28 @@ mod tests {
         assert_eq!(sent(&mut logic), vec![up(A), pointer(0, 0, 0)]);
     }
 
+    /// A close the person cancels at the question leaves nothing held and capture released: the
+    /// key and the button let go while the question was up send nothing more, a key reaches the
+    /// guest, and a click in the image captures again
+    #[test]
+    fn a_cancelled_close_leaves_nothing_held_and_the_input_goes_on() {
+        let mut logic = captured();
+        logic.button_down(BUTTON_RIGHT, 0, &at((100.0, 50.0)));
+        logic.key_down(key(KVK_A, 0));
+        sent(&mut logic);
+        logic.window_closing();
+        assert!(!logic.capture.is_captured());
+        assert_eq!(sent(&mut logic), vec![up(A), pointer(0, 0, 0)]);
+        logic.key_up(key(KVK_A, 0));
+        logic.button_up(BUTTON_RIGHT, &at((100.0, 50.0)));
+        assert_eq!(sent(&mut logic), vec![]);
+        logic.key_down(key(KVK_Q, 0));
+        logic.key_up(key(KVK_Q, 0));
+        assert_eq!(sent(&mut logic), vec![down(Q), up(Q)]);
+        logic.button_down(BUTTON_LEFT, 0, &at((500.0, 300.0)));
+        assert!(logic.capture.is_captured());
+    }
+
     /// A captured logic driving `mouse` once the guest hides its cursor.
     fn captured_with(mouse: &Arc<Mouse>) -> InputLogic {
         let mut logic = captured();

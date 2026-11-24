@@ -888,6 +888,33 @@ mod tests {
         );
     }
 
+    /// A close the person cancels at the question leaves nothing held and capture released, and
+    /// the input goes on: a key reaches the guest, and a click in the image captures again
+    #[test]
+    fn a_cancelled_close_leaves_nothing_held_and_the_input_goes_on() {
+        let mut input = focused();
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+        input.key(0x04, true, false);
+        input.take();
+        input.closing();
+        assert!(!input.is_captured());
+        assert_eq!(
+            input.take(),
+            vec![ToHost::Key(KeyEvent::up(0x04)), pointer(20, 20, 0)]
+        );
+        input.key(0x05, true, false);
+        input.key(0x05, false, false);
+        assert_eq!(
+            input.take(),
+            vec![
+                ToHost::Key(KeyEvent::down(0x05)),
+                ToHost::Key(KeyEvent::up(0x05))
+            ]
+        );
+        let r = input.button_down(BUTTON_LEFT, 2_000_000_000, &at((50.0, 25.0)));
+        assert!(r.capture_changed && input.is_captured());
+    }
+
     /// The wheel over the image sends notches up and left in the device's own direction, and
     /// lines as smooth scrolling at 10 points each
     #[test]

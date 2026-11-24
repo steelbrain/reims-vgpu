@@ -26,9 +26,11 @@
 //! (`native/macos/sdl/input.rs`); SDL's video starts as the application launches, before the
 //! windows open.
 //!
-//! **The end.** Quit (⌘Q uncaptured, or the Dock's) tells the host through every window's close
-//! callback, and cancels AppKit's own termination, which would `exit()` behind the host's back:
-//! the host ends the VM itself, and the windows close as their displays are released.
+//! **The end.** Quit (⌘Q uncaptured, or the Dock's) lets every window's input go and asks the
+//! person once whether to turn the VM off (`crate::close`), in a sheet on the key window or else
+//! the first, brought forward (`super::alert`); Turn Off tells the host through every window's
+//! close callback. Quit always cancels AppKit's own termination, which would `exit()` behind the
+//! host's back: the host ends the VM itself, and the windows close as their displays are released.
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
@@ -133,7 +135,7 @@ define_class!(
             launched(self.mtm());
         }
 
-        /// Quit tells the host, and cancels AppKit's own termination (module doc).
+        /// Quit asks the person, and cancels AppKit's own termination (module doc).
         #[unsafe(method(applicationShouldTerminate:))]
         fn should_terminate(&self, _sender: &NSApplication) -> NSApplicationTerminateReply {
             let _env = BlockEnv::foreign();
@@ -239,7 +241,7 @@ fn launched(mtm: MainThreadMarker) {
     deprecated,
     reason = "activateIgnoringOtherApps: is the way before macOS 14, which has no activate"
 )]
-fn activate(app: &NSApplication) {
+pub(crate) fn activate(app: &NSApplication) {
     if responds(app, sel!(activate)) {
         msg::get("activate", || app.activate());
     } else {

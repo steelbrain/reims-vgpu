@@ -41,8 +41,11 @@ use sdl3_sys::everything::*;
 
 pub(crate) use self::input::{Input, key_input_captured, quit_requested, release_key_input, takes};
 pub(crate) use self::ui::start;
+use super::alert;
+use super::main_thread::post_main;
 use super::render::{LayerRef, configure_layer};
 use super::shell as appkit;
+use crate::close::Answer;
 use crate::geometry::Insets;
 use crate::handle::Window;
 use crate::screens;
@@ -333,9 +336,32 @@ pub(crate) fn hold_size(shell: &Shell) {
     }
 }
 
-/// The display ended: the window hides, and the surface's reference to the layer goes, on the
-/// main thread. SDL's window may go at once.
+/// Asks the person whether to turn the VM off, for windows `ids` (`crate::close`), in a sheet on
+/// SDL's `NSWindow`, as AppKit's window asks (`super::alert`), rather than in SDL's message box,
+/// which on macOS runs a modal loop of its own on the main thread. It begins from posted work,
+/// outside the event at hand, with no window borrowed; the answer goes to [`shell::answered`]. A
+/// window whose display ended before then asks nothing.
+pub(crate) fn ask(shell: &Shell, ids: Vec<u64>) {
+    let id = shell.window.id();
+    post_main(move |mtm| {
+        let window = shell::with_shell(id, |s| (!s.closed).then(|| s.os.ns_window.clone()));
+        match window.flatten() {
+            Some(window) => alert::ask(
+                &window,
+                ids,
+                |ids, answer, _| shell::answered(ids, answer),
+                mtm,
+            ),
+            None => shell::answered(&ids, Answer::Cancel),
+        }
+    });
+}
+
+/// The display ended: an open question's sheet comes off (`super::alert::end`), the window
+/// hides, and the surface's reference to the layer goes, on the main thread. SDL's window may go
+/// at once.
 pub(crate) fn close(shell: &mut Shell) -> bool {
+    alert::end(&shell.os.ns_window);
     // SAFETY: SDL's window, on the main thread.
     unsafe { SDL_HideWindow(shell.sdl) };
     drop(shell.window.surface().take_layer());

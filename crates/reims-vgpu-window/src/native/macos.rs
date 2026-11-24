@@ -14,7 +14,9 @@
 //! without the feature has no SDL (`sdl_off`): its windows are AppKit's whatever the variable
 //! names, which the application's launch logs once.
 
-// AppKit's side: the application, its windows, their views, render threads, input and cursor.
+// AppKit's side: the application, its windows, their views, render threads, input and cursor,
+// and the question a close asks.
+mod alert;
 mod app;
 mod cursor;
 mod hotkeys;
@@ -182,14 +184,13 @@ pub(crate) fn key_input_captured(mtm: MainThreadMarker) -> bool {
     }
 }
 
-/// Quit: every window lets its input go and tells the host, which ends the VM.
+/// Quit: every window lets its input go, and the person is asked once whether to turn the VM
+/// off (`crate::close`); Turn Off tells the host through every window, which ends the VM.
 pub(crate) fn quit_requested(mtm: MainThreadMarker) {
     if sdl_windows() {
-        sdl::quit_requested();
+        sdl::quit_requested(mtm);
     } else {
-        for view in shell::views(mtm) {
-            view.close_requested();
-        }
+        shell::quit_requested(mtm);
     }
 }
 

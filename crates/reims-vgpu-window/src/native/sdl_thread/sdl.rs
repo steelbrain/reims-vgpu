@@ -18,7 +18,7 @@
 //!
 //! **The surface.** The window is made for Vulkan: its render thread makes the window's Vulkan
 //! surface of SDL's window (`super::render`), so SDL's window goes only once that thread has let
-//! its swapchain and surface go ([`close`], `crate::sdl::shell::released`).
+//! its swapchain and surface go ([`close()`], `crate::sdl::shell::released`).
 //!
 //! **Input** is SDL's events ([`input_event`], `super::input`). While captured, the window grabs
 //! the keyboard (`SDL_SetWindowKeyboardGrab`), so the compositor's own shortcuts reach the guest:
@@ -34,6 +34,7 @@
 //! hook on this thread, which takes the system's shortcuts while the window has the keyboard
 //! (`super::super::windows`).
 
+use std::ffi::{CStr, c_int};
 use std::sync::Arc;
 
 use sdl3_sys::everything::*;
@@ -43,12 +44,13 @@ use super::keymap;
 use super::render::Target;
 use crate::beyond::Hold;
 use crate::capture::Capture;
+use crate::close::{self, Answer};
 use crate::geometry::{Insets, Rect};
 use crate::handle::Window;
 use crate::screens;
-use crate::sdl::c_string;
 use crate::sdl::shell::{self, DEFAULT_MODE, Opened, Shell};
 use crate::sdl::units::{self, Units};
+use crate::sdl::{c_string, sdl_error};
 
 /// Points of a screen's height kept for a window's title bar and a panel: Wayland gives a client
 /// no work area, nor the size of the compositor's decorations, and Windows's work area leaves out
@@ -81,7 +83,7 @@ impl Input {
     }
 
     /// The person closed the window: every key and button held goes up, and capture ends, before
-    /// the host is told, as on macOS.
+    /// the person is asked whether to turn the VM off, as on macOS.
     pub(crate) fn close_requested(&mut self) {
         self.0.closing();
     }
@@ -445,6 +447,96 @@ fn grab_outcome(captured: bool, focused: bool, held: bool, refused: Option<&str>
     }
 }
 
+/// The button of the question's Turn Off (`crate::close`).
+const TURN_OFF_ID: c_int = 1;
+
+/// The button of the question's Cancel, the default, and the answer where no button is chosen.
+const CANCEL_ID: c_int = 0;
+
+/// Asks the person whether to turn the VM off, for windows `ids` (`crate::close`), in SDL's
+/// message box over `shell`'s window: on Linux zenity's question where zenity is installed, else
+/// SDL's own X11 dialog, which the window owns on X11 and under XWayland; on Windows a task dialog
+/// the window owns. Read from SDL 3.4.18's code: zenity's question is a window of its own, which
+/// SDL waits for. SDL's message box holds the thread it runs on until it is answered, the UI
+/// thread here, which made the window, as SDL asks: the other windows' events and the work posted
+/// wait meanwhile, while the render threads draw on. So it is posted, to run after the events at
+/// hand with no window borrowed; the answer goes to [`shell::answered`]. A window whose display
+/// ended before the question showed asks nothing.
+pub(crate) fn ask(shell: &Shell, ids: Vec<u64>) {
+    let id = shell.window.id();
+    super::ui::post(move || {
+        let parent = shell::with_shell(id, |s| (!s.closed).then_some(s.sdl)).flatten();
+        let answer = match parent {
+            Some(parent) => question(parent),
+            None => Answer::Cancel,
+        };
+        shell::answered(&ids, answer);
+    });
+}
+
+/// Shows the question over `parent`, and waits for its answer ([`answer_of`]). Where SDL shows
+/// none (no zenity and no X server on Linux), that is logged, and the close goes ahead.
+fn question(parent: *mut SDL_Window) -> Answer {
+    let title = c_string(close::QUESTION);
+    let message = c_string(close::DETAIL);
+    let turn_off = c_string(close::TURN_OFF);
+    let cancel = c_string(close::CANCEL);
+    let buttons = question_buttons(&turn_off, &cancel);
+    let data = SDL_MessageBoxData {
+        flags: SDL_MESSAGEBOX_WARNING | SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT,
+        window: parent,
+        title: title.as_ptr(),
+        message: message.as_ptr(),
+        numbuttons: 2,
+        buttons: buttons.as_ptr(),
+        colorScheme: std::ptr::null(),
+    };
+    let mut chosen = CANCEL_ID;
+    // SAFETY: SDL's video runs on this thread, which made `parent`, a window open on it; the
+    // strings and the buttons outlive the call.
+    let shown = unsafe { SDL_ShowMessageBox(&data, &mut chosen) };
+    if !shown {
+        log::warn!(
+            target: "reims_vgpu_window",
+            "the question before turning the VM off does not show ({}): the close goes ahead",
+            sdl_error()
+        );
+    }
+    answer_of(shown, chosen)
+}
+
+/// The question's buttons, left to right as the OS's own dialogs place them: on Linux Cancel,
+/// then Turn Off; on Windows Turn Off, then Cancel. Cancel is the default, for Return and for
+/// Escape (zenity takes neither flag).
+fn question_buttons(turn_off: &CStr, cancel: &CStr) -> [SDL_MessageBoxButtonData; 2] {
+    let turn_off = SDL_MessageBoxButtonData {
+        flags: SDL_MessageBoxButtonFlags(0),
+        buttonID: TURN_OFF_ID,
+        text: turn_off.as_ptr(),
+    };
+    let cancel = SDL_MessageBoxButtonData {
+        flags: SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,
+        buttonID: CANCEL_ID,
+        text: cancel.as_ptr(),
+    };
+    if cfg!(target_os = "windows") {
+        [turn_off, cancel]
+    } else {
+        [cancel, turn_off]
+    }
+}
+
+/// The answer of SDL's message box, `shown` or not, whose chosen button is `chosen`: Turn Off
+/// only by its button; any other, the question dismissed included (`chosen` left as it was, or
+/// -1 from Windows' task dialog), is Cancel.
+fn answer_of(shown: bool, chosen: c_int) -> Answer {
+    match (shown, chosen) {
+        (false, _) => Answer::Unshown,
+        (true, TURN_OFF_ID) => Answer::TurnOff,
+        (true, _) => Answer::Cancel,
+    }
+}
+
 /// The display ended: the window hides. SDL's window goes once the render thread has let go
 /// (`crate::sdl::shell::released`), never before.
 pub(crate) fn close(shell: &mut Shell) -> bool {
@@ -498,6 +590,33 @@ mod tests {
             input.0.take(),
             vec![ToHost::Key(KeyEvent::up(0x04)), pointer]
         );
+    }
+
+    /// The question's default, for Return and for Escape, is Cancel, and Turn Off is no default
+    #[test]
+    fn the_question_s_default_is_cancel() {
+        let buttons = question_buttons(c"Turn Off", c"Cancel");
+        let defaults =
+            SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT;
+        let cancel = buttons.iter().find(|b| b.buttonID == CANCEL_ID).unwrap();
+        let turn_off = buttons.iter().find(|b| b.buttonID == TURN_OFF_ID).unwrap();
+        assert_eq!(cancel.flags.0, defaults.0);
+        assert_eq!(turn_off.flags.0, 0);
+        // SAFETY: the texts are the C strings above, which live to the end of the test.
+        let (cancel, turn_off) =
+            unsafe { (CStr::from_ptr(cancel.text), CStr::from_ptr(turn_off.text)) };
+        assert_eq!((cancel, turn_off), (c"Cancel", c"Turn Off"));
+    }
+
+    /// Only Turn Off's button is Turn Off; the question dismissed, or any other button, is
+    /// Cancel, and a question that did not show is said so
+    #[test]
+    fn an_answer_is_turn_off_only_by_its_button() {
+        assert_eq!(answer_of(true, TURN_OFF_ID), Answer::TurnOff);
+        assert_eq!(answer_of(true, CANCEL_ID), Answer::Cancel);
+        assert_eq!(answer_of(true, -1), Answer::Cancel);
+        assert_eq!(answer_of(false, TURN_OFF_ID), Answer::Unshown);
+        assert_eq!(answer_of(false, CANCEL_ID), Answer::Unshown);
     }
 
     /// Each capture and release is logged with whether SDL holds the keyboard grab, and a release

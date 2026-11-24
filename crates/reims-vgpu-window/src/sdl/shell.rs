@@ -22,12 +22,15 @@
 //! draws a changed one: the drawable is the window's size in pixels, one pixel per screen pixel at
 //! any scale.
 //!
-//! **Events.** Closing the window (its close button) tells the host, which ends the VM, and leaves
-//! the window open: it closes when the display is released ([`close`]). Losing the keyboard
-//! releases the input. The window shown, exposed, hidden, minimized, restored or covered tells the
-//! render thread whether to draw ([`shows`]): nothing is presented into a window the person cannot
-//! see. On Wayland a covered window is one the compositor suspends, whose FIFO present would wait
-//! for a frame callback that never comes, on the queue the guest's frames use too.
+//! **Events.** Closing the window (its close button, or the keyboard's or the window system's
+//! close) lets its input go and asks the person, in the OS's own dialog over the window
+//! ([`os::ask`]), whether to turn the VM off (`crate::close`); Turn Off tells the host, which ends
+//! the VM ([`answered`]), and the window stays open: it closes when the display is released
+//! ([`close()`]). Losing the keyboard releases the input. The window shown, exposed, hidden,
+//! minimized, restored or covered tells the render thread whether to draw ([`shows`]): nothing is
+//! presented into a window the person cannot see. On Wayland a covered window is one the
+//! compositor suspends, whose FIFO present would wait for a frame callback that never comes, on
+//! the queue the guest's frames use too.
 //!
 //! **Capture.** While the input is captured, SDL holds the pointer over the image, SDL's mouse
 //! rect ([`mouse_rect`]), set again whenever the layout changes, and frees it when capture ends.
@@ -51,6 +54,7 @@ use sdl3_sys::everything::*;
 use super::cursor::CursorCache;
 use super::os::{self, Input};
 use super::{c_string, sdl_error};
+use crate::close::{self, Answer, Step};
 use crate::geometry::{self, Layout, Rect};
 use crate::handle::Window;
 
@@ -381,15 +385,16 @@ impl Shell {
     }
 
     /// The person closed the window: the input lets go ([`os::Input::close_requested`]), and the
-    /// host is told, which ends the VM ([`close_asked`]). The window stays until the display's
-    /// release closes it.
+    /// person is asked whether to turn the VM off ([`close_asked`]), where the host would hear of
+    /// it; Turn Off tells the host, which ends the VM ([`answered`]). The window stays until the
+    /// display's release closes it.
     pub(crate) fn close_requested(&mut self) {
         log::info!(
             target: "reims_vgpu_window",
             "window {:?}: closed by the person",
             self.window.title()
         );
-        close_asked(self);
+        close_asked(self, close::request);
     }
 
     /// Sends what the input queued to the host's callbacks, while the window has them, and has
@@ -603,6 +608,11 @@ trait Closing {
     fn capture_changed(&mut self);
     /// The grab, the pointer's hold and the size's hold follow capture.
     fn holds_follow_capture(&mut self);
+    /// Whether the host would hear of a close: the window lives, and the host gave a close
+    /// callback.
+    fn host_hears(&self) -> bool;
+    /// The person is asked whether to turn the VM off; the answer comes to [`answered`].
+    fn ask(&mut self);
     /// The host is told of the close.
     fn tell_host(&mut self);
 }
@@ -632,6 +642,17 @@ impl Closing for Shell {
         Shell::holds_follow_capture(self);
     }
 
+    fn host_hears(&self) -> bool {
+        self.window
+            .callbacks()
+            .is_some_and(|callbacks| callbacks.close.is_some())
+    }
+
+    fn ask(&mut self) {
+        let ids = vec![self.window.id()];
+        os::ask(self, ids);
+    }
+
     fn tell_host(&mut self) {
         if let Some(close) = self.window.callbacks().and_then(|c| c.close) {
             close();
@@ -639,18 +660,74 @@ impl Closing for Shell {
     }
 }
 
-/// A close the person asks for, in order: the input lets go, what it queued (the key-ups and the
-/// pointer's buttons up) goes to the host, the grab, the title and the cursor follow where
-/// capture ended, and only then is the host told, which takes its callbacks back, so the guest
-/// gets the key-ups first.
-fn close_asked(c: &mut impl Closing) {
+/// A close the person asks for, in order: the input lets go ([`let_go_for_close`]), and only
+/// then is the person asked, so the guest gets the key-ups before the question takes the
+/// keyboard; or, as `request` decides (`crate::close::request`), nothing more, where the host
+/// would not hear of it, or the host is told at once, where the person already chose Turn Off.
+fn close_asked(c: &mut impl Closing, request: impl FnOnce(bool) -> Step) {
+    let_go_for_close(c);
+    match request(c.host_hears()) {
+        Step::Nothing => {}
+        Step::Ask => c.ask(),
+        Step::Tell => c.tell_host(),
+    }
+}
+
+/// A close's letting go, in order: the input lets go, what it queued (the key-ups and the
+/// pointer's buttons up) goes to the host, and the grab, the title and the cursor follow where
+/// capture ended.
+fn let_go_for_close(c: &mut impl Closing) {
     let captured = c.is_captured();
     c.let_go();
     c.flush();
     if c.is_captured() != captured {
         c.capture_changed();
     }
-    c.tell_host();
+}
+
+/// The person answered the question a close asked ([`close_asked`]) for windows `ids`: Turn Off,
+/// or a question the OS could not show, tells each one's host, which ends the VM; Cancel tells
+/// none, and the VM runs on (`crate::close::answered`). A window whose display has ended tells
+/// nothing: its host's callbacks are gone.
+pub(crate) fn answered(ids: &[u64], answer: Answer) {
+    if close::answered(answer) {
+        for &id in ids {
+            with_shell(id, |shell| shell.tell_host());
+        }
+    }
+}
+
+/// Quit (macOS), for windows `ids`, the key window's first: each window's input lets go
+/// ([`let_go_for_close`]), and one question, over the first window, asks for them all, where any
+/// host would hear of it; Turn Off tells each one's host ([`answered`]).
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "Quit is the macOS application's")
+)]
+pub(crate) fn quit_asked(ids: &[u64]) {
+    let mut hears = false;
+    for &id in ids {
+        with_shell(id, |shell| {
+            let_go_for_close(shell);
+            hears |= shell.host_hears();
+        });
+    }
+    match close::request(hears) {
+        Step::Nothing => {}
+        Step::Ask => {
+            let asked = ids
+                .first()
+                .and_then(|&first| with_shell(first, |shell| os::ask(shell, ids.to_vec())));
+            if asked.is_none() {
+                answered(ids, Answer::Cancel);
+            }
+        }
+        Step::Tell => {
+            for &id in ids {
+                with_shell(id, |shell| shell.tell_host());
+            }
+        }
+    }
 }
 
 /// The display's end, in order, as AppKit's window closes (`DisplayView::window_closing`): the
@@ -714,8 +791,23 @@ mod tests {
         captured: bool,
         /// Whether letting go ends capture.
         releases: bool,
+        /// Whether the host would hear of a close.
+        hears: bool,
         /// The steps, in order.
         steps: Vec<&'static str>,
+    }
+
+    impl Recorded {
+        /// A window captured or not (`captured`), whose letting go ends capture, and whose host
+        /// hears of a close.
+        fn new(captured: bool) -> Recorded {
+            Recorded {
+                captured,
+                releases: true,
+                hears: true,
+                steps: Vec::new(),
+            }
+        }
     }
 
     impl Closing for Recorded {
@@ -749,34 +841,60 @@ mod tests {
             self.steps.push("holds follow");
         }
 
+        fn host_hears(&self) -> bool {
+            self.hears
+        }
+
+        fn ask(&mut self) {
+            self.steps.push("ask");
+        }
+
         fn tell_host(&mut self) {
             self.steps.push("tell host");
         }
     }
 
     /// The person's close lets the input go and sends what it queued, then has the grab, title
-    /// and cursor follow the capture it ended, and tells the host last; with no capture to end,
-    /// nothing follows it
+    /// and cursor follow the capture it ended, and asks last, telling the host nothing yet; with
+    /// no capture to end, nothing follows it
     #[test]
-    fn a_close_sends_the_key_ups_and_ends_capture_before_the_host_hears_of_it() {
-        let mut captured = Recorded {
-            captured: true,
-            releases: true,
-            steps: Vec::new(),
-        };
-        close_asked(&mut captured);
+    fn a_close_sends_the_key_ups_and_ends_capture_before_it_asks() {
+        let mut asks = close::Asks::default();
+        let mut captured = Recorded::new(true);
+        close_asked(&mut captured, |hears| asks.request(hears));
         assert_eq!(
             captured.steps,
-            ["let go", "flush", "capture changed", "tell host"]
+            ["let go", "flush", "capture changed", "ask"]
         );
         assert!(!captured.captured);
-        let mut free = Recorded {
-            captured: false,
-            releases: true,
-            steps: Vec::new(),
-        };
-        close_asked(&mut free);
-        assert_eq!(free.steps, ["let go", "flush", "tell host"]);
+        let mut asks = close::Asks::default();
+        let mut free = Recorded::new(false);
+        close_asked(&mut free, |hears| asks.request(hears));
+        assert_eq!(free.steps, ["let go", "flush", "ask"]);
+    }
+
+    /// A close whose host would not hear of it lets the input go and asks nothing; once the
+    /// person has chosen Turn Off, a later close tells the host with no question, and a cancelled
+    /// one leaves the next close to ask again
+    #[test]
+    fn a_close_asks_where_the_host_hears_and_tells_it_once_turned_off() {
+        let mut asks = close::Asks::default();
+        let mut unheard = Recorded::new(false);
+        unheard.hears = false;
+        close_asked(&mut unheard, |hears| asks.request(hears));
+        assert_eq!(unheard.steps, ["let go", "flush"]);
+
+        let mut first = Recorded::new(false);
+        close_asked(&mut first, |hears| asks.request(hears));
+        assert_eq!(first.steps, ["let go", "flush", "ask"]);
+        assert!(!asks.answered(Answer::Cancel));
+        let mut again = Recorded::new(false);
+        close_asked(&mut again, |hears| asks.request(hears));
+        assert_eq!(again.steps, ["let go", "flush", "ask"]);
+        assert!(asks.answered(Answer::TurnOff));
+        let mut later = Recorded::new(false);
+        close_asked(&mut later, |hears| asks.request(hears));
+        assert_eq!(later.steps, ["let go", "flush", "tell host"]);
     }
 
     /// The display's end lets the input go and sends what it queued, then lets go of the
@@ -784,22 +902,14 @@ mod tests {
     /// capture to end, nothing follows it
     #[test]
     fn the_end_lets_go_of_the_grab_and_the_holds() {
-        let mut captured = Recorded {
-            captured: true,
-            releases: true,
-            steps: Vec::new(),
-        };
+        let mut captured = Recorded::new(true);
         ended(&mut captured);
         assert_eq!(
             captured.steps,
             ["let go at the end", "flush", "holds follow"]
         );
         assert!(!captured.captured);
-        let mut free = Recorded {
-            captured: false,
-            releases: true,
-            steps: Vec::new(),
-        };
+        let mut free = Recorded::new(false);
         ended(&mut free);
         assert_eq!(free.steps, ["let go at the end", "flush"]);
     }

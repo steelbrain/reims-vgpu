@@ -24,8 +24,8 @@ pub(crate) fn key_input_captured(_mtm: MainThreadMarker) -> bool {
     false
 }
 
-/// No SDL window is open to tell the host.
-pub(crate) fn quit_requested() {}
+/// No SDL window is open to ask about.
+pub(crate) fn quit_requested(_mtm: MainThreadMarker) {}
 
 /// No SDL window opens.
 pub(crate) mod windows {

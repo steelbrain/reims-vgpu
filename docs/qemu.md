@@ -494,7 +494,8 @@ is its transport:
   macOS 26.7.2 guest ran 2688x1512; `2560x1440` and the default opened it
   shrunk to 1744x981 points, the guest at 3662x2039 (**measured**). Its
   input is queued for a BH and reaches the guest's tablet and keyboard
-  through its display's console. Closing any window powers the VM off.
+  through its display's console. Closing any window asks first, and its
+  Turn Off powers the VM off.
 - **The console** of each display shows what the display shows, with a
   window or without one: at each of its updates (a display change listener's
   refresh, or a screendump of its head) a thread of the device's pool reads
@@ -2266,8 +2267,8 @@ refuses to start such a VM on a QEMU whose `-display help` lists no `gtk`,
 until `reims-ctl update` builds one.
 Where the environment names no Wayland compositor or X server, GTK's window
 ends QEMU as it starts, so reims-ctl gives such a VM `-display none` there.
-Closing the window ends QEMU at once (`gd_window_close`, `qmp_quit`), as
-closing the library's window powers the VM off.
+Closing the window ends QEMU at once (`gd_window_close`, `qmp_quit`), with no
+question, where closing the library's window asks before it powers the VM off.
 
 **Measured** with a macOS 26.6.1 guest on reims-ctl's command line, on an
 RTX 5080 Laptop GPU host:

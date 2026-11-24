@@ -84,7 +84,8 @@ pub type ScrollFn = Arc<dyn Fn(ScrollEvent) + Send + Sync>;
 /// `(usage, down)`: a key of the USB HID keyboard page (0x07) went down or up. The guest's own
 /// key repeat applies: a held key is one down.
 pub type KeyFn = Arc<dyn Fn(u16, bool) + Send + Sync>;
-/// The person closed the window, or chose Quit: the host ends the VM.
+/// The person closed the window, or chose Quit, and chose Turn Off at the question the window asks
+/// first (`crate::close`): the host ends the VM.
 pub type CloseFn = Arc<dyn Fn() + Send + Sync>;
 
 /// Where a window's captured pointer goes past its image's edges: onto the guest's other

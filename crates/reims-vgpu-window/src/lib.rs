@@ -25,6 +25,9 @@
 //!   the pointer may go), [`beyond`] (a captured pointer past the image's edge, onto the guest's
 //!   other displays), [`scroll`] (wheel and trackpad deltas to notches or smooth scrolling)
 //!   and [`env`](mod@env) (the `REIMS_VGPU_WINDOW_*` variables);
+//! - a close the person asks for, which ends the VM, and the question asked before it: [`close`]
+//!   (when the window asks, its words, and what an answer does), with each OS's dialog in its
+//!   `native` side;
 //! - the host's screens ([`screens`]), as the OS lists them;
 //! - the window itself: [`handle`] (the [`Window`] the display holds), and its OS side
 //!   (`native`, one directory per OS behind one file). On macOS (`native/macos/`) that is the
@@ -45,6 +48,7 @@
 
 pub mod beyond;
 pub mod capture;
+mod close;
 pub mod config;
 pub mod env;
 pub mod game;

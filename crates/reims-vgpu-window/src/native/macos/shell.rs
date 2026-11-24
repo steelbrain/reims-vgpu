@@ -36,8 +36,10 @@
 //! hide (`presentationOptions`, which apply only while it is frontmost). When the screens change,
 //! each borderless window fills its screen again, or the main screen while its own is gone.
 //!
-//! **The delegate.** Closing the window (its close button) tells the host, which ends the VM, and
-//! leaves the window open: it closes when the display is released ([`close`]). Losing key status
+//! **The delegate.** Closing the window (its close button) lets its input go and asks the person,
+//! in a sheet on the window (`super::alert`), whether to turn the VM off; Turn Off tells the host,
+//! which ends the VM ([`answered`]). The window stays open either way: it closes when the display
+//! is released ([`close()`]), which takes an open question's sheet off first. Losing key status
 //! releases the input. Any resize the library did not make is the person's sizing, which ends
 //! the following of the guest's mode: tiling, Stage Manager and window managers set the frame
 //! with no other sign. A live resize's start, a zoom and entering full screen mark it before
@@ -62,8 +64,10 @@ use objc2_foundation::{
 use reims_vgpu_vulkan::core::rt::BlockEnv;
 use reims_vgpu_vulkan::os::msg;
 
+use super::alert;
 use super::main_thread::{MainOnly, responds, shared_app};
-use super::view::DisplayView;
+use super::view::{DisplayView, key_view};
+use crate::close::{self, Answer, Step};
 use crate::geometry::{self, Insets, Rect};
 use crate::handle::Window;
 use crate::screens;
@@ -179,7 +183,8 @@ define_class!(
     unsafe impl NSObjectProtocol for WindowDelegate {}
 
     unsafe impl NSWindowDelegate for WindowDelegate {
-        /// The window stays: the host ends the VM, and the display's release closes it.
+        /// The window stays: the person is asked whether to turn the VM off, Turn Off has the
+        /// host end it, and the display's release closes the window.
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> bool {
             let _env = BlockEnv::foreign();
@@ -320,13 +325,51 @@ fn view_of(id: u64, mtm: MainThreadMarker) -> Option<Retained<DisplayView>> {
     open.iter().find(|s| s.id == id).map(|s| s.view.clone())
 }
 
-/// The views of every open window.
-pub(crate) fn views(mtm: MainThreadMarker) -> Vec<Retained<DisplayView>> {
-    OPEN.get(mtm)
+/// The person answered the question a close asked (`super::alert`) for windows `ids`: Turn Off,
+/// or a question AppKit could not show, tells each one's host, which ends the VM; Cancel tells
+/// none, and the VM runs on (`crate::close::answered`). A window closed meanwhile tells nothing.
+pub(crate) fn answered(ids: &[u64], answer: Answer, mtm: MainThreadMarker) {
+    if close::answered(answer) {
+        for &id in ids {
+            if let Some(view) = view_of(id, mtm) {
+                view.tell_host();
+            }
+        }
+    }
+}
+
+/// Quit: every window's input lets go, and one question, over the key window or else the first
+/// opened, asks for them all (`crate::close`), where any host would hear of it; Turn Off tells
+/// each window's host ([`answered`]), and once the person has chosen it, Quit tells them at once.
+pub(crate) fn quit_requested(mtm: MainThreadMarker) {
+    let key = key_view(mtm);
+    let mut open: Vec<(u64, Retained<DisplayView>)> = OPEN
+        .get(mtm)
         .borrow()
         .iter()
-        .map(|s| s.view.clone())
-        .collect()
+        .map(|s| (s.id, s.view.clone()))
+        .collect();
+    open.sort_by_key(|(_, view)| !key.as_deref().is_some_and(|key| std::ptr::eq(key, &**view)));
+    let mut hears = false;
+    for (_, view) in &open {
+        view.window_closing();
+        hears |= view.host_hears();
+    }
+    match close::request(hears) {
+        Step::Nothing => {}
+        Step::Ask => {
+            let ids: Vec<u64> = open.iter().map(|(id, _)| *id).collect();
+            match open.first() {
+                Some((_, view)) => view.ask(ids),
+                None => answered(&ids, Answer::Cancel, mtm),
+            }
+        }
+        Step::Tell => {
+            for (_, view) in &open {
+                view.tell_host();
+            }
+        }
+    }
 }
 
 /// The frames of the open windowed windows, but window `except`'s.
@@ -887,6 +930,7 @@ pub(crate) fn close(id: u64, mtm: MainThreadMarker) {
         ..
     } = shell;
     view.window_closing();
+    alert::end(&window);
     msg::get("setDelegate:", || window.setDelegate(None));
     msg::get("close", || window.close());
     if borderless {

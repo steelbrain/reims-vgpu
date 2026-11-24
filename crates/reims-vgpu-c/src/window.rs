@@ -70,11 +70,14 @@ pub type RvgWindowWheelFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void,
 pub type RvgWindowKeyFn =
     Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, usage: u16, down: bool)>;
 
-/// `close(ctx)`: the person closed the window, or chose Quit. The window stays open: the host
-/// ends the VM, and its release of the device closes the window.
+/// `close(ctx)`: the person closed the window, or chose Quit, and chose Turn Off at the question
+/// the window asks first, in the OS's own dialog over it: "Turn off the VM?", with Turn Off and
+/// Cancel, the default. Cancel calls nothing. Where the OS shows no question, the close calls it
+/// as if Turn Off were chosen. The window stays open: the host ends the VM, and its release of the
+/// device closes the window.
 ///
 /// Thread, and what it may call: as RvgWindowPointerFn. Without it, closing the window does
-/// nothing, and Quit is ignored.
+/// nothing and asks nothing, and Quit is ignored.
 pub type RvgWindowCloseFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void)>;
 
 /// In an RvgWindowScroll's `phase`: the event is in no gesture (a notched wheel, a device that

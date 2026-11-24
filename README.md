@@ -175,7 +175,8 @@ it.
 
 The title says when input is captured and how to release it. Losing focus releases capture too,
 and gives the host back its system keys and its pointer. Losing focus, releasing capture or closing the window sends a key-up for every key
-still down, so nothing sticks. Closing a window powers the VM off.
+still down, so nothing sticks. Closing a window first asks "Turn off the VM?": Turn Off powers the
+VM off at once, as if its power were cut, and Cancel keeps it running.
 
 If you'd rather the window never capture anything, turn off **Capture input** in the VM's
 settings (`e` in `reims-ctl`, or `reims-ctl set <vm> --capture false`; it applies at the VM's

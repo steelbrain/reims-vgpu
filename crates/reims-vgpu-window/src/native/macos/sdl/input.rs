@@ -52,7 +52,7 @@ impl Input {
     }
 
     /// The person closed the window or chose Quit: as for AppKit's window, every key and button
-    /// held goes up, and capture ends, before the host is told.
+    /// held goes up, and capture ends, before the person is asked.
     pub(crate) fn close_requested(&mut self) {
         self.0.window_closing();
     }
@@ -284,9 +284,11 @@ pub(crate) fn key_input_captured(mtm: MainThreadMarker) -> bool {
         .unwrap_or(false)
 }
 
-/// Quit: every window lets its input go and tells the host, which ends the VM.
-pub(crate) fn quit_requested() {
-    for id in shell::each_open(|s| (!s.closed).then(|| s.window.id())) {
-        shell::with_shell(id, Shell::close_requested);
-    }
+/// Quit: every window lets its input go, and one question, over the key window or else the first
+/// opened, asks for them all whether to turn the VM off (`crate::sdl::shell::quit_asked`).
+pub(crate) fn quit_requested(mtm: MainThreadMarker) {
+    let key = key_shell(mtm);
+    let mut ids = shell::each_open(|s| (!s.closed).then(|| s.window.id()));
+    ids.sort_by_key(|&id| Some(id) != key);
+    shell::quit_asked(&ids);
 }

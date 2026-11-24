@@ -82,6 +82,8 @@ use super::cursor::CursorCache;
 use super::input::{InputState, Reaction, ViewContext};
 use super::main_thread::{ns_text, responds, shared_app};
 use super::render::{LayerRef, configure_layer};
+use super::{alert, shell};
+use crate::close::{self, Answer, Step};
 use crate::geometry::{self, Insets, Layout, Rect};
 use crate::handle::Window;
 
@@ -756,17 +758,47 @@ impl DisplayView {
         self.hold_size();
     }
 
-    /// The person closed the window or chose Quit: the input lets go, and the host is told,
-    /// which ends the VM. The window stays until the display's release closes it.
+    /// The person closed the window: the input lets go, then the person is asked whether to turn
+    /// the VM off, where the host would hear of it (`crate::close`); Turn Off tells the host, which
+    /// ends the VM ([`shell::answered`]). The window stays until the display's release closes it.
     pub(crate) fn close_requested(&self) {
         log::info!(
             "window {:?}: closed by the person",
             self.ivars().window.title()
         );
         self.window_closing();
+        match close::request(self.host_hears()) {
+            Step::Nothing => {}
+            Step::Ask => self.ask(vec![self.ivars().window.id()]),
+            Step::Tell => self.tell_host(),
+        }
+    }
+
+    /// Whether the host would hear of a close: the window lives, and the host gave a close
+    /// callback.
+    pub(crate) fn host_hears(&self) -> bool {
+        self.ivars()
+            .window
+            .callbacks()
+            .is_some_and(|callbacks| callbacks.close.is_some())
+    }
+
+    /// Tells the host the person closed the window, which ends the VM.
+    pub(crate) fn tell_host(&self) {
         let close = self.ivars().window.callbacks().and_then(|c| c.close);
         if let Some(close) = close {
             close();
+        }
+    }
+
+    /// Asks the person whether to turn the VM off, for windows `ids`, in a sheet on this view's
+    /// window (`super::alert`); the answer goes to [`shell::answered`]. A view out of its window
+    /// asks nothing.
+    pub(crate) fn ask(&self, ids: Vec<u64>) {
+        let mtm = self.mtm();
+        match msg::get("window", || self.window()) {
+            Some(window) => alert::ask(&window, ids, shell::answered, mtm),
+            None => shell::answered(&ids, Answer::Cancel, mtm),
         }
     }
 }

@@ -76,6 +76,7 @@ objc2-quartz-core = { workspace = true, features = [
     "objc2-metal",
 ] }
 objc2-app-kit = { workspace = true, features = [
+    "NSAlert",
     "NSApplication",
     "NSBitmapImageRep",
     "NSButton",

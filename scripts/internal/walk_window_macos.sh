@@ -288,7 +288,7 @@ fi
 echo "  screendump: $(tail -1 "$RESULTS")"
 
 wait_for "Release capture, then close the window with its red button"
-step L1 "Closing the window powers the VM off, and QEMU exits."
+step L1 "Closing the window asks in a sheet on it: \"Turn off the VM?\", \"The VM turns off at once, as if its power were cut. Unsaved work in it is lost.\", Cancel (the default, Return) and Turn Off. Cancel: the window and the VM run on, no key stuck in the guest. Close it again and choose Turn Off: the VM powers off, and QEMU exits."
 ended windowed
 
 # ---------------------------------------------------------------- boot 2
@@ -299,7 +299,7 @@ step B3 "The window takes keys and clicks as a titled one does: click to capture
 step M2 "In the guest's System Settings > Displays: one mode, the borderless window's pixels with its width a multiple of 16 and its height even, HiDPI on a Retina screen, at the rate the host screen is set to (its highest is $(refresh_hz) Hz here) (tests: geometry::a_drawable_offers_a_mode_a_multiple_of_16_wide_drawn_unscaled, screens::a_screen_runs_at_its_current_mode_s_rate)."
 step B4 "Change the host's screen: System Settings > Displays, pick another \"Larger Text\"/\"More Space\" size: the window re-fills its screen, and the guest takes its new size. (With a second screen, unplugging it moves its window to the main screen.) Set it back afterwards."
 wait_for "Uncaptured, press ⌘Q"
-step L4 "⌘Q while uncaptured powers the VM off, and QEMU exits."
+step L4 "⌘Q while uncaptured asks once, in a sheet on the window; Cancel keeps the VM running; ⌘Q again and Turn Off powers the VM off, and QEMU exits."
 ended borderless
 
 # ---------------------------------------------------------------- boot 3
@@ -315,7 +315,7 @@ step N2 "Click into the image and move around: the guest's pointer follows over 
 step N3 "With the window in front, keys reach the guest's TextEdit or Terminal, ⌘ shortcuts too (⌘A selects all in the guest, the VM's menu does not flash); ⌘Tab and ⌘Space stay the Mac's; ⌃⌥⌘ releases nothing and the title stays as it was."
 step N4 "After clicks into the image, drag an edge and a corner of the window: it resizes as in P5."
 wait_for "Quit the VM from its menu bar (the app menu's Quit), since ⌘Q is the guest's"
-step N5 "The menu's Quit powers the VM off, and QEMU exits."
+step N5 "The menu's Quit asks in a sheet on the window, \"Turn off the VM?\"; Turn Off powers the VM off, and QEMU exits."
 ended nocapture
 
 ended=1

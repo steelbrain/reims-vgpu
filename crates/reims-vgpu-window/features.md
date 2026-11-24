@@ -333,7 +333,8 @@ Unset or unparsable values give the defaults below.
   the image's edge, and ends in the guest. Keys go to the guest while the
   window has the keyboard: on macOS ⌘ shortcuts too, taken before the
   window's menu as while captured (⌘Q among them; the menu's Quit and the
-  close button still end the VM), with the system's own (⌘Tab, ⌘Space) left
+  close button still end the VM, once the person chooses Turn Off at the
+  question Leaving describes), with the system's own (⌘Tab, ⌘Space) left
   to macOS; on Linux and Windows what the compositor or Windows keeps for
   itself (Super, Alt+Tab, the Windows key) stays its own. A game gets the
   absolute pointer alone: the guest's mouse is never driven, so a camera
@@ -418,8 +419,25 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
 
 ## Leaving
 
-- Closing any window, or ⌘Q while uncaptured with capture on, powers the VM
-  off, and QEMU exits cleanly. `manual`
+- Closing any window (its close button), or Quit (⌘Q while uncaptured with
+  capture on, the application menu's Quit or the Dock's; with capture off
+  ⌘Q is the guest's, and the menu's Quit or the close button asks), first
+  lets every key and button go and ends any capture, the key-ups reaching
+  the guest, then asks in an alert, a sheet on the window, which comes
+  forward: "Turn off the VM?", "The VM turns off at once, as if its power
+  were cut. Unsaved work in it is lost.", with Turn Off, marked
+  destructive, and Cancel, the default. Turn Off powers the VM off, and
+  QEMU exits cleanly. Cancel leaves the window and the VM running, nothing
+  held in the guest and the input released. Quit asks once for every
+  window. A close while the question is up adds none; once Turn Off is
+  chosen, a later close asks nothing. No question where the close would end
+  nothing (the host gave no close callback) or where the VM is already
+  ending (the guest shut down, QEMU quitting, reims-ctl stop): the display's
+  release closes the window, and takes an open question's sheet off first.
+  `test: close::a_close_asks_only_where_the_host_would_hear_of_it`,
+  `test: close::only_turn_off_tells_the_host`,
+  `test: native::macos::input::a_cancelled_close_leaves_nothing_held_and_the_input_goes_on`,
+  `manual` (the sheet, its words and buttons; Cancel, then Turn Off)
 - The VM keeps full speed with its windows hidden or minimised (no App Nap).
   `manual`
 - `screendump` keeps working with windows open. `manual`
@@ -586,7 +604,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: native::sdl_thread::input::losing_the_keyboard_leaves_nothing_stuck`,
   `test: native::sdl_thread::input::closing_leaves_nothing_stuck`,
   `test: native::sdl_thread::sdl::a_close_the_person_asks_for_lifts_every_key_and_ends_capture`,
-  `test: sdl::shell::a_close_sends_the_key_ups_and_ends_capture_before_the_host_hears_of_it`
+  `test: sdl::shell::a_close_sends_the_key_ups_and_ends_capture_before_it_asks`
 - Capture: a click in the image captures the keyboard and the pointer, and
   the window then grabs the keyboard, so the compositor's own shortcuts
   (Super, Alt+Tab) reach the guest, and holds the pointer over the image, as
@@ -632,8 +650,29 @@ runtime's own device. The switches above apply, and `resolution=` too.
   over the image the pointer is in as it is.
   `test: sdl::shell::a_window_the_pointer_is_not_in_leaves_the_cursor`,
   `manual` (a VM with two displays)
-- Leaving: closing a window asks the host to end the VM; the window closes
-  at the display's release, once its swapchain is gone. `manual`
+- Leaving: closing a window (its close button, Alt+F4 or the window
+  system's close, the task bar's on Windows) lets every key and button go
+  and ends capture, the key-ups reaching the guest first, then asks, in
+  SDL's message box, with macOS's words and buttons (Leaving, above),
+  Cancel the default for Return and Escape: on Linux zenity's question
+  where zenity is installed, a window of its own, else SDL's own X11
+  dialog, which the window owns on X11 and under XWayland, Cancel left of
+  Turn Off; on Windows a task dialog the window owns, Turn Off left of
+  Cancel. Turn Off asks the host to end the VM; Cancel, or the question
+  dismissed, leaves the window and the VM running, nothing held in the
+  guest and the input released. While the question is up, the library's UI
+  thread waits for it: the windows' frames keep drawing, and their events
+  wait. When to ask is as on macOS; where SDL shows no question (no zenity
+  and no X server), the close goes ahead as before, and the reason is
+  logged. The window closes at the display's release, once its swapchain is
+  gone.
+  `test: close::a_close_asks_only_where_the_host_would_hear_of_it`,
+  `test: close::only_turn_off_tells_the_host`,
+  `test: sdl::shell::a_close_asks_where_the_host_hears_and_tells_it_once_turned_off`,
+  `test: native::sdl_thread::input::a_cancelled_close_leaves_nothing_held_and_the_input_goes_on`,
+  `test: native::sdl_thread::sdl::the_question_s_default_is_cancel`,
+  `test: native::sdl_thread::sdl::an_answer_is_turn_off_only_by_its_button`,
+  `manual` (the question on Wayland, X11 and Windows; Cancel, then Turn Off)
 - A GPU the driver reports lost, which the library makes no new device for:
   the window stays open and keeps the last frame it showed, and draws no
   more. Its swapchain makes no Vulkan call on the lost device from then on,

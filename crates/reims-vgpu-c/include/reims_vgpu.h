@@ -446,11 +446,14 @@ typedef void (*RvgWindowWheelFn)(void *ctx, int32_t dy, int32_t dx);
 // Thread, and what it may call: as RvgWindowPointerFn. Without it, keys go nowhere.
 typedef void (*RvgWindowKeyFn)(void *ctx, uint16_t usage, bool down);
 
-// `close(ctx)`: the person closed the window, or chose Quit. The window stays open: the host
-// ends the VM, and its release of the device closes the window.
+// `close(ctx)`: the person closed the window, or chose Quit, and chose Turn Off at the question
+// the window asks first, in the OS's own dialog over it: "Turn off the VM?", with Turn Off and
+// Cancel, the default. Cancel calls nothing. Where the OS shows no question, the close calls it
+// as if Turn Off were chosen. The window stays open: the host ends the VM, and its release of the
+// device closes the window.
 //
 // Thread, and what it may call: as RvgWindowPointerFn. Without it, closing the window does
-// nothing, and Quit is ignored.
+// nothing and asks nothing, and Quit is ignored.
 typedef void (*RvgWindowCloseFn)(void *ctx);
 
 // A scroll event, smoothly and as wheel notches, for an RvgWindowScrollFn.
