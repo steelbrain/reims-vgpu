@@ -945,12 +945,17 @@ pub fn start(vm: &Vm, host: Host) -> Result<Started> {
             std::thread::sleep(Duration::from_millis(200));
             if pid(vm).is_none() {
                 let log = tail(&vm.qemu_log(), 15);
-                let silent = log.lines().last().is_some_and(|l| l.trim() == "----");
-                let note = match mem_available_mib(Path::new("/proc/meminfo")) {
-                    Some(a) if silent && vm.config.profile.memfd_ram(host) => {
-                        format!("\n{}", memory_note(vm.name(), vm.config.memory_mib, a))
-                    }
-                    _ => String::new(),
+                let note = match ram_refused(&log, vm.config.profile, host) {
+                    Some(how) => format!(
+                        "\n{}",
+                        memory_note(
+                            vm.name(),
+                            vm.config.memory_mib,
+                            crate::os::memory_room_mib(),
+                            how
+                        )
+                    ),
+                    None => String::new(),
                 };
                 bail!("QEMU exited:\n{log}{note}");
             }
@@ -1065,33 +1070,92 @@ fn wait_gone(p: i32, t: Duration) -> bool {
     !alive(p)
 }
 
-/// The host's available memory, `MemAvailable` in `file` (`/proc/meminfo`), in MiB; None where it
-/// isn't there.
-pub fn mem_available_mib(file: &Path) -> Option<u64> {
-    std::fs::read_to_string(file)
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))
-        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
-        .map(|kib| kib / 1024)
+/// How a start's QEMU ended for want of host memory for the VM's RAM ([`ram_refused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RamRefused {
+    /// On Linux, QEMU ended with no error of its own after the command reims-ctl logged (the
+    /// log's last line is that command's `----`), as when the kernel ends a process it cannot
+    /// give memory.
+    Silent,
+    /// On Linux, QEMU says its allocation of the RAM failed (`preallocating memory failed`).
+    Allocation,
+    /// On Windows, QEMU says it cannot set up the RAM (`Cannot set up guest memory 'ram'`): the
+    /// section it makes for the RAM is committed whole, which Windows charges to its commit
+    /// limit, the host's RAM and page file together, and refuses past it (a 32 GiB VM's start
+    /// a user met failed so, with "Failed to CreateFileMapping: Insufficient system resources").
+    Commit,
 }
 
-/// What a start adds where QEMU ended with no error of its own after the command reims-ctl logged
-/// (the log's last line is that command's `----`), as when the kernel ends a process it cannot
-/// give memory: QEMU allocates the VM's RAM whole as it starts on Linux (`qemu`'s module doc), so
-/// a host without that much free memory ends it there.
-pub fn memory_note(name: &str, memory_mib: u64, available_mib: u64) -> String {
+/// Whether `log`, the tail of QEMU's log of a start it did not survive, shows it ended for want
+/// of host memory for the VM's RAM, where QEMU takes all of that RAM as it starts
+/// ([`Profile::ram_whole_at_start`]); and how.
+///
+/// Nothing checks the host's memory before a start: what the host can give is read at one moment
+/// ([`crate::os::memory_room_mib`]), and grows past that reading where the kernel can reclaim
+/// more than Linux's `MemAvailable` counts or Windows grows a page file it manages, so a check
+/// would refuse starts that work (the 32 GiB VM whose RAM Windows refused, [`RamRefused::Commit`],
+/// started when it was started again 29 s later). A start that fails names the memory instead
+/// ([`memory_note`]).
+pub fn ram_refused(log: &str, profile: Profile, host: Host) -> Option<RamRefused> {
+    if !profile.ram_whole_at_start(host) {
+        return None;
+    }
+    let says = |s: &str| log.lines().any(|l| l.contains(s));
+    if profile.section_ram(host) {
+        return says("Cannot set up guest memory 'ram'").then_some(RamRefused::Commit);
+    }
+    if log.lines().last().is_some_and(|l| l.trim() == "----") {
+        Some(RamRefused::Silent)
+    } else {
+        says("preallocating memory failed").then_some(RamRefused::Allocation)
+    }
+}
+
+/// What a start adds where QEMU ended for want of host memory for the VM's RAM, `how`
+/// ([`ram_refused`]): what the VM needs, what the host can give now, `room_mib`
+/// ([`crate::os::memory_room_mib`]), where it says, and what to do.
+pub fn memory_note(name: &str, memory_mib: u64, room_mib: Option<u64>, how: RamRefused) -> String {
     let gib = |mib: u64| match mib % 1024 {
         0 => format!("{} GiB", mib / 1024),
         _ => format!("{:.1} GiB", mib as f64 / 1024.0),
     };
+    let need = gib(memory_mib);
+    let less = format!("give it less with reims-ctl set {name} --memory SIZE");
+    let lead = match how {
+        RamRefused::Silent => {
+            "QEMU ended without an error of its own, as the kernel ends a process it cannot give \
+             memory"
+        }
+        RamRefused::Allocation => "QEMU could not allocate the VM's RAM",
+        RamRefused::Commit => {
+            let commit = format!(
+                "Windows did not give {name} its {need} of RAM: QEMU commits all of a VM's RAM \
+                 as it starts, against Windows' commit limit (the host's RAM and page file \
+                 together)"
+            );
+            return match room_mib {
+                Some(r) if r >= memory_mib => format!(
+                    "{commit}, and Windows can commit {} more now, enough for it, so starting it \
+                     again may work. If it does not, close programs to free memory, or {less}",
+                    gib(r)
+                ),
+                Some(r) => format!(
+                    "{commit}, and Windows can commit {} more now. Close programs to free \
+                     memory, or {less}, and start it again",
+                    gib(r)
+                ),
+                None => format!(
+                    "{commit}. Close programs to free memory, or {less}, and start it again"
+                ),
+            };
+        }
+    };
+    let room = room_mib
+        .map(|r| format!(", and this host has {} available now", gib(r)))
+        .unwrap_or_default();
     format!(
-        "QEMU ended without an error of its own, as the kernel ends a process it cannot give \
-         memory: {name} needs {} of free memory to start, since QEMU allocates all of its RAM \
-         as it starts, and this host has {} available now. Free some, or give it less with \
-         reims-ctl set {name} --memory SIZE",
-        gib(memory_mib),
-        gib(available_mib)
+        "{lead}: {name} needs {need} of free memory to start, since QEMU allocates all of its RAM \
+         as it starts{room}. Free some, or {less}"
     )
 }
 
@@ -1268,25 +1332,98 @@ mod tests {
         assert!(note.contains("vm.max_map_count=8388608"), "{note}");
     }
 
-    /// A start QEMU did not survive, with no error of its own, names the memory the VM's RAM
-    /// needs and what the host has available, read from `MemAvailable` as the kernel writes it.
+    /// A start QEMU did not survive on Linux, with no error of its own or with its allocation's,
+    /// names the memory the VM's RAM needs and what the host has available.
     #[test]
     fn a_vm_whose_qemu_ends_silently_is_told_what_its_ram_needs() {
-        let env = crate::testenv::Env::new("meminfo");
-        let file = env.root.join("meminfo");
-        assert_eq!(mem_available_mib(&file), None);
-        std::fs::write(
-            &file,
-            "MemTotal:       32000000 kB\nMemFree:         1000000 kB\nMemAvailable:    3145728 kB\n",
-        )
-        .unwrap();
-        assert_eq!(mem_available_mib(&file), Some(3072));
-        let note = memory_note("mac", 8192, 3584);
+        let note = memory_note("mac", 8192, Some(3584), RamRefused::Silent);
         assert!(
             note.starts_with("QEMU ended without an error of its own")
                 && note.contains("mac needs 8 GiB of free memory to start")
                 && note.contains("this host has 3.5 GiB available now")
                 && note.contains("reims-ctl set mac --memory SIZE"),
+            "{note}"
+        );
+        let note = memory_note("mac", 8192, Some(3584), RamRefused::Allocation);
+        assert!(
+            note.starts_with("QEMU could not allocate the VM's RAM: mac needs 8 GiB")
+                && note.contains("this host has 3.5 GiB available now")
+                && note.contains("reims-ctl set mac --memory SIZE"),
+            "{note}"
+        );
+    }
+
+    /// A start's QEMU ended for want of memory for the VM's RAM where it takes all of it as it
+    /// starts, the x86-64 machine's on Linux and Windows, and its log shows it: on Linux, QEMU
+    /// ended silently after the command or said its allocation failed; on Windows, QEMU said it
+    /// could not set up the RAM, as a 32 GiB VM's start a user met did. Another error, and the
+    /// arm64 machine, whose RAM is taken as the guest touches it, are not.
+    #[test]
+    fn a_start_that_ended_for_want_of_ram_is_told_from_qemus_log() {
+        use crate::host::Arch;
+        let host = |os| Host {
+            os,
+            arch: Arch::X86_64,
+        };
+        let (linux, windows) = (host(Os::Linux), host(Os::Windows));
+        let (q35, arm) = (Profile::Q35X86_64, Profile::VmappleArm64);
+        let command = "export REIMS_VGPU_LOG=warn\nexec qemu-system-x86_64 \\\n  -object \
+                       memory-backend-ram,id=ram,size=32768M,share=on\n----";
+        assert_eq!(ram_refused(command, q35, linux), Some(RamRefused::Silent));
+        assert_eq!(ram_refused(command, arm, linux), None);
+        let prealloc = format!(
+            "{command}\nqemu-system-x86_64: qemu_prealloc_mem: preallocating memory failed: \
+             Cannot allocate memory"
+        );
+        assert_eq!(
+            ram_refused(&prealloc, q35, linux),
+            Some(RamRefused::Allocation)
+        );
+        let other = format!("{command}\nqemu-system-x86_64: -drive file=disk.qcow2: No such file");
+        assert_eq!(ram_refused(&other, q35, linux), None);
+
+        let commit = format!(
+            "{command}\nC:\\qemu\\qemu-system-x86_64.exe: -object \
+             memory-backend-ram,id=ram,size=32768M,share=on: Cannot set up guest memory 'ram': \
+             Failed to CreateFileMapping: Insufficient system resources exist to complete the \
+             requested service."
+        );
+        assert_eq!(ram_refused(&commit, q35, windows), Some(RamRefused::Commit));
+        // On Windows, QEMU says why it ended: an end with no error of its own is not taken for
+        // the RAM's.
+        assert_eq!(ram_refused(command, q35, windows), None);
+        assert_eq!(ram_refused(&other, q35, windows), None);
+    }
+
+    /// A start Windows refused the VM's RAM names the RAM QEMU commits as it starts, what
+    /// Windows can commit now and what to do: with less room than the VM needs, close programs
+    /// or give it less; with enough, as when the next start a user met worked 29 s later, start
+    /// it again; and where Windows does not say, the same as with too little.
+    #[test]
+    fn a_start_windows_refused_ram_names_what_it_can_commit() {
+        let note = memory_note("mac", 32768, Some(20 * 1024 + 512), RamRefused::Commit);
+        assert_eq!(
+            note,
+            "Windows did not give mac its 32 GiB of RAM: QEMU commits all of a VM's RAM as it \
+             starts, against Windows' commit limit (the host's RAM and page file together), and \
+             Windows can commit 20.5 GiB more now. Close programs to free memory, or give it less \
+             with reims-ctl set mac --memory SIZE, and start it again"
+        );
+        let note = memory_note("mac", 32768, Some(40 * 1024), RamRefused::Commit);
+        assert!(
+            note.ends_with(
+                "Windows can commit 40 GiB more now, enough for it, so starting it again may \
+                 work. If it does not, close programs to free memory, or give it less with \
+                 reims-ctl set mac --memory SIZE"
+            ),
+            "{note}"
+        );
+        let note = memory_note("mac", 32768, None, RamRefused::Commit);
+        assert!(
+            note.ends_with(
+                "(the host's RAM and page file together). Close programs to free memory, or give \
+                 it less with reims-ctl set mac --memory SIZE, and start it again"
+            ),
             "{note}"
         );
     }

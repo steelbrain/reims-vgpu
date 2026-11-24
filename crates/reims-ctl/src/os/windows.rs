@@ -159,12 +159,23 @@ fn stamp(fmt: &str, t: &super::LocalTime, offset: i64) -> String {
 
 /// The host's RAM in MiB, where the host says.
 pub fn memory_mib() -> Option<u64> {
+    memory_status().map(|m| m.ullTotalPhys / (1024 * 1024))
+}
+
+/// The memory a new process can commit now, in MiB, where the host says: what is left of
+/// Windows' commit limit, the host's RAM and page file together (`ullAvailPageFile`).
+pub fn memory_room_mib() -> Option<u64> {
+    memory_status().map(|m| m.ullAvailPageFile / (1024 * 1024))
+}
+
+/// The host's memory now, as `GlobalMemoryStatusEx` says it.
+fn memory_status() -> Option<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: an all-zero MEMORYSTATUSEX with its length set is what the call fills.
     unsafe {
         let mut m: MEMORYSTATUSEX = std::mem::zeroed();
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        (GlobalMemoryStatusEx(&mut m) != 0).then_some(m.ullTotalPhys / (1024 * 1024))
+        (GlobalMemoryStatusEx(&mut m) != 0).then_some(m)
     }
 }
 

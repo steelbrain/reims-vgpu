@@ -228,6 +228,14 @@ impl Profile {
         host.os == Os::Windows
     }
 
+    /// Whether QEMU takes all of the guest's RAM from the host as it starts, so a host short of
+    /// memory ends a start: the x86-64 machine's memfd is allocated whole on Linux (`prealloc`,
+    /// [`crate::qemu`]'s module doc), and its section committed whole on Windows. The arm64
+    /// machine's memfd is allocated as the guest touches it.
+    pub fn ram_whole_at_start(self, host: Host) -> bool {
+        self == Profile::Q35X86_64 && (self.memfd_ram(host) || self.section_ram(host))
+    }
+
     /// Whether a Vulkan GPU can be chosen: the library runs on the host's Vulkan GPUs on Linux
     /// and Windows, and on a Mac on Mesa's KosmicKrisp, over the Mac's one GPU.
     pub fn gpu_choice(self, host: Host) -> bool {
@@ -261,12 +269,14 @@ mod tests {
         );
         assert!(Profile::Q35X86_64.memfd_ram(linux));
         assert!(!Profile::Q35X86_64.section_ram(linux));
+        assert!(Profile::Q35X86_64.ram_whole_at_start(linux));
         assert_eq!(Profile::Q35X86_64.accel(linux), "kvm");
         assert_eq!(Profile::Q35X86_64.accel_arg(linux), "kvm");
         let arm = Profile::VmappleArm64;
         assert_eq!(arm.accel(linux), "tcg");
         assert_eq!(arm.accel_arg(linux), "tcg,thread=multi");
         assert!(arm.memfd_ram(linux) && arm.gpu_choice(linux));
+        assert!(!arm.ram_whole_at_start(linux));
         assert!(arm.describe(linux).ends_with("emulated by TCG)"));
         for os in [Os::Mac, Os::Linux] {
             let host = Host {
@@ -319,6 +329,7 @@ mod tests {
         assert_eq!(Profile::supported_on(windows), [q35]);
         assert_eq!(q35.accel(windows), "whpx");
         assert!(q35.section_ram(windows) && !q35.memfd_ram(windows));
+        assert!(q35.ram_whole_at_start(windows));
         assert!(q35.gpu_choice(windows));
         assert!(q35.describe(windows).ends_with("WHPX)"));
         assert_eq!(windows.to_string(), "Windows on x86-64");

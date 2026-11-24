@@ -95,6 +95,22 @@ pub fn memory_mib() -> Option<u64> {
         .map(|kib| kib / 1024)
 }
 
+/// The memory a new process can take now, in MiB, where the host says: `MemAvailable` in Linux's
+/// `/proc/meminfo`. A Mac says nothing.
+pub fn memory_room_mib() -> Option<u64> {
+    mem_available_mib(Path::new("/proc/meminfo"))
+}
+
+/// `MemAvailable` in `file`, as `/proc/meminfo` gives it, in MiB; None where it isn't there.
+fn mem_available_mib(file: &Path) -> Option<u64> {
+    std::fs::read_to_string(file)
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|kib| kib / 1024)
+}
+
 /// The user's id.
 pub fn uid() -> u32 {
     // SAFETY: getuid has no preconditions.
@@ -431,5 +447,24 @@ pub fn set_at_interrupt(flag: &'static std::sync::atomic::AtomicBool) {
     unsafe {
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The memory a Linux host has available is read from `MemAvailable` as the kernel writes it.
+    #[test]
+    fn available_memory_is_read_from_meminfo() {
+        let env = crate::testenv::Env::new("meminfo");
+        let file = env.root.join("meminfo");
+        assert_eq!(mem_available_mib(&file), None);
+        std::fs::write(
+            &file,
+            "MemTotal:       32000000 kB\nMemFree:         1000000 kB\nMemAvailable:    3145728 kB\n",
+        )
+        .unwrap();
+        assert_eq!(mem_available_mib(&file), Some(3072));
     }
 }
