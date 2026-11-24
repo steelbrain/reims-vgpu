@@ -52,7 +52,7 @@ pub struct VmConfig {
     pub vmapple: Option<Vmapple>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_env: BTreeMap<String, String>,
-    /// The host's USB devices the guest is given while the VM runs (usb.rs), x86-64 VMs'.
+    /// The host's USB devices the guest is given while the VM runs (usb.rs), on Linux hosts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usb: Vec<UsbDevice>,
     /// The host's whole disks the guest is given while the VM runs (disks.rs), x86-64 VMs' on

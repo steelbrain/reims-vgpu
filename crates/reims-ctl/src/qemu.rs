@@ -91,13 +91,15 @@
 //! `reims-graphics-pci`, which has no option ROM there; and the configuration bundle reims-ctl
 //! carries ([`crate::prebuilt::ambrosia_bundle`]), loaded at 0x120000000, where Ambrosia reads
 //! it: its config.plist starts the device's driver module and adds the guest's kexts. The machine
-//! has its own xHCI controller with a keyboard and a tablet, and its `uuid` is the VM's ECID, which
-//! the tickets of its macOS are bound to. It runs on HVF on a Mac, with the GIC in the kernel, on
+//! has its own xHCI controller with a keyboard and a tablet, given on Linux the seven ports of an
+//! x86-64 VM's below by `-global` (the machine makes the controller itself), and its `uuid` is the
+//! VM's ECID, which the tickets of its macOS are bound to. It runs on HVF on a Mac, with the GIC in the kernel, on
 //! KVM on arm64 Linux, and on TCG, a thread for each vCPU, on x86-64 ([`Profile::accel_arg`]). On
 //! Linux its RAM is a shared memfd, as the library there needs, not allocated as QEMU starts.
-//! It takes no host USB device or disk, no VMware SVGA and no sound device.
+//! On a Linux host it takes the host's USB devices as an x86-64 VM does, on that controller's
+//! bus ([`crate::usb::bus`]); it takes no host disk, no VMware SVGA and no sound device.
 //!
-//! The xHCI controller has seven ports (`p2=7,p3=7`), each taking a USB 2 and a USB 3 device:
+//! Either machine's xHCI controller has seven ports (`p2=7,p3=7`), each taking a USB 2 and a USB 3 device:
 //! the keyboard, the tablet, and up to [`crate::vm::USB_DEVICES_MAX`] host devices, at their
 //! own speeds. Its 14 ports are within the 15 macOS numbers on one controller. QEMU's default of
 //! four would leave two: where a device takes the last free port, QEMU chains a full-speed hub
@@ -436,7 +438,10 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         "usb-tablet,id=tablet,bus=xhci.0",
     ]);
     for u in &c.usb {
-        push(&["-device", &crate::usb::device_arg(u)?]);
+        push(&[
+            "-device",
+            &crate::usb::device_arg(u, crate::usb::bus(c.profile))?,
+        ]);
     }
     if c.audio.enabled {
         let (backend, input_apart) = sound_routing(audio_backend(vm, ctx), ctx.sound);
@@ -511,8 +516,8 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             c.graphics().name()
         );
     }
-    if !c.usb.is_empty() {
-        bail!("USB passthrough: {}", crate::host::X86_64_ONLY);
+    if !c.usb.is_empty() && ctx.host.os != Os::Linux {
+        bail!("{}", crate::usb::LINUX_ONLY);
     }
     if !c.host_disks.is_empty() {
         bail!("{}", crate::disks::ONLY);
@@ -572,6 +577,18 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
                 .map_or(String::new(), |(w, h)| format!(",resolution={w}x{h}"))
         ),
     ]);
+    // On Linux, which alone gives it USB devices, the machine's own xHCI controller's ports, with
+    // the keyboard and the tablet on the first two (hw/vmapple/vmapple.c), and the host's USB
+    // devices after them.
+    if ctx.host.os == Os::Linux {
+        push(&["-global", "qemu-xhci.p2=7", "-global", "qemu-xhci.p3=7"]);
+        for u in &c.usb {
+            push(&[
+                "-device",
+                &crate::usb::device_arg(u, crate::usb::bus(c.profile))?,
+            ]);
+        }
+    }
     push(&[
         "-device",
         &format!(
@@ -817,7 +834,9 @@ mod tests {
     /// The machine's options on each host, as Ambrosia's boot check runs them
     /// (firmware/ambrosia/check-boot.sh): `head` is the accelerator and the RAM, which differ by
     /// host; the rest is every host's.
-    fn arm64_command_line(head: &[&str]) -> Vec<String> {
+    /// The arm64 command line after `head`, with the xHCI controller's ports where the host is
+    /// Linux, which alone gives the VM USB devices.
+    fn arm64_command_line(head: &[&str], linux: bool) -> Vec<String> {
         let rest = [
             "-smp",
             "4",
@@ -841,6 +860,10 @@ mod tests {
             "virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:aa:bb:cc,romfile=",
             "-device",
             "reims-graphics-pci,id=gfx",
+            "-global",
+            "qemu-xhci.p2=7",
+            "-global",
+            "qemu-xhci.p3=7",
             "-device",
             "loader,file=/d/prebuilt/Config-0123456789abcdef.cpio,addr=0x120000000,force-raw=on",
             "-display",
@@ -854,10 +877,13 @@ mod tests {
             "-pidfile",
             "/vms/t/qemu.pid",
         ];
+        let ports = rest.iter().position(|x| *x == "-global").unwrap();
         ["-name", "t"]
             .iter()
             .chain(head)
-            .chain(&rest)
+            .chain(&rest[..ports])
+            .chain(rest[ports..ports + 4].iter().filter(|_| linux))
+            .chain(&rest[ports + 4..])
             .map(|s| s.to_string())
             .collect()
     }
@@ -867,16 +893,19 @@ mod tests {
     #[test]
     fn arm64_on_x86_64_linux_runs_on_tcg() {
         let inv = invocation(&arm64_vm(), &arm64_ctx(linux())).unwrap();
-        let want = arm64_command_line(&[
-            "-accel",
-            "tcg,thread=multi",
-            "-machine",
-            "vmapple,uuid=0x9e35f01edc0c5536,memory-backend=ram,dump-guest-core=off",
-            "-m",
-            "8192M",
-            "-object",
-            "memory-backend-memfd,id=ram,size=8192M,share=on",
-        ]);
+        let want = arm64_command_line(
+            &[
+                "-accel",
+                "tcg,thread=multi",
+                "-machine",
+                "vmapple,uuid=0x9e35f01edc0c5536,memory-backend=ram,dump-guest-core=off",
+                "-m",
+                "8192M",
+                "-object",
+                "memory-backend-memfd,id=ram,size=8192M,share=on",
+            ],
+            true,
+        );
         assert_eq!(unix_paths(&inv.args), want);
     }
 
@@ -888,16 +917,19 @@ mod tests {
             arch: Arch::Aarch64,
         };
         let inv = invocation(&arm64_vm(), &arm64_ctx(arm_linux)).unwrap();
-        let want = arm64_command_line(&[
-            "-accel",
-            "kvm",
-            "-machine",
-            "vmapple,uuid=0x9e35f01edc0c5536,memory-backend=ram,dump-guest-core=off",
-            "-m",
-            "8192M",
-            "-object",
-            "memory-backend-memfd,id=ram,size=8192M,share=on",
-        ]);
+        let want = arm64_command_line(
+            &[
+                "-accel",
+                "kvm",
+                "-machine",
+                "vmapple,uuid=0x9e35f01edc0c5536,memory-backend=ram,dump-guest-core=off",
+                "-m",
+                "8192M",
+                "-object",
+                "memory-backend-memfd,id=ram,size=8192M,share=on",
+            ],
+            true,
+        );
         assert_eq!(unix_paths(&inv.args), want);
     }
 
@@ -906,14 +938,17 @@ mod tests {
     #[test]
     fn arm64_on_a_mac_runs_on_hvf() {
         let inv = invocation(&arm64_vm(), &arm64_ctx(mac())).unwrap();
-        let want = arm64_command_line(&[
-            "-accel",
-            "hvf,kernel-irqchip=on",
-            "-machine",
-            "vmapple,uuid=0x9e35f01edc0c5536",
-            "-m",
-            "8192M",
-        ]);
+        let want = arm64_command_line(
+            &[
+                "-accel",
+                "hvf,kernel-irqchip=on",
+                "-machine",
+                "vmapple,uuid=0x9e35f01edc0c5536",
+                "-m",
+                "8192M",
+            ],
+            false,
+        );
         assert_eq!(unix_paths(&inv.args), want);
         // The library's window is its own, as for an x86-64 VM.
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
@@ -958,8 +993,54 @@ mod tests {
             port: None,
             name: String::new(),
         }];
-        assert!(invocation(&usb, &arm64_ctx(mac())).is_err());
+        let e = invocation(&usb, &arm64_ctx(mac())).unwrap_err();
+        assert_eq!(e.to_string(), crate::usb::LINUX_ONLY);
         assert!(invocation(&arm64_vm(), &ctx(mac())).is_err(), "no Ambrosia");
+    }
+
+    /// On a Linux host an arm64 VM takes the host's USB devices as an x86-64 VM does, on the
+    /// machine's own xHCI controller's bus, after its seven ports' globals, before the bundle.
+    #[test]
+    fn arm64_usb_devices_are_passed_through_on_the_machines_controller() {
+        let arm_linux = Host {
+            os: Os::Linux,
+            arch: Arch::Aarch64,
+        };
+        let mut vm = arm64_vm();
+        vm.config.usb = vec![
+            UsbDevice {
+                id: "1050:0407".into(),
+                port: None,
+                name: "Yubico YubiKey".into(),
+            },
+            UsbDevice {
+                id: "0403:6001".into(),
+                port: Some("3-2.1".into()),
+                name: "FTDI FT232R".into(),
+            },
+        ];
+        for host in [arm_linux, linux()] {
+            let a = unix_paths(&invocation(&vm, &arm64_ctx(host)).unwrap().args);
+            assert!(
+                has(
+                    &a,
+                    &[
+                        "-global",
+                        "qemu-xhci.p2=7",
+                        "-global",
+                        "qemu-xhci.p3=7",
+                        "-device",
+                        "usb-host,id=usb-1050-0407,bus=usb-bus.0,vendorid=0x1050,productid=0x0407",
+                        "-device",
+                        "usb-host,id=usb-0403-6001-3-2.1,bus=usb-bus.0,vendorid=0x0403,\
+                         productid=0x6001,hostbus=3,hostport=2.1",
+                        "-device",
+                    ]
+                ),
+                "{a:?}"
+            );
+            assert!(!a.iter().any(|x| x.contains("xhci.0")), "{a:?}");
+        }
     }
 
     fn has(args: &[String], pair: &[&str]) -> bool {

@@ -146,7 +146,7 @@ case "$OS/$ARCH" in
   Linux/aarch64)
     PLATFORM=linux-arm64
     QEMU_CONFIGURE=(--target-list=aarch64-softmmu --enable-kvm --disable-sdl --disable-gtk --enable-slirp
-      --enable-gnutls)
+      --enable-libusb --enable-gnutls)
     QEMU_BINARIES=(qemu-system-aarch64)
     ;;
   *) die "reims-ctl runs x86-64 VMs on Linux and Windows x86-64 hosts, and arm64 VMs on arm64 Macs, arm64 Linux and Linux on x86-64; this is $OS on $ARCH" ;;
@@ -525,15 +525,16 @@ if [[ $OS == Linux && $SKIP_HOST_CHECKS == 0 ]]; then
       say "echo 0 | sudo tee $min_ttl_file turns it off now, and $keep, keeps it at 0 after a restart"
     fi
   fi
-  # USB passthrough (reims-ctl usb), which x86-64 VMs alone take: QEMU opens a USB device's file in
-  # /dev/bus/usb, which only root may write unless a udev rule says otherwise.
+  # USB passthrough (reims-ctl usb), which a Linux host's VMs take, x86-64 and arm64 alike: QEMU
+  # opens a USB device's file in /dev/bus/usb, which only root may write unless a udev rule says
+  # otherwise.
   # This one gives USB devices other than hubs to the kvm group, over SSH too,
   # and to the user at the host's screen (uaccess, which a file sorting before
   # systemd's 73-seat-late.rules sets). reims-ctl's usb::UDEV_RULE is the same
   # line, which its tests check.
   usb_rule_file=/etc/udev/rules.d/70-reims-ctl-usb.rules
   usb_rule='SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", GROUP="kvm", MODE="0664", TAG+="uaccess"'
-  if [[ $ARCH == x86_64 ]] && ! grep -qsxF "$usb_rule" "$usb_rule_file"; then
+  if ! grep -qsxF "$usb_rule" "$usb_rule_file"; then
     say "A VM can be given this host's USB devices once QEMU, running as you, may open them"
     if ask "Add the udev rule $usb_rule_file, giving USB devices other than hubs to the kvm group and to you at this host's screen, with sudo?"; then
       printf '# reims-ctl: USB devices for VMs (reims-ctl usb --help)\n%s\n' "$usb_rule" |

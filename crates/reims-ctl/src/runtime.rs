@@ -113,8 +113,8 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
                     c.name
                 );
             }
-            if !c.usb.is_empty() {
-                bail!("USB passthrough: {}", crate::host::X86_64_ONLY);
+            if !c.usb.is_empty() && host.os != Os::Linux {
+                bail!("{}", crate::usb::LINUX_ONLY);
             }
         }
     }

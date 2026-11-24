@@ -26,9 +26,6 @@ use std::fmt;
 pub const UNSUPPORTED: &str = "reims-ctl runs x86-64 VMs on Linux and Windows x86-64 hosts, \
                                and arm64 VMs on arm64 Macs, arm64 Linux and Linux on x86-64";
 
-/// What reims-ctl tells of the work only x86-64 VMs have (USB devices, VMware SVGA).
-pub const X86_64_ONLY: &str = "that's for x86-64 VMs, which run on Linux and Windows x86-64 hosts";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Os {
     Mac,

@@ -2554,21 +2554,12 @@ fn vm_menu(row: &VmRow, all: bool, host: Host) -> Vec<(VmCommand, &'static str)>
         .collect()
 }
 
-/// Whether the VM can be given the host's USB devices: an x86-64 VM on a Linux host. Else why
-/// not, to say.
+/// Whether the VM can be given the host's USB devices: any VM on a Linux host, and an x86-64
+/// VM on a Windows one ([`crate::usb::available`]). Else why not, to say.
 fn usb_available(host: Host, vm: &Vm) -> Result<(), String> {
-    match host.default_profile() {
-        None => return Err(crate::host::UNSUPPORTED.into()),
-        Some(Profile::VmappleArm64) => {
-            return Err(format!("USB passthrough: {}", crate::host::X86_64_ONLY));
-        }
-        Some(Profile::Q35X86_64) => {}
-    }
-    if vm.config.q35.is_none() {
-        return Err(format!(
-            "{}: USB passthrough is for x86-64 VMs on Linux hosts",
-            vm.name()
-        ));
+    crate::usb::available(host)?;
+    if vm.config.profile == Profile::VmappleArm64 && host.os != Os::Linux {
+        return Err(format!("{}: {}", vm.name(), crate::usb::LINUX_ONLY));
     }
     Ok(())
 }
@@ -3849,7 +3840,7 @@ mod tests {
         press(&mut app, [KeyCode::Char('p')]);
         assert!(app.overlay.is_none());
         assert_eq!(app.status.as_ref().unwrap().0, crate::host::UNSUPPORTED);
-        // An arm64 Mac makes arm64 VMs, which take no USB devices.
+        // An arm64 Mac makes arm64 VMs, which take USB devices on Linux hosts alone.
         let mut app = App::with(Host {
             os: Os::Mac,
             arch: Arch::Aarch64,
@@ -3858,7 +3849,7 @@ mod tests {
         press(&mut app, [KeyCode::Char('p')]);
         assert!(app.overlay.is_none());
         let said = &app.status.as_ref().unwrap().0;
-        assert!(said.ends_with(crate::host::X86_64_ONLY), "{said}");
+        assert_eq!(said, crate::usb::LINUX_ONLY);
 
         let mut app = App::with(LINUX);
         app.reload().unwrap();

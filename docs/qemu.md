@@ -2588,6 +2588,36 @@ Text uses:
   text at both levels, and so does `ImageAnalyzer`: x86-64 macOS's
   TextRecognition runs Espresso models on the GPU (`eng=5`), our device.
 
+### arm64 guests: USB passthrough
+
+On a Linux host, an arm64 VM takes the host's USB devices as an x86-64 VM
+does ("x86-64 macOS guests: USB passthrough", above): `usb-host` by
+`vendorid` and `productid`, with `hostbus` and `hostport` where the device
+was chosen beside a twin, attached at start and by QMP's `device_add` while
+the VM runs. The controller is `vmapple`'s own `qemu-xhci`, which the machine
+makes with its keyboard and tablet (hw/vmapple/vmapple.c,
+`vmapple_create_pcie`). It has no id, so its bus is named from its type,
+`usb-bus.0`, and reims-ctl gives it the x86-64 VM's seven ports with
+`-global`:
+
+```sh
+-global qemu-xhci.p2=7 -global qemu-xhci.p3=7 \
+-device usb-host,id=usb-1050-0407,bus=usb-bus.0,vendorid=0x1050,productid=0x0407
+```
+
+**Measured** 2026-11-24 on an M1 Pro under Fedora Asahi Remix 45 (Linux
+7.3.4, 16 KiB pages), with QEMU built from `development` at `5347f649f` with
+the KVM and audio branches merged (#166, #168), realizing `vmapple` paused
+(`-S`, TCG) and `info usb` over QMP: the keyboard and the tablet take ports 1
+and 2, and four `usb-host` devices take ports 3 to 6. At QEMU's default of
+four ports, the fourth device's port took a full-speed `usb-hub` and the
+second to fourth devices went on it (ports 4.1 to 4.3). A `usb-host`
+`device_add` without a bus went on `usb-bus.0`, and its `device_del` ended in
+`DEVICE_DELETED`.
+
+macOS hosts give no VM USB devices: reims-ctl lists the host's devices from
+Linux's sysfs alone, and the Mac's QEMU is built without libusb.
+
 ### arm64 guests: the boot check of our configuration
 
 Ambrosia's done list has 10 boots of our configuration: macOS 13.6, 14.6.1,
