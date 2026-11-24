@@ -114,6 +114,8 @@
 //!   ([`trace_event_op`]), so a traced walk finds the command buffer that signals the value
 //!   another waits for; and commits and completions write rt's metrics, first-use waits and
 //!   lowerings among them, at most every 50 ms ([`trace_metrics`]).
+//! - **The trip** (`core::trip`), where the host installed its clock: when rt's completed handler
+//!   entered, on the thread that runs the decoder's handlers, and each commit's call into rt.
 //!
 //! Every call rt refuses answers as Metal's answers where it fails (nothing encoded, nil, no
 //! wait), counted under the refusal's kind ([`rt_refused`]); never a death.
@@ -407,8 +409,22 @@ fn hand_on(
     handed: Arc<Handed>,
 ) -> impl FnOnce(&rt::CommandBuffer) + Send + 'static {
     move |made: &rt::CommandBuffer| {
+        // When it entered, and the GPU's idle before it, for the decoder's handlers' trip
+        // (`core::trip`).
+        let entered = crate::core::trip::stamp();
+        let gpu = if entered != 0 {
+            crate::core::trip::gpu_times(
+                made.kernel_end_time(),
+                made.gpu_start_time(),
+                made.gpu_end_time(),
+            )
+        } else {
+            None
+        };
         if !merges && HANDED.load(Ordering::SeqCst) == 0 {
+            crate::core::trip::set_handler(entered, false, gpu);
             super::handler_times::time(|| handlers(made));
+            crate::core::trip::set_handler(0, false, None);
             return;
         }
         HANDED.fetch_add(1, Ordering::SeqCst);
@@ -422,7 +438,9 @@ fn hand_on(
                 crate::exit_gate::stay()
             };
             let was = RUNS_HANDED.replace(true);
+            crate::core::trip::set_handler(entered, true, gpu);
             handlers(&made);
+            crate::core::trip::set_handler(0, false, None);
             RUNS_HANDED.set(was);
             drop((made, step));
             *handed.pending.lock() = false;
@@ -1242,7 +1260,12 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 });
                 self.failure.flight.store(number, Ordering::SeqCst);
                 loss.open.fetch_add(1, Ordering::SeqCst);
+                let called = crate::core::trip::stamp();
                 let committed = self.rt.commit();
+                if called != 0 {
+                    let ns = crate::core::trip::stamp().saturating_sub(called);
+                    crate::core::trip::set_commit(called, ns);
+                }
                 if committed.is_err() {
                     loss.open.fetch_sub(1, Ordering::SeqCst);
                     let flight = self.failure.flight.swap(0, Ordering::SeqCst);

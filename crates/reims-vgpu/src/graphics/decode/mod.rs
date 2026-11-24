@@ -1580,11 +1580,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// A new decoder for `platform` over its `region`, with no objects. The first one made turns
-    /// on the contexts' counts where the log names their target ([`work`]), and the host's
-    /// summary where the log names its ([`super::summary`]).
+    /// on the contexts' counts where the log names their target ([`work`]), the host's summary
+    /// where the log names its ([`super::summary`]), and the trip's line where the log names its
+    /// ([`super::trip`]).
     pub fn new(platform: Arc<P>, region: Arc<Region>) -> Self {
         work::start(&platform);
         super::summary::start(&platform);
+        super::trip::start(&platform);
         let made_at = platform.clock().now_mono();
         let lanes = lane::Budget::of_host(platform.threads().handle());
         let helpers = helpers::Helpers::new(Some(platform.threads().handle()));

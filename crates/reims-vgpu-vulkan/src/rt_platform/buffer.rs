@@ -1816,7 +1816,7 @@ fn by_pointer(
     then: &Then,
     held: Held,
 ) -> Option<(rt::Block, u64)> {
-    let release = holding(released(codes, then, None), held);
+    let release = holding(released(codes, then, None, LivePath::Pointer), held);
     let imported = match pointer_refused() {
         Some(error) => Err(error),
         // SAFETY: the creators' `HostRange` contracts keep the bytes mapped and readable until
@@ -1873,7 +1873,7 @@ fn unpinnable(
     if !crate::os::map_for_pointer(at, len) || crate::os::through_dma_bufs(at, len) {
         return refused(device, sel, codes, (at, len), then, &no, None);
     }
-    let release = holding(released(codes, then, None), held);
+    let release = holding(released(codes, then, None, LivePath::Pointer), held);
     let imported = match pointer_refused() {
         Some(error) => Err(error),
         // SAFETY: as `by_pointer`'s: the pages are the same, mapped from their files now.
@@ -1935,17 +1935,21 @@ static FROM_FILES_SAID: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
 /// refused and that of the one made in its place share ([`import_pages`]).
 type Then = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
-/// The release of an import for a make of `codes`, which runs `then`: one fewer import live, and,
-/// for a dma-buf's or a copy's, whose block `forget` names once it is made, the host's mapping of
-/// it, or the pages it copies, forgotten first ([`HostMappings`]). It makes no call into rt and
-/// drops no handle of rt's.
+/// The release of an import made by `path` for a make of `codes`, which runs `then`: one fewer
+/// import live, and, for a dma-buf's or a copy's, whose block `forget` names once it is made, the
+/// host's mapping of it, or the pages it copies, forgotten first ([`HostMappings`]). It makes no
+/// call into rt and drops no handle of rt's. While it lives, the import counts in
+/// [`live_imports`].
 fn released(
     codes: crate::answer::MadeCodes,
     then: &Then,
     forget: Option<(HostMappings, Arc<OnceLock<rt::BlockId>>)>,
+    path: LivePath,
 ) -> NoCopyDeallocator {
     let then = Arc::clone(then);
+    let live = Live::of(path);
     Box::new(move || {
+        let _live = live;
         LIVE_IMPORTS.fetch_sub(1, Ordering::Relaxed);
         crate::answer::count_gone(codes);
         if let Some((mapped, id)) = forget
@@ -1969,7 +1973,52 @@ type Released = Box<dyn FnOnce(HostMappings, Arc<OnceLock<rt::BlockId>>) -> NoCo
 #[cfg(target_os = "linux")]
 fn released_into(codes: crate::answer::MadeCodes, then: &Then) -> Released {
     let then = Arc::clone(then);
-    Box::new(move |mapped, id| released(codes, &then, Some((mapped, id))))
+    Box::new(move |mapped, id| released(codes, &then, Some((mapped, id)), LivePath::DmaBuf))
+}
+
+/// How a live import of the host's memory was made ([`live_imports`]).
+#[derive(Clone, Copy, Debug)]
+enum LivePath {
+    /// By the pages' pointer (rt's `import_host_memory`).
+    Pointer,
+    /// As dma-bufs of the files behind them (rt's `import_dma_buf`, `import_dma_bufs`).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "dma-buf imports are made on Linux alone")
+    )]
+    DmaBuf,
+    /// As a copy, a block of rt's own (`super::copied`).
+    Copy,
+}
+
+/// The imports of the host's memory live now, by [`LivePath`]: each counted from its release's
+/// make ([`released`]) until it runs or drops, so from just before rt's import call until rt
+/// frees the import, or drops the release of one it refused.
+static LIVE_BY_PATH: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// One import counted in [`LIVE_BY_PATH`] while this lives.
+struct Live(LivePath);
+
+impl Live {
+    /// Counts one import of `path` until the value drops.
+    fn of(path: LivePath) -> Live {
+        LIVE_BY_PATH[path as usize].fetch_add(1, Ordering::Relaxed);
+        Live(path)
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        LIVE_BY_PATH[self.0 as usize].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The imports of the host's memory live now (no-copy buffers' and heaps' pages, the guest's RAM
+/// among them): those rt took by the pages' pointer, those it took as dma-bufs of the files behind
+/// them, and the copies made where it took neither or the GPU's writes are dropped, as
+/// `[pointer, dma-buf, copy]`. A diagnostic, read by reims-vgpu's trip line.
+pub fn live_imports() -> [u64; 3] {
+    std::array::from_fn(|i| LIVE_BY_PATH[i].load(Ordering::Relaxed))
 }
 
 /// [`by_pointer`]'s import of `pages`, the `len` bytes of whole pages at their address, as a
@@ -2344,7 +2393,12 @@ fn copied(
 ) -> Option<(rt::Block, u64)> {
     let homes = device.known_blocks().homes.clone();
     let id = Arc::new(OnceLock::new());
-    let release = released(codes, then, Some((homes.clone(), Arc::clone(&id))));
+    let release = released(
+        codes,
+        then,
+        Some((homes.clone(), Arc::clone(&id))),
+        LivePath::Copy,
+    );
     // SAFETY: the creators' `HostRange` contracts keep the bytes mapped until their deallocator
     // runs, which runs only from `then`, from the copy's release, as the copy goes, once nothing
     // syncs it; the pages they lie in are mapped readable, as `by_pointer`'s are, and writable
@@ -2958,6 +3012,32 @@ mod tests {
     use crate::core::platform::values::{OptionSet, TextureDesc};
     use crate::core::testkit::DeallocatorWatch;
     use crate::rt_platform::RtRefusal;
+
+    /// An import counts live by its path while its release lives, and no longer once the release
+    /// runs or drops
+    #[test]
+    fn an_import_counts_live_by_its_path_while_its_release_lives() {
+        let before = live_imports();
+        let release = released(
+            IMPORTS_UNNAMED,
+            &Arc::new(Mutex::new(None)),
+            None,
+            LivePath::Copy,
+        );
+        let dropped = released(
+            IMPORTS_UNNAMED,
+            &Arc::new(Mutex::new(None)),
+            None,
+            LivePath::Pointer,
+        );
+        let live = live_imports();
+        assert_eq!((live[0], live[2]), (before[0] + 1, before[2] + 1));
+        drop(dropped);
+        // The release counts one fewer import live of every path too, as rt frees it.
+        LIVE_IMPORTS.fetch_add(1, Ordering::Relaxed);
+        release();
+        assert_eq!(live_imports(), before);
+    }
 
     /// A buffer's options: Shared, Private and Managed, Metal's default hazard tracking answered
     /// tracked, bits 20 and 24 answered without; Metal's refusals refused.

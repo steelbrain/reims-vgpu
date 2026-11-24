@@ -69,6 +69,7 @@ pub mod surface;
 pub mod swapchain;
 pub mod texture;
 pub mod tiled;
+pub mod trip;
 pub mod unbuilt;
 pub mod unmade;
 pub mod window_times;

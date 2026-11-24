@@ -94,6 +94,13 @@ pub(super) fn clock(region: &Region) -> Option<Clock> {
     })
 }
 
+/// The guest's time `guest_ns` on the host's clock, by `clock`'s offset; 0 where that falls
+/// before the host's clock's start.
+pub(crate) fn on_host(guest_ns: u64, clock: Clock) -> u64 {
+    let ns = i128::from(guest_ns) - i128::from(clock.offset_ns);
+    u64::try_from(ns.max(0)).unwrap_or(u64::MAX)
+}
+
 /// A command buffer's spans before the host took it, in nanoseconds (the module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Spans {
@@ -130,8 +137,7 @@ pub(crate) fn spans(
     noted_ns: u64,
 ) -> Spans {
     let host = clock.map(|clock| {
-        let posted = i128::from(times.posted_ns) - i128::from(clock.offset_ns);
-        let posted = u64::try_from(posted.max(0)).unwrap_or(u64::MAX);
+        let posted = on_host(times.posted_ns, clock);
         HostSpans {
             queued: ring_free_ns.saturating_sub(posted),
             transport: taken_ns.saturating_sub(posted.max(ring_free_ns)),

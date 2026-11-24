@@ -245,6 +245,7 @@ use crate::display::{
 use crate::ops::RgfxCommandBuffer;
 use crate::region::Region;
 use crate::ring::{Consumer, Message, Posted, Producer, RingAt, sized};
+use crate::trip;
 use crate::wake::{self, Doorbell, RawDoorbell, Wake};
 use crate::wire::*;
 
@@ -1546,6 +1547,8 @@ pub(crate) struct QueueShared {
     route_page: AtomicU32,
     /// Set when the queue is destroyed, or at a reset or the device's end.
     ending: AtomicBool,
+    /// Its part of the timed trip ([`trip`]), a diagnostic.
+    trip: trip::Queue,
 }
 
 /// What follows a record posted through [`CompletionPoster::post_unwaiting`]: run once, right
@@ -1581,6 +1584,18 @@ struct HandedRecord {
     /// with none, or it was handed over behind others in a full spell of the ring; 0 where
     /// neither.
     no_room_since: u64,
+    /// For a command buffer's completion with the trip timed, when rt's handler entered
+    /// ([`trip::Stage::Down`]); else 0.
+    trip_from: u64,
+}
+
+/// A buffer's completion this thread posted, handed over or posted at `entered`, rt's handler of
+/// it having entered at `from`: its post and its whole trip down, where the trip is timed
+/// ([`trip::Stage::Post`], [`trip::Stage::Down`]).
+fn trip_posted(entered: u64, from: u64) {
+    let (written, end) = trip::posted();
+    trip::time(trip::Stage::Post, written.saturating_sub(entered));
+    trip::time(trip::Stage::Down, end.saturating_sub(from));
 }
 
 /// What a queue's posts noted of its full completion ring for its service thread to tell
@@ -1668,6 +1683,9 @@ impl QueueShared {
     /// Its doorbell was rung: its service thread wakes, and so does a post waiting for room on
     /// its completion ring, as the guest may have taken completions before it rang.
     fn rung(&self) {
+        if trip::on() {
+            trip::count(trip::Count::MmioBells);
+        }
         self.wake.wake();
         self.room.wake();
     }
@@ -4100,6 +4118,7 @@ impl Shared {
             route: AtomicU64::new(0),
             route_page: AtomicU32::new(u32::MAX),
             ending: AtomicBool::new(false),
+            trip: trip::Queue::default(),
         });
         let ended: Vec<Arc<QueueShared>> = {
             let mut queues = self.queues.lock();
@@ -4351,9 +4370,14 @@ impl Shared {
                 .handing
                 .load(Ordering::Acquire)
                 .then(|| self.room_poll());
-            queue
+            let woke = queue
                 .wake
                 .sleep_for(queue.bell.as_ref().map(wake::raw), poll);
+            if trip::on() {
+                trip::count(trip::Count::Sleeps);
+                trip::add(trip::Count::Bells, woke.bells);
+                queue.trip.woke(now_ns());
+            }
             // A doorbell may follow the guest's take of completions, as the control thread's
             // may: a routed one rings nothing of the device's but the bell.
             queue.room.wake();
@@ -4377,6 +4401,7 @@ impl Shared {
         // Where the guest stamps its buffers ([`guest_times`]): when this thread came back to the
         // ring after the buffer it handed over before, on the host's clock; 0 before its first.
         let guest_times = self.driver_took(RGFX_FEATURE_GUEST_TIMES);
+        let timed = trip::on();
         let mut ring_free_ns = 0;
         loop {
             let (next, room, taken_ns) = {
@@ -4386,7 +4411,7 @@ impl Shared {
                 }
                 let next = submit.consumer.next(&self.region);
                 // The buffer's take, before it waits at the gate.
-                let taken_ns = if guest_times { now_ns() } else { 0 };
+                let taken_ns = if guest_times || timed { now_ns() } else { 0 };
                 // A commit waiting for room: after this take, a doorbell's thread's before it, or
                 // the last, where the ring is empty.
                 let room = next.is_ok() && self.room_wanted(&submit.consumer);
@@ -4440,6 +4465,11 @@ impl Shared {
                 }
                 Ok(None) | Err(_) => return,
             };
+            let take = if timed {
+                queue.trip.took(taken_ns)
+            } else {
+                trip::Take::default()
+            };
             // Order this command buffer after the creates its process posted before it. Creates
             // ride ring 0, which the control thread takes; command buffers ride the queues' own
             // rings (this thread). A create a buffer uses is posted before it in guest order, so
@@ -4480,6 +4510,9 @@ impl Shared {
             let mut message = message;
             let waits = self.control_done.load(Ordering::Acquire) < waits_for
                 || !self.lanes.through(queue.context, own);
+            if timed && waits {
+                trip::count(trip::Count::GateWaits);
+            }
             let offer = (waits && message.header.r#type == RGFX_CMD_COMMAND_BUFFER).then(|| {
                 let bytes = std::mem::take(&mut message.bytes);
                 Arc::new(Offer::new(Arc::clone(queue), bytes, waits_for, own))
@@ -4553,7 +4586,7 @@ impl Shared {
                 message
             };
             if guest_times {
-                self.note_guest_times(queue, &message, taken_ns, ring_free_ns);
+                self.note_guest_times(queue, &message, taken_ns, ring_free_ns, take);
             }
             // The host may let the claim go once the buffer is begun ([`QueueClaim`]); a buffer
             // a doorbell's thread answered meanwhile is the ring's next, which this takes next.
@@ -4563,7 +4596,15 @@ impl Shared {
                 held: Some(consuming),
                 walking: false,
             };
+            if timed {
+                let begun = now_ns();
+                trip::time(trip::Stage::Gate, begun.saturating_sub(taken_ns));
+                trip::set_up(taken_ns, begun);
+            }
             self.host.command_buffer(poster, message.bytes, &mut claim);
+            if timed {
+                trip::set_up(0, 0);
+            }
             consuming = claim.retake();
             if guest_times {
                 ring_free_ns = now_ns();
@@ -4573,14 +4614,16 @@ impl Shared {
 
     /// The guest's times of the `COMMAND_BUFFER` `message` ([`guest_times`]), taken off `queue`'s
     /// ring at `taken_ns` by a thread that came back to the ring at `ring_free_ns`: its `cbguest`
-    /// event in the host's trace, and its spans in the once-a-second line where its target logs.
-    /// Nothing for a buffer whose stream does not start with its times.
+    /// event in the host's trace, its spans in the once-a-second line where its target logs, and
+    /// in the trip where it is timed, with what its `take` found ([`trip::guest`]). Nothing for a
+    /// buffer whose stream does not start with its times.
     fn note_guest_times(
         &self,
         queue: &QueueShared,
         message: &Message,
         taken_ns: u64,
         ring_free_ns: u64,
+        take: trip::Take,
     ) {
         let Some(times) = guest_times::of(&message.bytes) else {
             return;
@@ -4588,6 +4631,15 @@ impl Shared {
         let clock = guest_times::clock(&self.region);
         let noted_ns = now_ns();
         let spans = guest_times::spans(&times, clock, taken_ns, ring_free_ns, noted_ns);
+        if trip::on() {
+            let host = spans.host.zip(clock).map(|(host, clock)| trip::OnHost {
+                queued: host.queued,
+                transport: host.transport,
+                began: guest_times::on_host(times.began_ns, clock),
+                committed: guest_times::on_host(times.committed_ns, clock),
+            });
+            trip::guest(spans.encode, spans.post_wait, host, taken_ns, take);
+        }
         self.host
             .trace("cbguest", &spans.event(queue.obj_id, message.header.seqno));
         if log::log_enabled!(target: guest_times::TARGET, log::Level::Debug)
@@ -4790,6 +4842,7 @@ impl Shared {
         if !wait && queue.handing.load(Ordering::Acquire) {
             return Post::Busy;
         }
+        let timed = trip::on();
         let raise = {
             let Some(mut completion) = lock_ring(&queue.complete, wait) else {
                 return Post::Busy;
@@ -4813,9 +4866,31 @@ impl Shared {
                 }
             }
         };
-        if raise {
-            self.raise_queue(queue);
+        if !timed {
+            if raise {
+                self.raise_queue(queue);
+            }
+            return Post::Done;
         }
+        let written = now_ns();
+        let end = if raise {
+            self.raise_queue(queue);
+            let end = now_ns();
+            trip::time(trip::Stage::Raise, end.saturating_sub(written));
+            trip::count(trip::Count::Raised);
+            end
+        } else {
+            trip::count(trip::Count::Unarmed);
+            written
+        };
+        trip::count(trip::Count::Records);
+        if RgfxMsgHeader::read_from_prefix(message)
+            .is_ok_and(|(header, _)| header.r#type == RGFX_EVT_CB_COMPLETE)
+        {
+            trip::count(trip::Count::Completions);
+            queue.trip.completed(end);
+        }
+        trip::set_posted(written, end);
         Post::Done
     }
 
@@ -5052,6 +5127,7 @@ impl Shared {
                 at: now_ns(),
                 then: None,
                 no_room_since: 0,
+                trip_from: 0,
             });
             self.control_handing.store(true, Ordering::Release);
             !handed.posting
@@ -5078,6 +5154,7 @@ impl Shared {
                     at: 0,
                     then: None,
                     no_room_since: 0,
+                    trip_from: 0,
                 });
             }
             if handed.posting {
@@ -5105,13 +5182,13 @@ impl Shared {
     /// ([`CompletionPoster::post_elsewhere`]), after the records handed over before it, and wakes
     /// that thread unless a thread is posting them already. Waits for nothing.
     fn hand_over(&self, queue: &QueueShared, message: &[u8], epoch: u64) {
-        self.hand_over_then(queue, message, epoch, None, 0);
+        self.hand_over_then(queue, message, epoch, None, 0, 0);
     }
 
     /// [`Self::hand_over`], `then` run once `message` is posted or dropped ([`Then`]), and, where
     /// the post that handed it found the ring with no room, since when (`no_room_since`, 0 where
     /// it did not look); dropped at once, and `then` run here, where the queue's service thread
-    /// has ended.
+    /// has ended. `trip_from` is [`HandedRecord::trip_from`].
     fn hand_over_then(
         &self,
         queue: &QueueShared,
@@ -5119,6 +5196,7 @@ impl Shared {
         epoch: u64,
         then: Option<Then>,
         no_room_since: u64,
+        trip_from: u64,
     ) {
         let wake = {
             let mut handed = queue.handed.lock();
@@ -5132,6 +5210,7 @@ impl Shared {
                 at: now_ns(),
                 then,
                 no_room_since,
+                trip_from,
             });
             queue.handing.store(true, Ordering::Release);
             !handed.posting
@@ -5152,18 +5231,31 @@ impl Shared {
         epoch: u64,
         then: Option<Then>,
     ) {
+        // A buffer's completion, where the trip is timed: when rt's handler entered, and the post.
+        let trip_from = trip::take_down();
+        let entered = if trip_from != 0 { now_ns() } else { 0 };
         if queue.handing.load(Ordering::Acquire) {
-            self.hand_over_then(queue, message, epoch, then, behind_since(queue));
+            if trip_from != 0 {
+                trip::count(trip::Count::HandedOver);
+            }
+            self.hand_over_then(queue, message, epoch, then, behind_since(queue), trip_from);
             if !self.post_handed(queue) {
                 queue.wake.wake();
             }
             return;
         }
-        if self.post_queue(queue, message, epoch) != Post::NoRoom {
+        let post = self.post_queue(queue, message, epoch);
+        if post != Post::NoRoom {
+            if post == Post::Done && trip_from != 0 {
+                trip_posted(entered, trip_from);
+            }
             return run(then);
         }
         self.note_no_room(queue);
-        self.hand_over_then(queue, message, epoch, then, now_ns());
+        if trip_from != 0 {
+            trip::count(trip::Count::HandedOver);
+        }
+        self.hand_over_then(queue, message, epoch, then, now_ns(), trip_from);
     }
 
     /// `queue`'s service thread has ended: no record handed over from now on is posted
@@ -5200,6 +5292,7 @@ impl Shared {
                 at: 0,
                 then: None,
                 no_room_since: behind_since(queue),
+                trip_from: 0,
             });
         }
         if !self.post_handed(queue) {
@@ -5254,7 +5347,8 @@ impl Shared {
                     }
                 }
             };
-            if self.post_queue(queue, &record.message, record.epoch) == Post::NoRoom {
+            let post = self.post_queue(queue, &record.message, record.epoch);
+            if post == Post::NoRoom {
                 if record.no_room_since == 0 {
                     record.no_room_since = now_ns();
                     self.note_no_room(queue);
@@ -5265,6 +5359,9 @@ impl Shared {
                 return (false, posted);
             }
             posted += 1;
+            if post == Post::Done && record.trip_from != 0 {
+                trip_posted(record.at, record.trip_from);
+            }
             if record.at != 0 {
                 let waited = now_ns().saturating_sub(record.at);
                 self.handed_wait_ns.fetch_max(waited, Ordering::Relaxed);

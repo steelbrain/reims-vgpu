@@ -46,3 +46,4 @@ pub mod sync;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trace;
+pub mod trip;

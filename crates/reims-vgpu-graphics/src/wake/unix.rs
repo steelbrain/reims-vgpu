@@ -95,8 +95,13 @@ impl Wake {
         self.sleep_for(doorbell, None);
     }
 
-    /// [`Self::sleep`], for `timeout` at most where one is given (rounded up to a millisecond).
-    pub(crate) fn sleep_for(&self, doorbell: Option<RawFd>, timeout: Option<std::time::Duration>) {
+    /// [`Self::sleep`], for `timeout` at most where one is given (rounded up to a millisecond):
+    /// what ended it.
+    pub(crate) fn sleep_for(
+        &self,
+        doorbell: Option<RawFd>,
+        timeout: Option<std::time::Duration>,
+    ) -> super::Woke {
         let timeout_ms = timeout.map_or(-1, |t| {
             libc::c_int::try_from(t.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
         });
@@ -119,14 +124,19 @@ impl Wake {
         // Before the drain: until it, a wake that ended the poll is still pending.
         #[cfg(test)]
         self.sleeps.fetch_add(1, Ordering::SeqCst);
+        let mut woke = super::Woke::default();
         if n <= 0 {
-            return;
+            return woke;
         }
-        for pollfd in fds {
-            if pollfd.fd >= 0 && pollfd.revents & libc::POLLIN != 0 {
-                drain(pollfd.fd);
-            }
+        let [own, bell] = fds;
+        if own.revents & libc::POLLIN != 0 {
+            drain(own.fd);
+            woke.wake = true;
         }
+        if bell.fd >= 0 && bell.revents & libc::POLLIN != 0 {
+            woke.bells = drain(bell.fd);
+        }
+        woke
     }
 }
 
@@ -154,11 +164,19 @@ pub(crate) fn bell() -> Option<OwnedFd> {
 
 /// Takes what `fd` holds, at most 64 bytes: an eventfd's count (8 bytes), or a pipe's writes
 /// (QEMU's event notifier is a pipe where the host has no eventfd). One read after a readable
-/// poll never blocks; what it leaves keeps the descriptor readable for the next sleep.
-fn drain(fd: RawFd) {
+/// poll never blocks; what it leaves keeps the descriptor readable for the next sleep. The
+/// signals it took: an eventfd's count, else 1 where it read any byte.
+fn drain(fd: RawFd) -> u64 {
     let mut buf = [0u8; 64];
     // SAFETY: up to 64 bytes into a local.
-    let _ = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    match n {
+        8 => u64::from_ne_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]),
+        n if n > 0 => 1,
+        _ => 0,
+    }
 }
 
 /// Makes `fd` non-blocking and closed on exec.

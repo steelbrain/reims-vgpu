@@ -132,6 +132,7 @@ use reims_vgpu_graphics::ops::{
     RgfxRenderPassDesc, RgfxRenderPassRateMap, RgfxRenderPassSamplePositions,
     RgfxRenderPassVisibility, RgfxSurfaceOrderWait, RgfxUploadWritten, op_group,
 };
+use reims_vgpu_graphics::trip;
 use reims_vgpu_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
     RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
@@ -648,6 +649,9 @@ struct InFlight {
     count: Arc<AtomicUsize>,
     out: Arc<AtomicUsize>,
     committed: bool,
+    /// Its queue's buffers committed and not completed as it was committed, for the trip
+    /// ([`trip::idle`]).
+    depth: usize,
 }
 
 impl InFlight {
@@ -659,6 +663,7 @@ impl InFlight {
             count: Arc::clone(count),
             out: Arc::clone(out),
             committed: false,
+            depth: 0,
         }
     }
 
@@ -666,7 +671,11 @@ impl InFlight {
     /// command buffers too, until dropped.
     fn commits(mut self) -> InFlight {
         if !self.committed {
-            self.out.fetch_add(1, Ordering::AcqRel);
+            let before = self.out.fetch_add(1, Ordering::AcqRel);
+            if trip::on() {
+                trip::depth(before);
+            }
+            self.depth = before;
             self.committed = true;
         }
         self
@@ -682,9 +691,17 @@ impl Drop for InFlight {
     }
 }
 
-/// `handler`, after which the buffer leaves its queue's count (`in_flight`).
+/// `handler`, after which the buffer leaves its queue's count (`in_flight`). Where the trip is
+/// timed, the GPU's idle before the buffer and its pickup go by its depth at its commit
+/// ([`trip::idle`]).
 fn leaving(handler: CompletedHandler, in_flight: InFlight) -> CompletedHandler {
     Box::new(move |info: CompletedInfo| {
+        if in_flight.committed
+            && trip::on()
+            && let Some((idle, pickup)) = reims_vgpu_vulkan::core::trip::gpu()
+        {
+            trip::idle(in_flight.depth, idle, pickup);
+        }
         handler(info);
         drop(in_flight);
     })
@@ -1064,7 +1081,20 @@ fn commit_holding<C: CommandBuffer<P>, P: Platform>(
     cb: &C,
     held: Option<&Held>,
 ) -> RaiseResult<()> {
+    // The trip's stamps of a buffer this thread carries out ([`trip::set_job`]): its walk, and
+    // the commit to rt's, with rt's call.
+    let (taken, start) = trip::job();
+    let before = if start != 0 { trip::now_ns() } else { 0 };
     let committed = cb.commit(ON);
+    if before != 0
+        && let Some((called, ns)) = reims_vgpu_vulkan::core::trip::take_commit()
+    {
+        trip::count(trip::Count::Commits);
+        trip::time(trip::Stage::Walk, before.saturating_sub(start));
+        trip::time(trip::Stage::Commit, called.saturating_sub(before));
+        trip::time(trip::Stage::RtCommit, ns);
+        trip::time(trip::Stage::Up, called.saturating_sub(taken));
+    }
     if committed.is_err()
         && let Some(held) = held
     {
@@ -2664,6 +2694,22 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .watch(cb_obj_id, seqno, context, events.waits)
         });
         Box::new(move |info: CompletedInfo| {
+            // The trip's stamps (`super::super::trip`): rt's handler's entry, and this one's.
+            let entered = trip::stamp();
+            let from = if entered != 0 {
+                let (at, handed) = reims_vgpu_vulkan::core::trip::handler();
+                if handed {
+                    trip::count(trip::Count::HandedOn);
+                }
+                if at != 0 {
+                    trip::time(trip::Stage::HandlerHop, entered.saturating_sub(at));
+                    at
+                } else {
+                    entered
+                }
+            } else {
+                0
+            };
             // The platform refused the buffer's completion on its own thread (a death in its
             // read, in the scope this decode carried there, which logs the death at WARN):
             // the buffer fails, as one a GPU error strikes on a Mac does, and its context's later
@@ -2736,9 +2782,22 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             // The buffer's work and its completion are done: a drain of its context may end,
             // once the record is on the guest's ring.
-            let post: Post = Box::new(move || match &sink {
-                Some(sink) => sink(record, Box::new(move || drop(drain))),
-                None => drop(drain),
+            let finished = if entered != 0 { trip::now_ns() } else { 0 };
+            if finished != 0 {
+                trip::time(trip::Stage::Ours, finished - entered);
+            }
+            let post: Post = Box::new(move || {
+                if finished != 0 {
+                    trip::since(trip::Stage::Order, finished);
+                    trip::set_down(from);
+                }
+                match &sink {
+                    Some(sink) => sink(record, Box::new(move || drop(drain))),
+                    None => drop(drain),
+                }
+                if finished != 0 {
+                    trip::set_down(0);
+                }
             });
             turn.finish(Some(post));
             drop(entry);

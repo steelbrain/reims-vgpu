@@ -63,6 +63,9 @@ impl Completions {
     fn finish(&self, at: u64, post: Option<Post>) {
         let mut turns = self.0.lock();
         if turns.running || at != turns.front {
+            if post.is_some() && reims_vgpu_graphics::trip::on() {
+                reims_vgpu_graphics::trip::count(reims_vgpu_graphics::trip::Count::Parked);
+            }
             turns.ahead.insert(at, post);
             return;
         }

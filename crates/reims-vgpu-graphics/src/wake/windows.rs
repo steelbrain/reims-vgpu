@@ -88,12 +88,13 @@ impl Wake {
         self.sleep_for(doorbell, None);
     }
 
-    /// [`Self::sleep`], for `timeout` at most where one is given (rounded up to a millisecond).
+    /// [`Self::sleep`], for `timeout` at most where one is given (rounded up to a millisecond):
+    /// what ended it.
     pub(crate) fn sleep_for(
         &self,
         doorbell: Option<RawDoorbell>,
         timeout: Option<std::time::Duration>,
-    ) {
+    ) -> super::Woke {
         let timeout_ms = timeout.map_or(INFINITE, |t| {
             u32::try_from(t.as_nanos().div_ceil(1_000_000))
                 .map_or(INFINITE - 1, |ms| ms.min(INFINITE - 1))
@@ -106,13 +107,16 @@ impl Wake {
         // Before the resets: until them, a wake that ended the wait is still pending.
         #[cfg(test)]
         self.sleeps.fetch_add(1, Ordering::SeqCst);
+        let mut woke = super::Woke::default();
         if waited >= WAIT_OBJECT_0 + count {
             // Timed out, or failed.
-            return;
+            return woke;
         }
-        for &handle in &handles[..count as usize] {
-            take(handle);
+        woke.wake = take(handles[0]);
+        if count > 1 {
+            woke.bells = u64::from(take(handles[1]));
         }
+        woke
     }
 
     /// The handles a sleep waits for, its own event first, and how many there are.
@@ -131,13 +135,15 @@ pub(crate) fn bell() -> Option<Doorbell> {
     None
 }
 
-/// Resets `event` where it is set: takes the signal that woke the sleep.
-fn take(event: HANDLE) {
+/// Resets `event` where it is set: takes the signal that woke the sleep. Whether it was set.
+fn take(event: HANDLE) -> bool {
     // SAFETY: a live event; a timeout of 0 never blocks.
     if unsafe { WaitForSingleObject(event, 0) } == WAIT_OBJECT_0 {
         // SAFETY: as above.
         let _ = unsafe { ResetEvent(event) };
+        return true;
     }
+    false
 }
 
 /// A doorbell that is not open, for the tests: a null handle, which no duplicate is made of

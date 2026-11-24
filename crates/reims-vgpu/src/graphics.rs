@@ -194,6 +194,7 @@ mod rt_window;
 mod sink;
 mod slow_answers;
 mod summary;
+mod trip;
 #[cfg(any(target_os = "linux", windows))]
 mod vaapi;
 mod video_choice;
@@ -3148,7 +3149,24 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         };
         let control = Arc::clone(self);
         let awaited = walk.awaited;
+        // The trip's stamps (`trip`): the buffer's take and its begin here, on the queue's thread,
+        // and its hand to the lane's.
+        let (trip_taken, trip_begun) = reims_vgpu_graphics::trip::up();
+        let on_lane = lane.is_some() && !here;
+        let trip_handed = if trip_begun != 0 && on_lane {
+            reims_vgpu_graphics::trip::now_ns()
+        } else {
+            0
+        };
         let job = move || {
+            let trip_start = if trip_begun != 0 {
+                let start = reims_vgpu_graphics::trip::now_ns();
+                trip::started(start, trip_begun, trip_handed);
+                reims_vgpu_graphics::trip::set_job(trip_taken, start);
+                start
+            } else {
+                0
+            };
             entry::run(|_| {
                 let mut decoder = decoder;
                 // The pipelines it names that were still compiling as it was begun, waited for out
@@ -3198,6 +3216,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 control.report(&poster, &message, outcome, stood_in);
                 drop(turn);
             });
+            if trip_start != 0 {
+                reims_vgpu_graphics::trip::set_job(0, 0);
+            }
         };
         match lane {
             Some(lane) if !here => lane.run(Box::new(job)),

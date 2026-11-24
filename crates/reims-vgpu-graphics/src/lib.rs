@@ -19,6 +19,8 @@
 //!   nothing to do.
 //! - [`clock`] is the device's clock, `HOST_TIME`'s, and [`clock::runtime`] places the
 //!   platform's GPU times on it before they reach the guest.
+//! - [`trip`] times a command buffer's completion's trip down to the guest and the guest's next
+//!   buffer's up, by stage: a diagnostic, off unless reims-vgpu turns it on.
 
 pub mod clock;
 mod control;
@@ -30,6 +32,7 @@ pub mod managed;
 pub mod ops;
 pub mod region;
 mod ring;
+pub mod trip;
 mod wake;
 pub mod wire;
 

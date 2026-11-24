@@ -26,6 +26,16 @@ pub(crate) use windows::not_open;
 #[cfg(windows)]
 pub(crate) use windows::{Doorbell, Wake, bell, duplicate, raw};
 
+/// What ended a sleep ([`Wake`]'s `sleep_for`): its own wake, and the signals the host's doorbell
+/// held (an eventfd's count of its writes, else 1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Woke {
+    /// The device's own wake was set.
+    pub(crate) wake: bool,
+    /// The host's doorbell's signals.
+    pub(crate) bells: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,13 +54,44 @@ mod tests {
         wake.sleep(Some(bell.raw()));
     }
 
-    /// A sleep for a time with nothing to wake it ends once the time has passed
+    /// A sleep for a time with nothing to wake it ends once the time has passed, woken by nothing
     #[test]
     fn a_sleep_for_a_time_ends_with_no_wake() {
         let wake = Wake::new().unwrap();
         let bell = Wake::new().unwrap();
-        wake.sleep_for(Some(bell.raw()), Some(std::time::Duration::from_millis(1)));
+        let woke = wake.sleep_for(Some(bell.raw()), Some(std::time::Duration::from_millis(1)));
+        assert_eq!(woke, Woke::default());
         wake.sleep_for(None, Some(std::time::Duration::ZERO));
+    }
+
+    /// A sleep tells its own wake from the doorbell's signal
+    #[test]
+    fn a_sleep_tells_its_wake_from_the_doorbells() {
+        let wake = Wake::new().unwrap();
+        let bell = Wake::new().unwrap();
+        wake.wake();
+        let woke = wake.sleep_for(Some(bell.raw()), None);
+        assert_eq!((woke.wake, woke.bells), (true, 0));
+        bell.wake();
+        let woke = wake.sleep_for(Some(bell.raw()), None);
+        assert_eq!((woke.wake, woke.bells), (false, 1));
+    }
+
+    /// A bell's eventfd gives the count of its writes
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bells_eventfd_counts_its_writes() {
+        use std::os::fd::AsRawFd;
+        let wake = Wake::new().unwrap();
+        let bell = bell().unwrap();
+        for _ in 0..3 {
+            let one = 1u64.to_ne_bytes();
+            // SAFETY: eight bytes from a local, to an eventfd the test owns.
+            let wrote = unsafe { libc::write(bell.as_raw_fd(), one.as_ptr().cast(), 8) };
+            assert_eq!(wrote, 8);
+        }
+        let woke = wake.sleep_for(Some(bell.as_raw_fd()), None);
+        assert_eq!((woke.wake, woke.bells), (false, 3));
     }
 
     /// The thread is parked only inside a sleep with no wake pending
