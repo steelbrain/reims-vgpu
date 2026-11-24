@@ -4021,6 +4021,95 @@ mod tests {
         assert!(app.overlay.is_none());
     }
 
+    /// A draw of `app`: whether its VM pane tells that the VM's OpenCore image lacks reims-vgpu's
+    /// macOS drivers, and the reads of the image the draw made, and the bytes they read.
+    fn draw_lacks(
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        app: &mut App,
+    ) -> (bool, (u64, u64)) {
+        let (reads, bytes) = opencore::tests::READS.get();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let (now_reads, now_bytes) = opencore::tests::READS.get();
+        let buf = terminal.backend().buffer();
+        let lacks = find(buf, buf.area, "Its OpenCore image lacks").is_some();
+        (lacks, (now_reads - reads, now_bytes - bytes))
+    }
+
+    /// The VM pane, drawn a few times a second, reads a VM's OpenCore image again only once it
+    /// may have changed: unchanged, a draw reads none of it, and the next draw after a rewrite
+    /// tells what the image then holds, whether another program rewrote it in place or reims-ctl
+    /// made it a new one (U), of the same length and time of last write.
+    #[test]
+    fn the_vm_pane_reads_the_opencore_image_again_only_once_it_changes() {
+        use opencore::tests::{carried_a, enabled, image_loading, on_reims_vgpu, qcow2};
+        let env = crate::testenv::Env::new("tui-opencore-reads");
+        let dir = env.root.join("vms/t");
+        std::fs::create_dir_all(&dir).unwrap();
+        // config.plist loading A.kext then B.kext, or B.kext alone, padded to the same length: an
+        // image holding the guest's kexts, and one lacking A.kext, of one length.
+        let both = enabled("A.kext") + &enabled("B.kext");
+        let b_alone = format!("{:<1$}", enabled("B.kext"), both.len());
+        let holding = qcow2(&image_loading(&both, carried_a(), &[]));
+        let lacking = qcow2(&image_loading(&b_alone, carried_a(), &[]));
+        assert_eq!(holding.len(), lacking.len());
+        on_reims_vgpu(&dir, &lacking, crate::vm::ImageFormat::Qcow2);
+        let image = dir.join("opencore.qcow2");
+        // Last written an hour ago, as a VM's image is by the time the pane shows it.
+        let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let written_long_ago = |p: &std::path::Path| {
+            let f = std::fs::File::options().write(true).open(p).unwrap();
+            f.set_modified(an_hour_ago).unwrap();
+        };
+        written_long_ago(&image);
+        let mut reg = Registry::default();
+        reg.add("t", &dir).unwrap();
+        reg.save().unwrap();
+        let mut app = App::with(Host {
+            os: Os::Mac,
+            arch: Arch::X86_64,
+        });
+        app.reload().unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
+        let read_lacking = draw_lacks(&mut terminal, &mut app);
+        assert!(read_lacking.0 && read_lacking.1.0 > 0, "{read_lacking:?}");
+        // Unchanged, the next draw reads none of it, and tells the same.
+        let kept = draw_lacks(&mut terminal, &mut app);
+        assert_eq!(kept, (true, (0, 0)));
+
+        // Rewritten in place by another program, holding the drivers, of the same length.
+        std::fs::write(&image, &holding).unwrap();
+        let read_holding = draw_lacks(&mut terminal, &mut app);
+        assert!(!read_holding.0 && read_holding.1.0 > 0, "{read_holding:?}");
+        eprintln!(
+            "a draw's reads of the image, and bytes read: {:?} lacking A.kext and {:?} holding \
+             the set where it may have changed, {:?} where it has not",
+            read_lacking.1, read_holding.1, kept.1
+        );
+        // Its time of last write set back to the hour before: read again, then kept.
+        written_long_ago(&image);
+        assert!(!draw_lacks(&mut terminal, &mut app).0);
+        assert_eq!(draw_lacks(&mut terminal, &mut app), (false, (0, 0)));
+
+        // reims-ctl makes it a new image (U), here one lacking A.kext, of the same length and
+        // time of last write as the image it replaces.
+        let made = env.root.join("made.qcow2");
+        std::fs::write(&made, &lacking).unwrap();
+        written_long_ago(&made);
+        let util = crate::testenv::program(
+            &env.root.join("reims-util"),
+            &format!(
+                "#!/bin/sh\nwhile [ \"$1\" != -o ]; do shift; done\ncp -p '{}' \"$2\"\n\
+                 echo '{{\"event\":\"done\",\"result\":{{}}}}'\n",
+                made.display()
+            ),
+        );
+        env.set("REIMS_CTL_UTIL", &util);
+        let mut vm = Registry::load().unwrap().open("t").unwrap();
+        opencore::renew(&mut vm, None, &mut |_| {}).unwrap();
+        assert!(draw_lacks(&mut terminal, &mut app).0);
+    }
+
     /// A VM's edit form offers its disk's controller as its settings have it, and saves the one
     /// picked.
     #[test]

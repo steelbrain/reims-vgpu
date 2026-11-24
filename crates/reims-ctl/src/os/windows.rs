@@ -191,6 +191,12 @@ pub fn gid(_m: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
+/// When the file `m` describes last changed, as Unix's ctime tells: none, as std's metadata on
+/// Windows gives no such time.
+pub fn changed(_m: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+    None
+}
+
 /// Whether this process may open the file `p` to read and write it.
 pub fn may_read_write(p: &Path) -> bool {
     std::fs::OpenOptions::new()

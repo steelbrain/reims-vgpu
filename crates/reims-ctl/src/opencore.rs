@@ -17,8 +17,11 @@ use crate::prebuilt::Kext;
 use crate::vm::{Graphics, ImageFormat, Vm};
 use crate::{paths, prebuilt, reims_util, runtime};
 use anyhow::{Context, Result, bail, ensure};
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 /// Lilu, the old graphics loader and its two shims, which the guest's set loaded through before
 /// Graft: an image reims-ctl makes lists none of them (migrate.rs, Migration 4).
@@ -139,7 +142,7 @@ pub fn shows_picker(vm: &Vm) -> Option<bool> {
 }
 
 /// How an image holds the guest's kexts for reims-vgpu's own device.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum GuestKexts {
     /// Each, in the set's order, with the executable reims-ctl carries.
     Held,
@@ -185,10 +188,90 @@ fn guest_kexts(
 }
 
 /// How a VM's OpenCore image holds the guest's kexts this reims-ctl carries; None where the
-/// image cannot be read, an error where reims-ctl carries no set.
+/// image cannot be read, an error where reims-ctl carries no set. What a read of the image finds
+/// is kept while its file stays as it was ([`KEPT`]): the interface's VM pane asks at each draw,
+/// a few times a second, and a read reads the image's config.plist and the kexts' executables,
+/// megabytes.
 fn image_guest_kexts(vm: &Vm) -> Option<Result<GuestKexts>> {
     let q = vm.config.q35.as_ref()?;
-    guest_kexts_in(&vm.path(&q.opencore), q.opencore_format, prebuilt::set)
+    let image = vm.path(&q.opencore);
+    let format = q.opencore_format;
+    let now = SystemTime::now();
+    let stamp = Stamp::of(&image);
+    {
+        let mut kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(k) = kept.get(&image)
+            && Some(k.stamp) == stamp
+            && k.format == format
+        {
+            return Some(Ok(k.kexts.clone()));
+        }
+        kept.remove(&image);
+    }
+    let read = guest_kexts_in(&image, format, prebuilt::set);
+    if let (Some(Ok(kexts)), Some(stamp)) = (&read, stamp)
+        && stamp.settled(now)
+    {
+        let kexts = kexts.clone();
+        let mut kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.insert(
+            image,
+            Kept {
+                format,
+                stamp,
+                kexts,
+            },
+        );
+    }
+    read
+}
+
+/// What a read of an image found of the guest's kexts, and its file as the read found it.
+struct Kept {
+    format: ImageFormat,
+    stamp: Stamp,
+    kexts: GuestKexts,
+}
+
+/// What reads of images found, by the image's path ([`image_guest_kexts`]). A read's answer is
+/// kept only where its file was last written more than [`SETTLED`] before the read began, and
+/// given again only while the file has the stamp it had then ([`Stamp`]): a write after the read
+/// gives the file a later time of last write. Any other stamp drops the answer. A new image
+/// reims-ctl makes ([`renew`]) drops its path's answer whatever its stamp.
+static KEPT: Mutex<BTreeMap<PathBuf, Kept>> = Mutex::new(BTreeMap::new());
+
+/// How long before a read of an image its file must have been last written for the read's answer
+/// to be kept ([`KEPT`]). FAT keeps a file's time of last write to two seconds, coarser than the
+/// other file systems a host may keep a VM on, and a kernel may take that time from a clock some
+/// milliseconds behind: a second more covers it, so a write after the read cannot leave the file
+/// the time it had.
+const SETTLED: Duration = Duration::from_secs(3);
+
+/// An image's file as a read of it found it: its length, when it was last written, and on macOS
+/// and Linux when its inode last changed ([`crate::os::changed`]), which a program that sets the
+/// file's time of last write back, as `cp -p` and `rsync -t` do, moves to the present.
+#[derive(Clone, Copy, PartialEq)]
+struct Stamp {
+    len: u64,
+    modified: SystemTime,
+    changed: Option<SystemTime>,
+}
+
+impl Stamp {
+    fn of(path: &Path) -> Option<Stamp> {
+        let m = std::fs::metadata(path).ok()?;
+        Some(Stamp {
+            len: m.len(),
+            modified: m.modified().ok()?,
+            changed: crate::os::changed(&m),
+        })
+    }
+
+    /// Whether the file was last written more than [`SETTLED`] before `now`.
+    fn settled(&self, now: SystemTime) -> bool {
+        let since = now.duration_since(self.modified);
+        since.is_ok_and(|d| d > SETTLED)
+    }
 }
 
 /// How the image at `image` holds the guest's kexts `set` gives; None where the image cannot be
@@ -364,6 +447,11 @@ pub fn renew(
         .filter(|(e, dir)| e.starts_with(dir) && *e != dir.join("opencore.qcow2"))
         .map(|(e, _)| e);
     std::fs::rename(&new, &image).with_context(|| format!("replace {}", image.display()))?;
+    // The new image is read at the next ask, whatever its stamp: a file system may keep it with
+    // the old one's length and time of last write, as one keeping times to two seconds may.
+    KEPT.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&image);
     *vm = Vm::load(&vm.dir)?;
     if let Some(q) = vm.config.q35.as_mut() {
         q.opencore = "opencore.qcow2".into();
@@ -467,6 +555,11 @@ impl Disk {
     }
 
     pub(crate) fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        #[cfg(test)]
+        {
+            let (reads, bytes) = tests::READS.get();
+            tests::READS.set((reads + 1, bytes + buf.len() as u64));
+        }
         let size = match self {
             Disk::Raw { size, .. } => *size,
             Disk::Qcow2(q) => q.size,
@@ -781,6 +874,12 @@ fn be64(b: &[u8], o: usize) -> u64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The reads of images this thread made ([`Disk::read`]), and the bytes they read.
+        pub(crate) static READS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
 
     /// A directory entry of `name`, an 8.3 name, with no long name before it.
     fn short(name: &[u8; 11], attr: u8, cluster: u32, size: u32) -> [u8; 32] {
@@ -1409,7 +1508,7 @@ pub(crate) mod tests {
     }
 
     /// A Kernel > Add entry loading `bundle`.
-    fn enabled(bundle: &str) -> String {
+    pub(crate) fn enabled(bundle: &str) -> String {
         format!(
             "<dict><key>BundlePath</key><string>{bundle}</string><key>Enabled</key><true/></dict>"
         )
@@ -1418,7 +1517,12 @@ pub(crate) mod tests {
     /// An image as reims-util makes it with the set the tests carry: config.plist loading A.kext
     /// then B.kext, and each bundle's files under EFI/OC/Kexts, A's executable `a`; then `more`.
     fn image_with_set(a: &[u8], more: &[(&str, &[u8])]) -> Vec<u8> {
-        let config = plist(&(enabled("A.kext") + &enabled("B.kext")));
+        image_loading(&(enabled("A.kext") + &enabled("B.kext")), a, more)
+    }
+
+    /// [`image_with_set`]'s files, its config.plist's Kernel > Add holding `kexts`.
+    pub(crate) fn image_loading(kexts: &str, a: &[u8], more: &[(&str, &[u8])]) -> Vec<u8> {
+        let config = plist(kexts);
         let mut files: Vec<(&str, &[u8])> = vec![
             ("EFI/OC/config.plist", config.as_bytes()),
             (
@@ -1436,7 +1540,7 @@ pub(crate) mod tests {
     }
 
     /// A VM on reims-vgpu in `dir` whose OpenCore image is `image`, in `format`.
-    fn on_reims_vgpu(dir: &Path, image: &[u8], format: ImageFormat) -> Vm {
+    pub(crate) fn on_reims_vgpu(dir: &Path, image: &[u8], format: ImageFormat) -> Vm {
         let (file, format) = match format {
             ImageFormat::Raw => ("opencore.img", "raw"),
             ImageFormat::Qcow2 => ("opencore.qcow2", "qcow2"),
@@ -1463,7 +1567,7 @@ pub(crate) mod tests {
     }
 
     /// The executable of A.kext the tests carry.
-    fn carried_a() -> &'static [u8] {
+    pub(crate) fn carried_a() -> &'static [u8] {
         crate::prebuilt::set().unwrap()[0]
             .executable_bytes()
             .unwrap()

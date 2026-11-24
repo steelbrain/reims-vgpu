@@ -107,6 +107,15 @@ pub fn gid(m: &std::fs::Metadata) -> Option<u32> {
     Some(m.gid())
 }
 
+/// When the inode of the file `m` describes last changed (its ctime): any write to the file, or
+/// change of its times, sets it to the present, and no program can set it otherwise.
+pub fn changed(m: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+    let secs = u64::try_from(m.ctime()).ok()?;
+    let nanos = u32::try_from(m.ctime_nsec()).ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
 /// Makes `d`, a directory for QMP sockets outside the VMs' own, the user's alone (0700) where it
 /// is new, and refuses one that is not a directory, another user owns, or others may write into:
 /// whoever could write there could put a socket of theirs in QMP's place and drive the VM. Some
