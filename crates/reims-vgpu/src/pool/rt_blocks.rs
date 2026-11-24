@@ -207,7 +207,9 @@ mod tests {
         assert_eq!(block.class, MemoryClass::SharedWriteCombined);
         assert!(block.len >= MIB, "{block:?}");
         assert_ne!(block.gpu_address, 0, "{block:?}");
-        let contents = block.contents.expect("a write-combined block's host mapping");
+        let contents = block
+            .contents
+            .expect("a write-combined block's host mapping");
         // SAFETY: the mapping spans the block, which the test holds while it writes and reads.
         let bytes = unsafe { std::slice::from_raw_parts_mut(contents.as_ptr(), MIB as usize) };
         bytes.fill(0xA5);

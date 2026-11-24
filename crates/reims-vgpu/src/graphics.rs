@@ -160,9 +160,8 @@ use crate::graphics::slow_answers::{
 use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
 use crate::pool::{
-    BlockSource, Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger,
-    PoolRemoveFn, PrivateBlocks, PrivateGive, PrivateTakeAnswer, PrivateTakeError, TAKE_MAX,
-    WriteCombined,
+    BlockSource, Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger, PoolRemoveFn,
+    PrivateBlocks, PrivateGive, PrivateTakeAnswer, PrivateTakeError, TAKE_MAX, WriteCombined,
 };
 use crate::trail;
 use crate::window::WindowLink;

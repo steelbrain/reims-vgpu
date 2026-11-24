@@ -115,9 +115,9 @@ pub(crate) use private_blocks::{
 };
 pub(crate) use rt_blocks::RtBlocks;
 pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};
-pub(crate) use write_combined::WriteCombined;
 #[cfg(test)]
 use takes::{TAKE_ALIGN, TakeAnswer, Taken};
+pub(crate) use write_combined::WriteCombined;
 
 use crate::Error;
 use crate::trail;
