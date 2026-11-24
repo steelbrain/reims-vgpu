@@ -332,8 +332,9 @@ impl Attachment {
     /// rt's texture, level, slice, depth plane, actions and resolve of it, which `what` names;
     /// `Err` names a level, slice or resolve plane past 32 bits, or an action Metal has none of. A
     /// depth plane past 32 bits is `u32::MAX`: Metal ignores the plane of a texture not 3D, and
-    /// one past a 3D texture's depth rt refuses as it refuses any plane past it.
-    fn rt(&self, what: &str) -> Result<RtAttachment, String> {
+    /// one past a 3D texture's depth rt refuses as it refuses any plane past it. `what` is
+    /// written only into an `Err`.
+    fn rt(&self, what: &dyn std::fmt::Display) -> Result<RtAttachment, String> {
         let word =
             |name: &str, raw: u64| u32::try_from(raw).map_err(|_| format!("{what}'s {name} {raw}"));
         let load = match self.load_action {
@@ -447,7 +448,7 @@ impl PassFields {
             .zip(&pass.colors)
             .zip(&pass.clear_colors);
         for (index, ((out, a), c)) in colors.enumerate() {
-            let a = a.rt(&format!("colour attachment {index}"))?;
+            let a = a.rt(&format_args!("colour attachment {index}"))?;
             *out = rt::RenderPassColorAttachmentDescriptor {
                 texture: a.texture,
                 level: a.level,
@@ -463,7 +464,7 @@ impl PassFields {
             };
         }
         let what = "the depth attachment";
-        let a = pass.depth.rt(what)?;
+        let a = pass.depth.rt(&what)?;
         out.depth_attachment = rt::RenderPassDepthAttachmentDescriptor {
             texture: a.texture,
             level: a.level,
@@ -483,7 +484,7 @@ impl PassFields {
             },
         };
         let what = "the stencil attachment";
-        let a = pass.stencil.rt(what)?;
+        let a = pass.stencil.rt(&what)?;
         out.stencil_attachment = rt::RenderPassStencilAttachmentDescriptor {
             texture: a.texture,
             level: a.level,
