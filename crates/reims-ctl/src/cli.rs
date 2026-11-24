@@ -561,6 +561,10 @@ pub struct SetArgs {
     /// Borderless windows that fill their screens, one for each display
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub borderless: Option<bool>,
+    /// Whether a click into the VM's windows captures the mouse and the keyboard (on by
+    /// default); false: the windows never capture them
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub capture: Option<bool>,
     /// auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
     #[arg(long)]
     pub gpu: Option<String>,
@@ -1146,6 +1150,12 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
                 format!("{n}, in {n} windows opening at {w}x{h}, whose sizes the guest follows"),
             ),
         }
+        if !c.display.capture {
+            add(
+                "capture",
+                "off: the windows never capture the mouse or the keyboard".into(),
+            );
+        }
     }
     if graphics.library() && c.profile.gpu_choice(host) {
         add(
@@ -1358,6 +1368,9 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(b) = a.borderless {
         c.display.borderless = b;
+    }
+    if let Some(b) = a.capture {
+        c.display.capture = b;
     }
     if let Some(g) = &a.gpu {
         c.gpu = resolve_gpu(g)?;
@@ -2318,6 +2331,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count(), 1);
+    }
+
+    /// `set --capture false` turns a VM's capture input off, and its summary says so;
+    /// `--capture`, alone or `true`, turns it on again, and the summary says nothing of it.
+    #[test]
+    fn set_turns_capture_input_off_and_on() {
+        let env = Env::new("set-capture");
+        let dir = env.root.join("vms/t");
+        register("t", &dir, &config(""));
+        let capture = || Vm::load(&dir).unwrap().config.display.capture;
+        let line = || {
+            describe(&Vm::load(&dir).unwrap(), Host::current())
+                .into_iter()
+                .find(|(k, _)| k == "capture")
+                .map(|(_, v)| v)
+        };
+        let host = Host::current();
+        assert_eq!(capture(), vm::DEFAULT_CAPTURE);
+        set(
+            set_args(&["reims-ctl", "set", "t", "--capture", "false"]),
+            host,
+        )
+        .unwrap();
+        assert!(!capture());
+        assert_eq!(
+            line().as_deref(),
+            Some("off: the windows never capture the mouse or the keyboard")
+        );
+        set(set_args(&["reims-ctl", "set", "t", "--capture"]), host).unwrap();
+        assert!(capture());
+        assert_eq!(line(), None);
+        set(
+            set_args(&["reims-ctl", "set", "t", "--capture=false"]),
+            host,
+        )
+        .unwrap();
+        assert!(!capture());
+        set(
+            set_args(&["reims-ctl", "set", "t", "--capture", "true"]),
+            host,
+        )
+        .unwrap();
+        assert!(capture());
     }
 
     /// A VM's summary and its printed command say how many windows it opens: one, as before

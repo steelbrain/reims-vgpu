@@ -76,7 +76,7 @@
 //!   the library's at the resolution's size ([`crate::vm::Display::window_size`], the device's
 //!   `resolution`, every window's; 1920x1080 by default) and follows its window's size at the
 //!   rate of the host screen the window is on; borderless reaches every window as
-//!   `REIMS_VGPU_WINDOW_BORDERLESS`.
+//!   `REIMS_VGPU_WINDOW_BORDERLESS`, and capture turned off as `REIMS_VGPU_WINDOW_CAPTURE=0`.
 //! - QEMU's `vmware-svga` (`graphics = "vmware-svga"`). The library then draws nothing, so the
 //!   window's and the GPU's variables are left out, and QEMU's own window, GTK's (`-display
 //!   gtk`), shows the display. Where QEMU's environment names no Wayland compositor or X server,
@@ -221,6 +221,9 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
     }
     if library && c.display.borderless {
         env.push(("REIMS_VGPU_WINDOW_BORDERLESS".into(), "1".into()));
+    }
+    if library && !c.display.capture {
+        env.push(("REIMS_VGPU_WINDOW_CAPTURE".into(), "0".into()));
     }
     if library && c.profile.gpu_choice(ctx.host) {
         if let Some((vendor, device)) = c.gpu.selected()? {
@@ -1980,6 +1983,33 @@ mod tests {
         vm.config.graphics = Some(Graphics::VmwareSvga);
         let a = invocation(&vm, &ctx(linux())).unwrap().args;
         assert!(!a.iter().any(|x| x.contains("max-ram-below-4g")), "{a:?}");
+    }
+
+    /// A VM whose capture setting is off gives the library's windows
+    /// `REIMS_VGPU_WINDOW_CAPTURE=0`, x86-64 and arm64 alike; with capture on, the default, the
+    /// variable is left out, and so it is on VMware SVGA, whose window is QEMU's.
+    #[test]
+    fn capture_off_reaches_the_library_s_windows() {
+        let capture = |vm: &Vm, c: &Ctx| {
+            invocation(vm, c)
+                .unwrap()
+                .env
+                .into_iter()
+                .find(|(k, _)| k == "REIMS_VGPU_WINDOW_CAPTURE")
+                .map(|(_, v)| v)
+        };
+        let mut vm = q35_vm();
+        assert!(vm.config.display.capture);
+        assert_eq!(capture(&vm, &ctx(linux())), None);
+        vm.config.display.capture = false;
+        assert_eq!(capture(&vm, &ctx(linux())).as_deref(), Some("0"));
+        assert_eq!(capture(&vm, &ctx(mac())).as_deref(), Some("0"));
+        vm.config.graphics = Some(Graphics::VmwareSvga);
+        assert_eq!(capture(&vm, &ctx(linux())), None);
+        let mut vm = arm64_vm();
+        assert_eq!(capture(&vm, &arm64_ctx(mac())), None);
+        vm.config.display.capture = false;
+        assert_eq!(capture(&vm, &arm64_ctx(mac())).as_deref(), Some("0"));
     }
 
     /// A VM of several displays gives reims-vgpu's device their count, and nothing else of the

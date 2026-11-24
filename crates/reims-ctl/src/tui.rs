@@ -1846,13 +1846,16 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
-        // An arm64 VM's form has these two alone: its displays are reims-ctl set's.
+        // An arm64 VM's form has these two and capture input alone: its displays are reims-ctl
+        // set's.
         if c.profile == Profile::VmappleArm64 {
+            fields.push(capture_field(c.display.capture));
             let form = Form::new(&format!("Edit {}", c.name), "save", fields);
             self.overlay = Some(Overlay::Form(FormKind::Edit(c.name.clone()), form));
             return;
         }
-        // The displays', the resolution's, borderless's and the GPU's fields are reims-vgpu's.
+        // The displays', the resolution's, borderless's, capture input's and the GPU's fields are
+        // reims-vgpu's.
         fields.push(graphics_field(c.graphics()));
         fields.extend([
             displays_field(c.display.count).show_if("graphics", LIBRARY),
@@ -1870,6 +1873,7 @@ impl App {
                 "Windows without borders that fill their screens, one for each display.",
             )
             .show_if("graphics", LIBRARY),
+            capture_field(c.display.capture).show_if("graphics", LIBRARY),
         ]);
         if c.profile.gpu_choice(self.host) {
             fields.push(self.gpu_field(&c.gpu).show_if("graphics", LIBRARY));
@@ -2613,6 +2617,20 @@ fn gpu_from_choice(id: &str, list: &[GpuInfo]) -> crate::vm::Gpu {
     }
 }
 
+/// The edit form's capture input field: whether a click into the VM's windows captures the
+/// mouse and the keyboard ([`crate::vm::Display::capture`]).
+fn capture_field(on: bool) -> Field {
+    Field::toggle(
+        "capture",
+        "Capture input",
+        on,
+        "On: a click into the VM's window captures the mouse and the keyboard, until the keys \
+         its title names let them go. Off: the window never captures them: the mouse works over \
+         the guest's screen and leaves the window freely, keys go to the guest while its window \
+         is in front, and the host keeps its own shortcuts, such as Alt+Tab and \u{2318}Tab.",
+    )
+}
+
 const RESOLUTION_HELP: &str = "The size each window opens at, WIDTHxHEIGHT in the desktop's \
      points, shrunk to fit the screen; the guest takes the window's size in pixels, and follows \
      it as you resize it. It starts a HiDPI desktop by itself on a display whose window is at \
@@ -2733,8 +2751,9 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     let c = &mut vm.config;
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
     c.memory_mib = parse_size_mib(&f.text("memory")).context("memory")?;
-    // An arm64 VM's form has these two alone (open_edit).
+    // An arm64 VM's form has these two and capture input alone (open_edit).
     if c.profile == Profile::VmappleArm64 {
+        c.display.capture = f.toggle("capture");
         return c.check();
     }
     if f.is_shown("graphics") {
@@ -2746,7 +2765,7 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
         q.disk_controller = DiskController::parse(&f.choice("disk_controller"))?;
     }
     // Hidden on VMware SVGA, which has one display, the displays, the resolution, the windows'
-    // first size, and borderless stay as they were.
+    // first size, borderless and capture input stay as they were.
     if f.is_shown("displays") {
         c.display.count = f.choice("displays").parse().context("displays: a number")?;
     }
@@ -2756,6 +2775,9 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     }
     if f.is_shown("borderless") {
         c.display.borderless = f.toggle("borderless");
+    }
+    if f.is_shown("capture") {
+        c.display.capture = f.toggle("capture");
     }
     if f.is_shown("gpu") {
         let id = f.choice("gpu");
@@ -2896,15 +2918,16 @@ of its own. A VM runs reims-vgpu's own GPU device unless its settings choose ano
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)
   K           kill it: power it off at once
-  e           edit its settings: CPUs, memory, displays, resolution, borderless, GPU,
-              audio, network, logs, extra QEMU arguments (they apply at its next start), its
-              disk controller (SATA, NVMe or virtio), its installer image, its boot selection
-              (OpenCore's picker, which makes it a new OpenCore image) and
+  e           edit its settings: CPUs, memory, displays, resolution, borderless, capture
+              input, GPU, audio, network, logs, extra QEMU arguments (they apply at its next
+              start), its disk controller (SATA, NVMe or virtio), its installer image, its boot
+              selection (OpenCore's picker, which makes it a new OpenCore image) and
               graphics: reims-vgpu, its own GPU device, on one to four displays, each in a
               window whose size the guest follows, with the macOS drivers reims-ctl puts in
               its OpenCore image (made again on a change); or QEMU's VMware SVGA, one display
               with no GPU acceleration, in QEMU's own window. Displays, resolution,
-              borderless and GPU are reims-vgpu's
+              borderless, capture input and GPU are reims-vgpu's. Capture input off, a click
+              into the VM's window never captures the mouse and the keyboard
   p           give it this host's USB devices: Space gives the selected one to
               the guest or takes it back, at once while the VM runs; a device you gave it
               joins the guest when it is plugged in. More in reims-ctl usb --help
@@ -4067,6 +4090,62 @@ mod tests {
             vm.config.display.resolution, "1280x720",
             "a hidden field changes nothing"
         );
+    }
+
+    /// A VM's edit form shows capture input on reims-vgpu as the VM's settings have it, and
+    /// saves it as toggled; on VMware SVGA it hides it, and the setting stays as it was. An
+    /// arm64 VM's form has it beside its CPUs and memory.
+    #[test]
+    fn the_edit_form_turns_capture_input_off_and_on() {
+        let mut row = vm_row("t");
+        row.vm.as_mut().unwrap().config.graphics = None;
+        let mut arm = vm_row("a");
+        let c = &mut arm.vm.as_mut().unwrap().config;
+        c.profile = Profile::VmappleArm64;
+        c.q35 = None;
+        c.vmapple = Some(crate::vm::Vmapple {
+            aux: "aux.img".into(),
+            ecid: 0x9e35_f01e_dc0c_5536,
+        });
+        let mut app = test_app(vec![row, arm]);
+        let focus = |app: &mut App, key: &str| {
+            for _ in 0..form(app).fields.len() {
+                if form(app).focused_key() == key {
+                    return;
+                }
+                press(app, [KeyCode::Down]);
+            }
+            panic!("no field {key}");
+        };
+        app.open_edit();
+        assert!(form(&app).is_shown("capture"));
+        assert_eq!(form(&app).toggle("capture"), crate::vm::DEFAULT_CAPTURE);
+        focus(&mut app, "capture");
+        press(&mut app, [KeyCode::Char('n')]);
+        let mut vm = app.rows[0].vm.as_ref().unwrap().clone();
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert!(!vm.config.display.capture);
+        press(&mut app, [KeyCode::Char(' ')]);
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert!(vm.config.display.capture);
+        press(&mut app, [KeyCode::Char('n')]);
+        focus(&mut app, "graphics");
+        press(&mut app, [KeyCode::Right]);
+        assert_eq!(form(&app).choice("graphics"), "vmware-svga");
+        assert!(!form(&app).is_shown("capture"));
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert!(vm.config.display.capture, "a hidden field changes nothing");
+        // An arm64 VM's form: its CPUs, its memory and capture input.
+        app.overlay = None;
+        app.table.select(Some(1));
+        app.open_edit();
+        let keys: Vec<_> = form(&app).fields.iter().map(|f| f.key).collect();
+        assert_eq!(keys, ["cpus", "memory", "capture"]);
+        focus(&mut app, "capture");
+        press(&mut app, [KeyCode::Char('n')]);
+        let mut vm = app.rows[1].vm.as_ref().unwrap().clone();
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert!(!vm.config.display.capture);
     }
 
     /// A VM's edit form shows reims-vgpu's displays, 1 to 4, and saves the one chosen; on

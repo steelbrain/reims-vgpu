@@ -253,7 +253,16 @@ pub struct Display {
     pub resolution: String,
     /// Borderless windows that fill their screens: every display's.
     pub borderless: bool,
+    /// Whether a click into a window captures the mouse and the keyboard, until the keys its
+    /// title names or the window losing the keyboard let them go; off, the windows never
+    /// capture them (`REIMS_VGPU_WINDOW_CAPTURE=0`, [`crate::qemu`]). Saved only where it is not
+    /// [`DEFAULT_CAPTURE`], so a VM that never chose follows the default.
+    #[serde(skip_serializing_if = "Display::is_default_capture")]
+    pub capture: bool,
 }
+
+/// Whether a VM's windows capture the mouse and the keyboard where its settings do not say.
+pub const DEFAULT_CAPTURE: bool = true;
 
 /// The most displays reims-vgpu's device takes (the device's `RGFX_DISPLAYS_MAX`, QEMU's
 /// `displays` property's top).
@@ -278,6 +287,7 @@ impl Default for Display {
             count: 1,
             resolution: "1920x1080".into(),
             borderless: false,
+            capture: DEFAULT_CAPTURE,
         }
     }
 }
@@ -285,6 +295,10 @@ impl Default for Display {
 impl Display {
     fn is_one(count: &u32) -> bool {
         *count == 1
+    }
+
+    fn is_default_capture(capture: &bool) -> bool {
+        *capture == DEFAULT_CAPTURE
     }
 
     /// The `displays` reims-vgpu's device is given: none for one, the device's own, which a
@@ -1564,6 +1578,24 @@ pub(crate) mod tests {
         c.display.count = 2;
         c.graphics = Some(Graphics::VmwareSvga);
         assert!(c.check().is_ok());
+    }
+
+    /// Capture input is saved only where it is not [`DEFAULT_CAPTURE`], so a VM whose settings
+    /// never chose follows the default, and the other value is saved and read back.
+    #[test]
+    fn capture_is_saved_only_off_the_default() {
+        let mut c = x86_64_config();
+        assert_eq!(c.display.capture, DEFAULT_CAPTURE);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(!text.contains("capture"), "{text}");
+        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        c.display.capture = !DEFAULT_CAPTURE;
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            text.contains(&format!("capture = {}", !DEFAULT_CAPTURE)),
+            "{text}"
+        );
+        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
     }
 
     /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`

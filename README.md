@@ -145,9 +145,9 @@ encode, so the guest encodes video in software there.
 
 `reims-ctl` with no command opens its interactive interface: create a VM, start it (each of its
 displays opens in a window), stop it (the guest shuts down, or is powered off after a timeout),
-edit its CPUs, memory, displays (up to four), resolution, borderless windows, GPU, audio and
-logs, change its installer, print the exact QEMU command it runs, and zip its logs with the
-host's details into Downloads for a bug report.
+edit its CPUs, memory, displays (up to four), resolution, borderless windows, input capture,
+GPU, audio and logs, change its installer, print the exact QEMU command it runs, and zip its
+logs with the host's details into Downloads for a bug report.
 
 ```sh
 reims-ctl list                  # the VMs and whether they run
@@ -176,6 +176,15 @@ it.
 The title says when input is captured and how to release it. Losing focus releases capture too,
 and gives the host back its system keys and its pointer. Losing focus, releasing capture or closing the window sends a key-up for every key
 still down, so nothing sticks. Closing a window powers the VM off.
+
+If you'd rather the window never capture anything, turn off **Capture input** in the VM's
+settings (`e` in `reims-ctl`, or `reims-ctl set <vm> --capture false`; it applies at the VM's
+next start). The title then ends "— input capture off". Clicks and keys still reach the guest
+while its window is in front, but nothing is grabbed or held: the pointer moves out of the window
+freely, and the host keeps its own shortcuts, such as Alt+Tab or ⌘Tab. On a Mac, other ⌘
+shortcuts go to the guest, ⌘Q among them, so quit the VM from the menu or by closing its window.
+A game that steers by the mouse's motion gets the plain pointer, which stops at the edge of the
+guest's picture.
 
 Fn/Globe does not reach the guest (QEMU's USB keyboard cannot carry it), and there is no HDR output.
 [`crates/reims-vgpu-window/features.md`](crates/reims-vgpu-window/features.md) lists everything the
