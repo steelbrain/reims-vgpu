@@ -2689,8 +2689,8 @@ second to fourth devices went on it (ports 4.1 to 4.3). A `usb-host`
 `DEVICE_DELETED`.
 
 **Measured** 2026-11-24 on the same host under KVM, booting a reflink clone
-of a macOS 27.2.1 (26B131) guest with reims-ctl at `e5f868243`, given an
-iPhone (05ac:12a8, high speed), with QEMU (at `534a8ced3`) run in a rootless
+of a macOS 27.2.1 (26B131) guest with this change's reims-ctl, given an
+iPhone (05ac:12a8, high speed), with the QEMU above run in a rootless
 distrobox (Fedora 45), as that host runs it, and `usb_host_*` traced:
 - The guest lists the controller's 14 ports, `AppleUSB20XHCIPort` at
   `port` 8 to 14 and `AppleUSB30XHCIPort` at 1 to 7, and keeps the keyboard
@@ -2712,10 +2712,30 @@ distrobox (Fedora 45), as that host runs it, and `usb_host_*` traced:
   it): each time QEMU's `info usbhost` did not list the new number, though
   its file was there and the user could open it, so QEMU did not open it
   again, and the guest did not get it back when it was given again.
-  `info usbhost` drops a device once it is gone, but never lists a new one.
-  Why the arrivals never reach libusb there is **unknown**. In a container
-  like that one, a USB device given to a VM must be plugged in before the VM
-  starts, and keep its device number while the VM runs.
+  `info usbhost` never listed a new device, and once one had gone it
+  listed none at all, an enclosure on another bus that nobody touched
+  among them. Why the arrivals never reach libusb there is **unknown**. In a
+  container like that one, a USB device given to a VM must be plugged in
+  before the VM starts, and keep its device number while the VM runs.
+- With usbmuxd stopped and masked for the boot (`systemctl mask
+  --runtime`), so that nothing on the host held the iPhone, the guest sent
+  the vendor requests 0xc045, 0x4040 and 0xc045, then 0xc052 with wIndex 3;
+  4 ms later the iPhone disconnected and came back as a new device, which
+  QEMU in the container did not see.
+- With the same QEMU run on the host itself, its libraries installed there,
+  and usbmuxd still stopped, the guest set the iPhone's configuration 5;
+  QEMU detached `cdc_ncm` from interfaces 2 and 4, claimed all six, and bulk
+  transfers ran on endpoints 4 and 5, with the iPhone at 0x01a00000 in the
+  guest's USB tree. When the host's usbmuxd started again, it took the
+  iPhone from the VM. As the iPhone re-enumerated after that (device numbers
+  2 to 6, across a reset of the host's controller), QEMU on the host opened
+  each new device (`usb_host_open_success`).
+- What keeps usbmuxd off one iPhone for good, read from its udev rule
+  (`39-usbmuxd.rules`, which unconfigures the device, makes it usbmuxd's and
+  starts usbmuxd): a rule in a file that sorts after it, matching that
+  iPhone's `serial`, that sets `ENV{SYSTEMD_WANTS}=""` and
+  `ENV{USBMUX_SUPPORTED}=""`. A usbmuxd already running for another Apple
+  device still takes it. Not yet booted with.
 
 macOS hosts give no VM USB devices: reims-ctl lists the host's devices from
 Linux's sysfs alone, and the Mac's QEMU is built without libusb.
