@@ -192,7 +192,9 @@
 //! percentile, against 66 to 69 and 115 us for a buffer committed whole (measured, lane splitend's
 //! walk sb-base1, m3-max-35830). Of the readers of these times in macOS 27's frameworks
 //! (QuartzCore's `CA::OGL::MetalContext` completed handlers, SkyLight's hitch telemetry and debug
-//! HUD, RenderBox's frame statistics), none paces frames from them (read from their code).
+//! HUD, RenderBox's frame statistics), none paces frames from them (read from their code). The
+//! handler the merge runs reads the last part's own GPU end ([`last_part_end`]), for the presents'
+//! late-show lines (`graphics/present.rs`).
 //!
 //! **Its parts' completions.** Each part before the last is marked to join the next one's
 //! completion as it is committed (`CommandBuffer::set_completion_joins_next`), so the platform may
@@ -282,6 +284,7 @@
 //! the commit, in the chunks' order) is done once. A `cbpar` trace event gives each buffer's
 //! chunks and their walks, and a `cbdeal` event each chunk's.
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -784,7 +787,8 @@ impl Parts {
     /// times that start at the first part's start and span every part's GPU time summed, ending no
     /// later than the last part's end (the module docs, "Its GPU times"). The platform runs
     /// a queue's completion handlers in its commit order, so every part before the last has been
-    /// seen.
+    /// seen. While `handler` runs, this thread reads the last part's own GPU end
+    /// ([`last_part_end`]).
     pub(crate) fn merged(self: Arc<Self>, handler: CompletedHandler) -> CompletedHandler {
         Box::new(move |mut info: CompletedInfo| {
             let seen = std::mem::take(&mut *self.seen.lock());
@@ -792,14 +796,32 @@ impl Parts {
                 info.error = Some(error);
                 info.status = CommandBufferStatus::ERROR;
             }
+            let last_end = info.gpu_times_ns.map_or(0, |(_, end)| end);
             if let (Some(first), Some((start, end))) = (seen.gpu_start, info.gpu_times_ns) {
                 let busy = seen.gpu_busy.saturating_add(end.saturating_sub(start));
                 let first = first.min(end);
                 info.gpu_times_ns = Some((first, first.saturating_add(busy).min(end)));
             }
+            let before = LAST_PART_END.replace(Some(last_end));
             handler(info);
+            LAST_PART_END.set(before);
         })
     }
+}
+
+thread_local! {
+    /// The last part's own GPU end of the buffer whose handler [`Parts::merged`] runs on this
+    /// thread now ([`last_part_end`]).
+    static LAST_PART_END: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Where this thread runs the handler of a buffer the walk could cut into parts, inside
+/// [`Parts::merged`]: its last part's own GPU end, as the platform gave it, 0 where it gave none.
+/// The buffer's merged times end its parts' GPU time summed after its first part's start, so the
+/// two differ by the GPU's gaps between its parts (the module docs, "Its GPU times"). `None` on
+/// any other thread, or outside the handler.
+pub(crate) fn last_part_end() -> Option<u64> {
+    LAST_PART_END.get()
 }
 
 #[cfg(test)]
@@ -1002,6 +1024,33 @@ mod tests {
             ok(30, 50),
             "a part with no GPU times adds none"
         );
+    }
+
+    /// The handler the merge runs reads its buffer's last part's own GPU end, 0 where the last
+    /// part has no GPU times, and no thread reads one outside it
+    #[test]
+    fn the_merged_handler_reads_the_last_part_s_own_end() {
+        let read = |last: CompletedInfo| {
+            let p = Arc::new(Parts::default());
+            let first = CompletedInfo {
+                status: CommandBufferStatus::COMPLETED,
+                error: None,
+                gpu_times_ns: Some((10, 20)),
+            };
+            p.part_handler((), None)(first);
+            let got = Arc::new(Mutex::new(None));
+            let into = Arc::clone(&got);
+            Arc::clone(&p).merged(Box::new(move |_| *into.lock() = Some(last_part_end())))(last);
+            got.lock().take().unwrap()
+        };
+        let last = |gpu_times_ns| CompletedInfo {
+            status: CommandBufferStatus::COMPLETED,
+            error: None,
+            gpu_times_ns,
+        };
+        assert_eq!(read(last(Some((45, 60)))), Some(60));
+        assert_eq!(read(last(None)), Some(0));
+        assert_eq!(last_part_end(), None);
     }
 
     /// Where a walk cuts its part ("How many parts"): with nothing out, at [`SPLIT_AFTER`];

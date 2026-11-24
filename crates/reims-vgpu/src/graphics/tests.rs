@@ -9290,9 +9290,9 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
 
 /// A present shown late logs, at debug on the presents' timing target, its writer that finished
 /// last after its take: the buffer's queue, context and seqno, when the host first saw it, when
-/// its walk began and its commit returned, when the GPU ran it, as the platform says, when the
-/// platform's completed handler of it entered, and when its completion was posted. A writer that
-/// finished before that one, of the same queue, is not named
+/// its walk began and its commit returned, when the GPU ran it, as the platform says, whole, when
+/// the platform's completed handler of it entered after its GPU end, and when its completion was
+/// posted. A writer that finished before that one, of the same queue, is not named
 #[test]
 fn a_present_shown_late_logs_its_last_writer_to_finish() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -9335,20 +9335,26 @@ fn a_present_shown_late_logs_its_last_writer_to_finish() {
         named.as_str(),
         ", walked from ",
         " to its commit to rt ",
-        ", on the GPU from ",
+        ", on the GPU whole from ",
         " the present's take (2000 us), rt's completed handler of it entered ",
         " its GPU end, its completion posted ",
         "; on the host's monotonic clock, in us: the present's take ",
         ", the buffer's first sight ",
         ", its walk ",
         ", its commit ",
-        ", its GPU start ",
+        ", its CB_COMPLETE's GPU start ",
+        ", its last part's GPU end ",
         ", its handler's entry ",
         ", its completion ",
     ] {
         assert!(lines[0].contains(part), "{part:?} in {:?}", lines[0]);
     }
-    for unknown in ["first sight unknown", "walk unknown", "entry unknown"] {
+    for unknown in [
+        "first sight unknown",
+        "walk unknown",
+        "last part's GPU end unknown",
+        "entry unknown",
+    ] {
         assert!(!lines[0].contains(unknown), "{unknown:?} in {:?}", lines[0]);
     }
 }

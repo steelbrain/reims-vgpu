@@ -2708,10 +2708,23 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .watch(cb_obj_id, seqno, context, events.waits)
         });
         Box::new(move |info: CompletedInfo| {
-            // rt's host clock as the handler enters, on the clock the record's GPU times are
-            // placed on, for the presents' late-show lines where they are on: the post carries it
-            // to the completion's sink (`present::with_handler_entry`).
-            let handler_entry = if present::late_lines() { rt_now() } else { 0 };
+            // For the presents' late-show lines, where they are on: rt's host clock as the handler
+            // enters, and, where the walk could cut the buffer into parts, its last part's own GPU
+            // end, each on the clock the record's GPU times are placed on, which the post carries
+            // to the completion's sink (`present::with_handled`).
+            let handled = if present::late_lines() {
+                let cut = match super::split::last_part_end() {
+                    None => present::Cut::Whole,
+                    Some(0) => present::Cut::Parts(None),
+                    Some(end) => present::Cut::Parts(Some(runtime::gpu_times((end, end)).1)),
+                };
+                present::Handled {
+                    entered: rt_now(),
+                    cut,
+                }
+            } else {
+                present::Handled::NONE
+            };
             // The trip's stamps (`super::super::trip`): rt's handler's entry, and this one's, and
             // the buffer's GPU end for its queue's next take.
             let entered = trip::stamp();
@@ -2816,7 +2829,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     trip::set_down(from, gpu_end);
                 }
                 match &sink {
-                    Some(sink) => present::with_handler_entry(handler_entry, || {
+                    Some(sink) => present::with_handled(handled, || {
                         sink(record, Box::new(move || drop(drain)));
                     }),
                     None => drop(drain),

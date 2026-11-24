@@ -101,9 +101,14 @@
 //! seqno, with when the host first saw that buffer (its doorbell's answer or its take from its
 //! ring, whichever came first), when its walk's job began on its lane and when its commit to rt
 //! returned ([`PresentQueue::buffer_committed`]), when the GPU ran it, as its `CB_COMPLETE` says
-//! ([`Ran`]), when rt's completed handler of it entered ([`with_handler_entry`]), and when its
+//! ([`Ran`]), when rt's completed handler of it entered ([`with_handled`]), and when its
 //! completion was posted, against the present's take and on the host's monotonic clock, or says
-//! that none of its writers finished after its take; and where the present waited for its
+//! that none of its writers finished after its take. A buffer its walk could cut into parts
+//! (`decode/split.rs`) has a `CB_COMPLETE` that starts at its first part's start and ends its
+//! parts' GPU time summed after that, before its last part's own end by the GPU's gaps between
+//! its parts: its line gives its last part's own end and those gaps, and times its handler's
+//! entry from that end ([`Cut`]); where its handler did not say whether it was cut, the line says
+//! what its `CB_COMPLETE`'s times are. And where the present waited for its
 //! surface's fill, when that fill was seen done and the size of the surface's block. What it needs
 //! is kept only where the line is on ([`Late`]). The guest's `CB_SUBMITTED` is no stamp of the
 //! commit: it is posted only where the guest asks, at the buffer's take or its doorbell's answer.
@@ -648,6 +653,7 @@ impl<P: Platform> State<P> {
                     entered: ran
                         .and_then(|(_, ran)| ran.entered)
                         .map(|ago| before(now, ago)),
+                    cut: ran.map_or(Cut::Unknown, |(_, r)| r.cut.map(|ago| before(now, ago))),
                 });
             }
         }
@@ -736,48 +742,99 @@ pub(crate) fn late_lines() -> bool {
 }
 
 /// A command buffer's GPU run as its completion is posted, for the late-show lines: how long
-/// before the post the GPU started it and ended it ([`PresentQueue::finished_ran`]).
+/// before the post the GPU started it and ended it, as its `CB_COMPLETE` says
+/// ([`PresentQueue::finished_ran`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ran {
     pub(crate) started: Duration,
     pub(crate) ended: Duration,
     /// How long before the post rt's completed handler of the buffer entered, where that was
-    /// read ([`handler_entry`]).
+    /// read ([`handled`]).
     pub(crate) entered: Option<Duration>,
+    /// Whether its walk could cut it into parts, with how long before the post its last part
+    /// ended, where that was read.
+    pub(crate) cut: Cut<Duration>,
 }
 
 impl Ran {
     /// The run from `start` to `end`, GPU times in nanoseconds of a clock that reads `now` at the
-    /// post, its completed handler entered at `entered` on that clock (0: not read): `None` where
-    /// the start is 0 (unknown) or the run ends before it starts.
-    pub(crate) fn before(now: u64, start: u64, end: u64, entered: u64) -> Option<Ran> {
+    /// post, with what its completed handler read, `handled`, on that clock: `None` where the
+    /// start is 0 (unknown) or the run ends before it starts.
+    pub(crate) fn before(now: u64, start: u64, end: u64, handled: Handled) -> Option<Ran> {
+        let ago = |t: u64| Duration::from_nanos(now.saturating_sub(t));
         (start != 0 && end >= start).then(|| Ran {
-            started: Duration::from_nanos(now.saturating_sub(start)),
-            ended: Duration::from_nanos(now.saturating_sub(end)),
-            entered: (entered != 0).then(|| Duration::from_nanos(now.saturating_sub(entered))),
+            started: ago(start),
+            ended: ago(end),
+            entered: (handled.entered != 0).then(|| ago(handled.entered)),
+            cut: handled.cut.map(ago),
         })
     }
 }
 
-thread_local! {
-    /// rt's host clock as the completed handler whose completion this thread posts entered, in
-    /// the clock `Ran::before` reads ([`with_handler_entry`]); 0 where none was read.
-    static ENTERED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+/// Whether a command buffer's walk could cut it into parts (`decode/split.rs`), as its completed
+/// handler read it ([`Handled`]), with `T` a time of its last part's own GPU end, for the
+/// late-show lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cut<T> {
+    /// Not read: its `CB_COMPLETE`'s times are its own, or, where its walk cut it, its first
+    /// part's start and its parts' GPU time summed after that.
+    Unknown,
+    /// Not cut: its `CB_COMPLETE`'s times are its own.
+    Whole,
+    /// One its walk could cut: its `CB_COMPLETE` starts at its first part's start and ends its
+    /// parts' GPU time summed after that, and its last part's own GPU end is this, where the
+    /// platform gave it.
+    Parts(Option<T>),
 }
 
-/// Runs `post`, a completion's post through its sink, with `entered`, when its completed handler
-/// entered, readable on this thread by the sink ([`handler_entry`]), for the late-show lines.
-pub(crate) fn with_handler_entry<R>(entered: u64, post: impl FnOnce() -> R) -> R {
-    let before = ENTERED.replace(entered);
+impl<T> Cut<T> {
+    /// The same, its last part's end mapped by `f`.
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Cut<U> {
+        match self {
+            Cut::Unknown => Cut::Unknown,
+            Cut::Whole => Cut::Whole,
+            Cut::Parts(end) => Cut::Parts(end.map(f)),
+        }
+    }
+}
+
+/// What a command buffer's completed handler read for the late-show lines, which its post carries
+/// to the completion's sink ([`with_handled`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Handled {
+    /// rt's host clock as the handler entered, on the clock `Ran::before` reads; 0 where it was
+    /// not read.
+    pub(crate) entered: u64,
+    /// Whether the walk could cut the buffer, with its last part's own GPU end on that clock.
+    pub(crate) cut: Cut<u64>,
+}
+
+impl Handled {
+    /// Nothing read.
+    pub(crate) const NONE: Handled = Handled {
+        entered: 0,
+        cut: Cut::Unknown,
+    };
+}
+
+thread_local! {
+    /// What the completed handler whose completion this thread posts read ([`with_handled`]).
+    static HANDLED: std::cell::Cell<Handled> = const { std::cell::Cell::new(Handled::NONE) };
+}
+
+/// Runs `post`, a completion's post through its sink, with `handled`, what its completed handler
+/// read, readable on this thread by the sink ([`handled`]), for the late-show lines.
+pub(crate) fn with_handled<R>(handled: Handled, post: impl FnOnce() -> R) -> R {
+    let before = HANDLED.replace(handled);
     let posted = post();
-    ENTERED.set(before);
+    HANDLED.set(before);
     posted
 }
 
-/// When the completed handler whose completion this thread posts now entered
-/// ([`with_handler_entry`]); 0 where it was not read.
-pub(crate) fn handler_entry() -> u64 {
-    ENTERED.get()
+/// What the completed handler whose completion this thread posts now read ([`with_handled`]);
+/// [`Handled::NONE`] outside such a post.
+pub(crate) fn handled() -> Handled {
+    HANDLED.get()
 }
 
 /// `ago` before `now`, or the clock's start where that is earlier.
@@ -822,6 +879,8 @@ struct LastWriter {
     ran: Option<(MonoTime, MonoTime)>,
     /// When rt's completed handler of it entered, where that was read.
     entered: Option<MonoTime>,
+    /// Whether its walk could cut it, with when its last part ended, where that was read.
+    cut: Cut<MonoTime>,
 }
 
 /// How far `t` lies from `from`: `"<n> us after"` or `"<n> us before"`.
@@ -935,12 +994,39 @@ impl Late {
         let ran = last.ran.map_or_else(
             || "its GPU run not known".to_owned(),
             |(start, end)| {
-                format!(
-                    "on the GPU from {} to {} the present's take ({} us)",
-                    apart(start, taken.at),
-                    apart(end, taken.at),
-                    end.saturating_duration_since(start).as_micros()
-                )
+                let span = |to: MonoTime| to.saturating_duration_since(start).as_micros();
+                match last.cut {
+                    Cut::Whole => format!(
+                        "on the GPU whole from {} to {} the present's take ({} us)",
+                        apart(start, taken.at),
+                        apart(end, taken.at),
+                        span(end)
+                    ),
+                    Cut::Parts(Some(last_end)) => format!(
+                        "on the GPU from its first part's start {} to its last part's end {} the \
+                         present's take ({} us: its parts' GPU time summed {} us, the gaps \
+                         between its parts {} us)",
+                        apart(start, taken.at),
+                        apart(last_end, taken.at),
+                        span(last_end),
+                        span(end),
+                        last_end.saturating_duration_since(end).as_micros()
+                    ),
+                    Cut::Parts(None) => format!(
+                        "on the GPU from its first part's start {} the present's take, its parts' \
+                         GPU time summed {} us, its last part's end not known",
+                        apart(start, taken.at),
+                        span(end)
+                    ),
+                    Cut::Unknown => format!(
+                        "on the GPU from {} to {} the present's take ({} us) as its CB_COMPLETE \
+                         says, which, where its walk cut it into parts, ends its parts' GPU time \
+                         summed after its first part's start",
+                        apart(start, taken.at),
+                        apart(end, taken.at),
+                        span(end)
+                    ),
+                }
             },
         );
         let walked = last.walk.map_or_else(
@@ -953,12 +1039,26 @@ impl Late {
                 )
             },
         );
-        let entered = match (last.entered, last.ran) {
-            (Some(entered), Some((_, end))) => format!(
+        // The last part's own GPU end: a whole buffer's end, or a cut one's last part's.
+        let last_end = match (last.cut, last.ran) {
+            (Cut::Whole, Some((_, end))) => Some(end),
+            (Cut::Parts(end), Some(_)) => end,
+            _ => None,
+        };
+        let entered = match (last.entered, last.cut, last_end) {
+            (Some(entered), Cut::Whole, Some(end)) => format!(
                 ", rt's completed handler of it entered {} its GPU end",
                 apart(entered, end)
             ),
-            _ => String::new(),
+            (Some(entered), _, Some(end)) => format!(
+                ", rt's completed handler of it entered {} its last part's GPU end",
+                apart(entered, end)
+            ),
+            (Some(entered), _, None) => format!(
+                ", rt's completed handler of it entered {} the present's take",
+                apart(entered, taken.at)
+            ),
+            (None, _, _) => String::new(),
         };
         let at = |t: Option<MonoTime>| t.map_or_else(|| "unknown".into(), |t| us(t).to_string());
         log::debug!(
@@ -967,8 +1067,8 @@ impl Late {
              the command buffer seqno {seqno} of queue {queue:#x} of context {}, {seen}, \
              {walked}, {ran}{entered}, its completion posted {} us after the present's \
              take{filled}; on the host's monotonic clock, in us: the present's take {}, the \
-             buffer's first sight {}, its walk {}, its commit {}, its GPU start {} and end {}, \
-             its handler's entry {}, its completion {}",
+             buffer's first sight {}, its walk {}, its commit {}, its CB_COMPLETE's GPU start {} \
+             and end {}, its last part's GPU end {}, its handler's entry {}, its completion {}",
             waited.as_micros(),
             queue >> RGFX_CONTEXT_OBJ_ID_SHIFT,
             last.done.saturating_duration_since(taken.at).as_micros(),
@@ -978,6 +1078,7 @@ impl Late {
             at(last.walk.map(|(_, committed)| committed)),
             at(last.ran.map(|(start, _)| start)),
             at(last.ran.map(|(_, end)| end)),
+            at(last_end),
             at(last.entered),
             us(last.done)
         );
@@ -1262,8 +1363,8 @@ mod tests {
     use reims_vgpu_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxSurfaceWriter};
 
     use super::{
-        Answer, Drawing, FillSeen, LATE_LEAST, LastWriter, Late, LetGo, PresentAnswers, Ran,
-        TIMING, Taken, handler_entry, with_handler_entry,
+        Answer, Cut, Drawing, FillSeen, Handled, LATE_LEAST, LastWriter, Late, LetGo,
+        PresentAnswers, Ran, TIMING, Taken, handled, with_handled,
     };
 
     /// An answer that records the refresh it was given at.
@@ -1736,6 +1837,7 @@ mod tests {
             done: us(201_000),
             ran: Some((us(200_200), us(200_900))),
             entered: Some(us(200_950)),
+            cut: Cut::Whole,
         };
         let fill = FillSeen {
             done: Some(us(200_100)),
@@ -1761,14 +1863,15 @@ mod tests {
                      all)): its last writer to finish, the command buffer seqno 7 of queue \
                      {queue:#x} of context 2, first seen by the host 500 us before the present's \
                      take, walked from 300 us before to its commit to rt 100 us before the \
-                     present's take, on the GPU from 200 us after to 900 us after the present's \
-                     take (700 us), rt's completed handler of it entered 50 us after its GPU end, \
+                     present's take, on the GPU whole from 200 us after to 900 us after the \
+                     present's take (700 us), rt's completed handler of it entered 50 us after \
+                     its GPU end, \
                      its completion posted 1000 us after the present's take; it waited for its \
                      surface's fill, of a block of 65536 bytes, seen done 100 us after its take; \
                      on the host's monotonic clock, in us: the present's take 200000, the \
-                     buffer's first sight 199500, its walk 199700, its commit 199900, its GPU \
-                     start 200200 and end 200900, its handler's entry 200950, its completion \
-                     201000"
+                     buffer's first sight 199500, its walk 199700, its commit 199900, its \
+                     CB_COMPLETE's GPU start 200200 and end 200900, its last part's GPU end \
+                     200900, its handler's entry 200950, its completion 201000"
                 ),
                 "a present shown late, 500 us after its take (0.5 times the median 1000 us of the \
                  last 10; a refresh of its display came between its take and its show (2 in \
@@ -1780,41 +1883,128 @@ mod tests {
         );
     }
 
-    /// A buffer's GPU run, and its completed handler's entry where that was read, count back from
-    /// the clock's reading at its completion's post, and the run is not known where its start is 0
-    /// or it ends before it starts
+    /// A buffer's GPU run, its completed handler's entry where that was read, and its last part's
+    /// own end where its walk could cut it, count back from the clock's reading at its
+    /// completion's post, and the run is not known where its start is 0 or it ends before it starts
     #[test]
     fn a_gpu_run_is_known_only_where_it_starts_and_ends_in_order() {
         let us = Duration::from_micros;
+        let handled = |entered, cut| Handled { entered, cut };
         assert_eq!(
-            Ran::before(10_000_000, 4_000_000, 7_000_000, 9_000_000),
+            Ran::before(
+                10_000_000,
+                4_000_000,
+                7_000_000,
+                handled(9_000_000, Cut::Parts(Some(8_000_000))),
+            ),
             Some(Ran {
                 started: us(6000),
                 ended: us(3000),
                 entered: Some(us(1000)),
+                cut: Cut::Parts(Some(us(2000))),
             })
         );
         assert_eq!(
-            Ran::before(10_000_000, 4_000_000, 7_000_000, 0),
+            Ran::before(10_000_000, 4_000_000, 7_000_000, Handled::NONE),
             Some(Ran {
                 started: us(6000),
                 ended: us(3000),
                 entered: None,
+                cut: Cut::Unknown,
             })
         );
-        assert_eq!(Ran::before(10_000_000, 0, 7_000_000, 9_000_000), None);
-        assert_eq!(
-            Ran::before(10_000_000, 7_000_000, 4_000_000, 9_000_000),
-            None
-        );
+        let whole = handled(9_000_000, Cut::Whole);
+        assert_eq!(Ran::before(10_000_000, 0, 7_000_000, whole), None);
+        assert_eq!(Ran::before(10_000_000, 7_000_000, 4_000_000, whole), None);
     }
 
-    /// A completion's post carries its completed handler's entry to its sink on whichever thread
-    /// runs it, and none outside it
+    /// A completion's post carries what its completed handler read to its sink on whichever
+    /// thread runs it, and nothing outside it
     #[test]
-    fn a_handler_entry_is_read_only_inside_its_post() {
-        assert_eq!(handler_entry(), 0);
-        assert_eq!(with_handler_entry(42, handler_entry), 42);
-        assert_eq!(handler_entry(), 0);
+    fn what_a_handler_read_is_read_only_inside_its_post() {
+        assert_eq!(handled(), Handled::NONE);
+        let read = Handled {
+            entered: 42,
+            cut: Cut::Parts(Some(41)),
+        };
+        assert_eq!(with_handled(read, handled), read);
+        assert_eq!(handled(), Handled::NONE);
+    }
+
+    /// A late present's writer its walk could cut has its line give its first part's start, its
+    /// last part's own end, its parts' GPU time summed and the gaps between its parts, and time
+    /// its completed handler's entry from its last part's end; where its last part's end is not
+    /// known, the entry is timed from the present's take; where its handler did not say whether
+    /// it was cut, the line says what its `CB_COMPLETE`'s times are
+    #[test]
+    fn a_cut_writer_s_line_times_its_handler_from_its_last_part_s_end() {
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let us = |n: u64| MonoTime::from_nanos(n * 1000);
+        let taken = |at: u64| Taken {
+            at: us(at),
+            refreshes: 0,
+            since_refresh: None,
+        };
+        let mut late = Late::default();
+        let writer = |cut, entered| LastWriter {
+            writer: RgfxSurfaceWriter {
+                queue_obj_id: (2 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 5,
+                seqno: 7,
+            },
+            seen: None,
+            walk: None,
+            done: us(203_000),
+            ran: Some((us(200_200), us(200_900))),
+            entered,
+            cut,
+        };
+        let cases = [
+            (Cut::Parts(Some(us(202_400))), Some(us(202_500))),
+            (Cut::Parts(None), Some(us(202_500))),
+            (Cut::Unknown, None),
+        ];
+        let (take, show) = (taken(200_000), us(203_500));
+        for (cut, entered) in cases {
+            late.shown(&take, Some(writer(cut, entered)), None, 1, show);
+        }
+        let lines: Vec<String> = (logs.take().into_iter())
+            .filter(|(level, target, _)| *level == log::Level::Debug && target == TIMING)
+            .map(|(_, _, line)| line)
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let has = |line: &str, parts: &[&str]| {
+            for part in parts {
+                assert!(line.contains(part), "{part:?} in {line:?}");
+            }
+        };
+        has(
+            &lines[0],
+            &[
+                "on the GPU from its first part's start 200 us after to its last part's end 2400 \
+                 us after the present's take (2200 us: its parts' GPU time summed 700 us, the \
+                 gaps between its parts 1500 us), rt's completed handler of it entered 100 us \
+                 after its last part's GPU end, its completion posted",
+                "its CB_COMPLETE's GPU start 200200 and end 200900, its last part's GPU end \
+                 202400, its handler's entry 202500,",
+            ],
+        );
+        has(
+            &lines[1],
+            &[
+                "on the GPU from its first part's start 200 us after the present's take, its \
+                 parts' GPU time summed 700 us, its last part's end not known, rt's completed \
+                 handler of it entered 2500 us after the present's take, its completion",
+                "its last part's GPU end unknown, its handler's entry 202500,",
+            ],
+        );
+        has(
+            &lines[2],
+            &[
+                "on the GPU from 200 us after to 900 us after the present's take (700 us) as its \
+                 CB_COMPLETE says, which, where its walk cut it into parts, ends its parts' GPU \
+                 time summed after its first part's start, its completion posted",
+                "its last part's GPU end unknown, its handler's entry unknown,",
+            ],
+        );
     }
 }

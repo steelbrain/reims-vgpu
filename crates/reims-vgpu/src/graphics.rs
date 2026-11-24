@@ -2898,7 +2898,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let completion: CompletionSink = Arc::new(move |record: RgfxCbComplete, then: Then| {
             let seqno = record.header.seqno;
             let gpu = (record.gpu_start_ns, record.gpu_end_ns);
-            let entered = present::handler_entry();
+            let handled = present::handled();
             let (presents, poster) = (Arc::clone(&presents), queue_poster.clone());
             let then: Then = Box::new(move || {
                 // A present waiting for the buffer is shown once its completion is posted; the
@@ -2906,7 +2906,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // on.
                 if let Some(queue) = queue {
                     let ran = present::late_lines()
-                        .then(|| ran_before_now(gpu, entered))
+                        .then(|| ran_before_now(gpu, handled))
                         .flatten();
                     presents.finished_ran(queue, seqno, &poster, ran);
                 }
@@ -4764,11 +4764,11 @@ fn post_from_handler(poster: &CompletionPoster, record: &[u8]) {
 }
 
 /// The GPU run of a `CB_COMPLETE` whose GPU start and end are `times`, as long before now as they
-/// lie, with its completed handler's entry `entered` on that clock (0: not read), for the
-/// presents' late-show lines ([`present::Ran`]): now is read on the clock the record's times
-/// count ([`rt_now`]). `None` where the record holds no run.
-fn ran_before_now(times: (u64, u64), entered: u64) -> Option<present::Ran> {
-    present::Ran::before(rt_now(), times.0, times.1, entered)
+/// lie, with what its completed handler read, `handled`, on that clock, for the presents'
+/// late-show lines ([`present::Ran`]): now is read on the clock the record's times count
+/// ([`rt_now`]). `None` where the record holds no run.
+fn ran_before_now(times: (u64, u64), handled: present::Handled) -> Option<present::Ran> {
+    present::Ran::before(rt_now(), times.0, times.1, handled)
 }
 
 /// rt's host clock now, as `runtime::gpu_times` places it, the clock the decoder places a
