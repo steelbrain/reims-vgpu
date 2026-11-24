@@ -95,16 +95,20 @@
 //!
 //! A present shown late is logged once more, at its show, on the same target: one whose show came
 //! [`LATE_TIMES`] times the median of the last [`LATE_WINDOW`] presents' or more after its take
-//! (while fewer than [`LATE_LEAST`] were shown, one a writer held past its take). The line names
-//! its writer that finished last after its take, its queue, context and seqno, with when the host
-//! first saw that buffer (its doorbell's answer or its take from its ring, whichever came first)
-//! and when its completion was posted, against the present's take and on the host's monotonic
-//! clock, or says that none of its writers finished after its take. What it needs is kept only
-//! where the line is on ([`Late`]).
+//! (while fewer than [`LATE_LEAST`] were shown, one a writer held past its take), or after a
+//! refresh of its display that came after its take, which its answer then waits a refresh more
+//! for. The line names its writer that finished last after its take, its queue, context and
+//! seqno, with when the host first saw that buffer (its doorbell's answer or its take from its
+//! ring, whichever came first), when the GPU ran it, as its `CB_COMPLETE` says ([`Ran`]), and when
+//! its completion was posted, against the present's take and on the host's monotonic clock, or
+//! says that none of its writers finished after its take; and where the present waited for its
+//! surface's fill, when that fill was seen done and the size of the surface's block. What it needs
+//! is kept only where the line is on ([`Late`]).
 //!
 //! [`RgfxSurfaceWriters`]: reims_vgpu_graphics::wire::RgfxSurfaceWriters
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -168,6 +172,8 @@ struct Waiting<P: Platform> {
     /// Its writer that finished last after its take, for its late-show line, where that line is
     /// on.
     last: Option<LastWriter>,
+    /// When its fill was first seen done, for its late-show line, where that line is on.
+    fill_done: Option<MonoTime>,
 }
 
 impl<P: Platform> PresentQueue<P> {
@@ -263,6 +269,7 @@ impl<P: Platform> PresentQueue<P> {
                 fill,
                 taken,
                 last: None,
+                fill_done: None,
             },
         );
     }
@@ -290,12 +297,17 @@ impl<P: Platform> PresentQueue<P> {
                 fill: None,
                 taken,
                 last: None,
+                fill_done: None,
             },
         );
     }
 
-    /// `waiting` joins display `display`'s presents, which are shown as they are ready.
-    fn push(&self, display: usize, waiting: Waiting<P>) {
+    /// `waiting` joins display `display`'s presents, which are shown as they are ready. Where the
+    /// late-show lines are on, a fill it waits for that is done already is seen done now.
+    fn push(&self, display: usize, mut waiting: Waiting<P>) {
+        if late_lines() && waiting.fill.as_ref().is_some_and(FillWait::done) {
+            waiting.fill_done = self.now();
+        }
         let mut state = self.state.lock();
         let Some(presents) = state.waiting.get_mut(display) else {
             return;
@@ -307,9 +319,18 @@ impl<P: Platform> PresentQueue<P> {
     }
 
     /// A fill of a device cache finished: the presents at the front waiting for nothing more are
-    /// shown.
+    /// shown. Where the late-show lines are on, each present whose fill is done is seen so now,
+    /// where it was not before.
     pub(crate) fn filled(&self) {
         let mut state = self.state.lock();
+        if let Some(now) = late_lines().then(|| self.now()).flatten() {
+            for present in state.waiting.iter_mut().flatten() {
+                if present.fill_done.is_none() && present.fill.as_ref().is_some_and(FillWait::done)
+                {
+                    present.fill_done = Some(now);
+                }
+            }
+        }
         if state.waits() {
             let gone = self.show_ready(&mut state);
             drop(state);
@@ -326,6 +347,18 @@ impl<P: Platform> PresentQueue<P> {
     /// takes once the queue has ended ([`Self::reset`]), so no buffer of the queue counts after
     /// the reset.
     pub(crate) fn finished(&self, queue: u64, seqno: u64, poster: &CompletionPoster) {
+        self.finished_ran(queue, seqno, poster, None);
+    }
+
+    /// [`Self::finished`], the buffer's GPU run `ran` as its `CB_COMPLETE` says, where it says one,
+    /// for the late-show lines.
+    pub(crate) fn finished_ran(
+        &self,
+        queue: u64,
+        seqno: u64,
+        poster: &CompletionPoster,
+        ran: Option<Ran>,
+    ) {
         let mut state = self.state.lock();
         if poster.stale() {
             return;
@@ -335,7 +368,8 @@ impl<P: Platform> PresentQueue<P> {
         *done = (*done).max(seqno);
         let done = *done;
         if late_lines() {
-            state.late_finished(queue, |s| before < s && s <= done, self.now());
+            let ran = ran.map(|ran| (seqno, ran));
+            state.late_finished(queue, |s| before < s && s <= done, self.now(), ran);
             if let Some(seen) = state.late.seen.get_mut(&queue) {
                 seen.retain(|&(s, _)| s > done);
                 if seen.is_empty() {
@@ -374,7 +408,7 @@ impl<P: Platform> PresentQueue<P> {
         }
         state.apart.entry(queue).or_default().insert(seqno);
         if late_lines() {
-            state.late_finished(queue, |s| s == seqno, self.now());
+            state.late_finished(queue, |s| s == seqno, self.now(), None);
         }
         if state.waits() {
             let gone = self.show_ready(&mut state);
@@ -512,7 +546,15 @@ impl<P: Platform> PresentQueue<P> {
                     break;
                 };
                 if let Some(now) = now {
-                    late.shown(&shown.taken, shown.last, now);
+                    let past = presented.answers.refreshes().saturating_sub(shown.taken.refreshes);
+                    let fill = shown.fill.as_ref().map(|_| FillSeen {
+                        done: shown.fill_done,
+                        block: match &shown.shows {
+                            Shows::Surface(_, Some(texture)) => texture.block_len(),
+                            _ => None,
+                        },
+                    });
+                    late.shown(&shown.taken, shown.last, fill, past, now);
                 }
                 gone.extend(presented.show(shown.shows, shown.color, shown.answer, shown.taken));
             }
@@ -534,8 +576,15 @@ impl<P: Platform> State<P> {
     }
 
     /// The command buffers of queue `queue` whose seqnos `newly` names finished at `now`: each
-    /// is the last writer to finish so far of each present waiting for it (its late-show line).
-    fn late_finished(&mut self, queue: u64, newly: impl Fn(u64) -> bool, now: Option<MonoTime>) {
+    /// is the last writer to finish so far of each present waiting for it (its late-show line),
+    /// the one at seqno `ran.0` with its GPU run `ran.1`, where it is given.
+    fn late_finished(
+        &mut self,
+        queue: u64,
+        newly: impl Fn(u64) -> bool,
+        now: Option<MonoTime>,
+        ran: Option<(u64, Ran)>,
+    ) {
         let Some(now) = now else {
             return;
         };
@@ -545,10 +594,12 @@ impl<P: Platform> State<P> {
                 .find(|w| w.queue_obj_id == queue && newly(w.seqno))
                 .copied();
             if let Some(writer) = finished {
+                let ran = ran.filter(|&(seqno, _)| seqno == writer.seqno);
                 present.last = Some(LastWriter {
                     writer,
                     seen: late.seen(queue, writer.seqno),
                     done: now,
+                    ran: ran.map(|(_, ran)| (before(now, ran.started), before(now, ran.ended))),
                 });
             }
         }
@@ -632,8 +683,41 @@ const LATE_TIMES: u32 = 2;
 const LATE_SEEN: usize = 256;
 
 /// Whether the late-show lines are on ([`TIMING`] at debug): what they need is kept only then.
-fn late_lines() -> bool {
+pub(crate) fn late_lines() -> bool {
     log::log_enabled!(target: TIMING, log::Level::Debug)
+}
+
+/// A command buffer's GPU run as its completion is posted, for the late-show lines: how long
+/// before the post the GPU started it and ended it ([`PresentQueue::finished_ran`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Ran {
+    pub(crate) started: Duration,
+    pub(crate) ended: Duration,
+}
+
+impl Ran {
+    /// The run from `start` to `end`, GPU times in nanoseconds of a clock that reads `now` at the
+    /// post: `None` where the start is 0 (unknown) or the run ends before it starts.
+    pub(crate) fn before(now: u64, start: u64, end: u64) -> Option<Ran> {
+        (start != 0 && end >= start).then(|| Ran {
+            started: Duration::from_nanos(now.saturating_sub(start)),
+            ended: Duration::from_nanos(now.saturating_sub(end)),
+        })
+    }
+}
+
+/// `ago` before `now`, or the clock's start where that is earlier.
+fn before(now: MonoTime, ago: Duration) -> MonoTime {
+    let ago = u64::try_from(ago.as_nanos()).unwrap_or(u64::MAX);
+    MonoTime::from_nanos(now.as_nanos().saturating_sub(ago))
+}
+
+/// A present's wait for its surface's fill, for its late-show line: when the fill was seen done,
+/// where it was, and the size of the surface's block, where it lies in one.
+#[derive(Clone, Copy, Debug)]
+struct FillSeen {
+    done: Option<MonoTime>,
+    block: Option<u64>,
 }
 
 /// What the late-show lines keep (the module doc), only where they are on.
@@ -655,6 +739,17 @@ struct LastWriter {
     seen: Option<MonoTime>,
     /// When its completion was posted.
     done: MonoTime,
+    /// When the GPU started and ended it, as its `CB_COMPLETE` says, where it says ([`Ran`]).
+    ran: Option<(MonoTime, MonoTime)>,
+}
+
+/// How far `t` lies from `from`: "<n> us after" or "<n> us before".
+fn apart(t: MonoTime, from: MonoTime) -> String {
+    if t >= from {
+        format!("{} us after", t.saturating_duration_since(from).as_micros())
+    } else {
+        format!("{} us before", from.saturating_duration_since(t).as_micros())
+    }
 }
 
 impl Late {
@@ -664,10 +759,18 @@ impl Late {
         seen.iter().find(|&&(s, _)| s == seqno).map(|&(_, at)| at)
     }
 
-    /// A present taken at `taken` was shown `now`, `last` its writer that finished last after its
-    /// take, where one did: its wait joins the window, and where it is late (the module doc) its
-    /// line is logged.
-    fn shown(&mut self, taken: &Taken, last: Option<LastWriter>, now: MonoTime) {
+    /// A present taken at `taken` was shown `now`, `past` refreshes of its display after its
+    /// take, `last` its writer that finished last after its take, where one did, and `fill` its
+    /// wait for its surface's fill, where it waited for one: its wait joins the window, and where
+    /// it is late (the module doc) its line is logged.
+    fn shown(
+        &mut self,
+        taken: &Taken,
+        last: Option<LastWriter>,
+        fill: Option<FillSeen>,
+        past: u64,
+        now: MonoTime,
+    ) {
         let waited = now.saturating_duration_since(taken.at);
         let median = (self.waits.len() >= LATE_LEAST).then(|| {
             let mut waits: Vec<Duration> = self.waits.iter().copied().collect();
@@ -679,14 +782,15 @@ impl Late {
             self.waits.pop_front();
         }
         self.waits.push_back(waited);
-        let late = match median {
-            Some(median) => waited > median && waited >= median.saturating_mul(LATE_TIMES),
-            None => last.is_some(),
-        };
+        let late = past > 0
+            || match median {
+                Some(median) => waited > median && waited >= median.saturating_mul(LATE_TIMES),
+                None => last.is_some(),
+            };
         if !late {
             return;
         }
-        let against = match median {
+        let mut against = match median {
             Some(median) => format!(
                 "{:.1} times the median {} us of the last {window}",
                 waited.as_secs_f64() / median.as_secs_f64(),
@@ -694,12 +798,29 @@ impl Late {
             ),
             None => format!("no median yet, {window} presents shown before it"),
         };
+        if past > 0 {
+            let _ = write!(
+                against,
+                "; a refresh of its display came between its take and its show ({past} in all)"
+            );
+        }
+        let filled = fill.map_or_else(String::new, |fill| {
+            let block = fill
+                .block
+                .map_or_else(|| "in no block".to_owned(), |b| format!("of a block of {b} bytes"));
+            let done = fill.done.map_or_else(
+                || "its end not seen".to_owned(),
+                |done| format!("seen done {} its take", apart(done, taken.at)),
+            );
+            format!("; it waited for its surface's fill, {block}, {done}")
+        });
         let us = |t: MonoTime| t.as_nanos() / 1000;
         let Some(last) = last else {
             log::debug!(
                 target: TIMING,
                 "a present shown late, {} us after its take ({against}): none of its writers \
-                 finished after its take; on the host's monotonic clock, in us: its take {}",
+                 finished after its take{filled}; on the host's monotonic clock, in us: its \
+                 take {}",
                 waited.as_micros(),
                 us(taken.at)
             );
@@ -717,12 +838,28 @@ impl Late {
             ),
             None => "first seen by the host at a time not kept".to_owned(),
         };
+        let ran = last.ran.map_or_else(
+            || "its GPU run not known".to_owned(),
+            |(start, end)| {
+                format!(
+                    "on the GPU from {} to {} the present's take ({} us)",
+                    apart(start, taken.at),
+                    apart(end, taken.at),
+                    end.saturating_duration_since(start).as_micros()
+                )
+            },
+        );
+        let (start, end) = last.ran.map_or_else(
+            || ("unknown".to_owned(), "unknown".to_owned()),
+            |(start, end)| (us(start).to_string(), us(end).to_string()),
+        );
         log::debug!(
             target: TIMING,
             "a present shown late, {} us after its take ({against}): its last writer to finish, \
-             the command buffer seqno {seqno} of queue {queue:#x} of context {}, {seen}, its \
-             completion posted {} us after the present's take; on the host's monotonic clock, in \
-             us: the present's take {}, the buffer's first sight {}, its completion {}",
+             the command buffer seqno {seqno} of queue {queue:#x} of context {}, {seen}, {ran}, \
+             its completion posted {} us after the present's take{filled}; on the host's \
+             monotonic clock, in us: the present's take {}, the buffer's first sight {}, its \
+             completion {}, its GPU start {start} and end {end}",
             waited.as_micros(),
             queue >> RGFX_CONTEXT_OBJ_ID_SHIFT,
             last.done.saturating_duration_since(taken.at).as_micros(),
@@ -840,6 +977,11 @@ impl<A> Default for PresentAnswers<A> {
 }
 
 impl<A: Answer> PresentAnswers<A> {
+    /// The device's refreshes so far.
+    pub(crate) fn refreshes(&self) -> u64 {
+        self.state.lock().refreshes
+    }
+
     /// A present is taken now: when, against the device's refreshes, for its timing line.
     pub(crate) fn taken(&self) -> Taken {
         let at = (self.now)();
@@ -1003,7 +1145,12 @@ mod tests {
     use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
     use reims_vgpu_vulkan::core::sync::Mutex;
 
-    use super::{Answer, Drawing, LetGo, PresentAnswers, TIMING};
+    use reims_vgpu_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxSurfaceWriter};
+
+    use super::{
+        Answer, Drawing, FillSeen, LATE_LEAST, LastWriter, Late, LetGo, PresentAnswers, Ran,
+        TIMING, Taken,
+    };
 
     /// An answer that records the refresh it was given at.
     struct Recorded {
@@ -1442,5 +1589,91 @@ mod tests {
             super::super::summary::take_presents(),
             [[us(100), us(0), us(100)], [us(200), us(0), us(200)]]
         );
+    }
+
+    /// A present's late-show line fires where a refresh of its display came between its take and
+    /// its show, though it waited no longer than the median, and gives its last writer's GPU run
+    /// and its wait for its surface's fill; a present shown before its display's next refresh,
+    /// within twice the median, logs none
+    #[test]
+    fn a_present_shown_after_a_refresh_past_its_take_logs_its_writers_gpu_run_and_its_fill() {
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let us = |n: u64| MonoTime::from_nanos(n * 1000);
+        let taken = |at: u64| Taken {
+            at: us(at),
+            refreshes: 0,
+            since_refresh: None,
+        };
+        let mut late = Late::default();
+        // A window of presents each shown 1 ms after its take, before the next refresh.
+        for i in 0..u64::try_from(LATE_LEAST).expect("small") {
+            late.shown(&taken(10_000 * i), None, None, 0, us(10_000 * i + 1000));
+        }
+        late.shown(&taken(100_000), None, None, 0, us(101_000));
+        // Shown 1.5 ms after its take, after a refresh.
+        let queue = (2 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 5;
+        let writer = LastWriter {
+            writer: RgfxSurfaceWriter {
+                queue_obj_id: queue,
+                seqno: 7,
+            },
+            seen: Some(us(199_500)),
+            done: us(201_000),
+            ran: Some((us(200_200), us(200_900))),
+        };
+        let fill = FillSeen {
+            done: Some(us(200_100)),
+            block: Some(65536),
+        };
+        late.shown(&taken(200_000), Some(writer), Some(fill), 1, us(201_500));
+        // Shown 0.5 ms after its take, after two refreshes, its fill's end not seen.
+        let fill = FillSeen {
+            done: None,
+            block: None,
+        };
+        late.shown(&taken(300_000), None, Some(fill), 2, us(300_500));
+        let lines: Vec<String> = (logs.take().into_iter())
+            .filter(|(level, target, _)| *level == log::Level::Debug && target == TIMING)
+            .map(|(_, _, line)| line)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                format!(
+                    "a present shown late, 1500 us after its take (1.5 times the median 1000 us of \
+                     the last 9; a refresh of its display came between its take and its show (1 in \
+                     all)): its last writer to finish, the command buffer seqno 7 of queue \
+                     {queue:#x} of context 2, first seen by the host 500 us before the present's \
+                     take, on the GPU from 200 us after to 900 us after the present's take (700 \
+                     us), its completion posted 1000 us after the present's take; it waited for \
+                     its surface's fill, of a block of 65536 bytes, seen done 100 us after its \
+                     take; on the host's monotonic clock, in us: the present's take 200000, the \
+                     buffer's first sight 199500, its completion 201000, its GPU start 200200 and \
+                     end 200900"
+                ),
+                "a present shown late, 500 us after its take (0.5 times the median 1000 us of the \
+                 last 10; a refresh of its display came between its take and its show (2 in \
+                 all)): none of its writers finished after its take; it waited for its surface's \
+                 fill, in no block, its end not seen; on the host's monotonic clock, in us: its \
+                 take 300000"
+                    .to_owned(),
+            ]
+        );
+    }
+
+    /// A buffer's GPU run counts back from the clock's reading at its completion's post, and is
+    /// not known where its start is 0 or it ends before it starts
+    #[test]
+    fn a_gpu_run_is_known_only_where_it_starts_and_ends_in_order() {
+        let us = Duration::from_micros;
+        assert_eq!(
+            Ran::before(10_000_000, 4_000_000, 7_000_000),
+            Some(Ran {
+                started: us(6000),
+                ended: us(3000),
+            })
+        );
+        assert_eq!(Ran::before(10_000_000, 0, 7_000_000), None);
+        assert_eq!(Ran::before(10_000_000, 7_000_000, 4_000_000), None);
     }
 }

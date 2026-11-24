@@ -9289,9 +9289,9 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
 }
 
 /// A present shown late logs, at debug on the presents' timing target, its writer that finished
-/// last after its take: the buffer's queue, context and seqno, when the host first saw it and when
-/// its completion was posted. A writer that finished before that one, of the same queue, is not
-/// named
+/// last after its take: the buffer's queue, context and seqno, when the host first saw it, when
+/// the GPU ran it, as the platform says, and when its completion was posted. A writer that
+/// finished before that one, of the same queue, is not named
 #[test]
 fn a_present_shown_late_logs_its_last_writer_to_finish() {
     let raised = Arc::new(AtomicU32::new(0));
@@ -9307,6 +9307,9 @@ fn a_present_shown_late_logs_its_last_writer_to_finish() {
     let ids = committed(&platform, 2);
     let world = platform.world();
     let done = |id| world.complete(id, CommandBufferStatus::COMPLETED, None, CompleteOn::Caller);
+    // Buffer 5 ran on the GPU for 2 ms, ending 1 ms ago on the platform's clock.
+    let start = metal2vulkan_runtime::host_time().saturating_sub(3_000_000);
+    assert!(world.set_gpu_times(ids[1], start, start + 2_000_000));
     assert!(done(ids[0]));
     assert!(done(ids[1]));
     let seqno = guest.seqno;
@@ -9327,9 +9330,12 @@ fn a_present_shown_late_logs_its_last_writer_to_finish() {
     );
     for part in [
         named.as_str(),
-        " us after the present's take; on the host's monotonic clock, in us: the present's take ",
+        ", on the GPU from ",
+        " the present's take (2000 us), its completion posted ",
+        "; on the host's monotonic clock, in us: the present's take ",
         ", the buffer's first sight ",
         ", its completion ",
+        ", its GPU start ",
     ] {
         assert!(lines[0].contains(part), "{part:?} in {:?}", lines[0]);
     }

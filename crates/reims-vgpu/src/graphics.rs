@@ -55,6 +55,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use metal2vulkan_runtime::host_time;
 use parking_lot::lock_api::ArcRwLockReadGuard;
 use parking_lot::{RawRwLock, RwLock};
+use reims_vgpu_graphics::clock::runtime;
 use reims_vgpu_graphics::ops::RgfxCommandBuffer;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
@@ -1628,6 +1629,13 @@ pub(crate) struct ShownTexture<P: Platform> {
     hold: Arc<DisplayHold>,
 }
 
+impl<P: Platform> ShownTexture<P> {
+    /// The size of the block it lies in, where it lies in one (the presents' late-show lines).
+    pub(crate) fn block_len(&self) -> Option<u64> {
+        self.hold.span.map(|(_, size)| size)
+    }
+}
+
 /// A texture the display showed before, by its surface's id, with the display's view of it
 /// ([`Presented`]'s `retired`).
 type RetiredTexture<P> = (u32, <P as Platform>::Texture, Arc<ShownView<P>>);
@@ -2889,11 +2897,15 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         // (`CompletionPoster::post_unwaiting`).
         let completion: CompletionSink = Arc::new(move |record: RgfxCbComplete, then: Then| {
             let seqno = record.header.seqno;
+            let gpu = (record.gpu_start_ns, record.gpu_end_ns);
             let (presents, poster) = (Arc::clone(&presents), queue_poster.clone());
             let then: Then = Box::new(move || {
-                // A present waiting for the buffer is shown once its completion is posted.
+                // A present waiting for the buffer is shown once its completion is posted; the
+                // buffer's GPU run goes with it to the presents' late-show lines, where they are
+                // on.
                 if let Some(queue) = queue {
-                    presents.finished(queue, seqno, &poster);
+                    let ran = present::late_lines().then(|| ran_before_now(gpu)).flatten();
+                    presents.finished_ran(queue, seqno, &poster, ran);
                 }
                 then();
             });
@@ -4736,6 +4748,16 @@ fn post_from_handler(poster: &CompletionPoster, record: &[u8]) {
     } else {
         poster.post_unwaiting(record, None);
     }
+}
+
+/// The GPU run of a `CB_COMPLETE` whose GPU start and end are `times`, as long before now as they
+/// lie, for the presents' late-show lines ([`present::Ran`]): now is read on the clock the
+/// record's times count, rt's host clock as `runtime::gpu_times` places it, as the decoder placed
+/// the times (`decode/cmdbuf.rs`). `None` where the record holds no run.
+fn ran_before_now(times: (u64, u64)) -> Option<present::Ran> {
+    let now = host_time();
+    let (now, _) = runtime::gpu_times((now, now));
+    present::Ran::before(now, times.0, times.1)
 }
 
 /// Whether this thread runs a submission handler inside a platform commit
