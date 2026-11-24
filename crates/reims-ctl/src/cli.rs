@@ -119,6 +119,18 @@ pub enum Cmd {
         #[arg(long, value_name = "DEVICE")]
         remove: Vec<String>,
     },
+    /// List this host's disks, and give a VM whole ones or take them back (Linux)
+    #[command(after_help = DISKS_HELP)]
+    Disks {
+        /// The VM whose disks to show or change (without one, this host's disks)
+        name: Option<String>,
+        /// Give the VM this disk (repeatable)
+        #[arg(long, value_name = "DISK")]
+        add: Vec<String>,
+        /// Take this disk back from the VM (repeatable)
+        #[arg(long, value_name = "DISK")]
+        remove: Vec<String>,
+    },
     /// List what's downloaded for new VMs (macOS installers and IPSWs) and the space each
     /// takes, or delete one
     Downloads {
@@ -250,6 +262,30 @@ kvm $USER, then log in again).",
         rule = crate::usb::UDEV_RULE,
     )
 }
+
+/// `disks --help`'s account of disk passthrough.
+const DISKS_HELP: &str = "\
+DISK is a disk's number in the list, its file (/dev/sdb, or its link in /dev/disk/by-id), or a \
+word of its name.
+
+A disk a VM has is the guest's while the VM runs, a SATA disk to macOS in the guest, which reads \
+and writes it as a Mac does a disk inside it. A VM keeps it for its next start: a disk given or \
+taken back while the VM runs is the guest's, or this host's again, from then. An x86-64 VM \
+takes up to three, or four where its own disk is on NVMe or virtio.
+
+A disk is known by its link in /dev/disk/by-id, named from its model and serial number, so the \
+VM has it in any port and after this host restarts. A disk with no link there, as behind some \
+USB enclosures, can't be given. A loop device is known by its file in /dev, which may lead to \
+another one after this host restarts.
+
+A disk this host uses can't be given, since a guest writing it would destroy it: one that is \
+mounted, or has a partition mounted (this host's system disk among them), swap, or part of LVM, \
+LUKS or RAID, and the disk that holds the VM's own image. A start checks again, and asks the \
+kernel whether anything holds the disk.
+
+QEMU opens the disk's file, which only root and the disk group may open, and the disk group \
+may write every disk of this host. Where you can't open a disk, reims-ctl gives the udev rule \
+that makes that disk alone yours, and the commands that add it.";
 
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
@@ -661,6 +697,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             Some(DownloadsCmd::Delete { names, yes }) => delete_downloads(&names, yes)?,
         },
         Cmd::Usb { name, add, remove } => usb(host, name.as_deref(), &add, &remove)?,
+        Cmd::Disks { name, add, remove } => disks(host, name.as_deref(), &add, &remove)?,
         Cmd::Logs {
             name,
             lines,
@@ -1148,6 +1185,19 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             }
         },
     );
+    if !c.host_disks.is_empty() {
+        add(
+            "host disks",
+            c.host_disks
+                .iter()
+                .map(|d| match d.name.as_str() {
+                    "" => d.path.display().to_string(),
+                    n => format!("{n} ({})", d.path.display()),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
     if !c.usb.is_empty() {
         add(
             "usb",
@@ -1511,6 +1561,100 @@ fn usb(host: Host, name: Option<&str>, add: &[String], remove: &[String]) -> Res
         );
     }
     Ok(())
+}
+
+/// `reims-ctl disks`: this host's disks, or a VM's choice of them, changed by `add` and
+/// `remove` first.
+fn disks(host: Host, name: Option<&str>, add: &[String], remove: &[String]) -> Result<()> {
+    use crate::disks;
+    if host.os != crate::host::Os::Linux || host.default_profile() != Some(Profile::Q35X86_64) {
+        bail!("{}", disks::ONLY);
+    }
+    let found = disks::host_disks();
+    let Some(name) = name else {
+        if !add.is_empty() || !remove.is_empty() {
+            bail!("name the VM to give the disks to: reims-ctl disks NAME --add DISK");
+        }
+        let rows = disks::rows(&[], &found);
+        if rows.is_empty() {
+            println!("This host has no disks to list.");
+            return Ok(());
+        }
+        for (i, r) in rows.iter().enumerate() {
+            println!("{}", disk_line(i, None, r, &[]));
+        }
+        println!("Give a VM one with: reims-ctl disks NAME --add NUMBER");
+        return Ok(());
+    };
+    let mut vm = Registry::load()?.open(name)?;
+    if vm.config.q35.is_none() {
+        bail!("{}", disks::ONLY);
+    }
+    let used = disks::HostUse::current();
+    let own = disks::own_devs(&vm, &used);
+    if !add.is_empty() || !remove.is_empty() {
+        // Each named in the list as it was, then turned over in the settings as they are.
+        let rows = disks::rows(&vm.config.host_disks, &found);
+        let mut picks = Vec::new();
+        for (arg, on) in add
+            .iter()
+            .map(|a| (a, true))
+            .chain(remove.iter().map(|a| (a, false)))
+        {
+            let r = &rows[disks::find(&rows, arg)?];
+            match (r.chosen.is_some(), on) {
+                (true, true) => println!("{name}: {} is the VM's already", r.name()),
+                (false, false) => println!("{name}: {} isn't the VM's", r.name()),
+                _ => picks.push(r.clone()),
+            }
+        }
+        if !picks.is_empty() {
+            let (saved, said) = disks::apply(&vm, |cur| {
+                picks
+                    .iter()
+                    .try_fold(cur.to_vec(), |c, r| disks::toggle(&c, r, &own))
+            })?;
+            for s in said {
+                println!("{s}");
+            }
+            vm = saved;
+        }
+    }
+    let rows = disks::rows(&vm.config.host_disks, &found);
+    if rows.is_empty() {
+        println!("This host has no disks to list.");
+        return Ok(());
+    }
+    for (i, r) in rows.iter().enumerate() {
+        println!("{}", disk_line(i, Some(r.chosen.is_some()), r, &own));
+    }
+    for p in disks::problems(&vm) {
+        eprintln!("warning: {p}");
+    }
+    if add.is_empty() && remove.is_empty() {
+        println!(
+            "Give {name} one with: reims-ctl disks {name} --add NUMBER; take one back with --remove NUMBER"
+        );
+    }
+    Ok(())
+}
+
+/// A line of `disks`' list: its number, whether the VM has it, its name and size, its file and
+/// notes. `own` are the devices that hold the VM's images.
+fn disk_line(i: usize, chosen: Option<bool>, r: &crate::disks::Row, own: &[(u32, u32)]) -> String {
+    let mark = match chosen {
+        Some(true) => "[x] ",
+        Some(false) => "[ ] ",
+        None => "",
+    };
+    let mut line = format!("{:>2}. {mark}{}  {}", i + 1, r.name(), r.path().display());
+    let notes = r.notes(own);
+    if !notes.is_empty() {
+        line.push_str("  (");
+        line.push_str(&notes.join(", "));
+        line.push(')');
+    }
+    line
 }
 
 /// A line of `usb`'s list: its number, whether the VM has it, its name, IDs and notes.
