@@ -7463,6 +7463,24 @@ impl<P: Platform> Caches<P> {
         state.by_block.get(&block)?.shapes.plane_of(reference.id())
     }
 
+    /// Whether the shape `reference` names is a drawn plane shape of the block at `block`'s
+    /// cache, its image rt's import of a Direct3D 11 texture ([`exported`],
+    /// `shapes::ShapeTable::insert_drawn_plane`).
+    pub(crate) fn drawn_plane(&self, block: u64, reference: &shapes::ShapeRef) -> bool {
+        let state = self.lock();
+        (state.by_block.get(&block)).is_some_and(|cache| cache.shapes.drawn_plane(reference.id()))
+    }
+
+    /// Adds the drawn plane shape `key` of the block at `block`'s cache on `image`, owing its
+    /// fill, as a surface over Direct3D 11 textures adds its planes on Windows ([`exported`]),
+    /// with no surface: the per-shape form's tests on every host.
+    #[cfg(test)]
+    pub(crate) fn add_drawn_plane(&self, block: u64, key: shapes::ShapeKey, image: P::Texture) {
+        let mut state = self.lock();
+        let cache = state.by_block.get_mut(&block).expect("the block's cache");
+        drop(cache.shapes.insert_drawn_plane(key, image, true, 0));
+    }
+
     /// The block at `block`'s cache's layout at the GPU's pitch, where it lays its surface out so
     /// ([`SurfaceCaches::repitched`]).
     pub(crate) fn repitched(&self, block: u64) -> Option<Arc<Repitched>> {

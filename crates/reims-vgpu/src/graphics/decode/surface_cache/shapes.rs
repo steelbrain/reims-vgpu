@@ -154,7 +154,14 @@
 //! the guest's CPU wrote them, a new IOSurface's zeros. On Windows the planes lie over
 //! Direct3D 11 textures that the pictures are drawn into, the textures cleared to zeros wherever
 //! the picture's draw does not write them once a decode took the planes' fills as met
-//! (`super::exported`).
+//! (`super::exported`). Such a drawn plane is rt's import of its texture, which takes the uses
+//! the texture's bind flags give and lists no view format but the texture's element format, the
+//! image's and the image's sRGB sibling: a texture over it in the image's format or that sibling
+//! is a view of it, and one in any other format takes the storage shape of its extent instead,
+//! as one over a plain shape does ("The shape"), counted by its formats
+//! ([`DRAWN_FORMAT_STORAGE`], docs/video/bugs.md D26), so rt is never asked a view it refuses.
+//! Rule 1 and the fills keep that shape current with the plane, so the guest reads the same
+//! pixels through it, at a copy's cost.
 //!
 //! **References.** Each guest texture over a shape, and each guest view of one, holds a
 //! [`ShapeRef`] in its decoder entry; the count of those is the shape's reference count, so every
@@ -230,6 +237,13 @@ pub(crate) const UNREFERENCED_FOR: std::time::Duration = std::time::Duration::fr
 /// another format of a texture without `PixelFormatView` usage: the texture takes the storage
 /// shape of its extent instead (the module doc, "The shape").
 pub(crate) const FORMAT_STORAGE: &str = "rt-shape-format-storage";
+
+/// The family of the counts' codes of a texture over a drawn plane shape in a format that is
+/// neither its image's nor its sRGB sibling, a view of the plane rt refuses, as its import of a
+/// Direct3D 11 texture lists no other view format: the texture takes the storage shape of its
+/// extent instead (the module doc, "Plane shapes"). Counted by the pair of formats,
+/// `rt-shape-drawn-format-storage-<plane's format>-as-<texture's format>`.
+pub(crate) const DRAWN_FORMAT_STORAGE: &str = "rt-shape-drawn-format-storage";
 
 /// The counts' codes of shapes made over a plane that held a shape of the other kind, plain or
 /// storage, and of rule 1's copies between a plain and a storage shape and their bytes
@@ -545,6 +559,9 @@ pub(crate) struct ShapeCounts {
     pub(crate) format_storage: u64,
     /// Textures over a plain shape that declare `PixelFormatView` usage.
     pub(crate) plain_format_views: u64,
+    /// Textures over a drawn plane shape in a format neither its image's nor its sRGB sibling,
+    /// which took the storage shape of their extent ([`DRAWN_FORMAT_STORAGE`]).
+    pub(crate) drawn_format_storage: u64,
     /// Shapes whose image the platform placed and their first fill filled at their make, and
     /// their bytes (the module doc, "Placed images").
     pub(crate) placed: u64,
@@ -627,6 +644,10 @@ pub(crate) struct Shape<T> {
     /// A plane shape: its image is a plane of the cache's surface, which the bound never drops
     /// (the module doc, "Plane shapes").
     pub(crate) plane: bool,
+    /// A drawn plane shape: its image is the platform's import of a Direct3D 11 texture the
+    /// host's video draws into, viewed in its own format and its sRGB sibling alone (the module
+    /// doc, "Plane shapes"; `ShapeTable::insert_drawn_plane`).
+    drawn: bool,
     /// Its image is the platform's own, which the platform cleared at its make, not placed, and
     /// no device recovery lost what it held since ([`ShapeTable::insert_cleared`]): with the
     /// cache's buffer holding no memory, it holds the zeros a fill would copy (the module doc,
@@ -766,6 +787,7 @@ impl<T> ShapeTable<T> {
             owed,
             video: false,
             plane: false,
+            drawn: false,
             cleared: false,
             used: now,
         });
@@ -803,6 +825,31 @@ impl<T> ShapeTable<T> {
             shape.plane = true;
         }
         made
+    }
+
+    /// Adds the drawn plane shape of `key`, its image `image` a plane of the cache's surface over
+    /// a Direct3D 11 texture, as [`Self::insert_plane`] adds a plane shape: a texture over it
+    /// in a format neither its image's nor its sRGB sibling takes the storage shape of its extent
+    /// (the module doc, "Plane shapes").
+    #[cfg(any(windows, test))]
+    pub(crate) fn insert_drawn_plane(
+        &mut self,
+        key: ShapeKey,
+        image: T,
+        owed: bool,
+        now: u64,
+    ) -> (ShapeRef, Again) {
+        let made = self.insert_plane(key, image, owed, now);
+        if let Some(shape) = self.shapes.last_mut() {
+            shape.drawn = true;
+        }
+        made
+    }
+
+    /// Whether the shape `id` names is a drawn plane shape (`Self::insert_drawn_plane`);
+    /// `false` for any other shape, and where the table holds none of `id`.
+    pub(crate) fn drawn_plane(&self, id: u64) -> bool {
+        (self.shapes.iter()).any(|s| s.drawn && s.id() == id)
     }
 
     /// The shapes' bytes ([`ShapeKey::bytes`]).
@@ -1757,6 +1804,30 @@ mod tests {
         let (_, again) = table.insert(key(11, 4), 11, true, now);
         assert_eq!(again, Again::Aged, "made again after its age");
         drop(held);
+    }
+
+    /// A drawn plane shape is a plane shape, of its plane, and the one shape the table names
+    /// drawn: a plane shape of the platform's surface and any other shape are not (the module
+    /// doc, "Plane shapes")
+    #[test]
+    fn a_drawn_plane_is_a_plane_shape_and_the_one_named_drawn() {
+        let mut table = ShapeTable::<u64>::default();
+        let plain = |key: ShapeKey| ShapeKey {
+            storage: false,
+            ..key
+        };
+        let chroma = ShapeKey {
+            plane: 1,
+            offset: 64 * 4096,
+            ..plain(key(32, 2))
+        };
+        let drawn = table.insert_drawn_plane(chroma, 1, true, 0).0;
+        let plane = table.insert_plane(plain(key(64, 1)), 0, true, 0).0;
+        let other = table.insert(key(16, 4), 2, true, 0).0;
+        assert_eq!(table.plane_of(drawn.id()), Some(1));
+        assert_eq!(table.plane_of(plane.id()), Some(0));
+        let named = [&drawn, &plane, &other].map(|s| table.drawn_plane(s.id()));
+        assert_eq!(named, [true, false, false]);
     }
 
     /// A decode drawn over a new cache's zeros takes as met the fills its plane shapes owe, and

@@ -10,7 +10,11 @@
 //! shape's nor its sRGB sibling, a view of the plain image that rt refuses as Metal refuses one
 //! of a texture with no `PixelFormatView` usage, takes the storage shape of its extent instead,
 //! counted ([`shapes::FORMAT_STORAGE`], logged once); one over a plain shape that declares
-//! `PixelFormatView` is counted too.
+//! `PixelFormatView` is counted too. So does a texture over a drawn plane shape (on Windows, a
+//! video plane over a Direct3D 11 texture, which rt imports viewed in its own format and its
+//! sRGB sibling alone) in any other format, counted by its formats
+//! ([`shapes::DRAWN_FORMAT_STORAGE`], each pair's first logged): rt is never asked a view of a
+//! drawn plane it refuses (`shapes`, "Plane shapes").
 //!
 //! A texture takes a shape where it is a 2D texture of one level, one slice and one sample in a
 //! colour format of texels ([`shapes::texel_bytes`]) lying wholly inside the cache's buffer; any
@@ -43,9 +47,12 @@ use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Texture as _};
 use reims_vgpu_vulkan::core::platform::types::{NsRange, PixelFormatInfo};
 use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::gpu::no_texture::views_without_usage;
 
-use super::surface_cache::shapes::{self, FORMAT_STORAGE, ShapeCounts, ShapeKey, ShapeUse};
+use super::surface_cache::shapes::{
+    self, DRAWN_FORMAT_STORAGE, FORMAT_STORAGE, ShapeCounts, ShapeKey, ShapeUse,
+};
 use super::surface_cache::{self, CacheLayout, STORAGE_PRIVATE, ShapeMaker};
 use super::{GraphicsDecoder, ObjHandle, TEXTURE_USAGE_WRITES, texture_desc};
 
@@ -66,6 +73,24 @@ const PLAIN_USAGE: u64 = 0x1 | 0x4;
 /// ([`FORMAT_STORAGE`]): its line is logged the first time alone, the rest counted
 /// (docs/conventions.md).
 static FORMAT_STORAGE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// The counts' code of a texture in format `view` over a drawn plane shape of format `plane`
+/// that took the storage shape of its extent ([`DRAWN_FORMAT_STORAGE`]), made once a pair and
+/// kept for the process (the counts keep codes as `&'static str`), and whether the pair is met
+/// for the first time: its line is logged the first time alone, the rest counted
+/// (docs/conventions.md). The pairs are bounded: a shape's format is a colour format of texels
+/// (`shapes::texel_bytes`).
+fn drawn_format_code(plane: u64, view: u64) -> (&'static str, bool) {
+    static CODES: Mutex<Vec<((u64, u64), &'static str)>> = Mutex::new(Vec::new());
+    let mut codes = CODES.lock();
+    if let Some(&(_, code)) = codes.iter().find(|(pair, _)| *pair == (plane, view)) {
+        return (code, false);
+    }
+    let code = format!("{DRAWN_FORMAT_STORAGE}-{plane}-as-{view}");
+    let code: &'static str = Box::leak(code.into_boxed_str());
+    codes.push(((plane, view), code));
+    (code, true)
+}
 
 /// The degradation code of a block refused as uncached in the per-shape form, which the kext
 /// gives a copy block instead (module doc).
@@ -230,10 +255,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(mut held) = caches.shape(&self.platform, device, block, key, &image) else {
             return unshaped(|_| {});
         };
-        if held.1.usage() == PLAIN_USAGE && !self.views_plain(m, held.1.pixel_format()) {
-            // A plain image is viewed in its own format and its sRGB sibling alone: the texture
-            // takes the storage shape of its extent, made of the Unknown usage where the cache
-            // holds none, which rule 1 keeps current with the plain one (`shapes`, "The shape").
+        let apart = if held.1.usage() == PLAIN_USAGE {
+            !self.views_plain(m, held.1.pixel_format())
+        } else {
+            caches.drawn_plane(block, &held.0) && !self.views_drawn(m, held.1.pixel_format())
+        };
+        if apart {
+            // A plain image, and a drawn plane's, is viewed in its own format and its sRGB
+            // sibling alone: the texture takes the storage shape of its extent, made of the
+            // Unknown usage where the cache holds none, which rule 1 keeps current with the
+            // other (`shapes`, "The shape" and "Plane shapes").
             drop(held);
             let key = key.as_storage();
             let image = TextureDesc { usage: 0, ..image };
@@ -294,6 +325,34 @@ impl<P: Platform> GraphicsDecoder<P> {
                 "the texture {:#x} over plane {} of the IOSurface {}: in format {pixel_format}, \
                  neither its plain shape's format {shape_format} nor its sRGB sibling, it takes \
                  the storage shape of its extent ({FORMAT_STORAGE}; the rest are counted)",
+                m.obj_id, m.plane, m.iosurface_id
+            );
+        }
+        false
+    }
+
+    /// Whether the drawn plane shape of `shape_format` the texture `m` asks lies over takes it as
+    /// a view: in `shape_format` or its sRGB sibling, the formats rt's import of the plane's
+    /// Direct3D 11 texture is viewed in (`shapes`, "Plane shapes"). One in any other format,
+    /// which takes the storage shape of its extent instead, is counted by its formats
+    /// ([`DRAWN_FORMAT_STORAGE`], each pair's first logged).
+    fn views_drawn(&self, m: &RgfxTextureFromIOSurface, shape_format: u64) -> bool {
+        let pixel_format = u64::from(m.desc.pixel_format);
+        if views_without_usage(shape_format, pixel_format) {
+            return true;
+        }
+        self.surface_caches
+            .count_shapes(|c| c.drawn_format_storage += 1);
+        let (code, first) = drawn_format_code(shape_format, pixel_format);
+        reims_vgpu_vulkan::answer::count_kind(code);
+        if first {
+            log::info!(
+                target: "reims_vgpu::graphics", kind:% = code;
+                "the texture {:#x} over plane {} of the IOSurface {}: in format {pixel_format}, \
+                 neither its drawn video plane's format {shape_format} nor its sRGB sibling, the \
+                 views rt imports the plane's Direct3D 11 texture with, it takes the storage \
+                 shape of its extent, kept current with the plane by copies ({code}; the rest \
+                 are counted)",
                 m.obj_id, m.plane, m.iosurface_id
             );
         }
@@ -982,6 +1041,70 @@ mod tests {
         let counts = r.dec.caches().counts().shapes;
         assert_eq!((counts.format_storage, counts.order_case), (1, 1));
         assert_eq!((counts.unshaped, counts.views_refused), (0, 0));
+    }
+
+    /// A texture over a drawn plane shape (on Windows, a video plane over a Direct3D 11 texture,
+    /// which rt imports viewed in its own format and its sRGB sibling alone) in the plane's
+    /// format (`R8Unorm`) or its sRGB sibling is a view of the plane's image, a video plane, and
+    /// counted as nothing. One in another format (`R8Uint`), a view rt would refuse, is a view of
+    /// the storage shape of its extent, made of the Unknown usage beside the plane, counted by
+    /// its formats; it is no video plane, and a later texture of the extent views that storage
+    /// shape, as one over a plain shape does
+    #[test]
+    fn a_texture_over_a_drawn_plane_in_another_format_takes_the_storage_shape() {
+        use reims_vgpu_vulkan::core::platform::Handle as _;
+        let (mut r, made) = shaped_made();
+        let info = PixelFormatInfo {
+            block_bytes: 1,
+            block_width: 1,
+            block_height: 1,
+            block_depth: 1,
+            ..PixelFormatInfo::default()
+        };
+        (r.p.script()).always("MTLPixelFormatGetInfoForDevice()", Step::value(info));
+        let desc = r.p.texture_descriptor(&TextureDesc {
+            pixel_format: 10,
+            width: 32,
+            height: 8,
+            usage: 0x1 | 0x4 | 0x10,
+            ..TextureDesc::default()
+        });
+        let plane = (r.device.new_texture(ON, &desc).unwrap()).expect("the plane's image");
+        let plane_id = plane.id().0;
+        let key = ShapeKey {
+            plane: 0,
+            offset: 0,
+            bytes_per_row: 128,
+            width: 32,
+            height: 8,
+            texel_bytes: 1,
+            storage: false,
+        };
+        r.dec.surface_caches.add_drawn_plane(BLOCK, key, plane);
+        let code = format!("{DRAWN_FORMAT_STORAGE}-10-as-13");
+        let was = counted(&code);
+        let video_plane = |r: &Rig, n: u64| {
+            let entry = r.dec.entry(n).unwrap();
+            entry.shape.as_ref().map(|s| s.video_plane)
+        };
+
+        let own = texture_as_image(&mut r, 21, 10, (32, 8), 0x5);
+        let sibling = texture_as_image(&mut r, 22, 11, (32, 8), 0x1);
+        assert_eq!([own, sibling], [plane_id; 2], "views of the plane");
+        assert_eq!([21, 22].map(|n| video_plane(&r, n)), [Some(Some(0)); 2]);
+        assert!(made.lock().is_empty(), "no image of their own");
+        assert_eq!(r.dec.caches().counts().shapes.drawn_format_storage, 0);
+        assert_eq!(counted(&code), was);
+
+        let other = texture_as_image(&mut r, 23, 13, (32, 8), 0x5);
+        assert_ne!(other, plane_id);
+        assert_eq!(*made.lock(), [(13, 0)], "a storage shape of its extent");
+        assert_eq!(video_plane(&r, 23), Some(None), "no video plane");
+        assert_eq!(texture_as_image(&mut r, 24, 10, (32, 8), 0x5), other);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!((counts.drawn_format_storage, counts.format_storage), (1, 0));
+        assert_eq!((counts.unshaped, counts.views_refused), (0, 0));
+        assert_eq!(counted(&code) - was, 1, "counted by its formats");
     }
 
     /// A texture that takes storage over a plane with only a plain shape of its extent makes a

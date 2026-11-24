@@ -61,7 +61,12 @@
 //! its pictures into (`graphics::drawn`), made at the ask and imported by the platform
 //! (`GpuDevice::import_d3d11_surface`), each plane the size of its plane shape with no rows of
 //! room below it: a decode's targets are then the planes' images and those textures
-//! (`Caches::drawn_targets`). Where the textures are not made (a driver refuses the draws'
+//! (`Caches::drawn_targets`). rt imports each texture with the uses its bind flags give
+//! (`RENDER_TARGET | SHADER_RESOURCE`: copied, sampled and rendered into) and no view format but
+//! the texture's element format, the plane image's and that one's sRGB sibling, so the planes
+//! are drawn plane shapes: a guest texture over a plane in a format neither the image's nor its
+//! sRGB sibling takes the storage shape of its extent instead of a view of the plane, counted
+//! (`shapes`, "Plane shapes"). Where the textures are not made (a driver refuses the draws'
 //! device's open of them, `OpenSharedResource1`, say), the ask makes no surface, counted as a
 //! surface the platform made none of, and the plane shapes take images of their own, where each
 //! picture lands by the CPU's copy (`graphics::vaapi`'s module doc, its third way). The first
@@ -961,9 +966,10 @@ impl<P: Platform> SurfaceCaches<P> {
         let mut found = None;
         let mut bytes = 0;
         for (plane, image) in ask.keys.iter().zip(&images) {
-            let (reference, _) = cache
-                .shapes
-                .insert_plane(*plane, image.clone_ref(), true, now);
+            let (reference, _) =
+                cache
+                    .shapes
+                    .insert_drawn_plane(*plane, image.clone_ref(), true, now);
             if plane == key {
                 found = Some((reference, image.clone_ref()));
             }
@@ -1271,7 +1277,11 @@ mod drawn_tests {
         cache.surface = CacheSurface::new(Some(VideoMemory::Drawn), Some(&PLANES));
         cache.surface.asked = true;
         for (key, image) in keys.into_iter().zip(&images) {
-            drop(cache.shapes.insert_plane(key, image.clone_ref(), true, 0));
+            drop(
+                cache
+                    .shapes
+                    .insert_drawn_plane(key, image.clone_ref(), true, 0),
+            );
         }
         cache.surface.made = Some(DrawnSurface {
             planes: images,

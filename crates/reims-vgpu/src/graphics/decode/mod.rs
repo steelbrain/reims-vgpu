@@ -2300,8 +2300,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                      images and {} views refused); {} caches kept past the budget; {} blocks \
                      refused uncached; {} made beside a shape of the other kind, {} copies \
                      between the kinds ({} MiB); {} textures over a plain shape in another format \
-                     given the storage shape, {} over a plain shape asking PixelFormatView; {} blocks with no view \
-                     of their pages cached with them copied",
+                     given the storage shape, {} over a plain shape asking PixelFormatView, {} \
+                     over a drawn plane in another format given the storage shape; {} blocks \
+                     with no view of their pages cached with them copied",
                     sh.made, sh.made_bytes >> 20, sh.found, sh.again, sh.aged_again, sh.fills,
                     sh.filled_bytes >> 20, sh.fills_made, sh.fills_deferred, sh.written_back,
                     sh.written_back_bytes >> 20, sh.kept_dirty, sh.overlap_copies,
@@ -2311,7 +2312,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     sh.usage_writes, sh.slot_reads, sh.unshaped,
                     sh.images_refused, sh.views_refused, sh.past_budget, sh.uncached_refused,
                     sh.order_case, sh.order_copies, sh.order_bytes >> 20, sh.format_storage,
-                    sh.plain_format_views, sh.pages_copied
+                    sh.plain_format_views, sh.drawn_format_storage, sh.pages_copied
                 );
             }
             if let Some(line) = surface_cache::planes_line(&sh) {
