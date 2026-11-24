@@ -37,6 +37,12 @@ impl Stages {
         self.last = Some(now);
         Some(part)
     }
+
+    /// rt's metrics as the last part read them, whole (`{:?}`), counted since the device was
+    /// made; `None` before a part read them.
+    pub fn metrics(&self) -> Option<String> {
+        self.last.as_ref().map(|metrics| format!("{metrics:?}"))
+    }
 }
 
 /// What a count rose by from `before` to `now`; where it fell, a new device's, what it is.

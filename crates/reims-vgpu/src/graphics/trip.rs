@@ -13,6 +13,12 @@
 //!   summary's), then the imports of the host's memory live at the line, by how rt took them
 //!   (`reims_vgpu_vulkan::rt_platform::buffer::live_imports`). A period that counted nothing
 //!   writes no line.
+//! - **rt's metrics** follow each such line, whole: `rt metrics at <wall s.ms>: <rt's Metrics,
+//!   {:?}>`, as `rt_platform::trip::Stages` read them, counted since rt's device was made.
+//! - **The card's lines** follow, `card at <wall s.ms> dev <ns> n <records>: <record> ...`, each
+//!   record a command buffer whose rt handler entered since the lines before
+//!   (`reims_vgpu_vulkan::core::trip::CardRecord`), [`CARD_RECORDS`] at most a line
+//!   ([`card_lines`]).
 //! - **The stamps**: the device's own, at its queues' takes, sleeps and posts; the platform's
 //!   (`reims_vgpu_vulkan::core::trip`), as rt's completed handler enters and around each commit's
 //!   call into rt, on the device's clock, which [`start`] installs; and the decoder's, as its
@@ -25,10 +31,12 @@
 //!   (`reims_vgpu_vulkan::core::logging::names`), as `decode::work` does, and makes its thread
 //!   then. Off, each site costs one relaxed load.
 
+use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reims_vgpu_graphics::trip;
+use reims_vgpu_vulkan::core::trip::CardRecord;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline};
 use reims_vgpu_vulkan::rt_platform::window_times;
@@ -64,10 +72,22 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
                     since = now;
                     let ms = clock.now_wall().as_nanos() / 1_000_000;
                     let ours = trip::take();
-                    let rt = rt.take();
+                    let part = rt.take();
                     let window = window_times::line(&window_times::take_trip());
                     let imports = reims_vgpu_vulkan::rt_platform::buffer::live_imports();
-                    if let Some(line) = line(ms, over, &ours, rt.as_deref(), &window, imports) {
+                    if let Some(line) = line(ms, over, &ours, part.as_deref(), &window, imports) {
+                        log::debug!(target: TARGET, "{line}");
+                        if let Some(metrics) = rt.metrics() {
+                            log::debug!(
+                                target: TARGET,
+                                "rt metrics at {}.{:03}: {metrics}",
+                                ms / 1_000,
+                                ms % 1_000
+                            );
+                        }
+                    }
+                    let cards = reims_vgpu_vulkan::core::trip::take_cards();
+                    for line in card_lines(ms, trip::now_ns(), &cards) {
                         log::debug!(target: TARGET, "{line}");
                     }
                 }
@@ -78,6 +98,52 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
             window_times::count_trip();
         }
     });
+}
+
+/// The card's records a line carries at most ([`card_lines`]).
+const CARD_RECORDS: usize = 64;
+
+/// The card's `records`, taken at wall time `ms` (milliseconds since the Unix epoch) and at `now`
+/// on the device's clock, in lines of at most [`CARD_RECORDS`]: `card at <wall s.ms> dev <now>
+/// n <records>: <record> ...`, each record `start,end,returned,taken,committed,raised,gpu_end,
+/// depth` (`CardRecord` and its chain), each time in nanoseconds before `now`, `-` where
+/// unknown, and its depth a count.
+fn card_lines(ms: u64, now: u64, records: &[CardRecord]) -> Vec<String> {
+    let ago = |line: &mut String, t: u64| {
+        if t == 0 {
+            line.push('-');
+        } else {
+            let _ = write!(line, "{}", i128::from(now) - i128::from(t));
+        }
+    };
+    let mut lines = Vec::new();
+    for chunk in records.chunks(CARD_RECORDS) {
+        let mut line = format!(
+            "card at {}.{:03} dev {now} n {}:",
+            ms / 1_000,
+            ms % 1_000,
+            chunk.len()
+        );
+        for record in chunk {
+            let chain = record.chain;
+            let times = [
+                record.start,
+                record.end,
+                record.returned,
+                chain.taken,
+                chain.committed,
+                chain.raised,
+                chain.gpu_end,
+            ];
+            for (i, t) in times.into_iter().enumerate() {
+                line.push(if i == 0 { ' ' } else { ',' });
+                ago(&mut line, t);
+            }
+            let _ = write!(line, ",{}", record.depth);
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 /// A buffer's walk started at `start`, begun on its queue's thread at `begun` and handed to its
@@ -120,6 +186,37 @@ fn line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The card's records go in lines of at most [`CARD_RECORDS`], each time before the line's
+    /// device time and `-` where unknown
+    #[test]
+    fn the_card_lines_carry_each_record_before_now() {
+        assert!(card_lines(1_000, 5_000, &[]).is_empty());
+        let record = CardRecord {
+            start: 4_000,
+            end: 4_500,
+            depth: 2,
+            returned: 3_000,
+            chain: reims_vgpu_vulkan::core::trip::Chain {
+                gpu_end: 0,
+                raised: 1_000,
+                committed: 2_000,
+                taken: 2_500,
+            },
+        };
+        let lines = card_lines(1_700_000_000_123, 5_000, &[record; CARD_RECORDS + 1]);
+        assert_eq!(lines.len(), 2);
+        let one = "1000,500,2000,2500,3000,4000,-,2";
+        let head = format!("card at 1700000000.123 dev 5000 n 64: {one} {one} ");
+        assert!(lines[0].starts_with(&head), "{}", lines[0]);
+        assert_eq!(
+            lines[1],
+            format!("card at 1700000000.123 dev 5000 n 1: {one}")
+        );
+        let line = &card_lines(1_000, 5_000, &[CardRecord::default()])[0];
+        assert_eq!(line, "card at 1.000 dev 5000 n 1: -,-,-,-,-,-,-,0");
+        assert!(!lines[0].contains("trip at "));
+    }
 
     /// A period that counted something writes its line, stamped, with rt's part after ours, then
     /// the windows' part, and the live imports last; one that counted nothing writes none

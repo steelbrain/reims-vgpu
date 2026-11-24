@@ -3164,6 +3164,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         // The trip's stamps (`trip`): the buffer's take and its begin here, on the queue's thread,
         // and its hand to the lane's.
         let (trip_taken, trip_begun) = reims_vgpu_graphics::trip::up();
+        let trip_chain = reims_vgpu_graphics::trip::chain();
         let on_lane = lane.is_some() && !here;
         let trip_handed = if trip_begun != 0 && on_lane {
             reims_vgpu_graphics::trip::now_ns()
@@ -3175,6 +3176,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 let start = reims_vgpu_graphics::trip::now_ns();
                 trip::started(start, trip_begun, trip_handed);
                 reims_vgpu_graphics::trip::set_job(trip_taken, start);
+                reims_vgpu_graphics::trip::set_chain(trip_chain);
                 start
             } else {
                 0
@@ -3230,6 +3232,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             });
             if trip_start != 0 {
                 reims_vgpu_graphics::trip::set_job(0, 0);
+                reims_vgpu_graphics::trip::set_chain(reims_vgpu_graphics::trip::Chain::NONE);
             }
         };
         match lane {

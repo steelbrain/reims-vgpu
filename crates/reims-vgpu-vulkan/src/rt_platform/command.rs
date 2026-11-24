@@ -402,15 +402,17 @@ impl Handed {
 /// handlers handed on are yet to run, when it hands them on to [`HANDED_ON`], `handed` holding
 /// them yet to run until they ran. Each run there is a step of the exit gate
 /// (`crate::exit_gate`), and parks for good once the process's exit closed it. A run on rt's
-/// thread is timed (`super::handler_times`).
+/// thread is timed (`super::handler_times`). Its `card`'s record is made as it enters
+/// (`core::trip`).
 fn hand_on(
     handlers: impl FnOnce(&rt::CommandBuffer) + Send + 'static,
     merges: bool,
     handed: Arc<Handed>,
+    card: Option<Arc<crate::core::trip::Card>>,
 ) -> impl FnOnce(&rt::CommandBuffer) + Send + 'static {
     move |made: &rt::CommandBuffer| {
-        // When it entered, and the GPU's idle before it, for the decoder's handlers' trip
-        // (`core::trip`).
+        // When it entered, and the GPU's idle before it and its end, for the decoder's handlers'
+        // trip, and its record on the card (`core::trip`).
         let entered = crate::core::trip::stamp();
         let gpu = if entered != 0 {
             crate::core::trip::gpu_times(
@@ -421,10 +423,18 @@ fn hand_on(
         } else {
             None
         };
+        let end = card.map_or(0, |card| {
+            card.completed(
+                entered,
+                rt::host_time(),
+                made.gpu_start_time(),
+                made.gpu_end_time(),
+            )
+        });
         if !merges && HANDED.load(Ordering::SeqCst) == 0 {
-            crate::core::trip::set_handler(entered, false, gpu);
+            crate::core::trip::set_handler(entered, false, gpu, end);
             super::handler_times::time(|| handlers(made));
-            crate::core::trip::set_handler(0, false, None);
+            crate::core::trip::set_handler(0, false, None, 0);
             return;
         }
         HANDED.fetch_add(1, Ordering::SeqCst);
@@ -438,9 +448,9 @@ fn hand_on(
                 crate::exit_gate::stay()
             };
             let was = RUNS_HANDED.replace(true);
-            crate::core::trip::set_handler(entered, true, gpu);
+            crate::core::trip::set_handler(entered, true, gpu, end);
             handlers(&made);
-            crate::core::trip::set_handler(0, false, None);
+            crate::core::trip::set_handler(0, false, None, 0);
             RUNS_HANDED.set(was);
             drop((made, step));
             *handed.pending.lock() = false;
@@ -1247,8 +1257,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                     self.rt.add_scheduled_handler(run(submission))?;
                 }
                 let handed = Arc::clone(&self.handed);
+                let card = crate::core::trip::card();
                 self.rt
-                    .add_completed_handler(hand_on(run(seen), merges, handed))?;
+                    .add_completed_handler(hand_on(run(seen), merges, handed, card.clone()))?;
                 super::copied::copy_in(&copies);
                 self.kept.takes().take(&self.device);
                 // Not complete until its first completed handler runs, which a refusal never runs.
@@ -1261,12 +1272,21 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 self.failure.flight.store(number, Ordering::SeqCst);
                 loss.open.fetch_add(1, Ordering::SeqCst);
                 let called = crate::core::trip::stamp();
+                if let Some(card) = &card {
+                    card.commits();
+                }
                 let committed = self.rt.commit();
                 if called != 0 {
                     let ns = crate::core::trip::stamp().saturating_sub(called);
                     crate::core::trip::set_commit(called, ns);
+                    if let Some(card) = &card {
+                        card.returned(called + ns);
+                    }
                 }
                 if committed.is_err() {
+                    if let Some(card) = &card {
+                        card.refused();
+                    }
                     loss.open.fetch_sub(1, Ordering::SeqCst);
                     let flight = self.failure.flight.swap(0, Ordering::SeqCst);
                     loss.flights.remove(flight);

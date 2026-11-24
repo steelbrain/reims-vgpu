@@ -345,8 +345,13 @@ static IDLES: [[Idle; 5]; 2] = [const { [const { Idle::new() }; 5] }; 2];
 static FINE: [Fine; 2] = [const { Fine::new() }; 2];
 
 thread_local! {
-    /// When rt's handler entered, for the completion this thread posts next ([`set_down`]).
-    static DOWN: Cell<u64> = const { Cell::new(0) };
+    /// When rt's handler entered and its buffer's GPU end, for the completion this thread posts
+    /// next ([`set_down`]).
+    static DOWN: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// The GPU end of the buffer whose completion this thread posts now ([`set_posting`]).
+    static POSTING: Cell<u64> = const { Cell::new(0) };
+    /// The way up of the buffer this thread carries out ([`set_chain`]).
+    static CHAIN: Cell<Chain> = const { Cell::new(Chain::NONE) };
     /// The take and the host's begin of the buffer this queue's thread hands to the host.
     static UP: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// The take and the walk's start of the buffer this thread carries out ([`set_job`]).
@@ -446,15 +451,61 @@ pub fn depth(n: usize) {
     });
 }
 
-/// rt's handler of the completion this thread posts next entered at `ns` (0: none).
-pub fn set_down(ns: u64) {
-    DOWN.set(ns);
+/// rt's handler of the completion this thread posts next entered at `ns` (0: none), its buffer's
+/// GPU end at `gpu_end` (0: unknown).
+pub fn set_down(ns: u64, gpu_end: u64) {
+    DOWN.set((ns, gpu_end));
 }
 
-/// When rt's handler of the completion this thread posts now entered, taken: 0 for a post that
-/// is no buffer's completion, or with the trip off.
-pub(crate) fn take_down() -> u64 {
-    DOWN.replace(0)
+/// When rt's handler of the completion this thread posts now entered, and its buffer's GPU end,
+/// taken: 0 for a post that is no buffer's completion, or with the trip off.
+pub(crate) fn take_down() -> (u64, u64) {
+    DOWN.replace((0, 0))
+}
+
+/// The completion this thread posts now is of a buffer whose GPU end was `gpu_end` (0: none).
+pub(crate) fn set_posting(gpu_end: u64) {
+    POSTING.set(gpu_end);
+}
+
+/// [`set_posting`]'s GPU end on this thread.
+pub(crate) fn posting() -> u64 {
+    POSTING.get()
+}
+
+/// A buffer's way up as its queue's thread took it, for the card's record
+/// (`reims_vgpu_vulkan::core::trip`), on the device's clock, each 0 where unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Chain {
+    /// The GPU end of the completion whose interrupt its take followed, where none of its queue's
+    /// buffers was in flight (`Take::serial_gpu_end`).
+    pub gpu_end: u64,
+    /// That interrupt's raise (`Take::serial_from`).
+    pub raised: u64,
+    /// The guest's commit call of it.
+    pub committed: u64,
+    /// Its take.
+    pub taken: u64,
+}
+
+impl Chain {
+    /// No buffer's.
+    pub const NONE: Chain = Chain {
+        gpu_end: 0,
+        raised: 0,
+        committed: 0,
+        taken: 0,
+    };
+}
+
+/// The buffer this thread carries out now has `chain`.
+pub fn set_chain(chain: Chain) {
+    CHAIN.set(chain);
+}
+
+/// [`set_chain`]'s chain on this thread.
+pub fn chain() -> Chain {
+    CHAIN.get()
 }
 
 /// The take and the host's begin of the buffer this queue's thread hands to the host now, (0, 0)
@@ -496,6 +547,7 @@ pub(crate) struct Queue {
     taken: AtomicU64,
     done: AtomicU64,
     down_ns: AtomicU64,
+    gpu_end_ns: AtomicU64,
     woke_ns: AtomicU64,
 }
 
@@ -505,14 +557,17 @@ pub(crate) struct Take {
     /// When the queue's last completion's interrupt was raised, where none of the queue's
     /// buffers was in flight; else 0.
     pub(crate) serial_from: u64,
+    /// The GPU end of that completion's buffer, where known; else 0.
+    pub(crate) serial_gpu_end: u64,
     /// The queue's thread was woken for it.
     pub(crate) woken: bool,
 }
 
 impl Queue {
     /// A completion written onto the queue's ring, its interrupt raised (or nothing raised) at
-    /// `end`.
-    pub(crate) fn completed(&self, end: u64) {
+    /// `end`, of a buffer whose GPU end was `gpu_end` (0: unknown).
+    pub(crate) fn completed(&self, end: u64, gpu_end: u64) {
+        self.gpu_end_ns.store(gpu_end, Relaxed);
         self.down_ns.store(end, Relaxed);
         self.done.fetch_add(1, Relaxed);
     }
@@ -534,6 +589,7 @@ impl Queue {
             count(Count::Serial);
             time(Stage::Gap, taken - down);
             take.serial_from = down;
+            take.serial_gpu_end = self.gpu_end_ns.load(Relaxed);
         }
         let woke = self.woke_ns.swap(0, Relaxed);
         if woke != 0 {
@@ -897,12 +953,13 @@ mod tests {
         let queue = Queue::default();
         // The first take: no completion before it.
         assert_eq!(queue.took(1_000), Take::default());
-        queue.completed(2_000);
+        queue.completed(2_000, 1_500);
         queue.woke(2_500);
         assert_eq!(
             queue.took(3_000),
             Take {
                 serial_from: 2_000,
+                serial_gpu_end: 1_500,
                 woken: true
             }
         );

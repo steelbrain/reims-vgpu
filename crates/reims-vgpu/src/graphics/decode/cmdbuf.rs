@@ -1082,10 +1082,23 @@ fn commit_holding<C: CommandBuffer<P>, P: Platform>(
     held: Option<&Held>,
 ) -> RaiseResult<()> {
     // The trip's stamps of a buffer this thread carries out ([`trip::set_job`]): its walk, and
-    // the commit to rt's, with rt's call.
+    // the commit to rt's, with rt's call; and its way up, for its record on the card.
     let (taken, start) = trip::job();
     let before = if start != 0 { trip::now_ns() } else { 0 };
+    if before != 0 {
+        let chain = trip::chain();
+        let chain = reims_vgpu_vulkan::core::trip::Chain {
+            gpu_end: chain.gpu_end,
+            raised: chain.raised,
+            committed: chain.committed,
+            taken: chain.taken,
+        };
+        reims_vgpu_vulkan::core::trip::set_chain(Some(chain));
+    }
     let committed = cb.commit(ON);
+    if before != 0 {
+        reims_vgpu_vulkan::core::trip::set_chain(None);
+    }
     if before != 0
         && let Some((called, ns)) = reims_vgpu_vulkan::core::trip::take_commit()
     {
@@ -2694,8 +2707,14 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .watch(cb_obj_id, seqno, context, events.waits)
         });
         Box::new(move |info: CompletedInfo| {
-            // The trip's stamps (`super::super::trip`): rt's handler's entry, and this one's.
+            // The trip's stamps (`super::super::trip`): rt's handler's entry, and this one's, and
+            // the buffer's GPU end for its queue's next take.
             let entered = trip::stamp();
+            let gpu_end = if entered != 0 {
+                reims_vgpu_vulkan::core::trip::gpu_end()
+            } else {
+                0
+            };
             let from = if entered != 0 {
                 let (at, handed) = reims_vgpu_vulkan::core::trip::handler();
                 if handed {
@@ -2789,14 +2808,14 @@ impl<P: Platform> GraphicsDecoder<P> {
             let post: Post = Box::new(move || {
                 if finished != 0 {
                     trip::since(trip::Stage::Order, finished);
-                    trip::set_down(from);
+                    trip::set_down(from, gpu_end);
                 }
                 match &sink {
                     Some(sink) => sink(record, Box::new(move || drop(drain))),
                     None => drop(drain),
                 }
                 if finished != 0 {
-                    trip::set_down(0);
+                    trip::set_down(0, 0);
                 }
             });
             turn.finish(Some(post));

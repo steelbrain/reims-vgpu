@@ -4585,9 +4585,11 @@ impl Shared {
             } else {
                 message
             };
-            if guest_times {
-                self.note_guest_times(queue, &message, taken_ns, ring_free_ns, take);
-            }
+            let committed = if guest_times {
+                self.note_guest_times(queue, &message, taken_ns, ring_free_ns, take)
+            } else {
+                0
+            };
             // The host may let the claim go once the buffer is begun ([`QueueClaim`]); a buffer
             // a doorbell's thread answered meanwhile is the ring's next, which this takes next.
             let mut claim = QueueClaim {
@@ -4600,10 +4602,17 @@ impl Shared {
                 let begun = now_ns();
                 trip::time(trip::Stage::Gate, begun.saturating_sub(taken_ns));
                 trip::set_up(taken_ns, begun);
+                trip::set_chain(trip::Chain {
+                    gpu_end: take.serial_gpu_end,
+                    raised: take.serial_from,
+                    committed,
+                    taken: taken_ns,
+                });
             }
             self.host.command_buffer(poster, message.bytes, &mut claim);
             if timed {
                 trip::set_up(0, 0);
+                trip::set_chain(trip::Chain::NONE);
             }
             consuming = claim.retake();
             if guest_times {
@@ -4616,7 +4625,8 @@ impl Shared {
     /// ring at `taken_ns` by a thread that came back to the ring at `ring_free_ns`: its `cbguest`
     /// event in the host's trace, its spans in the once-a-second line where its target logs, and
     /// in the trip where it is timed, with what its `take` found ([`trip::guest`]). Nothing for a
-    /// buffer whose stream does not start with its times.
+    /// buffer whose stream does not start with its times. The guest's commit call on the host's
+    /// clock, where the trip is timed and the guest held its clock's offset; else 0.
     fn note_guest_times(
         &self,
         queue: &QueueShared,
@@ -4624,13 +4634,14 @@ impl Shared {
         taken_ns: u64,
         ring_free_ns: u64,
         take: trip::Take,
-    ) {
+    ) -> u64 {
         let Some(times) = guest_times::of(&message.bytes) else {
-            return;
+            return 0;
         };
         let clock = guest_times::clock(&self.region);
         let noted_ns = now_ns();
         let spans = guest_times::spans(&times, clock, taken_ns, ring_free_ns, noted_ns);
+        let mut committed = 0;
         if trip::on() {
             let host = spans.host.zip(clock).map(|(host, clock)| trip::OnHost {
                 queued: host.queued,
@@ -4639,6 +4650,7 @@ impl Shared {
                 committed: guest_times::on_host(times.committed_ns, clock),
             });
             trip::guest(spans.encode, spans.post_wait, host, taken_ns, take);
+            committed = host.map_or(0, |host| host.committed);
         }
         self.host
             .trace("cbguest", &spans.event(queue.obj_id, message.header.seqno));
@@ -4647,6 +4659,7 @@ impl Shared {
         {
             log::debug!(target: guest_times::TARGET, "{line}");
         }
+        committed
     }
 
     /// On the thread of a queue made at reset count `epoch` whose command buffer waits for ring
@@ -4888,7 +4901,7 @@ impl Shared {
             .is_ok_and(|(header, _)| header.r#type == RGFX_EVT_CB_COMPLETE)
         {
             trip::count(trip::Count::Completions);
-            queue.trip.completed(end);
+            queue.trip.completed(end, trip::posting());
         }
         trip::set_posted(written, end);
         Post::Done
@@ -5231,8 +5244,9 @@ impl Shared {
         epoch: u64,
         then: Option<Then>,
     ) {
-        // A buffer's completion, where the trip is timed: when rt's handler entered, and the post.
-        let trip_from = trip::take_down();
+        // A buffer's completion, where the trip is timed: when rt's handler entered, its GPU end,
+        // and the post.
+        let (trip_from, trip_end) = trip::take_down();
         let entered = if trip_from != 0 { now_ns() } else { 0 };
         if queue.handing.load(Ordering::Acquire) {
             if trip_from != 0 {
@@ -5244,7 +5258,13 @@ impl Shared {
             }
             return;
         }
+        if trip_end != 0 {
+            trip::set_posting(trip_end);
+        }
         let post = self.post_queue(queue, message, epoch);
+        if trip_end != 0 {
+            trip::set_posting(0);
+        }
         if post != Post::NoRoom {
             if post == Post::Done && trip_from != 0 {
                 trip_posted(entered, trip_from);
