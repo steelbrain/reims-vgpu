@@ -3844,6 +3844,13 @@ impl<P: Platform> SurfaceCaches<P> {
         })
     }
 
+    /// Whether a fill of the block at `block`'s cache is asked and not yet made: there is a
+    /// [`Self::last_deferred_fill`], found without taking it.
+    fn fill_deferred(&self, block: u64) -> bool {
+        (self.deferred.get(&block))
+            .is_some_and(|q| q.iter().any(|d| matches!(d.copy, Asked::Fill { .. })))
+    }
+
     /// The last fill of the block at `block`'s cache asked and not yet made.
     fn last_deferred_fill(&self, block: u64) -> Option<Arc<DeferredFill>> {
         (self.deferred.get(&block)?.iter().rev()).find_map(|d| match &d.copy {
@@ -3903,7 +3910,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// shape, and one of the shapes fills those that owe one as it is made.
     fn owes_shape_fill(&self, block: u64) -> bool {
         (self.by_block.get(&block)).is_some_and(|cache| cache.shapes.owes())
-            && self.last_deferred_fill(block).is_none()
+            && !self.fill_deferred(block)
     }
 
     /// Whether the use `u` fills its block's cache from its pages as its command buffer begins,
@@ -3995,7 +4002,7 @@ impl<P: Platform> SurfaceCaches<P> {
         let waits = self.pending(block, false) > 0 || self.deferring(block);
         // A fill asked and not made takes the pages into the buffer as it is made, its memory
         // made now.
-        let takes_pages = named && self.lacks(block) && self.last_deferred_fill(block).is_none();
+        let takes_pages = named && self.lacks(block) && !self.fill_deferred(block);
         let mut filled = Ok(());
         if older || host_wrote || refill == Refill::Fill {
             if !older && host_wrote {
@@ -5494,7 +5501,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// waits, else in the finish of the last one ([`Self::defer_shapes_fill`]); the uses
     /// counted after it wait for it on the GPU either way.
     fn take_pages(&mut self, device: &P::Device, block: u64) -> RaiseResult<()> {
-        if !self.lacks(block) || self.last_deferred_fill(block).is_some() {
+        if !self.lacks(block) || self.fill_deferred(block) {
             return Ok(());
         }
         self.counts.buffer_refills_named += 1;
