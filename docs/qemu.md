@@ -2634,8 +2634,8 @@ Text uses:
 
 ### arm64 guests: audio
 
-An arm64 VM with audio on gets an x86-64 VM's two virtio sound devices on
-the same backend ("x86-64 macOS guests: audio", above): one with an output
+An arm64 VM with audio on gets, under KVM, an x86-64 VM's two virtio sound
+devices on the same backend ("x86-64 macOS guests: audio", above): one with an output
 stream alone and one with an input stream alone. They follow the GPU, at the
 slots QEMU picks, and there is no HDA, since Ambrosia plays no boot chime.
 arm64 macOS's `AppleVirtIO` kext has `AppleVirtIOSound`, matching virtio
@@ -2660,7 +2660,9 @@ under KVM on an M1 Pro, with a macOS 27.2.1 (26B131) guest:
   Virtual Sound Device"s: 2 output channels at 48 kHz as the default output,
   and 2 input channels as the default input. `afplay` in the guest plays
   through a `qemu-system-aarch64` PipeWire stream on the host's speakers.
-- Recording, and arm64 guests under HVF or TCG, are **unknown**.
+- Recording, and arm64 guests under HVF or TCG, are **unknown**. Until a
+  guest boots with the devices under HVF and under TCG, reims-ctl gives an
+  arm64 VM sound under KVM alone (`crates/reims-ctl/src/qemu.rs`, `vmapple`).
 
 ### arm64 guests: USB passthrough
 

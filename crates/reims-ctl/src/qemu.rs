@@ -97,11 +97,12 @@
 //! KVM on arm64 Linux, and on TCG, a thread for each vCPU, on x86-64 ([`Profile::accel_arg`]). On
 //! Linux its RAM is a shared memfd, as the library there needs, not allocated as QEMU starts.
 //! On a Linux host it takes the host's USB devices as an x86-64 VM does, on that controller's
-//! bus ([`crate::usb::bus`]); it takes no host disk and no VMware SVGA. With audio on, it has the
-//! same two virtio sound devices as an x86-64 VM, after the GPU, where QEMU puts them, and no HDA:
-//! arm64 macOS's AppleVirtIOSound drives them, on vendor/qemu's `virtio-sound-pci` whose
-//! capabilities vmapple links in address order, without which macOS 27's virtio transport never
-//! starts the device (docs/qemu.md, "arm64 guests: audio").
+//! bus ([`crate::usb::bus`]); it takes no host disk and no VMware SVGA. With audio on, under KVM,
+//! it has the same two virtio sound devices as an x86-64 VM, after the GPU, where QEMU puts them,
+//! and no HDA: arm64 macOS's AppleVirtIOSound drives them, on vendor/qemu's `virtio-sound-pci`
+//! whose capabilities vmapple links in address order, without which macOS 27's virtio transport
+//! never starts the device (docs/qemu.md, "arm64 guests: audio"). Under HVF and TCG, where no
+//! guest has booted with them yet, it has none.
 //!
 //! The x86-64 VM's xHCI controller, and on Linux the arm64 VM's, has seven ports (`p2=7,p3=7`),
 //! each taking a USB 2 and a USB 3 device:
@@ -569,7 +570,10 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
                 .map_or(String::new(), |(w, h)| format!(",resolution={w}x{h}"))
         ),
     ]);
-    if c.audio.enabled {
+    // Sound only under KVM, the one accelerator an arm64 guest has booted with it on
+    // (docs/qemu.md, "arm64 guests: audio"); under HVF and TCG the VM has none until a boot there
+    // passes with it.
+    if c.audio.enabled && c.profile.accel(ctx.host) == "kvm" {
         let sound = virtio_sound(vm, ctx, None);
         push(&sound.iter().map(String::as_str).collect::<Vec<_>>());
     }
@@ -935,8 +939,9 @@ mod tests {
         assert_eq!(unix_paths(&inv.args), want);
     }
 
-    /// An arm64 VM with audio on gets an x86-64 VM's two virtio sound devices on its backend,
-    /// after the GPU and before the bundle, where QEMU puts them, and no HDA; with audio off, none.
+    /// An arm64 VM with audio on gets, under KVM, an x86-64 VM's two virtio sound devices on its
+    /// backend, after the GPU and before the bundle, where QEMU puts them, and no HDA; under HVF
+    /// and TCG, where no guest has booted with them, none; with audio off, none.
     #[test]
     fn arm64_with_audio_has_virtio_sound() {
         let arm_linux = Host {
@@ -977,6 +982,16 @@ mod tests {
                     || (x.starts_with("virtio-sound-pci") && x.contains("addr="))),
             "{a:?}"
         );
+
+        // A Mac runs it on HVF and an x86-64 Linux host on TCG.
+        for host in [mac(), linux()] {
+            let a = invocation(&vm, &arm64_ctx(host)).unwrap().args;
+            assert!(
+                !a.iter()
+                    .any(|x| x == "-audiodev" || x.contains("virtio-sound")),
+                "{a:?}"
+            );
+        }
 
         vm.config.audio.enabled = false;
         let a = invocation(&vm, &arm64_ctx(arm_linux)).unwrap().args;
