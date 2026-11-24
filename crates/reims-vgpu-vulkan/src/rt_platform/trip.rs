@@ -6,12 +6,14 @@
 //! `vkQueueSubmit2` calls, the `VkSubmitInfo2`s they passed, their time inside the driver and the
 //! submit thread's waits for rt's queue lock before them, in all; its calibrations and their time;
 //! the groups a queue held behind its submissions in flight and the GPU's time from the work
-//! before each to its start; then each of rt's stage histograms as `| name n sum_us p50_us
-//! p90_us [bucket:n,...]`: `commit_to_scheduled`, `scheduled_to_gpu_start` (with the part behind
-//! other work, `behind`), `gpu_run` and `gpu_end_to_handler` (with its six steps' sums, `steps`),
-//! each in rt's buckets (bucket 0 under 2 us, bucket `i` from 2^i us to under 2^(i+1) us, the
-//! last from 2^22 us), their quantiles placed in their buckets by rank. Times are in
-//! microseconds, on rt's host clock.
+//! before each to its start, and the command buffers scheduled while their queue held them for
+//! room on the device's queue (`for_room`); then each of rt's stage histograms as `| name n sum_us
+//! p50_us p90_us [bucket:n,...]`: `commit_to_scheduled`, `scheduled_to_gpu_start` (with the part
+//! behind other work, `behind`), `gpu_run` and `gpu_end_to_handler` (with its six steps' sums,
+//! `steps`, then its tail, `tail n steps ...`: those of its spans of 1,024 us or more, with their
+//! six steps' sums), each in rt's buckets (bucket 0 under 2 us, bucket `i` from 2^i us to under
+//! 2^(i+1) us, the last from 2^22 us), their quantiles placed in their buckets by rank. Times are
+//! in microseconds, on rt's host clock.
 //!
 //! A device made after the one before reads as counted from none again: each count is what it rose
 //! by, or what it is where it fell.
@@ -103,6 +105,15 @@ fn stage(out: &mut String, name: &str, buckets: &[u64], ns: u64) {
     out.push(']');
 }
 
+/// What each of `before`'s step sums rose by to `now`'s, in microseconds, joined by commas.
+fn steps<const N: usize>(before: &[u64; N], now: &[u64; N]) -> String {
+    let steps: Vec<String> = rose_each(before, now)
+        .iter()
+        .map(|&ns| format!("{:.1}", us(ns)))
+        .collect();
+    steps.join(",")
+}
+
 /// The part of what rose from `before` to `now` (the module doc).
 pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
     macro_rules! rose {
@@ -112,7 +123,7 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
     }
     let mut out = format!(
         "rt: commit_lock {:.1}; submits {} infos {} call {:.1} queue_lock {:.1}; calibrations {} \
-         {:.1}; held_starts {} gap {:.1}",
+         {:.1}; held_starts {} gap {:.1} for_room {}",
         us(rose!(commit_lock_wait_nanos)),
         rose!(submissions),
         rose!(submit_infos),
@@ -122,6 +133,7 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
         us(rose!(calibration_nanos)),
         rose!(held_starts),
         us(rose!(held_start_gap_nanos)),
+        rose!(held_for_room),
     );
     stage(
         &mut out,
@@ -152,12 +164,19 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics) -> String {
         &rose_each(&before.gpu_end_to_handler, &now.gpu_end_to_handler),
         rose!(gpu_end_to_handler_nanos),
     );
-    let steps = rose_each(
-        &before.gpu_end_to_handler_steps_nanos,
-        &now.gpu_end_to_handler_steps_nanos,
+    let _ = write!(
+        out,
+        " steps {} tail {} steps {}",
+        steps(
+            &before.gpu_end_to_handler_steps_nanos,
+            &now.gpu_end_to_handler_steps_nanos,
+        ),
+        rose!(gpu_end_to_handler_tail),
+        steps(
+            &before.gpu_end_to_handler_tail_steps_nanos,
+            &now.gpu_end_to_handler_tail_steps_nanos,
+        ),
     );
-    let steps: Vec<String> = steps.iter().map(|&ns| format!("{:.1}", us(ns))).collect();
-    let _ = write!(out, " steps {}", steps.join(","));
     out
 }
 
@@ -177,14 +196,24 @@ mod tests {
         now.gpu_run[6] = 1;
         now.gpu_run_nanos = 190_000;
         now.gpu_end_to_handler_steps_nanos[0] = 2_000;
+        now.held_for_room = 4;
+        now.gpu_end_to_handler_tail = 2;
+        now.gpu_end_to_handler_tail_steps_nanos[4] = 1_500;
         let line = line(&before, &now);
         assert!(
             line.starts_with("rt: commit_lock 0.0; submits 3 infos 0 call 150.0 "),
             "{line}"
         );
+        assert!(
+            line.contains("; held_starts 0 gap 0.0 for_room 4 | "),
+            "{line}"
+        );
         assert!(line.contains(" | gpu_run 10 190.0 "), "{line}");
         assert!(line.contains("[3:9,6:1]"), "{line}");
-        assert!(line.ends_with(" steps 2.0,0.0,0.0,0.0,0.0,0.0"), "{line}");
+        assert!(
+            line.ends_with(" steps 2.0,0.0,0.0,0.0,0.0,0.0 tail 2 steps 0.0,0.0,0.0,0.0,1.5,0.0"),
+            "{line}"
+        );
         // The median falls in bucket 3: from 8 us to under 16 us.
         let p50 = quantile(&now.gpu_run, 0.5);
         assert!((8_000..16_000).contains(&p50), "{p50}");

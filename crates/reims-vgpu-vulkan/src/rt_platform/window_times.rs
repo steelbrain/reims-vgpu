@@ -28,33 +28,70 @@
 //! without it.
 //!
 //! A diagnostic: nothing is counted until the summary turns counting on ([`count`]), where the log
-//! names its target; off, each call costs one relaxed load. A kind is three atomics, added to with
-//! no lock; a take swaps each for 0, so a call counted while a take reads them can fall into
-//! either period, its count in one and its time in the other. Which lines the host writes is free
-//! under the contract.
+//! names its target, or reims-vgpu's trip line does ([`count_trip`]), where the log names its own;
+//! off, each call costs one relaxed load. The two count apart, each in a set of its own that only
+//! its take empties ([`take`], [`take_trip`]), so the summary's ten seconds stay whole beside the
+//! trip line's seconds. A kind is three atomics, added to with no lock; a take swaps each for 0,
+//! so a call counted while a take reads them can fall into either period, its count in one and its
+//! time in the other. Which lines the host writes is free under the contract.
 //!
 //! [`CompletedInfo::gpu_times_ns`]: crate::core::platform::command::CompletedInfo::gpu_times_ns
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Whether the times are counted ([`count`]).
-static ON: AtomicBool = AtomicBool::new(false);
+/// Which sets count: [`SUMMARY_ON`] ([`count`]) and [`TRIP_ON`] ([`count_trip`]).
+static ON: AtomicU8 = AtomicU8::new(0);
 
-/// The `vkAcquireNextImageKHR` calls.
-static ACQUIRES: Counter = Counter::new();
+/// [`ON`]'s bit for the summary's set, [`SUMMARY`].
+const SUMMARY_ON: u8 = 1;
 
-/// The `vkQueuePresentKHR` calls.
-static PRESENTS: Counter = Counter::new();
+/// [`ON`]'s bit for the trip line's set, [`TRIP`].
+const TRIP_ON: u8 = 2;
 
-/// The presents' waits for rt's lock of its presenting queue.
-static PRESENT_LOCK_WAITS: Counter = Counter::new();
+/// The summary's set ([`take`]).
+static SUMMARY: Kinds = Kinds::new();
 
-/// The window frames' command buffers on the GPU.
-static FRAMES_ON_GPU: Counter = Counter::new();
+/// The trip line's set ([`take_trip`]).
+static TRIP: Kinds = Kinds::new();
 
-/// The `vkCreateSwapchainKHR` calls.
-static CREATES: Counter = Counter::new();
+/// A set's counts, one of each kind.
+struct Kinds {
+    /// The `vkAcquireNextImageKHR` calls.
+    acquires: Counter,
+    /// The `vkQueuePresentKHR` calls.
+    presents: Counter,
+    /// The presents' waits for rt's lock of its presenting queue.
+    present_lock_waits: Counter,
+    /// The window frames' command buffers on the GPU.
+    frames_on_gpu: Counter,
+    /// The `vkCreateSwapchainKHR` calls.
+    creates: Counter,
+}
+
+impl Kinds {
+    /// A set that has counted none.
+    const fn new() -> Kinds {
+        Kinds {
+            acquires: Counter::new(),
+            presents: Counter::new(),
+            present_lock_waits: Counter::new(),
+            frames_on_gpu: Counter::new(),
+            creates: Counter::new(),
+        }
+    }
+
+    /// What the set counted since its take before, of each kind; each is counted from none again.
+    fn take(&self) -> Period {
+        Period {
+            acquires: self.acquires.take(),
+            presents: self.presents.take(),
+            present_lock_waits: self.present_lock_waits.take(),
+            frames_on_gpu: self.frames_on_gpu.take(),
+            creates: self.creates.take(),
+        }
+    }
+}
 
 /// What one kind counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,37 +152,49 @@ impl Counter {
     }
 }
 
-/// Turns counting on, for the rest of the process.
+/// Turns the summary's counting on, for the rest of the process.
 pub fn count() {
-    ON.store(true, Ordering::Relaxed);
+    ON.fetch_or(SUMMARY_ON, Ordering::Relaxed);
 }
 
-/// Whether the times are counted: a caller reads its clock only then.
+/// Turns the trip line's counting on, for the rest of the process.
+pub fn count_trip() {
+    ON.fetch_or(TRIP_ON, Ordering::Relaxed);
+}
+
+/// Whether the times are counted, in either set: a caller reads its clock only then.
 pub fn on() -> bool {
-    ON.load(Ordering::Relaxed)
+    ON.load(Ordering::Relaxed) != 0
+}
+
+/// `add` to each set that counts.
+fn counted(add: impl Fn(&Kinds)) {
+    let on = ON.load(Ordering::Relaxed);
+    if on & SUMMARY_ON != 0 {
+        add(&SUMMARY);
+    }
+    if on & TRIP_ON != 0 {
+        add(&TRIP);
+    }
 }
 
 /// A `vkAcquireNextImageKHR` call took `nanos`: counted where counting is on.
 pub(crate) fn acquired(nanos: u64) {
-    if on() {
-        ACQUIRES.add(nanos);
-    }
+    counted(|kinds| kinds.acquires.add(nanos));
 }
 
 /// A present waited `lock_wait` nanoseconds for rt's lock of its presenting queue, then its
 /// `vkQueuePresentKHR` call took `call`: counted where counting is on.
 pub(crate) fn presented(lock_wait: u64, call: u64) {
-    if on() {
-        PRESENT_LOCK_WAITS.add(lock_wait);
-        PRESENTS.add(call);
-    }
+    counted(|kinds| {
+        kinds.present_lock_waits.add(lock_wait);
+        kinds.presents.add(call);
+    });
 }
 
 /// A `vkCreateSwapchainKHR` call took `nanos`: counted where counting is on.
 pub(crate) fn created(nanos: u64) {
-    if on() {
-        CREATES.add(nanos);
-    }
+    counted(|kinds| kinds.creates.add(nanos));
 }
 
 /// A window frame's command buffer completed with `gpu_times_ns`, its GPU start and end
@@ -153,22 +202,21 @@ pub(crate) fn created(nanos: u64) {
 ///
 /// [`CompletedInfo::gpu_times_ns`]: crate::core::platform::command::CompletedInfo::gpu_times_ns
 pub fn frame_ran(gpu_times_ns: Option<(u64, u64)>) {
-    if let Some((start, end)) = gpu_times_ns
-        && on()
-    {
-        FRAMES_ON_GPU.add(end.saturating_sub(start));
+    if let Some((start, end)) = gpu_times_ns {
+        counted(|kinds| kinds.frames_on_gpu.add(end.saturating_sub(start)));
     }
 }
 
-/// What was counted since the take before, of each kind; each is counted from none again.
+/// What the summary's set counted since its take before, of each kind; each is counted from none
+/// again.
 pub fn take() -> Period {
-    Period {
-        acquires: ACQUIRES.take(),
-        presents: PRESENTS.take(),
-        present_lock_waits: PRESENT_LOCK_WAITS.take(),
-        frames_on_gpu: FRAMES_ON_GPU.take(),
-        creates: CREATES.take(),
-    }
+    SUMMARY.take()
+}
+
+/// What the trip line's set counted since its take before, of each kind; each is counted from
+/// none again.
+pub fn take_trip() -> Period {
+    TRIP.take()
 }
 
 /// The summary's part of `period`: `window: ...`, each kind by name with its count, its time in
@@ -235,6 +283,42 @@ mod tests {
             }
         );
         assert_eq!(take(), Period::default());
+    }
+
+    /// The trip line's set counts apart from the summary's: each counts only once on, and a take
+    /// of one leaves the other's counts whole
+    #[test]
+    fn the_trip_line_s_times_are_counted_apart_from_the_summary_s() {
+        count_trip();
+        assert!(on());
+        acquired(1_000);
+        presented(10, 2_000);
+        let spans = |count, total, longest| Spans {
+            count,
+            total: Duration::from_nanos(total),
+            longest: Duration::from_nanos(longest),
+        };
+        assert_eq!(take(), Period::default(), "the summary's set is not on");
+        count();
+        frame_ran(Some((100, 400)));
+        assert_eq!(
+            take(),
+            Period {
+                frames_on_gpu: spans(1, 300, 300),
+                ..Period::default()
+            }
+        );
+        assert_eq!(
+            take_trip(),
+            Period {
+                acquires: spans(1, 1_000, 1_000),
+                presents: spans(1, 2_000, 2_000),
+                present_lock_waits: spans(1, 10, 10),
+                frames_on_gpu: spans(1, 300, 300),
+                ..Period::default()
+            }
+        );
+        assert_eq!(take_trip(), Period::default());
     }
 
     /// The part names each kind with its count, time in all and longest, in milliseconds to a
