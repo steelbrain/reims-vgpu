@@ -3,7 +3,8 @@
 //! Slow work (starting, stopping, creating, a bug report) runs on a thread of its own, which
 //! reports its steps; the list shows each VM's step until it ends. Each VM's state is read
 //! again every second, so VMs started or stopped elsewhere (the CLI, a printed script, closing
-//! a VM's window) show as they are.
+//! a VM's window, the guest shutting down) show as they are, and a status line that states a
+//! VM's state says it again once it is another.
 //!
 //! A form whose submit starts slow work (a new VM's create, an edit's new installer) stays open
 //! while it runs, showing its step, and closes once it succeeds: a failure shows in it, to fix
@@ -111,10 +112,41 @@ struct VmRow {
     pid: Option<i32>,
 }
 
+/// A VM's state as a status line states it: the VM, and its QEMU's pid, or None where it is
+/// stopped, as [`VmRow::pid`] reads it.
+struct Stated {
+    vm: String,
+    pid: Option<i32>,
+}
+
+/// What a work says as it succeeds: its line, and the state of a VM where the line states it.
+struct Said {
+    line: String,
+    stated: Option<Stated>,
+}
+
+impl Said {
+    /// `line`, which states that `vm` runs as the QEMU of `pid`, or, with None, that it is
+    /// stopped.
+    fn stating(line: String, vm: &str, pid: Option<i32>) -> Said {
+        let stated = Some(Stated {
+            vm: vm.to_string(),
+            pid,
+        });
+        Said { line, stated }
+    }
+}
+
+impl From<String> for Said {
+    fn from(line: String) -> Said {
+        Said { line, stated: None }
+    }
+}
+
 /// A work's messages carry its VM and the id `spawn` gave it.
 enum Msg {
     Progress(String, u64, String),
-    Done(String, u64, Result<String, String>),
+    Done(String, u64, Result<Said, String>),
     Gpus(Vec<GpuInfo>),
     /// Apple's catalog of IPSWs, read as the interface starts on an arm64 host, and as the first
     /// arm64 VM's form opens on another (ask_ipsws).
@@ -246,7 +278,7 @@ impl VmCommand {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Level {
     Info,
     Ok,
@@ -260,6 +292,9 @@ struct App {
     table: TableState,
     overlay: Option<Overlay>,
     status: Option<(String, Level)>,
+    /// The VM's state the status line states, where it states one: each read of the VMs' states
+    /// says the state again once it is another (`restate`).
+    stated: Option<Stated>,
     activity: BTreeMap<String, String>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -309,6 +344,7 @@ impl App {
             table: TableState::default(),
             overlay: None,
             status: None,
+            stated: None,
             activity: BTreeMap::new(),
             tx,
             rx,
@@ -378,6 +414,50 @@ impl App {
 
     fn say(&mut self, s: &str, level: Level) {
         self.status = Some((s.to_string(), level));
+        self.stated = None;
+    }
+
+    /// `say`, for a line that states that `vm` runs as the QEMU of `pid`, or, with None, that
+    /// it is stopped.
+    fn say_state(&mut self, s: &str, level: Level, vm: &str, pid: Option<i32>) {
+        self.say(s, level);
+        self.stated = Some(Stated {
+            vm: vm.to_string(),
+            pid,
+        });
+    }
+
+    /// Says a VM's state again where the status line states it and the VMs' states, as just
+    /// read, have it another: the VM stopped, ran again as another QEMU, or was started. A
+    /// stop with reims-vgpu's fatal error in QEMU's log since the start names it, and where the
+    /// log is. Work of this interface for the VM is left to say what it did as it ends, and a
+    /// VM gone from the list, or whose settings do not read, is left as the line says.
+    fn restate(&mut self) {
+        let Some(stated) = &self.stated else { return };
+        if self.activity.contains_key(&stated.vm) {
+            return;
+        }
+        let Some(row) = self.rows.iter().find(|r| r.name == stated.vm) else {
+            return;
+        };
+        let Ok(vm) = &row.vm else { return };
+        if row.pid == stated.pid {
+            return;
+        }
+        let (name, pid, log) = (stated.vm.clone(), row.pid, vm.qemu_log());
+        if let Some(p) = pid {
+            let s = format!("{name}: running (pid {p})");
+            return self.say_state(&s, Level::Info, &name, pid);
+        }
+        match fatal_line(&log) {
+            // An error, which stays until another line replaces it.
+            Some(fatal) => {
+                let log = paths::tilde(&log);
+                let s = format!("{name}: stopped: {fatal} (its QEMU log: {log})");
+                self.say(&s, Level::Error);
+            }
+            None => self.say_state(&format!("{name}: stopped"), Level::Info, &name, None),
+        }
     }
 
     /// Reads Apple's catalog of IPSWs in the background, once, for the arm64 form's choices
@@ -421,6 +501,7 @@ impl App {
         });
         self.last_registry = Instant::now();
         self.last_state = Instant::now();
+        self.restate();
         Ok(())
     }
 
@@ -428,6 +509,7 @@ impl App {
         for r in &mut self.rows {
             r.pid = r.vm.as_ref().ok().and_then(runtime::pid);
         }
+        self.restate();
         // Devices plugged in or out show as they are.
         if let Some(Overlay::Usb { devices, .. }) = &mut self.overlay {
             *devices = usb::host_devices();
@@ -463,9 +545,10 @@ impl App {
 
     /// Runs `work` on a thread of its own and returns its id, or None, saying so, if the VM is
     /// busy.
-    fn spawn<F>(&mut self, vm: &str, first: &str, work: F) -> Option<u64>
+    fn spawn<F, S>(&mut self, vm: &str, first: &str, work: F) -> Option<u64>
     where
-        F: FnOnce(&mut dyn FnMut(&str)) -> Result<String> + Send + 'static,
+        F: FnOnce(&mut dyn FnMut(&str)) -> Result<S> + Send + 'static,
+        S: Into<Said>,
     {
         if self.activity.contains_key(vm) {
             self.say(&format!("{vm} is busy: {}", self.activity[vm]), Level::Warn);
@@ -482,7 +565,9 @@ impl App {
             let mut progress = move |s: &str| {
                 let _ = t.send(Msg::Progress(n.clone(), id, s.to_string()));
             };
-            let r = work(&mut progress).map_err(|e| format!("{e:#}"));
+            let r = work(&mut progress)
+                .map(Into::into)
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Done(name, id, r));
         });
         Some(id)
@@ -565,7 +650,8 @@ impl App {
         execute!(std::io::stdout(), EnterAlternateScreen)?;
         terminal.clear()?;
         match result {
-            Ok(Some(m)) => self.say(&m, Level::Info),
+            // The viewer says something after only as the VM stops (view::run).
+            Ok(Some(m)) => self.say_state(&m, Level::Info, vm.name(), None),
             Ok(None) => {}
             Err(e) => self.say(&format!("{}: {e:#}", vm.name()), Level::Error),
         }
@@ -576,7 +662,7 @@ impl App {
     fn message(&mut self, m: Msg) {
         match m {
             Msg::Progress(vm, id, s) => {
-                self.status = Some((format!("{vm}: {s}"), Level::Info));
+                self.say(&format!("{vm}: {s}"), Level::Info);
                 if let Some(Overlay::Form(_, f)) = &mut self.overlay
                     && let Some((work, step)) = &mut f.busy
                     && *work == id
@@ -598,7 +684,10 @@ impl App {
                     }
                 };
                 match r {
-                    Ok(s) => self.say(&s, Level::Ok),
+                    Ok(said) => {
+                        self.say(&said.line, Level::Ok);
+                        self.stated = said.stated;
+                    }
                     Err(e) => {
                         self.say(&format!("{vm}: {e}"), Level::Error);
                         // It opens again as it was submitted, with the error to fix.
@@ -1084,7 +1173,8 @@ impl App {
                 self.activity.remove(&name);
                 self.spawn(&name, "powering off", move |p| {
                     runtime::stop(&vm, true, None, |s| p(s))?;
-                    Ok(format!("{}: powered off", vm.name()))
+                    let s = format!("{}: powered off", vm.name());
+                    Ok(Said::stating(s, vm.name(), None))
                 });
             }
         }
@@ -1094,9 +1184,9 @@ impl App {
 
     fn start(&mut self) {
         let Some(vm) = self.selected_vm() else { return };
-        if runtime::running(&vm) {
-            self.say(&format!("{} is already running", vm.name()), Level::Info);
-            return;
+        if let Some(p) = runtime::pid(&vm) {
+            let s = format!("{} is already running", vm.name());
+            return self.say_state(&s, Level::Info, vm.name(), Some(p));
         }
         // What runtime::warnings finds shows in the VM's details, not here.
         let host = self.host;
@@ -1115,15 +1205,15 @@ impl App {
                 s.push_str("; ");
                 s.push_str(n);
             }
-            Ok(s)
+            Ok(Said::stating(s, vm.name(), Some(started.pid)))
         });
     }
 
     fn stop(&mut self, force: bool) {
         let Some(vm) = self.selected_vm() else { return };
         if !runtime::running(&vm) {
-            self.say(&format!("{} is not running", vm.name()), Level::Info);
-            return;
+            let s = format!("{} is not running", vm.name());
+            return self.say_state(&s, Level::Info, vm.name(), None);
         }
         let timeout = vm.config.stop_timeout();
         let first = if force {
@@ -1133,7 +1223,8 @@ impl App {
         };
         self.spawn(&vm.config.name.clone(), first, move |p| {
             runtime::stop(&vm, force, timeout, |s| p(s))?;
-            Ok(format!("{}: stopped", vm.name()))
+            let s = format!("{}: stopped", vm.name());
+            Ok(Said::stating(s, vm.name(), None))
         });
     }
 
@@ -1141,8 +1232,7 @@ impl App {
         let Some(row) = self.selected() else { return };
         if row.pid.is_none() {
             let n = row.name.clone();
-            self.say(&format!("{n} is not running"), Level::Info);
-            return;
+            return self.say_state(&format!("{n} is not running"), Level::Info, &n, None);
         }
         let name = row.name.clone();
         self.overlay = Some(Overlay::Confirm {
@@ -1158,9 +1248,9 @@ impl App {
     fn ask_delete(&mut self) {
         let Some(row) = self.selected() else { return };
         let name = row.name.clone();
-        if row.pid.is_some() {
-            self.say(&format!("{name} is running: stop it first"), Level::Warn);
-            return;
+        if let Some(p) = row.pid {
+            let s = format!("{name} is running: stop it first");
+            return self.say_state(&s, Level::Warn, &name, Some(p));
         }
         let dir = paths::tilde(&row.dir);
         self.overlay = Some(Overlay::Confirm {
@@ -1200,9 +1290,9 @@ impl App {
             );
             return;
         };
-        if runtime::running(&vm) {
-            self.say(&format!("{name} is running: stop it first"), Level::Warn);
-            return;
+        if let Some(p) = runtime::pid(&vm) {
+            let s = format!("{name} is running: stop it first");
+            return self.say_state(&s, Level::Warn, &name, Some(p));
         }
         let image = vm.path(&q.opencore);
         let id = match opencore::Config::read(&image, q.opencore_format).and_then(|c| c.identity())
@@ -1598,8 +1688,8 @@ impl App {
         let Some(r) = self.selected() else { return };
         if r.pid.is_none() {
             let name = r.name.clone();
-            self.say(&format!("{name} is not running: s starts it"), Level::Warn);
-            return;
+            let s = format!("{name} is not running: s starts it");
+            return self.say_state(&s, Level::Warn, &name, None);
         }
         self.pending_view = self.selected_vm();
     }
@@ -2820,6 +2910,24 @@ fn ssh_port_field(f: &Form) -> Result<Option<u16>> {
     Ok(crate::vm::ssh_port(p))
 }
 
+/// How reims-vgpu's fatal line starts: the line the library writes to QEMU's stderr, in one
+/// write, as it ends the process (`abort`), and at no other time.
+const FATAL: &str = "reims-vgpu: fatal: ";
+
+/// reims-vgpu's fatal line in the QEMU log `log` since the VM's start: after the `----` that
+/// ends the command a start writes to the log ([`runtime::start`]), each start's log a new file.
+fn fatal_line(log: &std::path::Path) -> Option<String> {
+    let text = runtime::tail(log, usize::MAX);
+    let lines: Vec<&str> = text.lines().collect();
+    let run = match lines.iter().rposition(|l| l.trim() == "----") {
+        Some(i) => &lines[i + 1..],
+        None => &lines[..],
+    };
+    run.iter()
+        .rev()
+        .find_map(|l| l.find(FATAL).map(|i| l[i..].trim_end().to_string()))
+}
+
 /// Runs less on `files`, each at its end, in the terminal ([`crate::os::run_in_terminal`]).
 fn run_less(files: &[PathBuf]) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new("less");
@@ -3709,7 +3817,7 @@ mod tests {
             app.overlay = Some(Overlay::Form(FormKind::Create(Profile::Q35X86_64), f));
         };
         let done = |app: &mut App, id, r: Result<&str, &str>| {
-            let r = r.map(String::from).map_err(String::from);
+            let r = r.map(|s| Said::from(s.to_string())).map_err(String::from);
             app.message(Msg::Done("vm".into(), id, r));
         };
         let shown = |app: &App| match &app.overlay {
@@ -4451,5 +4559,121 @@ mod tests {
         let saved = Vm::load(&dir).unwrap().config;
         assert!(saved.logs.enabled);
         assert_eq!(saved.memory_mib, 8192);
+    }
+
+    /// A status line that states a VM's state says it again once each read of the VMs' states
+    /// finds it another: a start's "running" line says the VM stopped once its QEMU ends by
+    /// itself (the guest shut down, or its window was closed), with reims-vgpu's fatal error and
+    /// where the log is where QEMU's log since the start holds one; a line that it is not
+    /// running says it runs once it is started elsewhere. A line about another VM, an error, and
+    /// a VM this interface's work runs for stay as they are.
+    #[test]
+    fn a_line_stating_a_vms_state_says_it_again_once_the_state_changes() {
+        let env = crate::testenv::Env::new("tui-restate");
+        let mut reg = Registry::default();
+        let mut vms = Vec::new();
+        for name in ["t", "u"] {
+            let dir = env.root.join("vms").join(name);
+            std::fs::create_dir_all(dir.join("logs")).unwrap();
+            let config = format!(
+                r#"
+                name = "{name}"
+                profile = "q35-x86_64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "disk.qcow2"
+                [q35]
+                opencore = "opencore.qcow2"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
+                "#
+            );
+            std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+            reg.add(name, &dir).unwrap();
+            vms.push(Vm::load(&dir).unwrap());
+        }
+        reg.save().unwrap();
+        let (t, u) = (&vms[0], &vms[1]);
+        let mut app = App::with(LINUX);
+        let said = |app: &App| app.status.clone().unwrap();
+        let select = |app: &mut App, name: &str| {
+            let i = app.rows.iter().position(|r| r.name == name);
+            app.table.select(i);
+        };
+
+        // t runs, as its start says, until its QEMU ends by itself.
+        let mut qemu = crate::runtime::test_qemu(&t.pidfile(), 30);
+        let pid = qemu.id() as i32;
+        app.reload().unwrap();
+        let running = format!("t: running (pid {pid}); its window is open");
+        let start = Said::stating(running.clone(), "t", Some(pid));
+        app.message(Msg::Done("t".into(), 1, Ok(start)));
+        app.refresh_state();
+        assert_eq!(said(&app), (running, Level::Ok));
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        app.refresh_state();
+        assert_eq!(said(&app), ("t: stopped".into(), Level::Info));
+
+        // Started elsewhere, as by the CLI: the line says it runs, and, said again, it stopped.
+        let mut qemu = crate::runtime::test_qemu(&t.pidfile(), 30);
+        let pid = qemu.id() as i32;
+        app.refresh_state();
+        let now = (format!("t: running (pid {pid})"), Level::Info);
+        assert_eq!(said(&app), now);
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        app.reload().unwrap();
+        assert_eq!(said(&app), ("t: stopped".into(), Level::Info));
+
+        // While this interface's work runs for t, its end says what happened.
+        app.activity.insert("t".into(), "starting".into());
+        let mut qemu = crate::runtime::test_qemu(&t.pidfile(), 30);
+        app.refresh_state();
+        assert_eq!(said(&app).0, "t: stopped");
+        app.activity.clear();
+
+        // A line about u stays as t's state changes.
+        select(&mut app, "u");
+        press(&mut app, [KeyCode::Char('x')]);
+        let u_line = ("u is not running".to_string(), Level::Info);
+        assert_eq!(said(&app), u_line);
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        app.refresh_state();
+        assert_eq!(said(&app), u_line);
+
+        // A line that u is not running says it runs once it does.
+        let mut other = crate::runtime::test_qemu(&u.pidfile(), 30);
+        app.refresh_state();
+        let now = (format!("u: running (pid {})", other.id()), Level::Info);
+        assert_eq!(said(&app), now);
+        let _ = other.kill();
+        let _ = other.wait();
+
+        // reims-vgpu's fatal error in QEMU's log since the start is named, with where the log
+        // is: an error, which stays as the VM's state changes.
+        let mut qemu = crate::runtime::test_qemu(&t.pidfile(), 30);
+        app.refresh_state();
+        select(&mut app, "t");
+        press(&mut app, [KeyCode::Char('d')]);
+        assert_eq!(said(&app).0, "t is running: stop it first");
+        let log = "reims-ctl 0.1.0 started t at 2026-11-24 00:00:00 +0000\n\
+                   qemu-system-x86_64 \\\n  -name t\n----\n\
+                   reims-vgpu: fatal: display.pipeline.no_library\n";
+        std::fs::write(t.qemu_log(), log).unwrap();
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        app.refresh_state();
+        let fatal = format!(
+            "t: stopped: reims-vgpu: fatal: display.pipeline.no_library (its QEMU log: {})",
+            paths::tilde(&t.qemu_log())
+        );
+        assert_eq!(said(&app), (fatal.clone(), Level::Error));
+        let mut qemu = crate::runtime::test_qemu(&t.pidfile(), 30);
+        app.refresh_state();
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        assert_eq!(said(&app), (fatal, Level::Error));
     }
 }
