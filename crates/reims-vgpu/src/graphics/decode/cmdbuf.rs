@@ -193,6 +193,10 @@ const NAMES_AT_ONCE: usize = 128;
 /// again at each draw, and the read of a long one stops here.
 const NAMES_READ: usize = 1024;
 
+/// How many of the last names it read, each once, [`GraphicsDecoder::find_named`] keeps so as not
+/// to look at one again: a draw names the pipeline and buffers the draw before it named.
+const NAMES_RECENT: usize = 8;
+
 /// `MTLRenderStageFragment`: a render encoder's update of the writers' fence covers its fragment
 /// stage and every stage before it, its render targets' writes among them.
 const RENDER_STAGE_FRAGMENT: u64 = 0x2;
@@ -3602,7 +3606,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`View::find_all`]). The walk then answers them from the view's names, as it would have
     /// found them as it reached them, and takes no lock of the table's for them between the
     /// commands it encodes. A name the view found already is not looked for again, so a draw's
-    /// names, which the draws after it name again, are looked for once.
+    /// names, which the draws after it name again, are looked for once; one among the last
+    /// [`NAMES_RECENT`] it read is not looked at again.
     ///
     /// [`View::find_all`]: super::tables::View::find_all
     fn find_named(&self, ops: &[u8]) {
@@ -3615,9 +3620,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         let mut ids = [0u64; FOUND_A_HOLD];
         let (mut n, mut looked, mut read) = (0, 0, 0);
+        let (mut recent, mut kept) = ([0u64; NAMES_RECENT], 0);
         each_named(ops, |id| {
             read += 1;
-            if self.owned(id) && !view.found(id) {
+            let again = recent[..kept.min(NAMES_RECENT)].contains(&id);
+            if !again {
+                recent[kept % NAMES_RECENT] = id;
+                kept += 1;
+            }
+            if !again && self.owned(id) && !view.found(id) {
                 ids[n] = id;
                 n += 1;
                 looked += 1;
