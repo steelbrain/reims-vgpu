@@ -118,6 +118,9 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
             }
         }
     }
+    // The host's disks the VM is given: refused where the host uses one, as it may have since
+    // it was given.
+    crate::disks::check_start(vm, host)?;
     if host.os == Os::Linux && c.profile.accel(host) == "kvm" {
         let kvm = std::fs::OpenOptions::new()
             .read(true)

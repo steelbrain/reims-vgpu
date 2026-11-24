@@ -487,6 +487,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
         vmapple: None,
         extra_env: BTreeMap::new(),
         usb: vec![],
+        host_disks: vec![],
     }
 }
 

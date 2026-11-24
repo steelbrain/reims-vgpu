@@ -35,7 +35,8 @@
 //! hosts: guest RAM resident from the start" there); the keyboard and
 //! tablet on a qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's
 //! interrupt transfers under GPU load and its input freezes, with the host's USB devices the VM's
-//! settings give it beside them ([`crate::usb`]); fixed PCI addresses (the AHCI controller, which
+//! settings give it beside them ([`crate::usb`]); the host's whole disks its settings give it, on
+//! the free AHCI ports ([`crate::disks`]); fixed PCI addresses (the AHCI controller, which
 //! holds OpenCore's image, the installer and, on SATA, the system disk, at slot 2, where
 //! OpenCore's boot entries name it; on NVMe, the system disk's controller at slot 10, and on
 //! virtio, its virtio-blk device at slot 6, [`DiskController`]); `isa-applesmc` with Apple's SMC
@@ -94,7 +95,7 @@
 //! the tickets of its macOS are bound to. It runs on HVF on a Mac, with the GIC in the kernel, on
 //! KVM on arm64 Linux, and on TCG, a thread for each vCPU, on x86-64 ([`Profile::accel_arg`]). On
 //! Linux its RAM is a shared memfd, as the library there needs, not allocated as QEMU starts.
-//! It takes no host USB device, no VMware SVGA and no sound device.
+//! It takes no host USB device or disk, no VMware SVGA and no sound device.
 //!
 //! The xHCI controller has seven ports (`p2=7,p3=7`), each taking a USB 2 and a USB 3 device:
 //! the keyboard, the tablet, and up to [`crate::vm::USB_DEVICES_MAX`] host devices, at their
@@ -104,7 +105,7 @@
 //! so one port stays free. With as many USB 2 ports as USB 3 ones no port is USB 2 alone: QEMU
 //! gives a device the first free port, and one freed goes to the back of the line.
 
-use crate::host::{Host, Profile};
+use crate::host::{Host, Os, Profile};
 use crate::vm::{DiskController, Graphics, Vm};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -383,11 +384,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     }
     // The installer, on port 4, past OpenCore's, or on 5 past an AHCI disk on 4.
     if let Some(p) = q.installer.as_deref().map(|p| vm.path(p)) {
-        let port = if q.disk_controller == DiskController::Ahci && q.disk_port == 4 {
-            5
-        } else {
-            4
-        };
+        let port = q.installer_port();
         push(&[
             "-drive",
             &format!(
@@ -400,6 +397,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             &format!("ide-hd,bus=sata.{port},drive=installer"),
         ]);
     }
+    host_disks(vm, ctx, &mut push)?;
     if c.network.enabled {
         push(&["-netdev", &netdev(vm)]);
         push(&[
@@ -463,6 +461,44 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// The host's disks the VM's settings give it (disks.rs), on the AHCI ports its own disks leave
+/// free: each a raw node, named so and never probed, over QEMU's `host_device`, which opens only
+/// a block or character device, with the host's page cache bypassed and QEMU's lock on the
+/// disk's file; with no boot index, so none boots ahead of OpenCore's image.
+fn host_disks(vm: &Vm, ctx: &Ctx, push: &mut impl FnMut(&[&str])) -> Result<()> {
+    let c = &vm.config;
+    if c.host_disks.is_empty() {
+        return Ok(());
+    }
+    if ctx.host.os != Os::Linux {
+        bail!("{}", crate::disks::ONLY);
+    }
+    let q = c.q35.as_ref().context("no [q35] settings")?;
+    let ports = q.host_disk_ports();
+    if c.host_disks.len() > ports.len() {
+        bail!(
+            "{}: a VM takes {} of the host's disks at most",
+            c.name,
+            ports.len()
+        );
+    }
+    for (i, (d, port)) in c.host_disks.iter().zip(ports).enumerate() {
+        push(&[
+            "-blockdev",
+            &format!(
+                "driver=host_device,node-name=hostdisk{i}-file,filename={},cache.direct=on,\
+                 locking=on",
+                optp(&d.path)
+            ),
+            "-blockdev",
+            &format!("driver=raw,node-name=hostdisk{i},file=hostdisk{i}-file"),
+            "-device",
+            &format!("ide-hd,bus=sata.{port},drive=hostdisk{i}"),
+        ]);
+    }
+    Ok(())
+}
+
 /// The arm64 machine's options (the module doc), in the order Ambrosia's boot check gives them,
 /// which is the order QEMU gives the devices their PCI slots in.
 fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
@@ -477,6 +513,9 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     }
     if !c.usb.is_empty() {
         bail!("USB passthrough: {}", crate::host::X86_64_ONLY);
+    }
+    if !c.host_disks.is_empty() {
+        bail!("{}", crate::disks::ONLY);
     }
     let mem = format!("{}M", c.memory_mib);
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
@@ -725,6 +764,7 @@ mod tests {
                 vmapple: None,
                 extra_env: BTreeMap::new(),
                 usb: vec![],
+                host_disks: vec![],
             },
         }
     }
@@ -1152,6 +1192,84 @@ mod tests {
         // None chosen: none passed through, on the same controller.
         let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
         assert!(!a.iter().any(|x| x.starts_with("usb-host")), "{a:?}");
+    }
+
+    /// The host's disks a VM is given follow its own disks, each on a free AHCI port: a raw
+    /// node, never probed for an image format, over `host_device`, with the host's cache
+    /// bypassed and QEMU's lock on; with no boot index, so OpenCore's image, the only one with
+    /// one, boots first. None given, the command is as it was; another host or an arm64 VM
+    /// refuses them.
+    #[test]
+    fn host_disks_are_raw_drives_on_free_sata_ports_after_the_vms_own() {
+        let mut vm = q35_vm();
+        vm.config.q35.as_mut().unwrap().installer = Some("/isos/install.img".into());
+        vm.config.host_disks = vec![
+            HostDiskChoice {
+                path: "/dev/disk/by-id/ata-WDC_WD40EFRX-68N32N0_WD-WCC7K1234567".into(),
+                name: "WDC WD40EFRX-68N, 4 TB".into(),
+            },
+            HostDiskChoice {
+                path: "/dev/disk/by-id/usb-SanDisk_Cruzer_Blade_4C53-0:0".into(),
+                name: String::new(),
+            },
+        ];
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        let installer = a
+            .iter()
+            .position(|x| x == "ide-hd,bus=sata.4,drive=installer")
+            .unwrap();
+        assert_eq!(
+            a[installer + 1..installer + 13],
+            [
+                "-blockdev",
+                "driver=host_device,node-name=hostdisk0-file,\
+                 filename=/dev/disk/by-id/ata-WDC_WD40EFRX-68N32N0_WD-WCC7K1234567,\
+                 cache.direct=on,locking=on",
+                "-blockdev",
+                "driver=raw,node-name=hostdisk0,file=hostdisk0-file",
+                "-device",
+                "ide-hd,bus=sata.0,drive=hostdisk0",
+                "-blockdev",
+                "driver=host_device,node-name=hostdisk1-file,\
+                 filename=/dev/disk/by-id/usb-SanDisk_Cruzer_Blade_4C53-0:0,cache.direct=on,\
+                 locking=on",
+                "-blockdev",
+                "driver=raw,node-name=hostdisk1,file=hostdisk1-file",
+                "-device",
+                "ide-hd,bus=sata.1,drive=hostdisk1",
+            ]
+        );
+        let booting: Vec<&String> = a.iter().filter(|x| x.contains("bootindex")).collect();
+        assert_eq!(booting, ["ide-hd,bus=sata.2,drive=opencore,bootindex=1"]);
+        // A third takes port 5, past the installer's.
+        vm.config.host_disks.push(HostDiskChoice {
+            path: "/dev/loop7".into(),
+            name: String::new(),
+        });
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(
+            a.contains(&"ide-hd,bus=sata.5,drive=hostdisk2".to_string()),
+            "{a:?}"
+        );
+        // None given: no node and no drive of the host's.
+        let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
+        assert!(
+            !a.iter().any(|x| x == "-blockdev" || x.contains("hostdisk")),
+            "{a:?}"
+        );
+        // Windows passes none through, nor does an arm64 VM.
+        let windows = Host {
+            os: Os::Windows,
+            arch: crate::host::Arch::X86_64,
+        };
+        let e = invocation(&vm, &ctx(windows)).unwrap_err().to_string();
+        assert!(e.contains(crate::disks::ONLY), "{e}");
+        let mut arm = arm64_vm();
+        arm.config.host_disks = vm.config.host_disks.clone();
+        let e = invocation(&arm, &arm64_ctx(linux()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(crate::disks::ONLY), "{e}");
     }
 
     /// With logs off the library still logs its warnings; with logs on, at their level.

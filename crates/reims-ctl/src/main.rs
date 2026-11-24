@@ -7,6 +7,7 @@ mod ambrosia;
 mod cli;
 mod copy;
 mod create;
+mod disks;
 mod downloads;
 mod form;
 mod gpu;

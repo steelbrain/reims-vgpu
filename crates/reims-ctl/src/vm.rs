@@ -55,6 +55,10 @@ pub struct VmConfig {
     /// The host's USB devices the guest is given while the VM runs (usb.rs), x86-64 VMs'.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub usb: Vec<UsbDevice>,
+    /// The host's whole disks the guest is given while the VM runs (disks.rs), x86-64 VMs' on
+    /// Linux hosts: `[[host_disk]]` tables.
+    #[serde(default, rename = "host_disk", skip_serializing_if = "Vec::is_empty")]
+    pub host_disks: Vec<HostDiskChoice>,
 }
 
 fn default_stop_timeout() -> u64 {
@@ -464,6 +468,31 @@ pub struct Q35 {
     pub disk_port: u32,
 }
 
+impl Q35 {
+    /// The AHCI port the installer is attached at: 4, past OpenCore's 2 and the system disk's
+    /// 3, or 5 past an AHCI system disk on 4.
+    pub fn installer_port(&self) -> u32 {
+        if self.disk_controller == DiskController::Ahci && self.disk_port == 4 {
+            5
+        } else {
+            4
+        }
+    }
+
+    /// The AHCI ports the host's disks a VM is given take, in their order (disks.rs): ICH9's
+    /// six, less OpenCore's, 2, the system disk's where it is on AHCI, and the installer's,
+    /// whether one is attached or not, so a disk keeps its port as installers come and go.
+    pub fn host_disk_ports(&self) -> Vec<u32> {
+        (0..6)
+            .filter(|&p| {
+                p != 2
+                    && p != self.installer_port()
+                    && !(self.disk_controller == DiskController::Ahci && p == self.disk_port)
+            })
+            .collect()
+    }
+}
+
 /// An arm64 VM's own settings: what its restore left beside its disk (restore.rs).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Vmapple {
@@ -582,6 +611,18 @@ impl UsbDevice {
     }
 }
 
+/// A whole disk of the host's that the guest is given while the VM runs (disks.rs): one
+/// `[[host_disk]]` table of the settings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostDiskChoice {
+    /// Its file: its link in `/dev/disk/by-id`, which follows the disk across reboots and
+    /// ports, or a loop device's file in `/dev`.
+    pub path: PathBuf,
+    /// Its name and size when it was chosen, shown while it is not attached.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
 /// A USB port's name as Linux gives it (`3-2.1`): its bus, and the port numbers from the bus's
 /// root hub, at most 7 (USB's tiers).
 pub fn parse_usb_port(p: &str) -> Option<(u32, &str)> {
@@ -611,6 +652,7 @@ impl VmConfig {
         }
         check_mac(&self.network.mac)?;
         self.check_usb()?;
+        self.check_host_disks()?;
         match self.profile {
             Profile::Q35X86_64 if self.q35.is_none() => {
                 bail!("{}: no [q35] settings", self.name)
@@ -640,6 +682,39 @@ impl VmConfig {
                 .any(|o| crate::usb::qemu_id(o) == crate::usb::qemu_id(u))
             {
                 bail!("{}: USB device {} is chosen twice", self.name, u.id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses host disks the VM cannot be given: more than the SATA ports its own disks leave
+    /// free ([`Q35::host_disk_ports`]), one chosen twice, and a file outside `/dev`.
+    fn check_host_disks(&self) -> Result<()> {
+        if let Some(q) = &self.q35 {
+            let n = q.host_disk_ports().len();
+            if self.host_disks.len() > n {
+                bail!(
+                    "{}: a VM takes {n} of the host's disks at most, on the SATA ports its own \
+                     disks leave free, not {}",
+                    self.name,
+                    self.host_disks.len()
+                );
+            }
+        }
+        for (i, d) in self.host_disks.iter().enumerate() {
+            if !d.path.starts_with("/dev") {
+                bail!(
+                    "{}: a disk of the host's is a file in /dev, not {}",
+                    self.name,
+                    d.path.display()
+                );
+            }
+            if self.host_disks[..i].iter().any(|o| o.path == d.path) {
+                bail!(
+                    "{}: the disk {} is chosen twice",
+                    self.name,
+                    d.path.display()
+                );
             }
         }
         Ok(())
@@ -1197,7 +1272,66 @@ pub(crate) mod tests {
             vmapple: None,
             extra_env: BTreeMap::from([("A".into(), "b".into())]),
             usb: vec![],
+            host_disks: vec![],
         }
+    }
+
+    /// The host's disks a VM is given are kept as `[[host_disk]]` tables, each once, by a file
+    /// in /dev, and no more than the SATA ports the VM's own disks leave free: OpenCore's 2, an
+    /// AHCI system disk's, and the installer's, attached or not.
+    #[test]
+    fn host_disks_are_checked_against_the_free_sata_ports() {
+        let mut c = x86_64_config();
+        let d = |p: &str| HostDiskChoice {
+            path: p.into(),
+            name: String::new(),
+        };
+        c.host_disks = vec![HostDiskChoice {
+            path: "/dev/disk/by-id/ata-WDC_WD40EFRX_1".into(),
+            name: "WDC WD40EFRX, 4 TB".into(),
+        }];
+        assert!(c.check().is_ok());
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        assert!(
+            text.ends_with(
+                "\n[[host_disk]]\npath = \"/dev/disk/by-id/ata-WDC_WD40EFRX_1\"\n\
+                 name = \"WDC WD40EFRX, 4 TB\"\n"
+            ),
+            "{text}"
+        );
+        let refused = |c: &VmConfig| format!("{:#}", c.check().unwrap_err());
+        // On NVMe, with the installer on 4: ports 0, 1, 3 and 5.
+        let q = c.q35.clone().unwrap();
+        assert_eq!(q.host_disk_ports(), [0, 1, 3, 5]);
+        c.host_disks = (1..=5)
+            .map(|i| d(&format!("/dev/disk/by-id/ata-D_{i}")))
+            .collect();
+        assert!(
+            refused(&c).contains("4 of the host's disks at most"),
+            "{}",
+            refused(&c)
+        );
+        c.host_disks.pop();
+        assert!(c.check().is_ok());
+        // On SATA at 3: 0, 1 and 5; at 4, the installer goes to 5: 0, 1 and 3.
+        let sata = |port| Q35 {
+            disk_controller: DiskController::Ahci,
+            disk_port: port,
+            ..q.clone()
+        };
+        assert_eq!(sata(3).host_disk_ports(), [0, 1, 5]);
+        assert_eq!(sata(4).host_disk_ports(), [0, 1, 3]);
+        c.q35 = Some(sata(3));
+        assert!(
+            refused(&c).contains("3 of the host's disks at most"),
+            "{}",
+            refused(&c)
+        );
+        c.host_disks = vec![d("/dev/sdb"), d("/dev/sdb")];
+        assert!(refused(&c).contains("chosen twice"), "{}", refused(&c));
+        c.host_disks = vec![d("/home/u/disk.img")];
+        assert!(refused(&c).contains("a file in /dev"), "{}", refused(&c));
     }
 
     /// The USB devices a VM is given are kept as `[[usb]]` tables, checked as QEMU takes them:
