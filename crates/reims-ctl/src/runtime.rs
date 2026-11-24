@@ -515,6 +515,7 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
         Profile::Q35X86_64 => None,
     };
     let avx512_xstate = avx512_xstate(vm, host, &qemu);
+    let smbios_memory_type = smbios_memory_type(vm, &qemu);
     Ok(Ctx {
         host,
         qemu,
@@ -522,6 +523,7 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
         sound: crate::os::sound_devices(),
         nested_vmx: crate::host::kvm_nested_vmx(),
         avx512_xstate,
+        smbios_memory_type,
         screen,
         graphics_rom: graphics_rom(vm)?,
         arm64,
@@ -538,6 +540,12 @@ fn avx512_xstate(vm: &Vm, host: Host, qemu: &Path) -> bool {
             || crate::opencore::holds_guest_kexts(vm),
             || crate::install::cpu_has_property(qemu, "x-avx512-xstate") == Some(true),
         )
+}
+
+/// Whether an x86-64 VM's memory devices get SMBIOS's Memory Type: where `qemu` takes the option
+/// ([`crate::install::smbios_takes_memory_type`]). An arm64 VM's command has no `-smbios`.
+fn smbios_memory_type(vm: &Vm, qemu: &Path) -> bool {
+    vm.config.profile == Profile::Q35X86_64 && crate::install::smbios_takes_memory_type(qemu)
 }
 
 /// The option ROM of reims-vgpu's own device, written into the data directory for an x86-64 VM
@@ -592,6 +600,7 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
     let ctx = context(vm, host).unwrap_or_else(|_| {
         let qemu = crate::install::qemu_binary_or_default(vm.config.profile);
         let avx512_xstate = avx512_xstate(vm, host, &qemu);
+        let smbios_memory_type = smbios_memory_type(vm, &qemu);
         Ctx {
             host,
             qemu,
@@ -599,6 +608,7 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
             sound: crate::os::sound_devices(),
             nested_vmx: crate::host::kvm_nested_vmx(),
             avx512_xstate,
+            smbios_memory_type,
             screen: crate::host::has_screen(&vm.config.extra_env),
             graphics_rom: graphics_rom(vm).unwrap_or_else(|_| crate::prebuilt::graphics_rom_path()),
             arm64: (vm.config.profile == Profile::VmappleArm64).then(|| qemu::Arm64Boot {

@@ -222,6 +222,35 @@ fn lists_property(out: &str, name: &str) -> bool {
     })
 }
 
+/// What `qemu -smbios type=17,memory_type=26 -version` answered, by binary and its modification
+/// time.
+type SmbiosProbes = HashMap<(PathBuf, Option<std::time::SystemTime>), bool>;
+
+/// Whether `qemu` takes `-smbios type=17`'s `memory_type`, the memory devices' SMBIOS Memory
+/// Type, which reims-vgpu's QEMU has since vendor/qemu's `0c91b471`. A QEMU without it, upstream's
+/// or one built from an older tree (`REIMS_CTL_QEMU` names any), ends at its start on the option.
+/// QEMU takes its options in order, so it checks `-smbios` and exits with an error before
+/// `-version` prints and exits with 0. Cached per binary, by its path and modification time; false
+/// where QEMU does not run.
+pub fn smbios_takes_memory_type(qemu: &Path) -> bool {
+    static CACHE: OnceLock<Mutex<SmbiosProbes>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mtime = std::fs::metadata(qemu).and_then(|m| m.modified()).ok();
+    let key = (qemu.to_path_buf(), mtime);
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return *v;
+    }
+    let takes = std::process::Command::new(qemu)
+        .args(["-smbios", "type=17,memory_type=26", "-version"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    cache.lock().unwrap().insert(key, takes);
+    takes
+}
+
 /// The audio backend to use where the VM names none: the host's native one, among those built
 /// (DirectSound's on Windows).
 pub fn default_audio_backend(available: &[String]) -> String {
@@ -283,6 +312,17 @@ mod tests {
         assert!(!lists_property(out, "x-avx512"));
         let none = "There are no options for qemu64-x86_64-cpu.\n";
         assert!(!lists_property(none, "x-avx512-xstate"));
+    }
+
+    /// A QEMU that does not run, or that refuses the probe's options, takes no `memory_type`:
+    /// this test binary stands for one that refuses them, as libtest ends on an option it does
+    /// not know.
+    #[test]
+    fn a_qemu_that_refuses_the_probe_takes_no_memory_type() {
+        let missing = std::env::temp_dir().join("reims-ctl-no-such-qemu");
+        assert!(!smbios_takes_memory_type(&missing));
+        let refuses = std::env::current_exe().unwrap();
+        assert!(!smbios_takes_memory_type(&refuses));
     }
 
     /// The installer's prune keeps a build older than the newest three while a QEMU runs from

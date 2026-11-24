@@ -2101,6 +2101,43 @@ vCPU `vmx` with `vmx=on` and with `vmx=on,+ssse3`, and none with
 
 **Unknown**: a VM run inside the guest.
 
+### x86-64 macOS guests: About This Mac
+
+About This Mac, Settings' About and System Information take an x86-64
+guest's processor name and memory from the SMBIOS tables OpenCore makes
+(reims-util's images: PlatformInfo `Automatic`, `UpdateSMBIOSMode`
+`Create`), not from CPUID's brand string.
+
+- **The processor's name** is macOS's own, looked up by Apple's type 131,
+  a processor-type code. OpenCore always writes that structure itself
+  (`CreateAppleProcessorType`), dropping any 131 QEMU gives, from
+  PlatformInfo's `ProcessorType`. reims-util leaves it at 0, automatic:
+  OcCpuLib picks it from the brand string's "Core i3/i5/i7/i9" or "Xeon"
+  and the CPU model. QEMU's Skylake-Client-noTSX-IBRS ("Intel Core
+  Processor (Skylake, IBRS, no TSX)", model 0x5E) gets 0x0905, Core i3
+  type 5, which macOS has no name for, so it shows "Unknown". A brand
+  string set with `-cpu ...,model-id=` reaches `machdep.cpu.brand_string`
+  and nothing in these panes. Only names macOS has can show.
+- **The memory** shows its size, speed and kind from type 17. OpenCore
+  copies its Memory Type, Speed and Configured Memory Speed from QEMU's,
+  and QEMU writes 0 and 7 ("RAM") unless told otherwise. `reims-ctl` gives
+  `-smbios type=17,speed=2666,memory_type=26`: 2666 MHz DDR4, the RAM of
+  both Macs a VM presents, iMac20,1 and iMacPro1,1 (OpenCore's model
+  database). `memory_type` is vendor/qemu's option; `reims-ctl` passes it
+  only to a QEMU that takes it, asked once per binary with
+  `-smbios type=17,memory_type=26 -version`, and another QEMU's guest keeps
+  "RAM".
+
+**Measured** on a Ryzen 7 7840HS host with an x86-64 macOS 26.7.2 guest
+(iMac20,1), from `system_profiler SPHardwareDataType SPMemoryDataType`, the
+guest's SMBIOS (ioreg's `AppleSMBIOS`) and screendumps of the panes:
+
+| QEMU command, OpenCore | type 131 | type 17 | Processor | Memory |
+|---|---|---|---|---|
+| before this change | 0x0905 | 0 MHz, 7 | "3.8 GHz Unknown" (SPHardware "Unknown"; Settings shows "3.8 GHz") | "16 GB RAM"; SPMemory "Speed: 0 MHz", "Type: RAM" |
+| `model-id=` the host's brand, `speed=2667` | 0x0905 | 2667 MHz, 7 | "Unknown" | "16 GB 2667 MHz RAM" |
+| the same, `ProcessorType` 0x0709 | 0x0709 | 2667 MHz, 7 | "3.8 GHz 8-Core Intel Core i7" | "16 GB 2667 MHz RAM" |
+
 ### x86-64 macOS guests: the SMC
 
 An x86-64 guest's SMC is QEMU's `isa-applesmc`: `reims-ctl` gives every

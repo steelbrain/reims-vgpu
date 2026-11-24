@@ -143,6 +143,9 @@ pub struct Ctx {
     /// Whether the guest's CPU lists the AVX-512 state components in CPUID leaf 0xD, QEMU's
     /// `x-avx512-xstate` ([`avx512_xstate`]).
     pub avx512_xstate: bool,
+    /// Whether QEMU takes `-smbios type=17`'s `memory_type`
+    /// ([`crate::install::smbios_takes_memory_type`]).
+    pub smbios_memory_type: bool,
     /// Whether QEMU's own window can open ([`crate::host::has_screen`]).
     pub screen: bool,
     /// The option ROM of reims-vgpu's own device, which its `romfile` names
@@ -350,6 +353,16 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         ),
     ]);
     push(&["-smbios", "type=2"]);
+    // The memory as the presented Mac has it: iMac20,1 and iMacPro1,1 both ship 2666 MHz DDR4
+    // (OpenCore's model database), where QEMU's memory devices are 0 MHz "RAM". OpenCore copies
+    // both fields into the guest's SMBIOS, and About This Mac shows them ("x86-64 macOS guests:
+    // About This Mac", docs/qemu.md). The kind, SMBIOS's Memory Type 26 (DDR4), is an option of
+    // reims-vgpu's QEMU alone; another QEMU keeps "RAM".
+    let mut memory = String::from("type=17,speed=2666");
+    if ctx.smbios_memory_type {
+        memory.push_str(",memory_type=26");
+    }
+    push(&["-smbios", &memory]);
     push(&["-device", "ich9-ahci,id=sata,addr=0x2"]);
     push(&[
         "-drive",
@@ -827,6 +840,7 @@ mod tests {
             },
             nested_vmx: false,
             avx512_xstate: false,
+            smbios_memory_type: true,
             screen: true,
             graphics_rom: "/d/firmware/ReimsGraphics-0123456789abcdef.rom".into(),
             arm64: None,
@@ -1194,6 +1208,8 @@ mod tests {
             "if=pflash,format=raw,file=/vms/t/OVMF_VARS.fd",
             "-smbios",
             "type=2",
+            "-smbios",
+            "type=17,speed=2666,memory_type=26",
             "-device",
             "ich9-ahci,id=sata,addr=0x2",
             "-drive",
@@ -1547,6 +1563,30 @@ mod tests {
         assert!(!decide(true, ZEN4, false, true));
         assert_eq!(*asked.borrow(), ["kexts"]);
         assert!(!decide(true, ZEN4, true, false));
+    }
+
+    /// A q35 VM's memory devices get 2666 MHz on every QEMU, and DDR4 (Memory Type 26) only
+    /// where QEMU takes `memory_type`: on one that does not, the VM still starts, its memory
+    /// showing as "RAM".
+    #[test]
+    fn memory_type_only_where_qemu_takes_it() {
+        let smbios = |smbios_memory_type| {
+            let c = Ctx {
+                smbios_memory_type,
+                ..ctx(linux())
+            };
+            let inv = invocation(&q35_vm(), &c).unwrap();
+            inv.args
+                .windows(2)
+                .filter(|w| w[0] == "-smbios")
+                .map(|w| w[1].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            smbios(true),
+            ["type=2", "type=17,speed=2666,memory_type=26"]
+        );
+        assert_eq!(smbios(false), ["type=2", "type=17,speed=2666"]);
     }
 
     /// `x-avx512-xstate=on` comes after `vmx=on` and before the VM's `cpu_flags`, so a VM's
