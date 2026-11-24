@@ -61,6 +61,15 @@
 //! [`HostVm::view_room`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_room
 //! [`HostVm::view_mappings`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_mappings
 //!
+//! **The cache's debug lines** (target `reims_vgpu::graphics::surface_pages`, a diagnostic). Each
+//! pages block's view is logged as taken from the cache or made anew, and as kept in the cache or
+//! let go of at its block's release. Each view the cache lets go of is logged with what chose it
+//! (past [`CACHED_VIEWS`] views, past [`CACHED_BYTES`], past the unheld views' mappings, or room
+//! for a view being made) and the cache's load after it. Every line names the view's runs by
+//! one hash of them ([`runs_hash`]), so a view made anew that matches a view let go of before
+//! shows which bound made the guest's block over the same pages pay for its view again. The
+//! hash and the counts are computed only where the lines are on.
+//!
 //! The runs are the guest's: each must be whole pages of the guest's (4 KiB) and of the host's
 //! from a page, lie in guest RAM, and the runs must sum to the surface's length; else the block
 //! gets no view, `SURFACE_PAGES` is refused, and the kext gives the surface a copy block instead.
@@ -363,6 +372,54 @@ pub(crate) const CACHED_BYTES: u64 = 1 << 30;
 /// module doc): a cached view's share of [`CACHED_BYTES`], 32 MiB, so no one view pushes the rest
 /// out.
 pub(crate) const CACHED_PAGES_BYTES: u64 = CACHED_BYTES / CACHED_VIEWS as u64;
+
+/// The target of the views' debug lines (the module doc, "The cache's debug lines").
+const VIEWS_TARGET: &str = "reims_vgpu::graphics::surface_pages";
+
+/// What let go of a view the cache kept, as the views' debug lines name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LetGo {
+    /// Past [`CACHED_VIEWS`] views, the oldest first.
+    Views,
+    /// Past [`CACHED_BYTES`], the oldest first.
+    Bytes,
+    /// Past the mappings the platform answers for the views no block holds
+    /// ([`HostVm::idle_view_mappings`]), the oldest of them first.
+    ///
+    /// [`HostVm::idle_view_mappings`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::idle_view_mappings
+    IdleMappings,
+    /// A view being made lacked the platform's room for its mappings
+    /// ([`SurfaceViews::make_room_for`]).
+    Room,
+}
+
+impl LetGo {
+    /// The name the debug lines give it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Views => "views",
+            Self::Bytes => "bytes",
+            Self::IdleMappings => "idle mappings",
+            Self::Room => "room",
+        }
+    }
+}
+
+/// Whether the views' debug lines are on: what they need is computed only then.
+fn views_debug() -> bool {
+    log::log_enabled!(target: VIEWS_TARGET, log::Level::Debug)
+}
+
+/// The 64-bit FNV-1a hash of `runs`, in order, each its address and length as little-endian
+/// `u64`s: the same for the same pages in the same order, by which the views' debug lines match
+/// a view made, kept, taken and let go of across the blocks over its pages.
+fn runs_hash(runs: &[(u64, u64)]) -> u64 {
+    (runs.iter())
+        .flat_map(|&(address, length)| address.to_le_bytes().into_iter().chain(length.to_le_bytes()))
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
 
 /// The surface worker's key of what is let go of there wherever its last hold goes: a view's
 /// mapping ([`SurfaceView`]'s drop), and a `Managed` buffer's CPU copy's buffer, which a
@@ -1566,8 +1623,13 @@ impl<P: Platform> SurfaceViews<P> {
         let mut evicted = Vec::new();
         let mut bytes: u64 = self.cache.iter().map(|c| c.view.length()).sum();
         while self.cache.len() > CACHED_VIEWS || (bytes > CACHED_BYTES && self.cache.len() > 1) {
+            let why = match self.cache.len() > CACHED_VIEWS {
+                true => (LetGo::Views, CACHED_VIEWS.to_u64()),
+                false => (LetGo::Bytes, CACHED_BYTES),
+            };
             if let Some(old) = self.cache.pop_front() {
                 bytes -= old.view.length();
+                self.log_let_go(&old, why);
                 evicted.push(old);
             }
         }
@@ -1585,6 +1647,7 @@ impl<P: Platform> SurfaceViews<P> {
                 };
                 mappings -= old.runs.len().to_u64();
                 self.counts.idle_returned += 1;
+                self.log_let_go(&old, (LetGo::IdleMappings, bound));
                 evicted.push(old);
             }
         }
@@ -1665,7 +1728,40 @@ impl<P: Platform> SurfaceViews<P> {
             .filter_map(|at| self.cache.remove(at))
             .collect();
         self.counts.idle_returned += evicted.len().to_u64();
+        for old in &evicted {
+            self.log_let_go(old, (LetGo::Room, short));
+        }
         evicted
+    }
+
+    /// The cache's views, the bytes they map, and the mappings of those no block holds, a
+    /// mapping a run: the load the views' debug lines give.
+    fn cache_load(&self) -> (usize, u64, u64) {
+        let bytes = self.cache.iter().map(|c| c.view.length()).sum();
+        let idle = (self.cache.iter())
+            .filter(|c| c.idle())
+            .map(|c| c.runs.len().to_u64())
+            .sum();
+        (self.cache.len(), bytes, idle)
+    }
+
+    /// The debug line of `old`'s let-go from the cache, chosen by `why` against its bound (views,
+    /// bytes or mappings), with the cache's load after it.
+    fn log_let_go(&self, old: &Cached<P>, (why, bound): (LetGo, u64)) {
+        if !views_debug() {
+            return;
+        }
+        let (views, bytes, idle) = self.cache_load();
+        log::debug!(
+            target: VIEWS_TARGET,
+            "a cached view let go of ({}, {}): runs {:016x}, {} runs, {:#x} bytes; the cache then \
+             holds {views} views of {bytes:#x} bytes, {idle} mappings unheld; the bound {bound}",
+            why.name(),
+            if old.idle() { "unheld" } else { "held by a block" },
+            runs_hash(&old.runs),
+            old.runs.len(),
+            old.view.length()
+        );
     }
 
     /// The buffer over the whole of the view of the block at `block` that holds its import, one
@@ -1762,7 +1858,7 @@ impl<P: Platform> SurfaceViews<P> {
         block_size: u64,
         context: Option<u32>,
     ) -> RaiseResult<Option<Arc<SurfaceView<P>>>> {
-        let (runs, length, copies, imports, (access, why), owner) = {
+        let (runs, length, copies, imports, (access, why), owner, load) = {
             let mut v = views.lock();
             let Some(p) = (v.private.get(&block))
                 .filter(|p| block_size <= p.block_size && context.is_none_or(|c| c == p.context))
@@ -1776,6 +1872,16 @@ impl<P: Platform> SurfaceViews<P> {
             let (access, why) = (p.access, p.why);
             let owner = p.context;
             if let Some(view) = v.take_cached(block, &runs, access) {
+                drop(v);
+                if views_debug() {
+                    log::debug!(
+                        target: VIEWS_TARGET,
+                        "the pages block at {block:#x} of context {owner}: its view taken from \
+                         the cache: runs {:016x}, {} runs, {length:#x} bytes",
+                        runs_hash(&runs),
+                        runs.len()
+                    );
+                }
                 return Ok(Some(view));
             }
             if v.memory.is_none() {
@@ -1789,8 +1895,19 @@ impl<P: Platform> SurfaceViews<P> {
                 v.known_imports.clone(),
                 (access, why),
                 owner,
+                views_debug().then(|| v.cache_load()),
             )
         };
+        if let Some((views, bytes, idle)) = load {
+            log::debug!(
+                target: VIEWS_TARGET,
+                "the pages block at {block:#x} of context {owner}: its view is not in the cache, \
+                 made anew: runs {:016x}, {} runs, {length:#x} bytes; the cache holds {views} \
+                 views of {bytes:#x} bytes, {idle} mappings unheld",
+                runs_hash(&runs),
+                runs.len()
+            );
+        }
         let clock = platform.clock();
         Self::make_room_for(views, platform, runs.len());
         let start = clock.now_mono();
@@ -2086,7 +2203,22 @@ impl<P: Platform> SurfaceViews<P> {
             && let Some((made, import)) = p.view.take()
         {
             let cached = (self.cache.iter()).any(|c| Arc::ptr_eq(&c.view, &made));
-            if cached || made.length() > CACHED_PAGES_BYTES {
+            let large = !cached && made.length() > CACHED_PAGES_BYTES;
+            if views_debug() {
+                log::debug!(
+                    target: VIEWS_TARGET,
+                    "the pages block at {offset:#x} released: its view {}: runs {:016x}, {} runs, \
+                     {:#x} bytes",
+                    match large {
+                        true => "let go of (too large to cache)",
+                        false => "kept in the cache",
+                    },
+                    runs_hash(&p.runs),
+                    p.runs.len(),
+                    made.length()
+                );
+            }
+            if cached || large {
                 p.view = Some((made, import));
             } else {
                 let access = match p.known {
@@ -4858,6 +4990,78 @@ pub(super) mod tests {
         r.dec.surface_worker().flush();
         assert_eq!(r.dec.views_of_surfaces().len().1, 1, "the first view alone");
         assert_eq!(Arc::strong_count(&big_view), 1, "only the test holds it");
+    }
+
+    /// The views' debug lines name a pages block's runs by one hash: its view made anew, kept in
+    /// the cache at its block's release, taken from the cache by a block over the same runs, and
+    /// let go of past the unheld views' mappings, with that bound named; blocks over other runs
+    /// have other hashes
+    #[test]
+    fn the_views_debug_lines_name_a_view_s_runs_by_one_hash() {
+        let mut r = rig(64);
+        let page = r.page;
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let cycle = |r: &mut Rig, block: u64, runs: &[(u64, u64)], obj_id: u64| {
+            let private = RGFX_SURFACE_PAGES_PRIVATE;
+            let length = runs.iter().map(|&(_, pages)| pages).sum::<u64>() * page;
+            assert_eq!(
+                r.pages_flagged(block, 0, runs, length, private),
+                RGFX_STATUS_OK
+            );
+            assert_eq!(r.pages_buffer(obj_id, 0, block, 0, page), Ok(()));
+            let m = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+            r.dec
+                .block_released(&r.device, block, 0, || (), Box::new(|| ()), no_raise());
+            r.dec.surface_worker().flush();
+        };
+        cycle(&mut r, BLOCK, &[(5, 1), (1, 1)], 10);
+        cycle(&mut r, BLOCK + 0x8000, &[(5, 1), (1, 1)], 11);
+        cycle(&mut r, BLOCK + 0x10000, &[(8, 1), (10, 1)], 12);
+        // Four mappings unheld, past three: the next view cached lets go of the oldest.
+        r.p.fake_vm().set_idle_view_mappings(Some(3));
+        cycle(&mut r, BLOCK + 0x18000, &[(12, 1)], 13);
+
+        // Each views' line: what it says of the view, and the hash it names.
+        let lines: Vec<(&str, String)> = (logs.take().into_iter())
+            .filter(|(level, target, _)| *level == log::Level::Debug && target == VIEWS_TARGET)
+            .filter_map(|(_, _, line)| {
+                let what = [
+                    "taken from the cache",
+                    "not in the cache, made anew",
+                    "kept in the cache",
+                    "let go of (idle mappings, unheld)",
+                ]
+                .into_iter()
+                .find(|what| line.contains(what))?;
+                let hash = line.split("runs ").nth(1)?.split(',').next()?.to_owned();
+                Some((what, hash))
+            })
+            .collect();
+        let hash = |at: usize| lines.get(at).map(|(_, hash)| hash.clone()).expect("a line");
+        let (first, second, third) = (hash(0), hash(4), hash(6));
+        assert!(
+            first != second && first != third && second != third,
+            "other runs, another hash"
+        );
+        assert_eq!(
+            lines,
+            [
+                ("not in the cache, made anew", first.clone()),
+                ("kept in the cache", first.clone()),
+                ("taken from the cache", first.clone()),
+                ("kept in the cache", first.clone()),
+                ("not in the cache, made anew", second.clone()),
+                ("kept in the cache", second),
+                ("not in the cache, made anew", third.clone()),
+                ("kept in the cache", third),
+                ("let go of (idle mappings, unheld)", first),
+            ]
+        );
+        assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 1);
     }
 
     /// A pages block of pages its process maps read-only (`RGFX_SURFACE_PAGES_READ_ONLY`) holds a
