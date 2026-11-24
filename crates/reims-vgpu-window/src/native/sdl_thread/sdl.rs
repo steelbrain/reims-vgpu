@@ -42,6 +42,7 @@ use super::input::{self, At, Wheel};
 use super::keymap;
 use super::render::Target;
 use crate::beyond::Hold;
+use crate::capture::Capture;
 use crate::geometry::{Insets, Rect};
 use crate::handle::Window;
 use crate::screens;
@@ -192,12 +193,15 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
     Some(Opened {
         sdl,
         asked: size,
-        input: Input(input::Input::with_links(
-            callbacks
-                .as_ref()
-                .and_then(|callbacks| callbacks.beyond.clone()),
-            callbacks.and_then(|callbacks| callbacks.motion),
-        )),
+        input: Input(
+            input::Input::with_links(
+                callbacks
+                    .as_ref()
+                    .and_then(|callbacks| callbacks.beyond.clone()),
+                callbacks.and_then(|callbacks| callbacks.motion),
+            )
+            .with_capture(Capture::with_setting(crate::env::settings().capture)),
+        ),
         state: State { display },
     })
 }

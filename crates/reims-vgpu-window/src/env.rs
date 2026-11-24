@@ -10,6 +10,10 @@
 //!   place of AppKit's, in a build with the `macos-sdl` feature, on by default (one without it
 //!   logs that, and opens AppKit's). Default: AppKit's. Linux has SDL3's alone, and reads no
 //!   value.
+//! - `REIMS_VGPU_WINDOW_CAPTURE`: `0`, `false`, `no` or `off`, in any case, turns capture off:
+//!   no window ever captures the keyboard or the pointer ([`crate::capture`]). `1`, `true`,
+//!   `yes` or `on` turns it on. Default: [`CAPTURE_DEFAULT`]. reims-ctl sets it from a VM's
+//!   settings.
 
 use std::sync::OnceLock;
 
@@ -19,9 +23,14 @@ pub const BORDERLESS_VAR: &str = "REIMS_VGPU_WINDOW_BORDERLESS";
 pub const SCREENS_VAR: &str = "REIMS_VGPU_WINDOW_SCREENS";
 /// The window implementation's variable (macOS).
 pub const IMPL_VAR: &str = "REIMS_VGPU_WINDOW_IMPL";
+/// The capture switch's variable.
+pub const CAPTURE_VAR: &str = "REIMS_VGPU_WINDOW_CAPTURE";
+
+/// Whether a click into the image captures input where the capture switch is unset.
+pub const CAPTURE_DEFAULT: bool = true;
 
 /// What the variables say.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     /// Borderless windows that fill their screens.
     pub borderless: bool,
@@ -29,6 +38,19 @@ pub struct Settings {
     pub screens: Vec<usize>,
     /// Which window a display opens on macOS.
     pub window_impl: WindowImpl,
+    /// Whether a click into the image captures input; off, nothing ever does.
+    pub capture: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            borderless: false,
+            screens: Vec::new(),
+            window_impl: WindowImpl::AppKit,
+            capture: CAPTURE_DEFAULT,
+        }
+    }
 }
 
 /// Which window a display opens on macOS (`REIMS_VGPU_WINDOW_IMPL`). Linux has SDL3's alone.
@@ -55,7 +77,18 @@ pub fn parse(borderless: Option<&str>, screens: Option<&str>) -> Settings {
     Settings {
         borderless: borderless.is_some_and(parse_switch),
         screens: screens.and_then(parse_screens).unwrap_or_default(),
-        window_impl: WindowImpl::AppKit,
+        ..Settings::default()
+    }
+}
+
+/// Whether capture is on, as the capture switch's value says: off for `0`, `false`, `no` and
+/// `off`, on for `1`, `true`, `yes` and `on`, in any case and spaces aside, else
+/// [`CAPTURE_DEFAULT`].
+pub fn parse_capture(value: Option<&str>) -> bool {
+    match value {
+        Some(value) if parse_switch(value) => true,
+        Some(value) if parse_off(value) => false,
+        _ => CAPTURE_DEFAULT,
     }
 }
 
@@ -65,6 +98,14 @@ fn parse_switch(value: &str) -> bool {
     ["1", "true", "yes", "on"]
         .iter()
         .any(|on| value.eq_ignore_ascii_case(on))
+}
+
+/// Whether a switch's value turns it off.
+fn parse_off(value: &str) -> bool {
+    let value = value.trim();
+    ["0", "false", "no", "off"]
+        .iter()
+        .any(|off| value.eq_ignore_ascii_case(off))
 }
 
 /// A list of screen indices, or `None` if any entry is not one.
@@ -84,6 +125,7 @@ pub fn settings() -> &'static Settings {
         let (borderless, screens) = (var(BORDERLESS_VAR), var(SCREENS_VAR));
         Settings {
             window_impl: parse_impl(var(IMPL_VAR).as_deref()),
+            capture: parse_capture(var(CAPTURE_VAR).as_deref()),
             ..parse(borderless.as_deref(), screens.as_deref())
         }
     })
@@ -137,6 +179,20 @@ mod tests {
             assert_eq!(parse_impl(Some(other)), WindowImpl::AppKit, "{other:?}");
         }
         assert_eq!(parse_impl(None), WindowImpl::AppKit);
+    }
+
+    /// Capture is on unless the switch says off: 0, false, no or off, in any case
+    #[test]
+    fn capture_is_on_unless_turned_off() {
+        assert!(CAPTURE_DEFAULT);
+        assert!(Settings::default().capture);
+        assert!(parse_capture(None));
+        for off in ["0", "false", "FALSE", "No", "off", " OFF "] {
+            assert!(!parse_capture(Some(off)), "{off:?}");
+        }
+        for on in ["1", "true", "Yes", " on ", "", "2", "disabled", "n"] {
+            assert!(parse_capture(Some(on)), "{on:?}");
+        }
     }
 
     /// The settings are read once and kept

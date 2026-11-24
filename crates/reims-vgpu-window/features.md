@@ -27,12 +27,14 @@ them; its `manual` checks are on a Linux host's guest boot.
 | `resolution=2560x1600` | the mode the window opens for, and the guest is offered until the window's pixels are known (QEMU's reims-graphics-pci property; 1920x1080 by default); with several displays, every window's |
 | `displays=2` | the reims-graphics device's displays, 1 to 4, a window each (QEMU's reims-graphics-pci property; 1 by default) |
 | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS, built with the `macos-sdl` feature (on by default): SDL3's window in place of AppKit's ("On macOS through SDL3" below) |
+| `REIMS_VGPU_WINDOW_CAPTURE=0` | capture off: no window ever captures the keyboard or the pointer ("Capture off" below); reims-ctl sets it for a VM whose capture setting is off |
 
 Unset or unparsable values give the defaults below.
 `test: env::unset_or_unparsable_values_are_the_defaults`,
 `test: env::the_window_is_appkits_unless_sdl_is_named`,
 `test: env::borderless_takes_the_usual_words`,
-`test: env::the_screen_list_is_all_or_nothing`
+`test: env::the_screen_list_is_all_or_nothing`,
+`test: env::capture_is_on_unless_turned_off`
 
 ## Opening
 
@@ -281,7 +283,8 @@ Unset or unparsable values give the defaults below.
 
 - A click into the image captures the keyboard and the pointer together: ⌘
   shortcuts and system keys (⌘Q, ⌘W, ⌘Tab, ⌘Space) go to the guest, and the
-  pointer stays over the image. Neither is captured without the other.
+  pointer stays over the image. Neither is captured without the other. With
+  capture off, nothing is ("Capture off", below).
   `test: capture::a_click_in_the_image_captures`,
   `test: capture::captured_keys_go_to_the_guest`,
   `test: native::macos::input::captured_command_keys_reach_the_guest_not_the_menu`
@@ -317,6 +320,33 @@ Unset or unparsable values give the defaults below.
 - Uncaptured, ⌘ shortcuts drive the host's menu, and other keys go to the
   guest. `test: capture::uncaptured_command_goes_to_the_host`,
   `test: native::macos::input::uncaptured_command_keys_go_to_the_menu`
+
+## Capture off
+
+- With capture off (`REIMS_VGPU_WINDOW_CAPTURE=0`, which reims-ctl sets for a
+  VM whose capture setting is off), no window ever captures, on any host: a
+  click into the image goes to the guest but captures nothing, so the window
+  never takes the host's system keys, never holds or locks the host's
+  pointer, and never holds its own size, and there is nothing to release.
+  The pointer reaches the guest over the image alone, as the absolute
+  tablet; outside the image only a drag that began in it goes on, held at
+  the image's edge, and ends in the guest. Keys go to the guest while the
+  window has the keyboard: on macOS ⌘ shortcuts too, taken before the
+  window's menu as while captured (⌘Q among them; the menu's Quit and the
+  close button still end the VM), with the system's own (⌘Tab, ⌘Space) left
+  to macOS; on Linux and Windows what the compositor or Windows keeps for
+  itself (Super, Alt+Tab, the Windows key) stays its own. A game gets the
+  absolute pointer alone: the guest's mouse is never driven, so a camera
+  that turns by the mouse's motion stops where the pointer reaches the
+  image's edge. The title ends " — input capture off" on every host.
+  `test: capture::capture_off_never_captures`,
+  `test: capture::capture_off_sends_the_pointer_outside_the_image_only_in_a_drag`,
+  `test: env::capture_is_on_unless_turned_off`,
+  `test: native::sdl_thread::input::capture_off_captures_nothing_and_sends_the_pointer_over_the_image_alone`,
+  `test: native::macos::input::capture_off_sends_keys_and_the_pointer_over_the_image_and_holds_nothing`,
+  `manual` (a VM with capture off: the title says so; clicks, drags and
+  keys reach the guest; the pointer leaves the window freely, and Alt+Tab
+  or ⌘Tab switches away, with no release chord)
 
 ## Scrolling
 
@@ -388,8 +418,8 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
 
 ## Leaving
 
-- Closing any window, or ⌘Q while uncaptured, powers the VM off, and QEMU
-  exits cleanly. `manual`
+- Closing any window, or ⌘Q while uncaptured with capture on, powers the VM
+  off, and QEMU exits cleanly. `manual`
 - The VM keeps full speed with its windows hidden or minimised (no App Nap).
   `manual`
 - `screendump` keeps working with windows open. `manual`
@@ -572,7 +602,8 @@ runtime's own device. The switches above apply, and `resolution=` too.
   title says whether input is captured, as on macOS, with Ctrl+Alt+Super to
   release. On a Windows host, where the same SDL window runs, the Windows
   key is that Super key (SDL's GUI key), and the title names the chord
-  Ctrl+Alt+Win.
+  Ctrl+Alt+Win. With capture off, nothing is captured, grabbed or held
+  ("Capture off", above).
   `test: native::sdl_thread::input::a_click_in_the_image_captures_and_is_sent`,
   `test: native::sdl_thread::input::ctrl_alt_super_releases_capture`,
   `test: capture::the_title_names_the_release_chord_in_the_host_s_keys`,

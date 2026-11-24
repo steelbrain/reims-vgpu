@@ -32,6 +32,12 @@
 //!   releases capture.
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
+//! - **With capture off** ([`crate::capture`], the VM's setting): a click in the image is sent,
+//!   but nothing is captured, and the system's hot keys, the host's pointer and the window's size
+//!   are never held; the pointer is sent over the image alone, and outside it only in a drag;
+//!   every key goes to the guest while the window is key, ⌘ shortcuts included, taken from
+//!   AppKit before its menu as while captured. A game gets the absolute pointer alone, which
+//!   stops at the image's edge.
 //! - **For games**, where the guest has its own mouse ([`crate::PointerMotion`]): captured, while
 //!   the guest hides its cursor on every display, the window holds the host's pointer still
 //!   (`CGAssociateMouseAndMouseCursorPosition(false)`, which the view applies) and hands its
@@ -168,10 +174,11 @@ fn guest_mode(cx: &ViewContext) -> Option<(u16, u16)> {
 
 /// Whether the application takes a key event from AppKit (`down` a key-down, else a key-up,
 /// with `flags` its `modifierFlags`) for the guest, before AppKit dispatches it: a key-down with
-/// ⌘ while `captured`, which would otherwise go to the menu; a key-up with ⌘ held, captured or
-/// not, which AppKit never hands the view.
-fn app_takes(captured: bool, down: bool, flags: u64) -> bool {
-    flags & FLAG_COMMAND != 0 && (captured || !down)
+/// ⌘ while every key is the guest's (`guest_keys`: [`Capture::keys_are_the_guest_s`], while
+/// captured or with capture off), which would otherwise go to the menu; a key-up with ⌘ held,
+/// whoever has the keys, which AppKit never hands the view.
+fn app_takes(guest_keys: bool, down: bool, flags: u64) -> bool {
+    flags & FLAG_COMMAND != 0 && (guest_keys || !down)
 }
 
 /// A scroll event's `phase`. Stationary (fingers held still) is Changed.
@@ -355,7 +362,8 @@ impl InputLogic {
 
     /// The pointer moved, or dragged, by `by`, its device's unaccelerated counts. Captured,
     /// with the guest's cursor hidden, it drives the guest's mouse ([`crate::game`]); else the
-    /// tablet goes where it is.
+    /// tablet goes where it is, outside the image with capture off only in a drag
+    /// ([`Capture::pointer_outside_image`]).
     fn moved(&mut self, by: (f64, f64), cx: &ViewContext) -> Reaction {
         if let Some(motion) = self.motion.clone() {
             if self.game.is_on() {
@@ -374,7 +382,10 @@ impl InputLogic {
                 return Reaction::default();
             }
         }
-        if let (Some(mode), Some(point)) = (guest_mode(cx), cx.point) {
+        if let (Some(mode), Some(point)) = (guest_mode(cx), cx.point)
+            && (geometry::contains(cx.image, point)
+                || self.capture.pointer_outside_image(self.buttons != 0))
+        {
             self.move_pointer(point, cx.image, mode);
         }
         Reaction::default()
@@ -521,7 +532,7 @@ impl InputLogic {
     /// The application saw a key event before AppKit dispatches it: true when the input takes
     /// it ([`app_takes`]).
     fn app_key(&mut self, down: bool, key: KeyInput) -> bool {
-        if !app_takes(self.capture.is_captured(), down, key.flags) {
+        if !app_takes(self.capture.keys_are_the_guest_s(), down, key.flags) {
             return false;
         }
         if down {
@@ -674,9 +685,10 @@ pub(crate) struct InputState {
 
 impl InputState {
     /// The input state of `window`, made on the main thread, driving the guest's mouse where the
-    /// host gives it.
+    /// host gives it, with capture on or off as the host's setting says ([`crate::env`]).
     pub(crate) fn new(window: Arc<Window>) -> InputState {
         let mut logic = InputLogic::new(crate::native::is_iso_keyboard());
+        logic.capture = Capture::with_setting(crate::env::settings().capture);
         logic.motion = window.callbacks().and_then(|callbacks| callbacks.motion);
         InputState {
             window,
@@ -814,7 +826,7 @@ impl InputState {
             _ => return false,
         };
         if !app_takes(
-            self.logic.capture.is_captured(),
+            self.logic.capture.keys_are_the_guest_s(),
             down,
             modifier_flags(event),
         ) {
@@ -1380,6 +1392,51 @@ mod tests {
         assert!(!logic.app_key(true, key(KVK_A, 0)));
         assert!(!logic.app_key(false, key(KVK_A, 0)));
         assert_eq!(sent(&mut logic), vec![down(COMMAND), down(Q), up(Q)]);
+    }
+
+    /// With capture off, a click in the image is sent and captures nothing; the pointer is sent
+    /// over the image alone, and outside it only in a drag; a ⌘ key-down is taken from AppKit
+    /// before the menu and reaches the guest, as while captured; ⌃⌥⌘ releases nothing; the
+    /// title says capture is off
+    #[test]
+    fn capture_off_sends_keys_and_the_pointer_over_the_image_and_holds_nothing() {
+        let mut logic = InputLogic::new(false);
+        logic.capture = Capture::with_setting(false);
+        logic.moved((0.0, 0.0), &at((580.0, 350.0)));
+        logic.moved((0.0, 0.0), &at((20.0, 350.0)));
+        assert_eq!(
+            logic.button_down(BUTTON_LEFT, 0, &at((580.0, 350.0))),
+            Reaction::default()
+        );
+        assert!(!logic.capture.is_captured());
+        assert_eq!(logic.capture.pointer_confinement(IMAGE), None);
+        assert!(logic.capture.window_resizable());
+        logic.moved((0.0, 0.0), &at((20.0, 350.0)));
+        logic.button_up(BUTTON_LEFT, &at((20.0, 350.0)));
+        logic.moved((0.0, 0.0), &at((10.0, 350.0)));
+        assert_eq!(
+            sent(&mut logic),
+            vec![
+                pointer(960, 600, 0),
+                pointer(960, 600, BUTTON_LEFT),
+                pointer(0, 600, BUTTON_LEFT),
+                pointer(0, 600, 0),
+            ]
+        );
+        logic.flags_changed(key(KVK_COMMAND, L_COMMAND));
+        assert!(logic.app_key(true, key(KVK_Q, L_COMMAND)));
+        assert!(logic.app_key(false, key(KVK_Q, L_COMMAND)));
+        logic.flags_changed(key(KVK_CONTROL, L_COMMAND | L_CONTROL));
+        assert_eq!(
+            logic.flags_changed(key(KVK_OPTION, L_COMMAND | L_CONTROL | L_OPTION)),
+            Reaction::default()
+        );
+        assert!(!logic.capture.is_captured());
+        assert_eq!(
+            sent(&mut logic),
+            vec![down(COMMAND), down(Q), up(Q), down(CONTROL), down(OPTION)]
+        );
+        assert_eq!(logic.capture.title_suffix(HostOs::MacOs), " \u{2014} input capture off");
     }
 
     /// A key-up under ⌘, which AppKit never hands the view, is taken and reaches the guest,

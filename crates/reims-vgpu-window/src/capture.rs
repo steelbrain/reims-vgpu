@@ -17,6 +17,16 @@
 //! The click that makes the window key only brings it forward: the view does not take a first
 //! click (`acceptsFirstMouse:`), so that click neither captures nor reaches the guest. Clicks
 //! after it capture, and are sent to the guest.
+//!
+//! With capture off, the host's setting for the VM ([`Capture::with_setting`],
+//! `crate::env`'s `REIMS_VGPU_WINDOW_CAPTURE`), nothing is ever captured: a click into the image
+//! is sent as before but captures nothing, so the host keeps its system keys and the pointer goes
+//! where the person moves it, and the window stays resizable. Every key goes to the guest while
+//! the window has the keyboard, ⌘ shortcuts included, as while captured
+//! ([`Capture::keys_are_the_guest_s`]): with no capture there is no other way to give the guest
+//! one, and the host's menu is in the pointer's reach. The pointer reaches the guest over the
+//! image alone, and outside it only in a drag, so the drag ends in the guest
+//! ([`Capture::pointer_outside_image`]). The title says so (`OFF_SUFFIX`).
 
 use crate::geometry::Rect;
 use crate::keys::Modifiers;
@@ -42,6 +52,8 @@ pub enum Route {
 pub struct Capture {
     /// Captured.
     captured: bool,
+    /// Capture is off: nothing is ever captured (the module doc).
+    off: bool,
 }
 
 /// The host's OS, whose names for the release chord's keys the title gives.
@@ -69,10 +81,21 @@ pub fn captured_suffix(host: HostOs) -> &'static str {
 /// What the title says while not captured, on every OS: that a click captures.
 pub(crate) const UNCAPTURED_SUFFIX: &str = " \u{2014} click to capture input";
 
+/// What the title says with capture off, on every OS: that nothing captures.
+pub(crate) const OFF_SUFFIX: &str = " \u{2014} input capture off";
+
 impl Capture {
-    /// Not captured.
+    /// Not captured, capture on.
     pub fn new() -> Capture {
         Capture::default()
+    }
+
+    /// Not captured, capture on where `on`, else off: nothing is ever captured (the module doc).
+    pub fn with_setting(on: bool) -> Capture {
+        Capture {
+            captured: false,
+            off: !on,
+        }
     }
 
     /// Whether input, the keyboard and the pointer, is captured.
@@ -83,8 +106,9 @@ impl Capture {
     /// A click landed in the image: the keyboard and the pointer are captured. `window_was_key`
     /// is whether the window already had the keyboard before the click; a click that made it
     /// key, where one reaches the input, is not forwarded.
+    /// With capture off, the click captures nothing.
     pub fn click_in_image(&mut self, window_was_key: bool) -> ClickAction {
-        self.captured = true;
+        self.captured = !self.off;
         ClickAction {
             forward: window_was_key,
         }
@@ -115,14 +139,27 @@ impl Capture {
         !self.captured
     }
 
-    /// Who a key goes to, `command_held` whether ⌘ is down: the guest while captured; the host
-    /// for a ⌘ key while not; else the guest.
+    /// Who a key goes to, `command_held` whether ⌘ is down: the guest while every key is its
+    /// ([`Capture::keys_are_the_guest_s`]); else the host for a ⌘ key, and the guest for others.
     pub fn route(&self, command_held: bool) -> Route {
-        if !self.captured && command_held {
+        if !self.keys_are_the_guest_s() && command_held {
             Route::Host
         } else {
             Route::Guest
         }
+    }
+
+    /// Whether every key goes to the guest, ⌘ shortcuts included: while captured, and always
+    /// with capture off. Only capture turns the host's system keys off.
+    pub fn keys_are_the_guest_s(&self) -> bool {
+        self.captured || self.off
+    }
+
+    /// Whether the pointer outside the image goes to the guest, held at the image's nearest
+    /// edge, `dragging` whether a button the guest was told is down is still down: always with
+    /// capture on, and with it off only in a drag, so the drag ends in the guest.
+    pub fn pointer_outside_image(&self, dragging: bool) -> bool {
+        !self.off || dragging
     }
 
     /// Whether `held` is the release chord, ⌃⌥⌘ all down (Shift either way), while captured.
@@ -133,9 +170,12 @@ impl Capture {
     }
 
     /// The text the window's title ends with on `host`: what capture is on and how to release it
-    /// while captured ([`captured_suffix`]), and that a click captures while not.
+    /// while captured ([`captured_suffix`]), that a click captures while not, and that capture
+    /// is off where it is (`OFF_SUFFIX`).
     pub fn title_suffix(&self, host: HostOs) -> &'static str {
-        if self.captured {
+        if self.off {
+            OFF_SUFFIX
+        } else if self.captured {
             captured_suffix(host)
         } else {
             UNCAPTURED_SUFFIX
@@ -326,5 +366,59 @@ mod tests {
             capture.title_suffix(HostOs::Windows),
             " \u{2014} input captured (press Ctrl+Alt+Win to release)"
         );
+    }
+
+    /// With capture off, a click into the image is sent but captures nothing: the pointer is
+    /// never held, the window stays resizable, no chord releases anything, and every key goes to
+    /// the guest, ⌘ shortcuts included; the title says capture is off on every OS
+    #[test]
+    fn capture_off_never_captures() {
+        let image = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 960.0,
+            height: 600.0,
+        };
+        let mut capture = Capture::with_setting(false);
+        assert_eq!(
+            capture.click_in_image(false),
+            ClickAction { forward: false }
+        );
+        assert_eq!(capture.click_in_image(true), ClickAction { forward: true });
+        assert!(!capture.is_captured());
+        assert_eq!(capture.pointer_confinement(image), None);
+        assert!(capture.window_resizable());
+        assert!(!capture.release_chord(CHORD));
+        assert!(!capture.release());
+        assert!(!capture.resign_key());
+        assert!(capture.keys_are_the_guest_s());
+        assert_eq!(capture.route(true), Route::Guest);
+        assert_eq!(capture.route(false), Route::Guest);
+        for host in [HostOs::MacOs, HostOs::Linux, HostOs::Windows] {
+            assert_eq!(
+                capture.title_suffix(host),
+                " \u{2014} input capture off",
+                "{host:?}"
+            );
+        }
+        // On, as before.
+        let mut on = Capture::with_setting(true);
+        assert_eq!(on, Capture::new());
+        assert!(!on.keys_are_the_guest_s());
+        on.click_in_image(true);
+        assert!(on.is_captured() && on.keys_are_the_guest_s());
+    }
+
+    /// The pointer outside the image reaches the guest with capture on, and with it off only in
+    /// a drag
+    #[test]
+    fn capture_off_sends_the_pointer_outside_the_image_only_in_a_drag() {
+        let mut on = Capture::new();
+        assert!(on.pointer_outside_image(false) && on.pointer_outside_image(true));
+        on.click_in_image(true);
+        assert!(on.pointer_outside_image(false));
+        let off = Capture::with_setting(false);
+        assert!(!off.pointer_outside_image(false));
+        assert!(off.pointer_outside_image(true));
     }
 }

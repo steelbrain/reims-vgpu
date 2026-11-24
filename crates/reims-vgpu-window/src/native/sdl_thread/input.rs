@@ -30,6 +30,11 @@
 //!   (`super::super::HOST_OS`): Ctrl+Alt+Super on Linux, Ctrl+Alt+Win on Windows.
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
+//! - **With capture off** ([`crate::capture`], the VM's setting): a click in the image is sent,
+//!   but nothing is captured, grabbed, held or locked; the pointer is sent over the image alone,
+//!   and outside it only in a drag; keys go to the guest while the window has the keyboard, but
+//!   what the compositor keeps. A game gets the absolute pointer alone, which stops at the
+//!   image's edge.
 //!
 //! - **For games**, where the guest has its own mouse ([`crate::PointerMotion`]): captured, while
 //!   the guest hides its cursor on every display, the window locks the host's pointer (SDL's
@@ -223,6 +228,12 @@ impl Input {
         }
     }
 
+    /// This input with `capture` in place of capture on: off where the host's setting turns it
+    /// off ([`Capture::with_setting`]).
+    pub(crate) fn with_capture(self, capture: Capture) -> Input {
+        Input { capture, ..self }
+    }
+
     /// Whether the captured pointer has gone past the image's edge.
     #[cfg(test)]
     pub(crate) fn is_away(&self) -> bool {
@@ -311,8 +322,9 @@ impl Input {
 
     /// The pointer moved. Captured, with the guest's cursor hidden, it drives the guest's mouse
     /// ([`crate::game`]); moving toward an edge another display meets and within reach of it, it
-    /// goes past it ([`crate::beyond`]). A place SDL reports while the pointer is locked is SDL's
-    /// own (the lock's warp): the pointer's moves are [`Self::moved_by`]'s.
+    /// goes past it ([`crate::beyond`]). Outside the image with capture off, it is sent only in a
+    /// drag ([`Capture::pointer_outside_image`]). A place SDL reports while the pointer is locked
+    /// is SDL's own (the lock's warp): the pointer's moves are [`Self::moved_by`]'s.
     pub(crate) fn moved(&mut self, at: &At) {
         if self.is_locked() {
             return;
@@ -336,6 +348,11 @@ impl Input {
                         .reached(beyond.as_ref(), point, at.image, mode, self.buttons, from)
             {
                 self.hold = Some(hold);
+                return;
+            }
+            if !geometry::contains(at.image, point)
+                && !self.capture.pointer_outside_image(self.buttons != 0)
+            {
                 return;
             }
             self.pointer(point, at.image, mode, false);
@@ -647,7 +664,7 @@ mod tests {
     use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::*;
-    use crate::capture::{UNCAPTURED_SUFFIX, captured_suffix};
+    use crate::capture::{OFF_SUFFIX, UNCAPTURED_SUFFIX, captured_suffix};
     use crate::game::SETTLE_NS;
     use crate::game::tests::Mouse;
 
@@ -792,6 +809,46 @@ mod tests {
             ]
         );
         assert_eq!(input.title_suffix(), UNCAPTURED_SUFFIX);
+    }
+
+    /// With capture off, a click in the image is sent but captures nothing, so nothing holds the
+    /// pointer; the pointer outside the image is sent only in a drag; Ctrl, Alt and the GUI key
+    /// are the guest's keys and release nothing; the title says capture is off
+    #[test]
+    fn capture_off_captures_nothing_and_sends_the_pointer_over_the_image_alone() {
+        let mut input = focused().with_capture(Capture::with_setting(false));
+        assert_eq!(input.title_suffix(), OFF_SUFFIX);
+        input.moved(&at((10.0, 10.0)));
+        input.moved(&at((120.0, 10.0)));
+        assert_eq!(input.take(), vec![pointer(20, 20, 0)], "none outside the image");
+        let r = input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+        assert!(!r.capture_changed && !input.is_captured());
+        assert_eq!(input.pointer_confinement(at((0.0, 0.0)).image), None);
+        // A drag goes on outside the image, held at its edge, and ends there.
+        input.moved(&at((120.0, 10.0)));
+        input.button_up(BUTTON_LEFT, &at((120.0, 10.0)));
+        input.moved(&at((130.0, 10.0)));
+        assert_eq!(
+            input.take(),
+            vec![
+                pointer(20, 20, BUTTON_LEFT),
+                pointer(199, 20, BUTTON_LEFT),
+                pointer(199, 20, 0),
+            ]
+        );
+        input.key(0xE0, true, false);
+        input.key(0xE2, true, false);
+        let r = input.key(0xE3, true, false);
+        assert!(!r.capture_changed && !input.is_captured());
+        assert_eq!(
+            input.take(),
+            vec![
+                ToHost::Key(KeyEvent::down(0xE0)),
+                ToHost::Key(KeyEvent::down(0xE2)),
+                ToHost::Key(KeyEvent::down(0xE3)),
+            ]
+        );
+        assert_eq!(input.title_suffix(), OFF_SUFFIX);
     }
 
     /// Losing the keyboard lifts every key and button and releases capture
