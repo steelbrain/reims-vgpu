@@ -9288,6 +9288,54 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     assert_eq!(device.control.pool.favoured(), None);
 }
 
+/// A present shown late logs, at debug on the presents' timing target, its writer that finished
+/// last after its take: the buffer's queue, context and seqno, when the host first saw it and when
+/// its completion was posted. A writer that finished before that one, of the same queue, is not
+/// named
+#[test]
+fn a_present_shown_late_logs_its_last_writer_to_finish() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, mut ring) = surface_and_queue(&device);
+    let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+    ring.publish(command_buffer_at(obj(1, 1), 100, 4));
+    ring.publish(command_buffer_at(obj(1, 1), 101, 5));
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 5)]);
+    guest.send(&device, present_surface(0x77));
+    presents_waiting(&device, 1);
+    device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT as u32);
+    let ids = committed(&platform, 2);
+    let world = platform.world();
+    let done = |id| world.complete(id, CommandBufferStatus::COMPLETED, None, CompleteOn::Caller);
+    assert!(done(ids[0]));
+    assert!(done(ids[1]));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    let lines: Vec<String> = (logs.take().into_iter())
+        .filter(|(level, target, line)| {
+            *level == log::Level::Debug
+                && target == super::present::TIMING
+                && line.starts_with("a present shown late")
+        })
+        .map(|(_, _, line)| line)
+        .collect();
+    assert_eq!(lines.len(), 1, "one late line: {lines:?}");
+    let named = format!(
+        "(no median yet, 0 presents shown before it): its last writer to finish, the command \
+         buffer seqno 5 of queue {:#x} of context 1, first seen by the host ",
+        obj(1, 1)
+    );
+    for part in [
+        named.as_str(),
+        " us after the present's take; on the host's monotonic clock, in us: the present's take ",
+        ", the buffer's first sight ",
+        ", its completion ",
+    ] {
+        assert!(lines[0].contains(part), "{part:?} in {:?}", lines[0]);
+    }
+    assert!(!lines[0].contains("first sight unknown"), "{:?}", lines[0]);
+}
+
 /// A present shown at its writer's completion, on the platform's thread that runs the buffer's
 /// completion handlers, lets go of the texture the display showed before off that thread: the
 /// release, held here as a driver that takes long to free an import of the guest's pages holds it,

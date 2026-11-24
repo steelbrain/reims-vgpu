@@ -2702,6 +2702,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ) {
         let message: &[u8] = &bytes;
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
+        // A queue's command buffer taken from its ring: the presents' late-show lines keep when
+        // the host first saw it (`present`).
+        if r#type == RGFX_CMD_COMMAND_BUFFER
+            && let Some(queue) = poster.queue_obj_id()
+        {
+            self.presents.buffer_seen(queue, message_identity(message).1);
+        }
         // A pipeline create waits for its reply from its take, here (`create_waits`).
         if create_waits::is_create(r#type) {
             let (_, seqno, obj_id) = message_identity(message);
@@ -3263,6 +3270,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// on the service thread takes in their place ([`Self::begin_command_buffer`]), so the
     /// guest's later buffers are committed after it as they would be had it been answered there.
     fn answer_command_buffer(&self, poster: &CompletionPoster, message: &[u8]) -> bool {
+        // The host sees the buffer: the presents' late-show lines keep when (`present`).
+        if let Some(queue) = poster.queue_obj_id() {
+            self.presents.buffer_seen(queue, message_identity(message).1);
+        }
         if foreign_queue(poster, message) || !self.pending.none_named_by(message) {
             return false;
         }

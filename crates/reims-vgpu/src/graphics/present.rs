@@ -93,6 +93,15 @@
 //! answered it ([`PresentAnswers::answered_at_show`]); the host's summary counts those answers
 //! too.
 //!
+//! A present shown late is logged once more, at its show, on the same target: one whose show came
+//! [`LATE_TIMES`] times the median of the last [`LATE_WINDOW`] presents' or more after its take
+//! (while fewer than [`LATE_LEAST`] were shown, one a writer held past its take). The line names
+//! its writer that finished last after its take, its queue, context and seqno, with when the host
+//! first saw that buffer (its doorbell's answer or its take from its ring, whichever came first)
+//! and when its completion was posted, against the present's take and on the host's monotonic
+//! clock, or says that none of its writers finished after its take. What it needs is kept only
+//! where the line is on ([`Late`]).
+//!
 //! [`RgfxSurfaceWriters`]: reims_vgpu_graphics::wire::RgfxSurfaceWriters
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -137,6 +146,8 @@ struct State<P: Platform> {
     /// By queue id: the poster onto its completion ring, through which what its submission ring
     /// has published is read.
     queues: HashMap<u64, CompletionPoster>,
+    /// What the late-show lines keep, only where they are on.
+    late: Late,
 }
 
 /// One present not yet shown.
@@ -154,6 +165,9 @@ struct Waiting<P: Platform> {
     fill: Option<FillWait>,
     /// When it was taken.
     taken: Taken,
+    /// Its writer that finished last after its take, for its late-show line, where that line is
+    /// on.
+    last: Option<LastWriter>,
 }
 
 impl<P: Platform> PresentQueue<P> {
@@ -167,8 +181,38 @@ impl<P: Platform> PresentQueue<P> {
                 apart: HashMap::new(),
                 waiting,
                 queues: HashMap::new(),
+                late: Late::default(),
             }),
         }
+    }
+
+    /// The platform's monotonic clock now, as the displays' answers read it.
+    fn now(&self) -> Option<MonoTime> {
+        self.presented.first().map(|presented| presented.answers.now())
+    }
+
+    /// The host sees the command buffer at `seqno` of queue `queue` now (its doorbell's answer or
+    /// its take from its ring): where the late-show lines are on, the first sight of it is kept
+    /// until it finishes, for the line of a present it is the last writer of (the module doc).
+    pub(crate) fn buffer_seen(&self, queue: u64, seqno: u64) {
+        if !late_lines() {
+            return;
+        }
+        let Some(now) = self.now() else {
+            return;
+        };
+        let mut state = self.state.lock();
+        if state.finished.get(&queue).is_some_and(|&done| done >= seqno) {
+            return;
+        }
+        let seen = state.late.seen.entry(queue).or_default();
+        if seen.iter().rev().any(|&(s, _)| s == seqno) {
+            return;
+        }
+        if seen.len() >= LATE_SEEN {
+            seen.pop_front();
+        }
+        seen.push_back((seqno, now));
     }
 
     /// Queue `queue` was made, its completion ring posted onto through `poster`: what its
@@ -212,6 +256,7 @@ impl<P: Platform> PresentQueue<P> {
                 writers,
                 fill,
                 taken,
+                last: None,
             },
         );
     }
@@ -238,6 +283,7 @@ impl<P: Platform> PresentQueue<P> {
                 writers: Vec::new(),
                 fill: None,
                 taken,
+                last: None,
             },
         );
     }
@@ -279,8 +325,18 @@ impl<P: Platform> PresentQueue<P> {
             return;
         }
         let done = state.finished.entry(queue).or_insert(0);
+        let before = *done;
         *done = (*done).max(seqno);
         let done = *done;
+        if late_lines() {
+            state.late_finished(queue, |s| before < s && s <= done, self.now());
+            if let Some(seen) = state.late.seen.get_mut(&queue) {
+                seen.retain(|&(s, _)| s > done);
+                if seen.is_empty() {
+                    state.late.seen.remove(&queue);
+                }
+            }
+        }
         if let Some(apart) = state.apart.get_mut(&queue) {
             apart.retain(|&s| s > done);
             if apart.is_empty() {
@@ -311,6 +367,9 @@ impl<P: Platform> PresentQueue<P> {
             return;
         }
         state.apart.entry(queue).or_default().insert(seqno);
+        if late_lines() {
+            state.late_finished(queue, |s| s == seqno, self.now());
+        }
         if state.waits() {
             let gone = self.show_ready(&mut state);
             drop(state);
@@ -385,6 +444,7 @@ impl<P: Platform> PresentQueue<P> {
             state.finished.clear();
             state.apart.clear();
             state.queues.clear();
+            state.late = Late::default();
             (state.waiting.iter_mut())
                 .map(std::mem::take)
                 .collect::<Vec<_>>()
@@ -406,6 +466,7 @@ impl<P: Platform> PresentQueue<P> {
         let mut state = self.state.lock();
         state.finished.retain(|&q, _| !gone(q));
         state.apart.retain(|&q, _| !gone(q));
+        state.late.seen.retain(|&q, _| !gone(q));
         for waiting in state.waiting.iter_mut().flatten() {
             waiting.writers.retain(|w| !gone(w.queue_obj_id));
         }
@@ -420,10 +481,12 @@ impl<P: Platform> PresentQueue<P> {
     #[must_use]
     fn show_ready(&self, state: &mut State<P>) -> Vec<Arc<DisplayHold>> {
         let mut gone = Vec::new();
+        let now = late_lines().then(|| self.now()).flatten();
         let State {
             finished,
             apart,
             waiting,
+            late,
             ..
         } = state;
         for (presents, presented) in waiting.iter_mut().zip(&self.presented) {
@@ -442,6 +505,9 @@ impl<P: Platform> PresentQueue<P> {
                 let Some(shown) = presents.pop_front() else {
                     break;
                 };
+                if let Some(now) = now {
+                    late.shown(&shown.taken, shown.last, now);
+                }
                 gone.extend(presented.show(shown.shows, shown.color, shown.answer, shown.taken));
             }
         }
@@ -459,6 +525,27 @@ impl<P: Platform> State<P> {
     /// Whether a present of any display waits.
     fn waits(&self) -> bool {
         self.waiting.iter().any(|presents| !presents.is_empty())
+    }
+
+    /// The command buffers of queue `queue` whose seqnos `newly` names finished at `now`: each
+    /// is the last writer to finish so far of each present waiting for it (its late-show line).
+    fn late_finished(&mut self, queue: u64, newly: impl Fn(u64) -> bool, now: Option<MonoTime>) {
+        let Some(now) = now else {
+            return;
+        };
+        let State { waiting, late, .. } = self;
+        for present in waiting.iter_mut().flatten() {
+            let finished = (present.writers.iter().rev())
+                .find(|w| w.queue_obj_id == queue && newly(w.seqno))
+                .copied();
+            if let Some(writer) = finished {
+                present.last = Some(LastWriter {
+                    writer,
+                    seen: late.seen(queue, writer.seqno),
+                    done: now,
+                });
+            }
+        }
     }
 }
 
@@ -521,6 +608,124 @@ pub(crate) enum LetGo {
 
 /// The target of each answer's timing line, at debug (the module doc).
 pub(crate) const TIMING: &str = "reims_vgpu::graphics::present_timing";
+
+/// How many presents' waits after their take a show is weighed against for its late-show line
+/// (the module doc).
+const LATE_WINDOW: usize = 64;
+
+/// The fewest presents' waits the late-show line takes a median of; with fewer, a present one of
+/// whose writers finished after its take is logged.
+const LATE_LEAST: usize = 8;
+
+/// How many times the median wait a present's wait after its take is, at least, for its late-show
+/// line.
+const LATE_TIMES: u32 = 2;
+
+/// How many command buffers not yet finished a queue keeps the host's first sight of for the
+/// late-show lines: past it the oldest go.
+const LATE_SEEN: usize = 256;
+
+/// Whether the late-show lines are on ([`TIMING`] at debug): what they need is kept only then.
+fn late_lines() -> bool {
+    log::log_enabled!(target: TIMING, log::Level::Debug)
+}
+
+/// What the late-show lines keep (the module doc), only where they are on.
+#[derive(Debug, Default)]
+struct Late {
+    /// By queue id: when the host first saw each of its command buffers not yet finished, by
+    /// seqno, oldest first.
+    seen: HashMap<u64, VecDeque<(u64, MonoTime)>>,
+    /// How long each of the last [`LATE_WINDOW`] presents shown waited after its take.
+    waits: VecDeque<Duration>,
+}
+
+/// A present's writer that finished after its take, the last of them so far, for its late-show
+/// line.
+#[derive(Clone, Copy, Debug)]
+struct LastWriter {
+    writer: RgfxSurfaceWriter,
+    /// When the host first saw the buffer, where that was kept.
+    seen: Option<MonoTime>,
+    /// When its completion was posted.
+    done: MonoTime,
+}
+
+impl Late {
+    /// When the host first saw the buffer at `seqno` of queue `queue`, where it was kept.
+    fn seen(&self, queue: u64, seqno: u64) -> Option<MonoTime> {
+        let seen = self.seen.get(&queue)?;
+        seen.iter().find(|&&(s, _)| s == seqno).map(|&(_, at)| at)
+    }
+
+    /// A present taken at `taken` was shown `now`, `last` its writer that finished last after its
+    /// take, where one did: its wait joins the window, and where it is late (the module doc) its
+    /// line is logged.
+    fn shown(&mut self, taken: &Taken, last: Option<LastWriter>, now: MonoTime) {
+        let waited = now.saturating_duration_since(taken.at);
+        let median = (self.waits.len() >= LATE_LEAST).then(|| {
+            let mut waits: Vec<Duration> = self.waits.iter().copied().collect();
+            waits.sort_unstable();
+            waits.get(waits.len() / 2).copied().unwrap_or_default()
+        });
+        let window = self.waits.len();
+        if window >= LATE_WINDOW {
+            self.waits.pop_front();
+        }
+        self.waits.push_back(waited);
+        let late = match median {
+            Some(median) => waited > median && waited >= median.saturating_mul(LATE_TIMES),
+            None => last.is_some(),
+        };
+        if !late {
+            return;
+        }
+        let against = match median {
+            Some(median) => format!(
+                "{:.1} times the median {} us of the last {window}",
+                waited.as_secs_f64() / median.as_secs_f64(),
+                median.as_micros()
+            ),
+            None => format!("no median yet, {window} presents shown before it"),
+        };
+        let us = |t: MonoTime| t.as_nanos() / 1000;
+        let Some(last) = last else {
+            log::debug!(
+                target: TIMING,
+                "a present shown late, {} us after its take ({against}): none of its writers \
+                 finished after its take; on the host's monotonic clock, in us: its take {}",
+                waited.as_micros(),
+                us(taken.at)
+            );
+            return;
+        };
+        let (queue, seqno) = (last.writer.queue_obj_id, last.writer.seqno);
+        let seen = match last.seen {
+            Some(seen) if seen <= taken.at => format!(
+                "first seen by the host {} us before the present's take",
+                taken.at.saturating_duration_since(seen).as_micros()
+            ),
+            Some(seen) => format!(
+                "first seen by the host {} us after the present's take",
+                seen.saturating_duration_since(taken.at).as_micros()
+            ),
+            None => "first seen by the host at a time not kept".to_owned(),
+        };
+        log::debug!(
+            target: TIMING,
+            "a present shown late, {} us after its take ({against}): its last writer to finish, \
+             the command buffer seqno {seqno} of queue {queue:#x} of context {}, {seen}, its \
+             completion posted {} us after the present's take; on the host's monotonic clock, in \
+             us: the present's take {}, the buffer's first sight {}, its completion {}",
+            waited.as_micros(),
+            queue >> RGFX_CONTEXT_OBJ_ID_SHIFT,
+            last.done.saturating_duration_since(taken.at).as_micros(),
+            us(taken.at),
+            last.seen.map_or_else(|| "unknown".to_owned(), |seen| us(seen).to_string()),
+            us(last.done)
+        );
+    }
+}
 
 /// When a present was taken, against the device's refreshes ([`PresentAnswers::taken`]).
 #[derive(Clone, Copy, Debug)]
@@ -600,6 +805,11 @@ impl Drawing {
 }
 
 impl<A> PresentAnswers<A> {
+    /// The clock the timing lines read, now.
+    pub(crate) fn now(&self) -> MonoTime {
+        (self.now)()
+    }
+
     /// No present shown yet, the timing lines read on `now`.
     pub(crate) fn new(now: Now) -> Self {
         PresentAnswers {
