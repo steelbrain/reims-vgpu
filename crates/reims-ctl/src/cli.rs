@@ -1407,8 +1407,9 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     };
     println!("{}: saved{note}", vm.name());
     // A graphics given makes the OpenCore image for it, where the VM is stopped; while it runs,
-    // its next start makes one without reims-vgpu's kexts on another device, and warns of an
-    // image that lacks them on reims-vgpu.
+    // its next start makes one without reims-vgpu's kexts on another device, and one with this
+    // reims-ctl's on reims-vgpu where it holds other builds; it warns of an image that lacks them
+    // on reims-vgpu.
     if a.graphics.is_some() && opencore::made_for_other_graphics(&vm) {
         let name = vm.name().to_string();
         let running = runtime::running(&vm);
@@ -1422,6 +1423,11 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
             }
         } else if let Some(w) = opencore::missing_guest_kexts(&vm) {
             println!("{name}: {w}");
+        } else if vm.config.graphics() == vm::Graphics::ReimsVgpu {
+            println!(
+                "{name}: its OpenCore image holds other builds of reims-vgpu's macOS drivers than \
+                 this reims-ctl carries: its next start makes it a new one with these"
+            );
         } else {
             println!(
                 "{name}: its OpenCore image loads reims-vgpu's macOS drivers: its next start \

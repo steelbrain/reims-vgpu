@@ -2,8 +2,9 @@
 //!
 //! reims-util makes a VM's image when the VM is made (reims_util.rs). A VM on reims-vgpu's own
 //! GPU device needs the guest's kexts this reims-ctl carries ([`crate::prebuilt`]), which an
-//! image of the user's own, or one an older reims-ctl made, may lack or hold other builds of
-//! ([`missing_guest_kexts`]). [`renew`] replaces a VM's image with one the
+//! image of the user's own may lack ([`missing_guest_kexts`]), and one an older reims-ctl made
+//! holds other builds of, until the VM's next start makes it again
+//! ([`holds_other_guest_kexts`]). [`renew`] replaces a VM's image with one the
 //! installed reims-util makes for the VM's graphics, presenting the same Mac, so macOS sees no
 //! new machine. reims-ctl keeps no copy of that identity: it is read from the old image's
 //! config.plist.
@@ -206,31 +207,37 @@ fn image_guest_kexts(vm: &Vm) -> Option<Result<GuestKexts>> {
 }
 
 /// What to tell of a VM on reims-vgpu's own GPU device whose OpenCore image lacks the guest's
-/// kexts this reims-ctl carries, or holds other builds of them; None where it holds them, the VM
-/// is on another device, or the image cannot be read.
+/// kexts this reims-ctl carries, as an image of the user's own may, which no start makes again;
+/// None where it holds them, or holds other builds of them, as the image of a VM an older
+/// reims-ctl made does after an update, which the VM's next start makes again with these
+/// ([`holds_other_guest_kexts`]); None also where the VM is on another device, or the image
+/// cannot be read.
 pub fn missing_guest_kexts(vm: &Vm) -> Option<String> {
     if vm.config.graphics() != Graphics::ReimsVgpu {
         return None;
     }
-    let fix = format!(
-        "To make it a new image that has this reims-ctl's, presenting the same Mac, press U in \
-         reims-ctl or run reims-ctl update-opencore {}.",
-        vm.name()
-    );
     match image_guest_kexts(vm)? {
         Err(e) => Some(format!("{e:#}")),
-        Ok(GuestKexts::Held) => None,
+        Ok(GuestKexts::Held | GuestKexts::Other(_)) => None,
         Ok(GuestKexts::Lacks(b)) => Some(format!(
             "Its OpenCore image lacks reims-vgpu's macOS drivers ({}), without which macOS has \
-             no driver for its GPU device. {fix}",
-            b.join(", ")
-        )),
-        Ok(GuestKexts::Other(b)) => Some(format!(
-            "Its OpenCore image holds other builds of reims-vgpu's macOS drivers ({}) than this \
-             reims-ctl carries, which may not drive its GPU device. {fix}",
-            b.join(", ")
+             no driver for its GPU device. To make it a new image that has this reims-ctl's, \
+             presenting the same Mac, press U in reims-ctl or run reims-ctl update-opencore {}.",
+            b.join(", "),
+            vm.name()
         )),
     }
+}
+
+/// Whether a VM on reims-vgpu's own GPU device has an OpenCore image that does not hold the
+/// guest's kexts this reims-ctl carries as it carries them, lacking them or holding other builds,
+/// or reims-ctl carries none; false where the image cannot be read.
+fn guest_kexts_differ(vm: &Vm) -> bool {
+    vm.config.graphics() == Graphics::ReimsVgpu
+        && matches!(
+            image_guest_kexts(vm),
+            Some(Err(_) | Ok(GuestKexts::Lacks(_) | GuestKexts::Other(_)))
+        )
 }
 
 /// Whether a VM on reims-vgpu's own device has an OpenCore image that holds the guest's kexts this
@@ -272,11 +279,11 @@ pub fn holds_unused_guest_kexts(vm: &Vm) -> bool {
 }
 
 /// Whether a VM's OpenCore image is made for other graphics than the VM runs: on reims-vgpu,
-/// lacking the guest's kexts or holding other builds ([`missing_guest_kexts`]); on another
+/// lacking the guest's kexts or holding other builds ([`guest_kexts_differ`]); on another
 /// device, loading them ([`holds_unused_guest_kexts`]).
 pub fn made_for_other_graphics(vm: &Vm) -> bool {
     match vm.config.graphics() {
-        Graphics::ReimsVgpu => missing_guest_kexts(vm).is_some(),
+        Graphics::ReimsVgpu => guest_kexts_differ(vm),
         _ => holds_unused_guest_kexts(vm),
     }
 }
@@ -362,7 +369,7 @@ pub fn renew(
         id.serial,
         if picker { "on" } else { "off" }
     );
-    if missing_guest_kexts(vm).is_some() {
+    if guest_kexts_differ(vm) {
         s.push_str(
             "; the installed reims-util did not put reims-vgpu's macOS drivers in it as given: \
              run reims-ctl update, which installs the reims-util it needs, and make it again",
@@ -792,15 +799,84 @@ pub(crate) mod tests {
     /// A raw OpenCore image laid out as reims-util's: a GPT whose one partition, the EFI system
     /// partition, is FAT32, a sector a cluster, holding EFI/OC/`config_plist`.
     pub(crate) fn image(config_plist: &[u8]) -> Vec<u8> {
+        image_of(&[("EFI/OC/config.plist", config_plist)])
+    }
+
+    /// [`image`]'s layout holding `files`, each at its path from the volume's root, `/` between
+    /// its names: each directory and file in a chain of its own, in the order first named.
+    pub(crate) fn image_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        enum Node {
+            Dir(Vec<(String, usize)>),
+            File(Vec<u8>),
+        }
+        let mut nodes = vec![Node::Dir(Vec::new())];
+        for (path, bytes) in files {
+            let names: Vec<&str> = path.split('/').collect();
+            let mut at = 0;
+            for (i, name) in names.iter().enumerate() {
+                let Node::Dir(children) = &nodes[at] else {
+                    panic!("{path}: a file on its way")
+                };
+                if let Some((_, c)) = children.iter().find(|(n, _)| n == name) {
+                    at = *c;
+                    continue;
+                }
+                nodes.push(if i + 1 == names.len() {
+                    Node::File(bytes.to_vec())
+                } else {
+                    Node::Dir(Vec::new())
+                });
+                let c = nodes.len() - 1;
+                if let Node::Dir(children) = &mut nodes[at] {
+                    children.push((name.to_string(), c));
+                }
+                at = c;
+            }
+        }
+        // A directory's entries: each child's long name, then its 8.3 entry; then the end.
+        let entries_of = |children: &[(String, usize)], first: &[usize]| -> Vec<u8> {
+            let mut d = Vec::new();
+            for (name, c) in children {
+                d.extend(long(name).concat());
+                let short_name: [u8; 11] = format!("N{c:07}   ").into_bytes().try_into().unwrap();
+                let (attr, size) = match &nodes[*c] {
+                    Node::Dir(_) => (0x10, 0),
+                    Node::File(b) => (0x20, b.len() as u32),
+                };
+                d.extend(short(&short_name, attr, first[*c] as u32, size));
+            }
+            d.extend([0u8; 32]);
+            d
+        };
+        // Each node's clusters, 16 entries to a directory's, and its first (0 for an empty
+        // file), the root's 2.
+        let sizes: Vec<usize> = nodes
+            .iter()
+            .map(|n| match n {
+                Node::Dir(children) => (children
+                    .iter()
+                    .map(|(name, _)| long(name).len() + 1)
+                    .sum::<usize>()
+                    + 1)
+                .div_ceil(16),
+                Node::File(b) => b.len().div_ceil(512),
+            })
+            .collect();
+        let mut first = Vec::new();
+        let mut next = 2;
+        for s in &sizes {
+            first.push(if *s == 0 { 0 } else { next });
+            next += s;
+        }
         const ESP: usize = 64 * 512;
         let put = |img: &mut Vec<u8>, at: usize, bytes: &[u8]| {
             img[at..at + bytes.len()].copy_from_slice(bytes)
         };
-        let clusters = config_plist.len().div_ceil(512);
-        // The boot sector, one FAT of a sector, then cluster 2.
-        let data = ESP + 2 * 512;
+        // The boot sector, one FAT, then cluster 2.
+        let fat_sectors = (next * 4).div_ceil(512);
+        let data = ESP + (1 + fat_sectors) * 512;
         let cluster = |c: usize| data + (c - 2) * 512;
-        let mut img = vec![0u8; cluster(5 + clusters)];
+        let mut img = vec![0u8; cluster(next)];
         put(&mut img, 512, b"EFI PART");
         put(&mut img, 512 + 72, &2u64.to_le_bytes());
         put(&mut img, 512 + 80, &1u32.to_le_bytes());
@@ -811,22 +887,26 @@ pub(crate) mod tests {
         img[ESP + 13] = 1;
         put(&mut img, ESP + 14, &1u16.to_le_bytes());
         img[ESP + 16] = 1;
-        put(&mut img, ESP + 36, &1u32.to_le_bytes());
+        put(&mut img, ESP + 36, &(fat_sectors as u32).to_le_bytes());
         put(&mut img, ESP + 44, &2u32.to_le_bytes());
         put(&mut img, ESP + 510, &[0x55, 0xaa]);
-        // The root, EFI and OC, a cluster each, then config.plist's chain from cluster 5.
-        for c in 2..5 + clusters {
-            let last = c < 5 || c == 4 + clusters;
-            let next = if last { 0x0fff_ffff } else { c as u32 + 1 };
-            put(&mut img, ESP + 512 + c * 4, &next.to_le_bytes());
+        for (n, (at, size)) in nodes.iter().zip(first.iter().zip(&sizes)) {
+            for c in *at..*at + *size {
+                let link = if c + 1 == at + size {
+                    0x0fff_ffff
+                } else {
+                    c as u32 + 1
+                };
+                put(&mut img, ESP + 512 + c * 4, &link.to_le_bytes());
+            }
+            let bytes = match n {
+                Node::Dir(children) => entries_of(children, &first),
+                Node::File(b) => b.clone(),
+            };
+            if *size > 0 {
+                put(&mut img, cluster(*at), &bytes);
+            }
         }
-        put(&mut img, cluster(2), &short(b"EFI        ", 0x10, 3, 0));
-        put(&mut img, cluster(3), &short(b"OC         ", 0x10, 4, 0));
-        let mut oc = long("config.plist").concat();
-        let size = config_plist.len() as u32;
-        oc.extend(short(b"CONFIG~1PLI", 0x20, 5, size));
-        put(&mut img, cluster(4), &oc);
-        put(&mut img, cluster(5), config_plist);
         img
     }
 
@@ -1262,6 +1342,146 @@ pub(crate) mod tests {
         let mut said = Vec::new();
         crate::runtime::prepare(&mut v, &mut |s| said.push(s.to_string()));
         assert!(said.is_empty() && !args.exists(), "{said:?}");
+    }
+
+    /// A Kernel > Add entry loading `bundle`.
+    fn enabled(bundle: &str) -> String {
+        format!(
+            "<dict><key>BundlePath</key><string>{bundle}</string><key>Enabled</key><true/></dict>"
+        )
+    }
+
+    /// An image as reims-util makes it with the set the tests carry: config.plist loading A.kext
+    /// then B.kext, and each bundle's files under EFI/OC/Kexts, A's executable `a`; then `more`.
+    fn image_with_set(a: &[u8], more: &[(&str, &[u8])]) -> Vec<u8> {
+        let config = plist(&(enabled("A.kext") + &enabled("B.kext")));
+        let mut files: Vec<(&str, &[u8])> = vec![
+            ("EFI/OC/config.plist", config.as_bytes()),
+            (
+                "EFI/OC/Kexts/A.kext/Contents/Info.plist",
+                &b"<plist>a</plist>"[..],
+            ),
+            ("EFI/OC/Kexts/A.kext/Contents/MacOS/A", a),
+            (
+                "EFI/OC/Kexts/B.kext/Contents/Info.plist",
+                &b"<plist>b</plist>"[..],
+            ),
+        ];
+        files.extend(more);
+        image_of(&files)
+    }
+
+    /// A VM on reims-vgpu in `dir` whose OpenCore image is `image`, in `format`.
+    fn on_reims_vgpu(dir: &Path, image: &[u8], format: ImageFormat) -> Vm {
+        let (file, format) = match format {
+            ImageFormat::Raw => ("opencore.img", "raw"),
+            ImageFormat::Qcow2 => ("opencore.qcow2", "qcow2"),
+        };
+        std::fs::write(dir.join(file), image).unwrap();
+        let config = format!(
+            r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.img"
+            disk_format = "raw"
+            graphics = "reims-vgpu"
+            [q35]
+            opencore = "{file}"
+            opencore_format = "{format}"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            "#
+        );
+        std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+        Vm::load(dir).unwrap()
+    }
+
+    /// The executable of A.kext the tests carry.
+    fn carried_a() -> &'static [u8] {
+        crate::prebuilt::set().unwrap()[0]
+            .executable_bytes()
+            .unwrap()
+    }
+
+    /// An image reims-util made with the guest's kexts this reims-ctl carries holds them, read
+    /// through qcow2 as through raw, whatever else its volume comes to hold beside them (what
+    /// OpenCore or a guest's macOS may write to it while it runs: a log in its root, a directory
+    /// of its own, a directory of many entries). One whose executable is another build's holds
+    /// other builds, of another size or of the same.
+    #[test]
+    fn an_image_holds_the_guest_kexts_it_was_made_with() {
+        let env = crate::testenv::Env::new("made-with");
+        let dir = env.root.join("vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let names: Vec<String> = (0..40)
+            .map(|i| format!("a file of a long name {i}"))
+            .collect();
+        let mut more: Vec<(&str, &[u8])> = vec![
+            ("opencore-2026-11-23-120000.txt", &[b'x'; 3000][..]),
+            ("EFI/APPLE/UPDATERS/MULTIUPDATER/flash.bin", &[1u8; 700][..]),
+        ];
+        let paths: Vec<String> = names.iter().map(|n| format!(".fseventsd/{n}")).collect();
+        more.extend(paths.iter().map(|p| (p.as_str(), &b"event"[..])));
+        for format in [ImageFormat::Raw, ImageFormat::Qcow2] {
+            let as_made = |raw: Vec<u8>| match format {
+                ImageFormat::Raw => raw,
+                ImageFormat::Qcow2 => qcow2(&raw),
+            };
+            let v = on_reims_vgpu(&dir, &as_made(image_with_set(carried_a(), &[])), format);
+            assert!(holds_guest_kexts(&v), "{format:?}");
+            let v = on_reims_vgpu(&dir, &as_made(image_with_set(carried_a(), &more)), format);
+            assert!(holds_guest_kexts(&v), "{format:?}");
+            let mut same_size = carried_a().to_vec();
+            *same_size.last_mut().unwrap() ^= 1;
+            for other in [&b"\xcf\xfa\xed\xfe an older a"[..], &same_size[..]] {
+                let v = on_reims_vgpu(&dir, &as_made(image_with_set(other, &more)), format);
+                assert!(
+                    !holds_guest_kexts(&v) && holds_other_guest_kexts(&v),
+                    "{format:?}"
+                );
+            }
+        }
+    }
+
+    /// After an update of reims-ctl, the image of a VM an older reims-ctl made holds other builds
+    /// of the guest's kexts until the VM's next start makes it again with these
+    /// (`runtime::prepare`); a VM running since before the update keeps it, as a macOS install,
+    /// which keeps its VM running for an hour or more, does. Its warnings tell nothing of it, and a
+    /// change of its graphics to reims-vgpu makes it again all the same. An image that lacks them,
+    /// as one of the user's own may, which no start makes again, is warned of.
+    #[test]
+    fn an_image_an_older_reims_ctl_made_is_not_warned_of() {
+        let env = crate::testenv::Env::new("older-build");
+        let dir = env.root.join("vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let host = crate::host::Host {
+            os: crate::host::Os::Windows,
+            arch: crate::host::Arch::X86_64,
+        };
+        let of_drivers = |v: &Vm| -> Vec<String> {
+            crate::runtime::warnings(v, host)
+                .into_iter()
+                .filter(|w| w.contains("drivers"))
+                .collect()
+        };
+        let older = image_with_set(b"\xcf\xfa\xed\xfe an older a", &[]);
+        let v = on_reims_vgpu(&dir, &qcow2(&older), ImageFormat::Qcow2);
+        assert!(holds_other_guest_kexts(&v) && made_for_other_graphics(&v));
+        assert_eq!(missing_guest_kexts(&v), None);
+        assert_eq!(of_drivers(&v), Vec::<String>::new());
+        // Lacking A.kext, it is warned of, with how to make it again.
+        let lacking = image_of(&[("EFI/OC/config.plist", plist(&enabled("B.kext")).as_bytes())]);
+        let v = on_reims_vgpu(&dir, &qcow2(&lacking), ImageFormat::Qcow2);
+        let said = missing_guest_kexts(&v).unwrap();
+        assert!(
+            said.contains("lacks reims-vgpu's macOS drivers (A.kext)")
+                && said.contains("update-opencore t"),
+            "{said}"
+        );
+        assert_eq!(of_drivers(&v), [said]);
+        assert!(!holds_other_guest_kexts(&v) && made_for_other_graphics(&v));
     }
 
     /// An image holds the guest's kexts where OpenCore loads each, in the set's order, with
