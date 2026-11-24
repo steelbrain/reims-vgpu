@@ -44,15 +44,25 @@
 //!
 //! A device made after the one before reads as counted from none again: each count is what it rose
 //! by, or what it is where it fell.
+//!
+//! The syncs of copied pages (`super::copied`) have a part of their own, `rt copied: ...`
+//! ([`copied_line`]), from the process's counts by code (`crate::answer::counted_kinds`), which
+//! the degradation counts line gives only at a device's make and reset and at the process's exit:
+//! what rose since the part before, for each kind of copy (writable, read-only, unchanging) its
+//! commits that synced one, the bytes the syncs went through and their time; then the read-only
+//! copies' commits and bytes by the guest's why, those that rose alone. Read at the part, from
+//! counts the syncs keep anyway: nothing more is done as pages are synced.
 
 use std::time::Duration;
 
 use metal2vulkan_runtime as rt;
 
-/// The metrics a part read last, to tell what rose since.
+/// The metrics a part read last, and the counts by code its copied pages' part read last, to tell
+/// what rose since.
 #[derive(Default)]
 pub struct Part {
     last: Option<rt::Metrics>,
+    copied: Vec<(&'static str, u64)>,
 }
 
 impl Part {
@@ -65,6 +75,61 @@ impl Part {
         self.last = Some(now);
         Some(part)
     }
+
+    /// The copied pages' part of what rose since the part before, or since the process began
+    /// ([`copied_line`]).
+    pub fn copied(&mut self) -> String {
+        let now = crate::answer::counted_kinds();
+        let part = copied_line(&self.copied, &now);
+        self.copied = now;
+        part
+    }
+}
+
+/// The copied pages' part (the module doc) of what rose from `before` to `now`, each the counts by
+/// code; a count that fell reads as it is.
+pub(crate) fn copied_line(before: &[(&str, u64)], now: &[(&str, u64)]) -> String {
+    use super::copied::{BYTES_CODES, COMMITS_CODES, NS_CODES, WHY_BYTES_CODES, WHY_COMMITS_CODES};
+    let count = |counts: &[(&str, u64)], code: &str| -> u64 {
+        (counts.iter())
+            .filter(|&&(c, _)| c == code)
+            .map(|&(_, n)| n)
+            .sum()
+    };
+    let rose = |code: &str| {
+        let n = count(now, code);
+        n.checked_sub(count(before, code)).unwrap_or(n)
+    };
+    let ms = |nanos: u64| Duration::from_nanos(nanos).as_secs_f64() * 1e3;
+    let kinds: Vec<String> = ["writable", "read-only", "unchanging"]
+        .iter()
+        .enumerate()
+        .map(|(k, kind)| {
+            format!(
+                "{kind} commits {} bytes {} sync {:.3} ms",
+                rose(COMMITS_CODES[k]),
+                rose(BYTES_CODES[k]),
+                ms(rose(NS_CODES[k]))
+            )
+        })
+        .collect();
+    let whys: Vec<String> = (WHY_COMMITS_CODES.into_iter().zip(WHY_BYTES_CODES))
+        .enumerate()
+        .filter_map(|(why, (commits, bytes))| {
+            let (commits, bytes) = (rose(commits), rose(bytes));
+            (commits != 0 || bytes != 0)
+                .then(|| format!("why {why} commits {commits} bytes {bytes}"))
+        })
+        .collect();
+    format!(
+        "rt copied: {}; read-only by why: {}",
+        kinds.join(", "),
+        if whys.is_empty() {
+            "none".to_owned()
+        } else {
+            whys.join(", ")
+        }
+    )
 }
 
 /// The live textures (each image and each view) and buffers of the process's latest device, as
@@ -350,6 +415,51 @@ mod tests {
                  private_take_sparse_bytes 0, private_take_sparse_allocations 0"
             ),
             "{part}"
+        );
+    }
+
+    /// The copied pages' part says what rose for each kind, a kind with none as 0, and the
+    /// read-only copies by the guest's why, the whys that rose alone; a count that fell, or one
+    /// counted first since the part before, reads as it is.
+    #[test]
+    fn a_copied_part_says_what_rose_by_kind_and_why() {
+        let before = [
+            ("rt-copied-writable-commits", 10),
+            ("rt-copied-writable-compared-bytes", 40_960),
+            ("rt-copied-writable-sync-ns", 1_000_000),
+            ("rt-copied-read-only-why-3-commits", 2),
+            ("rt-copied-read-only-why-3-bytes", 8_192),
+            ("rt-copied-read-only-why-5-commits", 1),
+            ("rt-copied-read-only-why-5-bytes", 4_096),
+            ("rt-copied-unchanging-commits", 9),
+            ("other-kind", 7),
+        ];
+        let now = [
+            ("rt-copied-writable-commits", 14),
+            ("rt-copied-writable-compared-bytes", 40_960 + 16_384),
+            ("rt-copied-writable-sync-ns", 1_000_000 + 2_500_000),
+            ("rt-copied-read-only-why-3-commits", 2 + 3),
+            ("rt-copied-read-only-why-3-bytes", 8_192 + 12_288),
+            ("rt-copied-read-only-why-5-commits", 1),
+            ("rt-copied-read-only-why-5-bytes", 4_096),
+            ("rt-copied-read-only-commits", 3),
+            ("rt-copied-read-only-copied-bytes", 12_288),
+            ("rt-copied-read-only-sync-ns", 125_000),
+            ("rt-copied-read-only-why-12-commits", 1),
+            ("rt-copied-read-only-why-12-bytes", 65_536),
+            ("rt-copied-unchanging-commits", 4),
+            ("other-kind", 9),
+        ];
+        assert_eq!(
+            copied_line(&before, &now),
+            "rt copied: writable commits 4 bytes 16384 sync 2.500 ms, read-only commits 3 bytes \
+             12288 sync 0.125 ms, unchanging commits 4 bytes 0 sync 0.000 ms; read-only by why: \
+             why 3 commits 3 bytes 12288, why 12 commits 1 bytes 65536"
+        );
+        assert_eq!(
+            copied_line(&now, &now),
+            "rt copied: writable commits 0 bytes 0 sync 0.000 ms, read-only commits 0 bytes 0 sync \
+             0.000 ms, unchanging commits 0 bytes 0 sync 0.000 ms; read-only by why: none"
         );
     }
 }

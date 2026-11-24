@@ -1,5 +1,5 @@
 //! The host's summary of each ten seconds in its log, for the walks that time a guest's frames.
-//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes up to seven
+//! Every [`PERIOD`], while the log names [`TARGET`] at debug, the summary writes up to eight
 //! lines of what the period held. Each line starts with its stamp: the host's wall time
 //! (`CLOCK_REALTIME`, seconds since the Unix epoch to the millisecond) and the trace's clock in
 //! nanoseconds (`reims_vgpu_vulkan::core::trace::now`, rt's host clock, which `cbdone` and the
@@ -17,6 +17,9 @@
 //!   time, and the CPU time inside its `vkCreateSwapchainKHR` calls, each with its count, its time
 //!   in all and the longest (the waits with no count: one a present).
 //! - **rt**: rt's part (`reims_vgpu_vulkan::rt_platform::summary`), once its device is made.
+//! - **Copied pages**: the syncs of copied pages since the line before, by kind, and the
+//!   read-only ones by the guest's why (`reims_vgpu_vulkan::rt_platform::summary`'s part of
+//!   them).
 //! - **Managed**: the ranges of `Managed` buffers the host carried out, the app's range messages
 //!   and their bytes apart from the upload chunks of `set*Bytes:` data that command buffers' own
 //!   streams name, their bytes and those buffers ([`managed`], whose doc says what each counts).
@@ -124,6 +127,7 @@ pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
                         Some(presents_part(over, &mut presents)),
                         Some(window_times::line(&window_times::take())),
                         rt.take(),
+                        Some(rt.copied()),
                         Some(managed::line(&managed::take())),
                         Some(waits_part(&long_waits::take())),
                         kept_part,
