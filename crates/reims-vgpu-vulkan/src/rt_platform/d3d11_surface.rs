@@ -124,6 +124,7 @@ fn plane_spec<'a>(
     Ok(rt::D3d11Plane {
         handle: plane.handle,
         image_format: rt_format("element format", plane.image_format)?,
+        bind_flags: plane.bind_flags,
         descriptor: rt_texture_descriptor(texture)?,
         index: None,
     })
@@ -181,26 +182,36 @@ pub(super) fn imported_surface(
     })
 }
 
-/// The import's usages that rt's `d3d11_plane` wants (metal2vulkan-runtime at fd0771d944,
-/// `d3d11.rs`'s `WANTED`), each kept where the plane's view format holds it and the import takes
-/// it ([`import_answers`]).
-const WANTED: [vk::ImageUsageFlags; 5] = [
-    vk::ImageUsageFlags::SAMPLED,
-    vk::ImageUsageFlags::COLOR_ATTACHMENT,
-    vk::ImageUsageFlags::TRANSFER_SRC,
-    vk::ImageUsageFlags::TRANSFER_DST,
-    vk::ImageUsageFlags::STORAGE,
-];
+/// The image usages rt's `d3d11_plane_form` wants of a plane whose texture was made with
+/// `bind_flags` (metal2vulkan-runtime at ec9e2771d0, `d3d11.rs`'s `bound_usage`): copied from and
+/// into; sampled for `D3D11_BIND_SHADER_RESOURCE`, rendered for `D3D11_BIND_RENDER_TARGET` and
+/// storage for `D3D11_BIND_UNORDERED_ACCESS`. Each is kept where the plane's view format holds it
+/// and the import takes it ([`import_answers`]).
+fn wanted(bind_flags: u32) -> Vec<vk::ImageUsageFlags> {
+    const BOUND: [(u32, vk::ImageUsageFlags); 3] = [
+        (0x8, vk::ImageUsageFlags::SAMPLED),
+        (0x20, vk::ImageUsageFlags::COLOR_ATTACHMENT),
+        (0x80, vk::ImageUsageFlags::STORAGE),
+    ];
+    let copies = [
+        vk::ImageUsageFlags::TRANSFER_SRC,
+        vk::ImageUsageFlags::TRANSFER_DST,
+    ];
+    let bound = (BOUND.iter())
+        .filter(|&&(bind, _)| bind_flags & bind != 0)
+        .map(|&(_, bit)| bit);
+    copies.into_iter().chain(bound).collect()
+}
 
 /// What the driver answers rt's import of each of `planes` on `device`, for the line of the
 /// draws' check at a video's open (reims-vgpu's `graphics::drawn_check`), which is a diagnostic:
 /// nothing decides by it. Each plane's image format and view format; the usage rt's
-/// `d3d11_plane` (metal2vulkan-runtime at fd0771d944) takes, by the same queries: each usage it
-/// wants that the view format's optimal features hold and the import takes with the pair of the
-/// two formats (none where they are one); and the formats the image lists. rt lists every format
-/// Metal views the plane's as, where the import takes them with that usage, else the pair. rt
-/// keeps its own list private, so that list is rebuilt here from metal2vulkan's
-/// `views_with_usage` and `direct_format`, said as such.
+/// `d3d11_plane_form` (metal2vulkan-runtime at ec9e2771d0) takes, by the same queries: each usage
+/// the plane's bind flags give ([`wanted`]) that the view format's optimal features hold and the
+/// import takes with the pair of the two formats (none where they are one); and the formats the
+/// image lists. rt lists the pair and the view format's sRGB sibling where the import takes them
+/// with that usage, else the pair. rt keeps its own list private, so the sibling is rebuilt here
+/// from metal2vulkan's `srgb_sibling`, `views_with_usage` and `direct_format`, said as such.
 pub fn import_answers(device: &RtObj<RtDevice>, planes: &[D3d11PlaneDesc<'_>]) -> String {
     let rt_device = device.rt();
     let raw = rt_device.raw();
@@ -221,7 +232,7 @@ fn direct(pf: rt::PixelFormat) -> Option<(vk::Format, Option<&'static str>)> {
 
 /// [`import_answers`]' answers for `plane`; `Err` names a format it does not map.
 fn plane_answers(raw: &rt::RawDevice<'_>, plane: &D3d11PlaneDesc<'_>) -> Result<String, String> {
-    use metal2vulkan::metal::format::views_with_usage;
+    use metal2vulkan::metal::format::{srgb_sibling, views_with_usage};
     let image_pf = rt_format("element format", plane.image_format)?;
     let view_pf = rt_format("pixel format", plane.pixel_format)?;
     let unmapped = |pf: rt::PixelFormat| format!("{pf:?} maps to no Vulkan format");
@@ -246,46 +257,43 @@ fn plane_answers(raw: &rt::RawDevice<'_>, plane: &D3d11PlaneDesc<'_>) -> Result<
         held.contains(feature)
     };
     let takes = |usage, list: &[vk::Format]| imports(raw, format, usage, list);
-    let usage = (WANTED.iter())
-        .filter(|&&bit| holds(bit) && takes(bit, &pair))
-        .fold(vk::ImageUsageFlags::empty(), |all, &bit| all | bit);
+    let usage = (wanted(plane.bind_flags).into_iter())
+        .filter(|&bit| holds(bit) && takes(bit, &pair))
+        .fold(vk::ImageUsageFlags::empty(), |all, bit| all | bit);
     let whole = !usage.is_empty() && takes(usage, &pair);
-    let mut listed = vec![view];
-    for &other in rt::PixelFormat::ALL {
-        if other == view_pf || !views_with_usage(view_pf, other) {
-            continue;
+    // The view format's sRGB sibling, where Metal views the plane's texture as it.
+    let sibling = (srgb_sibling(view_pf))
+        .filter(|&sibling| views_with_usage(view_pf, sibling))
+        .and_then(direct)
+        .filter(|&(_, sibling_class)| sibling_class == class)
+        .map(|(sibling, _)| sibling);
+    let siblings = sibling.map(|sibling| {
+        let mut siblings = vec![format];
+        for listed in [view, sibling] {
+            if !siblings.contains(&listed) {
+                siblings.push(listed);
+            }
         }
-        if let Some((other, other_class)) = direct(other)
-            && other_class == class
-            && !listed.contains(&other)
-        {
-            listed.push(other);
+        siblings
+    });
+    let list = match siblings {
+        Some(siblings) if takes(usage, &siblings) => {
+            format!("with the sRGB sibling (rebuilt) {}", names(&siblings))
         }
-    }
-    let mut full = vec![format];
-    for listed in listed {
-        if !full.contains(&listed) {
-            full.push(listed);
-        }
-    }
-    if full.len() == 1 {
-        full.clear();
-    }
-    let takes_full = full.len() > pair.len() && takes(usage, &full);
-    let list = match takes_full {
-        true => format!("Metal's views (rebuilt) {}", names(&full)),
-        false => format!(
-            "the pair {}, refused Metal's views (rebuilt) {}",
+        Some(siblings) => format!(
+            "the pair {}, refused with the sRGB sibling (rebuilt) {}",
             names(&pair),
-            names(&full)
+            names(&siblings)
         ),
+        None => format!("the pair {}, no sRGB sibling", names(&pair)),
     };
     let whole = if whole { "" } else { " (refused together)" };
     let usage = metal2vulkan::vk::ImageUsageFlags::from_raw(usage.as_raw());
     Ok(format!(
-        "{} as {}: usage {usage:?}{whole}, listing {list}",
+        "{} as {}: bind flags {:#x}, usage {usage:?}{whole}, listing {list}",
         names(&[format]),
-        names(&[view])
+        names(&[view]),
+        plane.bind_flags
     ))
 }
 
@@ -372,6 +380,9 @@ mod tests {
             width,
             height,
             usage: 0x1 | 0x4 | 0x10,
+            // `D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE`, as the host's video makes
+            // its targets.
+            bind_flags: 0x20 | 0x8,
         };
         let planes = [plane(20, 10, 64, 64), plane(23, 30, 32, 32)];
         let before = counted(D3D11_SURFACE_REFUSED_CODE);

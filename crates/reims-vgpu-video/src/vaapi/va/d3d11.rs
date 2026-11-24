@@ -167,6 +167,8 @@ const D3D11_FEATURE_D3D11_OPTIONS: u32 = 5;
 const D3D11_BIND_CONSTANT_BUFFER: u32 = 0x4;
 const D3D11_BIND_SHADER_RESOURCE: u32 = 0x8;
 const D3D11_BIND_RENDER_TARGET: u32 = 0x20;
+/// The `BindFlags` a [`Target`] is made with: drawn into and read.
+const TARGET_BIND: u32 = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 const D3D11_RESOURCE_MISC_SHARED: u32 = 0x2;
 const D3D11_RESOURCE_MISC_SHARED_NTHANDLE: u32 = 0x800;
 const D3D11_SRV_DIMENSION_TEXTURE2D: u32 = 4;
@@ -460,6 +462,8 @@ struct Target {
     _opened: Com,
     view: Com,
     size: (u32, u32),
+    /// The `BindFlags` the native device made the texture with.
+    bind_flags: u32,
 }
 
 impl PlaneTargets {
@@ -482,6 +486,12 @@ impl PlaneTargets {
     /// The luma's width and height in samples; the chroma's are half of each, rounded up.
     pub fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// The `BindFlags` (`D3D11_TEXTURE2D_DESC`) the luma's texture and the chroma's were made
+    /// with, which an import of them as images of another API's takes.
+    pub fn bind_flags(&self) -> [u32; 2] {
+        self.planes.each_ref().map(|plane| plane.bind_flags)
     }
 
     /// Says that they are to read zeros wherever no draw writes them, until a draw or
@@ -725,7 +735,7 @@ impl Makers {
             &self.native,
             format,
             size,
-            D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+            TARGET_BIND,
             D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
         )?;
         let handle = share(&native)?;
@@ -767,6 +777,7 @@ impl Makers {
             _opened: opened,
             view,
             size,
+            bind_flags: TARGET_BIND,
         })
     }
 }

@@ -286,8 +286,9 @@ pub struct ExportedSurface<P: Platform> {
 /// No Metal counterpart: one plane of a surface over Direct3D 11 textures that another API
 /// writes ([`GpuDevice::import_d3d11_surface`](super::device::GpuDevice::import_d3d11_surface)).
 /// The plane is the shared 2D texture `handle` names, of one level, slice and sample, and its
-/// elements are `image_format`'s. Its texture is of `pixel_format`, `width` by `height`, with
-/// Metal's `usage`. The handle is borrowed for the call: the caller may close it afterwards.
+/// elements are `image_format`'s, and it was made with `bind_flags`. Its texture is of
+/// `pixel_format`, `width` by `height`, with Metal's `usage`. The handle is borrowed for the
+/// call: the caller may close it afterwards.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub struct D3d11PlaneDesc<'a> {
@@ -305,6 +306,10 @@ pub struct D3d11PlaneDesc<'a> {
     pub height: u64,
     /// Its texture's `MTLTextureUsage`.
     pub usage: u64,
+    /// The `BindFlags` (`D3D11_TEXTURE2D_DESC`) the Direct3D 11 texture was made with: the
+    /// plane's image takes the uses they give and no other, so a texture usage they do not give
+    /// is refused.
+    pub bind_flags: u32,
 }
 
 /// No Metal counterpart: the memory of a surface over Direct3D 11 textures ([`ImportedSurface`]),

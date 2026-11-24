@@ -769,6 +769,7 @@ pub(crate) fn drawn_planes(
     let (width, height) = targets.size();
     let sizes = [(width, height), (width.div_ceil(2), height.div_ceil(2))];
     let handles = [targets.luma_handle(), targets.chroma_handle()];
+    let bind_flags = targets.bind_flags();
     std::array::from_fn(|n| D3d11PlaneDesc {
         handle: handles[n],
         image_format: DRAWN_FORMATS[at].1[n],
@@ -776,6 +777,7 @@ pub(crate) fn drawn_planes(
         width: u64::from(sizes[n].0),
         height: u64::from(sizes[n].1),
         usage: PLANE_USAGE,
+        bind_flags: bind_flags[n],
     })
 }
 
@@ -805,6 +807,7 @@ impl DrawnAsk {
             DrawnPlanes::new(draw, (width, height), self.ten_bit).map_err(Unmade::Textures)?;
         let targets = drawn.targets();
         let handles = [targets.luma_handle(), targets.chroma_handle()];
+        let bind_flags = targets.bind_flags();
         let planes: [D3d11PlaneDesc<'_>; 2] = std::array::from_fn(|n| D3d11PlaneDesc {
             handle: handles[n],
             image_format: self.elements[n],
@@ -812,6 +815,7 @@ impl DrawnAsk {
             width: self.keys[n].width,
             height: self.keys[n].height,
             usage: PLANE_USAGE,
+            bind_flags: bind_flags[n],
         });
         match device.import_d3d11_surface(ON, &planes) {
             Ok(made) => (made.filter(|m| m.planes.len() == 2))
@@ -1169,6 +1173,7 @@ mod rt_windows_tests {
                 let drawn = DrawnPlanes::new(&draw, (64, 48), *texel == 2).expect("the textures");
                 let targets = drawn.targets();
                 let handles = [targets.luma_handle(), targets.chroma_handle()];
+                let bind_flags = targets.bind_flags();
                 let planes: [D3d11PlaneDesc<'_>; 2] = std::array::from_fn(|n| D3d11PlaneDesc {
                     handle: handles[n],
                     image_format: elements[n],
@@ -1176,6 +1181,7 @@ mod rt_windows_tests {
                     width: sizes[n].0,
                     height: sizes[n].1,
                     usage: PLANE_USAGE,
+                    bind_flags: bind_flags[n],
                 });
                 let made = (device.import_d3d11_surface(ON, &planes))
                     .expect("no raise")
