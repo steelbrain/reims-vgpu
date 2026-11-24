@@ -16,7 +16,7 @@ use crate::gpu::GpuInfo;
 use crate::host::{Host, Os, Profile};
 use crate::update::Channel;
 use crate::vm::{DiskController, Graphics, Registry, Vm, format_mib, parse_size_mib};
-use crate::{install, logs, opencore, paths, reims_util, runtime, update, usb};
+use crate::{disks, install, logs, opencore, paths, reims_util, runtime, update, usb};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -147,6 +147,15 @@ enum Overlay {
         devices: Vec<usb::HostDevice>,
         choice: usize,
     },
+    /// The host's disks, to give the VM `vm` or take back (disks.rs): `found` as last read,
+    /// `own` the devices that hold the VM's images, and `choice` the selected row of
+    /// [`disks::rows`].
+    Disks {
+        vm: String,
+        found: Vec<disks::HostDisk>,
+        own: Vec<disks::Dev>,
+        choice: usize,
+    },
     /// A VM's menu, hanging from a cell: the one right-clicked, or the VM's name in the list.
     /// `all` holds every command, as Ctrl with Enter or the right click opens it.
     Menu {
@@ -200,6 +209,7 @@ enum VmCommand {
     PowerOff,
     Edit,
     Usb,
+    Disks,
     ShowCommand,
     ToggleLogs,
     ViewLogs,
@@ -210,13 +220,14 @@ enum VmCommand {
 
 impl VmCommand {
     /// Each with its key, in the menu's order.
-    const ALL: [(VmCommand, char); 12] = [
+    const ALL: [(VmCommand, char); 13] = [
         (VmCommand::Start, 's'),
         (VmCommand::View, 'v'),
         (VmCommand::Stop, 'x'),
         (VmCommand::PowerOff, 'K'),
         (VmCommand::Edit, 'e'),
         (VmCommand::Usb, 'p'),
+        (VmCommand::Disks, 'P'),
         (VmCommand::ShowCommand, 'c'),
         (VmCommand::ToggleLogs, 'l'),
         (VmCommand::ViewLogs, 'L'),
@@ -420,6 +431,9 @@ impl App {
         // Devices plugged in or out show as they are.
         if let Some(Overlay::Usb { devices, .. }) = &mut self.overlay {
             *devices = usb::host_devices();
+        }
+        if let Some(Overlay::Disks { found, .. }) = &mut self.overlay {
+            *found = disks::host_disks();
         }
         self.last_state = Instant::now();
     }
@@ -698,6 +712,12 @@ impl App {
                 devices,
                 choice,
             }) => self.usb_key(k, vm, devices, choice),
+            Some(Overlay::Disks {
+                vm,
+                found,
+                own,
+                choice,
+            }) => self.disks_key(k, vm, found, own, choice),
             Some(Overlay::Downloads { items, choice }) => self.downloads_key(k, items, choice),
             None => self.main_key(k),
         }
@@ -991,6 +1011,7 @@ impl App {
             VmCommand::PowerOff => self.ask_force_stop(),
             VmCommand::Edit => self.open_edit(),
             VmCommand::Usb => self.open_usb(),
+            VmCommand::Disks => self.open_disks(),
             VmCommand::ShowCommand => self.show_command(),
             VmCommand::ToggleLogs => self.toggle_logs(),
             VmCommand::ViewLogs => self.view_logs(),
@@ -1406,6 +1427,92 @@ impl App {
                     if failed { Level::Warn } else { Level::Ok },
                 );
             }
+            Err(e) => self.say(&format!("{e:#}"), Level::Error),
+        }
+        let _ = self.reload();
+    }
+
+    /// Opens the selected VM's host disks, where its host passes them through.
+    fn open_disks(&mut self) {
+        let Some(vm) = self.selected_vm() else { return };
+        if let Err(why) = disks_available(self.host, &vm) {
+            return self.say(&why, Level::Warn);
+        }
+        let own = disks::own_devs(&vm, &disks::HostUse::current());
+        self.overlay = Some(Overlay::Disks {
+            vm: vm.config.name.clone(),
+            found: disks::host_disks(),
+            own,
+            choice: 0,
+        });
+    }
+
+    /// The rows of the disks' view of the VM named `vm`: the host's disks `found`, each with
+    /// what of the VM's settings, as the list last read them, gives it.
+    fn disks_rows(&self, vm: &str, found: &[disks::HostDisk]) -> Vec<disks::Row> {
+        let chosen = self
+            .rows
+            .iter()
+            .find(|r| r.name == vm)
+            .and_then(|r| r.vm.as_ref().ok())
+            .map(|vm| vm.config.host_disks.clone())
+            .unwrap_or_default();
+        disks::rows(&chosen, found)
+    }
+
+    fn disks_key(
+        &mut self,
+        k: KeyEvent,
+        vm: String,
+        mut found: Vec<disks::HostDisk>,
+        own: Vec<disks::Dev>,
+        choice: usize,
+    ) {
+        let rows = self.disks_rows(&vm, &found);
+        let last = rows.len().saturating_sub(1);
+        let mut choice = choice.min(last);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => choice = (choice + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                choice = choice.saturating_sub(1)
+            }
+            KeyCode::Home => choice = 0,
+            KeyCode::End => choice = last,
+            KeyCode::Char('r') => {
+                found = disks::host_disks();
+                self.say("rescanned this host's disks", Level::Info);
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Some(row) = rows.get(choice) {
+                    self.toggle_disk(&vm, row, &own);
+                }
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::Disks {
+            vm,
+            found,
+            own,
+            choice,
+        });
+    }
+
+    /// Gives the VM named `name` the disk of `row`, or takes it back, from its next start
+    /// (disks::apply): a disk the host uses is refused, saying why. `own` are the devices that
+    /// hold the VM's images.
+    fn toggle_disk(&mut self, name: &str, row: &disks::Row, own: &[disks::Dev]) {
+        let Some(vm) = self
+            .rows
+            .iter()
+            .find(|r| r.name == name)
+            .and_then(|r| r.vm.as_ref().ok())
+            .cloned()
+        else {
+            return;
+        };
+        match disks::apply(&vm, |cur| disks::toggle(cur, row, own)) {
+            Ok((_, said)) => self.say(&said.join("; "), Level::Ok),
             Err(e) => self.say(&format!("{e:#}"), Level::Error),
         }
         let _ = self.reload();
@@ -2181,6 +2288,21 @@ impl App {
                 let running = self.rows.iter().any(|r| &r.name == vm && r.pid.is_some());
                 draw_usb(f, area, vm, running, &rows, devices, *choice);
             }
+            Some(Overlay::Disks {
+                vm,
+                found,
+                own,
+                choice,
+            }) => {
+                let rows = self.disks_rows(vm, found);
+                let of = self.rows.iter().find(|r| &r.name == vm);
+                let running = of.is_some_and(|r| r.pid.is_some());
+                let most = of
+                    .and_then(|r| r.vm.as_ref().ok())
+                    .and_then(|vm| vm.config.q35.as_ref())
+                    .map_or(0, |q| q.host_disk_ports().len());
+                draw_disks(f, area, vm, running, &rows, own, most, *choice);
+            }
             Some(Overlay::Downloads { items, choice }) => draw_downloads(f, area, items, *choice),
             // A menu whose VM has left the list closes.
             Some(Overlay::Menu {
@@ -2329,6 +2451,7 @@ impl App {
                         .into_iter()
                         .chain(runtime::warnings(vm, self.host))
                         .chain(usb::problems(vm))
+                        .chain(disks::problems(vm))
                     {
                         lines.push(Line::from(""));
                         lines.push(Line::from(Span::styled(w, Style::new().fg(Color::Yellow))));
@@ -2411,6 +2534,10 @@ fn vm_menu(row: &VmRow, all: bool, host: Host) -> Vec<(VmCommand, &'static str)>
                     "USB devices…",
                     vm.is_some_and(|vm| usb_available(host, vm).is_ok()),
                 ),
+                VmCommand::Disks => (
+                    "Host disks…",
+                    vm.is_some_and(|vm| disks_available(host, vm).is_ok()),
+                ),
                 VmCommand::ShowCommand => ("Show QEMU command", true),
                 VmCommand::ToggleLogs => match vm.map(|vm| vm.config.logs.enabled) {
                     Some(true) => ("Turn logs off", true),
@@ -2442,6 +2569,18 @@ fn usb_available(host: Host, vm: &Vm) -> Result<(), String> {
             "{}: USB passthrough is for x86-64 VMs on Linux hosts",
             vm.name()
         ));
+    }
+    Ok(())
+}
+
+/// Whether the VM can be given the host's disks: an x86-64 VM on a Linux host. Else why not,
+/// to say.
+fn disks_available(host: Host, vm: &Vm) -> Result<(), String> {
+    if host.os != Os::Linux
+        || host.default_profile() != Some(Profile::Q35X86_64)
+        || vm.config.q35.is_none()
+    {
+        return Err(disks::ONLY.into());
     }
     Ok(())
 }
@@ -2775,6 +2914,9 @@ of its own. A VM runs reims-vgpu's own GPU device unless its settings choose ano
   p           give it this host's USB devices: Space gives the selected one to
               the guest or takes it back, at once while the VM runs; a device you gave it
               joins the guest when it is plugged in. More in reims-ctl usb --help
+  P           give it whole disks of this host's: Space gives the selected one to the
+              guest or takes it back, from the VM's next start; a disk this host uses can't
+              be given. More in reims-ctl disks --help
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and
@@ -2993,6 +3135,115 @@ fn draw_usb(
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .title(Line::from(format!(" {vm}: USB devices ")).bold())
+        .border_style(Style::new().fg(Color::Cyan));
+    let body = block.inner(popup);
+    let above: u16 = lines[..first_row + choice.min(rows.len().saturating_sub(1))]
+        .iter()
+        .map(rows_of)
+        .sum();
+    let scroll = (above + 1).saturating_sub(body.height);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        popup,
+    );
+}
+
+/// Draws the disks' view of the VM `vm`: each of `rows` with a box checked where the VM has
+/// the disk, its name and size, its file and notes, `choice` highlighted, and what lets QEMU
+/// open the selected disk where this user can't. `own` are the devices that hold the VM's
+/// images, and `most` the disks it takes.
+#[allow(clippy::too_many_arguments)]
+fn draw_disks(
+    f: &mut Frame,
+    area: Rect,
+    vm: &str,
+    running: bool,
+    rows: &[disks::Row],
+    own: &[disks::Dev],
+    most: usize,
+    choice: usize,
+) {
+    let width = area.width.saturating_sub(4).min(100);
+    let inner_w = width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let when = if running {
+        "from its next start (until it stops, it keeps the ones it started with)"
+    } else {
+        "from its next start"
+    };
+    lines.push(
+        Line::from(format!(
+            "This host's disks. One you give {vm} is the guest's, whole, {when}. A disk this \
+             host uses can't be given: a guest writing it would destroy it."
+        ))
+        .dim(),
+    );
+    lines.push(Line::from(""));
+    let first_row = lines.len();
+    if rows.is_empty() {
+        lines.push(Line::from("This host has no disks to list."));
+    }
+    let name_w = rows
+        .iter()
+        .map(|r| r.name().chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(inner_w.saturating_sub(24).clamp(12, 44));
+    for (i, r) in rows.iter().enumerate() {
+        let mut name: String = r.name().chars().take(name_w).collect();
+        if r.name().chars().count() > name_w {
+            name.pop();
+            name.push('…');
+        }
+        let notes = r.notes(own);
+        let text = format!(
+            "{} [{}] {name:<name_w$}  {}{}",
+            if i == choice { "›" } else { " " },
+            if r.chosen.is_some() { "x" } else { " " },
+            r.path().display(),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", notes.join(", "))
+            }
+        );
+        lines.push(if i == choice {
+            Line::from(text).style(Style::new().fg(Color::Black).bg(Color::Cyan))
+        } else if r.disk.is_none() {
+            Line::from(text).dim()
+        } else {
+            Line::from(text)
+        });
+    }
+    lines.push(Line::from(""));
+    // What lets QEMU open the selected disk, where this user can't and the host leaves it be.
+    if let Some(d) = rows
+        .get(choice)
+        .and_then(|r| r.disk.as_ref())
+        .filter(|d| !d.usable() && disks::refusal(d, own).is_none())
+    {
+        let fix = format!("QEMU can't open what you can't: {}", disks::fix(d));
+        for l in fix.lines() {
+            lines.push(Line::from(l.to_string()).style(Style::new().fg(Color::Yellow)));
+        }
+    }
+    lines.push(
+        Line::from(format!(
+            "Space give or take back · r rescan · Esc close · up to {most} disks a VM"
+        ))
+        .dim(),
+    );
+    // Rows wrap to the popup's width; the highlighted one stays in sight.
+    let rows_of = |l: &Line| (l.width().max(1)).div_ceil(inner_w.max(1)) as u16;
+    let need: u16 = lines.iter().map(rows_of).sum::<u16>() + 2;
+    let height = need.min(area.height);
+    let popup = area.centered(Constraint::Length(width), Constraint::Length(height));
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(Line::from(format!(" {vm}: host disks ")).bold())
         .border_style(Style::new().fg(Color::Cyan));
     let body = block.inner(popup);
     let above: u16 = lines[..first_row + choice.min(rows.len().saturating_sub(1))]
@@ -3525,13 +3776,18 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let every = [ShowCommand, ToggleLogs, ViewLogs, Report];
-        let stopped = [&[Start, Edit, Usb][..], &every, &[UpdateOpencore, Delete]].concat();
+        let stopped = [
+            &[Start, Edit, Usb, Disks][..],
+            &every,
+            &[UpdateOpencore, Delete],
+        ]
+        .concat();
         assert_eq!(commands(&vm_row("t")), stopped);
         let mut running = vm_row("t");
         running.pid = Some(1);
-        let running_menu = [&[View, Stop, PowerOff, Edit, Usb][..], &every].concat();
+        let running_menu = [&[View, Stop, PowerOff, Edit, Usb, Disks][..], &every].concat();
         assert_eq!(commands(&running), running_menu);
-        // A Mac passes no USB device through.
+        // A Mac passes no USB device or disk through.
         let mac = Host {
             os: Os::Mac,
             arch: Arch::Aarch64,
@@ -3539,7 +3795,7 @@ mod tests {
         assert!(
             !vm_menu(&vm_row("t"), false, mac)
                 .iter()
-                .any(|it| it.0 == Usb)
+                .any(|it| it.0 == Usb || it.0 == Disks)
         );
         let broken = VmRow {
             vm: Err("parse vm.toml".into()),
@@ -3643,6 +3899,75 @@ mod tests {
             app.status.as_ref().map(|s| &s.0)
         );
         assert!(matches!(app.overlay, Some(Overlay::Usb { .. })));
+        press(&mut app, [KeyCode::Esc]);
+        assert!(app.overlay.is_none());
+    }
+
+    /// P opens a VM's host disks, on a Linux host alone: a disk it was given that is not
+    /// attached shows checked, after the host's disks, and Space takes it back, in its settings
+    /// as they are now.
+    #[test]
+    fn the_disks_view_takes_back_a_disk_not_attached() {
+        let env = crate::testenv::Env::new("tui-disks");
+        let dir = env.root.join("vms/t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vm = vm_row("t").vm.unwrap();
+        vm.dir = dir.clone();
+        vm.config.host_disks = vec![crate::vm::HostDiskChoice {
+            path: "/dev/disk/by-id/ata-Away_Disk_0001".into(),
+            name: "Away Disk, 2 TB".into(),
+        }];
+        vm.save().unwrap();
+        let mut reg = Registry::default();
+        reg.add("t", &dir).unwrap();
+        reg.save().unwrap();
+
+        let mut app = App::with(Host {
+            os: Os::Mac,
+            arch: Arch::X86_64,
+        });
+        app.reload().unwrap();
+        press(&mut app, [KeyCode::Char('P')]);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.status.as_ref().unwrap().0, disks::ONLY);
+
+        let mut app = App::with(LINUX);
+        app.reload().unwrap();
+        press(&mut app, [KeyCode::Char('P'), KeyCode::End]);
+        let Some(Overlay::Disks { found, .. }) = &app.overlay else {
+            panic!("no disks view");
+        };
+        let found = found.clone();
+        let rows = app.disks_rows("t", &found);
+        let away = rows.len() - 1;
+        assert_eq!(rows[away].name(), "Away Disk, 2 TB");
+        assert!(rows[away].chosen.is_some() && rows[away].disk.is_none());
+        assert_eq!(rows[away].notes(&[]), ["not attached"]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert!(find(&buf, buf.area, "[x] Away Disk, 2 TB").is_some());
+        assert!(find(&buf, buf.area, "t: host disks").is_some());
+
+        // Edited meanwhile, as by reims-ctl set: the change keeps it.
+        let mut now = Vm::load(&dir).unwrap();
+        now.config.cpus = 3;
+        now.save().unwrap();
+        press(&mut app, [KeyCode::Char(' ')]);
+        let saved = Vm::load(&dir).unwrap().config;
+        assert!(saved.host_disks.is_empty(), "{:?}", saved.host_disks);
+        assert_eq!(saved.cpus, 3);
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("Away Disk, 2 TB is no longer the VM's"),
+            "{:?}",
+            app.status.as_ref().map(|s| &s.0)
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Disks { .. })));
         press(&mut app, [KeyCode::Esc]);
         assert!(app.overlay.is_none());
     }
