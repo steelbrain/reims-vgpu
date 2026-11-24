@@ -87,6 +87,7 @@ mod host_blocks;
 mod private_blocks;
 mod rt_blocks;
 mod takes;
+mod write_combined;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ptr::NonNull;
@@ -114,6 +115,7 @@ pub(crate) use private_blocks::{
 };
 pub(crate) use rt_blocks::RtBlocks;
 pub(crate) use takes::{Give, PoolLedger, TAKE_MAX};
+pub(crate) use write_combined::WriteCombined;
 #[cfg(test)]
 use takes::{TAKE_ALIGN, TakeAnswer, Taken};
 
@@ -252,8 +254,12 @@ pub const RELEASE_DELAY: Duration = Duration::from_secs(5);
 pub enum MemoryClass {
     /// Device-local, never mapped, no host pointer.
     Private,
-    /// Host-visible, host-coherent and host-cached: the only class mapped into the guest.
+    /// Host-visible, host-coherent and host-cached: mapped into the guest.
     Shared,
+    /// Host-visible and host-coherent, and not host-cached where the GPU has such memory
+    /// (metal2vulkan-runtime's `SharedWriteCombined`): mapped into the guest where the host asks
+    /// for write-combined blocks ([`WriteCombined`]).
+    SharedWriteCombined,
 }
 
 /// A block's number, never reused while its source lives (metal2vulkan-runtime's `BlockId`).

@@ -480,6 +480,7 @@ fn block_text(block: &MappedBlock) -> String {
     let class = match block.class {
         rt::MemoryClass::Private => "Private",
         rt::MemoryClass::Shared => "Shared",
+        rt::MemoryClass::SharedWriteCombined => "write-combined Shared",
     };
     let import = block.import.unwrap_or("not an import");
     format!(

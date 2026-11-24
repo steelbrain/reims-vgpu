@@ -405,6 +405,14 @@ pub struct RvgGraphicsDeviceConfig {
     pub pool_physical_address: u64,
     /// The range's length in bytes, the most the pool may take: 0 for none.
     pub pool_physical_length: u64,
+    /// 1: the pool's blocks are write-combined memory, host-visible and host-coherent, and not
+    /// host-cached where the GPU has such memory, which pool_add then maps; 0: host-cached memory,
+    /// as a host built before this field has. A host whose hypervisor takes no cacheable mapping
+    /// of the GPU's memory as guest memory asks for 1: QEMU under Linux's KVM on arm64 where the
+    /// VM does not answer KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED, which refuses a cacheable
+    /// VM_PFNMAP mapping as a memory slot. Nothing without a pool. Refused
+    /// (RVG_ERR_INVALID_ARGUMENT): any other value.
+    pub pool_write_combined: u32,
 }
 
 // SAFETY: repr(C), a u32 first; pointers and u32s.
@@ -553,6 +561,11 @@ unsafe fn create(
         1 => true,
         _ => return refuse(RVG_ERR_INVALID_ARGUMENT),
     };
+    let pool_write_combined = match c.pool_write_combined {
+        0 => false,
+        1 => true,
+        _ => return refuse(RVG_ERR_INVALID_ARGUMENT),
+    };
     // SAFETY: the config's contract: NULL or a live map, and NULL or its files.
     let memory_map = match unsafe { memory_map(c.memory_map, c.memory_files) } {
         Ok(m) => m,
@@ -626,6 +639,7 @@ unsafe fn create(
         guest_arch,
         doorbell_pages,
         pool,
+        pool_write_combined,
     };
     match GraphicsDevice::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
         Ok(d) => {

@@ -98,15 +98,20 @@ impl BlockSource for RtBlocks {
         let rt_class = match class {
             MemoryClass::Private => rt::MemoryClass::Private,
             MemoryClass::Shared => rt::MemoryClass::Shared,
+            MemoryClass::SharedWriteCombined => rt::MemoryClass::SharedWriteCombined,
         };
         let started = trace::on().then(trace::now);
         let began = reims_vgpu_vulkan::core::long_waits::begin();
         let taken = self.device.rt().take_block(rt_class, len);
         began.end("pool-take");
         if let Some(started) = started {
-            // rttake: the class (0 Private, 1 Shared), the length asked, the nanoseconds rt's
-            // take took, 1 where rt refused it
-            let shared = u64::from(matches!(class, MemoryClass::Shared));
+            // rttake: the class (0 Private, 1 Shared, 2 write-combined Shared), the length asked,
+            // the nanoseconds rt's take took, 1 where rt refused it
+            let shared = match class {
+                MemoryClass::Private => 0,
+                MemoryClass::Shared => 1,
+                MemoryClass::SharedWriteCombined => 2,
+            };
             let took = trace::now().saturating_sub(started);
             trace::event("rttake", &[shared, len, took, u64::from(taken.is_err())]);
         }
@@ -183,6 +188,36 @@ mod tests {
         fn forget(&self, id: rt::BlockId) {
             self.0.lock().remove(&id.get());
         }
+    }
+
+    /// A write-combined Shared block, the pool's where the host asks for them
+    /// (`super::WriteCombined`), is rt's block of that class: host-mapped, at a GPU address,
+    /// known from its take until its release, and the host reads back what it wrote through its
+    /// mapping.
+    #[test]
+    fn on_vulkan_rt_blocks_give_a_write_combined_shared_block() {
+        let platform = crate::rt_test_end::platform();
+        let device = platform.metal_device(None).expect("rt's device on the GPU");
+        println!("rt's device: {}", device.facts().name);
+        let known = Known::default();
+        let blocks = RtBlocks::new(device.clone_ref(), Box::new(known.clone()));
+        let block = blocks
+            .take_block(MemoryClass::SharedWriteCombined, MIB)
+            .unwrap();
+        assert_eq!(block.class, MemoryClass::SharedWriteCombined);
+        assert!(block.len >= MIB, "{block:?}");
+        assert_ne!(block.gpu_address, 0, "{block:?}");
+        let contents = block.contents.expect("a write-combined block's host mapping");
+        // SAFETY: the mapping spans the block, which the test holds while it writes and reads.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(contents.as_ptr(), MIB as usize) };
+        bytes.fill(0xA5);
+        assert!(bytes.iter().all(|&b| b == 0xA5));
+        assert_eq!(
+            known.0.lock().get(&block.id.0),
+            Some(&(block.gpu_address, block.len))
+        );
+        assert_eq!(blocks.release_block(block.id), Ok(()));
+        assert!(known.0.lock().is_empty());
     }
 
     /// A block is taken from rt and given back by its number alone: the map hands rt its handle,

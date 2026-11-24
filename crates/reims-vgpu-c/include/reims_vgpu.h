@@ -662,6 +662,14 @@ typedef struct {
   uint64_t pool_physical_address;
   // The range's length in bytes, the most the pool may take: 0 for none.
   uint64_t pool_physical_length;
+  // 1: the pool's blocks are write-combined memory, host-visible and host-coherent, and not
+  // host-cached where the GPU has such memory, which pool_add then maps; 0: host-cached memory,
+  // as a host built before this field has. A host whose hypervisor takes no cacheable mapping
+  // of the GPU's memory as guest memory asks for 1: QEMU under Linux's KVM on arm64 where the
+  // VM does not answer KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED, which refuses a cacheable
+  // VM_PFNMAP mapping as a memory slot. Nothing without a pool. Refused
+  // (RVG_ERR_INVALID_ARGUMENT): any other value.
+  uint32_t pool_write_combined;
 } RvgGraphicsDeviceConfig;
 
 #ifdef __cplusplus

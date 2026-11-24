@@ -552,6 +552,7 @@ fn makes_words(makes: &[PoolMake], start: u64) -> String {
             let class = match make.class {
                 rt::MemoryClass::Private => "Private",
                 rt::MemoryClass::Shared => "Shared",
+                rt::MemoryClass::SharedWriteCombined => "write-combined Shared",
             };
             format!(
                 "{:.3} to {:.3} ms, {:.3} ms, a {class} {:.3} MiB on {}",

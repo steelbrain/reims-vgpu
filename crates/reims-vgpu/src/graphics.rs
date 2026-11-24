@@ -160,8 +160,9 @@ use crate::graphics::slow_answers::{
 use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
 use crate::pool::{
-    Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger, PoolRemoveFn,
-    PrivateBlocks, PrivateGive, PrivateTakeAnswer, PrivateTakeError, TAKE_MAX,
+    BlockSource, Give, HostBlocks, Pool, PoolAddFn, PoolConfig, PoolHost, PoolLedger,
+    PoolRemoveFn, PrivateBlocks, PrivateGive, PrivateTakeAnswer, PrivateTakeError, TAKE_MAX,
+    WriteCombined,
 };
 use crate::trail;
 use crate::window::WindowLink;
@@ -356,6 +357,12 @@ pub struct GraphicsConfig {
     /// `pool_remove`, a range [`PoolConfig::is_valid`] takes, and none of
     /// [`Self::memory_map`]'s ranges overlapping it: otherwise [`Error::InvalidArgument`].
     pub pool: Option<PoolConfig>,
+    /// The pool's blocks are write-combined Shared memory (`crate::pool::WriteCombined`):
+    /// host-visible and host-coherent, and not host-cached where the GPU has such memory, for a
+    /// host whose hypervisor takes no cacheable mapping of the GPU's memory as guest memory
+    /// (Linux's KVM on arm64 without stage-2 forced write-back). The guest's other blocks keep
+    /// their memory. Nothing without [`Self::pool`].
+    pub pool_write_combined: bool,
 }
 
 /// The architecture of the macOS guest a graphics device serves ([`GraphicsConfig::guest_arch`]).
@@ -559,6 +566,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         entry::run(|_| {
             let count = display_count(&config)?;
             let pool_host = pool_host(&config)?;
+            let pool_write_combined = config.pool_write_combined;
             let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)
                 .map_err(|_| Error::HostResources)?;
             let region = (platform.graphics_region(size))
@@ -588,6 +596,18 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                         let now = Box::new(move || clock.clock().now_mono());
                         let source =
                             (block_source.clone()).unwrap_or_else(|| Arc::new(HostBlocks::new()));
+                        // Write-combined blocks where the host asks; the Private blocks below
+                        // take the source unwrapped.
+                        let source: Arc<dyn BlockSource> = if pool_write_combined {
+                            log::info!(
+                                "pool: the host asks for write-combined blocks: the pool's blocks \
+                                 are host-visible, host-coherent memory, not host-cached where \
+                                 the GPU has such memory"
+                            );
+                            Arc::new(WriteCombined::new(source))
+                        } else {
+                            source
+                        };
                         Some(Pool::new(range, host, now, source)?)
                     }
                     None => None,

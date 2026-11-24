@@ -110,7 +110,8 @@ impl HostBlocks {
 
 impl BlockSource for HostBlocks {
     fn take_block(&self, class: MemoryClass, len: u64) -> Result<BlockInfo, BlockError> {
-        if class != MemoryClass::Shared {
+        // The process's own memory, whose host mapping is the one it has whatever the class.
+        if class == MemoryClass::Private {
             return Err(BlockError::Length);
         }
         let mut b = self.blocks.lock();

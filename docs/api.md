@@ -56,12 +56,13 @@ Every struct the host fills in, and every struct the library hands out, starts w
     zero, and is `RVG_ERR_UNSUPPORTED` otherwise. A host built against a newer header then works
     with an older library as long as it leaves the new fields at zero.
   - `RvgWindowConfig` and `RvgWindowCallbacks` are at their first version.
-    `RvgGraphicsDeviceConfig` is at its fifth: the second added `guest_arch`, and a host built
+    `RvgGraphicsDeviceConfig` is at its sixth: the second added `guest_arch`, and a host built
     before it, whose `struct_size` ends before that field, serves an x86-64 guest; the third added
     `doorbell_pages`, and a host built before it maps no doorbell pages; the fourth added
     `display_count` and `display_windows`, and a host built before it makes a device of one
     display; the fifth added `pool_physical_address` and `pool_physical_length`, and a host built
-    before it has no pool. `RvgGraphicsCallbacks` is at its fifth: the second added
+    before it has no pool; the sixth added `pool_write_combined`, and a host built before it has a
+    pool of host-cached blocks. `RvgGraphicsCallbacks` is at its fifth: the second added
     `route_doorbell`, and a host built before it routes no doorbell; the third added
     `route_doorbell_page`, and a host built before it routes none on a doorbell page; the fourth
     added `cursor_glyph_at`, `cursor_show_at` and `cursor_move_at`, and a host built before it is
@@ -242,7 +243,16 @@ heaps hold more than the addresses given, the range stops at their end and the d
 once; where the GPU answers no heap, the guest has no pool, and the device logs that too. The device
 logs the range it took, the addresses it was given and the heaps' total once, at its creation.
 `rvg_graphics_device_pool_range` answers the range it took, 0 and 0 for none, and the host reserves
-that before the guest's firmware runs. The host then maps
+that before the guest's firmware runs. A host whose hypervisor takes no cacheable mapping of the
+GPU's memory as guest memory sets `pool_write_combined` to 1: the device's pool blocks are then
+write-combined memory, the first memory type with `HOST_VISIBLE` and `HOST_COHERENT` and without
+`HOST_CACHED` that a buffer can use, or the Shared type where the GPU has none
+(metal2vulkan-runtime's `MemoryClass::SharedWriteCombined`), and the device logs that once.
+Linux's KVM on arm64 is such a hypervisor where the VM does not answer
+`KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED`: it takes a cacheable `VM_PFNMAP` mapping, as a GPU
+driver's mapping of its memory is, as a memory slot only where the CPU has stage-2 forced
+write-back and `CACHE_DIC`, and refuses it elsewhere (an M1 Pro under Fedora Asahi Remix 45,
+measured 2026-11-24), and QEMU asks for write-combined blocks there. The host then maps
 the device's blocks there as the pool grows
 (`pool_add`, answered by `rvg_graphics_device_pool_added`) and unmaps them as the device gives them
 back to its block source (`pool_remove`, answered by `rvg_graphics_device_pool_removed`). The device

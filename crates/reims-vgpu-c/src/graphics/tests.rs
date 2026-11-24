@@ -43,6 +43,7 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
         display_windows: std::ptr::null(),
         pool_physical_address: 0,
         pool_physical_length: 0,
+        pool_write_combined: 0,
     }
 }
 
@@ -562,6 +563,51 @@ unsafe extern "C-unwind" fn pool_add(
 
 unsafe extern "C-unwind" fn pool_remove(_ctx: *mut c_void, physical_address: u64, length: u64) {
     POOL_ASKS.lock().push((false, physical_address, length));
+}
+
+/// A host asks for the pool's blocks write-combined with `pool_write_combined` 1, which a device
+/// with a pool takes, and the pool then answers its range; 0 asks for host-cached blocks, as a
+/// config whose `struct_size` ends before the field does, whatever lies past it; any other value
+/// is refused.
+#[test]
+fn a_pool_s_write_combined_blocks_are_the_host_s_ask() {
+    const BASE: u64 = 52 << 30;
+    let with_pool = RvgGraphicsCallbacks {
+        pool_add: Some(pool_add),
+        pool_remove: Some(pool_remove),
+        destroy: None,
+        ..callbacks()
+    };
+    let config = |write_combined: u32, struct_size: usize| RvgGraphicsDeviceConfig {
+        struct_size: struct_size as u32,
+        pool_physical_address: BASE,
+        pool_physical_length: 2 << 20,
+        pool_write_combined: write_combined,
+        ..config(&with_pool)
+    };
+    let whole = size_of::<RvgGraphicsDeviceConfig>();
+    let before = std::mem::offset_of!(RvgGraphicsDeviceConfig, pool_write_combined);
+    let mut device = std::ptr::null_mut();
+    // SAFETY: live configs and out-pointers; then live devices, released.
+    unsafe {
+        for (write_combined, size) in [(1, whole), (0, whole), (7, before)] {
+            let c = config(write_combined, size);
+            assert_eq!(
+                rvg_graphics_device_create(&c, &mut device),
+                RVG_OK,
+                "{write_combined} in {size} bytes"
+            );
+            let mut length = 0;
+            assert_eq!(rvg_graphics_device_pool_range(device, &mut length), BASE);
+            assert_eq!(length, 2 << 20);
+            rvg_graphics_device_release(device);
+        }
+        let c = config(2, whole);
+        assert_eq!(
+            rvg_graphics_device_create(&c, &mut device),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+    }
 }
 
 /// A pool needs both of its callbacks and a range of whole 2 MiB; a device without one refuses
