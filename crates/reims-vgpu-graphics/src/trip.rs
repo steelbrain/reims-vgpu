@@ -288,6 +288,35 @@ pub const IDLE_BOUNDS_NS: [u64; 4] = [100_000, 200_000, 325_000, 400_000];
 /// The idle buckets' names in the line.
 const IDLE_NAMES: [&str; 5] = ["lt100", "100_200", "200_325", "325_400", "ge400"];
 
+/// The fine idle histogram's step, in nanoseconds: 20 us ([`FineIdle`]).
+pub const FINE_STEP_NS: u64 = 20_000;
+
+/// The fine idle histogram's buckets: one a step from 0 to 400 us, then one of 400 us or more.
+pub const FINE_BUCKETS: usize = 21;
+
+/// The command buffers' idle at one depth, in steps of [`FINE_STEP_NS`], and in all.
+struct Fine {
+    buckets: [AtomicU64; FINE_BUCKETS],
+    idle_ns: AtomicU64,
+}
+
+impl Fine {
+    const fn new() -> Fine {
+        Fine {
+            buckets: [const { AtomicU64::new(0) }; FINE_BUCKETS],
+            idle_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Its buckets and idle since the take before, zeroed.
+    fn take(&self) -> FineIdle {
+        FineIdle {
+            buckets: std::array::from_fn(|i| self.buckets[i].swap(0, Relaxed)),
+            sum: self.idle_ns.swap(0, Relaxed),
+        }
+    }
+}
+
 /// An idle bucket's idle in all, and its command buffers' pickups.
 struct Idle {
     idle_ns: AtomicU64,
@@ -308,6 +337,8 @@ static HISTS: [Hist; STAGES.len()] = [const { Hist::new() }; STAGES.len()];
 static COUNTERS: [AtomicU64; COUNTS.len()] = [const { AtomicU64::new(0) }; COUNTS.len()];
 /// By the depth at the commit (0, then 1 or more), then by idle bucket.
 static IDLES: [[Idle; 5]; 2] = [const { [const { Idle::new() }; 5] }; 2];
+/// By the depth at the commit (0, then 1 or more).
+static FINE: [Fine; 2] = [const { Fine::new() }; 2];
 
 thread_local! {
     /// When rt's handler entered, for the completion this thread posts next ([`set_down`]).
@@ -369,7 +400,7 @@ pub fn time(stage: Stage, ns: u64) {
 /// A command buffer committed with `depth` of its queue's buffers committed and not completed,
 /// whose GPU sat idle `idle_ns` before it and picked it up `pickup_ns` after rt scheduled it, the
 /// submit call that carries it included (both from rt's times of it): its pickup in its idle
-/// bucket, by its depth 0 or more.
+/// bucket, and its idle in its step of [`FINE_STEP_NS`], by its depth 0 or more.
 pub fn idle(depth: usize, idle_ns: u64, pickup_ns: u64) {
     let at = IDLE_BOUNDS_NS
         .iter()
@@ -378,6 +409,10 @@ pub fn idle(depth: usize, idle_ns: u64, pickup_ns: u64) {
     let cell = &IDLES[usize::from(depth > 0)][at];
     cell.idle_ns.fetch_add(idle_ns, Relaxed);
     cell.pickup.add(pickup_ns);
+    let fine = &FINE[usize::from(depth > 0)];
+    let step = (idle_ns / FINE_STEP_NS).min(FINE_BUCKETS as u64 - 1);
+    fine.buckets[step as usize].fetch_add(1, Relaxed);
+    fine.idle_ns.fetch_add(idle_ns, Relaxed);
 }
 
 /// Adds the span from `from` to now to `stage`, where `from` is not 0.
@@ -592,6 +627,53 @@ impl Spread {
     }
 }
 
+/// The command buffers' idle at one depth since the take before, in steps of [`FINE_STEP_NS`]
+/// ([`idle`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FineIdle {
+    /// Each step's command buffers: bucket `i` holds an idle from `i` steps to under `i + 1`, the
+    /// last every idle of 400 us or more.
+    pub buckets: [u64; FINE_BUCKETS],
+    /// Their idle in all, in nanoseconds.
+    pub sum: u64,
+}
+
+impl FineIdle {
+    /// How many command buffers.
+    pub fn n(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+
+    /// Their mean idle, in nanoseconds; 0 with none.
+    pub fn mean(&self) -> u64 {
+        self.sum.checked_div(self.n()).unwrap_or(0)
+    }
+
+    /// The idle at fraction `q` of them by nearest rank, placed within its step by its rank there,
+    /// in nanoseconds, or the last bucket's floor for one in it; 0 with none.
+    pub fn quantile(&self, q: f64) -> u64 {
+        let n = self.n();
+        if n == 0 {
+            return 0;
+        }
+        let rank = ((q * n as f64).ceil() as u64).clamp(1, n);
+        let mut below = 0;
+        for (i, &c) in self.buckets.iter().enumerate() {
+            if below + c >= rank {
+                let floor = i as u64 * FINE_STEP_NS;
+                if i + 1 == FINE_BUCKETS {
+                    return floor;
+                }
+                // The rank's middle within the step, so the idle stays in it.
+                let into = ((rank - below) as f64 - 0.5) / c as f64;
+                return floor + (FINE_STEP_NS as f64 * into) as u64;
+            }
+            below += c;
+        }
+        0
+    }
+}
+
 /// Every stage's spread and count since the take before ([`take`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Taken {
@@ -602,6 +684,8 @@ pub struct Taken {
     /// Each idle bucket's idle in all, in nanoseconds, and its pickups ([`idle`]): those at depth
     /// 0 in the buckets' order, then those at 1 or more.
     pub idle: Vec<(u64, Spread)>,
+    /// The idle in steps of [`FINE_STEP_NS`] ([`idle`]): of those at depth 0, then at 1 or more.
+    pub fine: Vec<FineIdle>,
 }
 
 /// Every stage's spans and every count since the take before, each zeroed.
@@ -612,6 +696,7 @@ pub fn take() -> Taken {
         idle: (IDLES.iter().flatten())
             .map(|cell| (cell.idle_ns.swap(0, Relaxed), cell.pickup.take()))
             .collect(),
+        fine: FINE.iter().map(Fine::take).collect(),
     }
 }
 
@@ -644,7 +729,9 @@ fn write_spread(f: &mut fmt::Formatter<'_>, spread: &Spread) -> fmt::Result {
 impl fmt::Display for Taken {
     /// `count=n ...`, then for each stage with spans `| name n sum_us p50_us p90_us
     /// [bucket:n,...]` ([`write_spread`]), then for each idle bucket with command buffers
-    /// `| idle d0|d1 bucket idle_us n pickup_sum_us pickup_p50_us pickup_p90_us [...]`.
+    /// `| idle d0|d1 bucket idle_us n pickup_sum_us pickup_p50_us pickup_p90_us [...]`, then for
+    /// each depth with command buffers `| idle20 d0|d1 n idle_us mean_us p50_us p90_us
+    /// [step:n,...]` ([`FineIdle`]).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
         for (count, n) in COUNTS.iter().zip(&self.counts) {
@@ -670,6 +757,27 @@ impl fmt::Display for Taken {
                     us(*idle_ns)
                 )?;
                 write_spread(f, pickup)?;
+            }
+        }
+        for (depth, fine) in self.fine.iter().enumerate() {
+            if fine.n() != 0 {
+                write!(
+                    f,
+                    " | idle20 d{depth} {} {:.1} {:.1} {:.1} {:.1} [",
+                    fine.n(),
+                    us(fine.sum),
+                    us(fine.mean()),
+                    us(fine.quantile(0.5)),
+                    us(fine.quantile(0.9))
+                )?;
+                let mut sep = "";
+                for (i, &c) in fine.buckets.iter().enumerate() {
+                    if c != 0 {
+                        write!(f, "{sep}{i}:{c}")?;
+                        sep = ",";
+                    }
+                }
+                f.write_char(']')?;
             }
         }
         Ok(())
@@ -728,6 +836,41 @@ mod tests {
         assert_eq!(take().idle[0].1.n(), 0, "taken once");
     }
 
+    /// A command buffer's idle goes in its 20 us step by its depth, the last step holding every
+    /// idle of 400 us or more
+    #[test]
+    fn an_idle_goes_in_its_20_us_step_by_depth() {
+        idle(0, 19_999, 0);
+        idle(0, 20_000, 0);
+        idle(1, 399_999, 0);
+        idle(3, 400_000, 0);
+        idle(3, 5_000_000, 0);
+        let fine = take().fine;
+        assert_eq!(fine[0].buckets[0], 1);
+        assert_eq!(fine[0].buckets[1], 1);
+        assert_eq!(fine[0].sum, 39_999);
+        assert_eq!(fine[1].buckets[19], 1);
+        assert_eq!(fine[1].buckets[FINE_BUCKETS - 1], 2);
+        assert_eq!(fine[1].n(), 3);
+        assert_eq!(take().fine[1].n(), 0, "taken once");
+    }
+
+    /// A fine idle's mean is its sum over its count, and its quantiles fall in their ranks' steps,
+    /// one in the last at its floor
+    #[test]
+    fn fine_idle_quantiles_fall_in_their_ranks_steps() {
+        let mut fine = FineIdle::default();
+        assert_eq!((fine.mean(), fine.quantile(0.5)), (0, 0));
+        // Nine of 110 us and one of 500 us.
+        fine.buckets[5] = 9;
+        fine.buckets[FINE_BUCKETS - 1] = 1;
+        fine.sum = 9 * 110_000 + 500_000;
+        assert_eq!(fine.mean(), 149_000);
+        assert_eq!(fine.quantile(0.5) / FINE_STEP_NS, 5);
+        assert_eq!(fine.quantile(0.9) / FINE_STEP_NS, 5);
+        assert_eq!(fine.quantile(0.99), 400_000);
+    }
+
     /// A queue's take with none in flight times the gap from its last completion, and its wake
     #[test]
     fn a_serial_take_times_its_gap() {
@@ -769,12 +912,16 @@ mod tests {
                 );
                 2 * IDLE_NAMES.len()
             ],
+            fine: vec![FineIdle::default(); 2],
         };
         taken.counts[Count::Takes as usize] = 3;
         // One buffer at depth 1 after 350 us idle, picked up in 150 us.
         taken.idle[IDLE_NAMES.len() + 3].0 = 350_000;
         taken.idle[IDLE_NAMES.len() + 3].1.buckets[bucket(150_000)] = 1;
         taken.idle[IDLE_NAMES.len() + 3].1.sum = 150_000;
+        // Two buffers at depth 0 after 105 and 125 us idle.
+        taken.fine[0].buckets[5] = 2;
+        taken.fine[0].sum = 230_000;
         taken.stages[Stage::Gap as usize].buckets[bucket(20_000)] = 2;
         taken.stages[Stage::Gap as usize].sum = 40_000;
         let line = taken.to_string();
@@ -782,6 +929,10 @@ mod tests {
         assert!(line.contains(" | gap 2 40.0 "), "{line}");
         assert!(line.contains(&format!("[{}:2]", bucket(20_000))), "{line}");
         assert!(line.contains(" | idle d1 325_400 350.0 1 150.0 "), "{line}");
+        assert!(
+            line.ends_with(" | idle20 d0 2 230.0 115.0 105.0 115.0 [5:2]"),
+            "{line}"
+        );
         assert!(!line.contains("d2_handler"), "{line}");
     }
 }

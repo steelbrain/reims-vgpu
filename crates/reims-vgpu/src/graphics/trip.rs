@@ -123,6 +123,7 @@ mod tests {
             stages: Vec::new(),
             counts: vec![0; trip::COUNTS.len()],
             idle: Vec::new(),
+            fine: Vec::new(),
         };
         assert_eq!(line(1_500, PERIOD, &ours, Some("rt: x"), [0; 3]), None);
         ours.counts[0] = 2;
