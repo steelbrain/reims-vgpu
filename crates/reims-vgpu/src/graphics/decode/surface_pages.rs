@@ -415,7 +415,12 @@ fn views_debug() -> bool {
 /// a view made, kept, taken and let go of across the blocks over its pages.
 fn runs_hash(runs: &[(u64, u64)]) -> u64 {
     (runs.iter())
-        .flat_map(|&(address, length)| address.to_le_bytes().into_iter().chain(length.to_le_bytes()))
+        .flat_map(|&(address, length)| {
+            address
+                .to_le_bytes()
+                .into_iter()
+                .chain(length.to_le_bytes())
+        })
         .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
         })
