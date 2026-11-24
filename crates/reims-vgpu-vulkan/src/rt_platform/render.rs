@@ -1264,7 +1264,9 @@ mod tests {
             }),
         );
         let target = target.expect("never a raise").expect("a render target");
-        let encoder = made.render_encoder(on, &pass(&target, 2)).expect("never a raise");
+        let encoder = made
+            .render_encoder(on, &pass(&target, 2))
+            .expect("never a raise");
         let encoder = encoder.expect("a render encoder");
         let sent = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
