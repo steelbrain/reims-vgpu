@@ -367,8 +367,9 @@ pub fn time(stage: Stage, ns: u64) {
 }
 
 /// A command buffer committed with `depth` of its queue's buffers committed and not completed,
-/// whose GPU sat idle `idle_ns` before it and picked it up `pickup_ns` after its submit call
-/// returned (both from rt's times of it): its pickup in its idle bucket, by its depth 0 or more.
+/// whose GPU sat idle `idle_ns` before it and picked it up `pickup_ns` after rt scheduled it, the
+/// submit call that carries it included (both from rt's times of it): its pickup in its idle
+/// bucket, by its depth 0 or more.
 pub fn idle(depth: usize, idle_ns: u64, pickup_ns: u64) {
     let at = IDLE_BOUNDS_NS
         .iter()

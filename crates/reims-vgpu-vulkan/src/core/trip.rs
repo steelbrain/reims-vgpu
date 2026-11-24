@@ -43,9 +43,10 @@ pub(crate) fn set_handler(at: u64, handed: bool, gpu: Option<(u64, u64)>) {
 }
 
 /// A command buffer's idle and pickup from rt's times of it, in nanoseconds of rt's host clock:
-/// its submission's end (`kernel_end`, the submit call's return) and its GPU's start and end. The
-/// idle is its GPU start less the latest GPU end of those before it whose handlers ran, 0 where
-/// it starts before that; the pickup its GPU start less its submission's end. `None` where rt
+/// its scheduling (`kernel_end`, stamped as its last segment joins a submission, before the
+/// `vkQueueSubmit2` call that carries it) and its GPU's start and end. The idle is its GPU start
+/// less the latest GPU end of those before it whose handlers ran, 0 where it starts before that;
+/// the pickup its GPU start less its scheduling, so the submit call is in it. `None` where rt
 /// holds no GPU times of it, or no command buffer's end came before.
 pub(crate) fn gpu_times(kernel_end: u64, start: u64, end: u64) -> Option<(u64, u64)> {
     if start == 0 || end == 0 || kernel_end == 0 {
@@ -96,7 +97,7 @@ mod tests {
     }
 
     /// A command buffer's idle runs from the latest end before it, and its pickup from its
-    /// submission's end
+    /// scheduling
     #[test]
     fn a_command_buffers_idle_runs_from_the_latest_end_before_it() {
         // The first: no end before it.
