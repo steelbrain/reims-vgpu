@@ -149,12 +149,12 @@ enum GuestKexts {
     Other(Vec<&'static str>),
 }
 
-/// How an image whose OpenCore loads `loaded`, in its order, holds `set`; `executable` reads a
-/// kext's executable from it, which is compared where the kext has one.
+/// How an image whose OpenCore loads `loaded`, in its order, holds `set`; `same` tells whether
+/// it holds a kext's executable as reims-ctl carries it, which is asked where the kext has one.
 fn guest_kexts(
     set: &'static [Kext],
     loaded: &[&str],
-    executable: &mut dyn FnMut(&Kext) -> Option<Vec<u8>>,
+    same: &mut dyn FnMut(&Kext) -> bool,
 ) -> GuestKexts {
     let at = |k: &Kext| loaded.iter().position(|b| b.eq_ignore_ascii_case(k.bundle));
     let lacks: Vec<_> = set
@@ -172,8 +172,7 @@ fn guest_kexts(
             let i = at(k);
             let in_order = last < i;
             last = i;
-            let other_build =
-                k.executable.is_some() && executable(k).as_deref() != k.executable_bytes();
+            let other_build = k.executable.is_some() && !same(k);
             !in_order || other_build
         })
         .map(|k| k.bundle)
@@ -189,21 +188,33 @@ fn guest_kexts(
 /// image cannot be read, an error where reims-ctl carries no set.
 fn image_guest_kexts(vm: &Vm) -> Option<Result<GuestKexts>> {
     let q = vm.config.q35.as_ref()?;
-    let image = vm.path(&q.opencore);
-    let config = Config::read(&image, q.opencore_format).ok()?;
-    let set = match prebuilt::set() {
+    guest_kexts_in(&vm.path(&q.opencore), q.opencore_format, prebuilt::set)
+}
+
+/// How the image at `image` holds the guest's kexts `set` gives; None where the image cannot be
+/// read, an error where `set` gives one. Each executable is compared whole, however large
+/// ([`Fat32::holds`]).
+fn guest_kexts_in(
+    image: &Path,
+    format: ImageFormat,
+    set: impl FnOnce() -> Result<&'static [Kext]>,
+) -> Option<Result<GuestKexts>> {
+    let disk = Disk::open(image, format).ok()?;
+    let fat = Fat32::open(&disk, esp_start(&disk).ok()?).ok()?;
+    let config = fat.read_file("EFI/OC/config.plist").ok()??;
+    let config = Config::parse(&config).ok()?;
+    let set = match set() {
         Ok(s) => s,
         Err(e) => return Some(Err(e)),
     };
-    let mut executable = |k: &Kext| {
-        let file = format!("EFI/OC/Kexts/{}/{}", k.bundle, k.executable?);
-        read_file(&image, q.opencore_format, &file).ok()?
+    let mut same = |k: &Kext| {
+        let (Some(exe), Some(carried)) = (k.executable, k.executable_bytes()) else {
+            return false;
+        };
+        let file = format!("EFI/OC/Kexts/{}/{exe}", k.bundle);
+        matches!(fat.holds(&file, carried), Ok(Some(true)))
     };
-    Some(Ok(guest_kexts(
-        set,
-        &config.loaded_kexts(),
-        &mut executable,
-    )))
+    Some(Ok(guest_kexts(set, &config.loaded_kexts(), &mut same)))
 }
 
 /// What to tell of a VM on reims-vgpu's own GPU device whose OpenCore image lacks the guest's
@@ -553,7 +564,11 @@ impl Qcow2 {
     }
 }
 
-/// The most of a file or directory read: a config.plist is tens of KiB.
+/// The most of a directory, or of a file read whole, reims-ctl reads. The volume is the guest's to
+/// write, and a corrupt or hostile one may give a directory a chain that loops, which only the
+/// FAT's end mark would end, as a directory's entry gives no size, or give a file's entry a size
+/// of up to 4 GiB. The one file read whole is config.plist, of tens of KiB; the guest's kexts are
+/// compared as they are read ([`Fat32::holds`]), and none of this bounds them.
 const MOST: u64 = 16 << 20;
 
 /// A FAT32 volume (Microsoft's FAT specification, 1.03).
@@ -591,9 +606,9 @@ impl<'a> Fat32<'a> {
         })
     }
 
-    /// The file at `path`, `/` between its names, matched without regard to case as FAT
+    /// The entry at `path`, `/` between its names, matched without regard to case as FAT
     /// matches them; None where there is none.
-    fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
+    fn find(&self, path: &str) -> Result<Option<Entry>> {
         let mut dir = self.root;
         let mut names = path.split('/').peekable();
         while let Some(name) = names.next() {
@@ -601,35 +616,84 @@ impl<'a> Fat32<'a> {
             let Some(e) = entries(&bytes).into_iter().find(|e| e.is(name)) else {
                 return Ok(None);
             };
-            if names.peek().is_some() {
-                dir = e.cluster;
-                continue;
+            if names.peek().is_none() {
+                return Ok(Some(e));
             }
-            let bytes = self.read_chain(e.cluster, u64::from(e.size).min(MOST))?;
-            ensure!(
-                bytes.len() as u64 == u64::from(e.size),
-                "{path} is cut short"
-            );
-            return Ok(Some(bytes));
+            dir = e.cluster;
         }
         Ok(None)
+    }
+
+    /// The file at `path` (as [`Fat32::find`] takes it), read whole; None where there is none.
+    fn read_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        let Some(e) = self.find(path)? else {
+            return Ok(None);
+        };
+        let size = u64::from(e.size);
+        ensure!(
+            size <= MOST,
+            "{path} is of {size} bytes, more than reims-ctl reads"
+        );
+        let bytes = self.read_chain(e.cluster, size)?;
+        ensure!(bytes.len() as u64 == size, "{path} is cut short");
+        Ok(Some(bytes))
+    }
+
+    /// Whether the file at `path` (as [`Fat32::find`] takes it) holds `bytes`, however many: its
+    /// entry's size first, then its clusters, a cluster at a time, to the first that differs, so
+    /// none of it is read where its size differs, and no more than `bytes` holds where it does;
+    /// None where there is no such file.
+    fn holds(&self, path: &str, bytes: &[u8]) -> Result<Option<bool>> {
+        let Some(e) = self.find(path)? else {
+            return Ok(None);
+        };
+        if u64::from(e.size) != bytes.len() as u64 {
+            return Ok(Some(false));
+        }
+        let mut rest = bytes;
+        self.chain(e.cluster, bytes.len() as u64, &mut |part| {
+            let same = rest.starts_with(part);
+            if same {
+                rest = &rest[part.len()..];
+            }
+            same
+        })?;
+        // A chain that ends before the file's size does not hold the rest.
+        Ok(Some(rest.is_empty()))
     }
 
     /// The bytes of the clusters from `first`, at most `most`.
     fn read_chain(&self, first: u32, most: u64) -> Result<Vec<u8>> {
         let mut out = Vec::new();
+        self.chain(first, most, &mut |part| {
+            out.extend_from_slice(part);
+            true
+        })?;
+        Ok(out)
+    }
+
+    /// Gives `part` the bytes of the clusters from `first`, a cluster at a time, until the chain
+    /// ends, `most` bytes are given (the last cluster's cut to them), or `part` returns false.
+    fn chain(&self, first: u32, most: u64, part: &mut dyn FnMut(&[u8]) -> bool) -> Result<()> {
+        let mut buf = vec![0u8; self.cluster_size as usize];
         let mut c = first;
-        while (2..0x0fff_fff8).contains(&c) && (out.len() as u64) < most {
-            let at = out.len();
-            out.resize(at + self.cluster_size as usize, 0);
+        let mut given = 0;
+        while (2..0x0fff_fff8).contains(&c) && given < most {
+            let n = (most - given).min(self.cluster_size) as usize;
             let offset = self.data + u64::from(c - 2) * self.cluster_size;
-            self.disk.read(offset, &mut out[at..])?;
+            self.disk.read(offset, &mut buf[..n])?;
+            if !part(&buf[..n]) {
+                break;
+            }
+            given += n as u64;
+            if given == most {
+                break;
+            }
             let mut next = [0u8; 4];
             self.disk.read(self.fat + u64::from(c) * 4, &mut next)?;
             c = u32::from_le_bytes(next) & 0x0fff_ffff;
         }
-        out.truncate(most as usize);
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -1445,6 +1509,52 @@ pub(crate) mod tests {
         }
     }
 
+    /// A kext's executable is compared whole, however large: one of more than 16 MiB, as
+    /// RgfxGate's may come to be with the Metal bundle it embeds, is held where each of its bytes
+    /// is the carried one's, read through qcow2 as through raw, and another build where only its
+    /// last byte differs.
+    #[test]
+    fn an_image_holds_an_executable_of_more_than_16_mib_as_carried() {
+        let big: &'static [u8] =
+            Vec::leak((0..(16 << 20) + 4099u32).map(|i| (i % 251) as u8).collect());
+        let files: &'static [(&'static str, &'static [u8])] =
+            Vec::leak(vec![("Contents/MacOS/Big", big)]);
+        let set: &'static [Kext] = Vec::leak(vec![Kext {
+            bundle: "Big.kext",
+            executable: Some("Contents/MacOS/Big"),
+            min_kernel: None,
+            max_kernel: None,
+            files,
+        }]);
+        let d = std::env::temp_dir().join(format!("reims-ctl-big-kext-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("opencore.img");
+        let config = plist(&enabled("Big.kext"));
+        let mut other = big.to_vec();
+        *other.last_mut().unwrap() ^= 1;
+        for format in [ImageFormat::Raw, ImageFormat::Qcow2] {
+            let held = |exe: &[u8]| {
+                let raw = image_of(&[
+                    ("EFI/OC/config.plist", config.as_bytes()),
+                    ("EFI/OC/Kexts/Big.kext/Contents/MacOS/Big", exe),
+                ]);
+                let image = match format {
+                    ImageFormat::Raw => raw,
+                    ImageFormat::Qcow2 => qcow2(&raw),
+                };
+                std::fs::write(&p, image).unwrap();
+                guest_kexts_in(&p, format, || Ok(set)).unwrap().unwrap()
+            };
+            assert_eq!(held(big), GuestKexts::Held, "{format:?}");
+            assert_eq!(
+                held(&other),
+                GuestKexts::Other(vec!["Big.kext"]),
+                "{format:?}"
+            );
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     /// After an update of reims-ctl, the image of a VM an older reims-ctl made holds other builds
     /// of the guest's kexts until the VM's next start makes it again with these
     /// (`runtime::prepare`); a VM running since before the update keeps it, as a macOS install,
@@ -1490,29 +1600,29 @@ pub(crate) mod tests {
     #[test]
     fn an_image_holds_the_guest_kexts_loaded_in_order_as_carried() {
         let set = crate::prebuilt::set().unwrap();
-        let ours = |k: &Kext| k.executable_bytes().map(<[u8]>::to_vec);
         let held = guest_kexts(
             set,
             &["Lilu.kext", "ReimsVgpu.kext", "a.KEXT", "B.kext"],
-            &mut |k| ours(k),
+            &mut |_| true,
         );
         assert_eq!(held, GuestKexts::Held);
         assert_eq!(
-            guest_kexts(set, &["Lilu.kext", "B.kext"], &mut |k| ours(k)),
+            guest_kexts(set, &["Lilu.kext", "B.kext"], &mut |_| true),
             GuestKexts::Lacks(vec!["A.kext"])
         );
         assert_eq!(
-            guest_kexts(set, &["B.kext", "A.kext"], &mut |k| ours(k)),
+            guest_kexts(set, &["B.kext", "A.kext"], &mut |_| true),
             GuestKexts::Other(vec!["B.kext"])
         );
-        assert_eq!(
-            guest_kexts(set, &["A.kext", "B.kext"], &mut |_| Some(b"older".to_vec())),
-            GuestKexts::Other(vec!["A.kext"])
-        );
-        assert_eq!(
-            guest_kexts(set, &["A.kext", "B.kext"], &mut |_| None),
-            GuestKexts::Other(vec!["A.kext"])
-        );
+        // An executable the image holds otherwise than carried, or not at all.
+        let mut asked = Vec::new();
+        let other = guest_kexts(set, &["A.kext", "B.kext"], &mut |k| {
+            asked.push(k.bundle);
+            false
+        });
+        assert_eq!(other, GuestKexts::Other(vec!["A.kext"]));
+        // B.kext has no executable to compare.
+        assert_eq!(asked, ["A.kext"]);
         let entries = "<dict><key>BundlePath</key><string>A.kext</string><key>Enabled</key><true/></dict>\
              <dict><key>BundlePath</key><string>B.kext</string><key>Enabled</key><false/></dict>";
         assert_eq!(config(entries).loaded_kexts(), ["A.kext"]);
