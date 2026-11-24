@@ -167,6 +167,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | `qemu-xhci` completes each command with a Command Completion Event of its own (xHCI 6.4.2.2): No Op, Set LTV, Get Port Bandwidth, a command it does not support and an Enable Slot that finds no free slot complete with Slot ID 0, and a command for a slot completes with that Slot ID whether or not the slot is enabled. Upstream's kept the previous command's Slot ID across one doorbell's commands, gave an NEC firmware revision reply the previous command's completion code, and gave every command after an NEC reply the reply's type and fields; `tests/qtest/usb-hcd-xhci-test.c` queues both kinds at one doorbell | `347a2204`, `3b327429` |
 | while a `usb-host` device's SET_INTERFACE call runs on its worker, the main loop makes no usbfs call on the device, each of which would wait for the call: it handles no libusb events, so every usb-host device's completions wait for the call, and the device's submits and cancels wait in order in a queue of its own, made when the call returns ("x86-64 macOS guests: USB passthrough", below) | `db125fda` |
 | `qemu-xhci` posts each Transfer Event a TD's TRBs owe after a Short Packet (xHCI 4.10.1.1.2): the TRB the packet is met on, where it has ISP or IOC, and each later TRB of the TD with IOC, with the same residue. Upstream's posted one event per TD, so macOS's isoch IN TDs of an Isoch TRB chained to a Normal TRB never completed, and a passed-through camera's stream stopped before its first frame ("x86-64 macOS guests: USB passthrough", below); `tests/qtest/usb-hcd-xhci-test.c` runs TDs of two TRBs into usb-kbd's reports | `ae97f3f5`, `1890afed` |
+| `usb-host`'s `reset-on-close` (on by default): off, QEMU leaves the host device unreset as it lets go of it (its removal or close, QEMU's exit, a failed open), releasing its interfaces to the host's drivers in the configuration the guest left; reims-ctl sets it, with `guest-reset=off`, on Apple's iOS devices, which a reset left in a state from which the next VM's mode switch lost them ("arm64 guests: USB passthrough", below) | `7bc47014f4` |
 | WHPX answers CPUID leaf 4 from the CPU model: its exit list lacked the leaf, so Hyper-V answered it with no cache levels, and macOS panicked 1.3 s into boot ("Windows hosts", below) | `cc128f0e` |
 | on Windows, shared RAM (`memory-backend-ram,share=on`, any RAM_SHARED block) is a view of a section the paging file backs, whose handle the RAMBlock keeps (`qemu_ram_get_section`); `qemu_win32_map_alloc` passes a size's high 32 bits ("Windows hosts: guest RAM in a section", below) | `6c2cae16` |
 | `reims-graphics-pci` on Windows: meson looks for the library there too, the memory walk passes each range of RAM that is a view of a section with the section's handle and the range's offset in it, and the control ring's doorbell is the EventNotifier's event | `a86885f8` |
@@ -2758,9 +2759,22 @@ installed, so that usbmuxd never started:
   multiplexor, and `AppleUSBNCM11Control` and `AppleUSBNCM11Data` the two NCM
   pairs, as `en1` (up, with a link-local IPv6 address) and `anri0`.
   `system_profiler SPUSBHostDataType` listed it at 480 Mb/s with its serial
-  number. reims-ctl now gives Apple's iOS devices, the IDs usbmuxd's rule
-  names, `guest-reset=off` (`usb::keeps_its_resets`), at a start and over
-  QMP, for x86-64 VMs too.
+  number.
+- With `guest-reset=off` given by reims-ctl, the VM stopped and started
+  again with the iPhone left plugged in: as QEMU exited it reset the iPhone
+  (`usb_host_exit_notifier`), which came back as a new device. The next
+  VM's guest addressed it, sent 0xc045, 0x4040, 0xc045 and 0xc052 with
+  wIndex 3, and it left the bus 1 s later and did not come back, unlocked
+  or not, until it was plugged in again. Plugged in again, it re-enumerated
+  once after the 0xc052 and the guest drove it.
+- A guest restart, in which QEMU runs on and, with `guest-reset=off`, does
+  not reset the iPhone: the rebooted guest addressed it, sent 0xc045 and
+  0x4040, and, with no 0xc052, set its configuration 5 at once. The iPhone
+  stayed on the bus as the same device, and the guest drove it.
+- So reims-ctl gives Apple's iOS devices, the IDs usbmuxd's rule names,
+  `guest-reset=off` and vendor/qemu's `reset-on-close=off`, which leaves
+  the device unreset as QEMU lets go of it (`usb::never_reset`), at a start
+  and over QMP, for x86-64 VMs too.
 
 macOS hosts give no VM USB devices: reims-ctl lists the host's devices from
 Linux's sysfs alone, and the Mac's QEMU is built without libusb.
