@@ -30,6 +30,17 @@
 //!   driver;
 //! - a manifest given by its path (`--gpu FILE.json`), which may be a driver outside the
 //!   loader's search paths, or a second driver for a GPU the loader reaches by its own.
+//!
+//! **A probe past its manifest.** A manifest names one driver, so a probe that finds GPUs of
+//! several drivers (by `VkPhysicalDeviceDriverProperties::driverID`, else by vendor) shows a
+//! loader that did not keep to it, nor would keep a VM's process to it: its GPUs are named by
+//! their IDs alone ([`GpuInfo::past_manifest`]), and one another manifest's probe found is listed
+//! from that probe. **Seen** in a user's report from a Windows host with an Intel GPU and a GTX
+//! 1650 Ti: the probe of Intel's manifest found both GPUs, so the GTX was saved under that
+//! manifest, and QEMU's run limited to it found both too. Why is not confirmed; a loader that
+//! ignores `VK_DRIVER_FILES` in an elevated process would do it. The library reads
+//! `MESA_VK_DEVICE_SELECT` itself (reims-vgpu-vulkan's `device_choice`), so IDs name the pick
+//! wherever the loader runs.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -48,10 +59,20 @@ pub struct GpuInfo {
     /// Whether another manifest reaches a GPU of the same vendor and device IDs.
     #[serde(default)]
     pub shares_ids: bool,
+    /// The driver's `VkDriverId`, where it says (Vulkan 1.2): 0 where it does not.
+    #[serde(default)]
+    pub driver_id: u32,
+    /// Whether the probe of [`GpuInfo::driver_file`] found GPUs of other drivers too, so that
+    /// manifest is not known to be this GPU's (the module doc): only its IDs name it.
+    #[serde(default)]
+    pub past_manifest: bool,
 }
 
 impl GpuInfo {
     pub fn label(&self) -> String {
+        if self.past_manifest {
+            return format!("{} ({})", self.name, self.kind);
+        }
         let file = self
             .driver_file
             .file_name()
@@ -61,10 +82,10 @@ impl GpuInfo {
     }
 
     /// The VM's settings for this GPU: named by its IDs, unless it is a CPU implementation or
-    /// another manifest reaches a GPU of the same IDs, which its driver's manifest names alone
-    /// (the module doc).
+    /// another manifest reaches a GPU of the same IDs, which its driver's manifest names alone;
+    /// by its IDs wherever its probe went past its manifest (the module doc).
     pub fn to_config(&self) -> crate::vm::Gpu {
-        let by_ids = self.kind != "cpu" && !self.shares_ids;
+        let by_ids = self.past_manifest || (self.kind != "cpu" && !self.shares_ids);
         crate::vm::Gpu {
             driver_file: Some(self.driver_file.clone()),
             device_id: self.shares_driver.then_some(self.device_id),
@@ -145,28 +166,42 @@ pub fn list() -> Vec<GpuInfo> {
             std::thread::spawn(move || probe(&exe, &file))
         })
         .collect();
-    let mut gpus: Vec<GpuInfo> = handles
-        .into_iter()
-        .filter_map(|h| h.join().ok())
-        .flatten()
-        .collect();
-    // One GPU can be reached through two manifests (a 32-bit and a 64-bit one, say): keep the
-    // first.
-    let mut seen = Vec::new();
-    gpus.retain(|g| {
-        let key = (
-            g.vendor_id,
-            g.device_id,
-            g.name.clone(),
-            g.driver_file.file_name().map(|f| f.to_os_string()),
-        );
-        if seen.contains(&key) {
-            false
-        } else {
-            seen.push(key);
-            true
+    let probes = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+    from_probes(probes)
+}
+
+/// The host's GPUs from each manifest's probe, in the loader's order of manifests: a probe that
+/// found several drivers' GPUs marked [`GpuInfo::past_manifest`], and each GPU listed once,
+/// discrete before integrated.
+fn from_probes(probes: Vec<Vec<GpuInfo>>) -> Vec<GpuInfo> {
+    let driver = |g: &GpuInfo| match g.driver_id {
+        0 => (0, g.vendor_id),
+        id => (id, 0),
+    };
+    let mut found: Vec<GpuInfo> = Vec::new();
+    for mut probe in probes {
+        let past = probe.iter().any(|g| driver(g) != driver(&probe[0]));
+        for g in &mut probe {
+            g.past_manifest = past;
         }
-    });
+        found.extend(probe);
+    }
+    // Those found through their own manifest first. One GPU can be reached through two manifests
+    // (a 32-bit and a 64-bit one, say): keep the first. One found past its manifest is kept only
+    // where none kept has its IDs, which alone name it.
+    found.sort_by_key(|g| g.past_manifest);
+    let mut gpus: Vec<GpuInfo> = Vec::new();
+    for g in found {
+        let ids = (g.vendor_id, g.device_id);
+        let seen = gpus.iter().any(|k| {
+            (k.vendor_id, k.device_id) == ids
+                && (g.past_manifest
+                    || (k.name == g.name && k.driver_file.file_name() == g.driver_file.file_name()))
+        });
+        if !seen {
+            gpus.push(g);
+        }
+    }
     mark_shared(&mut gpus);
     let rank = |k: &str| match k {
         "discrete" => 0,
@@ -251,7 +286,7 @@ pub fn probe_main() -> i32 {
         let Ok(entry) = ash::Entry::load() else {
             return 1;
         };
-        let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
+        let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 2, 0));
         let ci = vk::InstanceCreateInfo::default().application_info(&app);
         let Ok(instance) = entry.create_instance(&ci, None) else {
             return 1;
@@ -270,6 +305,16 @@ pub fn probe_main() -> i32 {
                     vk::PhysicalDeviceType::CPU => "cpu",
                     _ => "other",
                 };
+                // VkPhysicalDeviceDriverProperties is Vulkan 1.2's.
+                let v = p.api_version;
+                let driver_id = if vk::api_version_major(v) > 1 || vk::api_version_minor(v) >= 2 {
+                    let mut driver = vk::PhysicalDeviceDriverProperties::default();
+                    let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+                    instance.get_physical_device_properties2(pd, &mut p2);
+                    driver.driver_id.as_raw() as u32
+                } else {
+                    0
+                };
                 let info = GpuInfo {
                     name,
                     vendor_id: p.vendor_id,
@@ -278,6 +323,8 @@ pub fn probe_main() -> i32 {
                     driver_file: PathBuf::new(),
                     shares_driver: false,
                     shares_ids: false,
+                    driver_id,
+                    past_manifest: false,
                 };
                 println!("{}", serde_json::to_string(&info).unwrap());
             }
@@ -305,6 +352,8 @@ mod tests {
             driver_file: file.into(),
             shares_driver: false,
             shares_ids: false,
+            driver_id: 0,
+            past_manifest: false,
         }
     }
 
@@ -385,5 +434,91 @@ mod tests {
         let small = gpu("virtio", (0x1af4, 0x50), "virtual", "/icd/virtio.json");
         assert_eq!(small.to_config().select.as_deref(), Some("1af4:0050"));
         assert_eq!(small.to_config().selected().unwrap(), Some((0x1af4, 0x50)));
+    }
+
+    /// A probe that found several drivers' GPUs went past its manifest: its GPUs are named by
+    /// their IDs, and one a probe of its own manifest found is listed from that probe. Seen on a
+    /// Windows host, where the probe of Intel's manifest found the GTX too and saved it under
+    /// Intel's manifest.
+    #[test]
+    fn gpus_a_probe_found_past_its_manifest_are_named_by_their_ids() {
+        let found = |name: &str, ids: (u32, u32), kind: &str, file: &str, driver_id: u32| GpuInfo {
+            driver_id,
+            ..gpu(name, ids, kind, file)
+        };
+        let (intel, nvidia) = ("/icd/igvk64.json", "/icd/nv-vk64.json");
+        let uhd = |file| found("Intel UHD", (0x8086, 0x9bc4), "integrated", file, 5);
+        let gtx = |file| found("GTX 1650 Ti", (0x10de, 0x1f95), "discrete", file, 4);
+        let picks = |gpus: &[GpuInfo]| {
+            gpus.iter()
+                .map(|g| {
+                    let c = g.to_config();
+                    (g.name.clone(), c.select, c.driver_file, g.past_manifest)
+                })
+                .collect::<Vec<_>>()
+        };
+        let pick = |name: &str, select: &str, file: &str, past| {
+            (
+                name.to_owned(),
+                Some(select.to_owned()),
+                Some(PathBuf::from(file)),
+                past,
+            )
+        };
+        // Every probe found both GPUs: each is listed once, by its IDs.
+        let every = from_probes(vec![
+            vec![uhd(intel), gtx(intel)],
+            vec![gtx(nvidia), uhd(nvidia)],
+        ]);
+        assert_eq!(
+            picks(&every),
+            [
+                pick("GTX 1650 Ti", "10de:1f95", intel, true),
+                pick("Intel UHD", "8086:9bc4", intel, true)
+            ]
+        );
+        assert_eq!(every[0].label(), "GTX 1650 Ti (discrete)");
+        assert_ne!(
+            every[0].to_config(),
+            every[1].to_config(),
+            "the picks differ"
+        );
+        // NVIDIA's probe kept to its manifest: the GTX is listed from it.
+        let one = from_probes(vec![vec![uhd(intel), gtx(intel)], vec![gtx(nvidia)]]);
+        assert_eq!(
+            picks(&one),
+            [
+                pick("GTX 1650 Ti", "10de:1f95", nvidia, false),
+                pick("Intel UHD", "8086:9bc4", intel, true)
+            ]
+        );
+        // Each probe kept to its manifest: as before.
+        let both = from_probes(vec![vec![uhd(intel)], vec![gtx(nvidia)]]);
+        assert_eq!(
+            picks(&both),
+            [
+                pick("GTX 1650 Ti", "10de:1f95", nvidia, false),
+                pick("Intel UHD", "8086:9bc4", intel, false)
+            ]
+        );
+        assert_eq!(both[0].label(), "GTX 1650 Ti (discrete, nv-vk64.json)");
+        // Drivers that do not say their ID are told apart by vendor; two manifests of one name
+        // (a 32-bit and a 64-bit one) list a GPU once.
+        let unsaid = from_probes(vec![
+            vec![found("A", (0x1002, 1), "discrete", "/a/x.json", 0)],
+            vec![found("A", (0x1002, 1), "discrete", "/b/x.json", 0)],
+            vec![
+                found("B", (0x10de, 2), "discrete", "/c/y.json", 0),
+                found("C", (0x8086, 3), "integrated", "/c/y.json", 0),
+            ],
+        ]);
+        assert_eq!(
+            picks(&unsaid),
+            [
+                pick("A", "1002:0001", "/a/x.json", false),
+                pick("B", "10de:0002", "/c/y.json", true),
+                pick("C", "8086:0003", "/c/y.json", true)
+            ]
+        );
     }
 }

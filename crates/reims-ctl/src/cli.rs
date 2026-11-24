@@ -1479,13 +1479,18 @@ fn gpus(host: Host) {
          one."
     );
     for (i, g) in list.iter().enumerate() {
+        // A GPU whose probe went past its manifest is named by its IDs alone (crate::gpu).
+        let file = if g.past_manifest {
+            String::new()
+        } else {
+            format!("  {}", g.driver_file.display())
+        };
         println!(
-            "{:>2}. {}  [{:04x}:{:04x}]  {}",
+            "{:>2}. {}  [{:04x}:{:04x}]{file}",
             i + 1,
             g.name,
             g.vendor_id,
             g.device_id,
-            g.driver_file.display()
         );
     }
     println!("Give a VM one with: reims-ctl set NAME --gpu NUMBER");

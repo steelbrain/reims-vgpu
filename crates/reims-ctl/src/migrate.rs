@@ -1055,6 +1055,8 @@ mod tests {
             driver_file: file.into(),
             shares_driver: false,
             shares_ids: false,
+            driver_id: 0,
+            past_manifest: false,
         }
     }
 
