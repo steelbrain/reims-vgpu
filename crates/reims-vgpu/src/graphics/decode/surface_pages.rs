@@ -96,7 +96,10 @@
 //! for a view being made, or the age) and the cache's load after it. Every line names the view's
 //! runs by one hash of them ([`runs_hash`]), so a view made anew that matches a view let go of
 //! before shows which bound made the guest's block over the same pages pay for its view again.
-//! The hash and the counts are computed only where the lines are on.
+//! A pages block's view made anew is logged once more when made, with its make's steps, each
+//! timed: the room made for its mappings, its mapping, with the kernel mappings it takes where
+//! the platform counts them ([`HostVm::view_mappings`]), and its import, with its runs' layout.
+//! The hash, the counts and the steps' times are computed only where the lines are on.
 //!
 //! The runs are the guest's: each must be whole pages of the guest's (4 KiB) and of the host's
 //! from a page, lie in guest RAM, and the runs must sum to the surface's length; else the block
@@ -2024,13 +2027,20 @@ impl<P: Platform> SurfaceViews<P> {
             );
         }
         let clock = platform.clock();
+        // The make's steps are timed only where the views' lines are on: no clock is read else.
+        let now = || load.is_some().then(|| clock.now_mono());
+        let begun = now();
         Self::make_room_for(views, platform, runs.len());
-        let start = clock.now_mono();
+        let roomed = now();
+        let mut mapped = None;
         let made = match Self::map_runs(views, &runs, length) {
             // Its buffers lie over copies of its pages, which join no import.
-            Ok(view) if copies => Ok((view, None)),
+            Ok(view) if copies => {
+                mapped = now();
+                Ok((view, None))
+            }
             Ok(view) => {
-                let mapped = clock.now_mono();
+                mapped = now();
                 // The platform's copies of the pages count by the guest's why, where it gave one.
                 let held = trail::Held::over(Some(owner), Some(block), runs.iter().copied());
                 let import = pages_why_as(why, || match &imports {
@@ -2038,24 +2048,33 @@ impl<P: Platform> SurfaceViews<P> {
                     None => import_over(device, &view, held),
                 })?;
                 match import {
-                    Some(import) => {
-                        log::trace!(
-                            target: "reims_vgpu::graphics::surface_pages",
-                            "the pages block at {block:#x} of context {}: a view of {length:#x} \
-                             bytes at {:#x} in {}; mapped in {} us, imported in {} us",
-                            context.map_or_else(|| "any".to_owned(), |c| c.to_string()),
-                            view.base().addr(),
-                            Layout::of(runs.iter().copied(), GUEST_PAGE),
-                            mapped.saturating_duration_since(start).as_micros(),
-                            clock.now_mono().saturating_duration_since(mapped).as_micros()
-                        );
-                        Ok((view, Some(import)))
-                    }
+                    Some(import) => Ok((view, Some(import))),
                     None => Err(PagesRefusal::NoBuffer),
                 }
             }
             Err(why) => Err(why),
         };
+        if let (Some(begun), Some(roomed), Some(mapped), Ok((view, import))) =
+            (begun, roomed, mapped, &made)
+        {
+            let done = clock.now_mono();
+            let mappings = (platform.vm().view_mappings(view.base, view.length))
+                .map_or_else(|| "uncounted".to_owned(), |n| n.to_string());
+            let imported = match import {
+                Some(_) => "imported in",
+                None => "no import, over copies, in",
+            };
+            log::debug!(
+                target: VIEWS_TARGET,
+                "the pages block at {block:#x} of context {owner}: its view made in {} us: room \
+                 {} us, mapped in {} us ({mappings} mappings), {imported} {} us; {}",
+                done.saturating_duration_since(begun).as_micros(),
+                roomed.saturating_duration_since(begun).as_micros(),
+                mapped.saturating_duration_since(roomed).as_micros(),
+                done.saturating_duration_since(mapped).as_micros(),
+                Layout::of(runs.iter().copied(), GUEST_PAGE)
+            );
+        }
         let mut v = views.lock();
         let (view, import) = match made {
             Ok(made) => made,
@@ -5423,6 +5442,55 @@ pub(super) mod tests {
             ]
         );
         assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 1);
+    }
+
+    /// A pages block's view made anew logs its make's steps once, at debug on the views' target:
+    /// the room made, its mapping with the kernel mappings it takes, its import and its runs'
+    /// layout; a block that takes the cached view logs none
+    #[test]
+    fn a_pages_view_made_anew_logs_its_make_s_steps() {
+        let mut r = rig(64);
+        let page = r.page;
+        // Where a room is set, the fake counts a view's mappings: one a run.
+        r.p.fake_vm().set_view_room(Some(1000));
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let private = RGFX_SURFACE_PAGES_PRIVATE;
+        for (block, obj_id) in [(BLOCK, 10), (BLOCK + 0x8000, 11)] {
+            assert_eq!(
+                r.pages_flagged(block, 0, &[(5, 1), (1, 1)], 2 * page, private),
+                RGFX_STATUS_OK
+            );
+            assert_eq!(r.pages_buffer(obj_id, 0, block, 0, page), Ok(()));
+            let m = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id,
+            };
+            assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+            r.dec
+                .block_released(&r.device, block, 0, || (), Box::new(|| ()), no_raise());
+            r.dec.surface_worker().flush();
+        }
+        let steps: Vec<String> = (logs.take().into_iter())
+            .filter(|(level, target, line)| {
+                *level == log::Level::Debug
+                    && target == VIEWS_TARGET
+                    && line.contains("its view made in")
+            })
+            .map(|(_, _, line)| line)
+            .collect();
+        assert_eq!(steps.len(), 1, "the first block's make alone: {steps:?}");
+        let line = &steps[0];
+        let named = format!("the pages block at {BLOCK:#x} of context ");
+        for part in [
+            named.as_str(),
+            ": its view made in ",
+            ": room ",
+            " us, mapped in ",
+            " us (2 mappings), imported in ",
+            " us; 2 runs (",
+        ] {
+            assert!(line.contains(part), "{part:?} in {line:?}");
+        }
     }
 
     /// A pages block of pages its process maps read-only (`RGFX_SURFACE_PAGES_READ_ONLY`) holds a

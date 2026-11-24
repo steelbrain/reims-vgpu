@@ -3878,7 +3878,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// The carrying out of a `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` handed to the surface
     /// worker ([`Self::start_over_pages`]): `carry` is its poster, the message, its name, its
     /// block and its settles, which drop once it is made. Made under the reset gate, held shared
-    /// recursively; where the device was reset since, nothing is made.
+    /// recursively; where the device was reset since, nothing is made. Its debug line says how
+    /// long after its begin it was made, and how long after it the worker took it up (its wait
+    /// behind the worker's other jobs).
     fn over_pages_job(
         self: Arc<Self>,
         carry: (
@@ -3889,8 +3891,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             (Settle, Settle),
         ),
     ) -> Job {
+        const TARGET: &str = "reims_vgpu::graphics::surface_pages";
         let (poster, message, name, block, settles) = carry;
         Box::new(move || {
+            // When the worker took it up, for its line: read only where the line is on.
+            let started = log::log_enabled!(target: TARGET, log::Level::Debug)
+                .then(|| self.pool.now());
             let outcome = {
                 let _carried = self.reset_gate.read_recursive();
                 if poster.stale() {
@@ -3901,10 +3907,16 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 decoder.decode_refusing(&self.device, &message)
             };
             self.report(&poster, &message, outcome, false);
+            let begun = settles.0.begun;
             log::debug!(
-                target: "reims_vgpu::graphics::surface_pages",
-                "{name} of the block at {block:#x} made on the worker {} us after its begin",
-                self.pool.now().saturating_duration_since(settles.0.begun).as_micros()
+                target: TARGET,
+                "{name} of the block at {block:#x} made on the worker {} us after its begin, \
+                 taken up {} us after it",
+                self.pool.now().saturating_duration_since(begun).as_micros(),
+                started.map_or_else(
+                    || "unknown".to_owned(),
+                    |s| s.saturating_duration_since(begun).as_micros().to_string()
+                )
             );
             drop(settles);
         })
