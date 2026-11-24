@@ -1,5 +1,5 @@
 //! USB passthrough: the host's USB devices a VM's guest is given, through QEMU's `usb-host` on
-//! the VM's xHCI controller, on Linux hosts.
+//! the VM's xHCI controller ([`bus`]), on Linux hosts, to x86-64 and arm64 VMs alike.
 //!
 //! - A chosen device is kept in the VM's settings ([`UsbDevice`], a `[[usb]]` table) by its
 //!   vendor and product IDs, which follow it from port to port. One chosen while the host has
@@ -19,6 +19,7 @@
 //!   udev rule says otherwise: scripts/install-ctl.sh adds one ([`UDEV_RULE`]), which gives USB
 //!   devices other than hubs to the kvm group and to the user at the host's screen.
 
+use crate::host::{Host, Os, Profile};
 use crate::vm::{UsbDevice, Vm, parse_usb_port};
 use crate::{qmp, runtime};
 use anyhow::{Context, Result, bail};
@@ -365,11 +366,34 @@ pub fn qemu_id(u: &UsbDevice) -> String {
     id
 }
 
-/// The `-device` that passes `u` through, on the q35 machine's xHCI controller.
-pub fn device_arg(u: &UsbDevice) -> Result<String> {
+/// What reims-ctl says where it gives no VM the host's USB devices.
+pub const LINUX_ONLY: &str = "USB passthrough is for VMs on Linux hosts";
+
+/// Whether this host's VMs can be given its USB devices: where they run, on Linux. x86-64 VMs on
+/// Windows are not refused, as before, though `host_devices` lists none there. Else why not.
+pub fn available(host: Host) -> Result<(), &'static str> {
+    match host.default_profile() {
+        None => Err(crate::host::UNSUPPORTED),
+        Some(Profile::VmappleArm64) if host.os != Os::Linux => Err(LINUX_ONLY),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The USB bus of the VM's xHCI controller, which its host devices go on: on q35 the controller
+/// reims-ctl adds, `xhci`; on `vmapple` the machine's own, which has no id, so that its bus is
+/// named from its type (hw/core/bus.c, `qbus_init_internal`), the only USB bus there.
+pub fn bus(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Q35X86_64 => "xhci.0",
+        Profile::VmappleArm64 => "usb-bus.0",
+    }
+}
+
+/// The `-device` that passes `u` through, on `bus`, the VM's xHCI controller's ([`bus`]).
+pub fn device_arg(u: &UsbDevice, bus: &str) -> Result<String> {
     let (v, p) = u.ids()?;
     let mut a = format!(
-        "usb-host,id={},bus=xhci.0,vendorid={v:#06x},productid={p:#06x}",
+        "usb-host,id={},bus={bus},vendorid={v:#06x},productid={p:#06x}",
         qemu_id(u)
     );
     if let Some((bus, port)) = u.bus_port()? {
@@ -379,12 +403,12 @@ pub fn device_arg(u: &UsbDevice) -> Result<String> {
 }
 
 /// QMP's `device_add` arguments for the same device, typed as QMP takes them.
-fn device_add(u: &UsbDevice) -> Result<serde_json::Value> {
+fn device_add(u: &UsbDevice, bus: &str) -> Result<serde_json::Value> {
     let (v, p) = u.ids()?;
     let mut a = json!({
         "driver": "usb-host",
         "id": qemu_id(u),
-        "bus": "xhci.0",
+        "bus": bus,
         "vendorid": v,
         "productid": p,
     });
@@ -451,7 +475,7 @@ pub fn apply(
     }
     for u in new {
         let plugged = devices.iter().find(|d| d.is(u));
-        match q.execute("device_add", Some(device_add(u)?)) {
+        match q.execute("device_add", Some(device_add(u, bus(now.config.profile))?)) {
             Ok(_) => said.push(match plugged {
                 Some(d) if !d.usable() => {
                     format!("{name}: {} can't be the guest's: {}", label(u), unusable(d))
@@ -853,19 +877,24 @@ mod tests {
         let u = choice("1050:0407", None, "YubiKey");
         assert_eq!(qemu_id(&u), "usb-1050-0407");
         assert_eq!(
-            device_arg(&u).unwrap(),
+            device_arg(&u, bus(Profile::Q35X86_64)).unwrap(),
             "usb-host,id=usb-1050-0407,bus=xhci.0,vendorid=0x1050,productid=0x0407"
+        );
+        // On vmapple, the machine's own controller's bus.
+        assert_eq!(
+            device_arg(&u, bus(Profile::VmappleArm64)).unwrap(),
+            "usb-host,id=usb-1050-0407,bus=usb-bus.0,vendorid=0x1050,productid=0x0407"
         );
         let u = choice("0403:6001", Some("3-2.1"), "FT232R");
         assert_eq!(qemu_id(&u), "usb-0403-6001-3-2.1");
         assert_eq!(
-            device_arg(&u).unwrap(),
+            device_arg(&u, "xhci.0").unwrap(),
             "usb-host,id=usb-0403-6001-3-2.1,bus=xhci.0,vendorid=0x0403,productid=0x6001,\
              hostbus=3,hostport=2.1"
         );
         // QMP takes the IDs and the bus as numbers, the port as a string.
         assert_eq!(
-            device_add(&u).unwrap(),
+            device_add(&u, "xhci.0").unwrap(),
             json!({
                 "driver": "usb-host",
                 "id": "usb-0403-6001-3-2.1",
@@ -876,8 +905,21 @@ mod tests {
                 "hostport": "2.1",
             })
         );
-        assert!(device_arg(&choice("1050:04070", None, "")).is_err());
-        assert!(device_arg(&choice("1050:0407", Some("3-2.1,x=y"), "")).is_err());
+        assert!(device_arg(&choice("1050:04070", None, ""), "xhci.0").is_err());
+        assert!(device_arg(&choice("1050:0407", Some("3-2.1,x=y"), ""), "xhci.0").is_err());
+    }
+
+    /// A host's VMs take its USB devices where it runs them on Linux: x86-64 VMs there and on
+    /// Windows, as before, and arm64 VMs on arm64 Linux and on Linux on x86-64; not on a Mac.
+    #[test]
+    fn vms_take_usb_devices_on_linux_hosts() {
+        use crate::host::Arch;
+        let on = |os, arch| available(Host { os, arch });
+        assert_eq!(on(Os::Linux, Arch::X86_64), Ok(()));
+        assert_eq!(on(Os::Linux, Arch::Aarch64), Ok(()));
+        assert_eq!(on(Os::Windows, Arch::X86_64), Ok(()));
+        assert_eq!(on(Os::Mac, Arch::Aarch64), Err(LINUX_ONLY));
+        assert_eq!(on(Os::Mac, Arch::X86_64), Err(crate::host::UNSUPPORTED));
     }
 
     /// The rule `usb --help` shows and the fix names is the one scripts/install-ctl.sh writes,

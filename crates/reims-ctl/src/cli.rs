@@ -1478,14 +1478,61 @@ pub const CROSSING: &str = "If your screen is plugged into a different GPU than 
                             link: an RTX 3090 in a PCIe 3.0 x4 slot spends about 16 ms a frame \
                             on it at 3648 x 2039.";
 
+/// `doctor`'s USB passthrough check, on Linux: QEMU's usb-host, and the devices this user may
+/// open, which fail the check only where a VM is given USB devices.
+fn usb_check(profile: Profile) -> (bool, String) {
+    let devices = crate::usb::host_devices();
+    let closed: Vec<String> = devices
+        .iter()
+        .filter(|d| !d.usable())
+        .map(|d| d.file().display().to_string())
+        .collect();
+    let used = Registry::load().is_ok_and(|reg| {
+        reg.vms
+            .iter()
+            .filter_map(|e| Vm::load(&e.dir).ok())
+            .any(|vm| !vm.config.usb.is_empty())
+    });
+    let usb_host = install::qemu_binary(profile)
+        .ok()
+        .and_then(|q| install::has_device(&q, "usb-host"));
+    if usb_host == Some(false) {
+        (
+            !used,
+            "this QEMU has no usb-host, which passes USB devices through: reims-ctl \
+             update builds one with it"
+                .to_string(),
+        )
+    } else if devices.is_empty() {
+        (true, "no devices plugged in, other than hubs".to_string())
+    } else if closed.is_empty() {
+        (
+            true,
+            format!(
+                "{} to pass through (reims-ctl usb)",
+                plural(devices.len(), "device")
+            ),
+        )
+    } else {
+        (
+            !used,
+            format!(
+                "you can't open {} of the {} plugged in ({}): {}",
+                closed.len(),
+                plural(devices.len(), "device"),
+                closed.join(", "),
+                crate::usb::fix()
+            ),
+        )
+    }
+}
+
 /// `reims-ctl usb`: this host's USB devices, or a VM's choice of them, changed by `add` and
 /// `remove` first.
 fn usb(host: Host, name: Option<&str>, add: &[String], remove: &[String]) -> Result<()> {
     use crate::usb;
-    match host.default_profile() {
-        None => bail!("{}", crate::host::UNSUPPORTED),
-        Some(Profile::VmappleArm64) => bail!("USB passthrough: {}", crate::host::X86_64_ONLY),
-        Some(Profile::Q35X86_64) => {}
+    if let Err(why) = usb::available(host) {
+        bail!("{why}");
     }
     let devices = usb::host_devices();
     let Some(name) = name else {
@@ -1819,6 +1866,8 @@ fn doctor(host: Host) -> Result<i32> {
         crate::host::Os::Linux if profile.accel(host) == "kvm" && profile != Profile::Q35X86_64 => {
             let (ok, detail) = kvm_check(host, &vms);
             line(ok, "/dev/kvm", detail);
+            let (ok, detail) = usb_check(profile);
+            line(ok, "usb", detail);
         }
         crate::host::Os::Linux if profile == Profile::Q35X86_64 => {
             let (ok, detail) = kvm_check(host, &vms);
@@ -1877,52 +1926,7 @@ fn doctor(host: Host) -> Result<i32> {
                         .join("; ")
                 },
             );
-            // USB passthrough: QEMU's usb-host, and the devices this user may open, which
-            // fail the check only where a VM is given USB devices.
-            let devices = crate::usb::host_devices();
-            let closed: Vec<String> = devices
-                .iter()
-                .filter(|d| !d.usable())
-                .map(|d| d.file().display().to_string())
-                .collect();
-            let used = Registry::load().is_ok_and(|reg| {
-                reg.vms
-                    .iter()
-                    .filter_map(|e| Vm::load(&e.dir).ok())
-                    .any(|vm| !vm.config.usb.is_empty())
-            });
-            let usb_host = install::qemu_binary(profile)
-                .ok()
-                .and_then(|q| install::has_device(&q, "usb-host"));
-            let (ok, detail) = if usb_host == Some(false) {
-                (
-                    !used,
-                    "this QEMU has no usb-host, which passes USB devices through: reims-ctl \
-                     update builds one with it"
-                        .to_string(),
-                )
-            } else if devices.is_empty() {
-                (true, "no devices plugged in, other than hubs".to_string())
-            } else if closed.is_empty() {
-                (
-                    true,
-                    format!(
-                        "{} to pass through (reims-ctl usb)",
-                        plural(devices.len(), "device")
-                    ),
-                )
-            } else {
-                (
-                    !used,
-                    format!(
-                        "you can't open {} of the {} plugged in ({}): {}",
-                        closed.len(),
-                        plural(devices.len(), "device"),
-                        closed.join(", "),
-                        crate::usb::fix()
-                    ),
-                )
-            };
+            let (ok, detail) = usb_check(profile);
             line(ok, "usb", detail);
             let (ok, detail) = desktop_check(
                 crate::host::has_screen(&Default::default()),
