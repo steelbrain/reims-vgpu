@@ -95,7 +95,11 @@
 //! the tickets of its macOS are bound to. It runs on HVF on a Mac, with the GIC in the kernel, on
 //! KVM on arm64 Linux, and on TCG, a thread for each vCPU, on x86-64 ([`Profile::accel_arg`]). On
 //! Linux its RAM is a shared memfd, as the library there needs, not allocated as QEMU starts.
-//! It takes no host USB device or disk, no VMware SVGA and no sound device.
+//! It takes no host USB device or disk and no VMware SVGA. With audio on, it has the same two
+//! virtio sound devices as an x86-64 VM, after the GPU, where QEMU puts them, and no HDA: arm64
+//! macOS's AppleVirtIOSound drives them, on vendor/qemu's `virtio-sound-pci` whose capabilities
+//! vmapple links in address order, without which macOS 27's virtio transport never starts the
+//! device (docs/qemu.md, "arm64 guests: audio").
 //!
 //! The xHCI controller has seven ports (`p2=7,p3=7`), each taking a USB 2 and a USB 3 device:
 //! the keyboard, the tablet, and up to [`crate::vm::USB_DEVICES_MAX`] host devices, at their
@@ -439,21 +443,8 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         push(&["-device", &crate::usb::device_arg(u)?]);
     }
     if c.audio.enabled {
-        let (backend, input_apart) = sound_routing(audio_backend(vm, ctx), ctx.sound);
-        push(&["-audiodev", &format!("{},id=snd0", opt(backend))]);
-        if input_apart {
-            push(&["-audiodev", "none,id=sndin"]);
-        }
-        push(&[
-            "-device",
-            "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7,streams=1",
-            "-device",
-            if input_apart {
-                "virtio-sound-pci,id=audioin,audiodev=sndin,addr=0x8,streams=1,input-streams=1"
-            } else {
-                "virtio-sound-pci,id=audioin,audiodev=snd0,addr=0x8,streams=1,input-streams=1"
-            },
-        ]);
+        let sound = virtio_sound(vm, ctx, Some(("0x7", "0x8")));
+        push(&sound.iter().map(String::as_str).collect::<Vec<_>>());
         // At ICH9's own slot for it.
         push(&["-device", "ich9-intel-hda,id=hda,addr=0x1b"]);
         push(&["-device", "hda-output,bus=hda.0,audiodev=snd0"]);
@@ -572,6 +563,10 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
                 .map_or(String::new(), |(w, h)| format!(",resolution={w}x{h}"))
         ),
     ]);
+    if c.audio.enabled {
+        let sound = virtio_sound(vm, ctx, None);
+        push(&sound.iter().map(String::as_str).collect::<Vec<_>>());
+    }
     push(&[
         "-device",
         &format!(
@@ -610,6 +605,33 @@ pub fn sound_routing(backend: &str, devices: crate::os::SoundDevices) -> (&str, 
         "dsound" => (backend, !devices.input),
         _ => (backend, false),
     }
+}
+
+/// The VM's audio backend and its two virtio sound devices (the module doc): one with an output
+/// stream alone and one with an input stream alone, which records from an audiodev of its own,
+/// `none`, where [`sound_routing`] keeps the input apart. At `slots`, the output's and the
+/// input's, where given (q35's); where QEMU puts them otherwise (vmapple's).
+fn virtio_sound(vm: &Vm, ctx: &Ctx, slots: Option<(&str, &str)>) -> Vec<String> {
+    let (backend, input_apart) = sound_routing(audio_backend(vm, ctx), ctx.sound);
+    let mut a = vec!["-audiodev".to_string(), format!("{},id=snd0", opt(backend))];
+    if input_apart {
+        a.extend(["-audiodev".to_string(), "none,id=sndin".to_string()]);
+    }
+    let at = |slot: Option<&str>| slot.map_or(String::new(), |s| format!(",addr={s}"));
+    let input = if input_apart { "sndin" } else { "snd0" };
+    a.extend([
+        "-device".to_string(),
+        format!(
+            "virtio-sound-pci,id=audio,audiodev=snd0{},streams=1",
+            at(slots.map(|s| s.0))
+        ),
+        "-device".to_string(),
+        format!(
+            "virtio-sound-pci,id=audioin,audiodev={input}{},streams=1,input-streams=1",
+            at(slots.map(|s| s.1))
+        ),
+    ]);
+    a
 }
 
 /// What a start says of the VM's sound where [`sound_routing`] changes it.
@@ -800,6 +822,9 @@ mod tests {
             aux: "aux.img".into(),
             ecid: 0x9e35_f01e_dc0c_5536,
         });
+        // The command lines below are a VM's without audio; arm64_with_audio_has_virtio_sound
+        // adds it.
+        c.audio.enabled = false;
         vm
     }
 
@@ -878,6 +903,56 @@ mod tests {
             "memory-backend-memfd,id=ram,size=8192M,share=on",
         ]);
         assert_eq!(unix_paths(&inv.args), want);
+    }
+
+    /// An arm64 VM with audio on gets an x86-64 VM's two virtio sound devices on its backend,
+    /// after the GPU and before the bundle, where QEMU puts them, and no HDA; with audio off, none.
+    #[test]
+    fn arm64_with_audio_has_virtio_sound() {
+        let arm_linux = Host {
+            os: Os::Linux,
+            arch: Arch::Aarch64,
+        };
+        let mut vm = arm64_vm();
+        vm.config.audio.enabled = true;
+        let a = unix_paths(&invocation(&vm, &arm64_ctx(arm_linux)).unwrap().args);
+        assert!(
+            has(
+                &a,
+                &[
+                    "reims-graphics-pci,id=gfx",
+                    "-audiodev",
+                    "pipewire,id=snd0",
+                    "-device",
+                    "virtio-sound-pci,id=audio,audiodev=snd0,streams=1",
+                    "-device",
+                    "virtio-sound-pci,id=audioin,audiodev=snd0,streams=1,input-streams=1",
+                    "-device",
+                ]
+            ),
+            "{a:?}"
+        );
+        assert!(
+            a.iter()
+                .skip_while(|x| !x.starts_with("virtio-sound-pci,id=audioin"))
+                .nth(2)
+                .is_some_and(|x| x.starts_with("loader,")),
+            "{a:?}"
+        );
+        assert!(
+            !a.iter()
+                .any(|x| x.contains("hda")
+                    || (x.starts_with("virtio-sound-pci") && x.contains("addr="))),
+            "{a:?}"
+        );
+
+        vm.config.audio.enabled = false;
+        let a = invocation(&vm, &arm64_ctx(arm_linux)).unwrap().args;
+        assert!(
+            !a.iter()
+                .any(|x| x == "-audiodev" || x.contains("virtio-sound")),
+            "{a:?}"
+        );
     }
 
     /// On arm64 Linux the same machine runs on KVM.

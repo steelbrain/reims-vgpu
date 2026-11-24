@@ -149,7 +149,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | QMP's `screendump` in PPM, its default format, writes rows of width × 3 bytes. Upstream's wrote each row with its line buffer's stride, which pixman rounds up to 4 bytes, so a display whose width is not a multiple of 4 (a window of 3662 × 2039 pixels) read back sheared, its colours rotating from row to row; PNG's rows were right. `tests/qtest/display-screendump-test.c` dumps `bochs-display` at widths of 64, 66 and 67 | `e1360002ad` |
 | QMP's and HMP's `screendump` copy the console's surface under the BQL, then encode and write the copy on a thread of the pool with the BQL let go (`thread_pool_submit_co`), so a vCPU that touches a device the BQL guards no longer waits out the encode: a PNG of 2880x1620 takes about 120 ms on a Mac mini 2018 ("The reims-graphics device", below) | `500d30fb` |
 | the input layer's smooth `scroll` events (`qemu_input_queue_scroll`, `qemu_input_scrolls_smoothly`, QMP `input-send-event`); a device without them (`usb-tablet`, which every x86-64 VM has) gets the event's wheel notches | `9017d7e47e` |
-| `vmapple` ("arm64 guests", below): patches 1 to 6 of the RFC v7 series "vmapple: make it work on the latest macOS release" (Mohamed Mediouni), and the branch's commits for HVF's ISV=0 data aborts and in-kernel vGIC, the secondary CPUs' pointer authentication keys, macOS 14 and later and macOS 27 guests, the AES engine's refusal without a crypto library, and `usb-vmapple-tablet`, Virtualization.framework's USB pointing device | `00eb197889`, `4d4daab1a0`, `1161969f05`, `d24cde8e6e`, `ab4c3018f4`, `d10ee1dd7b`, `1d0776ac53`, `3deaf0f735`, `74d5134fb9`, `29043c9b34`, `eb67b81577`, `743bbba8f9`, `ffca79f534`, `6a54a097bd`, `eae5dd4a5c`, `4a39ef8d54`, `d01f28c9ed`, `93f9f40cdc` |
+| `vmapple` ("arm64 guests", below): patches 1 to 6 of the RFC v7 series "vmapple: make it work on the latest macOS release" (Mohamed Mediouni), and the branch's commits for HVF's ISV=0 data aborts and in-kernel vGIC, the secondary CPUs' pointer authentication keys, macOS 14 and later and macOS 27 guests, the AES engine's refusal without a crypto library, and `usb-vmapple-tablet`, Virtualization.framework's USB pointing device | `00eb197889`, `4d4daab1a0`, `1161969f05`, `d24cde8e6e`, `ab4c3018f4`, `d10ee1dd7b`, `1d0776ac53`, `3deaf0f735`, `74d5134fb9`, `29043c9b34`, `eb67b81577`, `743bbba8f9`, `ffca79f534`, `6a54a097bd`, `eae5dd4a5c`, `4a39ef8d54`, `d01f28c9ed`, `93f9f40cdc`, `5c42f3fce4` |
 | apple-gfx, Apple's paravirtualized GPU device on the library, with its windows, its option ROM, its IOSurface device and the VideoToolbox and M2 scaler devices, removed: `vmapple`, whose display was `apple-gfx-mmio`, stayed in the tree unbuilt until the next row's commits; the option that finds the library is `reims_vgpu` (`--enable-reims-vgpu`) | `96e1b470` |
 | `vmapple` for Ambrosia, built by default in an `aarch64-softmmu` build again: the machine without apple-gfx's display; no kernel-entry hook (the firmware makes macOS's kernel-entry changes, so AVPBooter boots only macOS 12 and 13 guests); RAM at 4 GiB, with the PCIe MMIO window from 0x50000000 below it for 1 GiB BARs (AVPBooter does not boot on this layout); TCG with the `max` CPU and a 24 MHz generic timer; the guest's write to its DMA configuration doorbell at 0x4ffff8 ignored, which panicked a macOS 27.0.1 kernel under TCG; and `virtio-net-pci` without its control queue in the machine's defaults, since one boot in four to six of a macOS 26 or 27 guest missed the completion of its first control command and never started DHCP | `15989559`, `b6821b78`, `981994e8`, `c629d147`, `42e7766d`, `1b3509f3` |
 | BAR 2 is one RAM region with no dirty log and no `scanout_written` callback: the library's window draws the scanout again at each refresh while it shows no presented surface | `7365f20e` |
@@ -2630,6 +2630,36 @@ Text uses:
 - An x86-64 macOS 26.7.2 guest on a Linux host, on a Radeon 780M, reads the
   text at both levels, and so does `ImageAnalyzer`: x86-64 macOS's
   TextRecognition runs Espresso models on the GPU (`eng=5`), our device.
+
+### arm64 guests: audio
+
+An arm64 VM with audio on gets an x86-64 VM's two virtio sound devices on
+the same backend ("x86-64 macOS guests: audio", above): one with an output
+stream alone and one with an input stream alone. They follow the GPU, at the
+slots QEMU picks, and there is no HDA, since Ambrosia plays no boot chime.
+arm64 macOS's `AppleVirtIO` kext has `AppleVirtIOSound`, matching virtio
+device type 0x19 (`IOVirtIOPrimaryMatch` `0x00191af4`), and its
+`AppleVirtIOPCITransport` matches every `0x1af4` PCI device (**read**, from
+the VirtualMac2,1 kernelcaches of 14.0 and 27.2.1).
+
+macOS 27's virtio PCI transport never starts a device whose capability list
+runs from high offsets to low, as QEMU links it, so on `vmapple` the
+`virtio-sound-pci` devices take `x-ascending-capabilities`, as
+`virtio-net-pci` does (`4a39ef8d54`, `5c42f3fce4`). **Measured** 2026-11-23
+under KVM on an M1 Pro, with a macOS 27.2.1 (26B131) guest:
+- Without the relink, each sound device's `IOConfigThread` spun in
+  `AppleVirtIO` ("triggered fail-safe by spinning for at least 1000000us at
+  fixed priority"). Sampled over QMP's `info registers`, it re-read the
+  device's PCI_CFG capability at 0x84 and notify capability at 0x70 through
+  IOPCIFamily's capability walk, forever. The transport never registered,
+  the device's status stayed 0, and `kernel_task` took two of four vCPUs.
+  With one sound device, and with two at `vectors=5`, the boot stopped
+  there, before the disks' drivers reached `DRIVER_OK`.
+- With it, both devices reach `DRIVER_OK`, and Core Audio lists two "Apple
+  Virtual Sound Device"s: 2 output channels at 48 kHz as the default output,
+  and 2 input channels as the default input. `afplay` in the guest plays
+  through a `qemu-system-aarch64` PipeWire stream on the host's speakers.
+- Recording, and arm64 guests under HVF or TCG, are **unknown**.
 
 ### arm64 guests: the boot check of our configuration
 
