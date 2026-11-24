@@ -105,7 +105,7 @@ pub enum Cmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         boot_selection: Option<bool>,
     },
-    /// List the GPUs a VM can be given (Linux)
+    /// List the GPUs a VM can be given (Linux and Windows)
     Gpus,
     /// List this host's USB devices, and give a VM some or take them back (Linux)
     #[command(after_help = usb_help())]
@@ -1443,8 +1443,13 @@ fn gpus(host: Host) {
     }
     let list = gpu::list();
     if list.is_empty() {
+        let loader = if cfg!(windows) {
+            "vulkan-1.dll"
+        } else {
+            "libvulkan.so.1"
+        };
         println!(
-            "No Vulkan GPU found (is the Vulkan loader, libvulkan.so.1, installed with your GPU's driver?)"
+            "No Vulkan GPU found (is the Vulkan loader, {loader}, installed with your GPU's driver?)"
         );
         return;
     }
