@@ -1875,9 +1875,7 @@ mod tests {
                    keep running: the installer goes at its next start.";
         let steps = install_steps(&vm).unwrap();
         assert!(
-            steps.ends_with(end)
-                && !steps.contains("error mode")
-                && !steps.contains("--network"),
+            steps.ends_with(end) && !steps.contains("error mode") && !steps.contains("--network"),
             "{steps}"
         );
     }
