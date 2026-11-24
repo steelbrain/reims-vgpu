@@ -645,7 +645,9 @@ impl<P: Platform> State<P> {
                     walk: late.walk(queue, writer.seqno),
                     done: now,
                     ran: ran.map(|(_, ran)| (before(now, ran.started), before(now, ran.ended))),
-                    entered: ran.and_then(|(_, ran)| ran.entered).map(|ago| before(now, ago)),
+                    entered: ran
+                        .and_then(|(_, ran)| ran.entered)
+                        .map(|ago| before(now, ago)),
                 });
             }
         }
@@ -1261,7 +1263,7 @@ mod tests {
 
     use super::{
         Answer, Drawing, FillSeen, LATE_LEAST, LastWriter, Late, LetGo, PresentAnswers, Ran,
-        TIMING, Taken,
+        TIMING, Taken, handler_entry, with_handler_entry,
     };
 
     /// An answer that records the refresh it was given at.
@@ -1801,7 +1803,10 @@ mod tests {
             })
         );
         assert_eq!(Ran::before(10_000_000, 0, 7_000_000, 9_000_000), None);
-        assert_eq!(Ran::before(10_000_000, 7_000_000, 4_000_000, 9_000_000), None);
+        assert_eq!(
+            Ran::before(10_000_000, 7_000_000, 4_000_000, 9_000_000),
+            None
+        );
     }
 
     /// A completion's post carries its completed handler's entry to its sink on whichever thread

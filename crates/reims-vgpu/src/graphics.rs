@@ -2905,7 +2905,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // buffer's GPU run goes with it to the presents' late-show lines, where they are
                 // on.
                 if let Some(queue) = queue {
-                    let ran = present::late_lines().then(|| ran_before_now(gpu, entered)).flatten();
+                    let ran = present::late_lines()
+                        .then(|| ran_before_now(gpu, entered))
+                        .flatten();
                     presents.finished_ran(queue, seqno, &poster, ran);
                 }
                 then();
