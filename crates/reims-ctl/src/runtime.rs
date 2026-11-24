@@ -379,16 +379,23 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
     } else {
         String::new()
     };
-    let network_on = if offline {
-        format!(" and turn its network back on (reims-ctl set {name} --network)")
+    // Both take effect at the VM's next start, so the VM need not stop for them.
+    let eject = if offline {
+        format!(
+            "eject the installer (reims-ctl eject {name}) and turn its network back on \
+             (reims-ctl set {name} --network). The VM can keep running: the installer goes, and \
+             the network comes back, at its next start"
+        )
     } else {
-        String::new()
+        format!(
+            "eject the installer (reims-ctl eject {name}). The VM can keep running: the installer \
+             goes at its next start"
+        )
     };
     Some(format!(
         "{network_off}To install macOS, start {name}: OpenCore boots its installer into macOS \
          Recovery. If the VM's disk is new, open Disk Utility, erase it ({media}) as APFS and \
-         quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
-         (reims-ctl eject {name}){network_on}."
+         quit Disk Utility. Then {last}. Once macOS is installed, {eject}."
     ))
 }
 
@@ -1844,7 +1851,8 @@ mod tests {
         );
     }
 
-    /// An x86-64 VM's install steps end with ejecting the installer.
+    /// An x86-64 VM's install steps end with ejecting the installer, which the VM need not stop
+    /// for.
     #[test]
     fn install_steps_end_with_ejecting_the_installer() {
         let config = r#"
@@ -1863,9 +1871,11 @@ mod tests {
             dir: "/vms/t".into(),
             config: toml::from_str(config).unwrap(),
         };
+        let end = "Once macOS is installed, eject the installer (reims-ctl eject t). The VM can \
+                   keep running: the installer goes at its next start.";
         let steps = install_steps(&vm).unwrap();
         assert!(
-            steps.ends_with("eject the installer (reims-ctl eject t).")
+            steps.ends_with(end)
                 && !steps.contains("error mode")
                 && !steps.contains("--network"),
             "{steps}"
@@ -1873,8 +1883,8 @@ mod tests {
     }
 
     /// An offline installer's steps say to install with the network off, before the VM starts,
-    /// and to turn it back on with the installer ejected; with the network already off, only the
-    /// second.
+    /// and to turn it back on with the installer ejected, which the VM need not stop for; with the
+    /// network already off, only the second.
     #[test]
     fn offline_install_steps_install_with_the_network_off() {
         let config = r#"
@@ -1895,7 +1905,8 @@ mod tests {
         };
         let off = "turn the VM's network off before you start it (reims-ctl set t --network false";
         let on = "eject the installer (reims-ctl eject t) and turn its network back on (reims-ctl \
-                  set t --network).";
+                  set t --network). The VM can keep running: the installer goes, and the network \
+                  comes back, at its next start.";
         let steps = install_steps(&vm).unwrap();
         assert!(
             steps.contains(off)

@@ -93,7 +93,8 @@ pub enum Cmd {
     /// Give a VM an installer image for its next start; a DMG is converted to a raw
     /// image in the VM's directory
     Insert { name: String, path: PathBuf },
-    /// Take the installer out of a VM
+    /// Take the installer out of a VM; a running VM need not stop, and drops it at its next
+    /// start
     Eject { name: String },
     /// Replace a VM's OpenCore image with one the installed reims-util makes, presenting
     /// the same Mac
@@ -330,7 +331,8 @@ fn create_examples_on(host: Host) -> String {
 
     # Download macOS Tahoe from Apple, make the VM's OpenCore image and a new
     # 128G disk, and start it: the installer boots into macOS Recovery. Once
-    # macOS is installed, reims-ctl eject mac takes the installer out
+    # macOS is installed, reims-ctl eject mac takes the installer out at the
+    # VM's next start, so the VM can keep running
     reims-ctl create mac --macos tahoe --start
 
     # One exact release, which installs with no network (13 to 20 GB); with the VM's

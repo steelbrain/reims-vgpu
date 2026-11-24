@@ -1788,7 +1788,7 @@ impl App {
             Field::choice("macos", "macOS version", options, &first, &version_help).show_if("source", &["download"]),
             Field::choice("installer_kind", "Installer", opts(&[("online", "Online, about 1 GB"), ("offline", "Offline, 13 to 20 GB")]), "online", "Online is Apple's recovery image: macOS downloads the newest release as it installs. Offline holds one release whole, and installs with no network (macOS 11 and later). Either is kept for the next VM, and a stopped download picks up where it stopped.").show_if("source", &["download"]),
             Field::text("release", "Release", "", "Optional: an exact release of that macOS, such as 26.6.2; empty for the newest. reims-util offline-installer list lists them.").placeholder("the newest").show_if("installer_kind", &["offline"]),
-            Field::path("installer", "Installer image", "", "An installer to boot (Tab completes): a raw image, such as a recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory. Eject it once macOS is installed (e).").show_if("source", &["installer"]),
+            Field::path("installer", "Installer image", "", "An installer to boot (Tab completes): a raw image, such as a recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory. Once macOS is installed, eject it in the edit form (e), with the VM running or not: it goes at the VM's next start.").show_if("source", &["installer"]),
             Field::text("disk_size", "Disk size", "128G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["download", "installer"]),
             Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("source", &["disk"]),
             Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; in place, the VM writes the image itself. A copy is instant where the image and the VM's directory are on one file system that makes reflinks, such as btrfs or XFS; else it is a full copy, which says so, with its size, before it starts.")
@@ -1933,14 +1933,15 @@ impl App {
                 "SATA, NVMe or virtio. macOS's installers and macOS find the disk on SATA or \
                  NVMe. On virtio an installed macOS 26 starts; other releases and the installers \
                  have not been tried there. Once macOS is installed, eject the installer before \
-                 a move, or OpenCore may start it instead.",
+                 a move, or OpenCore may start it instead. Both can change while the VM runs, \
+                 and take effect at its next start.",
             ));
             fields.push(
                 Field::path(
                     "installer",
                     "Installer image",
                     &installer_shown(&vm),
-                    "A raw image, or a DMG, converted to a raw image in the VM's directory (Tab completes). Empty to eject.",
+                    "A raw image, or a DMG, converted to a raw image in the VM's directory (Tab completes). Empty to eject, with the VM running or not: the installer goes at its next start.",
                 )
                 .placeholder("none (ejected)"),
             );
