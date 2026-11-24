@@ -505,7 +505,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -518,6 +518,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_BLOCK_RELEASE_UNHELD, RgfxBufferOverSurfacePages,
 };
 use reims_vgpu_video::core::device_memory::{MemoryIdentity, MemoryLife};
+use reims_vgpu_vulkan::core::collections::hasher::KeyBuild;
 use reims_vgpu_vulkan::core::host::HostPtr;
 use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
@@ -543,6 +544,12 @@ mod exported;
 pub(crate) mod shapes;
 #[cfg(any(windows, test))]
 mod spares;
+
+/// The caches' maps and sets by block, on the decoder's fixed hasher ([`KeyBuild`]): a begin
+/// looks each of its uses' blocks up in several of them.
+type HashMap<K, V> = std::collections::HashMap<K, V, KeyBuild>;
+/// [`HashMap`]'s set.
+type HashSet<K> = std::collections::HashSet<K, KeyBuild>;
 
 pub(crate) use exported::planes_line;
 
@@ -2716,15 +2723,15 @@ impl<P: Platform> SurfaceCaches<P> {
         device_writes::watch(&watcher);
         SurfaceCaches {
             early: true,
-            by_block: HashMap::new(),
+            by_block: HashMap::default(),
             transfer: None,
             owed_commits: Vec::new(),
-            ends: HashMap::new(),
-            gone: HashSet::new(),
+            ends: HashMap::default(),
+            gone: HashSet::default(),
             watched,
             counts: CacheCounts::default(),
-            pending: HashMap::new(),
-            deferred: HashMap::new(),
+            pending: HashMap::default(),
+            deferred: HashMap::default(),
             next_user: 0,
             parked: Vec::new(),
             signal_with: None,
@@ -2740,10 +2747,10 @@ impl<P: Platform> SurfaceCaches<P> {
             into_pages: Vec::new(),
             exportable: false,
             owed: Owed {
-                blocks: HashSet::new(),
+                blocks: HashSet::default(),
                 unlocked: Arc::clone(&unlocked),
             },
-            answering: HashSet::new(),
+            answering: HashSet::default(),
             copy_gpu: Arc::default(),
             dma_buf: false,
             #[cfg(windows)]
@@ -2760,8 +2767,8 @@ impl<P: Platform> SurfaceCaches<P> {
             aged: Vec::new(),
             staged: None,
             spares: Arc::new(Spares::new(SPARE_BYTES, PIECE)),
-            reserved: HashMap::new(),
-            left_over: HashMap::new(),
+            reserved: HashMap::default(),
+            left_over: HashMap::default(),
             let_go: Vec::new(),
             lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
             memory_refused: false,
@@ -3058,7 +3065,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 first_fill: Some(generation),
                 owner: None,
                 zeros: false,
-                users: HashMap::new(),
+                users: HashMap::default(),
                 asked: 0,
                 made: 0,
                 event: None,
@@ -3325,7 +3332,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 first_fill: carries.then_some(0),
                 owner: None,
                 zeros: false,
-                users: HashMap::new(),
+                users: HashMap::default(),
                 asked: 0,
                 made: 0,
                 event: None,
@@ -5874,7 +5881,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// does a copy out of a cache that would copy nothing ([`Self::release_may_copy`]).
     fn deferred_ways(&self, counts: &[Count]) -> Vec<(u64, Way)> {
         let mut ways = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for c in counts.iter().filter(|c| seen.insert(c.block)) {
             for deferred in self.deferred.get(&c.block).into_iter().flatten() {
                 match &deferred.copy {
@@ -7869,7 +7876,7 @@ impl<P: Platform> Caches<P> {
         let lacking = state.reserve_spares(&fills);
         reserve_unlocked(&mut state, device, lacking);
         let mut spare = Vec::new();
-        let mut no_event = HashSet::new();
+        let mut no_event = HashSet::default();
         let mut waited = false;
         loop {
             let lacking: Vec<u64> = (picked.iter())
