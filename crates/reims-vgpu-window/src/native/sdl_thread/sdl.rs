@@ -218,6 +218,34 @@ pub(crate) fn follow(shell: &mut Shell, mode: (u16, u16), _taken: &[Frame]) {
     }
 }
 
+/// After the person's resize to `size`, makes the window the next smaller size whose pixels the
+/// guest is offered whole (`units::offered_size`): the image then fills the window, where a size
+/// between two leaves up to 15 columns and a row of black beside it. A maximized, full-screen or
+/// borderless window keeps the size the system gave it. On Windows alone: the person's drag runs
+/// in a loop of Windows' own, and its size events reach the UI thread once it is over, so the
+/// size set here follows the drag and never fights it.
+#[cfg(windows)]
+pub(crate) fn fit_offered(shell: &Shell, size: (i32, i32)) {
+    // SAFETY: the window is SDL's, on this thread.
+    let (flags, display) = unsafe {
+        (
+            SDL_GetWindowFlags(shell.sdl),
+            SDL_GetDisplayForWindow(shell.sdl),
+        )
+    };
+    if (flags & SDL_WINDOW_MAXIMIZED).0 != 0
+        || (flags & SDL_WINDOW_FULLSCREEN).0 != 0
+        || (flags & SDL_WINDOW_BORDERLESS).0 != 0
+    {
+        return;
+    }
+    let fitted = units::offered_size(size, units_of(display));
+    if fitted != size {
+        // SAFETY: as above.
+        unsafe { SDL_SetWindowSize(shell.sdl, fitted.0, fitted.1) };
+    }
+}
+
 /// The window's size in points and its pixels per point: SDL's sizes of it in points and in
 /// pixels, whose ratio is the scale, fractional ones included. `None` before it has a size.
 pub(crate) fn metrics(shell: &Shell) -> Option<((f64, f64), f64)> {

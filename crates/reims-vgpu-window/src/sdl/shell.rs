@@ -338,6 +338,11 @@ impl Shell {
                     );
                 }
                 self.relayout();
+                // A size of the person's becomes the next the guest is offered whole.
+                #[cfg(windows)]
+                if !self.follows_guest {
+                    os::fit_offered(self, size);
+                }
                 false
             }
             k if k == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED.0
