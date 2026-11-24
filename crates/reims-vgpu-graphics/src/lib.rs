@@ -32,6 +32,8 @@ pub mod managed;
 pub mod ops;
 pub mod region;
 mod ring;
+// The trip line's histograms are a host diagnostic: cbindgen leaves the module out of the wire header.
+/// cbindgen:ignore
 pub mod trip;
 mod wake;
 pub mod wire;
