@@ -3,7 +3,7 @@
 # crates/reims-vgpu-window/features.md up to "On Linux", plus the refresh
 # rate on a ProMotion screen, on boots of an arm64 macOS guest with the
 # reims-graphics device on Ambrosia under HVF (docs/qemu.md, "arm64 guests"),
-# at the Mac, in an unlocked session. About 15 minutes. It walks SDL3's window
+# at the Mac, in an unlocked session. About 18 minutes. It walks SDL3's window
 # by default; IMPL=appkit walks AppKit's, to compare.
 #
 #   scripts/internal/walk_window_macos.sh VM_DIR
@@ -199,7 +199,7 @@ ended() {
 } >>"$RESULTS"
 
 cat <<EOF
-The walk of the $IMPL window: three boots of $VM_DIR, about 15 minutes.
+The walk of the $IMPL window: four boots of $VM_DIR, about 18 minutes.
 Results go to $RESULTS. Keep the Mac on its built-in screen unless a step
 asks for another. Have the guest's Terminal handy: some steps run a command
 in it. While input is captured the pointer stays over the guest's image:
@@ -307,6 +307,16 @@ boot chosen RESOLUTION=2560x1600 || exit 1
 step M3 "resolution=2560x1600: the window opened for a 2560x1600 guest, a guest pixel per host point, shrunk to fit the screen's visible area where it does not fit, and the guest's desktop fills it at its pixels, HiDPI on a Retina screen (tests: geometry::a_new_window_shows_a_guest_point_per_host_point, geometry::a_new_window_shrinks_to_the_visible_area)."
 wait_for "Close the window"
 ended chosen
+
+# ---------------------------------------------------------------- boot 4
+boot nocapture REIMS_VGPU_WINDOW_CAPTURE=0 || exit 1
+step N1 "Capture off: the title ends \"— input capture off\", and names no click and no keys to release (tests: capture::capture_off_never_captures)."
+step N2 "Click into the image and move around: the guest's pointer follows over the image, and the host's pointer leaves the window at every edge for the title bar, the menu bar, the Dock and other windows; nothing holds it. A drag begun in a guest window goes on outside the image, stops at its edge in the guest, and drops there when the button comes up (tests: capture::capture_off_sends_the_pointer_outside_the_image_only_in_a_drag, native::macos::input::capture_off_sends_keys_and_the_pointer_over_the_image_and_holds_nothing)."
+step N3 "With the window in front, keys reach the guest's TextEdit or Terminal, ⌘ shortcuts too (⌘A selects all in the guest, the VM's menu does not flash); ⌘Tab and ⌘Space stay the Mac's; ⌃⌥⌘ releases nothing and the title stays as it was."
+step N4 "After clicks into the image, drag an edge and a corner of the window: it resizes as in P5."
+wait_for "Quit the VM from its menu bar (the app menu's Quit), since ⌘Q is the guest's"
+step N5 "The menu's Quit powers the VM off, and QEMU exits."
+ended nocapture
 
 ended=1
 echo
