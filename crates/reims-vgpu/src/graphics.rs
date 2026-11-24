@@ -2898,13 +2898,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let completion: CompletionSink = Arc::new(move |record: RgfxCbComplete, then: Then| {
             let seqno = record.header.seqno;
             let gpu = (record.gpu_start_ns, record.gpu_end_ns);
+            let entered = present::handler_entry();
             let (presents, poster) = (Arc::clone(&presents), queue_poster.clone());
             let then: Then = Box::new(move || {
                 // A present waiting for the buffer is shown once its completion is posted; the
                 // buffer's GPU run goes with it to the presents' late-show lines, where they are
                 // on.
                 if let Some(queue) = queue {
-                    let ran = present::late_lines().then(|| ran_before_now(gpu)).flatten();
+                    let ran = present::late_lines().then(|| ran_before_now(gpu, entered)).flatten();
                     presents.finished_ran(queue, seqno, &poster, ran);
                 }
                 then();
@@ -3184,6 +3185,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             0
         };
         let job = move || {
+            // Its job's start on its lane, where the presents' late-show lines are on: the
+            // walk's, the wait for the pipelines it names among it (`present`).
+            let walked = control.presents.late_now();
             let trip_start = if trip_begun != 0 {
                 let start = reims_vgpu_graphics::trip::now_ns();
                 trip::started(start, trip_begun, trip_handed);
@@ -3221,6 +3225,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     Ok(Err(e)) => Ok(Err(e)),
                     Err(raise) => Err(raise),
                 };
+                // Committed to rt: the presents' late-show lines keep when, with its walk's start.
+                if let (Some(walked), Some(queue)) = (walked, poster.queue_obj_id())
+                    && matches!(outcome, Ok(Ok(())))
+                {
+                    let seqno = message_identity(&message).1;
+                    control.presents.buffer_committed(queue, seqno, walked);
+                }
                 decoder.make_at_first_dispatch(None);
                 // Nothing of its pre-pass outlives the views of the table its message holds.
                 if let Some(prepass) = prepass {
@@ -4751,13 +4762,18 @@ fn post_from_handler(poster: &CompletionPoster, record: &[u8]) {
 }
 
 /// The GPU run of a `CB_COMPLETE` whose GPU start and end are `times`, as long before now as they
-/// lie, for the presents' late-show lines ([`present::Ran`]): now is read on the clock the
-/// record's times count, rt's host clock as `runtime::gpu_times` places it, as the decoder placed
-/// the times (`decode/cmdbuf.rs`). `None` where the record holds no run.
-fn ran_before_now(times: (u64, u64)) -> Option<present::Ran> {
+/// lie, with its completed handler's entry `entered` on that clock (0: not read), for the
+/// presents' late-show lines ([`present::Ran`]): now is read on the clock the record's times
+/// count ([`rt_now`]). `None` where the record holds no run.
+fn ran_before_now(times: (u64, u64), entered: u64) -> Option<present::Ran> {
+    present::Ran::before(rt_now(), times.0, times.1, entered)
+}
+
+/// rt's host clock now, as `runtime::gpu_times` places it, the clock the decoder places a
+/// completion record's GPU times on (`decode/cmdbuf.rs`), for the presents' late-show lines.
+fn rt_now() -> u64 {
     let now = host_time();
-    let (now, _) = runtime::gpu_times((now, now));
-    present::Ran::before(now, times.0, times.1)
+    runtime::gpu_times((now, now)).0
 }
 
 /// Whether this thread runs a submission handler inside a platform commit

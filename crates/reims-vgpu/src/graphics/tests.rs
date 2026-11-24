@@ -9290,12 +9290,15 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
 
 /// A present shown late logs, at debug on the presents' timing target, its writer that finished
 /// last after its take: the buffer's queue, context and seqno, when the host first saw it, when
-/// the GPU ran it, as the platform says, and when its completion was posted. A writer that
+/// its walk began and its commit returned, when the GPU ran it, as the platform says, when the
+/// platform's completed handler of it entered, and when its completion was posted. A writer that
 /// finished before that one, of the same queue, is not named
 #[test]
 fn a_present_shown_late_logs_its_last_writer_to_finish() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
+    // The platform's clock 10 ms on, so the times counted back from it lie after its start.
+    platform.world().clock.advance(Duration::from_millis(10));
     let (mut guest, mut ring) = surface_and_queue(&device);
     let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
     ring.publish(command_buffer_at(obj(1, 1), 100, 4));
@@ -9330,16 +9333,24 @@ fn a_present_shown_late_logs_its_last_writer_to_finish() {
     );
     for part in [
         named.as_str(),
+        ", walked from ",
+        " to its commit to rt ",
         ", on the GPU from ",
-        " the present's take (2000 us), its completion posted ",
+        " the present's take (2000 us), rt's completed handler of it entered ",
+        " its GPU end, its completion posted ",
         "; on the host's monotonic clock, in us: the present's take ",
         ", the buffer's first sight ",
-        ", its completion ",
+        ", its walk ",
+        ", its commit ",
         ", its GPU start ",
+        ", its handler's entry ",
+        ", its completion ",
     ] {
         assert!(lines[0].contains(part), "{part:?} in {:?}", lines[0]);
     }
-    assert!(!lines[0].contains("first sight unknown"), "{:?}", lines[0]);
+    for unknown in ["first sight unknown", "walk unknown", "entry unknown"] {
+        assert!(!lines[0].contains(unknown), "{unknown:?} in {:?}", lines[0]);
+    }
 }
 
 /// A present shown at its writer's completion, on the platform's thread that runs the buffer's

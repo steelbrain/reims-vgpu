@@ -99,11 +99,14 @@
 //! refresh of its display that came after its take, which its answer then waits a refresh more
 //! for. The line names its writer that finished last after its take, its queue, context and
 //! seqno, with when the host first saw that buffer (its doorbell's answer or its take from its
-//! ring, whichever came first), when the GPU ran it, as its `CB_COMPLETE` says ([`Ran`]), and when
-//! its completion was posted, against the present's take and on the host's monotonic clock, or
-//! says that none of its writers finished after its take; and where the present waited for its
+//! ring, whichever came first), when its walk's job began on its lane and when its commit to rt
+//! returned ([`PresentQueue::buffer_committed`]), when the GPU ran it, as its `CB_COMPLETE` says
+//! ([`Ran`]), when rt's completed handler of it entered ([`with_handler_entry`]), and when its
+//! completion was posted, against the present's take and on the host's monotonic clock, or says
+//! that none of its writers finished after its take; and where the present waited for its
 //! surface's fill, when that fill was seen done and the size of the surface's block. What it needs
-//! is kept only where the line is on ([`Late`]).
+//! is kept only where the line is on ([`Late`]). The guest's `CB_SUBMITTED` is no stamp of the
+//! commit: it is posted only where the guest asks, at the buffer's take or its doorbell's answer.
 //!
 //! [`RgfxSurfaceWriters`]: reims_vgpu_graphics::wire::RgfxSurfaceWriters
 
@@ -225,6 +228,37 @@ impl<P: Platform> PresentQueue<P> {
             seen.pop_front();
         }
         seen.push_back((seqno, now));
+    }
+
+    /// The command buffer at `seqno` of queue `queue`, whose walk began at `walked`, is committed
+    /// to rt now: where the late-show lines are on, both are kept until it finishes, for the line
+    /// of a present it is the last writer of (the module doc).
+    pub(crate) fn buffer_committed(&self, queue: u64, seqno: u64, walked: MonoTime) {
+        if !late_lines() {
+            return;
+        }
+        let Some(now) = self.now() else {
+            return;
+        };
+        let mut state = self.state.lock();
+        if state
+            .finished
+            .get(&queue)
+            .is_some_and(|&done| done >= seqno)
+        {
+            return;
+        }
+        let walks = state.late.walks.entry(queue).or_default();
+        if walks.len() >= LATE_SEEN {
+            walks.pop_front();
+        }
+        walks.push_back((seqno, walked, now));
+    }
+
+    /// The host's clock now, where the late-show lines are on: a walk's start, for
+    /// [`Self::buffer_committed`].
+    pub(crate) fn late_now(&self) -> Option<MonoTime> {
+        late_lines().then(|| self.now()).flatten()
     }
 
     /// Queue `queue` was made, its completion ring posted onto through `poster`: what its
@@ -376,6 +410,12 @@ impl<P: Platform> PresentQueue<P> {
                     state.late.seen.remove(&queue);
                 }
             }
+            if let Some(walks) = state.late.walks.get_mut(&queue) {
+                walks.retain(|&(s, _, _)| s > done);
+                if walks.is_empty() {
+                    state.late.walks.remove(&queue);
+                }
+            }
         }
         if let Some(apart) = state.apart.get_mut(&queue) {
             apart.retain(|&s| s > done);
@@ -507,6 +547,7 @@ impl<P: Platform> PresentQueue<P> {
         state.finished.retain(|&q, _| !gone(q));
         state.apart.retain(|&q, _| !gone(q));
         state.late.seen.retain(|&q, _| !gone(q));
+        state.late.walks.retain(|&q, _| !gone(q));
         for waiting in state.waiting.iter_mut().flatten() {
             waiting.writers.retain(|w| !gone(w.queue_obj_id));
         }
@@ -601,8 +642,10 @@ impl<P: Platform> State<P> {
                 present.last = Some(LastWriter {
                     writer,
                     seen: late.seen(queue, writer.seqno),
+                    walk: late.walk(queue, writer.seqno),
                     done: now,
                     ran: ran.map(|(_, ran)| (before(now, ran.started), before(now, ran.ended))),
+                    entered: ran.and_then(|(_, ran)| ran.entered).map(|ago| before(now, ago)),
                 });
             }
         }
@@ -696,17 +739,43 @@ pub(crate) fn late_lines() -> bool {
 pub(crate) struct Ran {
     pub(crate) started: Duration,
     pub(crate) ended: Duration,
+    /// How long before the post rt's completed handler of the buffer entered, where that was
+    /// read ([`handler_entry`]).
+    pub(crate) entered: Option<Duration>,
 }
 
 impl Ran {
     /// The run from `start` to `end`, GPU times in nanoseconds of a clock that reads `now` at the
-    /// post: `None` where the start is 0 (unknown) or the run ends before it starts.
-    pub(crate) fn before(now: u64, start: u64, end: u64) -> Option<Ran> {
+    /// post, its completed handler entered at `entered` on that clock (0: not read): `None` where
+    /// the start is 0 (unknown) or the run ends before it starts.
+    pub(crate) fn before(now: u64, start: u64, end: u64, entered: u64) -> Option<Ran> {
         (start != 0 && end >= start).then(|| Ran {
             started: Duration::from_nanos(now.saturating_sub(start)),
             ended: Duration::from_nanos(now.saturating_sub(end)),
+            entered: (entered != 0).then(|| Duration::from_nanos(now.saturating_sub(entered))),
         })
     }
+}
+
+thread_local! {
+    /// rt's host clock as the completed handler whose completion this thread posts entered, in
+    /// the clock `Ran::before` reads ([`with_handler_entry`]); 0 where none was read.
+    static ENTERED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `post`, a completion's post through its sink, with `entered`, when its completed handler
+/// entered, readable on this thread by the sink ([`handler_entry`]), for the late-show lines.
+pub(crate) fn with_handler_entry<R>(entered: u64, post: impl FnOnce() -> R) -> R {
+    let before = ENTERED.replace(entered);
+    let posted = post();
+    ENTERED.set(before);
+    posted
+}
+
+/// When the completed handler whose completion this thread posts now entered
+/// ([`with_handler_entry`]); 0 where it was not read.
+pub(crate) fn handler_entry() -> u64 {
+    ENTERED.get()
 }
 
 /// `ago` before `now`, or the clock's start where that is earlier.
@@ -729,6 +798,9 @@ struct Late {
     /// By queue id: when the host first saw each of its command buffers not yet finished, by
     /// seqno, oldest first.
     seen: HashMap<u64, VecDeque<(u64, MonoTime)>>,
+    /// By queue id: when the walk of each of its command buffers not yet finished began, and when
+    /// it was committed to rt, by seqno, oldest first ([`PresentQueue::buffer_committed`]).
+    walks: HashMap<u64, VecDeque<(u64, MonoTime, MonoTime)>>,
     /// How long each of the last [`LATE_WINDOW`] presents shown waited after its take.
     waits: VecDeque<Duration>,
 }
@@ -740,10 +812,14 @@ struct LastWriter {
     writer: RgfxSurfaceWriter,
     /// When the host first saw the buffer, where that was kept.
     seen: Option<MonoTime>,
+    /// When its walk began and when it was committed to rt, where that was kept.
+    walk: Option<(MonoTime, MonoTime)>,
     /// When its completion was posted.
     done: MonoTime,
     /// When the GPU started and ended it, as its `CB_COMPLETE` says, where it says ([`Ran`]).
     ran: Option<(MonoTime, MonoTime)>,
+    /// When rt's completed handler of it entered, where that was read.
+    entered: Option<MonoTime>,
 }
 
 /// How far `t` lies from `from`: `"<n> us after"` or `"<n> us before"`.
@@ -763,6 +839,15 @@ impl Late {
     fn seen(&self, queue: u64, seqno: u64) -> Option<MonoTime> {
         let seen = self.seen.get(&queue)?;
         seen.iter().find(|&&(s, _)| s == seqno).map(|&(_, at)| at)
+    }
+
+    /// When the walk of the buffer at `seqno` of queue `queue` began and when it was committed to
+    /// rt, where they were kept.
+    fn walk(&self, queue: u64, seqno: u64) -> Option<(MonoTime, MonoTime)> {
+        let walks = self.walks.get(&queue)?;
+        (walks.iter().rev())
+            .find(|&&(s, _, _)| s == seqno)
+            .map(|&(_, walked, committed)| (walked, committed))
     }
 
     /// A present taken at `taken` was shown `now`, `past` refreshes of its display after its
@@ -856,22 +941,42 @@ impl Late {
                 )
             },
         );
-        let (start, end) = last.ran.map_or_else(
-            || ("unknown".to_owned(), "unknown".to_owned()),
-            |(start, end)| (us(start).to_string(), us(end).to_string()),
+        let walked = last.walk.map_or_else(
+            || "its walk not kept".to_owned(),
+            |(walked, committed)| {
+                format!(
+                    "walked from {} to its commit to rt {} the present's take",
+                    apart(walked, taken.at),
+                    apart(committed, taken.at)
+                )
+            },
         );
+        let entered = match (last.entered, last.ran) {
+            (Some(entered), Some((_, end))) => format!(
+                ", rt's completed handler of it entered {} its GPU end",
+                apart(entered, end)
+            ),
+            _ => String::new(),
+        };
+        let at = |t: Option<MonoTime>| t.map_or_else(|| "unknown".into(), |t| us(t).to_string());
         log::debug!(
             target: TIMING,
             "a present shown late, {} us after its take ({against}): its last writer to finish, \
-             the command buffer seqno {seqno} of queue {queue:#x} of context {}, {seen}, {ran}, \
-             its completion posted {} us after the present's take{filled}; on the host's \
-             monotonic clock, in us: the present's take {}, the buffer's first sight {}, its \
-             completion {}, its GPU start {start} and end {end}",
+             the command buffer seqno {seqno} of queue {queue:#x} of context {}, {seen}, \
+             {walked}, {ran}{entered}, its completion posted {} us after the present's \
+             take{filled}; on the host's monotonic clock, in us: the present's take {}, the \
+             buffer's first sight {}, its walk {}, its commit {}, its GPU start {} and end {}, \
+             its handler's entry {}, its completion {}",
             waited.as_micros(),
             queue >> RGFX_CONTEXT_OBJ_ID_SHIFT,
             last.done.saturating_duration_since(taken.at).as_micros(),
             us(taken.at),
-            last.seen.map_or_else(|| "unknown".to_owned(), |seen| us(seen).to_string()),
+            at(last.seen),
+            at(last.walk.map(|(walked, _)| walked)),
+            at(last.walk.map(|(_, committed)| committed)),
+            at(last.ran.map(|(start, _)| start)),
+            at(last.ran.map(|(_, end)| end)),
+            at(last.entered),
             us(last.done)
         );
     }
@@ -1599,9 +1704,9 @@ mod tests {
     }
 
     /// A present's late-show line fires where a refresh of its display came between its take and
-    /// its show, though it waited no longer than the median, and gives its last writer's GPU run
-    /// and its wait for its surface's fill; a present shown before its display's next refresh,
-    /// within twice the median, logs none
+    /// its show, though it waited no longer than the median, and gives its last writer's walk and
+    /// commit, its GPU run, its completed handler's entry and its wait for its surface's fill; a
+    /// present shown before its display's next refresh, within twice the median, logs none
     #[test]
     fn a_present_shown_after_a_refresh_past_its_take_logs_its_writers_gpu_run_and_its_fill() {
         let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
@@ -1625,8 +1730,10 @@ mod tests {
                 seqno: 7,
             },
             seen: Some(us(199_500)),
+            walk: Some((us(199_700), us(199_900))),
             done: us(201_000),
             ran: Some((us(200_200), us(200_900))),
+            entered: Some(us(200_950)),
         };
         let fill = FillSeen {
             done: Some(us(200_100)),
@@ -1651,12 +1758,15 @@ mod tests {
                      the last 9; a refresh of its display came between its take and its show (1 in \
                      all)): its last writer to finish, the command buffer seqno 7 of queue \
                      {queue:#x} of context 2, first seen by the host 500 us before the present's \
-                     take, on the GPU from 200 us after to 900 us after the present's take (700 \
-                     us), its completion posted 1000 us after the present's take; it waited for \
-                     its surface's fill, of a block of 65536 bytes, seen done 100 us after its \
-                     take; on the host's monotonic clock, in us: the present's take 200000, the \
-                     buffer's first sight 199500, its completion 201000, its GPU start 200200 and \
-                     end 200900"
+                     take, walked from 300 us before to its commit to rt 100 us before the \
+                     present's take, on the GPU from 200 us after to 900 us after the present's \
+                     take (700 us), rt's completed handler of it entered 50 us after its GPU end, \
+                     its completion posted 1000 us after the present's take; it waited for its \
+                     surface's fill, of a block of 65536 bytes, seen done 100 us after its take; \
+                     on the host's monotonic clock, in us: the present's take 200000, the \
+                     buffer's first sight 199500, its walk 199700, its commit 199900, its GPU \
+                     start 200200 and end 200900, its handler's entry 200950, its completion \
+                     201000"
                 ),
                 "a present shown late, 500 us after its take (0.5 times the median 1000 us of the \
                  last 10; a refresh of its display came between its take and its show (2 in \
@@ -1668,19 +1778,38 @@ mod tests {
         );
     }
 
-    /// A buffer's GPU run counts back from the clock's reading at its completion's post, and is
-    /// not known where its start is 0 or it ends before it starts
+    /// A buffer's GPU run, and its completed handler's entry where that was read, count back from
+    /// the clock's reading at its completion's post, and the run is not known where its start is 0
+    /// or it ends before it starts
     #[test]
     fn a_gpu_run_is_known_only_where_it_starts_and_ends_in_order() {
         let us = Duration::from_micros;
         assert_eq!(
-            Ran::before(10_000_000, 4_000_000, 7_000_000),
+            Ran::before(10_000_000, 4_000_000, 7_000_000, 9_000_000),
             Some(Ran {
                 started: us(6000),
                 ended: us(3000),
+                entered: Some(us(1000)),
             })
         );
-        assert_eq!(Ran::before(10_000_000, 0, 7_000_000), None);
-        assert_eq!(Ran::before(10_000_000, 7_000_000, 4_000_000), None);
+        assert_eq!(
+            Ran::before(10_000_000, 4_000_000, 7_000_000, 0),
+            Some(Ran {
+                started: us(6000),
+                ended: us(3000),
+                entered: None,
+            })
+        );
+        assert_eq!(Ran::before(10_000_000, 0, 7_000_000, 9_000_000), None);
+        assert_eq!(Ran::before(10_000_000, 7_000_000, 4_000_000, 9_000_000), None);
+    }
+
+    /// A completion's post carries its completed handler's entry to its sink on whichever thread
+    /// runs it, and none outside it
+    #[test]
+    fn a_handler_entry_is_read_only_inside_its_post() {
+        assert_eq!(handler_entry(), 0);
+        assert_eq!(with_handler_entry(42, handler_entry), 42);
+        assert_eq!(handler_entry(), 0);
     }
 }

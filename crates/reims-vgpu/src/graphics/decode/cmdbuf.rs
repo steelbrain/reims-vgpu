@@ -161,6 +161,7 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::super::completion::{cb_complete, cb_failed, cb_unlanded};
+use super::super::{present, rt_now};
 use super::commit_order::Until;
 use super::completions::{CompletionTurn, Completions, Post};
 use super::helpers::{Hand, Slots};
@@ -2707,6 +2708,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 .watch(cb_obj_id, seqno, context, events.waits)
         });
         Box::new(move |info: CompletedInfo| {
+            // rt's host clock as the handler enters, on the clock the record's GPU times are
+            // placed on, for the presents' late-show lines where they are on: the post carries it
+            // to the completion's sink (`present::with_handler_entry`).
+            let handler_entry = if present::late_lines() { rt_now() } else { 0 };
             // The trip's stamps (`super::super::trip`): rt's handler's entry, and this one's, and
             // the buffer's GPU end for its queue's next take.
             let entered = trip::stamp();
@@ -2811,7 +2816,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     trip::set_down(from, gpu_end);
                 }
                 match &sink {
-                    Some(sink) => sink(record, Box::new(move || drop(drain))),
+                    Some(sink) => present::with_handler_entry(handler_entry, || {
+                        sink(record, Box::new(move || drop(drain)));
+                    }),
                     None => drop(drain),
                 }
                 if finished != 0 {
