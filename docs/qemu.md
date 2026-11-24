@@ -2662,7 +2662,32 @@ distrobox (Fedora 45), as that host runs it, and `usb_host_*` traced:
   starts usbmuxd): a rule in a file that sorts after it, matching that
   iPhone's `serial`, that sets `ENV{SYSTEMD_WANTS}=""` and
   `ENV{USBMUX_SUPPORTED}=""`. A usbmuxd already running for another Apple
-  device still takes it. Not yet booted with.
+  device still takes it.
+
+**Measured** 2026-11-24 on the same host and guest, the VM started by
+reims-ctl on the host, both built from this branch merged with #166 and
+#168, and that rule
+installed, so that usbmuxd never started:
+- With QEMU's default, which makes each port reset the guest asks for a
+  reset of the device (`usb_host_reset`, `libusb_reset_device`), the iPhone
+  left the guest for good. Each reset made it leave the bus and come back
+  as a new device. The guest reset it as QEMU attached it; addressed it
+  and sent 0xc045, 0x4040, 0xc045 and 0xc052 with wIndex 3, after which it
+  came back as a new device; reset that one, which came back again; and
+  sent the same requests to the third, which left the bus 1 s after its
+  0xc052 and did not come back while it stayed plugged in, the Type-C port
+  still reporting its partner. Plugged in again, it went the same way.
+- With `guest-reset=off` on its `usb-host` device, given again over QMP,
+  and the iPhone plugged in again, it came back as a new device once, after
+  the 0xc052, and stayed. The guest set its configuration and the
+  alternate setting 1 of its two NCM data interfaces, and its own drivers
+  took every interface: `usbmuxd` (`AppleUSBHostInterfaceUserClient`) the
+  multiplexor, and `AppleUSBNCM11Control` and `AppleUSBNCM11Data` the two NCM
+  pairs, as `en1` (up, with a link-local IPv6 address) and `anri0`.
+  `system_profiler SPUSBHostDataType` listed it at 480 Mb/s with its serial
+  number. reims-ctl now gives Apple's iOS devices, the IDs usbmuxd's rule
+  names, `guest-reset=off` (`usb::keeps_its_resets`), at a start and over
+  QMP, for x86-64 VMs too.
 
 macOS hosts give no VM USB devices: reims-ctl lists the host's devices from
 Linux's sysfs alone, and the Mac's QEMU is built without libusb.
