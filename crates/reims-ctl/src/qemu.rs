@@ -956,16 +956,18 @@ mod tests {
                     "virtio-sound-pci,id=audio,audiodev=snd0,streams=1",
                     "-device",
                     "virtio-sound-pci,id=audioin,audiodev=snd0,streams=1,input-streams=1",
-                    "-device",
                 ]
             ),
             "{a:?}"
         );
+        // On Linux the xHCI controller's ports and the host's USB devices, which take no PCI slot,
+        // come between them and the bundle.
+        let sound = a
+            .iter()
+            .position(|x| x.starts_with("virtio-sound-pci,id=audioin"));
+        let bundle = a.iter().position(|x| x.starts_with("loader,"));
         assert!(
-            a.iter()
-                .skip_while(|x| !x.starts_with("virtio-sound-pci,id=audioin"))
-                .nth(2)
-                .is_some_and(|x| x.starts_with("loader,")),
+            matches!((sound, bundle), (Some(s), Some(b)) if s < b),
             "{a:?}"
         );
         assert!(
