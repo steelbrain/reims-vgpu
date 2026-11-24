@@ -15,6 +15,10 @@
 //!   back when it is plugged in again.
 //! - While the VM runs, a device chosen or taken back is attached or detached at once, with
 //!   QMP's `device_add` and `device_del`, and kept for the next start ([`apply`]).
+//! - QEMU makes a port reset the guest asks for a reset of the device itself
+//!   (`libusb_reset_device`), except for Apple's iOS devices ([`keeps_its_resets`]): a reset makes
+//!   an iPhone leave the bus and come back as a new device, and the guest's resets, on top of the
+//!   mode switch macOS asks of it, drove it off the bus until it was plugged in again.
 //! - QEMU opens the device's file, `/dev/bus/usb/BBB/DDD`, which only root may write unless a
 //!   udev rule says otherwise: scripts/install-ctl.sh adds one ([`UDEV_RULE`]), which gives USB
 //!   devices other than hubs to the kvm group and to the user at the host's screen.
@@ -389,6 +393,19 @@ pub fn bus(profile: Profile) -> &'static str {
     }
 }
 
+/// Whether QEMU keeps the guest's port resets from the device with IDs `v` and `p` (`usb-host`'s
+/// `guest-reset=off`): Apple's iOS devices, the IDs usbmuxd's udev rule names
+/// (39-usbmuxd.rules: `5ac/12[9a][0-9a-f]`, `5ac/190[1-5]`, `5ac/8600`). A reset makes an iPhone
+/// leave the bus and come back as a new device. macOS asks a new iPhone to switch its USB mode
+/// (vendor request 0xc052), which re-enumerates it once; with the guest's resets passed on as
+/// well it re-enumerated again at each, and after the second mode switch it left the bus until it
+/// was plugged in again. Without them it re-enumerated once and the guest drove it
+/// (docs/qemu.md, "arm64 guests: USB passthrough"). Every other device keeps QEMU's default,
+/// with which a USB stick and an audio device were measured.
+pub fn keeps_its_resets(v: u16, p: u16) -> bool {
+    v == 0x05ac && matches!(p, 0x1290..=0x12af | 0x1901..=0x1905 | 0x8600)
+}
+
 /// The `-device` that passes `u` through, on `bus`, the VM's xHCI controller's ([`bus`]).
 pub fn device_arg(u: &UsbDevice, bus: &str) -> Result<String> {
     let (v, p) = u.ids()?;
@@ -398,6 +415,9 @@ pub fn device_arg(u: &UsbDevice, bus: &str) -> Result<String> {
     );
     if let Some((bus, port)) = u.bus_port()? {
         a.push_str(&format!(",hostbus={bus},hostport={port}"));
+    }
+    if keeps_its_resets(v, p) {
+        a.push_str(",guest-reset=off");
     }
     Ok(a)
 }
@@ -415,6 +435,9 @@ fn device_add(u: &UsbDevice, bus: &str) -> Result<serde_json::Value> {
     if let Some((bus, port)) = u.bus_port()? {
         a["hostbus"] = json!(bus);
         a["hostport"] = json!(port);
+    }
+    if keeps_its_resets(v, p) {
+        a["guest-reset"] = json!(false);
     }
     Ok(a)
 }
@@ -905,8 +928,36 @@ mod tests {
                 "hostport": "2.1",
             })
         );
+        // An iPhone keeps the guest's resets: on the command line and over QMP.
+        let u = choice("05ac:12a8", None, "iPhone");
+        assert_eq!(
+            device_arg(&u, "usb-bus.0").unwrap(),
+            "usb-host,id=usb-05ac-12a8,bus=usb-bus.0,vendorid=0x05ac,productid=0x12a8,\
+             guest-reset=off"
+        );
+        assert_eq!(
+            device_add(&u, "usb-bus.0").unwrap()["guest-reset"],
+            json!(false)
+        );
+        assert!(
+            device_add(&choice("1050:0407", None, ""), "xhci.0").unwrap()["guest-reset"].is_null()
+        );
         assert!(device_arg(&choice("1050:04070", None, ""), "xhci.0").is_err());
         assert!(device_arg(&choice("1050:0407", Some("3-2.1,x=y"), ""), "xhci.0").is_err());
+    }
+
+    /// Apple's iOS devices, as usbmuxd's udev rule names them, and those alone keep the guest's
+    /// port resets: an iPhone, an iPad, an Apple TV; not a Mac's keyboard, nor another vendor's
+    /// device with an iPhone's product ID.
+    #[test]
+    fn apple_ios_devices_keep_the_guests_resets() {
+        for p in [0x1290, 0x12a8, 0x12ab, 0x12af, 0x1901, 0x1905, 0x8600] {
+            assert!(keeps_its_resets(0x05ac, p), "{p:#x}");
+        }
+        for p in [0x128f, 0x12b0, 0x1900, 0x1906, 0x8601, 0x024f] {
+            assert!(!keeps_its_resets(0x05ac, p), "{p:#x}");
+        }
+        assert!(!keeps_its_resets(0x1050, 0x12a8));
     }
 
     /// A host's VMs take its USB devices where it runs them on Linux: x86-64 VMs there and on
