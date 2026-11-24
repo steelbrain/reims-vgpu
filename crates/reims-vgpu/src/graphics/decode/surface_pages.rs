@@ -1829,7 +1829,10 @@ impl<P: Platform> SurfaceViews<P> {
             (c.unheld_since).is_some_and(|at| now.saturating_sub(at) >= CACHED_IDLE_FOR)
         };
         let mut aged = Vec::new();
-        while let Some(old) = (v.cache.iter()).position(past).and_then(|at| v.cache.remove(at)) {
+        while let Some(old) = (v.cache.iter())
+            .position(past)
+            .and_then(|at| v.cache.remove(at))
+        {
             v.counts.aged += 1;
             v.log_let_go(&old, (LetGo::Age, CACHED_IDLE_FOR / 1_000_000));
             aged.push(old);
@@ -3834,8 +3837,15 @@ pub(super) mod tests {
         let five = 5_000_000_000;
         assert!(age_at(&r, at + five), "unheld again from here");
         assert!(age_at(&r, at + CACHED_IDLE_FOR - 1));
-        assert_eq!(r.dec.views_of_surfaces().len().1, 2, "none past the age yet");
-        assert!(age_at(&r, at + CACHED_IDLE_FOR), "the view taken again stays");
+        assert_eq!(
+            r.dec.views_of_surfaces().len().1,
+            2,
+            "none past the age yet"
+        );
+        assert!(
+            age_at(&r, at + CACHED_IDLE_FOR),
+            "the view taken again stays"
+        );
         r.dec.surface_worker().flush();
         assert!(left.upgrade().is_none(), "the view no block took went");
         assert!(taken.upgrade().is_some(), "the view taken again stays");

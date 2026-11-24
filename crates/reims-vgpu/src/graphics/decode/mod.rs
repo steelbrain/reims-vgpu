@@ -1815,7 +1815,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             Arc::new(move || platform.clock().now_mono())
         };
         let timer = Arc::new(ViewsAge::new(now));
-        if self.shared.views_age.set(AgeStop(Arc::clone(&timer))).is_err() {
+        let stop = AgeStop(Arc::clone(&timer));
+        if self.shared.views_age.set(stop).is_err() {
             return;
         }
         let spawned = {
