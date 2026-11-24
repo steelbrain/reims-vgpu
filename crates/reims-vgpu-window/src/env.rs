@@ -181,17 +181,20 @@ mod tests {
         assert_eq!(parse_impl(None), WindowImpl::AppKit);
     }
 
-    /// Capture is on unless the switch says off: 0, false, no or off, in any case
+    /// Capture is off for 0, false, no and off, and on for 1, true, yes and on, in any case;
+    /// unset or unparsable, it is as by default, on
     #[test]
     fn capture_is_on_unless_turned_off() {
-        assert!(CAPTURE_DEFAULT);
-        assert!(Settings::default().capture);
-        assert!(parse_capture(None));
+        assert_eq!(Settings::default().capture, CAPTURE_DEFAULT);
+        assert_eq!(parse_capture(None), CAPTURE_DEFAULT);
         for off in ["0", "false", "FALSE", "No", "off", " OFF "] {
             assert!(!parse_capture(Some(off)), "{off:?}");
         }
-        for on in ["1", "true", "Yes", " on ", "", "2", "disabled", "n"] {
+        for on in ["1", "true", "Yes", " on "] {
             assert!(parse_capture(Some(on)), "{on:?}");
+        }
+        for other in ["", "2", "disabled", "n"] {
+            assert_eq!(parse_capture(Some(other)), CAPTURE_DEFAULT, "{other:?}");
         }
     }
 

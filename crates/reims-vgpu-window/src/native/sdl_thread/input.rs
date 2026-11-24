@@ -820,7 +820,11 @@ mod tests {
         assert_eq!(input.title_suffix(), OFF_SUFFIX);
         input.moved(&at((10.0, 10.0)));
         input.moved(&at((120.0, 10.0)));
-        assert_eq!(input.take(), vec![pointer(20, 20, 0)], "none outside the image");
+        assert_eq!(
+            input.take(),
+            vec![pointer(20, 20, 0)],
+            "none outside the image"
+        );
         let r = input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
         assert!(!r.capture_changed && !input.is_captured());
         assert_eq!(input.pointer_confinement(at((0.0, 0.0)).image), None);

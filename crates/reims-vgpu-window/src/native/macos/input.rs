@@ -1436,7 +1436,10 @@ mod tests {
             sent(&mut logic),
             vec![down(COMMAND), down(Q), up(Q), down(CONTROL), down(OPTION)]
         );
-        assert_eq!(logic.capture.title_suffix(HostOs::MacOs), " \u{2014} input capture off");
+        assert_eq!(
+            logic.capture.title_suffix(HostOs::MacOs),
+            " \u{2014} input capture off"
+        );
     }
 
     /// A key-up under ⌘, which AppKit never hands the view, is taken and reaches the guest,
