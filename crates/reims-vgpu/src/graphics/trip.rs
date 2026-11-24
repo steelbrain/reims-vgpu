@@ -36,9 +36,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reims_vgpu_graphics::trip;
-use reims_vgpu_vulkan::core::trip::CardRecord;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline};
+use reims_vgpu_vulkan::core::trip::CardRecord;
 use reims_vgpu_vulkan::rt_platform::window_times;
 
 /// The log target of the lines, at debug, which the filter names to start them ([`start`]).
