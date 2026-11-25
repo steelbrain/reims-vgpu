@@ -5770,4 +5770,112 @@ mod tests {
             assert_eq!(c.synced(), (true, true), "drops: {drops}");
         }
     }
+
+    /// On the GPU the test holds: each copy whose identity escaped is declared to rt at each
+    /// commit of its process's command buffers that syncs it, as a use that can write it, though
+    /// no encoder binds or declares it (`super::super::copied`'s docs, "Declared to rt"): a copy
+    /// listed as an app's read of its buffer's `gpuAddress` lists it, and one listed as a
+    /// residency set's add does (the decoder lists a copy alike at each act's note), reached by a
+    /// command buffer whose one blit fills a Private buffer. Each copy is counted once at the
+    /// commit, and the commit once; a commit of another process declares none. Where rt flushes
+    /// the Shared memory a command buffer binds (a fill of a Shared buffer shows it), it flushes
+    /// the copies' blocks before the escaped commit's submission and flushes then invalidates
+    /// them before its completion (rt's README, "Shared memory's coherence"), with no call
+    /// failing; where it does not, its counts stay as they were.
+    #[test]
+    fn an_escaped_copy_is_declared_to_rt_at_the_commit_that_syncs_it_on_vulkan() {
+        use super::super::copied::{DECLARATIONS_CODE, DECLARING_COMMITS_CODE};
+        use crate::core::platform::command::EscapedCopies;
+        use crate::core::platform::types::NsRange;
+
+        let platform = RtPlatform::new();
+        let device = (platform.system_default_device()).expect("an rt device on the GPU it holds");
+        let on = OnFault::Return;
+        let queue = device.new_command_queue().expect("a command queue");
+        let of = |options| device.new_buffer_of_length(on, 64, options);
+        let of = |options| of(options).expect("never a raise").expect("a buffer");
+        // `MTLResourceStorageModePrivate`: the escaped commit's fill reaches no Shared memory.
+        let (shared, private) = (of(0), of(0x20));
+        let fill = |buffer| BlitCmd::FillBuffer {
+            buffer,
+            range: NsRange::new(0, 64),
+            value: 0x55,
+        };
+        // rt's Shared coherence calls: flushes and their bytes, invalidates and their bytes, and
+        // those that failed.
+        let coherence = || {
+            let m = device.rt().counters().metrics();
+            [
+                m.shared_flushes,
+                m.shared_flushed_bytes,
+                m.shared_invalidates,
+                m.shared_invalidated_bytes,
+                m.shared_coherence_failures,
+            ]
+        };
+        let since = |before: [u64; 5]| {
+            let now = coherence();
+            [0, 1, 2, 3, 4].map(|i| now[i] - before[i])
+        };
+        let before = coherence();
+        blit_and_wait(&queue, vec![fill(&shared)]);
+        let flushes = since(before)[1] > 0;
+        let codes = [DECLARATIONS_CODE, DECLARING_COMMITS_CODE];
+        for drops in [false, true] {
+            let (address, residency) = (over_a_copy(&device, drops), over_a_copy(&device, drops));
+            let (escapes, others) = (EscapedCopies::default(), EscapedCopies::default());
+            let mut blocks = 0;
+            for c in [&address, &residency] {
+                escapes.add(&c.buffer.escaped_copy().expect("the copy under the buffer"));
+                let copied = c.buffer.copied().expect("a copy under the buffer");
+                blocks += copied.block().expect("rt's block of the copy").len;
+                c.mark();
+            }
+            let counts = codes.map(counted);
+            blit_and_wait_of(&queue, Some(&others), vec![fill(&private)]);
+            assert_eq!(
+                codes.map(counted),
+                counts,
+                "drops: {drops}: another process's"
+            );
+
+            let before = coherence();
+            blit_and_wait_of(&queue, Some(&escapes), vec![fill(&private)]);
+            let [
+                flushed,
+                flushed_bytes,
+                invalidated,
+                invalidated_bytes,
+                failed,
+            ] = since(before);
+            eprintln!(
+                "drops {drops}: rt flushes bound Shared memory: {flushes}; the escaped copies' \
+                 blocks: {blocks} bytes; at the escaped commit and its completion: \
+                 shared_flushes +{flushed}, shared_flushed_bytes +{flushed_bytes}, \
+                 shared_invalidates +{invalidated}, shared_invalidated_bytes \
+                 +{invalidated_bytes}, shared_coherence_failures +{failed}"
+            );
+            if flushes {
+                assert!(
+                    flushed >= 1 && flushed_bytes >= blocks,
+                    "drops: {drops}: rt flushed the escaped copies' blocks"
+                );
+                assert!(
+                    invalidated >= 1 && invalidated_bytes >= blocks,
+                    "drops: {drops}: rt invalidated the escaped copies' blocks"
+                );
+            } else {
+                let calls = [flushed, flushed_bytes, invalidated, invalidated_bytes];
+                assert_eq!(calls, [0; 4], "drops: {drops}: no call where rt makes none");
+            }
+            assert_eq!(failed, 0, "drops: {drops}: no coherence call failed");
+            assert_eq!(
+                codes.map(counted),
+                [counts[0] + 2, counts[1] + 1],
+                "drops: {drops}: each escaped copy declared at the commit that syncs it"
+            );
+            assert_eq!(address.synced(), (true, true), "drops: {drops}");
+            assert_eq!(residency.synced(), (true, true), "drops: {drops}");
+        }
+    }
 }

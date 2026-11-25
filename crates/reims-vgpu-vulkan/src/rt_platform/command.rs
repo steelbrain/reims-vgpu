@@ -68,9 +68,11 @@
 //! - **Copies of host pages** (`super::copied`): its encoders note each copy they set or declare
 //!   an object over, as Metal makes resident only those, and its commit adds its process's
 //!   escaped copies, which the caller names before any encoder (`reaches_escaped`) and its parts
-//!   take from it; its commit copies the CPU's writes into those before rt is handed the command
-//!   buffer, and where a use of one can write it its first completed handler merges the GPU's
-//!   writes back into their pages, before core's completion-seen handlers.
+//!   take from it, and declares each escaped one to rt as a use that can write it, in an encoder
+//!   of rt's of its own with no dispatch, since no binding names it (`super::copied`'s docs,
+//!   "Declared to rt"); its commit copies the CPU's writes into those before rt is handed the
+//!   command buffer, and where a use of one can write it its first completed handler merges the
+//!   GPU's writes back into their pages, before core's completion-seen handlers.
 //! - **Handed on** ([`hand_on`]): the completed handlers of a command buffer whose first merges a
 //!   copy back do not run on rt's completion thread, which retires every queue's work and would
 //!   wait for the merge, but on the platform's queue of handlers handed on
@@ -1182,12 +1184,13 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
         recorded_answer
     }
 
-    /// Hands rt the held handlers (the module's docs), then commits, the copies of host pages it
-    /// used and its process's escaped copies copied in first and, those a use of which can write
-    /// them, merged back first of the completed handlers (`super::copied`), which are then handed
-    /// on ([`hand_on`]), then the bytes of the tiled textures it used taken (`super::tiled`). A
-    /// second commit is Metal's refusal, counted; a commit rt refuses is counted, and its
-    /// handlers never run. In a process that records, the recorder writes the memory it reaches
+    /// Hands rt the held handlers (the module's docs), then commits, its process's escaped copies
+    /// declared to rt first, the copies of host pages it used and those escaped ones copied in
+    /// and, those a use of which can write them, merged back first of the completed handlers
+    /// (`super::copied`), which are then handed on ([`hand_on`]), then the bytes of the tiled
+    /// textures it used taken (`super::tiled`). A second commit is Metal's refusal, counted; a
+    /// commit rt refuses is counted, and its handlers never run, as is one whose escaped copies'
+    /// declaration rt refuses. In a process that records, the recorder writes the memory it reaches
     /// that changed before rt has it ([`crate::recorder::before_commit`]), and takes what its GPU
     /// work wrote after the merge of the host pages it copied, before core's handlers can tell
     /// the guest ([`crate::recorder::completion_seen`]).
@@ -1237,9 +1240,10 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 0,
                 Box::new(move |made: &rt::CommandBuffer| failure.completed(made.error())),
             );
-            if let Some(escapes) = self.escapes.get() {
-                self.kept.copies().escaped(escapes);
-            }
+            let escaped = match self.escapes.get() {
+                Some(escapes) => self.kept.copies().escaped(escapes),
+                None => Vec::new(),
+            };
             let copies = self.kept.copies().take();
             let merges = super::copied::writes(&copies);
             if let Some(merge) = super::copied::merging(&copies) {
@@ -1265,6 +1269,7 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                 let card = crate::core::trip::card();
                 self.rt
                     .add_completed_handler(hand_on(run(seen), merges, handed, card.clone()))?;
+                super::copied::declare(&self.rt, &escaped)?;
                 super::copied::copy_in(&copies);
                 self.kept.takes().take(&self.device);
                 // Not complete until its first completed handler runs, which a refusal never runs.

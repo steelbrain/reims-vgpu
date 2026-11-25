@@ -32,6 +32,15 @@
 //!   buffers, and of their parts, syncs it as a use that can write it, from the escape until the
 //!   last such object goes. A copy no object of which escaped is reached through no address the
 //!   guest holds.
+//! - **Declared to rt at the commits that sync it once it escaped** ([`declare`], from
+//!   `super::command`'s commit, before rt is handed the command buffer): rt flushes and
+//!   invalidates only the Shared memory a command buffer's bindings and declarations name (rt's
+//!   README, "Shared memory's coherence"), and no binding or declaration of the guest's names an
+//!   escaped copy. So the commit declares each escaped copy it syncs as a use that can write it:
+//!   rt's `use_heap` of the copy's block, in a serial compute encoder of rt's with no dispatch,
+//!   which records nothing and moves no heap texture, rt keeping the block, every byte of which
+//!   it counts as reached and written, until the command buffer retires. One declaration a copy a
+//!   commit, on every device, so they grow with the escaped copies a commit syncs.
 //! - **Copied in at the commits that use it** ([`copy_in`], from `super::command`'s commit,
 //!   before rt is handed the command buffer, so before the work that reads it): every byte of the
 //!   pages that differs from the base is written into the copy and the base. A byte the CPU did
@@ -40,7 +49,7 @@
 //!   flush; where it is not, rt flushes the Shared memory the command buffer keeps before it
 //!   submits it, and flushes then invalidates what it may write before its completed handlers run
 //!   (rt's README, "Shared memory's coherence"), which covers a copy the command buffer binds or
-//!   declares, but not one it reaches only through an address. A copy of pages whose GPU writes
+//!   declares, an escaped copy among them ("Declared to rt"). A copy of pages whose GPU writes
 //!   are dropped is written whole instead ("Writes dropped").
 //! - **Merged back at the completions of the command buffers that can write it** ([`merging`],
 //!   the first of the command buffer's completed handlers, so before core's and before a waiter
@@ -91,7 +100,8 @@
 //! [`WHY_BYTES_CODES`], `crate::core::platform::values::pages_why`); and as each copy of pages
 //! whose writes are dropped is made, its KiB, by whether the pages are unchanging and how their
 //! process maps them ([`UNCHANGING_KIB_CODE`], [`UNCHANGING_COW_KIB_CODE`],
-//! [`READ_ONLY_KIB_CODE`]).
+//! [`READ_ONLY_KIB_CODE`]); and the escaped copies the commits declared to rt
+//! ([`DECLARATIONS_CODE`]), with the commits that declared one ([`DECLARING_COMMITS_CODE`]).
 
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
@@ -221,6 +231,14 @@ pub const STORE_OUTS_CODE: &str = "rt-copied-store-outs";
 /// The code whose count is the nanoseconds the copies' syncs took, on the committing thread and
 /// on the thread that runs the command buffers' completed handlers.
 pub const SYNC_NS_CODE: &str = "rt-copied-sync-cpu-ns";
+
+/// The code whose count is the escaped copies the commits declared to rt ([`declare`]): one a
+/// copy a commit that syncs it.
+pub const DECLARATIONS_CODE: &str = "rt-copied-escaped-declarations";
+
+/// The code whose count is the commits that declared an escaped copy to rt ([`declare`]), which
+/// [`DECLARATIONS_CODE`]'s count is a sum over.
+pub const DECLARING_COMMITS_CODE: &str = "rt-copied-escaped-declaring-commits";
 
 /// The bytes a sync compares at a time.
 const CHUNK: usize = 4096;
@@ -533,19 +551,51 @@ impl Used {
 
     /// The command buffer is of the process whose escaped copies are `escapes`: it uses each
     /// copy `escapes` holds now, in a use that can write it ("And for every command buffer of its
-    /// process once it escaped").
-    pub(super) fn escaped(&self, escapes: &crate::core::platform::command::EscapedCopies) {
+    /// process once it escaped"). Those copies, each once, for its commit to declare ([`declare`]).
+    pub(super) fn escaped(
+        &self,
+        escapes: &crate::core::platform::command::EscapedCopies,
+    ) -> Vec<Arc<Copied>> {
+        let mut escaped = Vec::new();
         for copy in escapes.copies() {
             if let Ok(copied) = copy.downcast::<Copied>() {
                 self.add(Some(&copied), true);
+                escaped.push(copied);
             }
         }
+        escaped
     }
 
     /// The copies used, taken: none is used since.
     pub(super) fn take(&self) -> Vec<CopyUse> {
         std::mem::take(&mut *self.0.lock())
     }
+}
+
+/// Declares to rt each of `escaped`, the escaped copies a commit of `commands` syncs, as a use
+/// that can write it (the module's docs, "Declared to rt"): rt's `use_heap` of each one's block,
+/// in a serial compute encoder of `commands` with no dispatch, then counted
+/// ([`DECLARATIONS_CODE`], [`DECLARING_COMMITS_CODE`]). Nothing where none holds a block of rt's.
+/// Err: rt's refusal of the encoder or of a declaration (a command buffer committed, an encoder
+/// open), which refuses the commit as well.
+pub(super) fn declare(
+    commands: &rt::CommandBuffer,
+    escaped: &[Arc<Copied>],
+) -> Result<(), rt::Error> {
+    let blocks: Vec<rt::BlockId> = (escaped.iter())
+        .filter_map(|copied| copied.block().map(|block| block.id))
+        .collect();
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let mut encoder = commands.compute_command_encoder(rt::DispatchType::Serial)?;
+    for &id in &blocks {
+        encoder.use_heap(id)?;
+    }
+    encoder.end_encoding();
+    crate::answer::count_kind_by(DECLARATIONS_CODE, blocks.len().to_u64());
+    crate::answer::count_kind(DECLARING_COMMITS_CODE);
+    Ok(())
 }
 
 /// Whether the completion of the command buffer that uses `copies` has one to sync
@@ -695,6 +745,11 @@ impl Drop for Copied {
 }
 
 impl Copied {
+    /// The block of rt's that holds the copy; `None` in the tests, whose memory is their own.
+    pub(super) fn block(&self) -> Option<&rt::Block> {
+        self.block.as_ref()
+    }
+
     /// A copy of the `len` bytes at `home` in the memory `block` holds where given, whose first
     /// byte is `copy` and which holds `cap` bytes, the copy's bytes past `len` zeros, and its base,
     /// the bytes copied, of `kind` (one whose GPU writes are dropped with no base), counted by no
