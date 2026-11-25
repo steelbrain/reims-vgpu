@@ -25,15 +25,17 @@
 //!   of the undefined layout before a command that writes them, after another resource of their
 //!   heap may have written their bytes; the draws that read an attachment of their own pass in
 //!   place, through the attachment feedback loop, and the copies into the image's shadow such a
-//!   draw takes first on a device without the loop; the acquires of another API's writes; the
-//!   barriers rt recorded; the bytes its commits' copy-ins copied from Managed buffers' bytes into
-//!   their device copies; the releases of a texture or block an unsent upload held, their bytes,
-//!   and the sends of uploads they started; the sends of groups a queue held behind its
-//!   submissions in flight, and the GPU's nanoseconds from the end of the work submitted before
-//!   each to its own start; and a pipeline's makes split in two, the nanoseconds of the driver's
-//!   `vkCreate*Pipelines` calls and of rt's calls into the translator; and the command buffers
-//!   whose GPU times stay 0, those that found no timestamp pair and those whose pair read as not
-//!   available;
+//!   draw takes first on a device without the loop; the draws beyond a draw's own that a pipeline
+//!   state whose fragment function writes `[[stencil]]` takes on a device without
+//!   `VK_EXT_shader_stencil_export`, one for each stencil bit and one for the depth; the acquires
+//!   of another API's writes; the barriers rt recorded; the bytes its commits' copy-ins copied
+//!   from Managed buffers' bytes into their device copies; the releases of a texture or block an
+//!   unsent upload held, their bytes, and the sends of uploads they started; the sends of groups a
+//!   queue held behind its submissions in flight, and the GPU's nanoseconds from the end of the
+//!   work submitted before each to its own start; and a pipeline's makes split in two, the
+//!   nanoseconds of the driver's `vkCreate*Pipelines` calls and of rt's calls into the translator;
+//!   and the command buffers whose GPU times stay 0, those that found no timestamp pair and those
+//!   whose pair read as not available;
 //! - `gauges`, some of rt's gauges as they are now, by their fields' names: the live textures,
 //!   those held in an image of their own beside their buffer, the bytes of textures' places in
 //!   texture blocks, of textures' allocations of their own and of the spills, and the textures'
@@ -193,6 +195,7 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         heap_moves,
         attachment_loop_reads,
         attachment_read_copies,
+        stencil_bit_draws,
         external_acquires,
         barriers,
         managed_bytes_captured,
@@ -339,6 +342,8 @@ mod tests {
         before.attachment_loop_reads = 30;
         now.attachment_loop_reads = 30 + 14;
         now.attachment_read_copies = 1;
+        before.stencil_bit_draws = 8;
+        now.stencil_bit_draws = 8 + 16;
         now.external_acquires = 2;
         now.barriers = 40 + 9;
         now.managed_bytes_captured = 1_000_000 + 98_304;
@@ -381,7 +386,8 @@ mod tests {
              over-copies 4096 (dma-buf 4000, pitch 96), resolve copies 2048; counted \
              texture_clears 2, \
              texture_clear_bytes 524288, texture_clear_barriers 1, heap_moves 5, \
-             attachment_loop_reads 14, attachment_read_copies 1, external_acquires 2, barriers 9, \
+             attachment_loop_reads 14, attachment_read_copies 1, stencil_bit_draws 16, \
+             external_acquires 2, barriers 9, \
              managed_bytes_captured 98304, held_releases 3, held_release_bytes \
              16842752, held_release_starts 1, held_starts 6, held_start_gap_nanos 250000, \
              pipeline_creation_nanos 7250000, translation_nanos 3125000, untimed_command_buffers \
@@ -404,7 +410,7 @@ mod tests {
             part.ends_with(
                 "over-copies 0, resolve copies 0; counted texture_clears 0, texture_clear_bytes 0, \
                  texture_clear_barriers 0, heap_moves 0, attachment_loop_reads 0, \
-                 attachment_read_copies 0, external_acquires 0, barriers 0, \
+                 attachment_read_copies 0, stencil_bit_draws 0, external_acquires 0, barriers 0, \
                  managed_bytes_captured 0, held_releases 0, held_release_bytes 0, \
                  held_release_starts 0, held_starts 0, held_start_gap_nanos 0, \
                  pipeline_creation_nanos 0, translation_nanos 0, untimed_command_buffers 0, \
