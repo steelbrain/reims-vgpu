@@ -478,11 +478,12 @@ pub fn said(error: &rt::Error) -> Said<'_> {
 }
 
 /// rt's error as [`said`] gives it: as it displays, but the translator's refusal, whose display
-/// and fields can name the guest's functions, symbols and libraries, as the feature it refused and
-/// what it needs (their variants' fields, the translator's enums and numbers) and the attachment
-/// it is tied to, else as a refusal of the translator's alone. rt's other errors name nothing of
-/// the guest's: their fields are rt's own enums and numbers, a Vulkan call and its result, and the
-/// host's own I/O and loader errors.
+/// and fields can name the guest's functions, symbols and libraries. A refused feature is said as
+/// the feature and what it needs (their variants' fields, the translator's enums and numbers) and
+/// the attachment it is tied to. Any other error of the translator's is said as its structure
+/// ([`translator_structure`]): its class and its detail, with no string of it. rt's other errors
+/// name nothing of the guest's: their fields are rt's own enums and numbers, a Vulkan call and its
+/// result, and the host's own I/O and loader errors.
 pub struct Said<'a>(&'a rt::Error);
 
 impl std::fmt::Display for Said<'_> {
@@ -503,10 +504,51 @@ impl std::fmt::Display for Said<'_> {
                     None => Ok(()),
                 }
             }
-            rt::Error::Translation { .. } => f.write_str("the translator refused it"),
+            rt::Error::Translation { error, .. } => {
+                write!(f, "the translator refused it: {}", translator_structure(error))
+            }
             error => write!(f, "{error}"),
         }
     }
+}
+
+/// The most characters [`translator_structure`] gives, past which it ends with `…`. Each line
+/// that says it is one line of stderr, and a request's debug can run long: a list of capabilities,
+/// say.
+const TRANSLATOR_STRUCTURE_MOST: usize = 300;
+
+/// The translator's `error` as structure alone, for [`Said`]. This is its debug, which starts with
+/// its class (its variant: `InvalidInput`, `InvalidDescriptor`, `NeedsInput`, `LimitExceeded`,
+/// `Internal`, ...) and holds its detail: an `InvalidInput`'s kind, such as `Container(BadMagic)`
+/// or `Abi(UnknownKey)`, and where in the input it was found. Every string in the debug is
+/// replaced by `_`. Those strings are the guest's names (a function's, an entry point's, a
+/// symbol's, what the reader saw in its metadata) and the translator's own texts (an internal
+/// error's detail, a metadata key), which can quote the guest's names. The debug prints each
+/// string quoted, its own quotes escaped. At most [`TRANSLATOR_STRUCTURE_MOST`] characters.
+fn translator_structure(error: &metal2vulkan::error::Error) -> String {
+    let debug = format!("{error:?}");
+    let mut said = String::with_capacity(debug.len());
+    let (mut quoted, mut escaped) = (false, false);
+    for c in debug.chars() {
+        if quoted {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => quoted = false,
+                (false, _) => {}
+            }
+        } else if c == '"' {
+            quoted = true;
+            said.push('_');
+        } else {
+            said.push(c);
+        }
+    }
+    if let Some((at, _)) = said.char_indices().nth(TRANSLATOR_STRUCTURE_MOST) {
+        said.truncate(at);
+        said.push('…');
+    }
+    said
 }
 
 /// The code [`detail_line`] names for rt's `error`: a pixel format's own for `Gap::TextureFormat`
@@ -1117,11 +1159,12 @@ mod tests {
     /// The first of each feature the translator refuses has its line, naming the feature and what
     /// it needs, as structure alone, and the attachment it is tied to; no name of the guest's (a
     /// function's, a symbol's) is in it. An error of the translator's that refuses no feature is
-    /// named by its variant.
+    /// named by its variant, and its line says its class and its detail with no string of it: an
+    /// invalid input's kind and where it was found, but not the function's name.
     #[test]
     fn a_translator_refusal_s_line_names_its_feature_and_no_name() {
-        use metal2vulkan::error::{Attachment, DiagName, Error as Translator, Feature, Location};
-        use metal2vulkan::error::{LowerFamily, Unsupported};
+        use metal2vulkan::error::{AbiError, Attachment, DiagName, Error as Translator, Feature};
+        use metal2vulkan::error::{InputError, InputErrorKind, Location, LowerFamily, Unsupported};
         let at = Location::function(DiagName::new("a_guest_function"), Some(3), Some(9));
         let refused = Unsupported::not_implemented(Feature::Lowering(LowerFamily::Texture))
             .at(at.with_attachment(Attachment::Color(1)))
@@ -1147,9 +1190,51 @@ mod tests {
         assert_eq!(
             detail_line(sel, &cancelled, &name, None),
             "reims-vgpu: newRenderPipelineStateWithDescriptor:error:: metal2vulkan-runtime refused \
-             it (the translator refused it); the first of Translation-Cancelled \
+             it (the translator refused it: Cancelled); the first of Translation-Cancelled \
              (rt-refused-translation)\n"
         );
+        let at = Location::function(DiagName::new("a_guest_function"), Some(3), None);
+        let invalid = rt::Error::Translation {
+            error: Translator::InvalidInput(InputError::new(
+                InputErrorKind::Abi(AbiError::UnknownKey),
+                at,
+            )),
+            functions: Box::default(),
+        };
+        let name = crate::rt_platform::diag::refusal_name(&invalid).expect("a translator's name");
+        assert_eq!(
+            detail_line(sel, &invalid, &name, None),
+            "reims-vgpu: newRenderPipelineStateWithDescriptor:error:: metal2vulkan-runtime refused \
+             it (the translator refused it: InvalidInput(InputError { kind: Abi(UnknownKey), at: \
+             Function { func: _, block: Some(3), inst: None }, saw: None })); the first of \
+             Translation-InvalidInput (rt-refused-translation)\n"
+        );
+    }
+
+    /// The structure of a translator's error ([`translator_structure`]) holds none of its
+    /// strings, its own escaped quotes among them, and ends with `…` past
+    /// [`TRANSLATOR_STRUCTURE_MOST`] characters.
+    #[test]
+    fn a_translator_error_s_structure_holds_no_string_and_is_bounded() {
+        use metal2vulkan::error::{BitstreamError, Error as Translator, InputError};
+        use metal2vulkan::error::{InputErrorKind, InternalError, InternalKind, Location};
+        let detail = "a \"secret_fn\" \\ of the guest's";
+        let internal = Translator::Internal(InternalError::new(InternalKind::Invariant, detail));
+        assert_eq!(
+            translator_structure(&internal),
+            "Internal(InternalError { kind: Invariant, detail: _ })"
+        );
+        let blocks = [7; 200];
+        let long = Translator::InvalidInput(InputError::new(
+            InputErrorKind::Bitstream(BitstreamError::BadBlob),
+            Location::bitstream(64, &blocks, None),
+        ));
+        let said = translator_structure(&long);
+        let start = "InvalidInput(InputError { kind: Bitstream(BadBlob), at: Bitstream { bit: 64, \
+                     blocks: [7, 7, ";
+        assert!(said.starts_with(start), "{said}");
+        assert!(said.ends_with('…'), "{said}");
+        assert_eq!(said.chars().count(), TRANSLATOR_STRUCTURE_MOST + 1, "{said}");
     }
 
     /// No line the library writes of the translator's refusals, nor the `NSError` a creator
@@ -1161,8 +1246,9 @@ mod tests {
     #[test]
     fn no_line_of_a_translator_refusal_names_the_guest_s_function() {
         use crate::core::testkit::death::{Expect, Options, Outcome, run};
-        use metal2vulkan::error::{DescriptorError, DiagName, Error as Translator, Feature};
-        use metal2vulkan::error::{Location, LowerFamily, RuntimeInput, Unsupported};
+        use metal2vulkan::error::{AbiError, DescriptorError, DiagName, Error as Translator};
+        use metal2vulkan::error::{Feature, InputError, InputErrorKind, Location, LowerFamily};
+        use metal2vulkan::error::{RuntimeInput, Unsupported};
         const SECRET: &str = "secret_fn";
         let refusals = || {
             let at = Location::function(DiagName::new(SECRET), Some(3), Some(9));
@@ -1178,6 +1264,10 @@ mod tests {
                 Translator::NeedsInput(RuntimeInput::LinkedFunction {
                     symbol: DiagName::new(SECRET),
                 }),
+                Translator::InvalidInput(InputError::new(
+                    InputErrorKind::Abi(AbiError::UnknownStageAttribute(DiagName::new(SECRET))),
+                    Location::function(DiagName::new(SECRET), Some(3), Some(9)),
+                )),
             ]
             .map(|error| rt::Error::Translation {
                 error,
@@ -1211,7 +1301,7 @@ mod tests {
                                      feature Lowering(Texture), needing NotImplemented); refused \
                                      (rt-refused-translation), the first of its kind";
                 assert!(lines.iter().any(|l| l.ends_with(first_of_kind)), "{out}");
-                for name in ["Lowering", "InvalidDescriptor", "NeedsInput"] {
+                for name in ["Lowering", "InvalidDescriptor", "NeedsInput", "InvalidInput"] {
                     let first = format!("the first of Translation-{name} (rt-refused-translation)");
                     assert!(lines.iter().any(|l| l.ends_with(&first)), "{first}: {out}");
                 }
@@ -1225,8 +1315,12 @@ mod tests {
                                 NotImplemented";
                 let answers = [
                     lowering,
-                    "the translator refused it",
-                    "the translator refused it",
+                    "the translator refused it: InvalidDescriptor(EntryNotFound { requested: _, \
+                     available: 2 })",
+                    "the translator refused it: NeedsInput(LinkedFunction { symbol: _ })",
+                    "the translator refused it: InvalidInput(InputError { kind: \
+                     Abi(UnknownStageAttribute(_)), at: Function { func: _, block: Some(3), inst: \
+                     Some(9) }, saw: None })",
                 ]
                 .map(answered);
                 let said: Vec<&str> = (lines.iter())
