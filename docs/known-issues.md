@@ -93,6 +93,13 @@ To start such a kernel, turn this off for that VM. In its `vm.toml`
 cpu_flags = "+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check,x-avx512-xstate=off"
 ```
 
+## Animations can run late on an Intel integrated GPU
+
+On a Linux host with an Intel Iris Xe Graphics (Core i9-13900H), a web page that animates once per
+display refresh shows about 30% of its frames a refresh late, because under the host's default
+power policy its CPU runs the guest's and the host's graphics work at about 1.3 GHz, too slow to
+finish each frame within one refresh.
+
 ## On a Mac
 
 ### You need macOS 26 or later to run VMs
