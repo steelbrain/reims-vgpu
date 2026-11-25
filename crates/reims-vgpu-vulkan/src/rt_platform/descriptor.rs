@@ -6,28 +6,36 @@
 //!   rt's descriptor. Metal also ends the process at a `setPixelFormat:` of a format it makes no
 //!   texture of. The rt platform keeps any value, so it is the texture's creation that refuses it.
 //! - **The render pass descriptor** keeps what rt's pass has a field of, as it is set
-//!   ([`PassFields`]), from Metal's defaults: each attachment's texture, held as Metal's
-//!   descriptor retains it, its level and slice, its load and store actions as Metal's raw values,
-//!   which its reads answer, and its clear value; its resolve texture, held so too, its resolve
-//!   level, slice and depth plane, and a depth or stencil attachment's resolve filter as Metal's
-//!   raw value, by which rt's pass resolves where a store action resolves (rt's docs); the render
-//!   target's width and height; the render target array length, by which rt's pass renders, at 2
-//!   or more, that many slices of each attachment and resolve texture from its own slice, loading,
-//!   storing and resolving each (rt's docs); the default raster sample count, at which rt's pass
-//!   with no attachment renders, refused at 0, Metal's default, as Metal refuses it (rt's docs);
-//!   the visibility result buffer, held as Metal's descriptor retains it; and the
+//!   ([`PassFields`]), from Metal's defaults: each attachment's texture, held as Metal's descriptor
+//!   retains it, its level, slice and depth plane, its load and store actions as Metal's raw
+//!   values, which its reads answer, and its clear value; its resolve texture, held so too, its
+//!   resolve level, slice and depth plane, and a depth or stencil attachment's resolve filter as
+//!   Metal's raw value, by which rt's pass resolves where a store action resolves (rt's docs); the
+//!   render target's width and height; the render target array length, by which rt's pass renders,
+//!   at 2 or more, that many slices of each attachment and resolve texture from its own slice,
+//!   loading, storing and resolving each (rt's docs); the default raster sample count, at which
+//!   rt's pass with no attachment renders, refused at 0, Metal's default, as Metal refuses it (rt's
+//!   docs); the visibility result buffer, held as Metal's descriptor retains it; and the
 //!   `visibilityResultType`. rt's command buffer keeps that buffer until it retires, and rt's pass
 //!   writes the result of each `Boolean` or `Counting` mode its encoder sets at the mode's offset,
 //!   every other byte staying as it was; in a pass of `Accumulate` such a mode is rt's gap at the
-//!   encoder (`super::render`). A render encoder's creation turns them into rt's
-//!   descriptor ([`PassFields::rt_pass`]): an action, resolve filter or visibility result type
-//!   Metal has none of, or a level, slice or plane past 32 bits, is Metal's refusal there, as
-//!   Metal asserts at the encoder's creation; a width or height past 32 bits renders the attachments' area, as Metal's
-//!   does; and an array length past 32 bits is past every device's layers, which rt refuses as it
-//!   refuses any other past them, as it refuses an attachment with fewer slices from its own than
-//!   the length. A colour attachment past the eighth raises at its subscript, as Metal's does.
-//!   - **Kept nowhere, changing nothing rt renders**: a depth plane (rt renders into no 3D
-//!     texture); store action options (rt builds none); and `defaultColorSampleCount` (SPI).
+//!   encoder (`super::render`). A render encoder's creation turns them into rt's descriptor
+//!   ([`PassFields::rt_pass`]): an action, resolve filter or visibility result type Metal has none
+//!   of, or a level, slice or resolve plane past 32 bits, is Metal's refusal there, as Metal
+//!   asserts at the encoder's creation; a width or height past 32 bits renders the attachments'
+//!   area, as Metal's does; and an array length past 32 bits is past every device's layers, which
+//!   rt refuses as it refuses any other past them, as it refuses an attachment with fewer slices
+//!   from its own than the length. A colour attachment past the eighth raises at its subscript, as
+//!   Metal's does.
+//!   - **A colour attachment's depth plane** is rt's colour attachment's: rt's pass renders into
+//!     that depth plane of a 3D texture's level, the level's other planes keeping their texels, and
+//!     reads it of no other texture type, as Metal with its validation layer off ignores it there
+//!     (rt's docs). A plane past 32 bits is `u32::MAX`, past every 3D texture's depth, which rt
+//!     refuses as it refuses any plane past the level's depth. A depth or stencil attachment's
+//!     plane is kept and goes to no rt attachment: rt's depth and stencil attachments take no
+//!     plane, and a 3D texture as one is rt's gap.
+//!   - **Kept nowhere, changing nothing rt renders**: store action options (rt builds none); and
+//!     `defaultColorSampleCount` (SPI).
 //!   - **Unbuilt** ([`Unbuilt::RenderPass`]), counted at a set of other than Metal's default, and
 //!     kept nowhere, so the pass renders without them: an imageblock sample length, a threadgroup
 //!     memory length, a tile width or height, and sample positions. rt's pass renders its samples
@@ -440,7 +448,7 @@ impl PassFields {
 
     /// rt's descriptor of what is set (the module's docs). `Err` names the first value Metal
     /// takes no pass of: an action, resolve filter or visibility result type Metal has none of, or
-    /// a level, slice or plane past 32 bits.
+    /// a level, slice or resolve plane past 32 bits.
     pub fn rt_pass(&self) -> Result<rt::RenderPassDescriptor, String> {
         let pass = self.lock();
         let mut out = rt::RenderPassDescriptor::default();
