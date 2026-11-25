@@ -505,7 +505,11 @@ impl std::fmt::Display for Said<'_> {
                 }
             }
             rt::Error::Translation { error, .. } => {
-                write!(f, "the translator refused it: {}", translator_structure(error))
+                write!(
+                    f,
+                    "the translator refused it: {}",
+                    translator_structure(error)
+                )
             }
             error => write!(f, "{error}"),
         }
@@ -1234,7 +1238,11 @@ mod tests {
                      blocks: [7, 7, ";
         assert!(said.starts_with(start), "{said}");
         assert!(said.ends_with('…'), "{said}");
-        assert_eq!(said.chars().count(), TRANSLATOR_STRUCTURE_MOST + 1, "{said}");
+        assert_eq!(
+            said.chars().count(),
+            TRANSLATOR_STRUCTURE_MOST + 1,
+            "{said}"
+        );
     }
 
     /// No line the library writes of the translator's refusals, nor the `NSError` a creator
@@ -1301,7 +1309,12 @@ mod tests {
                                      feature Lowering(Texture), needing NotImplemented); refused \
                                      (rt-refused-translation), the first of its kind";
                 assert!(lines.iter().any(|l| l.ends_with(first_of_kind)), "{out}");
-                for name in ["Lowering", "InvalidDescriptor", "NeedsInput", "InvalidInput"] {
+                for name in [
+                    "Lowering",
+                    "InvalidDescriptor",
+                    "NeedsInput",
+                    "InvalidInput",
+                ] {
                     let first = format!("the first of Translation-{name} (rt-refused-translation)");
                     assert!(lines.iter().any(|l| l.ends_with(&first)), "{first}: {out}");
                 }
