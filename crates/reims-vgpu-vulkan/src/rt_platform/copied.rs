@@ -41,6 +41,21 @@
 //!   which records nothing and moves no heap texture, rt keeping the block, every byte of which
 //!   it counts as reached and written, until the command buffer retires. One declaration a copy a
 //!   commit, on every device, so they grow with the escaped copies a commit syncs.
+//!   - A declaration costs its block, not its copy. A copy's block is its own, the copy's length
+//!     rounded up to 64 KiB (rt's `take_block`; to the device's `bufferImageGranularity` where
+//!     that is larger). Where the device's Shared memory type is not host-coherent, rt flushes
+//!     the kept block whole before the submission and again before the completion, and
+//!     invalidates it whole before the completion: an 8 KiB copy, two 4 KiB pages, costs each
+//!     commit that syncs it two flushes and one invalidate of 64 KiB, each 8 times its bytes
+//!     (measured on an Iris Xe whose cached types rt was made to read as not coherent: two such
+//!     copies, 262144 bytes flushed in 2 calls and 131072 invalidated in 1). Where the type is
+//!     host-coherent, rt makes no call.
+//!   - A residency set's members are declared only as a commit syncs them. The guest's set never
+//!     reaches the host: a buffer's joining one, or a texture's over it, is noted as its escape
+//!     where it is the first, and the decoder lists the copy under the buffer where it lies over
+//!     one (`Buffer::escaped_copy`) and nothing where it does not. So a member over no copy is
+//!     declared at no commit, and a member's copy at each commit that syncs it, as any escaped
+//!     copy.
 //! - **Copied in at the commits that use it** ([`copy_in`], from `super::command`'s commit,
 //!   before rt is handed the command buffer, so before the work that reads it): every byte of the
 //!   pages that differs from the base is written into the copy and the base. A byte the CPU did

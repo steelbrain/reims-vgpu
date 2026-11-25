@@ -5773,11 +5773,15 @@ mod tests {
 
     /// On the GPU the test holds: each copy whose identity escaped is declared to rt at each
     /// commit of its process's command buffers that syncs it, as a use that can write it, though
-    /// no encoder binds or declares it (`super::super::copied`'s docs, "Declared to rt"): a copy
-    /// listed as an app's read of its buffer's `gpuAddress` lists it, and one listed as a
-    /// residency set's add does (the decoder lists a copy alike at each act's note), reached by a
-    /// command buffer whose one blit fills a Private buffer. Each copy is counted once at the
-    /// commit, and the commit once; a commit of another process declares none. Where rt flushes
+    /// no encoder binds or declares it, and nothing else is (`super::super::copied`'s docs,
+    /// "Declared to rt"): a copy listed as an app's read of its buffer's `gpuAddress` lists it,
+    /// and a residency set of three members lists the copy under the one that lies over a copy,
+    /// as the decoder lists at each member's note, and nothing for the other two, a Shared and a
+    /// Private buffer of rt's own; a live copy no object of which escaped is listed nowhere. The
+    /// command buffer's one blit fills a Private buffer. The commit syncs the two listed copies
+    /// and not the third, and counts a declaration for each of the two, so the declarations are
+    /// the copies it synced and not the set's members, and the commit once; a commit of another
+    /// process declares none. Where rt flushes
     /// the Shared memory a command buffer binds (a fill of a Shared buffer shows it), it flushes
     /// the copies' blocks before the escaped commit's submission and flushes then invalidates
     /// them before its completion (rt's README, "Shared memory's coherence"), with no call
@@ -5823,12 +5827,25 @@ mod tests {
         let codes = [DECLARATIONS_CODE, DECLARING_COMMITS_CODE];
         for drops in [false, true] {
             let (address, residency) = (over_a_copy(&device, drops), over_a_copy(&device, drops));
+            // Live on the device, but no object over it escaped.
+            let resident = over_a_copy(&device, drops);
             let (escapes, others) = (EscapedCopies::default(), EscapedCopies::default());
+            escapes.add(&address.buffer.escaped_copy().expect("the copy under the buffer"));
+            let set = [&shared, &residency.buffer, &private];
+            let mut listed = 0;
+            for member in set {
+                if let Some(copy) = member.escaped_copy() {
+                    escapes.add(&copy);
+                    listed += 1;
+                }
+            }
+            assert_eq!(listed, 1, "the set's one member over a copy");
             let mut blocks = 0;
             for c in [&address, &residency] {
-                escapes.add(&c.buffer.escaped_copy().expect("the copy under the buffer"));
                 let copied = c.buffer.copied().expect("a copy under the buffer");
                 blocks += copied.block().expect("rt's block of the copy").len;
+            }
+            for c in [&address, &residency, &resident] {
                 c.mark();
             }
             let counts = codes.map(counted);
@@ -5869,13 +5886,16 @@ mod tests {
                 assert_eq!(calls, [0; 4], "drops: {drops}: no call where rt makes none");
             }
             assert_eq!(failed, 0, "drops: {drops}: no coherence call failed");
+            assert_eq!(address.synced(), (true, true), "drops: {drops}");
+            assert_eq!(residency.synced(), (true, true), "drops: {drops}");
+            assert_eq!(resident.synced(), (false, false), "drops: {drops}: never escaped");
             assert_eq!(
                 codes.map(counted),
                 [counts[0] + 2, counts[1] + 1],
-                "drops: {drops}: each escaped copy declared at the commit that syncs it"
+                "drops: {drops}: the two copies the commit synced declared at it, not the \
+                 residency set's {} members nor the copy that never escaped",
+                set.len()
             );
-            assert_eq!(address.synced(), (true, true), "drops: {drops}");
-            assert_eq!(residency.synced(), (true, true), "drops: {drops}");
         }
     }
 }
