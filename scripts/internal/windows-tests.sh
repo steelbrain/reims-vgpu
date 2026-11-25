@@ -29,8 +29,15 @@
 # Environment: PRIORITY (the jobs' potluck priority, default 4), LANE (their `lane` label, default
 # windows-tests), BUILD_RAM and TEST_RAM (GiB each job reserves, its commit charge's limit on
 # Windows: default 12 and 26), OUT (where the jobs' logs go, default target/windows-tests),
-# MINIBASE (0: the build does not start from the base). The workspace stays held for an hour after
-# the tests, for a run again with `potluck dispatch --workspace`; the script prints it.
+# MINIBASE (0: the build does not start from the base), KEY (the jobs' potluck key, below). The
+# workspace stays held for an hour after the tests, for a run again with `potluck dispatch
+# --workspace`; the script prints it.
+#
+# Each job is dispatched with a potluck key (`potluck dispatch --key`), so a call again of the same
+# run joins the jobs the first queued rather than sending them twice: a dispatch that gave up
+# waiting has usually queued its job. The key is the commit, the packages, the tests' arguments and
+# MINIBASE (KEY names another, for a run again of jobs that ended), and the tests' key adds the
+# build's job.
 #
 # TEST_RAM's default is 1.25 times the largest commit charge the tests' job was measured at: runs
 # peaked at 14.7 to 18.1 GiB, then one at 20.7 GiB (potluck job m3-max-56017), and a job that
@@ -131,6 +138,8 @@ else
 fi
 job_args=()
 for p in "${packages[@]}"; do job_args+=(-p "$p"); done
+sum=$(printf '%s\n' "${packages[@]}" -- "$@" "MINIBASE=${MINIBASE:-}" | git hash-object --stdin | cut -c1-12)
+key=${KEY:-windows-tests-$(git rev-parse --short=12 HEAD)-$sum}
 
 # dispatch NAME OPTIONS... -- JOB-ARGS...: queues a job and prints its id. potluck's dispatch
 # returns once the job's workspace starts, so it runs in the background while the id is read.
@@ -169,8 +178,9 @@ build_failed() {
   exit 1
 }
 
-build=$(dispatch build --ram "${BUILD_RAM:-12}" --timeout 45m --hold 2h -- --job build "${job_args[@]}") || exit 1
-echo "windows-tests: build $build at $head (log $out/$head-build.log); keep this checkout clean until the tests are queued"
+build=$(dispatch build --key "$key-build" --ram "${BUILD_RAM:-12}" --timeout 45m --hold 2h \
+  -- --job build "${job_args[@]}") || exit 1
+echo "windows-tests: build $build at $head, key $key-build (log $out/$head-build.log); keep this checkout clean until the tests are queued"
 # The tests are queued in the build's workspace as soon as it starts, where they wait for it: a
 # dispatch needs a clean tree, and the checkout may change while the build runs.
 workspace=
@@ -186,9 +196,9 @@ while [ -z "$workspace" ]; do
   fi
   sleep 15
 done
-test=$(dispatch test --workspace "$workspace" --gpu "$gpu" --ram "${TEST_RAM:-26}" --timeout 20m --hold 1h \
-  -- --job test "${job_args[@]}" -- "$@") || exit 1
-echo "windows-tests: tests $test queued in $workspace (log $out/$head-test.log)"
+test=$(dispatch test --key "$key-test-$build" --workspace "$workspace" --gpu "$gpu" --ram "${TEST_RAM:-26}" \
+  --timeout 20m --hold 1h -- --job test "${job_args[@]}" -- "$@") || exit 1
+echo "windows-tests: tests $test queued in $workspace, key $key-test-$build (log $out/$head-test.log)"
 if ! wait_job "$build" "$out/$head-build.log"; then
   potluck cancel "$test" > /dev/null 2>&1
   build_failed
