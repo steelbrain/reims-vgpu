@@ -1196,11 +1196,7 @@ impl App {
             let mut said = Vec::new();
             let warned = runtime::prepare(&mut vm, &mut |s| said.push(s.to_string()));
             let started = runtime::start(&vm, host, p)?;
-            let mut s = format!(
-                "{}: running (pid {}); its window is open",
-                vm.name(),
-                started.pid
-            );
+            let mut s = started_line(vm.name(), started.pid, started.window);
             for n in said.iter().chain(&warned).chain(&started.note) {
                 s.push_str("; ");
                 s.push_str(n);
@@ -2910,6 +2906,20 @@ fn ssh_port_field(f: &Form) -> Result<Option<u16>> {
     Ok(crate::vm::ssh_port(p))
 }
 
+/// The line a start from this interface ends with: QEMU's pid, and that the VM's window is open
+/// where the start opened one ([`runtime::Started::window`]); else that it runs without one, as
+/// on a host where no window can open, and the key that shows its screen in this terminal.
+fn started_line(name: &str, pid: i32, window: bool) -> String {
+    if window {
+        format!("{name}: running (pid {pid}); its window is open")
+    } else {
+        format!(
+            "{name}: running (pid {pid}) without a window; {} shows its screen in this terminal",
+            VmCommand::View.key()
+        )
+    }
+}
+
 /// How reims-vgpu's fatal line starts: the line the library writes to QEMU's stderr, in one
 /// write, as it ends the process (`abort`), and at no other time.
 const FATAL: &str = "reims-vgpu: fatal: ";
@@ -4559,6 +4569,20 @@ mod tests {
         let saved = Vm::load(&dir).unwrap().config;
         assert!(saved.logs.enabled);
         assert_eq!(saved.memory_mib, 8192);
+    }
+
+    /// A start's line says the VM's window is open where the start opened one, and otherwise
+    /// that it runs without one and which key shows its screen here.
+    #[test]
+    fn a_start_says_whether_its_window_opened() {
+        assert_eq!(
+            started_line("t", 42, true),
+            "t: running (pid 42); its window is open"
+        );
+        assert_eq!(
+            started_line("t", 42, false),
+            "t: running (pid 42) without a window; v shows its screen in this terminal"
+        );
     }
 
     /// A status line that states a VM's state says it again once each read of the VMs' states

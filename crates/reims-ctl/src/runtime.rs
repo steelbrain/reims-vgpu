@@ -879,6 +879,8 @@ pub struct Started {
     pub pid: i32,
     /// A warning about how QEMU runs ([`launch_note`]), for the start's output.
     pub note: Option<String>,
+    /// Whether the start opened a window on the host ([`qemu::opens_window`]).
+    pub window: bool,
 }
 
 /// Starts the VM, and returns QEMU's pid once QMP answers. A start Windows refused the VM's RAM
@@ -916,6 +918,7 @@ pub fn start(vm: &Vm, host: Host, progress: &mut dyn FnMut(&str)) -> Result<Star
     let started = |pid| Started {
         pid,
         note: note.clone(),
+        window: qemu::opens_window(vm, &ctx),
     };
 
     let mut tries = 0;

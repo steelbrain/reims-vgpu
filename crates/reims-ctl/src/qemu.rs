@@ -689,6 +689,20 @@ pub fn sound_note(backend: &str, devices: crate::os::SoundDevices) -> Option<Str
     }
 }
 
+/// Whether a start of `vm` in `ctx` opens a window on the host: QEMU's own, GTK's, for VMware
+/// SVGA where it can open ([`Ctx::screen`]); the library's on reims-vgpu's own device unless the
+/// VM's variables give `REIMS_VGPU_WINDOW=0`, on a Mac, where it is AppKit's, and elsewhere where
+/// a window can open, without which the library opens none and the guest runs headless
+/// (crates/reims-vgpu-window/features.md, "On Linux").
+pub fn opens_window(vm: &Vm, ctx: &Ctx) -> bool {
+    if !vm.config.graphics().library() {
+        return ctx.screen;
+    }
+    let env = &vm.config.extra_env;
+    let headless = env.get("REIMS_VGPU_WINDOW").is_some_and(|v| v == "0");
+    !headless && (ctx.host.os == Os::Mac || ctx.screen)
+}
+
 fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let c = &vm.config;
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
@@ -1963,6 +1977,30 @@ pub(crate) mod tests {
         // On reims-vgpu's device, the library's window, never QEMU's.
         let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
         assert!(has(&a, &["-display", "none"]));
+    }
+
+    /// A start opens a window where one can open: QEMU's for VMware SVGA, the library's on
+    /// reims-vgpu's device, always on a Mac; none where no window can open, nor on reims-vgpu's
+    /// device kept headless by its variables.
+    #[test]
+    fn a_window_opens_only_where_one_can() {
+        let mut vm = q35_vm();
+        let headless = |host| Ctx {
+            screen: false,
+            ..ctx(host)
+        };
+        assert!(opens_window(&vm, &ctx(linux())));
+        assert!(!opens_window(&vm, &headless(linux())));
+        assert!(opens_window(&vm, &headless(mac())));
+        vm.config
+            .extra_env
+            .insert("REIMS_VGPU_WINDOW".into(), "0".into());
+        assert!(!opens_window(&vm, &ctx(linux())));
+        assert!(!opens_window(&vm, &ctx(mac())));
+        vm.config.extra_env.clear();
+        vm.config.graphics = Some(Graphics::VmwareSvga);
+        assert!(opens_window(&vm, &ctx(linux())));
+        assert!(!opens_window(&vm, &headless(linux())));
     }
 
     /// reims-vgpu's own device, with the ROM reims-ctl carries, on a machine that leaves its BAR
