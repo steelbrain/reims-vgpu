@@ -1,8 +1,7 @@
 // The display's present shaders, compiled into the Vulkan platform's shaders.metallib (build.rs),
 // which gpu/shaders.rs loads once per device. Core's display/pipeline.rs and reims-vgpu's
 // graphics/sink.rs make their pipelines and bind their arguments; reims-vgpu's
-// graphics/vaapi/fill.rs makes the video encoder's input fill's, and graphics/vaapi/rt_windows.rs
-// the check's of a video's planes over Direct3D 11 textures.
+// graphics/vaapi/fill.rs makes the video encoder's input fill's.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -339,31 +338,4 @@ kernel void videoGather444(device const uint *source [[buffer(0)]],
         word |= plane_out[to] & (0xffffffffu << (bytes * 8));
     }
     plane_out[to] = word;
-}
-
-// ---- The check of a video's planes over Direct3D 11 textures ----
-
-// What reims-vgpu's graphics/vaapi/rt_windows.rs draws at a video's open on a Windows host: each
-// pixel of a target the size of a plane holds the plane's texel at the same place, sampled through
-// the plane's texture as the guest's textures over it are, with no filter.
-struct PlaneCheckVertex {
-    float4 position [[position]];
-};
-
-// Vertex `vid` of one triangle that covers the target, from no buffer.
-vertex PlaneCheckVertex videoPlaneCheckVertex(uint vid [[vertex_id]]) {
-    float2 corner = float2(float((vid << 1) & 2), float(vid & 2));
-    PlaneCheckVertex out;
-    out.position = float4(corner * 2.0f - 1.0f, 0.0f, 1.0f);
-    return out;
-}
-
-// The nearest texel, a pixel's centre being a texel's at one texel a pixel.
-constexpr sampler plane_check_sampler(coord::normalized, address::clamp_to_edge, filter::nearest);
-
-// The plane's texel under the pixel.
-fragment float4 videoPlaneCheckFragment(PlaneCheckVertex in [[stage_in]],
-                                        texture2d<float> plane [[texture(0)]]) {
-    float2 size = float2(plane.get_width(), plane.get_height());
-    return plane.sample(plane_check_sampler, in.position.xy / size);
 }

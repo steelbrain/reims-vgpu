@@ -59,9 +59,6 @@
 //! clear of each target's render target view to 0, which every target format stores as zero
 //! bits.
 //!
-//! A picture of the caller's own samples in a texture of a pool's kind ([`PlaneDraw::picture`])
-//! lets the caller check, at a video's open, what its import of the targets reads of a draw.
-//!
 //! The form is made only where both Direct3D 11 devices answer `ExtendedResourceSharing`
 //! (`D3D11_FEATURE_D3D11_OPTIONS`), which sharing the targets' formats needs; elsewhere
 //! [`PlaneDraw::new`] says why not, and the caller copies by the CPU.
@@ -93,7 +90,6 @@ use super::d3d12::{
     IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, IID_ID3D12_RESOURCE, QUEUE_SIGNAL, SharedTexture,
     WAIT_OBJECT_0, WaitForSingleObject, adapter_of, check, guid, system_function,
 };
-use super::surface::SurfaceFormat;
 
 const IID_ID3D11_ON12_DEVICE: Guid = guid(
     0x8561_1e73,
@@ -692,27 +688,6 @@ impl PlaneDraw {
         let mut state = self.state.lock();
         state.clear(&to.planes, colour);
         state.flush_and_wait()
-    }
-
-    /// A picture in a texture of a pool's kind, `size` big in luma samples, of 10-bit samples in
-    /// 16 (P010) or 8-bit ones (NV12), holding `planes`: the luma's samples and the chroma's Cb
-    /// and Cr pairs, each row after row with nothing between them, little-endian, uploaded by the
-    /// draws' Direct3D 12 device, which returns once it is there (module doc).
-    pub fn picture(
-        &self,
-        size: (u32, u32),
-        ten_bit: bool,
-        planes: [&[u8]; 2],
-    ) -> Result<Arc<SharedTexture>, String> {
-        let format = if ten_bit {
-            SurfaceFormat::P010
-        } else {
-            SurfaceFormat::Nv12
-        };
-        let state = self.state.lock();
-        let texture = Arc::new(state.d3d12.shared_texture(format, size.0, size.1)?);
-        state.d3d12.upload(&texture, planes)?;
-        Ok(texture)
     }
 
     /// What `targets` hold, for checks: the luma's bytes and the chroma's, row after row with

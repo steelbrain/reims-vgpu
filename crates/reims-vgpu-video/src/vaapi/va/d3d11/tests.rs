@@ -286,44 +286,6 @@ fn a_draw_short_of_its_targets_leaves_zeros_past_the_picture_only_where_they_owe
     }
 }
 
-/// A picture of the caller's own samples ([`PlaneDraw::picture`]), 64 by 48, of 8-bit samples
-/// and of 10-bit ones, drawn whole into targets of its size, reads back as its bytes. Run
-/// holding the GPU, on the default adapter.
-#[test]
-#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
-fn a_picture_of_the_callers_samples_drawn_whole_reads_back_as_its_bytes() {
-    let draw = PlaneDraw::new(None).expect("the plane draws");
-    for ten_bit in [false, true] {
-        let sample = if ten_bit { 2 } else { 1 };
-        let lengths = [64 * 48 * sample, 32 * 24 * 2 * sample];
-        let planes: [Vec<u8>; 2] = std::array::from_fn(|n| {
-            (0..lengths[n])
-                .map(|i| {
-                    let byte = u8::try_from((i * 7 + n * 31) % 251).expect("a byte");
-                    // P010's low six bits of each sample are zero.
-                    if ten_bit && i % 2 == 0 {
-                        byte & 0xc0
-                    } else {
-                        byte
-                    }
-                })
-                .collect()
-        });
-        let texture =
-            (draw.picture((64, 48), ten_bit, [&planes[0], &planes[1]])).expect("the picture");
-        let to = draw.targets((64, 48), ten_bit).expect("the targets");
-        draw.draw(&texture, (0, 0), &to, (64, 48))
-            .expect("the draw");
-        let back = draw.read_back(&to).expect("the targets' read back");
-        for (plane, (back, want)) in ["luma", "chroma"].iter().zip(back.iter().zip(&planes)) {
-            assert!(
-                back == want,
-                "{ten_bit}: the {plane} reads back as the picture's bytes"
-            );
-        }
-    }
-}
-
 const IID_IDXGI_KEYED_MUTEX: Guid = guid(
     0x9d8e_1289,
     0xd7b3,

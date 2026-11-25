@@ -762,30 +762,6 @@ pub(super) fn drawn_spares<P: Platform>(gate: Arc<RwLock<()>>, now: Now) -> Draw
     )
 }
 
-/// The planes of a surface over `targets`, as a cache's ask of one imports them
-/// ([`DrawnAsk::make`]): the luma's and the chroma's texture, of the plane images' formats and
-/// usage, the chroma half the luma's size, rounded up. The draws' check at a video's open
-/// (`graphics::vaapi`'s `rt_windows`) reads a draw through them.
-#[cfg(windows)]
-pub(crate) fn drawn_planes(
-    targets: &reims_vgpu_video::vaapi::PlaneTargets,
-) -> [D3d11PlaneDesc<'_>; 2] {
-    let at = usize::from(targets.is_10_bit());
-    let (width, height) = targets.size();
-    let sizes = [(width, height), (width.div_ceil(2), height.div_ceil(2))];
-    let handles = [targets.luma_handle(), targets.chroma_handle()];
-    let bind_flags = targets.bind_flags();
-    std::array::from_fn(|n| D3d11PlaneDesc {
-        handle: handles[n],
-        image_format: DRAWN_FORMATS[at].1[n],
-        pixel_format: PLANE_FORMATS[at].1[n],
-        width: u64::from(sizes[n].0),
-        height: u64::from(sizes[n].1),
-        usage: PLANE_USAGE,
-        bind_flags: bind_flags[n],
-    })
-}
-
 /// Why [`DrawnAsk::make`] made no surface.
 #[cfg(windows)]
 enum Unmade {

@@ -272,8 +272,6 @@ pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
 #[cfg(test)]
 pub(crate) use surface_cache::LARGEST as surface_cache_largest;
-#[cfg(windows)]
-pub(crate) use surface_cache::drawn_planes;
 pub(crate) use surface_cache::shapes::ShapesLive;
 pub(crate) use surface_cache::{CacheLive, CachesLive, FillHook, FillWait};
 pub(crate) use tables::TableCounts;

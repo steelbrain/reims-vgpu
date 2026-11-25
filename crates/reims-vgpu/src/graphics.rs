@@ -175,15 +175,6 @@ mod decode;
 mod device_info;
 #[cfg(windows)]
 mod drawn;
-#[cfg(any(windows, test))]
-#[cfg_attr(
-    not(windows),
-    expect(
-        dead_code,
-        reason = "the check runs on Windows, and its tests on every host"
-    )
-)]
-mod drawn_check;
 mod fault_walk;
 #[cfg(any(target_os = "linux", test))]
 mod gather;
