@@ -8541,6 +8541,81 @@ fn a_library_the_platform_refuses_is_a_refused_create() {
     assert_eq!(device.decoder_object_count(), 2);
 }
 
+/// `create`, a render or compute pipeline create, naming no vertex function or no kernel: library
+/// 0 and no name, as the bundle sends a nil function.
+fn naming_no_function(mut create: Vec<u8>) -> Vec<u8> {
+    let (header, _) = RgfxMsgHeader::read_from_prefix(&create).unwrap();
+    if header.r#type == RGFX_CMD_RENDER_PIPELINE_CREATE {
+        let (mut m, _) = RgfxRenderPipelineCreate::read_from_prefix(&create).unwrap();
+        (m.vertex_library_obj_id, m.vertex_name_len) = (0, 0);
+        create[..size_of_val(&m)].copy_from_slice(m.as_bytes());
+    } else {
+        let (mut m, _) = RgfxComputePipelineCreate::read_from_prefix(&create).unwrap();
+        (m.function_library_obj_id, m.name_len) = (0, 0);
+        create[..size_of_val(&m)].copy_from_slice(m.as_bytes());
+    }
+    create
+}
+
+/// A pipeline create naming no vertex function or no kernel, as the bundle sends one where the
+/// device refused the library its program's functions were to come from, is answered refused and
+/// counted as `decode-no-function`, not as the guest protocol error `decode-bad-reference`, which
+/// a create naming a library the device never held still is. The first create of each why and
+/// kind is logged at warn, naming its kind, and the rest are folded under it
+#[test]
+fn a_create_naming_no_function_is_counted_apart_from_a_bad_reference() {
+    use reims_vgpu_vulkan::core::logging;
+
+    let count = |code: &str| {
+        (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+            .find(|(c, _)| c == code)
+            .map_or(0, |(_, n)| n)
+    };
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&lines);
+    assert!(logging::set_hook(
+        log::LevelFilter::Warn,
+        Box::new(move |_, _, message| seen.lock().push(message.to_owned())),
+    ));
+    let before = (count("decode-no-function"), count("decode-bad-reference"));
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    make_library(&device, &mut guest, obj(1, 10));
+    for n in 11..=12 {
+        let create = naming_no_function(render_pipeline_create(obj(1, n), obj(1, 10)));
+        guest.send(&device, create);
+        expect_reflection(&mut guest, obj(1, n), RGFX_PIPELINE_REFUSED);
+    }
+    guest.send(
+        &device,
+        naming_no_function(compute_pipeline_create(obj(1, 13), obj(1, 10))),
+    );
+    expect_reflection(&mut guest, obj(1, 13), RGFX_PIPELINE_REFUSED);
+    guest.send(&device, compute_pipeline_create(obj(1, 14), obj(1, 99)));
+    expect_reflection(&mut guest, obj(1, 14), RGFX_PIPELINE_REFUSED);
+    // The library's own creates are still made.
+    guest.send(&device, render_pipeline_create(obj(1, 15), obj(1, 10)));
+    expect_reflection(&mut guest, obj(1, 15), RGFX_PIPELINE_OK);
+    logging::clear_hook();
+    assert_eq!(count("decode-no-function") - before.0, 3);
+    assert_eq!(count("decode-bad-reference") - before.1, 1);
+    let not_carried_out: Vec<String> = (lines.lock().iter())
+        .filter(|line| line.contains("was not carried out"))
+        .cloned()
+        .collect();
+    let logged = |kind: &str, why: &str| {
+        (not_carried_out.iter())
+            .filter(|line| line.starts_with(kind) && line.ends_with(why))
+            .count()
+    };
+    assert_eq!(not_carried_out.len(), 3, "{not_carried_out:?}");
+    assert_eq!(logged("a render pipeline create", "NoFunction"), 1);
+    assert_eq!(logged("a compute pipeline create", "NoFunction"), 1);
+    assert_eq!(logged("a compute pipeline create", "BadReference"), 1);
+}
+
 /// A `HEAP_CREATE` of an Automatic heap `obj_id` of 1 MiB.
 fn heap_create(obj_id: u64) -> Vec<u8> {
     RgfxHeapCreate {

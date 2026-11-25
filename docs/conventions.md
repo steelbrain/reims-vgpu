@@ -149,9 +149,13 @@ repeats the ones code cites.
     decoder's (`two-ranges-kept-whole`, a command buffer dealt to two
     threads that the platform kept whole at a chunk's end, which fails at
     its stand-in; `decode-malformed`, `decode-unknown-command`,
-    `decode-refused`, `decode-bad-reference` and `decode-bad-resource-id`,
-    the messages it did not carry out, by why (`DecodeError`; one of a
-    context closed before it came is owed nothing, and not counted), and
+    `decode-refused`, `decode-bad-reference`, `decode-bad-resource-id` and
+    `decode-no-function`, the messages it did not carry out, by why
+    (`DecodeError`; `decode-no-function` is a pipeline create naming no
+    vertex function or kernel, as the bundle sends one where the device
+    refused the library its functions were to come from, and no guest
+    protocol error; one of a context closed before it came is owed
+    nothing, and not counted), and
     `decode-faulted`, those a raise kept it from, each kind's first logged;
     `read-only-pages-buffers`, the no-copy buffers it made
     over pages their process maps read-only, and `read-only-pages-kib`,

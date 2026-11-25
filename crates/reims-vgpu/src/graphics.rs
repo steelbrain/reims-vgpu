@@ -3363,10 +3363,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             Ok(prepared) => prepared,
             Err(e) => {
                 let (ty, seqno, obj_id) = message_identity(message);
+                // The first of each why and kind of create at warn, and the rest counted under
+                // both, so the counts' line says which kinds were folded.
+                let made = pipeline_create_kind(ty);
+                let class = format!("{e:?} of a {made} create");
                 log::warn!(
-                    target: "reims_vgpu::graphics", kind:? = e;
-                    "a pipeline create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
-                     carried out: {e:?}"
+                    target: "reims_vgpu::graphics", kind:% = class;
+                    "a {made} pipeline create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
+                     was not carried out: {e:?}"
                 );
                 e.count();
                 // Refused at its op, and answered at once: its process waits for the reply.
@@ -5506,6 +5510,16 @@ fn foreign_queue(poster: &CompletionPoster, message: &[u8]) -> bool {
             cb.header.r#type == RGFX_CMD_COMMAND_BUFFER && cb.queue_obj_id != queue
         }
         _ => false,
+    }
+}
+
+/// What a pipeline create of message type `ty`, one of the three ring 0 starts
+/// ([`GraphicsControl::start_pipeline`]), makes, as its refusal's log line names it.
+fn pipeline_create_kind(ty: u32) -> &'static str {
+    match ty {
+        RGFX_CMD_RENDER_PIPELINE_CREATE => "render",
+        RGFX_CMD_MESH_RENDER_PIPELINE_CREATE => "mesh render",
+        _ => "compute",
     }
 }
 

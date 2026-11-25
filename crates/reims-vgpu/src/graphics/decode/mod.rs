@@ -692,6 +692,11 @@ pub enum DecodeError {
     /// [`RGFX_RESOURCE_ID_LIMIT`], or another context's. The platform is not called, so no id the host's Metal ends the
     /// process for reaches it.
     BadResourceId,
+    /// A render pipeline create named no vertex function, or a compute pipeline create no
+    /// kernel: library 0 and no name, which the bundle sends for a nil function, as a program
+    /// holds where the device refused the library its functions were to come from. Answered
+    /// refused, as any create not carried out is; not a guest protocol error.
+    NoFunction,
     /// The command buffer's context was closed before the buffer came to the decoder (taken off
     /// its queue's ring before the close, handed over after it): nothing of it is carried out,
     /// and nothing is owed, its queue having ended at the close.
@@ -713,6 +718,7 @@ impl DecodeError {
             DecodeError::Refused => Some("decode-refused"),
             DecodeError::BadReference => Some("decode-bad-reference"),
             DecodeError::BadResourceId => Some("decode-bad-resource-id"),
+            DecodeError::NoFunction => Some("decode-no-function"),
             DecodeError::ContextClosed => None,
         }
     }
@@ -5715,7 +5721,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// attachments, a vertex or stage-input buffer or attribute index past Metal's last (30), or a
     /// linked function in no list Metal has, is [`DecodeError::Malformed`]. Neither is answered. A
     /// render create naming library 0 and no name for its fragment function has none (a pipeline
-    /// that does not rasterize).
+    /// that does not rasterize); one naming so no vertex function, and a compute create naming so
+    /// no kernel, is [`DecodeError::NoFunction`], the bundle's create of a nil function.
     ///
     /// Every field the wire carries reaches the platform's creator: the render form's functions,
     /// vertex descriptor, colour attachments (format, blending, factors, operations, write mask),
@@ -5746,6 +5753,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
         if header.r#type == RGFX_CMD_COMPUTE_PIPELINE_CREATE {
             let m = read::<RgfxComputePipelineCreate>(message).ok_or(DecodeError::Malformed)?;
+            if m.function_library_obj_id == 0 && m.name_len == 0 {
+                return Err(DecodeError::NoFunction);
+            }
             let library = library(m.function_library_obj_id)?;
             let name =
                 str_tail(message, m.name_offset, m.name_len).ok_or(DecodeError::Malformed)?;
@@ -5793,6 +5803,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             return self.prepare_mesh_pipeline(message);
         }
         let m = read::<RgfxRenderPipelineCreate>(message).ok_or(DecodeError::Malformed)?;
+        if m.vertex_library_obj_id == 0 && m.vertex_name_len == 0 {
+            return Err(DecodeError::NoFunction);
+        }
         let vertex_library = library(m.vertex_library_obj_id)?;
         let vertex_name = str_tail(message, m.vertex_name_offset, m.vertex_name_len)
             .ok_or(DecodeError::Malformed)?;
