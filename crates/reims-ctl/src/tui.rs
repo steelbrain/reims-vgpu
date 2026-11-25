@@ -1190,12 +1190,12 @@ impl App {
         }
         // What runtime::warnings finds shows in the VM's details, not here.
         let host = self.host;
-        self.spawn(&vm.config.name.clone(), "starting", move |_| {
+        self.spawn(&vm.config.name.clone(), "starting", move |p| {
             // What the start did to its settings first, and why, follows the start's line.
             let mut vm = vm;
             let mut said = Vec::new();
             let warned = runtime::prepare(&mut vm, &mut |s| said.push(s.to_string()));
-            let started = runtime::start(&vm, host)?;
+            let started = runtime::start(&vm, host, p)?;
             let mut s = format!(
                 "{}: running (pid {}); its window is open",
                 vm.name(),

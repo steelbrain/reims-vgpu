@@ -881,8 +881,9 @@ pub struct Started {
     pub note: Option<String>,
 }
 
-/// Starts the VM, and returns QEMU's pid once QMP answers.
-pub fn start(vm: &Vm, host: Host) -> Result<Started> {
+/// Starts the VM, and returns QEMU's pid once QMP answers. A start Windows refused the VM's RAM
+/// runs once more after a wait ([`retry_after`]), telling `progress`.
+pub fn start(vm: &Vm, host: Host, progress: &mut dyn FnMut(&str)) -> Result<Started> {
     if let Some(p) = pid(vm) {
         bail!("{} already runs (pid {p})", vm.name());
     }
@@ -912,73 +913,107 @@ pub fn start(vm: &Vm, host: Host) -> Result<Started> {
     }
     let note = launch_note(vm.name(), &launch);
     let sock = prepare_run(vm)?;
-
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(vm.qemu_log())?;
-    writeln!(
-        log,
-        "reims-ctl {} started {} at {}",
-        env!("CARGO_PKG_VERSION"),
-        vm.name(),
-        now_stamp("%Y-%m-%d %H:%M:%S %z")
-    )?;
-    match (&launch, &note) {
-        (Launch::Scope(unit), _) => writeln!(log, "in the systemd user scope {unit}")?,
-        (_, Some(n)) => writeln!(log, "warning: {n}")?,
-        _ => {}
-    }
-    log.write_all(inv.shell_script("the command").as_bytes())?;
-    writeln!(log, "----")?;
-
-    let run = launched(inv, vm.name(), &launch);
-    let mut cmd = run.command();
-    cmd.current_dir(&vm.dir);
-    crate::os::spawn_detached(cmd, log)
-        .with_context(|| format!("run {}", run.program.display()))?;
     let started = |pid| Started {
         pid,
         note: note.clone(),
     };
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut seen = false;
-    loop {
-        if let Some(p) = pid(vm) {
-            seen = true;
-            if qmp::Qmp::connect(&sock, Duration::from_secs(2)).is_ok() {
-                return Ok(started(p));
-            }
-        } else if seen || Instant::now() > deadline - Duration::from_secs(50) {
-            // QEMU wrote its pid file and exited, or never wrote it.
-            std::thread::sleep(Duration::from_millis(200));
-            if pid(vm).is_none() {
-                let log = tail(&vm.qemu_log(), 15);
-                let note = match ram_refused(&log, vm.config.profile, host) {
-                    Some(how) => format!(
-                        "\n{}",
-                        memory_note(
-                            vm.name(),
-                            vm.config.memory_mib,
-                            crate::os::memory_room_mib(),
-                            how
-                        )
-                    ),
-                    None => String::new(),
-                };
-                bail!("QEMU exited:\n{log}{note}");
-            }
+    let mut tries = 0;
+    'start: loop {
+        tries += 1;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(vm.qemu_log())?;
+        writeln!(
+            log,
+            "reims-ctl {} started {} at {}",
+            env!("CARGO_PKG_VERSION"),
+            vm.name(),
+            now_stamp("%Y-%m-%d %H:%M:%S %z")
+        )?;
+        match (&launch, &note) {
+            (Launch::Scope(unit), _) => writeln!(log, "in the systemd user scope {unit}")?,
+            (_, Some(n)) => writeln!(log, "warning: {n}")?,
+            _ => {}
         }
-        if Instant::now() > deadline {
-            match pid(vm) {
-                Some(p) => return Ok(started(p)),
-                None => bail!("QEMU did not start:\n{}", tail(&vm.qemu_log(), 15)),
+        log.write_all(inv.shell_script("the command").as_bytes())?;
+        writeln!(log, "----")?;
+
+        let run = launched(inv.clone(), vm.name(), &launch);
+        let mut cmd = run.command();
+        cmd.current_dir(&vm.dir);
+        crate::os::spawn_detached(cmd, log)
+            .with_context(|| format!("run {}", run.program.display()))?;
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut seen = false;
+        loop {
+            if let Some(p) = pid(vm) {
+                seen = true;
+                if qmp::Qmp::connect(&sock, Duration::from_secs(2)).is_ok() {
+                    return Ok(started(p));
+                }
+            } else if seen || Instant::now() > deadline - Duration::from_secs(50) {
+                // QEMU wrote its pid file and exited, or never wrote it.
+                std::thread::sleep(Duration::from_millis(200));
+                if pid(vm).is_none() {
+                    let log = tail(&vm.qemu_log(), 15);
+                    let how = ram_refused(&log, vm.config.profile, host);
+                    if let Some(wait) = retry_after(how, tries) {
+                        let line = format!(
+                            "Windows did not give the VM its RAM: starting it once more in {} s",
+                            wait.as_secs()
+                        );
+                        progress(&line);
+                        let log = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(vm.qemu_log());
+                        if let Ok(mut log) = log {
+                            let _ = writeln!(log, "reims-ctl: {line}");
+                        }
+                        std::thread::sleep(wait);
+                        continue 'start;
+                    }
+                    let note = match how {
+                        Some(how) => format!(
+                            "\n{}",
+                            memory_note(
+                                vm.name(),
+                                vm.config.memory_mib,
+                                crate::os::memory_room_mib(),
+                                how
+                            )
+                        ),
+                        None => String::new(),
+                    };
+                    bail!("QEMU exited:\n{log}{note}");
+                }
             }
+            if Instant::now() > deadline {
+                match pid(vm) {
+                    Some(p) => return Ok(started(p)),
+                    None => bail!("QEMU did not start:\n{}", tail(&vm.qemu_log(), 15)),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(150));
         }
-        std::thread::sleep(Duration::from_millis(150));
     }
 }
+
+/// How long a start waits before it runs QEMU once more, after its `tries`th try ended `how`
+/// ([`ram_refused`]): [`COMMIT_RETRY`] after a first try Windows refused the VM's RAM
+/// ([`RamRefused::Commit`]); otherwise no more tries, and a second refusal among them ends the
+/// start with [`memory_note`]. A user's start refused so worked when it was run again 29 s
+/// later, as what Windows can commit grows where it grows a page file it manages.
+pub fn retry_after(how: Option<RamRefused>, tries: u32) -> Option<Duration> {
+    (how == Some(RamRefused::Commit) && tries == 1).then_some(COMMIT_RETRY)
+}
+
+/// How long a start Windows refused the VM's RAM waits before it runs QEMU once more
+/// ([`retry_after`]).
+pub const COMMIT_RETRY: Duration = Duration::from_secs(10);
 
 /// Stops the VM: macOS's Control-Option-Command-Power on the USB keyboard ("quit all apps,
 /// then shut down", which asks about unsaved documents), then, a third of `timeout` in, the
@@ -1105,7 +1140,7 @@ pub enum RamRefused {
 /// more than Linux's `MemAvailable` counts or Windows grows a page file it manages, so a check
 /// would refuse starts that work (the 32 GiB VM whose RAM Windows refused, [`RamRefused::Commit`],
 /// started when it was started again 29 s later). A start that fails names the memory instead
-/// ([`memory_note`]).
+/// ([`memory_note`]), after one more try where Windows refused it ([`retry_after`]).
 pub fn ram_refused(log: &str, profile: Profile, host: Host) -> Option<RamRefused> {
     if !profile.ram_whole_at_start(host) {
         return None;
@@ -1438,6 +1473,28 @@ mod tests {
         );
     }
 
+    /// A start Windows refused the VM's RAM runs once more after a wait, as a user's start run
+    /// again 29 s later worked; a second refusal, and every other end of QEMU, end the start.
+    #[test]
+    fn a_start_windows_refused_ram_runs_once_more() {
+        use RamRefused::{Allocation, Commit, Silent};
+        let windows = Host {
+            os: Os::Windows,
+            arch: crate::host::Arch::X86_64,
+        };
+        let log = "----\nC:\\qemu\\qemu-system-x86_64.exe: -object \
+                   memory-backend-ram,id=ram,size=32768M,share=on: Cannot set up guest memory \
+                   'ram': Failed to CreateFileMapping: Insufficient system resources exist to \
+                   complete the requested service.";
+        let how = ram_refused(log, Profile::Q35X86_64, windows);
+        assert_eq!(how, Some(Commit));
+        assert_eq!(retry_after(how, 1), Some(COMMIT_RETRY));
+        assert_eq!(retry_after(how, 2), None);
+        for how in [None, Some(Silent), Some(Allocation)] {
+            assert_eq!(retry_after(how, 1), None, "{how:?}");
+        }
+    }
+
     /// The thrashing guard is told of above 0 only, read from its file as the kernel writes it,
     /// and the line that keeps it off is the one scripts/install-ctl.sh shows, for the same file.
     #[test]
@@ -1706,7 +1763,7 @@ mod tests {
         reg.save().unwrap();
         // a runs.
         let mut qemu = test_qemu(&vms[0].pidfile(), 30);
-        let r = start(&vms[1], Host::current());
+        let r = start(&vms[1], Host::current(), &mut |_| {});
         let _ = qemu.kill();
         let _ = qemu.wait();
         let e = format!("{:#}", r.unwrap_err());

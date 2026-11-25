@@ -634,7 +634,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             {
                 eprintln!("warning: {w}");
             }
-            let started = runtime::start(&vm, host)?;
+            let started = runtime::start(&vm, host, &mut |p| println!("{name}: {p}"))?;
             if let Some(n) = &started.note {
                 eprintln!("warning: {n}");
             }
@@ -964,7 +964,7 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         for w in runtime::prepare(&mut vm, &mut |p| println!("{name}: {p}")) {
             eprintln!("warning: {w}");
         }
-        let started = runtime::start(&vm, host)?;
+        let started = runtime::start(&vm, host, &mut |p| println!("{name}: {p}"))?;
         if let Some(n) = &started.note {
             eprintln!("warning: {n}");
         }
