@@ -45,14 +45,22 @@
 //!   refusal (`Gap::StorageElement`), encoding nothing, counted (`rt-refused-gap`), as the
 //!   compute encoder's dispatch is: Metal writes such a texture there, and Vulkan would drop the
 //!   writes.
-//! - **Nothing to record**: `useHeaps:` in each form (rt's pass orders every earlier command before
-//!   it and itself before every later one, and every resource is resident); the store action
-//!   options (the one option is custom sample positions, which rt's pass keeps none of:
-//!   `super::descriptor`); the object, mesh and tile functions' buffers, textures, samplers and
-//!   threadgroup memory, and the tile threadgroup memory length (rt makes no state with such
-//!   functions); and, each at Metal's default, a resolve texture of nil, a line width of 1,
-//!   primitive restart enabled, the viewport transform enabled, one vertex amplification view and
-//!   a tessellation factor scale of 1.
+//! - **`useHeaps:`** in each form is rt's `use_heap` of each heap it names but nil, as the compute
+//!   encoder's is (`super::compute`): the command buffer keeps the heap's block until it retires,
+//!   and rt records nothing and reads no stages (rt's pass orders every earlier command before it
+//!   and itself before every later one, and every resource is resident). On a device whose Shared
+//!   memory type is not host-coherent, rt flushes the Shared memory of every heap a command buffer
+//!   uses before its submission, and flushes then invalidates it before the host can see the
+//!   command buffer's progress (rt's README, "Shared memory's coherence"), so the host's writes to
+//!   the heap's resources reach a draw that reaches them only through an argument buffer or a
+//!   resource ID, and the draw's writes reach the host: rt flushes only what the consumer
+//!   declares. On a device whose Shared type is host-coherent rt makes neither call.
+//! - **Nothing to record**: the store action options (the one option is custom sample positions,
+//!   which rt's pass keeps none of: `super::descriptor`); the object, mesh and tile functions'
+//!   buffers, textures, samplers and threadgroup memory, and the tile threadgroup memory length
+//!   (rt makes no state with such functions); and, each at Metal's default, a resolve texture of
+//!   nil, a line width of 1, primitive restart enabled, the viewport transform enabled, one vertex
+//!   amplification view and a tessellation factor scale of 1.
 //! - **The visibility result mode** is rt's: `Boolean` and `Counting` count the encoder's later
 //!   draws, to the next mode set, and rt's pass writes the count at the mode's offset of its
 //!   visibility result buffer as it ends; `Disabled`, at any offset, ends the count. Metal's
@@ -404,9 +412,12 @@ impl RtRenderEncoder {
                     }
                 }
             }
+            RenderCmd::UseHeaps { heaps } | RenderCmd::UseHeapsStages { heaps, .. } => {
+                for heap in heaps.iter().flatten() {
+                    e.use_heap(heap.block_id())?;
+                }
+            }
             RenderCmd::EndEncoding
-            | RenderCmd::UseHeaps { .. }
-            | RenderCmd::UseHeapsStages { .. }
             | RenderCmd::SetColorStoreActionOptions { .. }
             | RenderCmd::SetDepthStoreActionOptions { .. }
             | RenderCmd::SetStencilStoreActionOptions { .. }
@@ -1031,7 +1042,7 @@ mod tests {
     use crate::core::platform::values::IcbDesc;
     use crate::core::platform::values::{
         AttributeDesc, BufferLayoutDesc, ColorAttachmentDesc, ColorAttachmentSet,
-        FullRenderPipelineDesc, PassSet, TextureDesc, VertexDesc,
+        FullRenderPipelineDesc, HeapDesc, OptionSet, PassSet, TextureDesc, VertexDesc,
     };
     use crate::rt_platform::unbuilt::RtRefusal;
     use crate::rt_platform::{
@@ -1601,7 +1612,8 @@ mod tests {
 
     /// A declaration of no usage (`useResources:` of 0, in each form) declares nothing and is no
     /// refusal, as the compute encoder's (`super::compute`'s docs, "No usage"), where a usage
-    /// with a bit past sample is Metal's refusal, counted; the draw after either draws.
+    /// with a bit past sample is Metal's refusal, counted; the draw after either draws, as does
+    /// one after `useHeaps:` in each form.
     #[test]
     fn a_declaration_of_no_usage_is_no_refusal_on_vulkan() {
         // `MTLRenderStageFragment`.
@@ -1662,6 +1674,36 @@ mod tests {
             assert_eq!(counted(metal), before + 2 * refused, "{usage}");
             assert_eq!(texels(), green, "{usage}");
         }
+        // `useHeaps:` in each form is rt's `use_heap` of each heap but nil, which records nothing:
+        // the draw after it draws, and nothing is refused.
+        let heap = device.new_heap(&HeapDesc {
+            size: 0x10000,
+            heap_type: 0,
+            options: vec![OptionSet::ResourceOptions(0)],
+            pinned_gpu_address: None,
+        });
+        let heap = heap.expect("never a raise").heap.expect("a heap");
+        let heaps = [Some(&heap), None];
+        let before = counted(metal);
+        let mut cmds = vec![
+            RenderCmd::UseHeaps { heaps: &heaps },
+            RenderCmd::UseHeapsStages {
+                heaps: &heaps,
+                stages: FRAGMENT,
+            },
+        ];
+        cmds.extend(bound(
+            &state,
+            &vertices,
+            RenderCmd::DrawPrimitives {
+                primitive_type: TRIANGLE,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+        ));
+        assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
+        assert_eq!(counted(metal), before);
+        assert_eq!(texels(), green);
     }
 
     /// The commands that set `state` and `vertices` at vertex buffer 0, then `draw`.
