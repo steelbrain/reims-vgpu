@@ -231,8 +231,9 @@ A host names the guest physical addresses it can give the guest's Shared pool
 (`pool_physical_address`, `pool_physical_length`), 2 MiB-aligned and with no RAM under them, 0 and 0
 for none. The device takes from their start as many as the memory heaps of its GPU device hold,
 every heap summed, rounded up to 2 MiB. Its Shared blocks come from the heap of the first memory
-type with `HOST_VISIBLE`, `HOST_COHERENT` and `HOST_CACHED` that a buffer of the device's usage can
-use, but a heap's size is how the driver accounts for memory, not the most it allocates: on an AMD
+type with `HOST_VISIBLE` and `HOST_CACHED` that a buffer of the device's usage can use, the first
+with `HOST_COHERENT` too where there is one, but a heap's size is how the driver accounts for
+memory, not the most it allocates: on an AMD
 APU, RADV splits the memory the GPU can use into that type's heap, a third of it (5.52 of 16.57 GiB
 on a 780M, measured 11-18 with `vulkaninfo`), and a device-local heap over the same memory, and the
 runtime takes Shared blocks until the driver refuses one. The bound is the heaps' sizes, not

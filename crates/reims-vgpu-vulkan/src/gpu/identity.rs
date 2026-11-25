@@ -131,15 +131,15 @@ pub(crate) unsafe fn device_local_budget_of(
 
 /// The bytes of `memory`'s heaps, every one of them, summed (`GpuDevice::memory_heaps_total`),
 /// which bound the guest's Shared pool's range. Every heap, not only the heap of
-/// metal2vulkan-runtime's Shared memory type (host-visible, host-coherent and host-cached), whose
-/// blocks fill the pool: a heap's size is how the driver accounts for its memory, not what it will
-/// allocate (on a 780M, RADV gives that type a 5.52 GiB heap beside an 11.05 GiB device-local one,
-/// measured with `vulkaninfo` on 2026-11-18, both from the same system memory), and the runtime
-/// takes Shared blocks until the driver refuses one. The sizes, not `VK_EXT_memory_budget`'s
-/// budgets: the pool's range is guest physical addresses held for the device's life, which RAM
-/// fills only as the pool takes blocks, while a budget is what the process may allocate at the
-/// moment it is read, which other processes move, and which a driver may answer past its heap's
-/// size ([`device_local_budget_of`]).
+/// metal2vulkan-runtime's Shared memory type (host-visible and host-cached, a host-coherent one
+/// first), whose blocks fill the pool: a heap's size is how the driver accounts for its memory,
+/// not what it will allocate (on a 780M, RADV gives that type a 5.52 GiB heap beside an 11.05 GiB
+/// device-local one, measured with `vulkaninfo` on 2026-11-18, both from the same system memory),
+/// and the runtime takes Shared blocks until the driver refuses one. The sizes, not
+/// `VK_EXT_memory_budget`'s budgets: the pool's range is guest physical addresses held for the
+/// device's life, which RAM fills only as the pool takes blocks, while a budget is what the process
+/// may allocate at the moment it is read, which other processes move, and which a driver may answer
+/// past its heap's size ([`device_local_budget_of`]).
 pub(crate) fn memory_heaps_total_of(memory: &vk::PhysicalDeviceMemoryProperties) -> u64 {
     memory
         .memory_heaps_as_slice()

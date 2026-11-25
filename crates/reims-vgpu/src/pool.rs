@@ -252,7 +252,8 @@ pub const RELEASE_DELAY: Duration = Duration::from_secs(5);
 pub enum MemoryClass {
     /// Device-local, never mapped, no host pointer.
     Private,
-    /// Host-visible, host-coherent and host-cached: the only class mapped into the guest.
+    /// Host-visible and host-cached, host-coherent where the device has such a type: the only
+    /// class mapped into the guest.
     Shared,
 }
 

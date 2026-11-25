@@ -35,9 +35,13 @@
 //! - **Copied in at the commits that use it** ([`copy_in`], from `super::command`'s commit,
 //!   before rt is handed the command buffer, so before the work that reads it): every byte of the
 //!   pages that differs from the base is written into the copy and the base. A byte the CPU did
-//!   not change is never written, so a GPU write to the copy by work still in flight stays. rt's
-//!   memory of a Shared block is coherent, so the GPU reads the bytes written with no flush. A
-//!   copy of pages whose GPU writes are dropped is written whole instead ("Writes dropped").
+//!   not change is never written, so a GPU write to the copy by work still in flight stays. Where
+//!   the device's Shared memory type is host-coherent, the GPU reads the bytes written with no
+//!   flush; where it is not, rt flushes the Shared memory the command buffer keeps before it
+//!   submits it, and flushes then invalidates what it may write before its completed handlers run
+//!   (rt's README, "Shared memory's coherence"), which covers a copy the command buffer binds or
+//!   declares, but not one it reaches only through an address. A copy of pages whose GPU writes
+//!   are dropped is written whole instead ("Writes dropped").
 //! - **Merged back at the completions of the command buffers that can write it** ([`merging`],
 //!   the first of the command buffer's completed handlers, so before core's and before a waiter
 //!   returns): every byte of the copy that differs from the base is written into the pages where
