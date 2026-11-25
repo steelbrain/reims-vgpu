@@ -40,7 +40,8 @@
 //! manifest, and QEMU's run limited to it found both too. Why is not confirmed; a loader that
 //! ignores `VK_DRIVER_FILES` in an elevated process would do it. The library reads
 //! `MESA_VK_DEVICE_SELECT` itself (reims-vgpu-vulkan's `device_choice`), so IDs name the pick
-//! wherever the loader runs.
+//! wherever the loader runs. A VM an older reims-ctl gave a GPU so, under a manifest whose probe
+//! now goes past it, is named by that GPU's IDs once ([`crate::migrate`], migration 6).
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -153,6 +154,12 @@ pub fn icd_files() -> Vec<PathBuf> {
 
 /// The host's GPUs, each with the driver manifest that reaches it.
 pub fn list() -> Vec<GpuInfo> {
+    from_probes(probes())
+}
+
+/// What each driver's manifest's probe found, in the loader's order of manifests: the GPUs, each
+/// with that manifest as its [`GpuInfo::driver_file`].
+pub fn probes() -> Vec<Vec<GpuInfo>> {
     if !cfg!(any(target_os = "linux", windows)) {
         return Vec::new();
     }
@@ -166,21 +173,26 @@ pub fn list() -> Vec<GpuInfo> {
             std::thread::spawn(move || probe(&exe, &file))
         })
         .collect();
-    let probes = handles.into_iter().filter_map(|h| h.join().ok()).collect();
-    from_probes(probes)
+    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+}
+
+/// Whether `probe`, what one manifest's probe found, holds GPUs of several drivers (by
+/// `driverID`, else by vendor), so it went past its manifest (the module doc).
+pub fn went_past(probe: &[GpuInfo]) -> bool {
+    let driver = |g: &GpuInfo| match g.driver_id {
+        0 => (0, g.vendor_id),
+        id => (id, 0),
+    };
+    probe.iter().any(|g| driver(g) != driver(&probe[0]))
 }
 
 /// The host's GPUs from each manifest's probe, in the loader's order of manifests: a probe that
 /// found several drivers' GPUs marked [`GpuInfo::past_manifest`], and each GPU listed once,
 /// discrete before integrated.
-fn from_probes(probes: Vec<Vec<GpuInfo>>) -> Vec<GpuInfo> {
-    let driver = |g: &GpuInfo| match g.driver_id {
-        0 => (0, g.vendor_id),
-        id => (id, 0),
-    };
+pub fn from_probes(probes: Vec<Vec<GpuInfo>>) -> Vec<GpuInfo> {
     let mut found: Vec<GpuInfo> = Vec::new();
     for mut probe in probes {
-        let past = probe.iter().any(|g| driver(g) != driver(&probe[0]));
+        let past = went_past(&probe);
         for g in &mut probe {
             g.past_manifest = past;
         }

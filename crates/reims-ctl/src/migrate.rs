@@ -33,6 +33,13 @@
 //!   pick from the list does now ([`crate::gpu::GpuInfo::to_config`]), by its IDs where those
 //!   name it. A running VM's too: QEMU reads them at the VM's next start. The host's GPUs are
 //!   listed once a run, and only for a VM that has such a GPU.
+//! - Migration 6 is for the VMs whose GPU a reims-ctl saved under a driver's manifest whose probe
+//!   finds GPUs of other drivers too ([`crate::gpu`], "A probe past its manifest"), which does
+//!   not name that GPU: as a user's Windows host saved a GTX 1650 Ti under Intel's manifest,
+//!   with no IDs. Where that manifest's probe now goes past it and finds one GPU of the
+//!   settings' name and any device ID, they name it as a pick of that GPU from the list does
+//!   now, by its IDs, as migration 5's do; a running VM's too, and the probes run as migration
+//!   5's list does.
 
 use crate::gpu::GpuInfo;
 use crate::opencore::{self, Config};
@@ -44,7 +51,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// The migrations this reims-ctl carries: 1 to this.
-pub const CURRENT: u32 = 5;
+pub const CURRENT: u32 = 6;
 
 /// The ported drivers older OpenCore images load, by bundle name: the seven kexts that run Apple's
 /// arm64 GPU driver on x86-64, which reims-util carried until its fe9bfe1.
@@ -105,7 +112,7 @@ enum Plan {
     Defer,
     /// Its image made again for the graphics it runs, for this reason.
     Image(Why),
-    /// Migration 5: its GPU's settings replaced by these.
+    /// Migrations 5 and 6: its GPU's settings replaced by these.
     Gpu(crate::vm::Gpu),
 }
 
@@ -202,10 +209,46 @@ fn plan_5(vm: &Vm, gpus: impl FnOnce() -> Vec<GpuInfo>) -> Plan {
     }
 }
 
-/// The host's GPUs ([`crate::gpu::list`]), listed at the first ask of a run.
+/// Migration 6's plan for `vm`, of what each of the host's manifests' probes found, `probes`,
+/// asked only where its settings name a GPU by its driver's manifest and name with no IDs: where
+/// the probe of that manifest went past it ([`crate::gpu::went_past`]) and found one GPU of that
+/// name and device ID (where the settings keep one), the settings a pick of the GPU of its IDs
+/// from the list gives, where they name it by its IDs.
+fn plan_6(vm: &Vm, probes: impl FnOnce() -> Vec<Vec<GpuInfo>>) -> Plan {
+    let g = &vm.config.gpu;
+    let (Some(file), Some(name), None) = (&g.driver_file, &g.name, &g.select) else {
+        return Plan::Skip;
+    };
+    let probes = probes();
+    let found: Vec<(u32, u32)> = (probes.iter())
+        .filter(|p| p.iter().any(|f| &f.driver_file == file) && crate::gpu::went_past(p))
+        .flatten()
+        .filter(|f| &f.name == name && g.device_id.is_none_or(|id| id == f.device_id))
+        .map(|f| (f.vendor_id, f.device_id))
+        .collect();
+    let [ids] = found.as_slice() else {
+        return Plan::Skip;
+    };
+    let gpus = crate::gpu::from_probes(probes);
+    let listed: Vec<&GpuInfo> = (gpus.iter())
+        .filter(|l| (l.vendor_id, l.device_id) == *ids)
+        .collect();
+    match listed.as_slice() {
+        [only] if only.to_config().select.is_some() => Plan::Gpu(only.to_config()),
+        _ => Plan::Skip,
+    }
+}
+
+/// What each of the host's manifests' probes found ([`crate::gpu::probes`]), probed at the first
+/// ask of a run.
+fn host_probes() -> Vec<Vec<GpuInfo>> {
+    static PROBED: std::sync::OnceLock<Vec<Vec<GpuInfo>>> = std::sync::OnceLock::new();
+    PROBED.get_or_init(crate::gpu::probes).clone()
+}
+
+/// The host's GPUs ([`crate::gpu::list`]), from [`host_probes`].
 fn host_gpus() -> Vec<GpuInfo> {
-    static LISTED: std::sync::OnceLock<Vec<GpuInfo>> = std::sync::OnceLock::new();
-    LISTED.get_or_init(crate::gpu::list).clone()
+    crate::gpu::from_probes(host_probes())
 }
 
 /// Whether `vm`'s settings, as saved, name apple-gfx: they read as reims-vgpu's own device.
@@ -246,6 +289,7 @@ fn plan_of(n: u32, vm: &Vm, running: bool) -> Plan {
             plan_4(vm, running, &kexts)
         }
         5 => plan_5(vm, host_gpus),
+        6 => plan_6(vm, host_probes),
         _ => Plan::Skip,
     }
 }
@@ -354,7 +398,7 @@ fn carry_out(vm: &mut Vm, plan: Plan, n: u32) -> Option<String> {
                  OpenCore image again"
             ),
         }),
-        Plan::Gpu(gpu) => Some(match pick_gpu(vm, gpu) {
+        Plan::Gpu(gpu) => Some(match pick_gpu(vm, gpu, n) {
             Ok(line) => format!("{name}: {line}"),
             Err(e) => format!(
                 "{name}: left as it was: {e:#}; reims-ctl set {name} --gpu NUMBER picks its GPU \
@@ -364,18 +408,30 @@ fn carry_out(vm: &mut Vm, plan: Plan, n: u32) -> Option<String> {
     }
 }
 
-/// Gives `vm` the GPU settings `gpu` and saves them (migration 5); what changed, or an error with
-/// the VM as it was.
-fn pick_gpu(vm: &mut Vm, gpu: crate::vm::Gpu) -> Result<String> {
+/// Gives `vm` the GPU settings `gpu` and saves them (migration `n`, 5 or 6); what changed, or an
+/// error with the VM as it was.
+fn pick_gpu(vm: &mut Vm, gpu: crate::vm::Gpu, n: u32) -> Result<String> {
     let before = std::mem::replace(&mut vm.config.gpu, gpu);
     if let Err(e) = vm.save() {
         vm.config.gpu = before;
         return Err(e);
     }
     let g = &vm.config.gpu;
+    let why = match n {
+        5 => "instead of hiding the host's other GPUs, so its window can be drawn on the GPU \
+              your desktop runs on"
+            .to_string(),
+        _ => format!(
+            "instead of by the Vulkan driver file it was saved with, {}, which finds GPUs of \
+             other drivers too",
+            (before.driver_file.as_deref())
+                .and_then(Path::file_name)
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+    };
     Ok(format!(
-        "its GPU, {}, is now picked by its IDs ({}) instead of hiding the host's other GPUs, so \
-         its window can be drawn on the GPU your desktop runs on",
+        "its GPU, {}, is now picked by its IDs ({}) {why}",
         g.name.as_deref().unwrap_or("?"),
         g.select.as_deref().unwrap_or("?"),
     ))
@@ -1200,6 +1256,110 @@ mod tests {
         assert_eq!(plan_5(&path, unasked), Plan::Skip);
         let auto = vm(&env.root.join("auto"), "q35-x86_64", None, "");
         assert_eq!(plan_5(&auto, unasked), Plan::Skip);
+    }
+
+    /// Migration 6 names a GPU saved under a manifest whose probe goes past it by its IDs, as on
+    /// a user's Windows host: an Intel GPU and a GTX 1650 Ti, the GTX saved under Intel's
+    /// igvk64.json with its device ID and no IDs to pick it, where the probe of Intel's manifest
+    /// finds both GPUs. The VM then starts on the GTX's IDs, the loader limited to no driver; the
+    /// settings saved, the next run leaves it be without probing. Where NVIDIA's probe found the
+    /// GTX too, the pick is from that probe, as the list has it.
+    #[test]
+    fn migration_6_names_a_gpu_its_manifest_probe_went_past_by_its_ids() {
+        let env = crate::testenv::Env::new("migrate-gpu-past");
+        let unasked = || -> Vec<Vec<GpuInfo>> { panic!("the host's GPUs were probed") };
+        const INTEL: &str = "C:/drivers/intel/igvk64.json";
+        const NV: &str = "C:/drivers/nvidia/nv-vk64.json";
+        const GTX: &str = "NVIDIA GeForce GTX 1650 Ti";
+        // VkDriverId: 4 is NVIDIA's, 5 Intel's on Windows.
+        let found = |name: &str, ids: (u32, u32), kind: &str, file: &str, driver_id: u32| GpuInfo {
+            driver_id,
+            ..listed(name, ids, kind, file)
+        };
+        let uhd = |file| found("Intel(R) UHD Graphics", (0x8086, 0x9bc4), "integrated", file, 5);
+        let gtx = |file| found(GTX, (0x10de, 0x1f95), "discrete", file, 4);
+        let windows = crate::host::Host {
+            os: crate::host::Os::Windows,
+            arch: crate::host::Arch::X86_64,
+        };
+        let start_env = |v: &Vm| -> std::collections::BTreeMap<String, String> {
+            let ctx = crate::qemu::tests::ctx(windows);
+            let inv = crate::qemu::invocation(v, &ctx).unwrap();
+            inv.env.into_iter().collect()
+        };
+        let saved_shape = format!(
+            "[gpu]\ndriver_file = \"{INTEL}\"\ndevice_id = 8085\nname = \"{GTX}\"\n"
+        );
+
+        let dir = env.root.join("mac");
+        let mut v = vm_with_gpu(&dir, &saved_shape);
+        let before = start_env(&v);
+        assert_eq!(before["VK_DRIVER_FILES"], INTEL);
+        assert_eq!(before["VK_LOADER_DEVICE_ID_FILTER"], "0x1f95");
+        // Intel's probe found both GPUs; NVIDIA's, the GTX alone.
+        let host = || vec![vec![uhd(INTEL), gtx(INTEL)], vec![gtx(NV)]];
+        let plan = plan_6(&v, host);
+        let want = crate::vm::Gpu {
+            driver_file: Some(NV.into()),
+            device_id: None,
+            select: Some("10de:1f95".into()),
+            name: Some(GTX.into()),
+        };
+        assert_eq!(plan, Plan::Gpu(want.clone()));
+        assert_eq!(plan_5(&v, || crate::gpu::from_probes(host())), Plan::Skip);
+        let line = carry_out(&mut v, plan, 6).unwrap();
+        assert_eq!(
+            line,
+            "mac: its GPU, NVIDIA GeForce GTX 1650 Ti, is now picked by its IDs (10de:1f95) \
+             instead of by the Vulkan driver file it was saved with, igvk64.json, which finds \
+             GPUs of other drivers too"
+        );
+        let saved = Vm::load(&dir).unwrap();
+        assert_eq!(saved.config.gpu, want);
+        let after = start_env(&saved);
+        assert_eq!(after["MESA_VK_DEVICE_SELECT"], "10de:1f95");
+        assert_eq!(after["VK_LOADER_DEVICE_SELECT"], "0x10de:0x1f95");
+        for limit in [
+            "VK_DRIVER_FILES",
+            "VK_ICD_FILENAMES",
+            "VK_LOADER_DEVICE_ID_FILTER",
+        ] {
+            assert!(!after.contains_key(limit), "{limit} in {after:?}");
+        }
+        assert_eq!(plan_of(6, &saved, false), Plan::Skip);
+        assert_eq!(plan_6(&saved, unasked), Plan::Skip);
+
+        // NVIDIA's probe found both GPUs too: the GTX is listed from Intel's, by its IDs; and so
+        // where the settings keep no device ID.
+        let v = vm_with_gpu(&env.root.join("every"), &saved_shape);
+        let every = || vec![vec![uhd(INTEL), gtx(INTEL)], vec![gtx(NV), uhd(NV)]];
+        assert_eq!(
+            plan_6(&v, every),
+            Plan::Gpu(crate::vm::Gpu {
+                driver_file: Some(INTEL.into()),
+                device_id: Some(0x1f95),
+                select: Some("10de:1f95".into()),
+                name: Some(GTX.into()),
+            })
+        );
+        let no_id = vm_with_gpu(
+            &env.root.join("no-id"),
+            &saved_shape.replace("device_id = 8085\n", ""),
+        );
+        assert_eq!(plan_6(&no_id, every), plan_6(&v, every));
+        // Each probe keeps to its manifest: Intel's finds no GTX, and the VM is left be.
+        assert_eq!(
+            plan_6(&v, || vec![vec![uhd(INTEL)], vec![gtx(NV)]]),
+            Plan::Skip
+        );
+        // A device ID Intel's probe did not find, and a VM with no GPU chosen, are left be.
+        let other = vm_with_gpu(
+            &env.root.join("other"),
+            &saved_shape.replace("8085", "8086"),
+        );
+        assert_eq!(plan_6(&other, host), Plan::Skip);
+        let auto = vm(&env.root.join("auto"), "q35-x86_64", None, "");
+        assert_eq!(plan_6(&auto, unasked), Plan::Skip);
     }
 
     #[test]

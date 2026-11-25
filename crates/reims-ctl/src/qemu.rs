@@ -768,7 +768,7 @@ pub fn quote(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::host::{Arch, Os};
     use crate::vm::*;
@@ -829,7 +829,8 @@ mod tests {
         }
     }
 
-    fn ctx(host: Host) -> Ctx {
+    /// A context of a start on `host`, with no file of its own read.
+    pub(crate) fn ctx(host: Host) -> Ctx {
         Ctx {
             host,
             qemu: "/q/bin/qemu".into(),
