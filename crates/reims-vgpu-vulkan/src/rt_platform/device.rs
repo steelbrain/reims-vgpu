@@ -284,6 +284,28 @@
 //! boot's line says what share of its dispatches, direct and indirect, ran whole threadgroups on
 //! a partial-threadgroups variant.
 //!
+//! **Its Shared memory's flushes and invalidates.** rt's Shared storage takes a host-visible,
+//! host-cached memory type, a host-coherent one first (rt's README, "Shared memory's coherence"),
+//! and the device reads once, as it is made, whether that type is host-coherent. Only where it is
+//! not (Mesa's Intel driver over the i915 kernel driver lists such a type on a GPU with no cache
+//! it shares with the CPU) does rt flush the Shared memory a submission's command buffers reach
+//! before it submits them, and flush then invalidate what a command buffer may write before the
+//! host can see its progress. Those calls reach only what the command buffer keeps: the buffers its
+//! commands bind, copy or render with, the resources `useResources:` names and the heaps
+//! `useHeaps:` names, which the compute and render encoders pass to rt (`super::compute`,
+//! `super::render`); a range a command reaches only through an address is neither flushed nor
+//! invalidated. rt counts those calls and the bytes they name, each range widened to whole
+//! multiples of the device's `nonCoherentAtomSize` (`Metrics::shared_flushes`,
+//! `shared_flushed_bytes`, `shared_invalidates`, `shared_invalidated_bytes`), and the calls of
+//! either kind that did not return success (`Metrics::shared_coherence_failures`). The counts line
+//! carries all five as amounts, [`SHARED_FLUSHES_CODE`], [`SHARED_FLUSHED_BYTES_CODE`],
+//! [`SHARED_INVALIDATES_CODE`], [`SHARED_INVALIDATED_BYTES_CODE`] and
+//! [`SHARED_COHERENCE_FAILURES_CODE`], so a boot's line on such a device says how much Shared
+//! memory its submissions reached and whether a call failed. On a device whose Shared type is
+//! host-coherent, as it is on every GPU this project's tests and boots run on, rt keeps no ranges
+//! and makes neither call, and all five stay 0: only metal2vulkan's test-only view
+//! (`--cfg m2v_shared_view`), which this build never sets, makes the calls on such a device.
+//!
 //! **Its memory at its highest.** Four of rt's gauges split the device memory a device holds past
 //! its places and blocks: the preprocess regions executions of indirect command buffers hold
 //! (`Gauges::preprocess_used_bytes`) and those kept idle for the next (`preprocess_idle_bytes`),
@@ -460,6 +482,29 @@ pub const UNFINISHED_WAIT_NS_CODE: &str = "rt-first-use-unfinished-wait-ns";
 /// (`Metrics::first_use_unfinished_wait_max_nanos`), an amount risen to it
 /// ([`note_highest_metrics`]).
 pub const UNFINISHED_WAIT_MAX_NS_CODE: &str = "rt-first-use-unfinished-wait-max-ns";
+
+/// The code of rt's `vkFlushMappedMemoryRanges` calls over Shared memory
+/// (`Metrics::shared_flushes`), an amount on the counts line ([`fold_metrics`]): 0, as are the
+/// four codes after it, on a device whose Shared type is host-coherent (the module's docs, "Its
+/// Shared memory's flushes and invalidates").
+pub const SHARED_FLUSHES_CODE: &str = "rt-shared-flushes";
+
+/// The code of the bytes those calls named, each range widened to whole multiples of the device's
+/// `nonCoherentAtomSize` (`Metrics::shared_flushed_bytes`).
+pub const SHARED_FLUSHED_BYTES_CODE: &str = "rt-shared-flushed-bytes";
+
+/// The code of rt's `vkInvalidateMappedMemoryRanges` calls over Shared memory
+/// (`Metrics::shared_invalidates`), an amount on the counts line ([`fold_metrics`]).
+pub const SHARED_INVALIDATES_CODE: &str = "rt-shared-invalidates";
+
+/// The code of the bytes those calls named, widened as the flushes' are
+/// (`Metrics::shared_invalidated_bytes`).
+pub const SHARED_INVALIDATED_BYTES_CODE: &str = "rt-shared-invalidated-bytes";
+
+/// The code of those flushes and invalidates that did not return success
+/// (`Metrics::shared_coherence_failures`), an amount on the counts line ([`fold_metrics`]): the
+/// work goes on as after a success.
+pub const SHARED_COHERENCE_FAILURES_CODE: &str = "rt-shared-coherence-failures";
 
 /// The code of the exported blocks a public call handed out a device address in, each counted at
 /// the first, which a block's make never is (`Metrics::exported_blocks_addressed`), an amount on
@@ -639,9 +684,10 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// layout, the draws that read an attachment of their own pass through the feedback loop, the
 /// copies into attachments' shadows on a device without it and their bytes, the draws of stencil
 /// output by bits, the main pipelines the states' finishes made and their nanoseconds, the
-/// first-use waits for an unfinished main pipeline and their nanoseconds, and the over-copies of
-/// a kind rt kept none of.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 38;
+/// first-use waits for an unfinished main pipeline and their nanoseconds, the over-copies of a
+/// kind rt kept none of, and the flushes and invalidates of Shared memory, their bytes and the
+/// calls that failed.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 43;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -676,11 +722,12 @@ static OVER_COPY_KINDS_LOGGED: crate::core::sync::Mutex<Vec<rt::OverCopyKind>> =
 /// and draws that pushed level fields, its heap textures' moves out of the undefined layout, its
 /// draws' reads of their own attachments through the feedback loop and its copies into the
 /// attachments' shadows on a device without it, its draws of stencil output by bits, its states'
-/// finishes and their waits and its over-copies of a kind rt kept none of rose by since the last
-/// fold ([`folded_counts`]), so the counts line carries their totals, then its maxima
-/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest, and logs its
-/// over-copies' kinds the process had not logged ([`note_over_copy_kinds`]) (the module's docs).
-/// Nothing of rt's before the device is made. First it counts the dispatches the rt platform's compute encoders encoded since the last fold
+/// finishes and their waits, its over-copies of a kind rt kept none of and its flushes and
+/// invalidates of Shared memory rose by since the last fold ([`folded_counts`]), so the counts
+/// line carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
+/// ([`note_gauges`]) at their highest, and logs its over-copies' kinds the process had not logged
+/// ([`note_over_copy_kinds`]) (the module's docs). Nothing of rt's before the device is made.
+/// First it counts the dispatches the rt platform's compute encoders encoded since the last fold
 /// (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
     super::compute::fold_dispatches();
@@ -878,8 +925,11 @@ fn over_copy_kind_line(
 /// ([`STENCIL_BIT_DRAWS_CODE`]), the main pipelines the states' finishes made
 /// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), the
 /// first-use waits for an unfinished main pipeline ([`UNFINISHED_WAITS_CODE`]) and their
-/// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]), and the over-copies of a kind rt kept none of
-/// ([`OVER_COPIES_UNKEPT_KIND_CODE`]).
+/// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]), the over-copies of a kind rt kept none of
+/// ([`OVER_COPIES_UNKEPT_KIND_CODE`]), and the flushes of Shared memory
+/// ([`SHARED_FLUSHES_CODE`]) and their bytes ([`SHARED_FLUSHED_BYTES_CODE`]), its invalidates
+/// ([`SHARED_INVALIDATES_CODE`]) and their bytes ([`SHARED_INVALIDATED_BYTES_CODE`]), and those
+/// calls that failed ([`SHARED_COHERENCE_FAILURES_CODE`]).
 fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
     let over = over_copy_counts(m);
     let more = [
@@ -942,6 +992,11 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         (UNFINISHED_WAITS_CODE, m.first_use_unfinished_waits),
         (UNFINISHED_WAIT_NS_CODE, m.first_use_unfinished_wait_nanos),
         (OVER_COPIES_UNKEPT_KIND_CODE, m.over_copies_unkept_kind),
+        (SHARED_FLUSHES_CODE, m.shared_flushes),
+        (SHARED_FLUSHED_BYTES_CODE, m.shared_flushed_bytes),
+        (SHARED_INVALIDATES_CODE, m.shared_invalidates),
+        (SHARED_INVALIDATED_BYTES_CODE, m.shared_invalidated_bytes),
+        (SHARED_COHERENCE_FAILURES_CODE, m.shared_coherence_failures),
     ];
     std::array::from_fn(|i| match i.checked_sub(OVER_COPY_METRICS) {
         None => over[i],
@@ -2545,8 +2600,9 @@ mod tests {
     /// layout, the draws that read an attachment of their own pass through the feedback loop, the
     /// copies into attachments' shadows on a device without it and their bytes, the draws of
     /// stencil output by bits, the main pipelines the states' finishes made and their
-    /// nanoseconds, the first-use waits for an unfinished main pipeline and their nanoseconds, and
-    /// the over-copies of a kind rt kept none of.
+    /// nanoseconds, the first-use waits for an unfinished main pipeline and their nanoseconds, the
+    /// over-copies of a kind rt kept none of, and the flushes and invalidates of Shared memory,
+    /// their bytes and the calls that failed.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2598,6 +2654,11 @@ mod tests {
             UNFINISHED_WAITS_CODE,
             UNFINISHED_WAIT_NS_CODE,
             OVER_COPIES_UNKEPT_KIND_CODE,
+            SHARED_FLUSHES_CODE,
+            SHARED_FLUSHED_BYTES_CODE,
+            SHARED_INVALIDATES_CODE,
+            SHARED_INVALIDATED_BYTES_CODE,
+            SHARED_COHERENCE_FAILURES_CODE,
         ];
         let counts = || {
             let all = crate::answer::degradation_counts();
@@ -2647,6 +2708,10 @@ mod tests {
         m.first_use_unfinished_waits = 1;
         m.first_use_unfinished_wait_nanos = 400_000;
         m.over_copies_unkept_kind = 1;
+        m.shared_flushes = 10;
+        m.shared_flushed_bytes = 40_960;
+        m.shared_invalidates = 4;
+        m.shared_invalidated_bytes = 8_192;
         let mut folded = [0; FOLDED_METRICS];
         fold(&mut folded, folded_counts(&m));
         m.over_copies = 3;
@@ -2691,6 +2756,11 @@ mod tests {
         m.first_use_unfinished_waits = 3;
         m.first_use_unfinished_wait_nanos = 400_000 + 900_000;
         m.over_copies_unkept_kind = 4;
+        m.shared_flushes = 10 + 15;
+        m.shared_flushed_bytes = 40_960 + 61_440;
+        m.shared_invalidates = 4 + 6;
+        m.shared_invalidated_bytes = 8_192 + 12_288;
+        m.shared_coherence_failures = 1;
         fold(&mut folded, folded_counts(&m));
         assert_eq!(folded, folded_counts(&m).map(|(_, n)| n));
         let after = counts();
@@ -2700,7 +2770,8 @@ mod tests {
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
                 28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 9, 4,
-                12, 8, 6, 19, 3, 3_145_728, 24, 5, 18_750_000, 3, 1_300_000, 4
+                12, 8, 6, 19, 3, 3_145_728, 24, 5, 18_750_000, 3, 1_300_000, 4, 25, 102_400, 10,
+                20_480, 1
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
