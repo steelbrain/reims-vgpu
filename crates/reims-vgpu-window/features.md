@@ -660,16 +660,20 @@ runtime's own device. The switches above apply, and `resolution=` too.
   Turn Off; on Windows a task dialog the window owns, Turn Off left of
   Cancel. Turn Off asks the host to end the VM; Cancel, or the question
   dismissed, leaves the window and the VM running, nothing held in the
-  guest and the input released. While the question is up, the library's UI
-  thread waits for it: the windows' frames keep drawing, and their events
-  wait. When to ask is as on macOS; where SDL shows no question (no zenity
-  and no X server), the close goes ahead as before, and the reason is
-  logged. The window closes at the display's release, once its swapchain is
-  gone.
+  guest and the input released. From the close to the answer nothing of
+  the window's input reaches the guest: not a key that goes down after the
+  close let the keys go (F4 of Alt+F4 on Windows, which SDL hands over
+  after the close), nor the keys and clicks the question takes, nor their
+  ups. While the question is up, the library's UI thread waits for it: the
+  windows' frames keep drawing, and their events wait. When to ask is as on
+  macOS; where SDL shows no question (no zenity and no X server), the close
+  goes ahead as before, and the reason is logged. The window closes at the
+  display's release, once its swapchain is gone.
   `test: close::a_close_asks_only_where_the_host_would_hear_of_it`,
   `test: close::only_turn_off_tells_the_host`,
   `test: sdl::shell::a_close_asks_where_the_host_hears_and_tells_it_once_turned_off`,
   `test: native::sdl_thread::input::a_cancelled_close_leaves_nothing_held_and_the_input_goes_on`,
+  `test: native::sdl_thread::input::a_key_down_after_the_close_s_lift_never_reaches_the_guest`,
   `test: native::sdl_thread::sdl::the_question_s_default_is_cancel`,
   `test: native::sdl_thread::sdl::an_answer_is_turn_off_only_by_its_button`,
   `manual` (the question on Wayland, X11 and Windows; Cancel, then Turn Off)

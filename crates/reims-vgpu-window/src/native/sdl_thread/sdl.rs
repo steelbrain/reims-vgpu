@@ -462,14 +462,21 @@ const CANCEL_ID: c_int = 0;
 /// wait meanwhile, while the render threads draw on. So it is posted, to run after the events at
 /// hand with no window borrowed; the answer goes to [`shell::answered`]. A window whose display
 /// ended before the question showed asks nothing.
-pub(crate) fn ask(shell: &Shell, ids: Vec<u64>) {
+///
+/// From the close to the answer, nothing of the window's input reaches the guest
+/// ([`input::Input::question_opened`]): the events at hand before the question shows, a key that
+/// went down after the close's lift among them, and the ups of the keys the question's dialog
+/// takes, which come once it is answered.
+pub(crate) fn ask(shell: &mut Shell, ids: Vec<u64>) {
     let id = shell.window.id();
+    shell.input.0.question_opened();
     super::ui::post(move || {
         let parent = shell::with_shell(id, |s| (!s.closed).then_some(s.sdl)).flatten();
         let answer = match parent {
             Some(parent) => question(parent),
             None => Answer::Cancel,
         };
+        shell::with_shell(id, |s| s.input.0.question_answered());
         shell::answered(&ids, answer);
     });
 }

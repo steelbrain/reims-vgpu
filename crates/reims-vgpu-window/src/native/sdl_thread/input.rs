@@ -30,6 +30,14 @@
 //!   (`super::super::HOST_OS`): Ctrl+Alt+Super on Linux, Ctrl+Alt+Win on Windows.
 //! - **No stuck keys**: losing the keyboard, releasing capture and closing send an up for every
 //!   key held; losing the keyboard and closing lift the buttons held too.
+//! - **While a close's question is open** ([`Input::question_opened`], `crate::close`), nothing of
+//!   the window's reaches the guest, no key, button, pointer or wheel, from the close's lift of
+//!   every key and button to the answer. A key that goes down after the lift never reaches it,
+//!   nor does its up: SDL on Windows hands Alt+F4's close over before F4's down (read from SDL
+//!   3.4.18's code, `WIN_WindowProc`), and a question in a dialog of its own takes the ups of the
+//!   keys held as it shows (SDL's message box lifts the keys SDL holds as it shows,
+//!   `SDL_ResetKeyboard`, and their ups come once it is answered). The keys and clicks that answer
+//!   the question are the question's.
 //! - **With capture off** ([`crate::capture`], the VM's setting): a click in the image is sent,
 //!   but nothing is captured, grabbed, held or locked; the pointer is sent over the image alone,
 //!   and outside it only in a drag; keys go to the guest while the window has the keyboard, but
@@ -194,6 +202,8 @@ pub(crate) struct Input {
     motion: Option<Arc<dyn PointerMotion>>,
     /// Whether the captured pointer drives it.
     game: Game,
+    /// A close's question is open over the window: nothing reaches the guest (the module doc).
+    question: bool,
 }
 
 impl std::fmt::Debug for Input {
@@ -326,7 +336,7 @@ impl Input {
     /// drag ([`Capture::pointer_outside_image`]). A place SDL reports while the pointer is locked
     /// is SDL's own (the lock's warp): the pointer's moves are [`Self::moved_by`]'s.
     pub(crate) fn moved(&mut self, at: &At) {
-        if self.is_locked() {
+        if self.is_locked() || self.question {
             return;
         }
         if let (Some(point), Some(mode)) = (at.point, guest_mode(at)) {
@@ -364,6 +374,9 @@ impl Input {
     /// points, on, coming back where it lands on the window's display, away from the edge, or
     /// driving the guest's mouse from where it is once the guest hides its cursor.
     pub(crate) fn moved_by(&mut self, by: (f64, f64), at: &At) {
+        if self.question {
+            return;
+        }
         if let Some(motion) = self.motion.clone() {
             if self.game.is_on() {
                 let cursor = cursor_point(at);
@@ -409,6 +422,9 @@ impl Input {
 
     /// Button `bit` went down at `timestamp` (SDL's event clock).
     pub(crate) fn button_down(&mut self, bit: u32, timestamp: u64, at: &At) -> Reaction {
+        if self.question {
+            return Reaction::default();
+        }
         if self.game.press(self.motion.as_deref(), bit) {
             return Reaction::default();
         }
@@ -448,6 +464,9 @@ impl Input {
     /// Button `bit` went up: sent where the guest was told it is down, wherever the pointer is,
     /// by the route it went down by (the guest's mouse, or the tablet).
     pub(crate) fn button_up(&mut self, bit: u32, at: &At) {
+        if self.question {
+            return;
+        }
         if self.game.release(self.motion.as_deref(), bit) {
             return;
         }
@@ -472,6 +491,9 @@ impl Input {
 
     /// The wheel turned (the module doc).
     pub(crate) fn wheel(&mut self, wheel: Wheel, at: &At) {
+        if self.question {
+            return;
+        }
         let (Some(point), Some(_)) = (at.point, guest_mode(at)) else {
             return;
         };
@@ -506,7 +528,7 @@ impl Input {
 
     /// A key, `usage`, went down (`down`) or up; `repeat` for the host's repeat of a held key.
     pub(crate) fn key(&mut self, usage: u16, down: bool, repeat: bool) -> Reaction {
-        if !self.focused {
+        if !self.focused || self.question {
             return Reaction::default();
         }
         if !down {
@@ -559,6 +581,20 @@ impl Input {
         self.let_go_game();
         self.let_go_away();
         self.capture.release();
+    }
+
+    /// A close's question opened over the window: every key and button held is lifted, capture
+    /// ends, and nothing reaches the guest until it is answered ([`Self::question_answered`], the
+    /// module doc).
+    pub(crate) fn question_opened(&mut self) {
+        self.closing();
+        self.question = true;
+    }
+
+    /// The question was answered: the input goes on. Nothing is held in the guest: what went down
+    /// while the question was open never reached it, so its ups go nowhere either.
+    pub(crate) fn question_answered(&mut self) {
+        self.question = false;
     }
 
     /// Ups for every key held.
@@ -913,6 +949,60 @@ mod tests {
         );
         let r = input.button_down(BUTTON_LEFT, 2_000_000_000, &at((50.0, 25.0)));
         assert!(r.capture_changed && input.is_captured());
+    }
+
+    /// While a close's question is open nothing reaches the guest, and no key is held there during
+    /// it or after: Alt+F4 as SDL hands it over on Windows (Alt's down, the close, then F4's
+    /// down), the clicks, moves and wheel the question gets, and the ups of Alt and F4 coming
+    /// once it is answered (SDL's message box lifts the keys SDL holds as it shows); after the
+    /// answer the input goes on
+    #[test]
+    fn a_key_down_after_the_close_s_lift_never_reaches_the_guest() {
+        const ALT: u16 = 0xE2;
+        const F4: u16 = 0x3D;
+        let mut input = focused();
+        input.button_down(BUTTON_LEFT, 1_000_000_000, &at((10.0, 10.0)));
+        input.key(ALT, true, false);
+        assert_eq!(
+            input.take(),
+            vec![
+                pointer(20, 20, BUTTON_LEFT),
+                ToHost::Key(KeyEvent::down(ALT))
+            ]
+        );
+        input.question_opened();
+        assert!(!input.is_captured());
+        assert_eq!(
+            input.take(),
+            vec![ToHost::Key(KeyEvent::up(ALT)), pointer(20, 20, 0)]
+        );
+        input.key(F4, true, false);
+        input.key(F4, true, true);
+        input.key(0x28, true, false);
+        input.key(0x28, false, false);
+        input.moved(&at((30.0, 30.0)));
+        input.button_down(BUTTON_LEFT, 2_000_000_000, &at((30.0, 30.0)));
+        input.button_up(BUTTON_LEFT, &at((30.0, 30.0)));
+        input.wheel(
+            Wheel {
+                notches: (0, 1),
+                lines: (0.0, 1.0),
+                flipped: false,
+            },
+            &at((30.0, 30.0)),
+        );
+        assert_eq!(input.take(), vec![], "nothing while the question is open");
+        assert!(!input.is_captured());
+        input.question_answered();
+        input.key(ALT, false, false);
+        input.key(F4, false, false);
+        assert_eq!(input.take(), vec![], "no up for a key the guest never had");
+        input.key(0x05, true, false);
+        input.moved(&at((40.0, 20.0)));
+        assert_eq!(
+            input.take(),
+            vec![ToHost::Key(KeyEvent::down(0x05)), pointer(80, 40, 0)]
+        );
     }
 
     /// The wheel over the image sends notches up and left in the device's own direction, and
