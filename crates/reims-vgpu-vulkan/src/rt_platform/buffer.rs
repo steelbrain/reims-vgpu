@@ -5830,7 +5830,12 @@ mod tests {
             // Live on the device, but no object over it escaped.
             let resident = over_a_copy(&device, drops);
             let (escapes, others) = (EscapedCopies::default(), EscapedCopies::default());
-            escapes.add(&address.buffer.escaped_copy().expect("the copy under the buffer"));
+            escapes.add(
+                &address
+                    .buffer
+                    .escaped_copy()
+                    .expect("the copy under the buffer"),
+            );
             let set = [&shared, &residency.buffer, &private];
             let mut listed = 0;
             for member in set {
@@ -5888,7 +5893,11 @@ mod tests {
             assert_eq!(failed, 0, "drops: {drops}: no coherence call failed");
             assert_eq!(address.synced(), (true, true), "drops: {drops}");
             assert_eq!(residency.synced(), (true, true), "drops: {drops}");
-            assert_eq!(resident.synced(), (false, false), "drops: {drops}: never escaped");
+            assert_eq!(
+                resident.synced(),
+                (false, false),
+                "drops: {drops}: never escaped"
+            );
             assert_eq!(
                 codes.map(counted),
                 [counts[0] + 2, counts[1] + 1],
