@@ -47,6 +47,17 @@ Intel UHD 630.
 
 We're working on all three. We don't know of a workaround yet.
 
+## Sound comes after video on Windows
+
+On a Windows host, a VM's sound reaches your speakers about 0.1 s after the guest sends it, and
+macOS in the VM is told it plays within about 2 ms. So a video player in the guest shows each
+frame about 0.1 s before you hear the sound that goes with it. We measured this on our Windows
+test host, and haven't measured other hosts yet.
+
+macOS gets that 2 ms from its own driver for the VM's sound device, which reports the same figure
+whatever the host does. Telling it the real delay needs a driver of ours in the guest, which we
+don't have yet. We don't know of a workaround.
+
 ## QEMU uses more memory than you gave the VM
 
 Graphics memory that the guest and the GPU share comes from the host, on top of the VM's RAM.

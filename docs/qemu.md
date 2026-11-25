@@ -1583,11 +1583,8 @@ cursor (read from code: `audio/dsoundaudio.c`):
   audio not yet played (`dsound_buffer_get_free`).
 - It clears what the play cursor has passed, so a gap plays silence rather
   than the buffer's audio from a turn earlier.
-- The output buffer's default is now 185.76 ms, so the reserve is 92.88 ms.
-  That covers two measured amounts together. The first is how far the
-  buffer's fill at a period's arrival ranged in the runs below, 61 ms at
-  most. The second is a timer run up to 30 ms late, as in the busy run
-  before the change.
+- The output buffer's default is now 185.76 ms. Until vendor/qemu
+  `4d205af8` the reserve was half of it, 92.88 ms (below).
 reims-ctl's `-audiodev` is unchanged.
 
 **Measured** after the change, the same way (2026-11-24, job
@@ -1607,6 +1604,88 @@ and 50.8 ms at p99. In the other two runs they took 10.1 ms at the median
 and 11.1 to 11.2 ms at p99. In that slow run, QEMU's timer ran up to
 137 ms late, the guest's posts came up to 334 ms apart, and the voice had 59
 gaps at rest.
+
+From vendor/qemu `207be587` and `4d205af8` the guest's audio waits less
+(read from code: `hw/audio/virtio-snd.c`, `audio/audio-be.c`,
+`audio/dsoundaudio.c`):
+- virtio-snd's TX handler has the audio backend write the guest's audio as
+  soon as it has queued the guest's messages, not at the audio timer's next
+  run. It calls `audio_be_kick`, which a mixing-engine backend answers with
+  `audio_run`, as its timer does. The timer keeps its 10 ms period, and the
+  trace event `audio_run_poll` names these runs `kick`.
+- dsound's reserve past the write cursor is 60 ms (`DSOUND_RESERVE_US`), not
+  half the buffer.
+
+The 92.88 ms reserve held three things. The first is the guest's posts:
+their arrivals spread over 43.8 ms at rest and 45.7 ms busy about their
+pace in the runs after the first change, and over 43.6 and 52.2 ms in the
+run before it. The second is the timer's wait for each post: 5.5 ms at the
+median at rest, at most 13 ms, with the timer's runs up to 30 ms apart
+busy. The third is DirectSound's cursors, which move in 10 ms steps. It had
+been sized as the 61 ms that the fill at a period's arrival ranged, plus a
+timer run 30 ms late, but the 61 ms already held the timer's wait, so that
+counted the timer twice. With the kick a post waits at most 3.6 ms for its
+write, and the reserve covers the guest's spread and a cursor step.
+
+**Measured** on the mini, the same way (2026-11-24 and 25; 200 s at rest,
+then 200 s busy). Where the stream starts on the guest's 41.67 ms grid
+decides how near the reserve the later posts come, and a run starts where
+it happens to. So each run's trace was also replayed from every post as the
+stream's start: that post's write placed the reserve past the write cursor,
+the later margins moved with it, and each fall below the write cursor
+counted as a gap. "Needed" is the smallest reserve with no gap at any
+start: the margin's largest fall from a post's write to any later read.
+
+| vendor/qemu (job) | reserve | clicks, rest / busy | fill at a period's write, median (ms) | needed, rest / busy (ms) | gaps at the worst start, rest / busy |
+|---|---|---|---|---|---|
+| `0c0ac356` (`m3-max-73497`) | 92.88 ms | 0 / 0 | 134.2 / 143.5 | 62.0 / 60.0 | 0 / 0 |
+| kick, a test build (`m3-max-73621`) | 64 ms | 0 / 0 | 110.0 / 110.0 | 50.7 / 56.0 | 0 / 0 |
+| kick, a test build (`m3-max-73644`) | 56 ms | 0 / 0 | 97.3 / 101.3 | 51.3 / 56.7 | 0 / 1 (of 2235 starts) |
+| `4d205af8` (`m3-max-73673` at rest; `m3-max-73700` and `m3-max-73711` busy) | 60 ms | 0 / 1 and 0 | 104.0 / 97.3 and 98.7 | 51.3 / 58.0 and 53.3 | 0 / 0 and 0 |
+
+The busy runs at 60 ms took the whole machine (`--exclusive`). The one
+click in `m3-max-73700`'s busy run, 28.8 s in, was a 4.75 ms skip with no
+silence. The voice had no gap there: its margin past the write cursor
+stayed over 50 ms, and the guest's posts came on their grid. Its cause is
+not found. In `m3-max-73711`, whose busy run had no click, the guest's
+`coreaudiod` logged no overload, skip or glitch; `m3-max-73700` did not
+read that log. A fill's median moves with the start phase as well as the
+reserve: 97.3 to 104.0 ms at 60 ms. The busy phase of `m3-max-73673` is not
+counted: another job ran on the mini beside it, the timer's runs came up to
+47.6 ms apart, and the guest's posts strayed up to 491 ms from their pace.
+It had 131 clicks and 18 gaps.
+
+On a Linux host, with the kick, the guest's sound had no click and the
+timer kept its period (no run without the kick was made there to compare).
+**Measured** on `homelab-gem10-1` (2026-11-25, job `m3-max-73666`,
+vendor/qemu `4d205af8`): a 26.7.2 x86-64 guest with reims-ctl's sound
+(`pipewire`) played the same tone into PipeWire's default sink, the node's
+analog output, whose monitor `parec` recorded.
+That gave 0 clicks in 203.0 s at rest and 0 in 203.0 s busy. The timer's own
+runs came 10.34 ms apart at the median at rest and 10.15 ms busy, at most
+20.56 and 11.70 ms, with no late run (`audio_timer_delayed`). There was one
+kick per post, 2,413 in each phase. The device realized paused (`-S`) first
+and quit with exit 0.
+
+The guest's own grid sets the floor. Its posts spread over 43.6 to 52.9 ms
+in these runs whatever the device does, and DirectSound adds its 30 ms lead
+and 10 ms steps. So at this reserve a period's write waits about 100 ms to
+play, and the worst start of a run needed up to 58.0 ms of reserve.
+
+What the guest's players are told of that wait is a constant. The
+device's CoreAudio properties, read in the guest (2026-11-24, job
+`m3-max-73621`), are a device latency of 0 frames, a stream latency of 0, a
+safety offset of 100 frames (2.08 ms at 48 kHz) and an IO buffer of 512
+frames. Apple's HAL plug-in for the device (`AppleVirtIOSound.driver`) sets
+both safety offsets to 100 frames and no latency at all (read from its
+x86-64 code). virtio-snd gives the guest one latency figure,
+`virtio_snd_pcm_status.latency_bytes` in each completion: the bytes queued
+in the device and not yet taken by the mixing engine, 0 for at least 99% of
+the periods. `virtio_snd_pcm_info` has no latency field. So a player that
+lines its video up with the device's latency shows each frame about 100 ms
+before its sound on a Windows host. Telling it the true figure needs a
+guest component of ours that reports it ([known-issues.md](known-issues.md),
+"Sound comes after video on Windows").
 
 ## x86-64 macOS guests
 
