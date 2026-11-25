@@ -254,6 +254,17 @@
 //! [`ATTACHMENT_LOOP_READS_CODE`], [`ATTACHMENT_READ_COPIES_CODE`] and
 //! [`ATTACHMENT_READ_COPY_BYTES_CODE`], so a host's line says which route its draws took.
 //!
+//! **Its draws of stencil output by bits.** On a device without `VK_EXT_shader_stencil_export`, a
+//! draw through a pipeline state whose fragment function writes `[[stencil]]` is drawn once, then
+//! once for each stencil bit its depth-stencil state can replace, and once more for the depth
+//! where the state writes it under a compare other than `Always` and `Never`: draws Metal does not
+//! make, which store Metal's values but where fragments of one draw meet at a sample (rt's static
+//! note `PrecisionNote::StencilOutputOverlap`). Where those draws would not give Metal's answer,
+//! rt refuses the draw (`Gap::Draw` of `StencilOutput`). rt counts the draws beyond each draw's
+//! own (`Metrics::stencil_bit_draws`, 0 on a device with the extension), and the counts line
+//! carries them as an amount, [`STENCIL_BIT_DRAWS_CODE`], so a host's line says whether its draws
+//! took that route.
+//!
 //! **Its Direct3D 11 planes' hand-overs.** On Windows, each submission whose command buffers keep
 //! a plane of a Direct3D 11 surface (`super::d3d11_surface`), or whose uploads copy into or out of
 //! one, acquires those planes from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own
@@ -543,6 +554,12 @@ pub const ATTACHMENT_READ_COPIES_CODE: &str = "rt-attachment-read-copies";
 /// the counts line ([`fold_metrics`]).
 pub const ATTACHMENT_READ_COPY_BYTES_CODE: &str = "rt-attachment-read-copy-bytes";
 
+/// The code of the draws beyond a draw's own that a pipeline state whose fragment function writes
+/// `[[stencil]]` takes on a device without `VK_EXT_shader_stencil_export`, one for each stencil
+/// bit and one for the depth (`Metrics::stencil_bit_draws`), an amount on the counts line
+/// ([`fold_metrics`]).
+pub const STENCIL_BIT_DRAWS_CODE: &str = "rt-stencil-bit-draws";
+
 /// The code of the most bytes of preprocess regions that executions of indirect command buffers
 /// held at a look (`Gauges::preprocess_used_bytes`, [`note_gauges`]).
 pub const PREPROCESS_USED_MOST_CODE: &str = "rt-preprocess-used-bytes-most";
@@ -620,10 +637,11 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// storage usage, the submissions that handed Direct3D 11 planes over, the dispatches and draws
 /// that pushed a storage texture's level fields, the heap textures moved out of the undefined
 /// layout, the draws that read an attachment of their own pass through the feedback loop, the
-/// copies into attachments' shadows on a device without it and their bytes, the main pipelines
-/// the states' finishes made and their nanoseconds, the first-use waits for an unfinished main
-/// pipeline and their nanoseconds, and the over-copies of a kind rt kept none of.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 37;
+/// copies into attachments' shadows on a device without it and their bytes, the draws of stencil
+/// output by bits, the main pipelines the states' finishes made and their nanoseconds, the
+/// first-use waits for an unfinished main pipeline and their nanoseconds, and the over-copies of
+/// a kind rt kept none of.
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 38;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -657,12 +675,12 @@ static OVER_COPY_KINDS_LOGGED: crate::core::sync::Mutex<Vec<rt::OverCopyKind>> =
 /// through an extended usage, its submissions that handed Direct3D 11 planes over, its dispatches
 /// and draws that pushed level fields, its heap textures' moves out of the undefined layout, its
 /// draws' reads of their own attachments through the feedback loop and its copies into the
-/// attachments' shadows on a device without it, its states' finishes and their waits and its
-/// over-copies of a kind rt kept none of rose by since the last fold ([`folded_counts`]), so the
-/// counts line carries their totals, then its maxima ([`note_highest_metrics`]) and its gauges
-/// ([`note_gauges`]) at their highest, and logs its over-copies' kinds the process had not logged
-/// ([`note_over_copy_kinds`]) (the module's docs). Nothing of rt's before the device is made.
-/// First it counts the dispatches the rt platform's compute encoders encoded since the last fold
+/// attachments' shadows on a device without it, its draws of stencil output by bits, its states'
+/// finishes and their waits and its over-copies of a kind rt kept none of rose by since the last
+/// fold ([`folded_counts`]), so the counts line carries their totals, then its maxima
+/// ([`note_highest_metrics`]) and its gauges ([`note_gauges`]) at their highest, and logs its
+/// over-copies' kinds the process had not logged ([`note_over_copy_kinds`]) (the module's docs).
+/// Nothing of rt's before the device is made. First it counts the dispatches the rt platform's compute encoders encoded since the last fold
 /// (`super::compute::fold_dispatches`).
 pub fn fold_metrics() {
     super::compute::fold_dispatches();
@@ -856,7 +874,8 @@ fn over_copy_kind_line(
 /// layout ([`HEAP_MOVES_CODE`]), the draws that read an attachment of their own pass through the
 /// feedback loop ([`ATTACHMENT_LOOP_READS_CODE`]), the copies into attachments' shadows on a
 /// device without it ([`ATTACHMENT_READ_COPIES_CODE`]) and their bytes
-/// ([`ATTACHMENT_READ_COPY_BYTES_CODE`]), the main pipelines the states' finishes made
+/// ([`ATTACHMENT_READ_COPY_BYTES_CODE`]), the draws of stencil output by bits
+/// ([`STENCIL_BIT_DRAWS_CODE`]), the main pipelines the states' finishes made
 /// ([`FINISHED_PIPELINES_CODE`]) and their nanoseconds ([`FINISHED_PIPELINE_NS_CODE`]), the
 /// first-use waits for an unfinished main pipeline ([`UNFINISHED_WAITS_CODE`]) and their
 /// nanoseconds ([`UNFINISHED_WAIT_NS_CODE`]), and the over-copies of a kind rt kept none of
@@ -917,6 +936,7 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
             ATTACHMENT_READ_COPY_BYTES_CODE,
             m.attachment_read_copy_bytes,
         ),
+        (STENCIL_BIT_DRAWS_CODE, m.stencil_bit_draws),
         (FINISHED_PIPELINES_CODE, m.finished_pipelines),
         (FINISHED_PIPELINE_NS_CODE, m.finished_pipeline_nanos),
         (UNFINISHED_WAITS_CODE, m.first_use_unfinished_waits),
@@ -2523,10 +2543,10 @@ mod tests {
     /// storage usage, the submissions that handed Direct3D 11 planes over, the dispatches and draws
     /// that pushed a storage texture's level fields, the heap textures moved out of the undefined
     /// layout, the draws that read an attachment of their own pass through the feedback loop, the
-    /// copies into attachments' shadows on a device without it and their bytes, the main
-    /// pipelines the states' finishes made and their nanoseconds, the first-use waits for an
-    /// unfinished main pipeline and their nanoseconds, and the over-copies of a kind rt kept none
-    /// of.
+    /// copies into attachments' shadows on a device without it and their bytes, the draws of
+    /// stencil output by bits, the main pipelines the states' finishes made and their
+    /// nanoseconds, the first-use waits for an unfinished main pipeline and their nanoseconds, and
+    /// the over-copies of a kind rt kept none of.
     #[test]
     fn over_copies_fold_into_the_counts_by_their_rise() {
         let codes = [
@@ -2572,6 +2592,7 @@ mod tests {
             ATTACHMENT_LOOP_READS_CODE,
             ATTACHMENT_READ_COPIES_CODE,
             ATTACHMENT_READ_COPY_BYTES_CODE,
+            STENCIL_BIT_DRAWS_CODE,
             FINISHED_PIPELINES_CODE,
             FINISHED_PIPELINE_NS_CODE,
             UNFINISHED_WAITS_CODE,
@@ -2620,6 +2641,7 @@ mod tests {
         m.attachment_loop_reads = 7;
         m.attachment_read_copies = 1;
         m.attachment_read_copy_bytes = 1_048_576;
+        m.stencil_bit_draws = 8;
         m.finished_pipelines = 2;
         m.finished_pipeline_nanos = 12_000_000;
         m.first_use_unfinished_waits = 1;
@@ -2663,6 +2685,7 @@ mod tests {
         m.attachment_loop_reads = 7 + 12;
         m.attachment_read_copies = 3;
         m.attachment_read_copy_bytes = 3 * 1_048_576;
+        m.stencil_bit_draws = 8 + 16;
         m.finished_pipelines = 5;
         m.finished_pipeline_nanos = 12_000_000 + 6_750_000;
         m.first_use_unfinished_waits = 3;
@@ -2677,7 +2700,7 @@ mod tests {
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
                 28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 9, 4,
-                12, 8, 6, 19, 3, 3_145_728, 5, 18_750_000, 3, 1_300_000, 4
+                12, 8, 6, 19, 3, 3_145_728, 24, 5, 18_750_000, 3, 1_300_000, 4
             ]
         );
         let named = over_copy_counts(&m).map(|(code, _)| code);
