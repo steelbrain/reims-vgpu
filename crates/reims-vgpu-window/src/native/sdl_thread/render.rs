@@ -12,6 +12,11 @@
 //! window's Vulkan surface ([`VulkanTarget`]), as `crate::present` says: made at the first draw,
 //! tried again after [`RETRY`] where no image came in time, made again where one ends.
 //!
+//! Over the frame it draws the window's overlay where the window shows one
+//! ([`Surface::set_overlay`]: on Linux the question a close asks, `super::question`), and where
+//! the window can draw no more ([`Presenting::is_ended`]) it tells the UI thread, once an overlay,
+//! that the overlay does not show (`super::sdl::overlay_unshown`).
+//!
 //! Requests that come while it draws fold into one: it draws the latest frame once more. It
 //! copies the sink out of the window's lock before asking it, and holds no lock of the window's
 //! while it draws.
@@ -31,7 +36,7 @@ use reims_vgpu_vulkan::os::OsThreads;
 use sdl3_sys::everything::{SDL_Vulkan_CreateSurface, SDL_Window};
 
 use crate::geometry::Layout;
-use crate::handle::Window;
+use crate::handle::{DrawnOverlay, Window};
 use crate::present::{Presenting, RETRY, VulkanTarget};
 
 /// The render thread's stack: 8 MiB, as the process's main thread has. The render thread's
@@ -100,10 +105,14 @@ struct SurfaceState {
     layout: Option<Layout>,
     /// Whether the window is shown.
     visible: bool,
-    /// Something new to show: a frame, a layout, the window showing again.
+    /// Something new to show: a frame, a layout, the window showing again, the overlay.
     dirty: bool,
     /// The window has ended: the render thread ends.
     closed: bool,
+    /// What the window draws over the frame, while it shows one.
+    overlay: Option<DrawnOverlay>,
+    /// The UI thread was told this overlay does not show.
+    unshown_told: bool,
 }
 
 /// A draw the render thread takes: SDL's window and the layout.
@@ -178,6 +187,37 @@ impl Surface {
         });
     }
 
+    /// What the window draws over the frame (the module doc), or none: drawn at once.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only Linux's window draws an overlay")
+    )]
+    pub(crate) fn set_overlay(&self, overlay: Option<DrawnOverlay>) {
+        self.update(|s| {
+            s.overlay = overlay;
+            s.unshown_told = false;
+            s.dirty = true;
+        });
+    }
+
+    /// The overlay to draw over the frame, if any.
+    fn overlay(&self) -> Option<DrawnOverlay> {
+        self.state.lock().overlay.clone()
+    }
+
+    /// Whether to tell the UI thread the overlay does not show: once an overlay, while there is
+    /// one.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only Linux's window draws an overlay")
+    )]
+    fn tell_unshown(&self) -> bool {
+        let mut state = self.state.lock();
+        let tell = state.overlay.is_some() && !state.unshown_told;
+        state.unshown_told |= tell;
+        tell
+    }
+
     /// The guest presented a frame: it is drawn.
     pub(crate) fn request_draw(&self) {
         self.update(|s| s.dirty = true);
@@ -246,13 +286,20 @@ fn run(window: &Window) {
             presenting.make(|| sink.presenter(&work.target));
         }
         let cursor = window.drawn_cursor();
+        let overlay = surface.overlay();
         if presenting.draw(
             work.layout.drawable,
             work.layout.scale,
             work.layout.pixels,
             cursor.as_ref(),
+            overlay.as_ref(),
         ) {
             retry = Some(work);
+        }
+        #[cfg(target_os = "linux")]
+        if presenting.is_ended() && surface.tell_unshown() {
+            let id = window.id();
+            super::ui::post(move || super::sdl::overlay_unshown(id));
         }
     }
     drop(presenting);
@@ -356,6 +403,33 @@ mod tests {
         assert!(surface.state.lock().take().is_some());
         surface.close();
         assert!(surface.next(None).is_none());
+    }
+
+    /// An overlay set or taken away asks for a draw; the UI thread is told once an overlay that
+    /// it does not show, and not where there is none
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overlay_is_drawn_and_told_unshown_once() {
+        let surface = Surface::new();
+        surface.set_target(a_target());
+        surface.set_layout(a_layout());
+        surface.set_visible(true);
+        assert!(surface.state.lock().take().is_some());
+        assert!(!surface.tell_unshown(), "no overlay");
+        let overlay = DrawnOverlay {
+            image: Arc::new(crate::handle::Glyph::default()),
+            at: (1, 2),
+        };
+        surface.set_overlay(Some(overlay));
+        assert!(surface.state.lock().take().is_some(), "drawn");
+        assert_eq!(surface.overlay().map(|o| o.at), Some((1, 2)));
+        assert!(surface.tell_unshown());
+        assert!(!surface.tell_unshown(), "told once");
+        surface.set_overlay(surface.overlay());
+        assert!(surface.tell_unshown(), "a new overlay is told again");
+        surface.set_overlay(None);
+        assert!(surface.state.lock().take().is_some(), "drawn without it");
+        assert!(surface.overlay().is_none() && !surface.tell_unshown());
     }
 
     /// A draw that had no image in time is not made again while the window is hidden: it is

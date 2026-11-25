@@ -299,6 +299,7 @@ fn run(window: &Window) {
             work.layout.scale,
             work.layout.pixels,
             cursor.as_ref(),
+            None,
         ) {
             retry = Some(work.layout);
         }

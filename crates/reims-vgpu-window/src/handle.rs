@@ -194,6 +194,17 @@ pub struct DrawnCursor {
     pub at: (u16, u16),
 }
 
+/// An image the window draws over its frame, a pixel of it to a pixel of the drawable, clipped to
+/// the drawable, wherever the frame comes from: on Linux the question a close asks
+/// (`native::sdl_thread::question`).
+#[derive(Clone, Debug)]
+pub struct DrawnOverlay {
+    /// Its pixels, opaque or blended over the frame by their alpha; the hot spot is not used.
+    pub image: Arc<Glyph>,
+    /// Its top left, in the drawable's pixels.
+    pub at: (u64, u64),
+}
+
 /// What a window posts to its UI thread: `native`'s posts, or a test's.
 pub(crate) struct UiPosts {
     /// Starts the window's render thread and posts its opening.

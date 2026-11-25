@@ -31,7 +31,9 @@ use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::rt_platform::swapchain::RtSwapchain;
 use reims_vgpu_vulkan::rt_platform::window_times;
 use reims_vgpu_vulkan::swapchain::{Acquired, Refused};
-use reims_vgpu_window::{Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget};
+use reims_vgpu_window::{
+    Drawn, DrawnCursor, DrawnOverlay, FrameSink, PixelRect, Presenter, VulkanTarget,
+};
 
 use super::sink::ScanoutDraw;
 use super::{Presented, Shown};
@@ -153,7 +155,8 @@ struct RtPresenter {
 
 impl Presenter for RtPresenter {
     /// The next image, the display drawn into it, with `cursor` drawn over it where the window
-    /// draws the guest's cursor (`sink`'s module doc, "The guest's cursor"), and its present once
+    /// draws the guest's cursor (`sink`'s module doc, "The guest's cursor") and `overlay` over all
+    /// of it where the window shows one ("The window's overlay"), and its present once
     /// rt has scheduled the draw; nothing, the image kept for the next draw, where the draw is
     /// refused (`sink`'s module doc, "A refused draw"), or rt refuses its present or its commit.
     fn draw(
@@ -162,6 +165,7 @@ impl Presenter for RtPresenter {
         scale: f64,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
+        overlay: Option<&DrawnOverlay>,
     ) -> Drawn {
         entry::run(|_| {
             self.draw.drawn(drawable, scale);
@@ -177,7 +181,8 @@ impl Presenter for RtPresenter {
             };
             let swapchain = &self.swapchain;
             let committed = self.draw.scoped(|| {
-                let (command_buffer, presents) = self.draw.encode(texture, region, cursor)?;
+                let (command_buffer, presents) =
+                    self.draw.encode(texture, region, cursor, overlay)?;
                 // A draw dropped here answers its presents at the next refresh.
                 if !swapchain.encode_ready(frame, &command_buffer) {
                     return None;

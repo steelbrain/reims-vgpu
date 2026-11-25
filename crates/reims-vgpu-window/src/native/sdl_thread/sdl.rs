@@ -71,6 +71,9 @@ pub(crate) struct State {
     /// The screen it opened on: SDL's answer to which screen a window is on is not used (the
     /// module doc).
     display: SDL_DisplayID,
+    /// The question a close asks in the window, while it is open ([`ask`]).
+    #[cfg(target_os = "linux")]
+    question: Option<super::question::Question>,
 }
 
 /// A window's input: SDL's events, queued until the shell sends them (`super::input`).
@@ -204,7 +207,11 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
             )
             .with_capture(Capture::with_setting(crate::env::settings().capture)),
         ),
-        state: State { display },
+        state: State {
+            display,
+            #[cfg(target_os = "linux")]
+            question: None,
+        },
     })
 }
 
@@ -269,8 +276,13 @@ pub(crate) fn cursor_changed(shell: &mut Shell) {
 }
 
 /// An input event of type `kind` for the window: the pointer, a button, the wheel or a key, to
-/// the window's input. Whether capture changed.
+/// the window's input, or to the question open in the window ([`ask`]). Whether capture changed.
 pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bool {
+    #[cfg(target_os = "linux")]
+    if shell.os.question.is_some() {
+        question_event(shell, kind, event);
+        return false;
+    }
     match kind {
         k if k == SDL_EVENT_MOUSE_MOTION.0 => {
             // SAFETY: a motion event.
@@ -453,23 +465,164 @@ const TURN_OFF_ID: c_int = 1;
 /// The button of the question's Cancel, the default, and the answer where no button is chosen.
 const CANCEL_ID: c_int = 0;
 
-/// Asks the person whether to turn the VM off, for windows `ids` (`crate::close`), in SDL's
-/// message box over `shell`'s window: on Linux zenity's question where zenity is installed, else
-/// SDL's own X11 dialog, which the window owns on X11 and under XWayland; on Windows a task dialog
-/// the window owns. Read from SDL 3.4.18's code: zenity's question is a window of its own, which
-/// SDL waits for. SDL's message box holds the thread it runs on until it is answered, the UI
-/// thread here, which made the window, as SDL asks: the other windows' events and the work posted
-/// wait meanwhile, while the render threads draw on. So it is posted, to run after the events at
-/// hand with no window borrowed; the answer goes to [`shell::answered`]. A window whose display
-/// ended before the question showed asks nothing.
+/// Asks the person whether to turn the VM off, for windows `ids` (`crate::close`), over `shell`'s
+/// window: on Linux in the window itself, which the library draws (`ask_in_the_window`), and in
+/// SDL's message box where the window cannot draw it; on Windows in SDL's message box, a task
+/// dialog the window owns ([`ask_in_a_dialog`]).
 ///
 /// From the close to the answer, nothing of the window's input reaches the guest
 /// ([`input::Input::question_opened`]): the events at hand before the question shows, a key that
-/// went down after the close's lift among them, and the ups of the keys the question's dialog
-/// takes, which come once it is answered.
+/// went down after the close's lift among them, the keys and clicks the question takes, and the
+/// ups of the keys a dialog takes, which come once it is answered.
 pub(crate) fn ask(shell: &mut Shell, ids: Vec<u64>) {
-    let id = shell.window.id();
     shell.input.0.question_opened();
+    #[cfg(target_os = "linux")]
+    let Err(ids) = ask_in_the_window(shell, ids) else {
+        return;
+    };
+    ask_in_a_dialog(shell.window.id(), ids);
+}
+
+/// Asks the question in `shell`'s window (`super::question`): drawn over the frame by its render
+/// thread, the window's keys and clicks going to it ([`question_event`]), the host's arrow over it
+/// ([`asks`]); the window restored where it is minimized, and raised. `ids` back where the window
+/// has no drawable to draw it in yet. A render thread that can draw no more hands the question to
+/// SDL's message box ([`overlay_unshown`]).
+#[cfg(target_os = "linux")]
+fn ask_in_the_window(shell: &mut Shell, ids: Vec<u64>) -> Result<(), Vec<u64>> {
+    let layout = shell.layout;
+    if layout.drawable.0 == 0 || layout.drawable.1 == 0 {
+        return Err(ids);
+    }
+    let question = super::question::Question::new(ids, layout.drawable, layout.scale);
+    shell.window.surface().set_overlay(Some(question.overlay()));
+    shell.os.question = Some(question);
+    // SAFETY: the window is SDL's, on this thread.
+    unsafe {
+        if (SDL_GetWindowFlags(shell.sdl) & SDL_WINDOW_MINIMIZED).0 != 0 {
+            SDL_RestoreWindow(shell.sdl);
+        }
+        SDL_RaiseWindow(shell.sdl);
+    }
+    shell.refresh_cursor();
+    log::info!(
+        target: "reims_vgpu_window",
+        "window {:?}: the question before turning the VM off shows in the window",
+        shell.window.title()
+    );
+    Ok(())
+}
+
+/// An input event of type `kind` for the question open in `shell`'s window: its keys, and the
+/// left button's clicks at their pixels of the drawable (`super::question`). A focus moved draws
+/// it again; an answer ends it ([`answered_in_the_window`]).
+#[cfg(target_os = "linux")]
+fn question_event(shell: &mut Shell, kind: u32, event: &SDL_Event) {
+    use super::question::Step;
+    let scale = shell.layout.scale;
+    let Some(question) = shell.os.question.as_mut() else {
+        return;
+    };
+    let step = match kind {
+        k if k == SDL_EVENT_KEY_DOWN.0 || k == SDL_EVENT_KEY_UP.0 => {
+            // SAFETY: a key event.
+            let key = unsafe { event.key };
+            keymap::usb_usage(key.scancode.0).map_or(Step::Nothing, |usage| {
+                question.key(usage, key.down, key.repeat)
+            })
+        }
+        k if k == SDL_EVENT_MOUSE_BUTTON_DOWN.0 || k == SDL_EVENT_MOUSE_BUTTON_UP.0 => {
+            // SAFETY: a button event.
+            let b = unsafe { event.button };
+            if input::button_bit(b.button) == crate::config::BUTTON_LEFT {
+                let point = (f64::from(b.x) * scale, f64::from(b.y) * scale);
+                question.click(b.down, point)
+            } else {
+                Step::Nothing
+            }
+        }
+        _ => Step::Nothing,
+    };
+    match step {
+        Step::Nothing => {}
+        Step::Redraw => shell.window.surface().set_overlay(Some(question.overlay())),
+        Step::Answer(answer) => answered_in_the_window(shell, answer),
+    }
+}
+
+/// The person answered the question in `shell`'s window: it goes, the window's input goes on, and
+/// the answer goes to [`shell::answered`], posted, to run with no window borrowed.
+#[cfg(target_os = "linux")]
+fn answered_in_the_window(shell: &mut Shell, answer: Answer) {
+    let Some(question) = shell.os.question.take() else {
+        return;
+    };
+    shell.window.surface().set_overlay(None);
+    shell.input.0.question_answered();
+    shell.refresh_cursor();
+    let ids = question.ids;
+    super::ui::post(move || shell::answered(&ids, answer));
+}
+
+/// Window `id`'s render thread can draw no more (its GPU device lost, or no swapchain), so the
+/// question open in it does not show (`super::render`): it is asked in SDL's message box instead
+/// ([`ask_in_a_dialog`]), the input held as it was.
+#[cfg(target_os = "linux")]
+pub(super) fn overlay_unshown(id: u64) {
+    let ids = shell::with_shell(id, |s| {
+        let question = s.os.question.take()?;
+        s.window.surface().set_overlay(None);
+        s.refresh_cursor();
+        Some(question.ids)
+    })
+    .flatten();
+    if let Some(ids) = ids {
+        log::warn!(
+            target: "reims_vgpu_window",
+            "the window draws no more: the question before turning the VM off shows in SDL's \
+             message box"
+        );
+        ask_in_a_dialog(id, ids);
+    }
+}
+
+/// Whether a question is open in `shell`'s window, over which the host's arrow shows.
+#[cfg(target_os = "linux")]
+pub(crate) fn asks(shell: &Shell) -> bool {
+    shell.os.question.is_some()
+}
+
+/// Whether a question is open in the window: none on Windows, whose question is a dialog.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn asks(_shell: &Shell) -> bool {
+    false
+}
+
+/// The window was laid out again: the question open in it is laid out for the new drawable and
+/// drawn again where that changed it.
+#[cfg(target_os = "linux")]
+pub(crate) fn laid_out(shell: &mut Shell) {
+    if let Some(question) = shell.os.question.as_mut()
+        && question.relayout(shell.layout.drawable, shell.layout.scale)
+    {
+        shell.window.surface().set_overlay(Some(question.overlay()));
+    }
+}
+
+/// The window was laid out again: nothing more on Windows, whose question is a dialog.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn laid_out(_shell: &mut Shell) {}
+
+/// Asks the question for windows `ids` in SDL's message box over window `id`: on Linux zenity's
+/// question where zenity is installed, else SDL's own X11 dialog, which the window owns on X11 and
+/// under XWayland; on Windows a task dialog the window owns. Read from SDL 3.4.18's code: zenity's
+/// question is a window of its own, which SDL waits for, and on Wayland SDL tries nothing else.
+/// SDL's message box holds the thread it runs on until it is answered, the UI thread here, which
+/// made the window, as SDL asks: the other windows' events and the work posted wait meanwhile,
+/// while the render threads draw on. So it is posted, to run after the events at hand with no
+/// window borrowed; the answer goes to [`shell::answered`], after the window's input goes on. A
+/// window whose display ended before the question showed asks nothing.
+fn ask_in_a_dialog(id: u64, ids: Vec<u64>) {
     super::ui::post(move || {
         let parent = shell::with_shell(id, |s| (!s.closed).then_some(s.sdl)).flatten();
         let answer = match parent {
@@ -482,7 +635,7 @@ pub(crate) fn ask(shell: &mut Shell, ids: Vec<u64>) {
 }
 
 /// Shows the question over `parent`, and waits for its answer ([`answer_of`]). Where SDL shows
-/// none (no zenity and no X server on Linux), that is logged, and the close goes ahead.
+/// none (on Linux no zenity on Wayland, or no X server), that is logged, and the VM runs on.
 fn question(parent: *mut SDL_Window) -> Answer {
     let title = c_string(close::QUESTION);
     let message = c_string(close::DETAIL);
@@ -505,7 +658,7 @@ fn question(parent: *mut SDL_Window) -> Answer {
     if !shown {
         log::warn!(
             target: "reims_vgpu_window",
-            "the question before turning the VM off does not show ({}): the close goes ahead",
+            "the question before turning the VM off does not show ({}): the VM runs on",
             sdl_error()
         );
     }
@@ -544,9 +697,15 @@ fn answer_of(shown: bool, chosen: c_int) -> Answer {
     }
 }
 
-/// The display ended: the window hides. SDL's window goes once the render thread has let go
-/// (`crate::sdl::shell::released`), never before.
+/// The display ended: the window hides, and a question open in it ends as cancelled. SDL's
+/// window goes once the render thread has let go (`crate::sdl::shell::released`), never before.
 pub(crate) fn close(shell: &mut Shell) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(question) = shell.os.question.take() {
+        shell.window.surface().set_overlay(None);
+        let ids = question.ids;
+        super::ui::post(move || shell::answered(&ids, Answer::Cancel));
+    }
     // SAFETY: the window is SDL's, on this thread.
     unsafe { SDL_HideWindow(shell.sdl) };
     false

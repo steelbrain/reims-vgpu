@@ -325,8 +325,8 @@ fn view_of(id: u64, mtm: MainThreadMarker) -> Option<Retained<DisplayView>> {
     open.iter().find(|s| s.id == id).map(|s| s.view.clone())
 }
 
-/// The person answered the question a close asked (`super::alert`) for windows `ids`: Turn Off,
-/// or a question AppKit could not show, tells each one's host, which ends the VM; Cancel tells
+/// The person answered the question a close asked (`super::alert`) for windows `ids`: Turn Off
+/// tells each one's host, which ends the VM; Cancel, or a question AppKit could not show, tells
 /// none, and the VM runs on (`crate::close::answered`). A window closed meanwhile tells nothing.
 pub(crate) fn answered(ids: &[u64], answer: Answer, mtm: MainThreadMarker) {
     if close::answered(answer) {

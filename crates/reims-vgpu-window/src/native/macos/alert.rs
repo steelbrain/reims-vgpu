@@ -29,7 +29,7 @@ pub(crate) type Answered = fn(&[u64], Answer, MainThreadMarker);
 
 /// Asks the person whether to turn the VM off for windows `ids`, in an alert as a sheet on
 /// `window` (the module doc): the answer is posted to the main thread, to `answered`. Where
-/// AppKit refuses the sheet, that is logged, and the answer is Unshown: the close goes ahead.
+/// AppKit refuses the sheet, that is logged, and the answer is Unshown: the VM runs on.
 pub(crate) fn ask(window: &NSWindow, ids: Vec<u64>, answered: Answered, mtm: MainThreadMarker) {
     let alert = msg::get("new", || NSAlert::new(mtm));
     msg::get("setAlertStyle:", || {
@@ -77,7 +77,7 @@ pub(crate) fn ask(window: &NSWindow, ids: Vec<u64>, answered: Answered, mtm: Mai
         alert.beginSheetModalForWindow_completionHandler(window, Some(&handler));
     }) {
         log::warn!(
-            "the question before turning the VM off does not show ({}: {}): the close goes ahead",
+            "the question before turning the VM off does not show ({}: {}): the VM runs on",
             caught.name,
             caught.reason
         );

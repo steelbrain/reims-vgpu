@@ -16,6 +16,9 @@ A PARTICULAR PURPOSE. See the licenses for more details.
 
 This covers everything in the repository but QEMU, the submodule at
 vendor/qemu, which keeps QEMU's own licenses (its LICENSE and COPYING
-files). The crates the build takes, from crates.io and from the metal2vulkan
+files), and the 8 by 8 font's glyphs in
+crates/reims-vgpu-window/src/native/sdl_thread/question.rs, copied from SDL
+3.4.18's src/render/SDL_render_debug_font.h: Marcel Sondaar's font8_8, of
+IBM's VGA font, which that file marks public domain. The crates the build takes, from crates.io and from the metal2vulkan
 repository, are not part of the repository, and each keeps its
 own license.

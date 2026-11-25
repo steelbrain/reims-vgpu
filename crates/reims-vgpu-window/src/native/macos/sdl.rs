@@ -287,6 +287,15 @@ pub(crate) fn screens_changed(shell: &mut Shell) {
     }
 }
 
+/// The window was laid out again: nothing more, as its question is a sheet ([`ask`]).
+pub(crate) fn laid_out(_shell: &mut Shell) {}
+
+/// Whether a question is open in the window, over which the host's arrow shows: none, as its
+/// question is a sheet ([`ask`]).
+pub(crate) fn asks(_shell: &Shell) -> bool {
+    false
+}
+
 /// SDL's input events are not taken: AppKit's events are, before the application dispatches
 /// them (`input`).
 pub(crate) fn input_event(_shell: &mut Shell, _kind: u32, _event: &SDL_Event) -> bool {

@@ -3,7 +3,8 @@
 //! (`crate::sdl`), and what the SDL thread does its own way is here: SDL runs on the library's UI
 //! thread (`ui`), where the window opens, changes and ends, as `sdl` places, sizes and ends it,
 //! and its events become the host's input (`input`, `keymap`); each window's render thread draws
-//! into its swapchain (`render`). What the OS under it adds is its own file (`super::linux`: the
+//! into its swapchain (`render`), on Linux with the question a close asks over the frame
+//! (`question`). What the OS under it adds is its own file (`super::linux`: the
 //! GPU a Wayland compositor composites on; `super::windows`). This file is what the shared window
 //! code asks of it: the render thread (`render`, through the display's
 //! [`FrameSink`](crate::FrameSink)), the window's opening, changes and end, posted to the UI
@@ -11,6 +12,8 @@
 
 mod input;
 mod keymap;
+#[cfg(target_os = "linux")]
+mod question;
 mod render;
 pub(crate) mod sdl;
 mod ui;

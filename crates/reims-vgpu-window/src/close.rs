@@ -9,9 +9,9 @@
 //! window lives (the display's release takes the host's callbacks back) and the host gave a close
 //! callback (without one a close does nothing). One question is open at a time in the process: a
 //! close asked for while one is open adds none. Once the person has chosen Turn Off, a later close
-//! tells the host at once, as the VM is ending. Where the OS cannot show the question
-//! ([`Answer::Unshown`]), the close goes ahead as it did before the question, and the OS's side
-//! logs why.
+//! tells the host at once, as the VM is ending. Where no question can show ([`Answer::Unshown`]),
+//! the close does nothing: a close that cannot ask never turns the VM off. The VM runs on, the
+//! next close asks again, and the OS's side logs why.
 //!
 //! Before the question shows, the window's input lets go as a close's does: every key and button
 //! held goes up and capture ends, the keys going to the guest first. A cancelled close leaves it
@@ -53,7 +53,7 @@ pub(crate) enum Answer {
     TurnOff,
     /// Cancel, or the question dismissed: nothing happens.
     Cancel,
-    /// The OS could not show the question: the host is told, as before the question.
+    /// No question could show: nothing happens, as for Cancel, and the OS's side logs why.
     Unshown,
 }
 
@@ -62,7 +62,7 @@ pub(crate) enum Answer {
 pub(crate) struct Asks {
     /// A question is open.
     open: bool,
-    /// The person chose Turn Off, or no question could be shown: the VM is ending.
+    /// The person chose Turn Off: the VM is ending.
     ending: bool,
 }
 
@@ -85,10 +85,8 @@ impl Asks {
     /// The person answered the open question: whether the host is told.
     pub(crate) fn answered(&mut self, answer: Answer) -> bool {
         self.open = false;
-        if answer != Answer::Cancel {
-            self.ending = true;
-        }
-        answer != Answer::Cancel
+        self.ending |= answer == Answer::TurnOff;
+        answer == Answer::TurnOff
     }
 }
 
@@ -109,7 +107,7 @@ pub(crate) fn answered(answer: Answer) -> bool {
     let said = match answer {
         Answer::TurnOff => "the person chose Turn Off: the host turns the VM off",
         Answer::Cancel => "the close is cancelled, or its window ended: the host is not told",
-        Answer::Unshown => "no question showed: the host turns the VM off",
+        Answer::Unshown => "no question showed: the host is not told, and the VM runs on",
     };
     log::info!(target: "reims_vgpu_window", "{said}");
     tell
@@ -130,8 +128,8 @@ mod tests {
         assert_eq!(asks.request(false), Step::Nothing);
     }
 
-    /// Cancel tells the host nothing, and the next close asks again; Turn Off, or a question the
-    /// OS could not show, tells the host, and a later close tells it at once
+    /// Cancel, or a question that could not show, tells the host nothing, and the next close asks
+    /// again; Turn Off tells the host, and a later close tells it at once
     #[test]
     fn only_turn_off_tells_the_host() {
         let mut asks = Asks::default();
@@ -144,7 +142,7 @@ mod tests {
 
         let mut unshown = Asks::default();
         assert_eq!(unshown.request(true), Step::Ask);
-        assert!(unshown.answered(Answer::Unshown));
-        assert_eq!(unshown.request(true), Step::Tell);
+        assert!(!unshown.answered(Answer::Unshown));
+        assert_eq!(unshown.request(true), Step::Ask);
     }
 }

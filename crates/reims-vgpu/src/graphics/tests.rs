@@ -3000,7 +3000,7 @@ fn draws_the_scanout(
         width: drawable.width(),
         height: drawable.height(),
     };
-    if draw.encode(drawable, rect, None).is_none()
+    if draw.encode(drawable, rect, None, None).is_none()
         || platform.call_log().count(SCANOUT_BLIT) != blits + 1
     {
         return false;
@@ -3503,7 +3503,7 @@ fn a_kept_present_s_table_reaches_the_next_drawn_frame() {
     let drawn_table = || -> Vec<f32> {
         let log = platform.call_log();
         let mark = log.mark();
-        let _drawn = draw.encode(&drawable, rect, None).expect("a draw");
+        let _drawn = draw.encode(&drawable, rect, None, None).expect("a draw");
         let bound = log
             .since(mark)
             .into_iter()
@@ -9552,7 +9552,9 @@ fn a_presented_surface_s_block_waits_for_the_display() {
         width: 64,
         height: 64,
     };
-    let (command_buffer, presents) = draw.encode(&drawable, rect, None).expect("a draw of it");
+    let (command_buffer, presents) = draw
+        .encode(&drawable, rect, None, None)
+        .expect("a draw of it");
     presents.after(&command_buffer);
     no_catch(command_buffer.commit(OnFault::Die));
     let drawing = committed(&platform, 1)[0];
@@ -9576,7 +9578,7 @@ fn a_presented_surface_s_block_waits_for_the_display() {
     );
     // A draw from here reads nothing of the block: the guest set no scanout either.
     assert!(device.control.presented[0].shown().is_none());
-    assert!(draw.encode(&drawable, rect, None).is_none());
+    assert!(draw.encode(&drawable, rect, None, None).is_none());
 
     let world = platform.world();
     assert!(world.complete(

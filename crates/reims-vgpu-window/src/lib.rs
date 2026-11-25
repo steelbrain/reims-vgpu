@@ -26,8 +26,8 @@
 //!   other displays), [`scroll`] (wheel and trackpad deltas to notches or smooth scrolling)
 //!   and [`env`](mod@env) (the `REIMS_VGPU_WINDOW_*` variables);
 //! - a close the person asks for, which ends the VM, and the question asked before it: [`close`]
-//!   (when the window asks, its words, and what an answer does), with each OS's dialog in its
-//!   `native` side;
+//!   (when the window asks, its words, and what an answer does), with each OS's question in its
+//!   `native` side: on Linux one the library draws in the window (`native/sdl_thread/question`);
 //! - the host's screens ([`screens`]), as the OS lists them;
 //! - the window itself: [`handle`] (the [`Window`] the display holds), and its OS side
 //!   (`native`, one directory per OS behind one file). On macOS (`native/macos/`) that is the
@@ -71,7 +71,7 @@ pub use config::{
     MomentumPhase, PointerBeyond, PointerFn, PointerMotion, ScrollEvent, ScrollFn, ScrollPhase,
     WheelFn, WindowCallbacks, WindowConfig,
 };
-pub use handle::{DrawnCursor, FrameSink, Glyph, PixelRect, Window};
+pub use handle::{DrawnCursor, DrawnOverlay, FrameSink, Glyph, PixelRect, Window};
 pub use present::{Drawn, Presenter, VulkanTarget};
 pub use screens::HostScreen;
 

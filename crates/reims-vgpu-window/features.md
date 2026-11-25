@@ -652,31 +652,49 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `manual` (a VM with two displays)
 - Leaving: closing a window (its close button, Alt+F4 or the window
   system's close, the task bar's on Windows) lets every key and button go
-  and ends capture, the key-ups reaching the guest first, then asks, in
-  SDL's message box, with macOS's words and buttons (Leaving, above),
-  Cancel the default for Return and Escape: on Linux zenity's question
-  where zenity is installed, a window of its own, else SDL's own X11
-  dialog, which the window owns on X11 and under XWayland, Cancel left of
-  Turn Off; on Windows a task dialog the window owns, Turn Off left of
-  Cancel. Turn Off asks the host to end the VM; Cancel, or the question
-  dismissed, leaves the window and the VM running, nothing held in the
-  guest and the input released. From the close to the answer nothing of
-  the window's input reaches the guest: not a key that goes down after the
-  close let the keys go (F4 of Alt+F4 on Windows, which SDL hands over
-  after the close), nor the keys and clicks the question takes, nor their
-  ups. While the question is up, the library's UI thread waits for it: the
-  windows' frames keep drawing, and their events wait. When to ask is as on
-  macOS; where SDL shows no question (no zenity and no X server), the close
-  goes ahead as before, and the reason is logged. The window closes at the
-  display's release, once its swapchain is gone.
+  and ends capture, the key-ups reaching the guest first, then asks, with
+  macOS's words and buttons (Leaving, above) in ASCII, Cancel the default
+  for Return and Escape. On Linux the library asks in the window itself,
+  with nothing installed on the host and the same on Wayland and X11 and
+  every desktop: a dark panel centred over the frame, Cancel left of Turn
+  Off, in an 8 by 8 pixel font each of whose pixels is a whole square of
+  the screen's, a line about 12 points high at every scale, fractional
+  ones and 4K included; Tab and the arrows move the focus, Space answers
+  the focused button, a click answers the button it went down and up on,
+  the host's arrow shows over the window, and a minimized window is
+  restored and raised. Where the window draws no more (its GPU lost, or no
+  swapchain), the question shows in SDL's message box instead: zenity's
+  where zenity is installed, else SDL's own X11 dialog. On Windows a task
+  dialog the window owns, Turn Off left of Cancel. Turn Off asks the host
+  to end the VM; Cancel, or the question dismissed, leaves the window and
+  the VM running, nothing held in the guest and the input released. From
+  the close to the answer nothing of the window's input reaches the guest:
+  not a key that goes down after the close let the keys go (F4 of Alt+F4
+  on Windows, which SDL hands over after the close), nor the keys and
+  clicks the question takes, nor their ups. Where no question can show,
+  the close keeps the VM running and logs why; the VM is then turned off
+  by the guest's own shutdown or the host's stop (reims-ctl stop). The one
+  case known to reach it is a Linux host whose window draws no more (its
+  GPU lost, or no swapchain) in a Wayland session without zenity, or with
+  no X server. While a dialog is up, the library's UI thread waits for it:
+  the windows' frames keep drawing, and their events wait. When to ask is
+  as on macOS. The window closes at the display's release, once its
+  swapchain is gone.
   `test: close::a_close_asks_only_where_the_host_would_hear_of_it`,
   `test: close::only_turn_off_tells_the_host`,
   `test: sdl::shell::a_close_asks_where_the_host_hears_and_tells_it_once_turned_off`,
   `test: native::sdl_thread::input::a_cancelled_close_leaves_nothing_held_and_the_input_goes_on`,
   `test: native::sdl_thread::input::a_key_down_after_the_close_s_lift_never_reaches_the_guest`,
+  `test: native::sdl_thread::question::the_question_s_words_are_macos_s_in_the_font`,
+  `test: native::sdl_thread::question::the_font_scales_with_the_density`,
+  `test: native::sdl_thread::question::return_and_escape_cancel_and_space_answers_the_focus`,
+  `test: native::sdl_thread::question::a_click_answers_the_button_it_went_down_and_up_on`,
+  `test: native::sdl_thread::render::an_overlay_is_drawn_and_told_unshown_once`,
+  `test: reims-vgpu::graphics::sink::the_window_s_overlay_is_drawn_over_everything_in_a_pass_of_its_own`,
   `test: native::sdl_thread::sdl::the_question_s_default_is_cancel`,
   `test: native::sdl_thread::sdl::an_answer_is_turn_off_only_by_its_button`,
-  `manual` (the question on Wayland, X11 and Windows; Cancel, then Turn Off)
+  `manual` (the question on Wayland without zenity, X11 and Windows;
+  Cancel, then Turn Off)
 - A GPU the driver reports lost, which the library makes no new device for:
   the window stays open and keeps the last frame it showed, and draws no
   more. Its swapchain makes no Vulkan call on the lost device from then on,

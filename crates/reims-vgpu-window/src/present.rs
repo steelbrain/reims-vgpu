@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use ash::vk;
 
-use crate::handle::{DrawnCursor, PixelRect};
+use crate::handle::{DrawnCursor, DrawnOverlay, PixelRect};
 
 /// How long the render thread waits before it draws again where no image came in time: about a
 /// refresh at 120 Hz. Before it answers [`Drawn::Retry`] for want of an image, the presenter has
@@ -58,14 +58,16 @@ pub enum Drawn {
 pub trait Presenter: Send {
     /// Draws the display's current frame into the next image of `drawable` pixels (width,
     /// height), `scale` of them a point of the window's screen, over `region` of it, clearing the
-    /// rest, with `cursor` over it where the window draws the guest's cursor, and presents it.
-    /// Blocks only for the next image, up to a few frames.
+    /// rest, with `cursor` over it where the window draws the guest's cursor, and `overlay` over
+    /// all of it where the window shows one (black under it where the display has nothing to
+    /// draw), and presents it. Blocks only for the next image, up to a few frames.
     fn draw(
         &mut self,
         drawable: (u64, u64),
         scale: f64,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
+        overlay: Option<&DrawnOverlay>,
     ) -> Drawn;
 }
 
@@ -128,15 +130,29 @@ impl Presenting {
         self.ended |= self.presenter.is_none();
     }
 
+    /// Whether the window stays as it is, drawing no more: the sink made no presenter, the
+    /// presenters ended too many times in a row, or the presenter's device is lost.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only Linux's window draws an overlay it must know shows"
+        )
+    )]
+    pub(crate) fn is_ended(&self) -> bool {
+        self.ended
+    }
+
     /// Has the presenter draw the current frame into an image of `drawable` pixels, `scale` of
-    /// them a point, over `region`, with `cursor` over it: whether to draw again after [`RETRY`]
-    /// (no image came in time). Nothing without a presenter.
+    /// them a point, over `region`, with `cursor` and `overlay` over it: whether to draw again
+    /// after [`RETRY`] (no image came in time). Nothing without a presenter.
     pub(crate) fn draw(
         &mut self,
         drawable: (u64, u64),
         scale: f64,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
+        overlay: Option<&DrawnOverlay>,
     ) -> bool {
         if self.ended {
             return false;
@@ -144,7 +160,7 @@ impl Presenting {
         let Some(presenter) = self.presenter.as_mut() else {
             return false;
         };
-        let drawn = presenter.draw(drawable, scale, region, cursor);
+        let drawn = presenter.draw(drawable, scale, region, cursor, overlay);
         if drawn == Drawn::Lost {
             // Kept to the window's end, asked no more, and no other made (the module doc, "A lost
             // device").
@@ -198,6 +214,7 @@ mod tests {
             _scale: f64,
             _region: PixelRect,
             _cursor: Option<&DrawnCursor>,
+            _overlay: Option<&DrawnOverlay>,
         ) -> Drawn {
             self.0.pop_front().unwrap_or(Drawn::Presented)
         }
@@ -217,6 +234,7 @@ mod tests {
             _scale: f64,
             _region: PixelRect,
             _cursor: Option<&DrawnCursor>,
+            _overlay: Option<&DrawnOverlay>,
         ) -> Drawn {
             self.draws.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Drawn::Lost
@@ -268,16 +286,16 @@ mod tests {
         assert!(p.needs_presenter());
         p.make(|| scripted(&[Drawn::Retry, Drawn::Presented, Drawn::Ended]));
         assert!(!p.needs_presenter());
-        assert!(p.draw((4, 4), 1.0, REGION, None), "no image: a retry");
-        assert!(!p.draw((4, 4), 1.0, REGION, None));
-        assert!(!p.draw((4, 4), 1.0, REGION, None));
+        assert!(p.draw((4, 4), 1.0, REGION, None, None), "no image: a retry");
+        assert!(!p.draw((4, 4), 1.0, REGION, None, None));
+        assert!(!p.draw((4, 4), 1.0, REGION, None, None));
         assert!(p.needs_presenter(), "an ended presenter is made again");
         p.make(|| None);
         assert!(
             !p.needs_presenter(),
             "no presenter: the window stays as it is"
         );
-        assert!(!p.draw((4, 4), 1.0, REGION, None));
+        assert!(!p.draw((4, 4), 1.0, REGION, None, None));
     }
 
     /// A presenter whose device is lost is kept to the window's end, so the window keeps the frame
@@ -294,10 +312,10 @@ mod tests {
             dropped: Arc::clone(&dropped),
         };
         p.make(|| Some(Box::new(losing)));
-        assert!(!p.draw((4, 4), 1.0, REGION, None), "no retry");
+        assert!(!p.draw((4, 4), 1.0, REGION, None, None), "no retry");
         for _ in 0..100 {
             assert!(!p.needs_presenter(), "none made again");
-            assert!(!p.draw((4, 4), 1.0, REGION, None));
+            assert!(!p.draw((4, 4), 1.0, REGION, None, None));
         }
         assert_eq!(draws.load(Ordering::SeqCst), 1, "asked once, at the loss");
         assert!(
@@ -315,7 +333,7 @@ mod tests {
         for _ in 0..=RENEWALS {
             assert!(p.needs_presenter());
             p.make(|| scripted(&[Drawn::Ended]));
-            p.draw((4, 4), 1.0, REGION, None);
+            p.draw((4, 4), 1.0, REGION, None, None);
         }
         assert!(!p.needs_presenter());
     }

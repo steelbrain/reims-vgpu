@@ -23,6 +23,11 @@
 //! moves for it. It is made again only for a new glyph, and the pipeline once per drawable format;
 //! a recovered device makes both again (`sink`'s module doc, "A recovered device").
 //!
+//! **The window's overlay** ([`DrawnOverlay`]: on Linux the question a close asks) is drawn by a
+//! pass of the same kind, after the cursor's, a pixel of its image to a pixel of the drawable at
+//! the overlay's place, clipped to the drawable alone ([`overlay_placement`]), with a pipeline and
+//! a texture of its own ([`CursorPass::overlay`]), made again only for a new image.
+//!
 //! **Refusals.** What the platform refuses of them leaves the frame without the guest's cursor,
 //! logged (once a kind, `core::logging`); the host's cursor stays hidden over the image while the
 //! guest leads, so neither shows. The draw's values are ones the platforms take: a scissor inside
@@ -43,7 +48,7 @@ use reims_vgpu_vulkan::core::platform::values::{
     ColorAttachmentDesc, FullRenderPipelineDesc, TextureDesc,
 };
 use reims_vgpu_vulkan::core::platform::{Handle as _, HostRange, Platform};
-use reims_vgpu_window::{DrawnCursor, Glyph, PixelRect};
+use reims_vgpu_window::{DrawnCursor, DrawnOverlay, Glyph, PixelRect};
 
 use super::Converter;
 use crate::entry::no_catch;
@@ -60,18 +65,38 @@ const GLYPH_FORMAT: u64 = 70;
 const GLYPH_USAGE: u64 = 1;
 /// The cursor's pipelines' label.
 pub(super) const CURSOR_PIPELINE_LABEL: &str = "reims-vgpu.display-cursor";
+/// The overlay's pipelines' label.
+pub(super) const OVERLAY_PIPELINE_LABEL: &str = "reims-vgpu.display-overlay";
 
-/// What a sink keeps to draw the guest's cursor, from one frame to the next.
+/// What a sink keeps to draw the guest's cursor, or the window's overlay, from one frame to the
+/// next.
 pub(super) struct CursorPass<P: Platform> {
+    /// Its pipelines' label.
+    label: &'static str,
+    /// What it draws, for its refusals' lines.
+    draws: &'static str,
     /// The blending pipelines made so far, by the drawable's pixel format.
     pipelines: Vec<(u64, P::RenderPipeline)>,
     /// The glyph last drawn, and its texture.
     glyph: Option<(Arc<Glyph>, P::Texture)>,
 }
 
-impl<P: Platform> Default for CursorPass<P> {
-    fn default() -> Self {
+impl<P: Platform> CursorPass<P> {
+    /// The guest's cursor's pass.
+    pub(super) fn cursor() -> Self {
+        CursorPass::new(CURSOR_PIPELINE_LABEL, "guest cursor")
+    }
+
+    /// The window's overlay's pass.
+    pub(super) fn overlay() -> Self {
+        CursorPass::new(OVERLAY_PIPELINE_LABEL, "overlay")
+    }
+
+    /// A pass whose pipelines are labelled `label`, drawing what `draws` names.
+    fn new(label: &'static str, draws: &'static str) -> Self {
         CursorPass {
+            label,
+            draws,
             pipelines: Vec::new(),
             glyph: None,
         }
@@ -92,27 +117,28 @@ pub(super) struct Prepared<P: Platform> {
 }
 
 impl<P: ApiPlatform> CursorPass<P> {
-    /// What drawing `cursor` over the frame drawn into `target` over `region` binds, with
-    /// `converter`'s functions on `device` of `platform`: the pipeline for the target's format,
-    /// made the first time, and the glyph's texture, made again only for a new glyph. `None` where
-    /// nothing would show, and where the platform refuses the pipeline or the texture (logged).
+    /// What drawing `glyph` over the frame drawn into `target` binds, at `placed` (its viewport
+    /// and scissor: [`placement`], [`overlay_placement`]), with `converter`'s functions on
+    /// `device` of `platform`: the pipeline for the target's format, made the first time, and the
+    /// glyph's texture, made again only for a new glyph. `None` where the platform refuses the
+    /// pipeline or the texture (logged).
     pub(super) fn prepare(
         &mut self,
         platform: &Arc<P>,
         device: &P::Device,
         converter: &Converter<P>,
         target: &P::Texture,
-        region: PixelRect,
-        cursor: &DrawnCursor,
+        placed: (MtlViewport, MtlScissorRect),
+        glyph: &Arc<Glyph>,
     ) -> Option<Prepared<P>> {
-        let (viewport, scissor) = placement(region, (target.width(), target.height()), cursor)?;
+        let (viewport, scissor) = placed;
         let format = target.pixel_format();
         let pipeline = match self.pipelines.iter().find(|(f, _)| *f == format) {
             Some((_, pipeline)) => pipeline.clone_ref(),
             None => {
                 let made = device
                     .new_render_pipeline_state_full(&FullRenderPipelineDesc {
-                        label: Some(CURSOR_PIPELINE_LABEL),
+                        label: Some(self.label),
                         colors: vec![(0, over(format))],
                         ..FullRenderPipelineDesc::new(
                             &converter.pipelines.vertex_function,
@@ -122,19 +148,19 @@ impl<P: ApiPlatform> CursorPass<P> {
                     .ok()
                     .flatten();
                 let Some(pipeline) = made else {
-                    return refused("a pipeline for the drawable's format");
+                    return refused(self.draws, "a pipeline for the drawable's format");
                 };
                 self.pipelines.push((format, pipeline.clone_ref()));
                 pipeline
             }
         };
         let texture = match &self.glyph {
-            Some((drawn, texture)) if Arc::ptr_eq(drawn, &cursor.glyph) => texture.clone_ref(),
+            Some((drawn, texture)) if Arc::ptr_eq(drawn, glyph) => texture.clone_ref(),
             _ => {
-                let Some(texture) = glyph_texture(platform, device, &cursor.glyph) else {
-                    return refused("a texture for the glyph");
+                let Some(texture) = glyph_texture(platform, device, glyph) else {
+                    return refused(self.draws, "a texture for its image");
                 };
-                self.glyph = Some((Arc::clone(&cursor.glyph), texture.clone_ref()));
+                self.glyph = Some((Arc::clone(glyph), texture.clone_ref()));
                 texture
             }
         };
@@ -147,12 +173,13 @@ impl<P: ApiPlatform> CursorPass<P> {
     }
 }
 
-/// Logs that the platform refused `what`: the frame shows no guest cursor.
-fn refused<T>(what: &str) -> Option<T> {
+/// Logs that the platform refused `what` for the pass that draws `draws`: the frame shows none.
+fn refused<T>(draws: &str, what: &str) -> Option<T> {
+    let kind = format!("{draws}: {what}");
     // Once per kind; later ones at debug, counted (`core::logging`).
     log::warn!(
-        target: "reims_vgpu::graphics", kind:% = what;
-        "the window draws no guest cursor: the platform refused {what}"
+        target: "reims_vgpu::graphics", kind:% = kind;
+        "the window draws no {draws}: the platform refused {what}"
     );
     None
 }
@@ -241,6 +268,51 @@ pub(super) fn placement(
         y: sy,
         width: sw,
         height: sh,
+    };
+    Some((viewport, scissor))
+}
+
+/// Where `overlay` draws over a target of `size` pixels: the viewport, its image's rectangle at
+/// its place, a pixel of it to a pixel of the target; and the scissor, the target's pixels that
+/// rectangle covers. `None` where nothing would show: an empty image, or one wholly off the
+/// target; and where the viewport would reach past [`VIEWPORT_BOUNDS`] or be larger than
+/// [`VIEWPORT_DIMENSION`] (the module doc).
+pub(super) fn overlay_placement(
+    size: (u64, u64),
+    overlay: &DrawnOverlay,
+) -> Option<(MtlViewport, MtlScissorRect)> {
+    let (width, height) = (
+        u64::from(overlay.image.width),
+        u64::from(overlay.image.height),
+    );
+    let (x, y) = overlay.at;
+    let (x1, y1) = (
+        x.saturating_add(width).min(size.0),
+        y.saturating_add(height).min(size.1),
+    );
+    if x1 <= x || y1 <= y {
+        return None;
+    }
+    #[expect(clippy::as_conversions, reason = "u64 to f64 rounds to nearest")]
+    let [left, top, width, height] = [x, y, width, height].map(|v| v as f64);
+    let (_, high) = VIEWPORT_BOUNDS;
+    let within = |start: f64, length: f64| start + length <= high && length <= VIEWPORT_DIMENSION;
+    if !(within(left, width) && within(top, height)) {
+        return None;
+    }
+    let viewport = MtlViewport {
+        origin_x: left,
+        origin_y: top,
+        width,
+        height,
+        znear: 0.0,
+        zfar: 1.0,
+    };
+    let scissor = MtlScissorRect {
+        x,
+        y,
+        width: x1 - x,
+        height: y1 - y,
     };
     Some((viewport, scissor))
 }
@@ -401,6 +473,37 @@ mod tests {
         assert!(placement(scaled, (1700, 1700), &big).is_none());
         let fits = cursor((240, 1), (0, 0), (100, 100), (0, 0));
         assert!(placement(scaled, (1700, 1700), &fits).is_some());
+    }
+
+    /// An overlay is drawn a pixel of its image to a pixel of the target at its place, clipped to
+    /// the target alone; one wholly off the target, an empty one, and one past Vulkan's least
+    /// viewport bounds draw nothing
+    #[test]
+    fn an_overlay_is_drawn_pixel_for_pixel_at_its_place() {
+        let overlay = |(width, height): (u32, u32), at: (u64, u64)| DrawnOverlay {
+            image: Arc::new(Glyph {
+                width,
+                height,
+                hot_spot: (0, 0),
+                rgba: Vec::new(),
+            }),
+            at,
+        };
+        let (v, s) = overlay_placement((1920, 1080), &overlay((624, 248), (648, 416))).unwrap();
+        assert_eq!(
+            (v.origin_x, v.origin_y, v.width, v.height),
+            (648.0, 416.0, 624.0, 248.0)
+        );
+        assert_eq!((s.x, s.y, s.width, s.height), (648, 416, 624, 248));
+        let (v, s) = overlay_placement((320, 200), &overlay((312, 248), (4, 0))).unwrap();
+        assert_eq!((v.width, v.height), (312.0, 248.0));
+        assert_eq!((s.x, s.y, s.width, s.height), (4, 0, 312, 200));
+        let none = |o: &DrawnOverlay| overlay_placement((320, 200), o).is_none();
+        assert!(none(&overlay((10, 10), (320, 0))));
+        assert!(none(&overlay((10, 10), (0, 200))));
+        assert!(none(&overlay((0, 10), (0, 0))));
+        assert!(none(&overlay((4097, 10), (0, 0))));
+        assert!(overlay_placement((9000, 100), &overlay((10, 10), (8190, 0))).is_none());
     }
 
     /// Premultiplying scales each colour channel by the alpha, to nearest, and keeps the alpha

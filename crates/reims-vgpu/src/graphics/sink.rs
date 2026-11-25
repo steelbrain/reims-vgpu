@@ -52,6 +52,12 @@
 //! of its own after the frame's, in the frame's command buffer (`cursor`). The host's reads of
 //! the display draw no cursor.
 //!
+//! **The window's overlay.** Where the window shows an overlay (on Linux the question a close
+//! asks), the draw puts its image over all of that, the cursor included, a pixel to a pixel of
+//! the drawable, in a pass of the same kind (`cursor`), while the display's panel is off too.
+//! Where the display has nothing to draw (no scanout and no surface, or its draw refused), the
+//! overlay is drawn over black, so that it always shows. The host's reads draw no overlay.
+//!
 //! **A display the guest does not drive.** The window of a display after display 0
 //! ([`Shown`]'s `black_undriven`) draws black while the guest shows nothing on it, no scanout and
 //! no presented surface: a guest whose driver drives display 0 alone leaves the others so, and a
@@ -135,11 +141,11 @@ use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult, refusals};
 use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::os::OsVm;
-use reims_vgpu_window::{DrawnCursor, PixelRect};
+use reims_vgpu_window::{DrawnCursor, DrawnOverlay, PixelRect};
 
 use reims_vgpu_vulkan::core::display::pipeline::{DisplayPipelineCache, PipelineKey};
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-use reims_vgpu_vulkan::core::platform::types::MtlViewport;
+use reims_vgpu_vulkan::core::platform::types::{MtlScissorRect, MtlViewport};
 
 use self::cursor::CursorPass;
 use super::color::DisplayColor;
@@ -234,6 +240,9 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     /// What draws the guest's cursor where the window draws it (`cursor`): its pipelines and its
     /// glyph's texture, made at their first use.
     cursor: Mutex<CursorPass<P>>,
+    /// What draws the window's overlay (the module doc): its pipelines and its image's texture,
+    /// made at their first use.
+    overlay: Mutex<CursorPass<P>>,
     /// For the tests: every colour takes the pass, with no table.
     #[cfg(test)]
     tables_off: AtomicBool,
@@ -557,7 +566,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             color_table: Mutex::new(None),
             ramps: Mutex::default(),
             scanout_ramp: Kept::new(),
-            cursor: Mutex::default(),
+            cursor: Mutex::new(CursorPass::cursor()),
+            overlay: Mutex::new(CursorPass::overlay()),
             #[cfg(test)]
             tables_off: AtomicBool::new(false),
         }
@@ -570,7 +580,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     }
 
     /// Lets go of the objects the draws made and keep (the converter, the colour's functions,
-    /// pipelines, buffers and table, the ramps, and the cursor's pipelines and glyph texture)
+    /// pipelines, buffers and table, the ramps, and the cursor's and the overlay's pipelines and
+    /// textures)
     /// where the device recovered since they were made ([`GpuDevice::recoveries`], the module
     /// doc, "A recovered device"): the next draw that needs one makes it again on the device's
     /// new GPU device. The scanout's import is a no-copy buffer over the region's pages, which a
@@ -585,7 +596,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         log::info!(
             target: "reims_vgpu::graphics",
             "the device recovered: the display's draws make their pipelines, buffers, tables, \
-             ramps and cursor again"
+             ramps, cursor and overlay again"
         );
         self.converter.forget();
         self.color_functions.forget();
@@ -594,7 +605,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         *self.color_table.lock() = None;
         self.ramps.lock().clear();
         self.scanout_ramp.forget();
-        *self.cursor.lock() = CursorPass::default();
+        *self.cursor.lock() = CursorPass::cursor();
+        *self.overlay.lock() = CursorPass::overlay();
     }
 
     /// Runs `draw`, a draw of the display, in a refusal scope (the module doc, "A refused draw"):
@@ -698,7 +710,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     ///
     /// Where the window draws the guest's cursor itself (`cursor`, the guest moving it on its
     /// own), `cursor` is drawn over what the display shows, in a pass of its own after it
-    /// ([`Self::encode_cursor`]); never while the display's panel is off.
+    /// ([`Self::encode_cursor`]); never while the display's panel is off. Where the window shows
+    /// an overlay, `overlay` is drawn over all of it, the panel off too, and over black where the
+    /// display has nothing to draw ([`Self::encode_overlay`], the module doc).
     ///
     /// It runs in the draw's refusal scope ([`Self::scoped`]): `None` too where a death in it
     /// refused it, nothing committed, and its presents are answered at the next refresh.
@@ -707,10 +721,21 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
+        overlay: Option<&DrawnOverlay>,
     ) -> Option<(P::CommandBuffer, DrawnPresents<P>)> {
         self.scoped(|| {
             let mut presents = self.presented.drawn();
-            let (command_buffer, hold) = self.encode_shown(texture, region)?;
+            let shown = match self.encode_shown(texture, region) {
+                Some(shown) => shown,
+                None if overlay.is_some() => {
+                    // Nothing of the display's: the overlay over black (the module doc).
+                    let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+                    self.clear(&command_buffer, texture);
+                    (command_buffer, None)
+                }
+                None => return None,
+            };
+            let (command_buffer, hold) = shown;
             if let Some(hold) = hold {
                 // The surface's block stays until the draw has read it.
                 presents.reading(hold);
@@ -719,6 +744,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 && !self.shown.asleep()
             {
                 self.encode_cursor(&command_buffer, texture, region, cursor);
+            }
+            if let Some(overlay) = overlay {
+                self.encode_overlay(&command_buffer, texture, overlay);
             }
             Some((command_buffer, presents))
         })
@@ -735,16 +763,58 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         region: PixelRect,
         cursor: &DrawnCursor,
     ) {
+        let size = (texture.width(), texture.height());
+        let Some(placed) = cursor::placement(region, size, cursor) else {
+            return;
+        };
+        self.encode_glyph(command_buffer, texture, &self.cursor, placed, &cursor.glyph);
+    }
+
+    /// The window's `overlay` drawn into `texture` over what `command_buffer` drew there, a pixel
+    /// to a pixel at its place, in a render pass of its own as the cursor's
+    /// ([`Self::encode_cursor`]); nothing where it would not show, or where the platform refuses
+    /// the converter, the pipeline or the texture.
+    fn encode_overlay(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        texture: &P::Texture,
+        overlay: &DrawnOverlay,
+    ) {
+        let size = (texture.width(), texture.height());
+        let Some(placed) = cursor::overlay_placement(size, overlay) else {
+            return;
+        };
+        self.encode_glyph(
+            command_buffer,
+            texture,
+            &self.overlay,
+            placed,
+            &overlay.image,
+        );
+    }
+
+    /// `glyph` drawn into `texture` at `placed` (its viewport and scissor) with what `kept` keeps
+    /// from frame to frame, in a render pass of its own that loads it, with the converter's strip
+    /// and the kept pipeline and glyph's texture (`cursor`'s module doc); nothing where the
+    /// platform refuses the converter, the pipeline or the texture.
+    fn encode_glyph(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        texture: &P::Texture,
+        kept: &Mutex<CursorPass<P>>,
+        placed: (MtlViewport, MtlScissorRect),
+        glyph: &Arc<reims_vgpu_window::Glyph>,
+    ) {
         let Some(converter) = self.converter() else {
             return;
         };
-        let prepared = self.cursor.lock().prepare(
+        let prepared = kept.lock().prepare(
             &self.platform,
             &self.device,
             &converter,
             texture,
-            region,
-            cursor,
+            placed,
+            glyph,
         );
         let Some(prepared) = prepared else {
             return;
@@ -1611,7 +1681,6 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
 #[cfg(test)]
 mod tests {
     use reims_vgpu_vulkan::core::platform::ObjId;
-    use reims_vgpu_vulkan::core::platform::types::MtlScissorRect;
     use reims_vgpu_vulkan::core::testkit::calllog::Call;
     use reims_vgpu_vulkan::core::testkit::objects::{CompleteOn, kind};
     use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform};
@@ -1717,7 +1786,7 @@ mod tests {
             let (platform, draw, presented, drawable) = rig();
             let surface = texture(&draw, 80);
             let hold = show_held(&presented, &surface, queued);
-            let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None).unwrap();
+            let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None, None).unwrap();
             assert_eq!(hold.strong_count(), 2, "the draw holds the surface");
             presents.after(&command_buffer);
             no_catch(command_buffer.commit(OnFault::Die));
@@ -1798,7 +1867,7 @@ mod tests {
         });
         let log = platform.call_log();
         let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, None).unwrap();
+        let _ = draw.encode(&drawable, WHOLE, None, None).unwrap();
         let calls = log.since(mark);
         assert!(
             !calls
@@ -1842,7 +1911,7 @@ mod tests {
         let cursor = drawn_cursor();
 
         let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, Some(&cursor)).unwrap();
+        let _ = draw.encode(&drawable, WHOLE, Some(&cursor), None).unwrap();
         let calls = log.since(mark);
         let sels: Vec<_> = calls.iter().map(|c| c.sel).collect();
         let blit = sels.iter().position(|s| *s == COPY_IN).expect("the blit");
@@ -1898,7 +1967,7 @@ mod tests {
 
         // The same glyph again: nothing made.
         let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, Some(&cursor)).unwrap();
+        let _ = draw.encode(&drawable, WHOLE, Some(&cursor), None).unwrap();
         for made in [NEW_PIPELINE, NEW_TEXTURE, REPLACE] {
             assert_eq!(count_since(&platform, mark, made), 0, "{made}");
         }
@@ -1911,7 +1980,7 @@ mod tests {
             ..drawn_cursor()
         };
         let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, Some(&moved)).unwrap();
+        let _ = draw.encode(&drawable, WHOLE, Some(&moved), None).unwrap();
         assert_eq!(count_since(&platform, mark, NEW_PIPELINE), 0);
         assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 1);
         assert_eq!(count_since(&platform, mark, REPLACE), 1);
@@ -1919,14 +1988,123 @@ mod tests {
 
         // No cursor, and the panel off.
         let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, None).unwrap();
+        let _ = draw.encode(&drawable, WHOLE, None, None).unwrap();
         assert_eq!(count_since(&platform, mark, BEGIN), 0);
         draw.shown
             .asleep
             .store(true, std::sync::atomic::Ordering::Release);
         let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, Some(&moved)).unwrap();
+        let _ = draw.encode(&drawable, WHOLE, Some(&moved), None).unwrap();
         assert_eq!(count_since(&platform, mark, DRAW), 0);
+    }
+
+    /// The window's overlay is drawn over the frame and the cursor, in a pass of its own after
+    /// both: a blending pipeline of its own, made once; its image's texture, made and filled once
+    /// for each image; its rectangle at its place, a pixel to a pixel, as the viewport, and the
+    /// scissor. It is drawn while the panel is off too, where the cursor is not, and where the
+    /// display has nothing to draw, over a clear of the drawable
+    #[test]
+    fn the_window_s_overlay_is_drawn_over_everything_in_a_pass_of_its_own() {
+        const BEGIN: &str = "renderCommandEncoderWithDescriptor:";
+        let (platform, draw, _, drawable) = rig();
+        let log = platform.call_log();
+        let cursor = drawn_cursor();
+        let overlay = DrawnOverlay {
+            image: Arc::new(reims_vgpu_window::Glyph {
+                width: 8,
+                height: 4,
+                hot_spot: (0, 0),
+                rgba: vec![0xff; 128],
+            }),
+            at: (2, 3),
+        };
+
+        let mark = log.mark();
+        let _ = draw
+            .encode(&drawable, WHOLE, Some(&cursor), Some(&overlay))
+            .unwrap();
+        let calls = log.since(mark);
+        let sels: Vec<_> = calls.iter().map(|c| c.sel).collect();
+        let passes: Vec<_> = (sels.iter().enumerate())
+            .filter(|(_, s)| **s == BEGIN)
+            .map(|(at, _)| at)
+            .collect();
+        let blit = sels.iter().position(|s| *s == COPY_IN).expect("the blit");
+        assert_eq!(
+            passes.len(),
+            2,
+            "the cursor's, then the overlay's: {sels:?}"
+        );
+        assert!(blit < passes[0]);
+        let pipelines: Vec<_> = (calls.iter())
+            .filter(|c| c.sel == NEW_PIPELINE)
+            .map(|c| format!("{:?}", c.args[0]))
+            .collect();
+        assert_eq!(pipelines.len(), 2, "{pipelines:?}");
+        assert!(pipelines[0].contains("reims-vgpu.display-cursor"));
+        assert!(pipelines[1].contains("reims-vgpu.display-overlay"));
+        assert!(pipelines[1].contains("blending_enabled: true"));
+        assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 2);
+        assert_eq!(count_since(&platform, mark, REPLACE), 2);
+        let arg = |sel: &str| {
+            (calls.iter())
+                .filter(|c| c.sel == sel)
+                .map(|c| c.args[0].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            arg("setViewport:")[1],
+            Arg::val(&MtlViewport {
+                origin_x: 2.0,
+                origin_y: 3.0,
+                width: 8.0,
+                height: 4.0,
+                znear: 0.0,
+                zfar: 1.0,
+            })
+        );
+        assert_eq!(
+            arg("setScissorRect:")[1],
+            Arg::val(&MtlScissorRect {
+                x: 2,
+                y: 3,
+                width: 8,
+                height: 4,
+            })
+        );
+        assert_eq!(count_since(&platform, mark, DRAW), 2);
+
+        // The same image again: nothing made.
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, WHOLE, None, Some(&overlay)).unwrap();
+        for made in [NEW_PIPELINE, NEW_TEXTURE, REPLACE] {
+            assert_eq!(count_since(&platform, mark, made), 0, "{made}");
+        }
+        assert_eq!(count_since(&platform, mark, DRAW), 1);
+
+        // The panel off: the overlay over black, with no cursor.
+        draw.shown
+            .asleep
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mark = log.mark();
+        let _ = draw
+            .encode(&drawable, WHOLE, Some(&cursor), Some(&overlay))
+            .unwrap();
+        assert_eq!(count_since(&platform, mark, DRAW), 1);
+
+        // Nothing of the display's to draw: a clear, then the overlay; with no overlay, nothing.
+        let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
+        let presented = Arc::new(Presented::<FakePlatform>::default());
+        let empty = Arc::new(Shown::default());
+        let draw = ScanoutDraw::new(Arc::clone(&platform), &region, &empty, &presented).unwrap();
+        assert!(draw.encode(&drawable, WHOLE, None, None).is_none());
+        let mark = log.mark();
+        let _ = draw
+            .encode(&drawable, WHOLE, None, Some(&overlay))
+            .expect("a draw");
+        let sels = log.sels_since(mark);
+        assert_eq!(sels.iter().filter(|s| **s == BEGIN).count(), 2, "{sels:?}");
+        assert_eq!(count_since(&platform, mark, DRAW), 1);
     }
 
     /// A death in the cursor's pass refuses that draw alone: the pass's encoder is ended after
@@ -1939,7 +2117,7 @@ mod tests {
         let cursor = drawn_cursor();
         platform.script().push(DRAW, Step::crash());
         let mark = log.mark();
-        assert!(draw.encode(&drawable, WHOLE, Some(&cursor)).is_none());
+        assert!(draw.encode(&drawable, WHOLE, Some(&cursor), None).is_none());
         let sels = log.sels_since(mark);
         let died = sels.iter().position(|s| *s == DRAW).expect("the draw");
         assert_eq!(&sels[died + 1..], ["endEncoding"], "{sels:?}");
@@ -1947,7 +2125,7 @@ mod tests {
 
         let mark = log.mark();
         let (command_buffer, presents) =
-            (draw.encode(&drawable, WHOLE, Some(&cursor))).expect("a draw");
+            (draw.encode(&drawable, WHOLE, Some(&cursor), None)).expect("a draw");
         presents.after(&command_buffer);
         command_buffer.commit(OnFault::Die).unwrap();
         let sels = log.sels_since(mark);
@@ -2040,7 +2218,7 @@ mod tests {
             width: u64::from(width),
             height: u64::from(height),
         };
-        let (command_buffer, presents) = draw.encode(&target, image, Some(&cursor)).unwrap();
+        let (command_buffer, presents) = draw.encode(&target, image, Some(&cursor), None).unwrap();
         command_buffer.commit(OnFault::Die).unwrap();
         command_buffer.wait_until_completed(OnFault::Die).unwrap();
         drop(presents);
@@ -2178,7 +2356,7 @@ mod tests {
             }
             platform.script().push(at, Step::crash());
             let mark = log.mark();
-            assert!(draw.encode(&drawable, region, None).is_none());
+            assert!(draw.encode(&drawable, region, None, None).is_none());
             let sels = log.sels_since(mark);
             let died = sels
                 .iter()
@@ -2188,7 +2366,8 @@ mod tests {
             assert!(!sels.contains(&"commit"));
 
             let mark = log.mark();
-            let (command_buffer, presents) = draw.encode(&drawable, region, None).expect("a draw");
+            let (command_buffer, presents) =
+                draw.encode(&drawable, region, None, None).expect("a draw");
             presents.after(&command_buffer);
             command_buffer.commit(OnFault::Die).unwrap();
             let sels = log.sels_since(mark);
@@ -2238,7 +2417,7 @@ mod tests {
             platform.script().push(at, Step::crash());
             let mark = log.mark();
             assert!(
-                draw.encode(&drawable, region, None).is_none(),
+                draw.encode(&drawable, region, None, None).is_none(),
                 "{at} {before}"
             );
             let sels = log.sels_since(mark);
@@ -2261,7 +2440,8 @@ mod tests {
             assert!(!sels.contains(&"commit"), "{sels:?}");
 
             let mark = log.mark();
-            let (command_buffer, presents) = draw.encode(&drawable, region, None).expect("a draw");
+            let (command_buffer, presents) =
+                draw.encode(&drawable, region, None, None).expect("a draw");
             presents.after(&command_buffer);
             command_buffer.commit(OnFault::Die).unwrap();
             let sels = log.sels_since(mark);
@@ -2291,7 +2471,7 @@ mod tests {
         };
 
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         let blits: Vec<_> = log
             .since(mark)
             .into_iter()
@@ -2309,7 +2489,7 @@ mod tests {
         set_color(&presented, 1, [None, None, None, Some(Arc::clone(&post))]);
         let made = keep_new_buffers(&platform, 16);
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         let calls = log.since(mark);
         let named: Vec<_> = calls
             .iter()
@@ -2349,7 +2529,7 @@ mod tests {
 
         // The same colour again: only the scanout's place is made.
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         assert_eq!(
             log.sels_since(mark)
                 .iter()
@@ -2391,7 +2571,7 @@ mod tests {
             height: 32,
         };
         let mark = log.mark();
-        let _ = draw.encode(&drawable, corner, None).unwrap();
+        let _ = draw.encode(&drawable, corner, None, None).unwrap();
         assert_eq!(
             log.sels_since(mark)
                 .iter()
@@ -2413,7 +2593,7 @@ mod tests {
         // Every stage off again: the blit, as before.
         set_color(&presented, 3, Default::default());
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         assert_eq!(
             log.sels_since(mark).iter().filter(|s| **s == DRAW).count(),
             0
@@ -2454,7 +2634,7 @@ mod tests {
         let pre: Table = Arc::from(vec![[0.25, 0.25, 0.25, 0.0]]);
         set_color(&presented, 1, [None, Some(pre), None, None]);
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         let calls = log.since(mark);
         assert_eq!(calls.iter().filter(|c| c.sel == DRAW).count(), 1);
         assert!(
@@ -2519,7 +2699,7 @@ mod tests {
         let made = keep_new_buffers(&platform, 32);
 
         let mark = log.mark();
-        let (first, _) = draw.encode(&drawable, region, None).unwrap();
+        let (first, _) = draw.encode(&drawable, region, None, None).unwrap();
         assert_eq!(
             count_since(&platform, mark, DRAW),
             2,
@@ -2551,7 +2731,7 @@ mod tests {
 
         // Not completed yet: the next draw draws the table again, into the same texture.
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         assert_eq!(count_since(&platform, mark, DRAW), 2);
         assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 0);
 
@@ -2559,7 +2739,7 @@ mod tests {
         platform.world().set_auto_complete(Some(CompleteOn::Caller));
         first.commit(OnFault::Die).unwrap();
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         assert_eq!(count_since(&platform, mark, DRAW), 1);
         assert_eq!(
             count_since(&platform, mark, NEW_BUFFER),
@@ -2581,7 +2761,7 @@ mod tests {
         let plane: Table = Arc::from(vec![[1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 0.0, 0.0]]);
         set_color(&presented, 2, [Some(plane), None, None, None]);
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         assert_eq!(count_since(&platform, mark, DRAW), 2);
         assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 1);
 
@@ -2593,7 +2773,7 @@ mod tests {
         ]);
         set_color(&presented, 3, [None, None, Some(rows), Some(post)]);
         let mark = log.mark();
-        let _ = draw.encode(&drawable, region, None).unwrap();
+        let _ = draw.encode(&drawable, region, None, None).unwrap();
         assert_eq!(count_since(&platform, mark, DRAW), 1);
         assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 0);
         assert_eq!(
@@ -2641,7 +2821,7 @@ mod tests {
             let surface = texture(&draw, format);
             let view = show(&surface);
             let mark = log.mark();
-            let _ = draw.encode(&drawable, region, None).unwrap();
+            let _ = draw.encode(&drawable, region, None, None).unwrap();
             assert_eq!(count_since(&platform, mark, DRAW), 2, "{format}");
             assert_eq!(count_since(&platform, mark, NEW_VIEW), 1, "{format}");
             let viewed = view.made().expect("the display's view").clone_ref();
@@ -2674,7 +2854,7 @@ mod tests {
             );
             // Again: the ramp and the view are kept.
             let mark = log.mark();
-            let _ = draw.encode(&drawable, region, None).unwrap();
+            let _ = draw.encode(&drawable, region, None, None).unwrap();
             assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 0, "{format}");
             assert_eq!(count_since(&platform, mark, NEW_VIEW), 0, "{format}");
             assert_eq!(
@@ -2704,7 +2884,7 @@ mod tests {
         for (shown, at) in [(&surface, quarter), (&srgb, region)] {
             let view = show(shown);
             let mark = log.mark();
-            let _ = draw.encode(&drawable, at, None).unwrap();
+            let _ = draw.encode(&drawable, at, None, None).unwrap();
             assert_eq!(count_since(&platform, mark, DRAW), 1);
             let viewed = view.made().expect("the display's view");
             assert_eq!(fragment_textures(&platform, mark), [(viewed.id(), 0)]);
@@ -2744,7 +2924,7 @@ mod tests {
             }),
         });
         let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, None).expect("a draw");
+        let _ = draw.encode(&drawable, WHOLE, None, None).expect("a draw");
         assert_eq!(count_since(&platform, mark, NEW_VIEW), 1);
         let viewed = view.made().expect("the display's view").clone_ref();
         assert_ne!(viewed.resource_index(), 7);
@@ -2757,7 +2937,7 @@ mod tests {
         let next = placed();
         assert_eq!(next.resource_index(), 7);
         let mark = log.mark();
-        let _ = draw.encode(&drawable, WHOLE, None).expect("a draw");
+        let _ = draw.encode(&drawable, WHOLE, None, None).expect("a draw");
         assert_eq!(count_since(&platform, mark, NEW_VIEW), 0);
         assert_eq!(fragment_textures(&platform, mark), [(viewed.id(), 0)]);
     }
@@ -2789,14 +2969,14 @@ mod tests {
         let before = refused();
         platform.script().push(NEW_VIEW, Step::Nil);
         let mark = log.mark();
-        assert!(draw.encode(&drawable, WHOLE, None).is_none());
+        assert!(draw.encode(&drawable, WHOLE, None, None).is_none());
         assert_eq!(refused(), before + 1);
         assert!(view.made().is_none());
         let sels = log.sels_since(mark);
         assert_eq!(sels, [NEW_VIEW], "{sels:?}");
 
         let mark = log.mark();
-        let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None).expect("a draw");
+        let (command_buffer, presents) = draw.encode(&drawable, WHOLE, None, None).expect("a draw");
         presents.after(&command_buffer);
         command_buffer.commit(OnFault::Die).unwrap();
         assert_eq!(refused(), before + 1);

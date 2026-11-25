@@ -474,6 +474,7 @@ impl Shell {
             }
         }
         self.window.surface().set_layout(layout);
+        os::laid_out(self);
     }
 
     /// The pointer moved to `point` (in points): the cursor changes as it enters or leaves the
@@ -487,15 +488,17 @@ impl Shell {
     }
 
     /// Sets the cursor: over the image the guest's, or none while the guest hides its own or the
-    /// window draws it itself (`handle`'s module doc); the host's arrow elsewhere and before the
-    /// guest has set one. SDL's cursor is the process's, so only the window the pointer is in
-    /// (SDL's mouse focus) sets it ([`cursor_step`]).
+    /// window draws it itself (`handle`'s module doc); the host's arrow elsewhere, before the
+    /// guest has set one, and while a question is open in the window ([`os::asks`]). SDL's cursor
+    /// is the process's, so only the window the pointer is in (SDL's mouse focus) sets it
+    /// ([`cursor_step`]).
     pub(crate) fn refresh_cursor(&mut self) {
         let guest = self.window.guest();
         // SAFETY: SDL's video runs on this thread.
         let has_pointer = unsafe { SDL_GetMouseFocus() } == self.sdl;
         let hidden = !guest.host_cursor_visible() && guest.cursor.is_some();
-        let ours = match cursor_step(has_pointer, self.over_image, hidden) {
+        let over_image = self.over_image && !os::asks(self);
+        let ours = match cursor_step(has_pointer, over_image, hidden) {
             CursorStep::Leave => return,
             CursorStep::Hide => {
                 // SAFETY: SDL's video runs on this thread.
@@ -685,8 +688,8 @@ fn let_go_for_close(c: &mut impl Closing) {
     }
 }
 
-/// The person answered the question a close asked ([`close_asked`]) for windows `ids`: Turn Off,
-/// or a question the OS could not show, tells each one's host, which ends the VM; Cancel tells
+/// The person answered the question a close asked ([`close_asked`]) for windows `ids`: Turn Off
+/// tells each one's host, which ends the VM; Cancel, or a question that could not show, tells
 /// none, and the VM runs on (`crate::close::answered`). A window whose display has ended tells
 /// nothing: its host's callbacks are gone.
 pub(crate) fn answered(ids: &[u64], answer: Answer) {
