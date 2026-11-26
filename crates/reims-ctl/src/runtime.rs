@@ -1056,7 +1056,7 @@ pub fn stop(
                 true
             }
             Err(e) => {
-                progress(&format!("{e}"));
+                progress(&keys_unsent(&e));
                 false
             }
         };
@@ -1085,6 +1085,11 @@ pub fn stop(
         progress(NO_SHUTDOWN);
     }
     power_off(vm, p, &mut progress)
+}
+
+/// What a stop says where its keys did not reach the guest: that, and why, `e` with its causes.
+fn keys_unsent(e: &anyhow::Error) -> String {
+    format!("Control-Option-Command-Power did not reach the guest: {e:#}")
 }
 
 /// What a stop says as it powers off a guest that did not shut down in its timeout.
@@ -1926,6 +1931,39 @@ mod tests {
         );
         let e = format!("{:#}", unreached.unwrap_err());
         assert!(e.ends_with("a forced stop powers it off"), "{e}");
+    }
+
+    /// A stop whose keys do not reach the guest says so, and why, with every cause: where QEMU
+    /// does not answer on its QMP socket, as while another program's client is connected to it
+    /// (qmp.rs), that, not the OS's bare EAGAIN, which is all a user's stop printed
+    /// ("Resource temporarily unavailable (os error 11)"); where nothing listens there, the
+    /// connect's error after the socket's path.
+    #[test]
+    fn a_stop_whose_keys_do_not_reach_the_guest_says_why() {
+        let env = crate::testenv::Env::new("stop-unanswered");
+        let sock = env.root.join("qmp.sock");
+        // A QEMU's socket while another client is connected to it: it accepts no other.
+        let _held = crate::os::UnixListener::bind(&sock).unwrap();
+        let t = Duration::from_millis(200);
+        let unanswered = qmp::Qmp::connect(&sock, t).err();
+        let none = env.root.join("none.sock");
+        let refused = qmp::Qmp::connect(&none, t).err();
+        let unanswered = keys_unsent(&unanswered.unwrap());
+        let refused = keys_unsent(&refused.unwrap());
+        assert_eq!(
+            unanswered,
+            format!(
+                "Control-Option-Command-Power did not reach the guest: QEMU did not answer on {} \
+                 in 0.2 s: QEMU answers one QMP client at a time, and no other while a program \
+                 stays connected to that socket",
+                sock.display()
+            )
+        );
+        let lead = format!(
+            "Control-Option-Command-Power did not reach the guest: connect to {}: ",
+            none.display()
+        );
+        assert!(refused.starts_with(&lead) && refused.len() > lead.len(), "{refused}");
     }
 
     /// An x86-64 VM with an installer has install steps, which name the disk to erase as Disk
