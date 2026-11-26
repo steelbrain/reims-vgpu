@@ -93,8 +93,8 @@ use crate::core::sync::{Condvar, Mutex};
 use super::d3d12::{
     Com, CommandQueueDesc, CreateEventW, DEVICE_CREATE_COMMAND_QUEUE, DEVICE_CREATE_FENCE, Device,
     FENCE_GET_COMPLETED_VALUE, FENCE_SET_EVENT_ON_COMPLETION, Guid, Handle, Hresult,
-    IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, LetGo, QUEUE_SIGNAL,
-    SharedTexture, WAIT_OBJECT_0, WaitForSingleObject, adapter_of, check, guid, system_function,
+    IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, LetGo, QUEUE_SIGNAL, SharedTexture, WAIT_OBJECT_0,
+    WaitForSingleObject, adapter_of, check, guid, system_function,
 };
 
 const IID_ID3D11_ON12_DEVICE: Guid = guid(

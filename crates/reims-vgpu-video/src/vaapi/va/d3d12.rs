@@ -930,7 +930,13 @@ pub(super) fn process_gpu_memory() -> Result<u64, String> {
             // SAFETY: the buffer holds `size` bytes, aligned for the items, which the call writes
             // with the names they point at after them.
             let status = unsafe {
-                array(counter, PDH_FMT_LARGE, &mut size, &mut count, items.as_mut_ptr())
+                array(
+                    counter,
+                    PDH_FMT_LARGE,
+                    &mut size,
+                    &mut count,
+                    items.as_mut_ptr(),
+                )
             };
             if status != 0 {
                 return Err(failed("PdhGetFormattedCounterArrayW", status));

@@ -109,9 +109,11 @@ fn pools_let_go_give_back_their_memory() {
     let mut charged = Vec::new();
     for pool in 1..=3 {
         {
-            let made = SurfacePool::new(&display, SurfaceFormat::Nv12, BIG.0, BIG.1, 0)
-                .expect("a pool");
-            let lent: Vec<Surface> = (0..SURFACES).map(|_| made.get().expect("a surface")).collect();
+            let made =
+                SurfacePool::new(&display, SurfaceFormat::Nv12, BIG.0, BIG.1, 0).expect("a pool");
+            let lent: Vec<Surface> = (0..SURFACES)
+                .map(|_| made.get().expect("a surface"))
+                .collect();
             assert!(
                 lent.iter().all(|surface| surface.texture().is_some()),
                 "pool {pool}: a surface of no texture of ours"
