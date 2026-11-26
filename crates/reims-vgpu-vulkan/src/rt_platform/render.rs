@@ -2350,7 +2350,9 @@ mod tests {
     /// Textures). Its plain usage: the transfers, sampling, and the colour attachment rt gives a
     /// one-sample colour texture for resolves.
     fn twin_stores(device: &RtObj<RtDevice>, format: u64) -> Option<bool> {
-        use ash::vk::{self, FormatFeatureFlags2 as F, ImageCreateFlags as C, ImageUsageFlags as U};
+        use ash::vk::{
+            self, FormatFeatureFlags2 as F, ImageCreateFlags as C, ImageUsageFlags as U,
+        };
         let (srgb, unorm) = match format {
             71 => (vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM),
             81 => (vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM),
@@ -2515,7 +2517,10 @@ mod tests {
             let srgb8 = twin.is_some();
             if let Some(stored) = twin {
                 eprintln!("{format}: the device stores a slot's write through its twin: {stored}");
-                assert_eq!(!unstored, stored, "{format}: whether a slot's write is stored");
+                assert_eq!(
+                    !unstored, stored,
+                    "{format}: whether a slot's write is stored"
+                );
             }
             let declared_refused = unstored || srgb8;
             let declared = [Some(ResourceRef::Texture(&candidate))];
