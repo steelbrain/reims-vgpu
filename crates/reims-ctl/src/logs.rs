@@ -117,7 +117,10 @@ impl End {
         match self {
             End::Exited(status) => format!("{tool} ended with {status}"),
             End::TimedOut(limit) => {
-                format!("{tool} timed out after {} s and was stopped", limit.as_secs())
+                format!(
+                    "{tool} timed out after {} s and was stopped",
+                    limit.as_secs()
+                )
             }
             End::Failed(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 format!("{tool} is not installed on this host")
@@ -197,9 +200,8 @@ fn run_limited(mut cmd: Command, limit: Duration) -> Limited {
             break;
         }
     }
-    let take = |b: &Arc<Mutex<Vec<u8>>>| {
-        std::mem::take(&mut *b.lock().unwrap_or_else(|e| e.into_inner()))
-    };
+    let take =
+        |b: &Arc<Mutex<Vec<u8>>>| std::mem::take(&mut *b.lock().unwrap_or_else(|e| e.into_inner()));
     Limited {
         stdout: take(&stdout),
         stderr: take(&stderr),
