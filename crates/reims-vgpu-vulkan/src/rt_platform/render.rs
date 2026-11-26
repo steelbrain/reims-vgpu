@@ -2083,7 +2083,9 @@ mod tests {
     /// no storage element, a draw whose fragment function writes a texture beyond its slots
     /// (through an argument buffer) is rt's refusal, which draws nothing and is counted under
     /// `rt-refused-gap`, as the compute encoder's dispatch of a kernel that writes the same
-    /// texture at a slot is, and exactly where that dispatch is. The same draw before the
+    /// texture at a slot is, wherever that dispatch is, and also for an 8-bit sRGB texture,
+    /// which a kernel's write at a slot stores through its UNORM twin on every device while a
+    /// write beyond the slots has no storage element for it. The same draw before the
     /// declaration, after a declaration for reading alone, and after a declared write of a
     /// texture with a storage element draws, and so does a draw of a function that reaches no
     /// texture beyond its slots after the declared write.
@@ -2198,6 +2200,11 @@ mod tests {
                 ..TextureDesc::default()
             });
             let unstored = stores_none(&candidate);
+            // `RGBA8Unorm_sRGB` and `BGRA8Unorm_sRGB`: stored at a slot through the UNORM twin
+            // on every device, and no storage element beyond the slots.
+            let srgb8 = matches!(format, 71 | 81);
+            assert!(!(srgb8 && unstored), "{format}: a slot's write of it is stored");
+            let declared_refused = unstored || srgb8;
             let declared = [Some(ResourceRef::Texture(&candidate))];
 
             // A declared write, then the draw: rt's gap where the texture has no storage
@@ -2218,8 +2225,8 @@ mod tests {
             ];
             cmds.extend(drawn(&writing, &vertices, &argument));
             assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
-            assert_eq!(counted(gap), before + u64::from(unstored), "{format}");
-            let (drawn_texels, written_texel) = match unstored {
+            assert_eq!(counted(gap), before + u64::from(declared_refused), "{format}");
+            let (drawn_texels, written_texel) = match declared_refused {
                 true => (red, [0; 4]),
                 false => (green, magenta),
             };
@@ -2270,7 +2277,7 @@ mod tests {
                 vertex_count: 3,
             });
             assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
-            assert_eq!(counted(gap), before + u64::from(unstored), "{format}");
+            assert_eq!(counted(gap), before + u64::from(declared_refused), "{format}");
             assert_eq!(drawn_into(), green, "{format}");
             assert_eq!(texel(&written), magenta, "{format}");
 
@@ -2285,7 +2292,7 @@ mod tests {
             assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
             assert_eq!(counted(gap), before, "{format}");
             assert_eq!(drawn_into(), green, "{format}");
-            if unstored {
+            if declared_refused {
                 refused.push(format);
             }
         }
