@@ -60,7 +60,8 @@
 //!   them waits, once its picture is decoded, for the oldest to land. The landing waits only
 //!   for the hardware, so the wait ends.
 //! - **A picture of the stream that does not decode** is answered with no picture
-//!   ([`picture_error`]), its command buffer completing as any other: one whose bytes do not
+//!   ([`picture_error`], which the backend answers as its error, [`NotDecoded`], and the session
+//!   takes as no picture), its command buffer completing as any other: one whose bytes do not
 //!   read as its standard reads them, one that predicts from a picture the decoder does not
 //!   hold (as a stream's first pictures do where it starts at a P picture), and one after a
 //!   picture that did not decode, before the decoding starts afresh at an I (H.264) or IRAP
@@ -71,7 +72,10 @@
 //!   `kVTVideoDecoderReferenceMissingErr` and no image. The output's earlier bytes, which the
 //!   guest's decoder hands on here, are the device's own, not Apple's concealment. What is no
 //!   picture's (a stream the decoder does not take, an `avcC` or `hvcC` record's error) and
-//!   the hardware's or the host API's errors fault the command buffer.
+//!   the hardware's or the host API's errors fault the command buffer. A session's first such
+//!   picture is logged at `warn`, so a report at the default level shows that a guest was handed
+//!   an output the picture did not land in (a new output's zeros, which show green), and its end
+//!   counts them all.
 //! - **The event** is a shared event, as the host signals it: the runtime holds a command
 //!   buffer's wait for it on the host until the value is reached.
 //! - **An end** ([`Drop`]) closes the landing thread's queue and waits up to [`TEARDOWN_WAIT`]
@@ -79,7 +83,8 @@
 //!   alive what it lands from, so a decoder may go before its last pictures land.
 //!
 //! The session logs the first picture of each way it lands at `info` ("hardware video: ..."),
-//! and its counts at its end: its pictures by the way each landed, the outputs they landed in
+//! and its counts at its end: its pictures by the way each landed, the decodes that answered none
+//! and how many of them were pictures of the stream that do not decode, the outputs they landed in
 //! ([`Outputs`]: how many surfaces' memory, and the most of it live at once), and the time the
 //! CPU's copies of them took.
 
@@ -161,8 +166,8 @@ pub(crate) trait HostDecoder<P: Platform>: Send + 'static {
     /// sets the session handed it, and answers its picture, which the session lands in the
     /// decode's output; `None` for a picture the stream's random access skips (a RASL picture
     /// after a CRA picture at the stream's start), and for one of the stream's pictures that does
-    /// not decode ([`picture_error`]), whose output gets nothing. An error faults the command
-    /// buffer.
+    /// not decode, which it answers as the error [`picture_error`] makes ([`NotDecoded`]), whose
+    /// output gets nothing. Any other error faults the command buffer.
     ///
     /// `au` lies in the guest's bitstream buffer, in place. Its bytes stay mapped and as they are
     /// until the picture answered has landed ([`HostPicture::land`] returned), or, where none is
@@ -1069,19 +1074,24 @@ fn decode_fault(what: impl std::fmt::Display) -> Raise {
 }
 
 /// A backend's answer to a decode whose access unit is a picture of the stream that does not
-/// decode, `error` (the module docs, "A picture of the stream that does not decode"): no picture.
-/// The process's first of each kind of error is logged at `info` (`kind`), and the rest counted.
-pub(crate) fn picture_error<P: Platform>(
-    name: &str,
-    error: impl std::fmt::Display,
-) -> Option<Box<dyn HostPicture<P>>> {
-    log::info!(
-        kind:% = error;
-        "hardware video: {name}: a picture of the stream that does not decode lands nothing, its \
-         output keeping its bytes: {error}"
-    );
-    None
+/// decode, `error` (the module docs, "A picture of the stream that does not decode"): the error
+/// [`NotDecoded`], which the session answers as no picture, faulting nothing, and logs and counts
+/// ([`HostVideoSession::not_decoded`]).
+pub(crate) fn picture_error(error: impl std::fmt::Display) -> BackendError {
+    Box::new(NotDecoded(error.to_string()))
 }
+
+/// A picture of the stream that does not decode, as its decoder said it ([`picture_error`]).
+#[derive(Debug)]
+pub(crate) struct NotDecoded(String);
+
+impl std::fmt::Display for NotDecoded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotDecoded {}
 
 /// One decode's work for the landing thread: its picture, its output and its bitstream's buffer,
 /// held until its value is signalled.
@@ -1151,6 +1161,8 @@ struct Counts {
     landed: [u64; 6],
     /// Decodes that answered no picture.
     skipped: u64,
+    /// Of them, pictures of the stream that do not decode ([`NotDecoded`]).
+    not_decoded: u64,
     /// Pictures that failed to land.
     failed: u64,
     /// Pictures the hardware answered failed that landed as it left them.
@@ -1270,6 +1282,28 @@ impl<P: Platform> HostVideoSession<P> {
             landing: Some(landing),
         })
     }
+
+    /// Counts `not`, a decode's picture of the stream that does not decode, which lands nothing,
+    /// its output keeping its bytes; the session's first is logged at `warn` (the module docs, "A
+    /// picture of the stream that does not decode"), the rest counted at its end. Answers whether
+    /// it was the first, said.
+    fn not_decoded(&self, not: &NotDecoded) -> bool {
+        let first = {
+            let mut counts = self.counts.lock();
+            counts.not_decoded += 1;
+            counts.not_decoded == 1
+        };
+        if first {
+            let name = self.name;
+            log::warn!(
+                kind:% = not;
+                "hardware video: {name}: a picture of the stream that does not decode lands \
+                 nothing, its output keeping its bytes (a new output's zeros): {not}; the \
+                 session's others are counted at its end"
+            );
+        }
+        first
+    }
 }
 
 impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
@@ -1289,7 +1323,16 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
             (state.decoder.parameter_sets(decode.parameter_sets))
                 .map_err(|error| decode_fault(format_args!("its parameter sets: {error}")))?;
         }
-        let picture = state.decoder.decode(au, &output).map_err(decode_fault)?;
+        let picture = match state.decoder.decode(au, &output) {
+            Ok(picture) => picture,
+            Err(error) => match error.downcast::<NotDecoded>() {
+                Ok(not) => {
+                    self.not_decoded(&not);
+                    None
+                }
+                Err(error) => return Err(decode_fault(error)),
+            },
+        };
         state.outputs.saw(&output);
         let skipped = picture.is_none();
         let value = state.value + 1;
@@ -1361,14 +1404,16 @@ impl<P: Platform> Drop for HostVideoSession<P> {
             String::new()
         };
         log::info!(
-            "hardware video: {name}: a session ended after {last} decodes: landed {}; {} skipped, \
-             {} failed, {} landed as the hardware failed them{outputs_said}{cpu_said}",
+            "hardware video: {name}: a session ended after {last} decodes: landed {}; {} skipped \
+             ({} of them pictures of the stream that do not decode), {} failed, {} landed as the \
+             hardware failed them{outputs_said}{cpu_said}",
             if landed.is_empty() {
                 "none".to_owned()
             } else {
                 landed.join(", ")
             },
             counts.skipped,
+            counts.not_decoded,
             counts.failed,
             counts.landed_failed
         );

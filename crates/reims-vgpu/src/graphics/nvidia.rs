@@ -630,7 +630,7 @@ impl<P: Platform> HostDecoder<P> for NvdecDecoder<P> {
     ) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError> {
         let picture = match self.decoder.decode(au) {
             Ok(picture) => picture,
-            Err(error) if error.is_picture_error() => return Ok(picture_error(NAME, error)),
+            Err(error) if error.is_picture_error() => return Err(picture_error(error)),
             Err(error) => return Err(error.into()),
         };
         Ok(picture.map(|picture| {

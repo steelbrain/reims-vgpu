@@ -240,11 +240,12 @@ impl HostPicture<P> for Picture {
     }
 }
 
-/// A decoder that logs what it is handed and answers `answers` in turn: a picture of
+/// A decoder that logs what it is handed and answers `answers` in turn (an error as it is, a
+/// picture of the stream that does not decode's [`picture_error`] among them): a picture of
 /// `Fill(n)` for decode `n` once they run out.
 struct Decoder {
     log: Log,
-    answers: VecDeque<Result<Option<Picture>, &'static str>>,
+    answers: VecDeque<Result<Option<Picture>, BackendError>>,
     decoded: u8,
     most_unlanded: usize,
 }
@@ -276,7 +277,7 @@ impl HostDecoder<P> for Decoder {
 /// A session over a decoder answering `answers`, and the log it keeps, that spares 8 pictures.
 fn session(
     p: &FakePlatform,
-    answers: Vec<Result<Option<Picture>, &'static str>>,
+    answers: Vec<Result<Option<Picture>, BackendError>>,
     log: &Log,
 ) -> HostVideoSession<P> {
     session_sparing(p, answers, log, 8)
@@ -285,7 +286,7 @@ fn session(
 /// [`session`]'s, its decoder sparing `most_unlanded` pictures.
 fn session_sparing(
     p: &FakePlatform,
-    answers: Vec<Result<Option<Picture>, &'static str>>,
+    answers: Vec<Result<Option<Picture>, BackendError>>,
     log: &Log,
     most_unlanded: usize,
 ) -> HostVideoSession<P> {
@@ -637,7 +638,7 @@ struct InCache {
 
 #[cfg(unix)]
 impl InCache {
-    fn new(p: &FakePlatform, answers: Vec<Result<Option<Picture>, &'static str>>) -> Self {
+    fn new(p: &FakePlatform, answers: Vec<Result<Option<Picture>, BackendError>>) -> Self {
         use reims_vgpu_vulkan::core::platform::values::TextureDesc;
         let s = session(p, answers, &Log::default());
         let memory = Arc::new(Acquires {
@@ -884,30 +885,63 @@ fn values_are_signalled_in_decode_order_once_landed() {
 
 /// A picture of the stream that does not decode ([`picture_error`]) lands nothing: its value is
 /// signalled in its turn, its command buffer completes as any, and its output keeps its bytes.
+/// The session counts it among the decodes that answered no picture and apart, for its end's
+/// line, and says only its first ([`HostVideoSession::not_decoded`]).
 #[test]
 fn a_picture_of_the_stream_that_does_not_decode_lands_nothing_and_completes() {
-    assert!(picture_error::<P>("test", "a reference frame is missing").is_none());
+    assert!(picture_error("a reference frame is missing").is::<NotDecoded>());
     let p = FakePlatform::new();
     let log = Log::default();
-    let s = session(&p, vec![Ok(None)], &log);
+    let answers = vec![
+        Err(picture_error("a reference frame is missing")),
+        Ok(None),
+        Err(picture_error("a picture after one that did not decode")),
+    ];
+    let s = session(&p, answers, &log);
     let bitstream = buffer(&p, 4096, STORAGE_SHARED);
-    let (first, second) = (
-        buffer(&p, 16384, STORAGE_SHARED),
-        buffer(&p, 16384, STORAGE_SHARED),
+    let outputs: Vec<_> = (0..4).map(|_| buffer(&p, 16384, STORAGE_SHARED)).collect();
+    let decoded: Vec<_> = (outputs.iter())
+        .map(|out| (s.decode(&decode(&bitstream, &[], planes(out, out, 96)))).unwrap())
+        .collect();
+    assert_eq!(
+        decoded.iter().map(|d| d.value).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
     );
-    let none = s
-        .decode(&decode(&bitstream, &[], planes(&first, &first, 96)))
-        .unwrap();
-    assert_eq!(none.value, 1);
-    let next = s
-        .decode(&decode(&bitstream, &[], planes(&second, &second, 96)))
-        .unwrap();
-    assert_eq!(next.value, 2);
-    assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
-    assert!(!none.landed.as_deref().is_some_and(Landed::failed));
-    assert!(bytes(&first).iter().all(|&x| x == UNTOUCHED));
-    assert!(holds(&bytes(&second), 0, 64, 96, 2));
-    assert_eq!(s.counts.lock().skipped, 1);
+    assert_eq!(
+        decoded.iter().map(|d| d.skipped).collect::<Vec<_>>(),
+        [true, true, true, false]
+    );
+    assert!(event_of(&s).wait_until_signaled_value(4, 10_000));
+    assert!(
+        !decoded
+            .iter()
+            .any(|d| d.landed.as_deref().is_some_and(Landed::failed))
+    );
+    for out in &outputs[..3] {
+        assert!(bytes(out).iter().all(|&x| x == UNTOUCHED));
+    }
+    assert!(holds(&bytes(&outputs[3]), 0, 64, 96, 4));
+    let counts = s.counts.lock();
+    assert_eq!((counts.skipped, counts.not_decoded), (3, 2));
+}
+
+/// Of a session's pictures of the stream that do not decode, only its first is said
+/// ([`HostVideoSession::not_decoded`] answers whether it said it), each session's own.
+#[test]
+fn a_session_says_its_first_picture_that_does_not_decode_alone() {
+    let p = FakePlatform::new();
+    let not = NotDecoded("a reference frame is missing".to_owned());
+    let (one, two) = (
+        session(&p, Vec::new(), &Log::default()),
+        session(&p, Vec::new(), &Log::default()),
+    );
+    assert_eq!(
+        [one.not_decoded(&not), one.not_decoded(&not)],
+        [true, false]
+    );
+    assert!(two.not_decoded(&not));
+    assert_eq!(one.counts.lock().not_decoded, 2);
+    assert_eq!(two.counts.lock().not_decoded, 1);
 }
 
 /// A decode that would have the session hold more pictures unlanded than its decoder spares
@@ -942,7 +976,11 @@ fn a_decode_past_the_decoder_s_spare_pictures_waits_for_the_oldest_to_land() {
 fn a_failed_landing_is_signalled_and_a_refusal_spends_no_value() {
     let p = FakePlatform::new();
     let log = Log::default();
-    let s = session(&p, vec![Ok(Some(Picture::Fail)), Err("a bad slice")], &log);
+    let s = session(
+        &p,
+        vec![Ok(Some(Picture::Fail)), Err("a bad slice".into())],
+        &log,
+    );
     let bitstream = buffer(&p, 4096, STORAGE_SHARED);
     let pages = buffer(&p, 16384, STORAGE_SHARED);
     let d = || decode(&bitstream, &[], planes(&pages, &pages, 96));

@@ -1300,7 +1300,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
             .and_then(|targets| targets.target_for(codec, output, &self.said, &self.roles));
         let mut frames = match self.frames(au, target_for) {
             Ok(frames) => frames,
-            Err(error) if error.is_picture_error() => return Ok(picture_error(NAME, error)),
+            Err(error) if error.is_picture_error() => return Err(picture_error(error)),
             Err(error) => return Err(error.into()),
         };
         let frame = match (frames.pop(), frames.len()) {
