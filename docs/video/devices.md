@@ -24,8 +24,11 @@ the runtime device's GPU (the LUID Vulkan answers for it) and Mesa's VA-API driv
 dma-buf: its pictures decode into shared Direct3D 12 textures, which the runtime device's GPU
 copies into the guest's planes, or their device caches; where the device imports none, they come
 back through `vaGetImage` and the CPU's copy ([vaapi.md](vaapi.md), "Loading libva"). On Intel's UHD 630 (driver 31.0.101.2145)
-`vaon12` decodes H.264 and HEVC Main and Main 10 and encodes nothing, so the device lists no
-encoder there.
+`vaon12` decodes H.264 and HEVC Main and Main 10 and encodes nothing. The Windows arm answers no
+encoder on any GPU, whatever `vaon12` encodes (`open_on_rt` in
+`crates/reims-vgpu/src/graphics/vaapi.rs` opens with `encodes: false`): rt imports no shared
+Direct3D 12 texture, which an encoder's input would be written through. So on a Windows host the
+device lists no encoder, and the guest encodes in software, on every GPU.
 
 Each arm that declines says why in one line at info. A Mac has no video arm, on either platform.
 Where no arm takes the device, the host writes no video caps, and the guest is offered no
