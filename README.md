@@ -153,7 +153,7 @@ logs with the host's details into Downloads for a bug report.
 reims-ctl list                  # the VMs and whether they run
 reims-ctl set mac --memory 12G --resolution 1920x1080   # applies at the next start
 reims-ctl command mac           # the QEMU command it runs, as a shell script
-reims-ctl report mac            # logs, settings and the host's details, zipped, for a bug report
+reims-ctl report mac            # logs, settings, the host's details and its vulkaninfo, zipped, for a bug report
 reims-ctl update                # pull the checkout and install again
 reims-ctl update --channel development   # switch to the development branch first (stable is master)
 ```

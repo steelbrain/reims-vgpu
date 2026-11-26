@@ -149,6 +149,7 @@ pub enum Cmd {
         serial: bool,
     },
     /// Zip a VM's logs, settings and the host's details into Downloads, for a bug report
+    #[command(after_help = report_help())]
     Report { name: String },
     /// Update reims-ctl and its QEMU from the checkout it was installed from
     #[command(after_help = update_help())]
@@ -194,6 +195,19 @@ first.
 
 Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
 buttons on the top row hold that key for the next key or click.";
+
+/// What `reims-ctl report --help` ends with: what the zip holds.
+fn report_help() -> String {
+    format!(
+        "The zip holds system.txt, what this host is and the warnings the VM gets; \
+         vulkaninfo.txt, all vulkaninfo says about this host's Vulkan drivers and GPUs, below a \
+         line that says how it ended: its exit status, that it was stopped after {} s, or that \
+         vulkaninfo isn't installed (on Linux and on a Mac, the vulkan-tools package has it); \
+         vm.toml, the VM's settings; launch.sh, the QEMU command reims-ctl runs; state.txt, \
+         whether the VM runs; and logs/, the end of each of its logs.",
+        logs::VULKANINFO_LIMIT.as_secs()
+    )
+}
 
 /// What `reims-ctl update --help` ends with: when it builds, then [`UPDATE_MIGRATIONS`].
 fn update_help() -> String {

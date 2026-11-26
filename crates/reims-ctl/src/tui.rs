@@ -3059,8 +3059,8 @@ of its own. A VM runs reims-vgpu's own GPU device unless its settings choose ano
   l           turn its logs on or off
   L           view its QEMU log in less: :n shows the serial console, / searches,
               F follows the log as it grows, q comes back
-  b           write a bug report: its logs, settings, command and this host's details,
-              zipped into your Downloads folder
+  b           write a bug report: its logs, settings, command, this host's details and
+              all vulkaninfo says of its Vulkan drivers, zipped into your Downloads folder
   d           delete it
   U           make it a new OpenCore image with the installed reims-util, presenting the
               same Mac, for its graphics: on reims-vgpu with the macOS drivers of its GPU
