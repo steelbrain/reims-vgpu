@@ -1,11 +1,13 @@
 //! Bug reports: a zip of a VM's logs, its settings, the exact QEMU command, what the host is
 //! and vulkaninfo's whole report of it, in the downloads folder, for someone to attach to a
-//! report.
+//! report. A running VM's library is asked first for its degradation counts as they are then
+//! ([`ask_counts`]), so its QEMU log in the zip ends with them.
 
 use crate::host::{Host, Os};
 use crate::runtime;
 use crate::vm::Vm;
 use anyhow::{Context, Result};
+use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,6 +21,17 @@ const LOG_CAP: u64 = 64 << 20;
 /// How long one run of vulkaninfo may take: a GPU driver that hangs can hold it forever, and
 /// the report goes on without the rest of its output.
 pub const VULKANINFO_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long the ask for a running VM's counts waits for QMP's greeting and its answer: QMP takes
+/// one client at a time, so the ask waits while another holds it (reims-ctl's viewer).
+const COUNTS_WAIT: Duration = Duration::from_secs(3);
+
+/// The QOM path of a VM's display device, which qemu.rs names `gfx`.
+const DISPLAY_PATH: &str = "/machine/peripheral/gfx";
+
+/// The property of reims-graphics-pci whose set to true has the library write its degradation
+/// counts into QEMU's log before QMP answers (vendor/qemu hw/display/reims-graphics-pci.c).
+const COUNTS_PROPERTY: &str = "x-write-counts";
 
 pub fn bundle(vm: &Vm, host: Host) -> Result<PathBuf> {
     let stamp = runtime::now_stamp("%Y%m%d-%H%M%S");
@@ -42,8 +55,9 @@ pub fn bundle(vm: &Vm, host: Host) -> Result<PathBuf> {
                 .as_bytes(),
         )?;
     }
+    // Before the logs are read, so that QEMU's ends with the counts as of the report.
     let state = match runtime::pid(vm) {
-        Some(p) => format!("running, pid {p}\n"),
+        Some(p) => format!("running, pid {p}\n{}\n", ask_counts(&vm.qmp_socket())),
         None => "stopped\n".to_string(),
     };
     zip.add(&format!("{prefix}/state.txt"), state.as_bytes())?;
@@ -64,6 +78,22 @@ pub fn bundle(vm: &Vm, host: Host) -> Result<PathBuf> {
     }
     zip.finish()?;
     Ok(out)
+}
+
+/// Asks the VM on QMP's `socket` to write its library's degradation counts into its QEMU log now
+/// (reims-graphics-pci's [`COUNTS_PROPERTY`]): state.txt's line that says whether it did. A VM
+/// on VMware SVGA has no such property, and QMP says so.
+fn ask_counts(socket: &Path) -> String {
+    let asked = crate::qmp::Qmp::connect(socket, COUNTS_WAIT).and_then(|mut qmp| {
+        let set = json!({ "path": DISPLAY_PATH, "property": COUNTS_PROPERTY, "value": true });
+        qmp.execute("qom-set", Some(set))
+    });
+    match asked {
+        Ok(_) => "degradation counts: the library wrote them into logs/qemu.log for this report, \
+                  where it had counted any"
+            .to_string(),
+        Err(e) => format!("degradation counts: not written for this report: {e:#}"),
+    }
 }
 
 fn read_tail(p: &Path, cap: u64) -> Result<Vec<u8>> {
@@ -509,6 +539,85 @@ fn dos_now() -> (u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A QMP server at `sock` that greets, answers each command with `answer`, and records each
+    /// command but qmp_capabilities, whole.
+    fn fake_qmp(sock: &Path, answer: &'static str) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        use std::io::BufRead;
+        let listener = crate::os::UnixListener::bind(sock).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().map_while(Result::ok) {
+                let _ = conn.write_all(b"{\"QMP\": {}}\n");
+                let reader = std::io::BufReader::new(conn.try_clone().unwrap());
+                for line in reader.lines().map_while(Result::ok) {
+                    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let reply = if v["execute"] == "qmp_capabilities" {
+                        "{\"return\": {}}"
+                    } else {
+                        record.lock().unwrap().push(v);
+                        answer
+                    };
+                    let _ = conn.write_all(format!("{reply}\n").as_bytes());
+                }
+            }
+        });
+        seen
+    }
+
+    /// A running VM is asked to write its library's degradation counts with a qom-set of its
+    /// display device's x-write-counts property, and state.txt's line says whether it did: a
+    /// refusal, as a VM on VMware SVGA answers, and a socket nothing listens on say why not
+    #[test]
+    fn a_running_vm_is_asked_to_write_its_counts() {
+        let env = crate::testenv::Env::new("report-counts");
+        // As a VM's own (`vm::qmp_socket_in`): a temporary directory's path can be past a
+        // socket's.
+        let socket = |name: &str| {
+            let runtime = crate::paths::runtime_dir();
+            let short = crate::paths::short_runtime_dir();
+            let name = format!("report-counts-{name}-{}", std::process::id());
+            let s = crate::vm::qmp_socket_in(&env.root.join(&name), &name, &runtime, &short);
+            std::fs::create_dir_all(s.parent().unwrap()).unwrap();
+            let _ = std::fs::remove_file(&s);
+            s
+        };
+        let (written, refused) = (socket("written"), socket("refused"));
+        let asked = fake_qmp(&written, "{\"return\": {}}");
+        let no = "{\"error\": {\"class\": \"GenericError\", \
+                  \"desc\": \"Property 'vmware-svga.x-write-counts' not found\"}}";
+        let _ = fake_qmp(&refused, no);
+        let wrote = ask_counts(&written);
+        let not = ask_counts(&refused);
+        let none = ask_counts(&socket("none"));
+        for s in [&written, &refused] {
+            let _ = std::fs::remove_file(s);
+        }
+        let set = json!({
+            "execute": "qom-set",
+            "arguments": {
+                "path": "/machine/peripheral/gfx",
+                "property": "x-write-counts",
+                "value": true,
+            },
+        });
+        assert_eq!(*asked.lock().unwrap(), [set]);
+        assert_eq!(
+            wrote,
+            "degradation counts: the library wrote them into logs/qemu.log for this report, where \
+             it had counted any"
+        );
+        assert_eq!(
+            not,
+            "degradation counts: not written for this report: QMP qom-set: Property \
+             'vmware-svga.x-write-counts' not found"
+        );
+        assert!(
+            none.starts_with("degradation counts: not written for this report: connect to "),
+            "{none}"
+        );
+    }
 
     #[test]
     fn warnings_list_one_a_line_or_none() {

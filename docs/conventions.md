@@ -137,8 +137,10 @@ repeats the ones code cites.
     Metal's call answers where it fails, each kind's first on a line of
     stderr naming the call, and counted: `rt-unbuilt-<piece>` and
     `rt-refused-<kind>` (`rt_platform::unbuilt`).
-  - At each reset of the device and at the process's exit, two lines give
-    the counts. `reims-vgpu: degradation counts: <code> <n>, <code> <n>, …`,
+  - At each reset of the device, at the process's exit and when the host
+    asks for them (`rvg_write_counts`, which QEMU's device calls when its
+    `x-write-counts` property is set, as `reims-ctl report` does on a
+    running VM), two lines give the counts. `reims-vgpu: degradation counts: <code> <n>, <code> <n>, …`,
     on stderr, sorted by code, is every kind relayed or counted since the
     process began: the platform's (`rt-unbuilt-<piece>`,
     `rt-refused-<kind>`, `rt-refused-texture-format-<n>` and the other

@@ -768,6 +768,15 @@ void rvg_graphics_device_release(RvgGraphicsDevice *device);
 // once, with the first answer. Calls back: never.
 bool rvg_quiesce_for_exit(uint64_t timeout_ms);
 
+// Writes the library's degradation counts on stderr now, as a device's reset and the process's
+// exit do: `reims-vgpu: degradation counts: <code> <n>, ...`, every kind counted since the process
+// began, where any was and where the line changed since the library last wrote it, then the log's
+// count of its repeated lines. For a host asked for them while its guest runs, so that a log read
+// then has them: QEMU calls it for its device's `x-write-counts` property, which `reims-ctl
+// report` sets. It takes no handle: the counts are the process's. It waits for no thread of the
+// library's. Calls back: never.
+void rvg_write_counts(void);
+
 // The device's region: its first byte, page-aligned, and, through `size` where it is not NULL,
 // its size, a power of two. The host maps it into the guest as BAR 2, once; it is memory of the
 // host's process (on Linux a shared mapping of a memfd of the library's, on macOS private

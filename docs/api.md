@@ -225,6 +225,17 @@ an exit handler, so the handler calls none: it runs the same exit work and ends 
 `_exit(EXIT_FAILURE)`, and the library writes no degradation counts. After the cleanup's true
 answer it does nothing. QEMU's trace event `reims_graphics_end` names each end through `_exit`.
 
+### The degradation counts
+
+The library writes its degradation counts on stderr, one line of every kind it counted since the
+process began ([conventions.md](conventions.md), "Each degradation is logged once per boot, then
+counted"), at each reset of a device and at the process's exit, and when the host asks:
+`rvg_write_counts`, on any thread, writes them before it returns, where the line changed since the
+library last wrote it. It takes no handle, since the counts are the process's, and waits for no
+thread of the library's. QEMU calls it, under the BQL, when its device's `x-write-counts` property
+is set to true over QMP, which `reims-ctl report` does on a running VM before it zips QEMU's log, so
+the zip has the counts as of the report.
+
 ### The guest's Shared pool
 
 A host names the guest physical addresses it can give the guest's Shared pool
@@ -277,6 +288,7 @@ Objective-C.
 | constants | the status codes; the PCI facts (`RVG_GRAPHICS_PCI_VENDOR_ID` 0x1234, `_DEVICE_ID` 0x5247, `_CLASS` 0x380, `RVG_GRAPHICS_PCI_BAR_REGISTERS` 0, `RVG_GRAPHICS_REGISTERS_SIZE` 4096, `RVG_GRAPHICS_MSIX_OFFSET` 2048, `RVG_GRAPHICS_MSIX_VECTORS` 1, `RVG_GRAPHICS_PCI_BAR_REGION` 2, `RVG_GRAPHICS_PCI_BAR_DOORBELLS` 4, `RVG_GRAPHICS_DOORBELLS_SIZE` 4 MiB, `RVG_GRAPHICS_DOORBELL_PAGE_SIZE` 16 KiB, `RVG_GRAPHICS_DOORBELL_PAGES` 256); `RVG_GRAPHICS_DISPLAYS_MAX` 4; the doorbell (`RVG_GRAPHICS_REG_DOORBELL`, `RVG_GRAPHICS_DOORBELL_CONTROL`); `RVG_GRAPHICS_ALLOCATIONS_OFFSET`; `RVG_GUEST_ARCH_X86_64` 0 and `RVG_GUEST_ARCH_ARM64` 1; `RVG_WINDOW_BUTTON_*`, `RVG_WINDOW_SCROLL_PHASE_*`, `RVG_WINDOW_SCROLL_MOMENTUM_*` |
 | status | `rvg_status_message` |
 | the process's exit | `rvg_quiesce_for_exit` |
+| the process's degradation counts | `rvg_write_counts` |
 | the device | `RvgGraphicsDeviceConfig`, `RvgGuestArch`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_doorbell_write`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position`, `_read_display_at`, `_cursor_position_at`, `_pool_added`, `_pool_removed`, `_pool_grow`, `_pool_range` |
 | its windows | `RvgWindowConfig`, `RvgWindowCallbacks`, `RvgWindowPointerFn`, `RvgWindowWheelFn`, `RvgWindowKeyFn`, `RvgWindowCloseFn`, `RvgWindowScrollFn`, `RvgWindowScroll`; no function of their own: `RvgGraphicsDeviceConfig.window` carries display 0's, and `display_windows` those of displays 1 and up |
 
@@ -367,6 +379,7 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | `rvg_graphics_device_create` | a refusal's destroys | nothing of the host's |
 | `rvg_graphics_device_release` | never | nothing: the threads end and the destroy runs afterwards |
 | `rvg_quiesce_for_exit` | never | the library's calls in progress on other threads, and the GPU's work, until its bound |
+| `rvg_write_counts` | never | nothing |
 | `rvg_graphics_device_region` | never | nothing |
 | `rvg_graphics_device_mmio_read` | never | nothing |
 | `rvg_graphics_device_mmio_write_taking` | `raise_interrupt`, for a doorbell answered on the calling thread; `route_doorbell` and `route_doorbell_page`, dropping routes, for a STATUS write of 0, and `route_doorbell_page`, dropping a page's routes, for a `DOORBELL_PAGE_BIND` write that binds the page to another context | a STATUS write of 0: the command the control thread is taking; a `DOORBELL_PAGE_BIND` write: the queues' table, held elsewhere |

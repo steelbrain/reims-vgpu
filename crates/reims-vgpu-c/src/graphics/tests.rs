@@ -685,3 +685,43 @@ fn a_quiesce_ahead_of_the_exit_with_nothing_to_stop_answers_true() {
     assert!(rvg_quiesce_for_exit(0));
     assert!(rvg_quiesce_for_exit(5_000));
 }
+
+/// The write of the counts takes no handle and writes the process's degradation counts on stderr
+/// before it returns, again only where they changed since: in a child, since the counts are the
+/// process's
+#[test]
+fn a_write_of_the_counts_writes_their_line_before_it_returns() {
+    const CODE: &str = "test-c-api-write-counts";
+    const CHILD: &str = "RVG_WRITE_COUNTS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        reims_vgpu_vulkan::answer::count_kind(CODE);
+        rvg_write_counts();
+        eprintln!("first write returned");
+        rvg_write_counts();
+        eprintln!("second write returned");
+        reims_vgpu_vulkan::answer::count_kind(CODE);
+        rvg_write_counts();
+        eprintln!("third write returned");
+        return;
+    }
+    let test = "graphics::tests::a_write_of_the_counts_writes_their_line_before_it_returns";
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let seen: Vec<&str> = (stderr.lines())
+        .filter(|l| l.starts_with("reims-vgpu: degradation counts:") || l.ends_with("returned"))
+        .collect();
+    let counted = |l: &str, n: u64| l.contains(&format!("{CODE} {n}"));
+    assert!(
+        matches!(
+            seen[..],
+            [one, "first write returned", "second write returned", two, "third write returned"]
+                if counted(one, 1) && counted(two, 2)
+        ),
+        "{stderr}"
+    );
+}

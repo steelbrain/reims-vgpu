@@ -31,9 +31,9 @@
 //! first digit, quote or `;` is its class ([`class`]), so a size, an address or a name in it
 //! makes no kind of its own. An info line that names a [`KIND`] is written once per kind too: a
 //! fallback each session or object may take, said once per process. [`write_repeats`] writes how
-//! many lines of each kind came after its first since its last line, at a device's reset and at
-//! the process's exit (`crate::answer::write_counts`). Other info lines, and debug and trace
-//! lines, are written as they come: a line at info is never on a path every event takes
+//! many lines of each kind came after its first since its last line, at a device's reset, at the
+//! process's exit and at a host's ask (`crate::answer::write_counts`). Other info lines, and debug
+//! and trace lines, are written as they come: a line at info is never on a path every event takes
 //! (docs/conventions.md).
 
 use std::fmt::Write as _;

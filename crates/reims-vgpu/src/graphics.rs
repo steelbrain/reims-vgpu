@@ -1396,6 +1396,17 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             })
         })
     }
+
+    /// Writes the process's degradation counts on stderr now, as a device's reset and the
+    /// process's exit do (`reims_vgpu_vulkan::answer::write_counts`): the line of every kind
+    /// counted since the process began, where any was and where it changed since it was last
+    /// written, and the log's count of its repeated lines. What the C API's `rvg_write_counts`
+    /// does, for a host asked for them while its guest runs: QEMU's device's `x-write-counts`
+    /// property, which `reims-ctl report` sets before it zips QEMU's log. It waits for no thread
+    /// of the library's.
+    pub fn write_counts() {
+        entry::run(|_| reims_vgpu_vulkan::answer::write_counts());
+    }
 }
 
 /// The warning of a let-go that waited out its `bound` ([`GraphicsDevice::let_go_of_gpu`]), `held`

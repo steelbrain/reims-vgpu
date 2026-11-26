@@ -5,8 +5,9 @@
 //! - **Counts by code** ([`count_kind`], [`count_kind_by`], [`count_made`]): kinds the library
 //!   counts outside rt's own metrics, each under a code of its own, which the counts line
 //!   carries ([`degradation_counts`], [`write_counts`]): `reims-vgpu: degradation counts: <code>
-//!   <n>, ...`, written at a device's reset and at the process's exit
-//!   ([`crate::exit_gate`]). It is the line a boot's degradations are read from
+//!   <n>, ...`, written at a device's reset, at the process's exit ([`crate::exit_gate`]) and
+//!   when the host asks (`reims-vgpu`'s `GraphicsDevice::write_counts`, the C API's
+//!   `rvg_write_counts`). It is the line a boot's degradations are read from
 //!   (docs/conventions.md). A kind's line is its caller's to log, once per kind.
 //! - **Out of host memory** (`out_of_host_memory`, on Linux and Windows): a map, a file or
 //!   memory the host refused for want of mappings, files, memory or commit charge where Metal's
@@ -380,11 +381,11 @@ static COUNTS_WRITTEN: crate::core::sync::Mutex<String> =
 /// and where they changed since this last wrote them: `reims-vgpu: degradation counts: <code>
 /// <n>, …` ([`counts_line`]), the line the codes of a boot's degradations are read from; and the
 /// log's count of the lines it wrote at debug after their kind's first
-/// ([`crate::core::logging::write_repeats`]). A device's reset and the process's exit write them
-/// (`reims-vgpu`'s reset, [`crate::exit_gate`]). The rt platform's over-copy amounts, its
-/// command buffers held for room, its cache writes, its translations, its compute dispatches and
-/// its gauges at their highest are folded into the counts first
-/// (`rt_platform::device::fold_metrics`).
+/// ([`crate::core::logging::write_repeats`]). A device's reset, the process's exit and a host's ask
+/// write them, on any thread (`reims-vgpu`'s reset and `GraphicsDevice::write_counts`,
+/// [`crate::exit_gate`]). The rt platform's over-copy amounts, its command buffers held for room,
+/// its cache writes, its translations, its compute dispatches and its gauges at their highest are
+/// folded into the counts first (`rt_platform::device::fold_metrics`).
 pub fn write_counts() {
     crate::core::logging::write_repeats();
     {

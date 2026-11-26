@@ -329,13 +329,13 @@
 //! ([`note_gauges`]): the in-run highest, to within the looks. The gauges' thread looks every 5 s
 //! from the process's first device's open on, whether or not its lines are in the log
 //! (`super::gauge_log`); so do the counts' folds ([`fold_metrics`]: a guest device's reset, after
-//! its objects dropped, and the process's exit), and the let-go of a device once every handle but
-//! the platform's is gone, before rt's quiesce and teardown of it (`RtPlatform::let_go_of_device`),
-//! since the teardown sets every gauge to zero and the counts line of an exit after a let-go, as at
-//! a host's quit, comes after it. A value rt held between two looks is not seen. The trace's
-//! `rtcounts` carries the compiled kernels and the map's entries as they are at each of its events
-//! (`super::command`), at most one each 50 ms while command buffers commit or complete, so a traced
-//! run shows them over time.
+//! its objects dropped, a host's ask for the counts and the process's exit), and the let-go of a
+//! device once every handle but the platform's is gone, before rt's quiesce and teardown of it
+//! (`RtPlatform::let_go_of_device`), since the teardown sets every gauge to zero and the counts
+//! line of an exit after a let-go, as at a host's quit, comes after it. A value rt held between two
+//! looks is not seen. The trace's `rtcounts` carries the compiled kernels and the map's entries as
+//! they are at each of its events (`super::command`), at most one each 50 ms while command buffers
+//! commit or complete, so a traced run shows them over time.
 
 use std::sync::{Arc, OnceLock};
 

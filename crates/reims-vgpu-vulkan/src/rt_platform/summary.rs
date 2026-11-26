@@ -49,11 +49,11 @@
 //!
 //! The syncs of copied pages (`super::copied`) have a part of their own, `rt copied: ...`
 //! ([`copied_line`]), from the process's counts by code (`crate::answer::counted_kinds`), which
-//! the degradation counts line gives only at a device's make and reset and at the process's exit:
-//! what rose since the part before, for each kind of copy (writable, read-only, unchanging) its
-//! commits that synced one, the bytes the syncs went through and their time; then the read-only
-//! copies' commits and bytes by the guest's why, those that rose alone. Read at the part, from
-//! counts the syncs keep anyway: nothing more is done as pages are synced.
+//! the degradation counts line gives only at a device's make and reset, at a host's ask and at the
+//! process's exit: what rose since the part before, for each kind of copy (writable, read-only,
+//! unchanging) its commits that synced one, the bytes the syncs went through and their time; then
+//! the read-only copies' commits and bytes by the guest's why, those that rose alone. Read at the
+//! part, from counts the syncs keep anyway: nothing more is done as pages are synced.
 
 use std::time::Duration;
 
