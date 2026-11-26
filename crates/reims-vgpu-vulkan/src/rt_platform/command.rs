@@ -1506,8 +1506,14 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                             kept.takes().used_tiled(&tiled);
                         }
                         let operands = self.names_operands();
+                        let default_samples = pass.default_raster_sample_count;
                         Some(RtObj::new(RtRenderEncoder::new(
-                            encoder, mark, kept, targets, operands,
+                            encoder,
+                            mark,
+                            kept,
+                            targets,
+                            operands,
+                            default_samples,
                         )))
                     }
                     Err(error) => {

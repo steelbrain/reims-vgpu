@@ -104,6 +104,9 @@ pub struct RtRenderPipeline {
     /// Its rasterization fields, for the first line of each kind of rt's refusals of a draw of it
     /// (`super::render`).
     raster: Raster,
+    /// Its attachment formats and raster sample count, for the first line of rt's refusals of a
+    /// draw of it into a pass of other formats (`super::render`).
+    formats: Formats,
     /// Its vertex and fragment functions, by their roles, which the first line of each kind of
     /// rt's refusals of a draw of it names (`super::render`).
     functions: Named,
@@ -157,6 +160,56 @@ impl std::fmt::Display for Raster {
     }
 }
 
+/// A render pipeline state's attachment formats and raster sample count as its descriptor set
+/// them, for the first line of rt's refusals of a draw of it into a pass whose attachments are of
+/// other formats or another sample count (`Draw-AttachmentFormats`, `super::render`): structure
+/// alone, no name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Formats {
+    /// Each colour attachment's pixel format, by index; `None` where the descriptor sets none
+    /// (`MTLPixelFormatInvalid`).
+    pub colors: [Option<PixelFormat>; 8],
+    /// The depth attachment's pixel format; `None` where it sets none.
+    pub depth: Option<PixelFormat>,
+    /// The stencil attachment's pixel format; `None` where it sets none.
+    pub stencil: Option<PixelFormat>,
+    /// `rasterSampleCount`.
+    pub samples: u32,
+}
+
+impl Formats {
+    /// The formats of rt's descriptor `d`.
+    fn of(d: &rt::RenderPipelineDescriptor) -> Formats {
+        Formats {
+            colors: (d.color_attachments.each_ref()).map(|c| c.as_ref().map(|c| c.pixel_format)),
+            depth: d.depth_format,
+            stencil: d.stencil_format,
+            samples: d.raster_sample_count,
+        }
+    }
+}
+
+impl std::fmt::Display for Formats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set = (self.colors.iter().enumerate()).filter_map(|(i, c)| c.map(|c| (i, c)));
+        let mut any = false;
+        for (index, format) in set {
+            write!(f, "colour {index} {format:?}, ")?;
+            any = true;
+        }
+        if !any {
+            f.write_str("no colour, ")?;
+        }
+        for (what, format) in [("depth", self.depth), ("stencil", self.stencil)] {
+            match format {
+                Some(format) => write!(f, "{what} {format:?}, ")?,
+                None => write!(f, "{what} none, ")?,
+            }
+        }
+        write!(f, "raster sample count {}", self.samples)
+    }
+}
+
 impl RtRenderPipeline {
     /// rt's state.
     pub fn rt(&self) -> &rt::RenderPipelineState {
@@ -166,6 +219,11 @@ impl RtRenderPipeline {
     /// Its rasterization fields.
     pub fn raster(&self) -> Raster {
         self.raster
+    }
+
+    /// Its attachment formats and raster sample count.
+    pub fn formats(&self) -> Formats {
+        self.formats
     }
 
     /// Its functions, by their roles (`super::unbuilt::naming_functions`).
@@ -451,6 +509,7 @@ fn make(
         fragment_written,
         colors,
         raster: Raster::of(descriptor),
+        formats: Formats::of(descriptor),
         functions,
     }))
 }

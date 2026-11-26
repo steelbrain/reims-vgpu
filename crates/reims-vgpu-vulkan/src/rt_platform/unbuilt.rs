@@ -25,7 +25,10 @@
 //! site names it, as structure alone: a texture's descriptor, a view's and the texture it views, a
 //! copy's kind, textures, places, buffer layout and what its two textures share, a pass's
 //! attachments and store actions, a draw's primitive type and its pipeline state's rasterization
-//! fields ([`refusal_detail`]). rt's error is in a line or an `NSError` of this module's as
+//! fields, with the state's attachment formats and raster sample count beside the pass's
+//! attachments' formats and sample counts where rt refused the state's formats
+//! (`Draw-AttachmentFormats`), and a refused viewport's six values (`Draw-Viewport`)
+//! ([`refusal_detail`]). rt's error is in a line or an `NSError` of this module's as
 //! structure alone: no name of the guest's it carries (a function's, a symbol's, a library's) is in
 //! one, nor a label. Where a refused dispatch, a refused draw or a pipeline state's refused make
 //! names the functions it runs ([`naming_functions`]), the first line of each kind written there
@@ -423,7 +426,8 @@ fn diagnosed(sel: &'static str, error: &rt::Error) {
 /// the call `sel`, rt's `error` and `what`, what the call asked of rt that rt's error does not
 /// name, as structure alone (a texture's descriptor; a view's and its texture's; a copy's kind,
 /// textures, places, buffer layout and what its textures share; a pass's attachments and store
-/// actions; a draw's primitive type and its pipeline state's rasterization fields). A caller that
+/// actions; a draw's primitive type and its pipeline state's rasterization fields, its formats and
+/// the pass's where rt refused them, and the viewports a command set). A caller that
 /// names `what` calls it before it counts the refusal, whose own call here ([`rt_refused`],
 /// [`diagnosed`]) then writes nothing. Every count of the diagnostics' calls here, so each name
 /// the counts give has its line. Counts nothing.

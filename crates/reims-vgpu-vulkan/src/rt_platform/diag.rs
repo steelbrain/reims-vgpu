@@ -1322,6 +1322,8 @@ pub struct Target {
     pub slice: u32,
     /// Its texture's `MTLTextureType`.
     pub texture_type: u32,
+    /// Its texture's pixel format.
+    pub format: rt::PixelFormat,
     /// Its texture's sample count.
     pub samples: u32,
     /// Its texture's index, 0 for one with none: rt reads a fetched attachment through it.
@@ -3248,6 +3250,7 @@ mod tests {
             level: 0,
             slice: 0,
             texture_type: 2,
+            format: rt::PixelFormat::BGRA8Unorm,
             samples: 1,
             index,
             name: super::super::fault::Name::default(),

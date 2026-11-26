@@ -529,9 +529,10 @@ impl PassFields {
         Ok(out)
     }
 
-    /// The pass's targets, for the boot diagnostics (`super::diag`): each attachment of a texture,
-    /// with its level and slice, but one whose level or slice is past 32 bits, which rt's pass
-    /// takes none of.
+    /// The pass's targets, for the boot diagnostics (`super::diag`) and the first line of rt's
+    /// refusals of a draw into the pass of a state of other formats (`super::render`): each
+    /// attachment of a texture, with its level and slice, but one whose level or slice is past 32
+    /// bits, which rt's pass takes none of.
     pub fn targets(&self) -> Vec<Target> {
         let pass = self.lock();
         let one = |point: Point, a: &Attachment| {
@@ -542,6 +543,7 @@ impl PassFields {
                 level: u32::try_from(a.level).ok()?,
                 slice: u32::try_from(a.slice).ok()?,
                 texture_type: d.texture_type.as_raw(),
+                format: d.pixel_format,
                 samples: d.sample_count,
                 index: texture.rt().gpu_resource_id().index,
                 name: texture.named().name(),

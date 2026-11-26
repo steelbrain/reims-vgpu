@@ -96,7 +96,11 @@
 //! A command rt refuses encodes nothing, counted under the refusal's kind; in a list, the entries
 //! before the refused one are bound. The first line of each kind of rt's refusals of a draw of
 //! primitives or patches, and of an unbuilt one, names the vertex and fragment functions of the
-//! pipeline state set (`super::unbuilt::naming_functions`).
+//! pipeline state set (`super::unbuilt::naming_functions`). The first line of each of rt's draw
+//! gaps names the draw's primitive type and the state's rasterization fields; a state of other
+//! formats than its pass's (`Draw-AttachmentFormats`), the state's colour, depth and stencil
+//! formats and raster sample count beside the pass's attachments' formats and sample counts; and a
+//! viewport rt refused (`Draw-Viewport`), its six values ([`DrawDetail`]).
 
 use std::cell::RefCell;
 
@@ -115,9 +119,9 @@ use super::blit::{Stop, report};
 use super::command::{Kept, OpenMark};
 use super::compute::{declared, resource_usage, slots, small};
 use super::copied::Used;
-use super::diag::{self, Bound, Target, Use};
+use super::diag::{self, Bound, Point, Target, Use};
 use super::fault::{EncoderKind, EncoderNames, Naming};
-use super::render_pipeline::{Raster, RtRenderPipeline};
+use super::render_pipeline::{Formats, Raster, RtRenderPipeline};
 use super::texture::RtTexture;
 use super::unbuilt::{Unbuilt, naming_functions, refuse};
 use super::{RtBuffer, RtObj, RtPlatform};
@@ -137,8 +141,12 @@ pub struct RtRenderEncoder {
     /// What its command buffer keeps until it completes.
     kept: Kept,
     /// Its pass's targets, for the boot diagnostics (`diag::attachment_read`,
-    /// `diag::fetched_attachment`).
+    /// `diag::fetched_attachment`) and the first line of rt's refusals of a draw of a state of
+    /// other formats ([`FormatsDetail`]).
     targets: Vec<Target>,
+    /// Its pass's `defaultRasterSampleCount`, the samples of a pass with no attachment, for that
+    /// line.
+    default_samples: u32,
 }
 
 /// An encoder's rt encoder, until `endEncoding` ends it, and its pipeline state.
@@ -166,14 +174,15 @@ struct Seen {
 
 impl RtRenderEncoder {
     /// The encoder over rt's `encoder`, open as `mark` marks it, its pipeline states kept in
-    /// `kept`, of a pass of `targets`, naming its operands where `operands` (`super::fault`'s
-    /// `Operands`).
+    /// `kept`, of a pass of `targets` and of `default_samples`, its `defaultRasterSampleCount`,
+    /// naming its operands where `operands` (`super::fault`'s `Operands`).
     pub fn new(
         encoder: rt::RenderCommandEncoder,
         mark: OpenMark,
         kept: Kept,
         targets: Vec<Target>,
         operands: bool,
+        default_samples: u32,
     ) -> RtRenderEncoder {
         let names = EncoderNames {
             attachments: targets.iter().map(|t| (t.point, t.name)).collect(),
@@ -189,6 +198,19 @@ impl RtRenderEncoder {
             mark,
             kept,
             targets,
+            default_samples,
+        }
+    }
+
+    /// What a draw of the state `seen` set asked of the pass's attachments, for the first line of
+    /// rt's refusal of it as a state of other formats ([`FormatsDetail`]).
+    fn formats(&self, seen: &Seen) -> FormatsDetail {
+        FormatsDetail {
+            state: seen.state.as_ref().map(|state| state.formats()),
+            pass: (self.targets.iter())
+                .map(|t| (t.point, t.format, t.samples))
+                .collect(),
+            default_samples: self.default_samples,
         }
     }
 
@@ -730,17 +752,24 @@ fn execution(cmd: &RenderCmd<'_, RtPlatform>) -> Option<super::icb::ExecutionDet
 /// What a draw asked of rt, for the process's first line of each kind of rt's refusals of it
 /// (`super::unbuilt::refusal_detail`), as structure alone: its primitive type (Metal's number;
 /// none for a command other than a draw of one) and the rasterization fields of the pipeline
-/// state set (none before one is set). Whether the state's vertex function writes
-/// `[[point_size]]` is rt's to know (its translator's), which no call of rt's answers here, so the
-/// line says it is not known.
-struct DrawDetail {
+/// state set (none before one is set); for a refusal of the state's formats
+/// (`Draw-AttachmentFormats`), the state's attachment formats and raster sample count beside the
+/// pass's attachments' ([`FormatsDetail`]); and for a command that sets viewports (`Draw-Viewport`,
+/// `Draw-Viewports`), each viewport's six values ([`Viewports`]). Whether the state's vertex
+/// function writes `[[point_size]]` is rt's to know (its translator's), which no call of rt's
+/// answers here, so the line says it is not known.
+struct DrawDetail<'a> {
     /// The draw's primitive type.
     primitive: Option<u64>,
     /// The rasterization fields of the pipeline state set.
     raster: Option<Raster>,
+    /// The formats of the state set and of the pass, where rt refused the state's formats.
+    formats: Option<FormatsDetail>,
+    /// The viewports the command set, where it sets any.
+    viewports: Option<Viewports<'a>>,
 }
 
-impl std::fmt::Display for DrawDetail {
+impl std::fmt::Display for DrawDetail<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.primitive {
             Some(primitive) => write!(f, "a draw of primitive type {primitive}")?,
@@ -751,8 +780,102 @@ impl std::fmt::Display for DrawDetail {
                 f,
                 ", the pipeline state's {raster}, its vertex function's point size write not known \
                  here"
-            ),
-            None => f.write_str(", no pipeline state set"),
+            )?,
+            None => f.write_str(", no pipeline state set")?,
+        }
+        if let Some(formats) = &self.formats {
+            write!(f, "; {formats}")?;
+        }
+        if let Some(viewports) = &self.viewports {
+            write!(f, "; {viewports}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The formats a draw rt refused as a state of other formats than its pass's asked of it
+/// (`Draw-AttachmentFormats`, [`DrawDetail`]): the pipeline state's colour, depth and stencil
+/// formats and raster sample count, and the pass's attachments' formats and sample counts, or,
+/// for a pass with none, its `defaultRasterSampleCount`. rt compares the Vulkan formats it renders
+/// them in, and the sample counts.
+struct FormatsDetail {
+    /// The state's, none before a state is set.
+    state: Option<Formats>,
+    /// Each attachment of the pass: which it is, its texture's pixel format and sample count.
+    pass: Vec<(Point, rt::PixelFormat, u32)>,
+    /// The pass's `defaultRasterSampleCount`.
+    default_samples: u32,
+}
+
+impl std::fmt::Display for FormatsDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(state) = &self.state {
+            write!(f, "the pipeline state's attachments: {state}; ")?;
+        }
+        f.write_str("the pass's:")?;
+        if self.pass.is_empty() {
+            let samples = self.default_samples;
+            return write!(f, " no attachment, default raster sample count {samples}");
+        }
+        for (at, &(point, format, samples)) in self.pass.iter().enumerate() {
+            let comma = if at == 0 { "" } else { "," };
+            match point {
+                Point::Color(index) => write!(f, "{comma} colour {index}")?,
+                Point::Depth => write!(f, "{comma} depth")?,
+                Point::Stencil => write!(f, "{comma} stencil")?,
+            }
+            write!(f, " {format:?} of {samples} samples")?;
+        }
+        Ok(())
+    }
+}
+
+/// The viewports a command sets, for the first line of rt's refusals of one (`Draw-Viewport`,
+/// `Draw-Viewports`, [`DrawDetail`]).
+#[derive(Clone, Copy)]
+enum Viewports<'a> {
+    /// `setViewport:`'s.
+    One(MtlViewport),
+    /// `setViewports:count:`'s.
+    Many(&'a [MtlViewport]),
+}
+
+/// The most viewports a line names: Metal's 16. A command of more names those and how many more.
+const NAMED_VIEWPORTS: usize = 16;
+
+/// The viewports the command `cmd` sets; none for a command that sets none.
+fn set_viewports<'a>(cmd: &RenderCmd<'a, RtPlatform>) -> Option<Viewports<'a>> {
+    match *cmd {
+        RenderCmd::SetViewport { viewport } => Some(Viewports::One(viewport)),
+        RenderCmd::SetViewports { viewports } => Some(Viewports::Many(viewports)),
+        _ => None,
+    }
+}
+
+impl std::fmt::Display for Viewports<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let all = match self {
+            Viewports::One(viewport) => {
+                f.write_str("the viewport set:")?;
+                std::slice::from_ref(viewport)
+            }
+            Viewports::Many(viewports) => {
+                write!(f, "the {} viewports set:", viewports.len())?;
+                viewports
+            }
+        };
+        for (at, v) in all.iter().take(NAMED_VIEWPORTS).enumerate() {
+            let comma = if at == 0 { "" } else { "," };
+            write!(
+                f,
+                "{comma} [originX {:?}, originY {:?}, width {:?}, height {:?}, znear {:?}, zfar \
+                 {:?}]",
+                v.origin_x, v.origin_y, v.width, v.height, v.znear, v.zfar
+            )?;
+        }
+        match all.len().saturating_sub(NAMED_VIEWPORTS) {
+            0 => Ok(()),
+            more => write!(f, ", and {more} more"),
         }
     }
 }
@@ -974,6 +1097,7 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             let primitive = drawn_primitive(&cmd);
             let execution = execution(&cmd);
             let draw = draws(&cmd);
+            let viewports = set_viewports(&cmd);
             let held = self.open.lock();
             let mut open = held.borrow_mut();
             if let Some(names) = open.naming.names() {
@@ -987,7 +1111,14 @@ impl RenderEncoder<RtPlatform> for RtObj<RtRenderEncoder> {
             if let Some(Stop::Rt(error @ rt::Error::Unsupported(rt::Gap::Draw { kind }))) = &stopped
             {
                 let raster = open.seen.state.as_ref().map(|state| state.raster());
-                let what = DrawDetail { primitive, raster };
+                let formats =
+                    (*kind == rt::DrawKind::AttachmentFormats).then(|| self.formats(&open.seen));
+                let what = DrawDetail {
+                    primitive,
+                    raster,
+                    formats,
+                    viewports,
+                };
                 naming_functions(functions.clone(), || {
                     super::unbuilt::refusal_detail(sel, error, Some(&what));
                 });
@@ -1118,14 +1249,9 @@ mod tests {
         assert_eq!(draw, Some(0));
         let what = DrawDetail {
             primitive: draw,
-            raster: Some(Raster {
-                enabled: true,
-                topology: metal2vulkan::metal::PrimitiveTopologyClass::Unspecified,
-                samples: 1,
-                alpha_to_coverage: false,
-                alpha_to_one: false,
-                open_gl_mode: true,
-            }),
+            raster: Some(raster()),
+            formats: None,
+            viewports: None,
         };
         assert_eq!(
             what.to_string(),
@@ -1136,11 +1262,130 @@ mod tests {
         let what = DrawDetail {
             primitive: drawn_primitive(&RenderCmd::<RtPlatform>::EndEncoding),
             raster: None,
+            formats: None,
+            viewports: set_viewports(&RenderCmd::<RtPlatform>::EndEncoding),
         };
         assert_eq!(
             what.to_string(),
             "a command other than a draw of a primitive type, no pipeline state set"
         );
+    }
+
+    /// The rasterization fields of a state of one sample, as a test's descriptor sets them.
+    fn raster() -> Raster {
+        Raster {
+            enabled: true,
+            topology: metal2vulkan::metal::PrimitiveTopologyClass::Unspecified,
+            samples: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            open_gl_mode: true,
+        }
+    }
+
+    /// A draw rt refused as a state of other formats than its pass's (`Draw-AttachmentFormats`)
+    /// names the state's colour, depth and stencil formats and raster sample count beside the
+    /// pass's attachments' formats and sample counts, or a pass of no attachment's default raster
+    /// sample count
+    #[test]
+    fn a_refused_draw_of_other_formats_names_the_state_s_formats_beside_the_pass_s() {
+        use rt::PixelFormat;
+        let mut colors = [None; 8];
+        colors[0] = Some(PixelFormat::BGRA8Unorm);
+        colors[2] = Some(PixelFormat::RGBA16Float);
+        let state = Formats {
+            colors,
+            depth: Some(PixelFormat::Depth32Float),
+            stencil: None,
+            samples: 4,
+        };
+        let what = DrawDetail {
+            primitive: Some(TRIANGLE),
+            raster: Some(raster()),
+            formats: Some(FormatsDetail {
+                state: Some(state),
+                pass: vec![
+                    (Point::Color(0), PixelFormat::BGRA8UnormSRGB, 1),
+                    (Point::Depth, PixelFormat::Depth32FloatStencil8, 1),
+                    (Point::Stencil, PixelFormat::Depth32FloatStencil8, 1),
+                ],
+                default_samples: 0,
+            }),
+            viewports: None,
+        };
+        assert_eq!(
+            what.to_string(),
+            "a draw of primitive type 3, the pipeline state's rasterization enabled true, input \
+             primitive topology Unspecified, raster sample count 1, alpha to coverage false, alpha \
+             to one false, OpenGL mode true, its vertex function's point size write not known \
+             here; the pipeline state's attachments: colour 0 BGRA8Unorm, colour 2 RGBA16Float, \
+             depth Depth32Float, stencil none, raster sample count 4; the pass's: colour 0 \
+             BGRA8UnormSRGB of 1 samples, depth Depth32FloatStencil8 of 1 samples, stencil \
+             Depth32FloatStencil8 of 1 samples"
+        );
+        let none = FormatsDetail {
+            state: Some(Formats {
+                colors: [None; 8],
+                depth: None,
+                stencil: None,
+                samples: 1,
+            }),
+            pass: Vec::new(),
+            default_samples: 4,
+        };
+        assert_eq!(
+            none.to_string(),
+            "the pipeline state's attachments: no colour, depth none, stencil none, raster sample \
+             count 1; the pass's: no attachment, default raster sample count 4"
+        );
+    }
+
+    /// A viewport rt refused (`Draw-Viewport`) is named by its six values, as the guest set them;
+    /// `setViewports:count:` names each, up to Metal's 16, and how many more
+    #[test]
+    fn a_refused_viewport_names_its_six_values() {
+        let mirrored = MtlViewport {
+            origin_x: 64.0,
+            origin_y: 0.5,
+            width: -64.0,
+            height: 32.0,
+            znear: 0.0,
+            zfar: 1.25,
+        };
+        let cmd = RenderCmd::<RtPlatform>::SetViewport { viewport: mirrored };
+        let what = DrawDetail {
+            primitive: drawn_primitive(&cmd),
+            raster: Some(raster()),
+            formats: None,
+            viewports: set_viewports(&cmd),
+        };
+        assert_eq!(
+            what.to_string(),
+            "a command other than a draw of a primitive type, the pipeline state's rasterization \
+             enabled true, input primitive topology Unspecified, raster sample count 1, alpha to \
+             coverage false, alpha to one false, OpenGL mode true, its vertex function's point \
+             size write not known here; the viewport set: [originX 64.0, originY 0.5, width \
+             -64.0, height 32.0, znear 0.0, zfar 1.25]"
+        );
+        let two = [MtlViewport::default(), mirrored];
+        let cmd = RenderCmd::<RtPlatform>::SetViewports { viewports: &two };
+        let named = set_viewports(&cmd).map(|v| v.to_string());
+        assert_eq!(
+            named.as_deref(),
+            Some(
+                "the 2 viewports set: [originX 0.0, originY 0.0, width 0.0, height 0.0, znear 0.0, \
+                 zfar 0.0], [originX 64.0, originY 0.5, width -64.0, height 32.0, znear 0.0, zfar \
+                 1.25]"
+            )
+        );
+        let many = [MtlViewport::default(); 18];
+        let named = Viewports::Many(&many).to_string();
+        assert!(
+            named.starts_with("the 18 viewports set: [originX 0.0"),
+            "{named}"
+        );
+        assert!(named.ends_with("zfar 0.0], and 2 more"), "{named}");
+        assert_eq!(named.matches("originX").count(), 16, "{named}");
     }
 
     /// A pass of `texture` as colour attachment 0, of `load_action` (cleared to opaque red) and a
