@@ -2203,7 +2203,10 @@ mod tests {
             // `RGBA8Unorm_sRGB` and `BGRA8Unorm_sRGB`: stored at a slot through the UNORM twin
             // on every device, and no storage element beyond the slots.
             let srgb8 = matches!(format, 71 | 81);
-            assert!(!(srgb8 && unstored), "{format}: a slot's write of it is stored");
+            assert!(
+                !(srgb8 && unstored),
+                "{format}: a slot's write of it is stored"
+            );
             let declared_refused = unstored || srgb8;
             let declared = [Some(ResourceRef::Texture(&candidate))];
 
@@ -2225,7 +2228,11 @@ mod tests {
             ];
             cmds.extend(drawn(&writing, &vertices, &argument));
             assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
-            assert_eq!(counted(gap), before + u64::from(declared_refused), "{format}");
+            assert_eq!(
+                counted(gap),
+                before + u64::from(declared_refused),
+                "{format}"
+            );
             let (drawn_texels, written_texel) = match declared_refused {
                 true => (red, [0; 4]),
                 false => (green, magenta),
@@ -2277,7 +2284,11 @@ mod tests {
                 vertex_count: 3,
             });
             assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
-            assert_eq!(counted(gap), before + u64::from(declared_refused), "{format}");
+            assert_eq!(
+                counted(gap),
+                before + u64::from(declared_refused),
+                "{format}"
+            );
             assert_eq!(drawn_into(), green, "{format}");
             assert_eq!(texel(&written), magenta, "{format}");
 
