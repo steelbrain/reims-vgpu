@@ -757,7 +757,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
     ! cmp -s "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured" ||
     ! ninja -C "$BUILD" -n >/dev/null 2>&1; then
     say "Configuring QEMU"
-    (cd "$BUILD" && PKG_CONFIG_PATH="$PC" "${CONFIGURE[@]}")
+    (cd "$BUILD" && PKG_CONFIG_PATH="$PC${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" "${CONFIGURE[@]}")
     cp "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured"
     printf '%s\n' "$CONFIGURED" >"$BUILD/configured-with"
     printf '%s\n' "$QEMU_SOURCE" >"$BUILD/qemu-source"
