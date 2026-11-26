@@ -118,7 +118,7 @@
 //! memory is, counted alike, naming the open-file limit.
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::core::num::{ToU64, ToUsize};
 use crate::core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
@@ -517,13 +517,63 @@ const HUGE_ALIGN: u64 = 2 << 20;
 /// it in 7.2): the guest's kernel memory was overwritten so on a Radeon 890M with Linux 6.18.59
 /// (issue 185). QEMU advises the RAM's own mapping so (`vendor/qemu/system/physmem.c`,
 /// `ram_block_add`), before its prealloc touches a page. A refusal changes nothing: a kernel
-/// without transparent huge pages refuses the advice and makes none.
+/// without transparent huge pages refuses the advice and makes none. On Linux 7.2 and later
+/// ([`huge_pages_take`]) nothing is advised, as QEMU then puts the guest's RAM on huge pages.
 fn off_huge_pages(at: u64, length: u64, offset: u64) {
-    if !at.wrapping_sub(offset).is_multiple_of(HUGE_ALIGN) {
+    if huge_pages_take() || !at.wrapping_sub(offset).is_multiple_of(HUGE_ALIGN) {
         return;
     }
     // SAFETY: advice on a mapping just made, which changes none of its bytes.
     unsafe { libc::madvise(ptr(at), length.to_usize(), libc::MADV_NOHUGEPAGE) };
+}
+
+/// Whether the guest's RAM may lie on huge pages: the running kernel is Linux 7.2 or later
+/// ([`linux_release_at_least`] of `uname`'s release), read once. 7.2 builds a udmabuf's table from
+/// its pages themselves (upstream 5bf888673e0d), so its imports bind the right pages over large
+/// folios. QEMU decides the same of the same fact (`qemu_guest_ram_huge_pages`,
+/// `vendor/qemu/util/cutils.c`), whose test holds the same table.
+fn huge_pages_take() -> bool {
+    #[cfg(test)]
+    if let Some(take) = TEST_HUGE_PAGES.with(std::cell::Cell::get) {
+        return take;
+    }
+    static TAKE: OnceLock<bool> = OnceLock::new();
+    *TAKE.get_or_init(|| {
+        // SAFETY: an empty utsname for the kernel to fill.
+        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: a utsname to fill.
+        if unsafe { libc::uname(&mut uts) } != 0 {
+            return false;
+        }
+        // SAFETY: the kernel's NUL-terminated release, in the buffer it filled.
+        let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) };
+        linux_release_at_least(&release.to_string_lossy(), 7, 2)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's answer of [`huge_pages_take`] in place of the kernel's, on the thread that sets
+    /// it.
+    static TEST_HUGE_PAGES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether `release`, a Linux kernel release as `uname` gives it (`7.3.3-1-cachyos`), is
+/// `major.minor` or later by its leading `MAJOR.MINOR`; `false` where it does not start with two
+/// numbers and a dot between them.
+fn linux_release_at_least(release: &str, major: u64, minor: u64) -> bool {
+    fn number(s: &str) -> Option<(u64, &str)> {
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        let value = s.get(..digits)?.parse().ok()?;
+        Some((value, &s[digits..]))
+    }
+    let Some((maj, rest)) = number(release) else {
+        return false;
+    };
+    let Some((min, _)) = rest.strip_prefix('.').and_then(number) else {
+        return false;
+    };
+    maj > major || (maj == major && min >= minor)
 }
 
 /// A fresh range of `len` bytes, rounded up to whole pages, of zeros, that a view can be made of:
@@ -2021,17 +2071,19 @@ pub(crate) mod tests {
         None
     }
 
-    /// A shared mapping of a file whose address agrees with its offset modulo 2 MiB, where a fault
-    /// or khugepaged could put the file's pages on a huge folio, is advised `MADV_NOHUGEPAGE`
-    /// (`off_huge_pages`), so the guest's RAM stays on base pages through the library's views of
-    /// it; two such that follow on in the file are still one mapping to the kernel, as the views'
-    /// budget counts them (`mappings_added`); one that does not agree is left without the advice
+    /// Below Linux 7.2, a shared mapping of a file whose address agrees with its offset modulo
+    /// 2 MiB, where a fault or khugepaged could put the file's pages on a huge folio, is advised
+    /// `MADV_NOHUGEPAGE` (`off_huge_pages`), so the guest's RAM stays on base pages through the
+    /// library's views of it; two such that follow on in the file are still one mapping to the
+    /// kernel, as the views' budget counts them (`mappings_added`); one that does not agree is left
+    /// without the advice; and on 7.2 and later none is advised
     #[test]
-    fn a_files_mapping_that_could_hold_a_huge_page_is_advised_off_them() {
+    fn a_files_mapping_that_could_hold_a_huge_page_is_advised_off_them_before_7_2() {
         if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
             eprintln!("skipped: this kernel has no transparent huge pages to advise off");
             return;
         }
+        TEST_HUGE_PAGES.with(|h| h.set(Some(false)));
         let p = page();
         let v = vm();
         let rw = VmProt::READ | VmProt::WRITE;
@@ -2061,7 +2113,39 @@ pub(crate) mod tests {
         assert_eq!(file(Some(apart), p, &backing(HUGE_ALIGN), rw), Ok(apart));
         let flags = vm_flags_at(apart).expect("the mapping");
         assert!(!flags.iter().any(|f| f == "nh"), "{flags:?}");
+
+        TEST_HUGE_PAGES.with(|h| h.set(Some(true)));
+        let later = aligned + 2 * HUGE_ALIGN;
+        assert_eq!(file(Some(later), HUGE_ALIGN, &backing(0), rw), Ok(later));
+        let flags = vm_flags_at(later).expect("the mapping");
+        assert!(!flags.iter().any(|f| f == "nh"), "7.2 and later: {flags:?}");
+        TEST_HUGE_PAGES.with(|h| h.set(None));
         assert!(v.deallocate(reserved, 4 * HUGE_ALIGN).is_success());
+    }
+
+    /// The kernel's release decides as QEMU's `qemu_linux_release_at_least` does, by the same
+    /// table (`vendor/qemu/tests/unit/test-cutils.c`): 7.2 and later take huge pages, an older
+    /// release or one that does not parse does not
+    #[test]
+    fn the_kernels_release_decides_huge_pages_as_qemu_does() {
+        for (release, huge) in [
+            ("6.13", false),
+            ("6.18.59", false),
+            ("7.1.9", false),
+            ("7.1.0-arch1-1", false),
+            ("7.2", true),
+            ("7.2.0", true),
+            ("7.3.3-1-cachyos", true),
+            ("10.0.1", true),
+            ("", false),
+            ("garbage", false),
+            ("7", false),
+            ("7.", false),
+            ("v7.3.3", false),
+            ("7.x", false),
+        ] {
+            assert_eq!(linux_release_at_least(release, 7, 2), huge, "{release:?}");
+        }
     }
 
     /// A graphics device's region's memory is one shared mapping, read and write, of a memfd of
