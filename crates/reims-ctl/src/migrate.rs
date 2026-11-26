@@ -1276,7 +1276,15 @@ mod tests {
             driver_id,
             ..listed(name, ids, kind, file)
         };
-        let uhd = |file| found("Intel(R) UHD Graphics", (0x8086, 0x9bc4), "integrated", file, 5);
+        let uhd = |file| {
+            found(
+                "Intel(R) UHD Graphics",
+                (0x8086, 0x9bc4),
+                "integrated",
+                file,
+                5,
+            )
+        };
         let gtx = |file| found(GTX, (0x10de, 0x1f95), "discrete", file, 4);
         let windows = crate::host::Host {
             os: crate::host::Os::Windows,
@@ -1287,9 +1295,8 @@ mod tests {
             let inv = crate::qemu::invocation(v, &ctx).unwrap();
             inv.env.into_iter().collect()
         };
-        let saved_shape = format!(
-            "[gpu]\ndriver_file = \"{INTEL}\"\ndevice_id = 8085\nname = \"{GTX}\"\n"
-        );
+        let saved_shape =
+            format!("[gpu]\ndriver_file = \"{INTEL}\"\ndevice_id = 8085\nname = \"{GTX}\"\n");
 
         let dir = env.root.join("mac");
         let mut v = vm_with_gpu(&dir, &saved_shape);
