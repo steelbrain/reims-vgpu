@@ -198,7 +198,10 @@ mod tests {
         };
         let before = counted();
         for n in 1..=2 {
-            assert_eq!(undrawn(format!("draw {n} failed")), format!("draw {n} failed"));
+            assert_eq!(
+                undrawn(format!("draw {n} failed")),
+                format!("draw {n} failed")
+            );
             assert_eq!(counted(), before + n);
         }
         let in_counts = reims_vgpu_vulkan::answer::degradation_counts();
