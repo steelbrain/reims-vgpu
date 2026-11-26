@@ -145,6 +145,7 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | the `displays` property, 1 to 4 (1 by default, others refused at realize): display i is head i, with a console, a window under `-display none` and a cursor of its own; console i reads display i (`rvg_graphics_device_read_display_at`), so QMP's `screendump` of head i saves it ("The reims-graphics device", below) | `010bf827` |
 | file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is | `5e83e90dc2` |
 | shared file-backed guest RAM of base pages (the memfd of `reims-ctl`'s VMs) advised `MADV_NOHUGEPAGE` in place of `MADV_HUGEPAGE` on Linux, before its prealloc, so it stays on 4 KiB pages at every `shmem_enabled` ("Linux hosts: guest RAM on 4 KiB pages", below) | `51382c20` |
+| the device's RAM from the library's memory (the region, BAR 2, and each piece of the Shared pool) advised `MADV_NOHUGEPAGE` once `ram_block_add` has advised it `MADV_HUGEPAGE`, so it stays on 4 KiB pages as guest RAM does ("Linux hosts: guest RAM on 4 KiB pages", below) | `1a35b9fb` |
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `83de566436` |
 | QMP's `screendump` in PPM, its default format, writes rows of width × 3 bytes. Upstream's wrote each row with its line buffer's stride, which pixman rounds up to 4 bytes, so a display whose width is not a multiple of 4 (a window of 3662 × 2039 pixels) read back sheared, its colours rotating from row to row; PNG's rows were right. `tests/qtest/display-screendump-test.c` dumps `bochs-display` at widths of 64, 66 and 67 | `e1360002ad` |
 | QMP's and HMP's `screendump` copy the console's surface under the BQL, then encode and write the copy on a thread of the pool with the BQL let go (`thread_pool_submit_co`), so a vCPU that touches a device the BQL guards no longer waits out the encode: a PNG of 2880x1620 takes about 120 ms on a Mac mini 2018 ("The reims-graphics device", below) | `500d30fb` |
@@ -691,7 +692,9 @@ QEMU advises the guest's RAM, the memfd of `reims-ctl`'s VMs, `MADV_NOHUGEPAGE`
 before its prealloc (`ram_block_add`, `system/physmem.c`), and the library
 gives the same advice to each of its views of that memfd that could hold a
 huge page (`off_huge_pages`, `crates/reims-vgpu-vulkan/src/os/linux/vm.rs`),
-so the guest runs on 4 KiB pages at every `shmem_enabled`. Linux 6.11 to 7.1
+as the device does to the library's memory it maps into the guest, the region
+and the Shared pool's pieces (`reims_graphics_library_ram`), so the guest runs
+on 4 KiB pages at every `shmem_enabled`. Linux 6.11 to 7.1
 build a udmabuf's scatterlist with an entry per 4 KiB page that names a large
 folio's head page and an offset past the page (fixed in 7.2 by upstream
 `5bf888673e0d`), and amdgpu's import of such a dma-buf binds the buffer's
@@ -1464,8 +1467,9 @@ once, in 5 rounds that rotate the kinds. The table gives each rate's median in M
 - On Linux the same probe put the pool within 5% of the region
   (homelab-um790-xtx-1 under KVM, `m3-max-51954`). One thread stored 28,531
   MB/s into the pool and 29,991 into the region, and 8 threads loaded 77,731
-  and 78,000. There, QEMU madvises each piece HUGEPAGE, and none to all of
-  a piece was in huge pages, against 202 of the region's 268 MiB resident.
+  and 78,000. There, QEMU madvised each piece HUGEPAGE (before `1a35b9fb`),
+  and none to all of a piece was in huge pages, against 202 of the region's
+  268 MiB resident.
 
 Making a piece: the pool starts with no piece, so the guest's first take
 waited for one to be made and mapped. That take, 128 KiB, waited:
