@@ -12,7 +12,7 @@ use crate::core::runtime::{Runtime as _, StdRuntime};
 
 use super::super::d3d12::{
     Com, Device, Guid, Hresult, SharedTexture, check, default_adapter_device_references,
-    default_adapter_device_references_once_let_go, guid,
+    default_adapter_device_references_once_let_go, guid, process_gpu_memory_settled,
 };
 use super::super::display::Display;
 use super::super::frame::{Frame, PlaneRows};
@@ -489,11 +489,15 @@ fn targets_let_go_give_back_their_memory() {
 /// session's end: while they live the draws keep an open of each, and once they are let go none
 /// (the fix's own claim, by count). By memory, three cycles: the level after the last, against the
 /// level after the first, is up by less than a tenth of what a cycle's 16 textures held, so that
-/// what a pool left behind would add up past the bound. The level after the first cycle is not
-/// asserted: on the UHD Graphics 630 that cycle left 63,930,368 of the 466,493,440 bytes its
-/// textures held, with one flush of the draws' contexts and with a second after a wait for the GPU
-/// alike (**measured** 2026-11-26, driver 31.0.101.2145, potluck jobs m3-max-75548 and
-/// m3-max-75554); the test prints it. Run holding the GPU, on the default adapter.
+/// what a pool left behind would add up past the bound, as DXGI counts the process's memory and
+/// as Windows charges it (`super::super::d3d12::process_gpu_memory`): an open of each texture's NT
+/// handle, which DXGI did not count, stayed charged for good, 16 times a texture's 12.4 MB a cycle
+/// (`super::super::d3d12`'s module doc), where the draws' wrap of its resource leaves nothing. The
+/// level after the first cycle is not asserted: on the UHD Graphics 630, with those opens, that
+/// cycle left 63,930,368 of the 466,493,440 bytes its textures held as DXGI counts them, with one
+/// flush of the draws' contexts and with a second after a wait for the GPU alike (**measured**
+/// 2026-11-26, driver 31.0.101.2145, potluck jobs m3-max-75548 and m3-max-75554); the test prints
+/// both. Run holding the GPU, on the default adapter.
 #[test]
 #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
 fn pool_textures_let_go_give_back_their_memory() {
@@ -502,8 +506,9 @@ fn pool_textures_let_go_give_back_their_memory() {
     let draw = PlaneDraw::new(None).expect("the plane draws");
     let to = draw.targets((64, 48), false).expect("the targets");
     let device = Device::new(None).expect("a Direct3D 12 device");
-    // A cycle (above): what its textures held above the level it began at, and the level after.
-    let cycle = |n: usize| -> (u64, u64) {
+    // A cycle (above): what its textures held above the level it began at, and the level after,
+    // as DXGI counts it and as Windows charges it.
+    let cycle = |n: usize| -> (u64, u64, u64) {
         let start = memory_used(&draw);
         let textures: Vec<Arc<SharedTexture>> = (0..16)
             .map(|_| {
@@ -532,21 +537,29 @@ fn pool_textures_let_go_give_back_their_memory() {
             0,
             "cycle {n}: no open of a texture let go"
         );
-        (held, memory_used(&draw))
+        (held, memory_used(&draw), process_gpu_memory_settled())
     };
-    let before = memory_used(&draw);
-    let (held, first) = cycle(1);
+    let before = (memory_used(&draw), process_gpu_memory_settled());
+    let (held, first, first_charged) = cycle(1);
     println!(
-        "the first cycle left {} bytes of the {held} that its 16 pool textures held",
-        first.saturating_sub(before)
+        "the first cycle left {} bytes of the {held} that its 16 pool textures held, and {} bytes \
+         charged",
+        first.saturating_sub(before.0),
+        first_charged.saturating_sub(before.1)
     );
     cycle(2);
-    let (held, last) = cycle(3);
+    let (held, last, last_charged) = cycle(3);
     let grown = last.saturating_sub(first);
     assert!(
         grown < held / 10,
         "{grown} bytes more after the third cycle than after the first, of the {held} that a \
          cycle's 16 pool textures held"
+    );
+    let grown = last_charged.saturating_sub(first_charged);
+    assert!(
+        grown < held / 10,
+        "{grown} bytes more charged after the third cycle than after the first, of the {held} \
+         that a cycle's 16 pool textures held"
     );
 }
 

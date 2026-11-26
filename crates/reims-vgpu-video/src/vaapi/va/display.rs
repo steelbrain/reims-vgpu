@@ -275,7 +275,9 @@ impl Display {
     /// adapter the driver picks, for the examples. No import check runs:
     /// Windows makes no dma-buf, so the driver is lent no import
     /// ([`Display::import_writes`] says so) and frames come back through
-    /// images.
+    /// images. `Err` where the driver takes no Direct3D 12 resource as a
+    /// decode's surface, the one way a pool hands it its textures
+    /// (`super::surface::takes_resources`).
     #[cfg(windows)]
     pub fn open_adapter(luid: Option<[u8; 8]>, runtime: Arc<dyn Runtime>) -> Result<Self, Error> {
         let Some(step) = runtime.exit_step() else {
@@ -296,7 +298,9 @@ impl Display {
             Some(luid) => format!("the DXGI adapter of LUID {:#x}", u64::from_le_bytes(luid)),
             None => "the DXGI adapter the driver picks".to_owned(),
         };
-        Self::initialise(raw, name, None, luid, runtime, step)
+        let display = Self::initialise(raw, name, None, luid, runtime, step)?;
+        super::surface::takes_resources(&display)?;
+        Ok(display)
     }
 
     /// The Direct3D 12 device on the display's adapter, which its pools

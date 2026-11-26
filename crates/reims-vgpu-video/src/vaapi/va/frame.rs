@@ -108,10 +108,9 @@ impl Frame {
         self.surface.export()
     }
 
-    /// The frame's surface as the shared Direct3D 12 texture it is, on Windows, for another
-    /// device to read its planes by the texture's NT handle (`super::d3d12`); `None` where its
-    /// pool's surfaces are the driver's own. It reads the decode only once [`Frame::sync`]
-    /// returned.
+    /// The frame's surface as the Direct3D 12 texture it is, on Windows, for the plane draws to
+    /// read its planes through its resource (`super::d3d12`); `None` where its pool's surfaces
+    /// are the driver's own. It reads the decode only once [`Frame::sync`] returned.
     #[cfg(windows)]
     pub fn texture(&self) -> Option<Arc<super::d3d12::SharedTexture>> {
         self.surface.texture()

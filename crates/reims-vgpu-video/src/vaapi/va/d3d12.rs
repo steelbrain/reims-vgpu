@@ -1,15 +1,28 @@
 //! Direct3D 12, on Windows, as much of it as the module needs: a device on the display's DXGI
-//! adapter, shared NV12 and P010 textures that the display's pools are made of, and copies
-//! between them.
+//! adapter, the NV12 and P010 textures that the display's pools are made of, and copies between
+//! them.
 //!
-//! A pool's surfaces on Windows are textures of ours, made here on the adapter's device with a
-//! shared heap (`D3D12_HEAP_FLAG_SHARED`), each opened by Mesa's VA driver (`vaon12`) through its
-//! NT handle (`VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE`), so that what decodes into them can be read
-//! by others that open the same handle: the Vulkan platform's copy of a picture into the guest's
-//! planes. vaon12's own surfaces are not shared, and their export fails (measured on the UHD 630,
+//! A pool's surfaces on Windows are textures of ours, made here on the adapter's device, each
+//! handed to Mesa's VA driver (`vaon12`) as its resource
+//! (`VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE`), so that what decodes into them can be read by
+//! the plane draws (`super::d3d11`), which wrap the same resource. Direct3D 12 makes one device a
+//! process and adapter (`D3D12CreateDevice` answers the one that lives), so the driver's, the
+//! draws' and the pools' devices on the decode's adapter are one, and each takes the resource as
+//! its own. vaon12's own surfaces cannot be read so: their export fails (measured on the UHD 630,
 //! Mesa 26.2.7, 2026-11-16). A copy of one texture into another (a stand-in for a lost frame,
 //! `super::surface`) runs on a copy queue of this device's, which the module waits for on its
 //! fence.
+//!
+//! No pool texture is shared by an NT handle. An open of a texture's NT handle on the device that
+//! made it (`ID3D12Device::OpenSharedHandle`) charged the process's GPU memory with the texture's
+//! size for good: past the open's release, the texture's and its handle's, and the display's
+//! `vaTerminate`, while the device lived; and vaon12's import of an NT handle
+//! (`VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE`) is such an open, charged again at each import of the
+//! same texture. A pool of six 3840x2160 NV12 textures was charged 72 MiB at each import and at
+//! each of the draws' opens, with no VA call for the opens alone, in the "GPU Process Memory"
+//! counters' Shared Usage, which DXGI's `QueryVideoMemoryInfo` does not count; handed over and
+//! wrapped as resources, none (measured on an Intel UHD Graphics 630, driver 31.0.101.2145, Mesa
+//! 26.2.7, 2026-11-26, with a program of our own on D3D12 and libva alone).
 //!
 //! The binding is written by hand: the functions are loaded from `d3d12.dll` and `dxgi.dll` with
 //! `LoadLibraryW` and `GetProcAddress`, as libva is (`super::libva`), and each COM method is
@@ -97,7 +110,6 @@ pub(super) const IID_ID3D12_FENCE: Guid = guid(
 
 // The vtable indices of the methods called (the SDK's `<interface>Vtbl` structures).
 const QUERY_INTERFACE: usize = 0;
-#[cfg(test)]
 const ADD_REF: usize = 1;
 const RELEASE: usize = 2;
 const FACTORY4_ENUM_ADAPTER_BY_LUID: usize = 26;
@@ -105,7 +117,6 @@ pub(super) const DEVICE_CREATE_COMMAND_QUEUE: usize = 8;
 const DEVICE_CREATE_COMMAND_ALLOCATOR: usize = 9;
 const DEVICE_CREATE_COMMAND_LIST: usize = 12;
 const DEVICE_CREATE_COMMITTED_RESOURCE: usize = 27;
-const DEVICE_CREATE_SHARED_HANDLE: usize = 31;
 pub(super) const DEVICE_CREATE_FENCE: usize = 36;
 const QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 pub(super) const QUEUE_SIGNAL: usize = 14;
@@ -120,12 +131,11 @@ const DXGI_FORMAT_NV12: u32 = 103;
 const DXGI_FORMAT_P010: u32 = 104;
 const D3D_FEATURE_LEVEL_11_0: u32 = 0xb000;
 const D3D12_HEAP_TYPE_DEFAULT: u32 = 1;
-const D3D12_HEAP_FLAG_SHARED: u32 = 0x1;
+const D3D12_HEAP_FLAG_NONE: u32 = 0;
 const D3D12_RESOURCE_DIMENSION_TEXTURE2D: u32 = 3;
 const D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET: u32 = 0x1;
 const D3D12_RESOURCE_STATE_COMMON: u32 = 0;
 const D3D12_COMMAND_LIST_TYPE_COPY: u32 = 3;
-const GENERIC_ALL: u32 = 0x1000_0000;
 pub(super) const WAIT_OBJECT_0: u32 = 0;
 
 /// `D3D12_HEAP_PROPERTIES`.
@@ -243,6 +253,18 @@ impl Com {
 
     pub(super) fn raw(&self) -> *mut c_void {
         self.0.as_ptr()
+    }
+
+    /// Another reference of the object (`AddRef`, every COM object's method 1), released when
+    /// dropped.
+    pub(super) fn another(&self) -> Com {
+        // SAFETY: `AddRef` is every COM object's method 1; the reference it adds is the new
+        // `Com`'s, which releases it once.
+        unsafe {
+            let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = self.method(ADD_REF);
+            add_ref(self.raw());
+        }
+        Com(self.0)
     }
 
     /// The method at `index` of the object's vtable, as `F`.
@@ -373,16 +395,18 @@ impl Drop for Handle {
     }
 }
 
-/// A shared texture of a pool's: the resource, and the NT handle that opens it elsewhere.
+/// A texture of a pool's, shared by the driver's decodes and the draws (module doc), which each
+/// take its resource ([`SharedTexture::raw_resource`], [`SharedTexture::resource`]).
 ///
-/// Another device opens it by its NT handle ([`SharedTexture::handle`]), which stays the
-/// texture's: an import of it is let go once [`SharedTexture::alive`] no longer upgrades, and a
-/// device that keeps its open asks to be told as the texture goes ([`SharedTexture::on_let_go`]),
-/// since an open keeps the texture's memory while it lives.
+/// An import of it is let go once [`SharedTexture::alive`] no longer upgrades, and a device that
+/// keeps one (the draws' wrap of its resource) asks to be told as the texture goes
+/// ([`SharedTexture::on_let_go`]), since it keeps the texture's memory while it lives.
 #[derive(Debug)]
 pub struct SharedTexture {
     resource: Com,
-    handle: Handle,
+    /// The device that made it, which the draws' device is to be (module doc): its pointer, as
+    /// the device's identity, never dereferenced.
+    device: usize,
     format: SurfaceFormat,
     size: (u32, u32),
     /// Its life, which another device's imports of it are let go by.
@@ -418,15 +442,19 @@ impl Drop for SharedTexture {
 }
 
 impl SharedTexture {
-    /// The NT handle that opens the texture, as a pointer, for the driver's import.
-    pub(crate) fn raw_handle(&self) -> *mut c_void {
-        self.handle.0.as_ptr()
+    /// The texture's resource (an `ID3D12Resource`), for the driver's import, which takes a
+    /// reference of its own.
+    pub(crate) fn raw_resource(&self) -> *mut c_void {
+        self.resource.raw()
     }
 
-    /// The NT handle that opens the texture, which stays the texture's.
-    pub fn handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-        // SAFETY: the handle is open while the texture lives, and the borrow ends with it.
-        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.handle.0.as_ptr()) }
+    /// Another reference of the texture's resource, for a device of `device`'s to wrap: `Err`
+    /// where `device` did not make it, as only the device that made a resource uses it.
+    pub(super) fn resource(&self, device: &Com) -> Result<Com, String> {
+        if device.raw().addr() != self.device {
+            return Err("a texture of another Direct3D 12 device".to_owned());
+        }
+        Ok(self.resource.another())
     }
 
     /// Whether its samples are 10-bit in 16 (P010), else 8-bit (NV12).
@@ -483,7 +511,7 @@ impl Device {
         })
     }
 
-    /// A texture of `format`, `width` by `height`, in a shared heap, and its NT handle.
+    /// A texture of `format`, `width` by `height`, for a pool (module doc).
     pub(crate) fn shared_texture(
         &self,
         format: SurfaceFormat,
@@ -532,7 +560,7 @@ impl Device {
             create(
                 self.device.raw(),
                 &heap,
-                D3D12_HEAP_FLAG_SHARED,
+                D3D12_HEAP_FLAG_NONE,
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 null(),
@@ -541,34 +569,9 @@ impl Device {
             )
         };
         let resource = Com::made("CreateCommittedResource", result, resource)?;
-        let mut handle = null_mut();
-        // SAFETY: the method is `CreateSharedHandle`, of a resource of this device's in a shared
-        // heap, with no security attributes and no name.
-        let result = unsafe {
-            let share: unsafe extern "system" fn(
-                *mut c_void,
-                *mut c_void,
-                *const c_void,
-                u32,
-                *const u16,
-                *mut *mut c_void,
-            ) -> Hresult = self.device.method(DEVICE_CREATE_SHARED_HANDLE);
-            share(
-                self.device.raw(),
-                resource.raw(),
-                null(),
-                GENERIC_ALL,
-                null(),
-                &mut handle,
-            )
-        };
-        check("CreateSharedHandle", result)?;
-        let handle = NonNull::new(handle)
-            .map(Handle)
-            .ok_or("CreateSharedHandle made no handle")?;
         Ok(SharedTexture {
             resource,
-            handle,
+            device: self.device.raw().addr(),
             format,
             size: (width, height),
             life: Arc::new(()),
@@ -847,6 +850,134 @@ pub(super) fn video_memory_used() -> Result<[u64; 2], String> {
         *used = info.current_usage;
     }
     Ok(used)
+}
+
+/// What Windows charges this process on its GPUs, in bytes: the "GPU Process Memory" counters'
+/// Shared Usage and Dedicated Usage of the process's instances (one an adapter, named
+/// `pid_<pid>_luid_...`), summed, read once. It counts what an open of a texture's NT handle left
+/// charged, which DXGI's `QueryVideoMemoryInfo` does not (module doc). Tests only.
+#[cfg(test)]
+pub(super) fn process_gpu_memory() -> Result<u64, String> {
+    /// `PDH_FMT_COUNTERVALUE_ITEM_W` read as `PDH_FMT_LARGE`: the instance's name, then
+    /// `PDH_FMT_COUNTERVALUE`'s status and its value.
+    #[repr(C)]
+    struct Item {
+        name: *const u16,
+        status: u32,
+        value: i64,
+    }
+    type OpenQuery = unsafe extern "system" fn(*const u16, usize, *mut *mut c_void) -> u32;
+    type AddCounter =
+        unsafe extern "system" fn(*mut c_void, *const u16, usize, *mut *mut c_void) -> u32;
+    type Collect = unsafe extern "system" fn(*mut c_void) -> u32;
+    type CounterArray =
+        unsafe extern "system" fn(*mut c_void, u32, *mut u32, *mut u32, *mut Item) -> u32;
+    type CloseQuery = unsafe extern "system" fn(*mut c_void) -> u32;
+    const PDH_FMT_LARGE: u32 = 0x400;
+    const PDH_MORE_DATA: u32 = 0x8000_07d2;
+    const COUNTERS: [&str; 2] = [
+        "\\GPU Process Memory(*)\\Shared Usage",
+        "\\GPU Process Memory(*)\\Dedicated Usage",
+    ];
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain([0]).collect() };
+    let function = |name: &CStr| system_function("pdh.dll", name);
+    // SAFETY: each function is pdh.dll's of that name (pdh.h), as the type says.
+    let (open, add, collect, array, close) = unsafe {
+        (
+            std::mem::transmute::<NonNull<c_void>, OpenQuery>(function(c"PdhOpenQueryW")?),
+            std::mem::transmute::<NonNull<c_void>, AddCounter>(function(c"PdhAddEnglishCounterW")?),
+            std::mem::transmute::<NonNull<c_void>, Collect>(function(c"PdhCollectQueryData")?),
+            std::mem::transmute::<NonNull<c_void>, CounterArray>(function(
+                c"PdhGetFormattedCounterArrayW",
+            )?),
+            std::mem::transmute::<NonNull<c_void>, CloseQuery>(function(c"PdhCloseQuery")?),
+        )
+    };
+    let failed = |what: &str, status: u32| format!("{what} failed: {status:#010x}");
+    let mut query = null_mut();
+    // SAFETY: no data source (the live counters), and where to write the query.
+    let status = unsafe { open(null(), 0, &mut query) };
+    if status != 0 {
+        return Err(failed("PdhOpenQueryW", status));
+    }
+    let prefix = format!("pid_{}_", std::process::id());
+    let read = || -> Result<u64, String> {
+        let mut counters = [null_mut(); 2];
+        for (path, counter) in COUNTERS.iter().zip(&mut counters) {
+            let path = wide(path);
+            // SAFETY: the query is open, the path NUL-terminated.
+            let status = unsafe { add(query, path.as_ptr(), 0, counter) };
+            if status != 0 {
+                return Err(failed("PdhAddEnglishCounterW", status));
+            }
+        }
+        // SAFETY: the query is open.
+        let status = unsafe { collect(query) };
+        if status != 0 {
+            return Err(failed("PdhCollectQueryData", status));
+        }
+        let mut bytes = 0u64;
+        for counter in counters {
+            let (mut size, mut count) = (0u32, 0u32);
+            // SAFETY: a null buffer of no size asks for the size.
+            let status =
+                unsafe { array(counter, PDH_FMT_LARGE, &mut size, &mut count, null_mut()) };
+            if status != PDH_MORE_DATA {
+                return Err(failed("PdhGetFormattedCounterArrayW", status));
+            }
+            let mut items: Vec<Item> =
+                Vec::with_capacity(usize::try_from(size).unwrap_or(0) / size_of::<Item>() + 1);
+            // SAFETY: the buffer holds `size` bytes, aligned for the items, which the call writes
+            // with the names they point at after them.
+            let status = unsafe {
+                array(counter, PDH_FMT_LARGE, &mut size, &mut count, items.as_mut_ptr())
+            };
+            if status != 0 {
+                return Err(failed("PdhGetFormattedCounterArrayW", status));
+            }
+            // SAFETY: the call wrote `count` items.
+            unsafe { items.set_len(usize::try_from(count).unwrap_or(0)) };
+            for item in &items {
+                // SAFETY: each name is NUL-terminated UTF-16 in the buffer, which lives.
+                let name = unsafe {
+                    let length = (0..).take_while(|&i| *item.name.add(i) != 0).count();
+                    String::from_utf16_lossy(std::slice::from_raw_parts(item.name, length))
+                };
+                if item.status == 0 && name.starts_with(&prefix) {
+                    bytes += u64::try_from(item.value).unwrap_or(0);
+                }
+            }
+        }
+        Ok(bytes)
+    };
+    let bytes = read();
+    // SAFETY: the query is open, and closed once.
+    unsafe { close(query) };
+    bytes
+}
+
+/// [`process_gpu_memory`] once it has moved by less than 1 MiB over its last 2 s, read every
+/// 250 ms, or as it is 30 s on. Tests only.
+#[cfg(test)]
+pub(super) fn process_gpu_memory_settled() -> u64 {
+    use crate::core::runtime::{Runtime as _, StdRuntime};
+    // The tests' clock: std's, which the library does not read.
+    let clock = StdRuntime;
+    let start = clock.now();
+    let mut reads = std::collections::VecDeque::new();
+    loop {
+        let bytes = process_gpu_memory().expect("the GPU Process Memory counters");
+        reads.push_back(bytes);
+        if reads.len() > 8 {
+            reads.pop_front();
+        }
+        let (low, high) = (reads.iter().min(), reads.iter().max());
+        let settled = reads.len() == 8 && high.zip(low).is_some_and(|(h, l)| h - l < 1 << 20);
+        if settled || clock.elapsed_since(start) >= Duration::from_secs(30) {
+            return bytes;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// The device of the display opened on `luid`, made at its first use and kept; `Err` with why

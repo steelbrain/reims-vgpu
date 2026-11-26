@@ -1,4 +1,4 @@
-//! Direct3D 11 on Windows: a picture's planes drawn from the shared texture it decoded into
+//! Direct3D 11 on Windows: a picture's planes drawn from the pool texture it decoded into
 //! (`Frame::texture`) into two textures of one plane each, which another device imports as
 //! images of one plane ([`PlaneDraw`], [`PlaneTargets`]).
 //!
@@ -10,7 +10,9 @@
 //! (`D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`): the luma as `R8_UNORM` (`R16_UNORM` for 10-bit samples) and the chroma's Cb and Cr samples packed into
 //! one texel, `Cb | Cr << 8` as `R16_UINT` (`<< 16`, `R32_UINT`), which reads as `RG8Unorm`
 //! (`RG16Unorm`) in a view of the same bits. The draws run on a Direct3D 11 device over a
-//! Direct3D 12 device of ours (D3D11On12), which opens each pool texture by its NT handle and
+//! Direct3D 12 device of ours (D3D11On12), the pools' own device (one a process and adapter,
+//! `super::d3d12`), which wraps each pool texture's resource (`CreateWrappedResource`) rather
+//! than open an NT handle of it, an open that would stay charged for good (`super::d3d12`), and
 //! reads its planes through views of `R8_UINT` and `R8G8_UINT` (`R16_UINT` and `R16G16_UINT`):
 //! one triangle a plane over the crop's extent, each pixel its texel from the crop's origin, so
 //! the targets hold what the CPU's copy writes, at their first texel, and nothing past it.
@@ -32,11 +34,11 @@
 //! What a picture's draw would otherwise pay the first time is made with the [`PlaneDraw`], at a
 //! decoder's open: the devices, the shaders, compiled by `D3DCompile` at run time, and the
 //! pipelines of the four target formats, by a draw into a texture of each. A pool texture's open
-//! and views are made at its first picture, and kept while it lives: the texture tells the draws
-//! as it goes (`SharedTexture::on_let_go`), and they let go of its open then, on the thread that
-//! let go of the texture, and flush as a pair of targets let go does (below). An open keeps the
-//! texture's memory, so a pool's goes as the pool does, not at the draws' next picture of another
-//! pool, which may never come.
+//! (the wrap of its resource) and views are made at its first picture, and kept while it lives:
+//! the texture tells the draws as it goes (`SharedTexture::on_let_go`), and they let go of its
+//! open then, on the thread that let go of the texture, and flush as a pair of targets let go does
+//! (below). An open keeps the texture's memory, so a pool's goes as the pool does, not at the
+//! draws' next picture of another pool, which may never come.
 //!
 //! Direct3D 11 destroys an object whose last reference goes only at a later flush of its
 //! device's immediate context ("deferred destruction", `ID3D11DeviceContext::Flush`'s
@@ -91,7 +93,7 @@ use crate::core::sync::{Condvar, Mutex};
 use super::d3d12::{
     Com, CommandQueueDesc, CreateEventW, DEVICE_CREATE_COMMAND_QUEUE, DEVICE_CREATE_FENCE, Device,
     FENCE_GET_COMPLETED_VALUE, FENCE_SET_EVENT_ON_COMPLETION, Guid, Handle, Hresult,
-    IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, IID_ID3D12_RESOURCE, LetGo, QUEUE_SIGNAL,
+    IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, LetGo, QUEUE_SIGNAL,
     SharedTexture, WAIT_OBJECT_0, WaitForSingleObject, adapter_of, check, guid, system_function,
 };
 
@@ -129,7 +131,6 @@ const DEVICE_CREATE_VERTEX_SHADER: usize = 12;
 const DEVICE_CREATE_PIXEL_SHADER: usize = 15;
 const DEVICE_CHECK_FEATURE_SUPPORT: usize = 33;
 const DEVICE1_OPEN_SHARED_RESOURCE_1: usize = 48;
-const D3D12_DEVICE_OPEN_SHARED_HANDLE: usize = 32;
 const CONTEXT_PS_SET_SHADER_RESOURCES: usize = 8;
 const CONTEXT_PS_SET_SHADER: usize = 9;
 const CONTEXT_VS_SET_SHADER: usize = 11;
@@ -371,7 +372,7 @@ struct Makers {
 struct Opened {
     /// The texture's life, which the texture's drop names the entry by (module doc).
     texture: Weak<()>,
-    /// The texture's Direct3D 12 resource, opened by its NT handle.
+    /// The texture's Direct3D 12 resource, a reference of the draws' own.
     _resource: Com,
     /// The resource wrapped for the Direct3D 11 device, and its luma and chroma views.
     wrapped: Com,
@@ -809,24 +810,7 @@ impl State {
         if let Some(at) = (self.opened.iter()).position(|o| Weak::ptr_eq(&o.texture, &life)) {
             return Ok((at, false));
         }
-        let mut out = null_mut();
-        // SAFETY: the method is ID3D12Device's `OpenSharedHandle`, of the texture's NT handle,
-        // which is open while the texture lives, with ID3D12Resource's IID.
-        let result = unsafe {
-            let open: unsafe extern "system" fn(
-                *mut c_void,
-                *mut c_void,
-                *const Guid,
-                *mut *mut c_void,
-            ) -> Hresult = self.d3d12.device.method(D3D12_DEVICE_OPEN_SHARED_HANDLE);
-            open(
-                self.d3d12.device.raw(),
-                texture.raw_handle(),
-                &IID_ID3D12_RESOURCE,
-                &mut out,
-            )
-        };
-        let resource = Com::made("ID3D12Device::OpenSharedHandle", result, out)?;
+        let resource = texture.resource(&self.d3d12.device)?;
         let flags = ResourceFlags {
             bind_flags: D3D11_BIND_SHADER_RESOURCE,
             misc_flags: 0,

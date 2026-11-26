@@ -105,11 +105,11 @@ pub(crate) const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x2;
 /// `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` (va_drmcommon.h): a surface
 /// over dma-bufs, described by a [`VADRMPRIMESurfaceDescriptor`].
 pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
-/// `VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE` (va_win32.h): a surface imported
-/// from the NT handle of a Direct3D 12 resource, which the external buffer
-/// descriptor attribute points at (an array of one handle a surface).
+/// `VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE` (va_win32.h): a surface over
+/// a Direct3D 12 resource, which the external buffer descriptor attribute
+/// points at (an array of one `ID3D12Resource` pointer a surface).
 #[cfg(windows)]
-pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE: u32 = 0x0001_0000;
+pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE: u32 = 0x0002_0000;
 /// `vaExportSurfaceHandle`'s flags (va.h).
 pub(crate) const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
 pub(crate) const VA_EXPORT_SURFACE_WRITE_ONLY: u32 = 0x0002;

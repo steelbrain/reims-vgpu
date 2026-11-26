@@ -18,11 +18,11 @@
 //! ([`end_context`]), is kept until the GPU is done with every one of its
 //! surfaces.
 //!
-//! On Windows a pool's surfaces are Direct3D 12 textures of ours, made
-//! shared, that the driver imports by their NT handles
-//! (`shared_surfaces`, `super::d3d12`), so that another device can open
-//! what decodes into them; where the adapter's device makes no such texture
-//! or the driver imports none, they are the driver's own, as on Linux.
+//! On Windows a pool's surfaces are Direct3D 12 textures of ours that the
+//! driver takes as their resources (`shared_surfaces`, `super::d3d12`), so
+//! that the plane draws can read what decodes into them; where the adapter's
+//! device makes no such texture or the driver takes none, they are the
+//! driver's own, as on Linux.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -454,12 +454,12 @@ fn create_surfaces(
     Ok(ids)
 }
 
-/// `count` surfaces of `pool`'s format and size, on Windows: each a shared
-/// texture of the display's Direct3D 12 device that the driver imports by its
-/// NT handle (`super::d3d12`), so that another device can read what decodes
-/// into it; or, where the device makes no such texture or the driver imports
-/// none, surfaces of the driver's own, as on Linux, with why at info once a
-/// process (`kind`).
+/// `count` surfaces of `pool`'s format and size, on Windows: each a texture
+/// of the display's Direct3D 12 device that the driver takes as its resource
+/// (`super::d3d12`), so that the plane draws can read what decodes into it;
+/// or, where the device makes no such texture or the driver takes none,
+/// surfaces of the driver's own, as on Linux, with why at info once a process
+/// (`kind`).
 #[cfg(windows)]
 fn shared_surfaces(pool: &PoolInner, count: usize) -> Result<Vec<ffi::VASurfaceID>, Error> {
     let display = &pool.display;
@@ -500,8 +500,39 @@ fn shared_surfaces(pool: &PoolInner, count: usize) -> Result<Vec<ffi::VASurfaceI
     Ok(made)
 }
 
-/// A surface of `format`, `width` by `height`, that the driver imports from
-/// `texture`'s NT handle (`VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE`).
+/// Whether the driver takes a Direct3D 12 resource as the surface of an
+/// H.264 or HEVC decode (`VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE` among
+/// the memory types of H.264 High's or HEVC Main's decode surfaces), the one
+/// way a pool hands it a texture ([`import_texture`]): `Err` where a decode's
+/// surfaces list memory types without it, so that the display, and with it
+/// the hardware's decodes, are refused. A driver that decodes neither is
+/// refused by its caps, not here.
+#[cfg(windows)]
+pub(super) fn takes_resources(display: &Display) -> Result<(), Error> {
+    let mut without = None;
+    for profile in [Profile::H264_HIGH, Profile::HEVC_MAIN] {
+        let Ok(surfaces) = display.surface_capabilities(profile, Entrypoint::VLD) else {
+            continue;
+        };
+        let types = surfaces.memory_types.unwrap_or(0);
+        if types & ffi::VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE != 0 {
+            return Ok(());
+        }
+        without = Some(types);
+    }
+    match without {
+        Some(types) => Err(Error::Unsupported(format!(
+            "a Direct3D 12 resource as a decode's surface: its memory types are {types:#010x}, \
+             without VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// A surface of `format`, `width` by `height`, that the driver makes over
+/// `texture`'s resource (`VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE`), never
+/// by an NT handle, whose import keeps the texture's memory charged for good
+/// (`super::d3d12`).
 #[cfg(windows)]
 fn import_texture(
     display: &Display,
@@ -510,7 +541,7 @@ fn import_texture(
     height: u32,
     texture: &SharedTexture,
 ) -> Result<ffi::VASurfaceID, Error> {
-    let mut handles = [texture.raw_handle()];
+    let mut resources = [texture.raw_resource()];
     let mut attributes = [ffi::VASurfaceAttrib::zeroed(); 3];
     attributes[0].type_ = ffi::VASurfaceAttribPixelFormat;
     attributes[0].value.type_ = ffi::VAGenericValueTypeInteger;
@@ -518,10 +549,10 @@ fn import_texture(
     attributes[1].type_ = ffi::VASurfaceAttribMemoryType;
     attributes[1].value.type_ = ffi::VAGenericValueTypeInteger;
     attributes[1].value.value.i =
-        i32::from_ne_bytes(ffi::VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE.to_ne_bytes());
+        i32::from_ne_bytes(ffi::VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE.to_ne_bytes());
     attributes[2].type_ = ffi::VASurfaceAttribExternalBufferDescriptor;
     attributes[2].value.type_ = ffi::VAGenericValueTypePointer;
-    attributes[2].value.value.p = handles.as_mut_ptr().cast();
+    attributes[2].value.value.p = resources.as_mut_ptr().cast();
     for attribute in &mut attributes {
         attribute.flags = ffi::VA_SURFACE_ATTRIB_SETTABLE;
     }
@@ -529,8 +560,9 @@ fn import_texture(
     check(
         "vaCreateSurfaces",
         // SAFETY: `id` holds one entry; the attributes are valid, the
-        // descriptor points at one NT handle, which the call reads and the
-        // texture keeps open.
+        // descriptor points at one resource of the adapter's Direct3D 12
+        // device, the driver's own (`super::d3d12`), which the texture keeps
+        // and the surface takes a reference of.
         display.call(|raw| unsafe {
             ffi::vaCreateSurfaces(
                 raw,

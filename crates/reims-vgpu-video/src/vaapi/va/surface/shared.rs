@@ -91,3 +91,39 @@ fn a_stand_in_copy_gives_the_surface_what_the_other_holds() {
         );
     }
 }
+
+/// A decoder's pool gives back the GPU memory it held once let go, as Windows charges the process
+/// for it (`super::super::d3d12`'s module doc): three pools in turn of six surfaces of 3840x2160
+/// NV12 each, lent and let go with the pool, as a session's pool is at its end; the charge after
+/// the third is up by less than a tenth of a pool's textures on the charge after the first. A pool
+/// whose textures the driver imported by NT handle stayed charged for good, 72 MiB a pool, which
+/// this held two of (**measured** on the UHD 630, 2026-11-26). Run on the Windows host, holding
+/// its GPU.
+#[test]
+#[ignore = "needs vaon12 on a Direct3D 12 GPU: run on the Windows host"]
+fn pools_let_go_give_back_their_memory() {
+    const BIG: (u32, u32) = (3840, 2160);
+    const SURFACES: usize = 6;
+    let textures = SURFACES as u64 * u64::from(BIG.0 * BIG.1 * 3 / 2);
+    let display = Display::open_adapter(None, StdRuntime::shared()).expect("a VA display");
+    let mut charged = Vec::new();
+    for pool in 1..=3 {
+        {
+            let made = SurfacePool::new(&display, SurfaceFormat::Nv12, BIG.0, BIG.1, 0)
+                .expect("a pool");
+            let lent: Vec<Surface> = (0..SURFACES).map(|_| made.get().expect("a surface")).collect();
+            assert!(
+                lent.iter().all(|surface| surface.texture().is_some()),
+                "pool {pool}: a surface of no texture of ours"
+            );
+        }
+        charged.push(super::super::d3d12::process_gpu_memory_settled());
+    }
+    let grown = charged[2].saturating_sub(charged[0]);
+    println!("charged after each pool: {charged:?} bytes");
+    assert!(
+        grown < textures / 10,
+        "{grown} bytes more charged after the third pool than after the first, of the {textures} \
+         that a pool's textures hold"
+    );
+}
