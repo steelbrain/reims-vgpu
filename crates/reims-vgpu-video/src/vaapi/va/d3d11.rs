@@ -32,7 +32,11 @@
 //! What a picture's draw would otherwise pay the first time is made with the [`PlaneDraw`], at a
 //! decoder's open: the devices, the shaders, compiled by `D3DCompile` at run time, and the
 //! pipelines of the four target formats, by a draw into a texture of each. A pool texture's open
-//! and views are made at its first picture, and kept while it lives.
+//! and views are made at its first picture, and kept while it lives: the texture tells the draws
+//! as it goes (`SharedTexture::on_let_go`), and they let go of its open then, on the thread that
+//! let go of the texture, and flush as a pair of targets let go does (below). An open keeps the
+//! texture's memory, so a pool's goes as the pool does, not at the draws' next picture of another
+//! pool, which may never come.
 //!
 //! Direct3D 11 destroys an object whose last reference goes only at a later flush of its
 //! device's immediate context ("deferred destruction", `ID3D11DeviceContext::Flush`'s
@@ -40,15 +44,15 @@
 //! would never be destroyed, and the draws' device would destroy their opens only at its next
 //! draw, all of a held session's at once. So a pair of targets let go flushes both contexts,
 //! under the lock, once its objects are released ([`PlaneTargets`]' last field): its textures
-//! and their memory go as it does.
+//! and their memory go as it does. A pool texture's open let go flushes them the same way.
 //!
 //! Pairs let go of together, as a session's are at its end on several threads, share their
-//! flushes ([`Flushes`]): a pair let go of while another's flush runs waits for the next flush,
-//! which the first of the waiting pairs makes, once, for every pair released before it began,
-//! and each pair's drop returns once a flush begun after its release is done. So a burst takes
-//! the lock and flushes once for the pairs let go of meanwhile, not once a pair, and a flush
-//! destroys no more than the pairs whose drops wait for it, one a thread: a picture's draw
-//! waiting for the lock waits for no more than that.
+//! flushes ([`Flushes`]), and so do pool textures' opens: a pair let go of while another's flush
+//! runs waits for the next flush, which the first of the waiting pairs makes, once, for every
+//! pair released before it began, and each pair's drop returns once a flush begun after its
+//! release is done. So a burst takes the lock and flushes once for the pairs let go of
+//! meanwhile, not once a pair, and a flush destroys no more than the pairs whose drops wait for
+//! it, one a thread: a picture's draw waiting for the lock waits for no more than that.
 //!
 //! A target's bytes are undefined at its make. Its owner may say they are to read zeros wherever
 //! no draw writes them ([`PlaneTargets::owe_zeros`]): the next draw whose extent leaves part of
@@ -87,8 +91,8 @@ use crate::core::sync::{Condvar, Mutex};
 use super::d3d12::{
     Com, CommandQueueDesc, CreateEventW, DEVICE_CREATE_COMMAND_QUEUE, DEVICE_CREATE_FENCE, Device,
     FENCE_GET_COMPLETED_VALUE, FENCE_SET_EVENT_ON_COMPLETION, Guid, Handle, Hresult,
-    IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, IID_ID3D12_RESOURCE, QUEUE_SIGNAL, SharedTexture,
-    WAIT_OBJECT_0, WaitForSingleObject, adapter_of, check, guid, system_function,
+    IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, IID_ID3D12_RESOURCE, LetGo, QUEUE_SIGNAL,
+    SharedTexture, WAIT_OBJECT_0, WaitForSingleObject, adapter_of, check, guid, system_function,
 };
 
 const IID_ID3D11_ON12_DEVICE: Guid = guid(
@@ -351,7 +355,7 @@ struct State {
     fence: Com,
     /// The fence's last value signalled.
     value: u64,
-    /// The pool textures opened, each kept while it lives.
+    /// The pool textures opened, each kept while it lives, and let go as it goes (module doc).
     opened: Vec<Opened>,
 }
 
@@ -365,7 +369,7 @@ struct Makers {
 
 /// A pool texture opened on the draws' device (module doc).
 struct Opened {
-    /// The texture's life: the entry goes once it no longer upgrades.
+    /// The texture's life, which the texture's drop names the entry by (module doc).
     texture: Weak<()>,
     /// The texture's Direct3D 12 resource, opened by its NT handle.
     _resource: Com,
@@ -395,39 +399,67 @@ struct Destroyed {
 }
 
 impl Drop for Destroyed {
-    /// The pair's objects are released by now (its last field). The pair asks for a flush and
-    /// returns once one begun after its ask is done: one that runs already began before it, so
-    /// it waits for the next, which it makes where no other pair waiting began it first.
+    /// The pair's objects are released by now (its last field): it flushes them
+    /// ([`flush_released`]).
     fn drop(&mut self) {
-        let mut owed = self.flushes.owed.lock();
-        owed.asked += 1;
-        let mine = owed.asked;
-        while owed.covered < mine {
-            if owed.flushing {
-                self.flushes.done.wait(&mut owed);
-                continue;
-            }
-            owed.flushing = true;
-            drop(owed);
-            let state = self.state.lock();
-            // Every pair that asked by now released its objects before it asked: this flush,
-            // begun after, destroys them.
-            let covers = self.flushes.owed.lock().asked;
-            state.flush_destroyed();
-            drop(state);
-            owed = self.flushes.owed.lock();
-            owed.covered = owed.covered.max(covers);
-            owed.flushing = false;
-            #[cfg(test)]
-            {
-                owed.made += 1;
-            }
-            self.flushes.done.notify_all();
-        }
+        flush_released(&self.state, &self.flushes);
     }
 }
 
-/// The flushes the pairs of a [`PlaneDraw`]'s let go of share (module doc).
+/// Destroys what the caller released of `state`'s objects (module doc): asks for a flush and
+/// returns once one begun after its ask is done. One that runs already began before it, so it
+/// waits for the next, which it makes where no other caller waiting began it first.
+fn flush_released(state: &Mutex<State>, flushes: &Flushes) {
+    let mut owed = flushes.owed.lock();
+    owed.asked += 1;
+    let mine = owed.asked;
+    while owed.covered < mine {
+        if owed.flushing {
+            flushes.done.wait(&mut owed);
+            continue;
+        }
+        owed.flushing = true;
+        drop(owed);
+        let locked = state.lock();
+        // Every caller that asked by now released its objects before it asked: this flush,
+        // begun after, destroys them.
+        let covers = flushes.owed.lock().asked;
+        locked.flush_destroyed();
+        drop(locked);
+        owed = flushes.owed.lock();
+        owed.covered = owed.covered.max(covers);
+        owed.flushing = false;
+        #[cfg(test)]
+        {
+            owed.made += 1;
+        }
+        flushes.done.notify_all();
+    }
+}
+
+/// What the draws do as a pool texture they opened goes (`SharedTexture::on_let_go`, module
+/// doc): let go of its open, under the lock, and flush it as a pair of targets let go is
+/// ([`flush_released`]); nothing once the draws' objects are gone.
+fn let_go_open(state: Weak<Mutex<State>>, flushes: Weak<Flushes>) -> LetGo {
+    Box::new(move |life: &Weak<()>| {
+        let (Some(state), Some(flushes)) = (state.upgrade(), flushes.upgrade()) else {
+            return;
+        };
+        let mut locked = state.lock();
+        let had = locked.opened.len();
+        locked
+            .opened
+            .retain(|opened| !Weak::ptr_eq(&opened.texture, life));
+        let released = locked.opened.len() < had;
+        drop(locked);
+        if released {
+            flush_released(&state, &flushes);
+        }
+    })
+}
+
+/// The flushes the pairs of a [`PlaneDraw`]'s let go of share, and its opens of pool textures
+/// let go (module doc).
 #[derive(Default)]
 struct Flushes {
     owed: Mutex<Owed>,
@@ -435,14 +467,14 @@ struct Flushes {
     done: Condvar,
 }
 
-/// The pairs let go of, and the flushes of them.
+/// The pairs and opens let go of, and the flushes of them.
 #[derive(Default)]
 struct Owed {
-    /// The pairs that asked for a flush so far, each once its objects were released.
+    /// The pairs and opens that asked for a flush so far, each once its objects were released.
     asked: u64,
-    /// The pairs the last flush done covered: every pair that had asked as it began.
+    /// The asks the last flush done covered: every one made as it began.
     covered: u64,
-    /// A pair's drop is making a flush.
+    /// A pair's drop, or an open's let go, is making a flush.
     flushing: bool,
     /// The flushes made (tests only).
     #[cfg(test)]
@@ -642,7 +674,15 @@ impl PlaneDraw {
             ));
         }
         let mut state = self.state.lock();
-        let at = state.opened(texture, to.ten_bit)?;
+        let (at, made) = state.opened(texture, to.ten_bit)?;
+        if made {
+            // Asked once, as the open is made: the caller holds the texture for the call, so
+            // it goes only after.
+            texture.on_let_go(let_go_open(
+                Arc::downgrade(&self.state),
+                Arc::downgrade(&self.flushes),
+            ));
+        }
         let (x, y) = origin;
         state.set_origin([x, y, x / 2, y / 2]);
         // The owed zeros are taken as the draw is recorded, under the state's lock, as
@@ -758,14 +798,16 @@ impl Makers {
 }
 
 impl State {
-    /// The index in `opened` of `texture`'s open, made where there is none; the entries of
-    /// textures that no longer live are let go first.
-    fn opened(&mut self, texture: &Arc<SharedTexture>, ten_bit: bool) -> Result<usize, String> {
-        self.opened
-            .retain(|opened| opened.texture.strong_count() > 0);
+    /// The index in `opened` of `texture`'s open, and whether it is made now, where there was
+    /// none.
+    fn opened(
+        &mut self,
+        texture: &Arc<SharedTexture>,
+        ten_bit: bool,
+    ) -> Result<(usize, bool), String> {
         let life = texture.alive();
         if let Some(at) = (self.opened.iter()).position(|o| Weak::ptr_eq(&o.texture, &life)) {
-            return Ok(at);
+            return Ok((at, false));
         }
         let mut out = null_mut();
         // SAFETY: the method is ID3D12Device's `OpenSharedHandle`, of the texture's NT handle,
@@ -827,7 +869,7 @@ impl State {
             wrapped,
             views,
         });
-        Ok(self.opened.len() - 1)
+        Ok((self.opened.len() - 1, true))
     }
 
     /// A view of `resource`'s plane of `format`, as the plane's format names it.

@@ -376,7 +376,9 @@ impl Drop for Handle {
 /// A shared texture of a pool's: the resource, and the NT handle that opens it elsewhere.
 ///
 /// Another device opens it by its NT handle ([`SharedTexture::handle`]), which stays the
-/// texture's: an import of it is let go once [`SharedTexture::alive`] no longer upgrades.
+/// texture's: an import of it is let go once [`SharedTexture::alive`] no longer upgrades, and a
+/// device that keeps its open asks to be told as the texture goes ([`SharedTexture::on_let_go`]),
+/// since an open keeps the texture's memory while it lives.
 #[derive(Debug)]
 pub struct SharedTexture {
     resource: Com,
@@ -385,6 +387,34 @@ pub struct SharedTexture {
     size: (u32, u32),
     /// Its life, which another device's imports of it are let go by.
     life: Arc<()>,
+    /// What the devices that keep an open of it do as it goes.
+    let_go: LetGoes,
+}
+
+/// What a device that keeps an open of a [`SharedTexture`] does as the texture goes, told the
+/// texture's life ([`SharedTexture::alive`]) its open was made by: let go of the open.
+pub(crate) type LetGo = Box<dyn FnOnce(&Weak<()>) + Send>;
+
+/// A [`SharedTexture`]'s [`LetGo`]s, run once, at its drop.
+#[derive(Default)]
+struct LetGoes(Mutex<Vec<LetGo>>);
+
+impl std::fmt::Debug for LetGoes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} let go", self.0.lock().len())
+    }
+}
+
+impl Drop for SharedTexture {
+    /// Tells each device that keeps an open of the texture that it goes, on this thread, before
+    /// its resource and handle are let go: a device then lets go of its open, so that the
+    /// texture's memory goes with it, not at the device's next use of another texture.
+    fn drop(&mut self) {
+        let life = Arc::downgrade(&self.life);
+        for let_go in std::mem::take(self.let_go.0.get_mut()) {
+            let_go(&life);
+        }
+    }
 }
 
 impl SharedTexture {
@@ -413,6 +443,13 @@ impl SharedTexture {
     /// longer upgrades.
     pub fn alive(&self) -> Weak<()> {
         Arc::downgrade(&self.life)
+    }
+
+    /// Asks that `let_go` run as the texture goes, on the thread that lets go of it last, told
+    /// its life: a device that keeps an open of it lets go of the open there. `let_go` takes no
+    /// lock that a holder of the texture may hold as it lets go of it.
+    pub(crate) fn on_let_go(&self, let_go: LetGo) {
+        self.let_go.0.lock().push(let_go);
     }
 }
 
@@ -535,6 +572,7 @@ impl Device {
             format,
             size: (width, height),
             life: Arc::new(()),
+            let_go: LetGoes::default(),
         })
     }
 

@@ -483,6 +483,57 @@ fn targets_let_go_give_back_their_memory() {
     );
 }
 
+/// Pool textures let go give back their memory as they go, with no draw after (the module doc's
+/// opens): 16 shared textures of 3840 by 2160 luma samples, of 8-bit samples, each drawn from
+/// once, as a session's pool is, hold at least their 16 times 12.4 MB of the adapter's memory
+/// more while they live, and the draws keep an open of each; once they are let go, as a pool is
+/// at its session's end, the draws keep none, and less than a tenth of what they held is left.
+/// Before the draws let go of an open as its texture went, they did so only at their next draw
+/// from another texture, so a pool's memory stayed with the draws until the next video. Run
+/// holding the GPU, on the default adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn pool_textures_let_go_give_back_their_memory() {
+    const SIZE: (u32, u32) = (3840, 2160);
+    let texture = u64::from(SIZE.0 * SIZE.1 + SIZE.0.div_ceil(2) * SIZE.1.div_ceil(2) * 2);
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    let to = draw.targets((64, 48), false).expect("the targets");
+    let device = Device::new(None).expect("a Direct3D 12 device");
+    let before = memory_used(&draw);
+    let textures: Vec<Arc<SharedTexture>> = (0..16)
+        .map(|_| {
+            let texture = (device.shared_texture(SurfaceFormat::Nv12, SIZE.0, SIZE.1))
+                .expect("a shared texture");
+            Arc::new(texture)
+        })
+        .collect();
+    for texture in &textures {
+        draw.draw(texture, (0, 0), &to, (64, 48)).expect("the draw");
+    }
+    let held = memory_used(&draw).saturating_sub(before);
+    assert!(
+        held >= 16 * texture,
+        "16 pool textures hold {held} bytes more, of their {} bytes",
+        16 * texture
+    );
+    assert_eq!(
+        draw.state.lock().opened.len(),
+        16,
+        "an open of each texture"
+    );
+    drop(textures);
+    assert_eq!(
+        draw.state.lock().opened.len(),
+        0,
+        "no open of a texture let go"
+    );
+    let left = memory_used(&draw).saturating_sub(before);
+    assert!(
+        left < held / 10,
+        "{left} bytes of the {held} that 16 pool textures held are left once they are let go"
+    );
+}
+
 /// Pairs of targets let go of together share their flushes (the module doc's): four pairs of
 /// 3840 by 2160 luma samples let go of on four threads while the draws' lock is held, as a draw
 /// or another pair's flush holds it, wait for a flush begun after their release, and the first of
