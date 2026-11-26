@@ -143,7 +143,8 @@ virtio device (`d151bcd9`, upstream's `b501f21312`).
 | the device's realize warns where BAR 2 would get no address: on a PC machine with RAM at 1 GiB ("The reims-graphics device", below) | `b7d7fdaf` |
 | the window opens at the `resolution` property's size, 1920x1080 without it | `9bf62d84` |
 | the `displays` property, 1 to 4 (1 by default, others refused at realize): display i is head i, with a console, a window under `-display none` and a cursor of its own; console i reads display i (`rvg_graphics_device_read_display_at`), so QMP's `screendump` of head i saves it ("The reims-graphics device", below) | `010bf827` |
-| file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is, so transparent huge pages can back it where the host allows them ("Linux hosts: huge pages for guest RAM", below) | `5e83e90dc2` |
+| file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is | `5e83e90dc2` |
+| shared file-backed guest RAM of base pages (the memfd of `reims-ctl`'s VMs) advised `MADV_NOHUGEPAGE` in place of `MADV_HUGEPAGE` on Linux, before its prealloc, so it stays on 4 KiB pages at every `shmem_enabled` ("Linux hosts: guest RAM on 4 KiB pages", below) | `51382c20` |
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `83de566436` |
 | QMP's `screendump` in PPM, its default format, writes rows of width × 3 bytes. Upstream's wrote each row with its line buffer's stride, which pixman rounds up to 4 bytes, so a display whose width is not a multiple of 4 (a window of 3662 × 2039 pixels) read back sheared, its colours rotating from row to row; PNG's rows were right. `tests/qtest/display-screendump-test.c` dumps `bochs-display` at widths of 64, 66 and 67 | `e1360002ad` |
 | QMP's and HMP's `screendump` copy the console's surface under the BQL, then encode and write the copy on a thread of the pool with the BQL let go (`thread_pool_submit_co`), so a vCPU that touches a device the BQL guards no longer waits out the encode: a PNG of 2880x1620 takes about 120 ms on a Mac mini 2018 ("The reims-graphics device", below) | `500d30fb` |
@@ -684,20 +685,26 @@ on such an image:
 on its Vulkan platform. These are the facts of such hosts the library and
 QEMU rely on.
 
-### Linux hosts: huge pages for guest RAM
+### Linux hosts: guest RAM on 4 KiB pages
 
-QEMU maps file-backed guest RAM, the memfd of `reims-ctl`'s VMs among it, at
-a 2 MiB-aligned address (`system/physmem.c`), as it maps anonymous RAM.
-The kernel backs a shmem mapping with a transparent huge page only where the
-mapping's address keeps the file's offset in one, so at the 4 KiB alignment
-before, the guest ran on 4 KiB pages alone. Whether huge pages back it now
-is the host's choice: `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
-at `advise` (CachyOS ships it), with QEMU's `MADV_HUGEPAGE`, or at `always`
-or `within_size`; at `never` or `deny`, upstream's default, nothing changes.
+QEMU advises the guest's RAM, the memfd of `reims-ctl`'s VMs, `MADV_NOHUGEPAGE`
+before its prealloc (`ram_block_add`, `system/physmem.c`), and the library
+gives the same advice to each of its views of that memfd that could hold a
+huge page (`off_huge_pages`, `crates/reims-vgpu-vulkan/src/os/linux/vm.rs`),
+so the guest runs on 4 KiB pages at every `shmem_enabled`. Linux 6.11 to 7.1
+build a udmabuf's scatterlist with an entry per 4 KiB page that names a large
+folio's head page and an offset past the page (fixed in 7.2 by upstream
+`5bf888673e0d`), and amdgpu's import of such a dma-buf binds the buffer's
+pages to the wrong host pages, which overwrote a macOS 26.7.2 guest's kernel
+memory on a Radeon 890M with Linux 6.18.59 (issue 185; the arithmetic is in
+`crates/reims-vgpu-vulkan/src/os/linux/dma_buf.rs`, "The pages' size").
 
-Measured on msi-5080 (macos-26, 16 GiB, a drag and a UFO test,
-2026-10-27): KVM maps about 10 GiB of the guest at 2 MiB, none
-before, and the vCPUs' time a frame falls 6-7% at the same frame rate.
+Until then, guest RAM was on huge pages where the host's THP settings gave
+them at a fault (`shmem_enabled` at `advise`, as CachyOS ships it, with
+QEMU's `MADV_HUGEPAGE`, or at `always` or `within_size`). Measured on
+msi-5080 (macos-26, 16 GiB, a drag and a UFO test, 2026-10-27): KVM mapped
+about 10 GiB of the guest at 2 MiB, and the vCPUs' time a frame was 6-7%
+lower than on 4 KiB pages at the same frame rate.
 
 ### Linux hosts: guest RAM resident from the start
 
@@ -705,10 +712,11 @@ before, and the vCPUs' time a frame falls 6-7% at the same frame rate.
 (`prealloc=on` on the memfd backend), with as many threads as the guest has
 vCPUs (`prealloc-threads`). Without it, the guest's first touch of a page
 faults on a vCPU, and KVM resolves the fault through `get_user_pages`, which
-holds the process's mmap lock for read. Where the host backs the memfd with
-transparent huge pages (above), that fault allocates a 2 MiB page, and with
-`defrag` at `madvise` (the kernel's default) and QEMU's `MADV_HUGEPAGE` it
-reclaims and compacts memory for it inside the fault. On a host whose free
+holds the process's mmap lock for read. Where the host backed the memfd with
+transparent huge pages, as it could before the advice above, that fault
+allocated a 2 MiB page, and with `defrag` at `madvise` (the kernel's
+default) and QEMU's `MADV_HUGEPAGE` it reclaimed and compacted memory for it
+inside the fault. On a host whose free
 memory is fragmented, compaction mostly fails and can take over a second. A
 thread that asks for the lock for write meanwhile (glibc growing a heap by
 `mprotect`, a view's `mmap`) waits behind the fault, and every later reader
@@ -734,7 +742,7 @@ Through `reims-ctl`, installed by `scripts/install-ctl.sh` (macos-26.7.2,
 8 GiB, 8 vCPUs; 2026-11-08): on um870 (Radeon 780M) QEMU reached its first
 vCPU thread 0.53 s after its start and `reims-ctl start` returned in 0.8 s;
 on ms01 (Iris Xe) `start` returned in 8.9 s. Both reached the desktop with
-all of the guest's RAM in 2 MiB pages.
+all of the guest's RAM in 2 MiB pages, before the advice above.
 
 A host without the free memory for a VM's RAM now refuses the VM as QEMU
 starts, where before it overcommitted: the kernel kills QEMU during the
