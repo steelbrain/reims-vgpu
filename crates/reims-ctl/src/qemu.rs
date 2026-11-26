@@ -29,11 +29,10 @@
 //!
 //! The machine, `q35-x86_64`, follows the command line the x86-64 guests were measured on
 //! (docs/qemu.md): RAM as a shared memfd, which the library on Linux requires, allocated whole as
-//! QEMU starts (`prealloc`), so no guest-RAM fault runs on a vCPU under the process's mmap lock:
-//! where the host backed shmem with transparent huge pages, before QEMU advised guest RAM off them,
-//! such a fault allocated a huge page, compacting memory for it under that lock, and stalled vCPUs
-//! for up to 1.8 s, the others queued behind it ("Linux hosts: guest RAM resident from the start"
-//! there); the keyboard and
+//! QEMU starts (`prealloc`), so no guest-RAM fault runs on a vCPU: where the host backs shmem with
+//! transparent huge pages, such a fault allocates a huge page, compacting memory for it under the
+//! process's mmap lock, and stalled vCPUs for up to 1.8 s, the others queued behind it ("Linux
+//! hosts: guest RAM resident from the start" there); the keyboard and
 //! tablet on a qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's
 //! interrupt transfers under GPU load and its input freezes, with the host's USB devices the VM's
 //! settings give it beside them ([`crate::usb`]); the host's whole disks its settings give it, on
