@@ -647,18 +647,24 @@ runtime's own device. The switches above apply, and `resolution=` too.
   scrolling, its lines at 10 points each, in no gesture (SDL gives no
   phases); the guest gets the device's own direction.
   `test: native::sdl_thread::input::the_wheel_sends_the_devices_own_direction`
-- Cursor: over the image the guest's glyph at the image's scale, with an
-  image at the screen's own scale for HiDPI; hidden when the guest hides
-  its own; the host's arrow over the bars and the title bar. Where the guest's
+- Cursor: over the image the guest's glyph at the image's scale, the size
+  the guest draws it: on Wayland with an image at the screen's own scale
+  for HiDPI, and on X11 and a Windows host at the window's pixels, which
+  SDL draws as they are (on a Windows screen at 150%, a guest shown a
+  pixel to a screen pixel has its cursor at its own pixels, not half as
+  large again); hidden when the guest hides its own; the host's arrow over
+  the bars and the title bar. Where the guest's
   cursor position changes with no pointer move of the window's in the second
   before, the window draws the cursor into the image where the guest puts it,
   and hides the host's over the image, as on macOS.
+  `test: sdl::cursor::a_cursor_is_handed_sdl_at_the_guest_s_size_in_sdl_s_units`,
+  `test: native::sdl_thread::ui::sdl_draws_a_cursor_at_the_size_it_is_given`,
   `test: sdl::cursor::a_glyph_is_resampled_by_nearest_pixel`,
   `test: sdl::cursor::a_short_or_empty_glyph`,
   `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
   `test: reims-vgpu::graphics::tests::the_window_draws_the_cursor_the_guest_moves_on_its_own`,
   `test: reims-vgpu::graphics::sink::on_vulkan_the_cursor_s_pass_blends_the_glyph_over_the_frame`,
-  `manual`
+  `manual` (a Windows host at 150%)
 - With several displays' windows open, the cursor is set only by the window
   the pointer is in: SDL's cursor is the process's, so another window's guest
   changing its cursor, or that window's layout changing, leaves the cursor

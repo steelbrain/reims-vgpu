@@ -11,10 +11,12 @@
 //! **SDL's settings**, before its video starts: no signal handlers of its own (the host's stay
 //! the host's), the screen saver allowed (the windows keep the host from sleeping no more than
 //! any other window), `reims-vgpu` the windows' application ID (the task bar's entry on Wayland;
-//! SDL 3.4.18's Windows driver does not read it),
-//! cursors given for the screen's scale ([`crate::sdl::cursor`]), no quit event when the last
-//! window closes, as the windows' end is the display's, and the locked pointer's motion as the
-//! compositor or window system accelerates it, so a captured pointer gone past the image's edge
+//! SDL 3.4.18's Windows driver does not read it), cursors drawn at the size they are given (no
+//! `SDL_MOUSE_DPI_SCALE_CURSORS`, which SDL 3.4.18's Windows driver alone reads: the window gives
+//! a cursor's image in SDL's sizes, pixels there, which the hint would scale again by the
+//! monitor's content scale; [`crate::sdl::cursor`]), no quit event when the last window closes,
+//! as the windows' end is the display's, and the locked pointer's motion as the compositor or
+//! window system accelerates it, so a captured pointer gone past the image's edge
 //! (`crate::beyond`) moves on as fast as it moved over the image.
 //!
 //! Where SDL's video does not start (no Wayland compositor and no X server to reach on Linux), the
@@ -150,18 +152,19 @@ pub(crate) fn screens() -> Vec<HostScreen> {
     screens.clone().unwrap_or_default()
 }
 
+/// SDL's settings (the module doc).
+const HINTS: [(&CStr, &CStr); 6] = [
+    (c"SDL_NO_SIGNAL_HANDLERS", c"1"),
+    (c"SDL_VIDEO_ALLOW_SCREENSAVER", c"1"),
+    (c"SDL_APP_ID", c"reims-vgpu"),
+    (c"SDL_QUIT_ON_LAST_WINDOW_CLOSE", c"0"),
+    (c"SDL_MOUSE_FOCUS_CLICKTHROUGH", c"1"),
+    (c"SDL_MOUSE_RELATIVE_SYSTEM_SCALE", c"1"),
+];
+
 /// Sets SDL's settings (the module doc).
 fn set_hints() {
-    let hints: [(&CStr, &CStr); 7] = [
-        (c"SDL_NO_SIGNAL_HANDLERS", c"1"),
-        (c"SDL_VIDEO_ALLOW_SCREENSAVER", c"1"),
-        (c"SDL_APP_ID", c"reims-vgpu"),
-        (c"SDL_MOUSE_DPI_SCALE_CURSORS", c"1"),
-        (c"SDL_QUIT_ON_LAST_WINDOW_CLOSE", c"0"),
-        (c"SDL_MOUSE_FOCUS_CLICKTHROUGH", c"1"),
-        (c"SDL_MOUSE_RELATIVE_SYSTEM_SCALE", c"1"),
-    ];
-    for (name, value) in hints {
+    for (name, value) in HINTS {
         // SAFETY: both are NUL-terminated strings SDL copies.
         unsafe { SDL_SetHint(name.as_ptr(), value.as_ptr()) };
     }
@@ -365,5 +368,17 @@ mod tests {
         assert!(driver_note("x11", true).starts_with(", through XWayland"));
         assert_eq!(driver_note("x11", false), "");
         assert_eq!(driver_note("wayland", true), "");
+    }
+
+    /// SDL is not told to scale cursors by the screen's content scale: the window gives a
+    /// cursor's image in SDL's sizes (`crate::sdl::cursor`), pixels on X11 and Windows, where
+    /// SDL 3.4.18's Windows driver would draw it again at the monitor's scale under the hint
+    #[test]
+    fn sdl_draws_a_cursor_at_the_size_it_is_given() {
+        assert!(
+            !HINTS
+                .iter()
+                .any(|&(name, _)| name == c"SDL_MOUSE_DPI_SCALE_CURSORS")
+        );
     }
 }
