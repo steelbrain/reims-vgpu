@@ -71,6 +71,31 @@ impl Drop for Env {
     }
 }
 
+/// A new, empty directory for a test's Unix sockets, `reims-ctl-<tag>-<pid>`, where a socket's
+/// path fits in `sun_path`: in `/tmp` on Linux and macOS, whose `$TMPDIR` can be too long for one,
+/// as a CI job's can, and in the temporary directory on Windows, as `paths::short_runtime_dir`
+/// is. It is removed when it drops.
+pub struct SocketDir(pub PathBuf);
+
+impl SocketDir {
+    pub fn new(tag: &str) -> SocketDir {
+        let name = format!("reims-ctl-{tag}-{}", std::process::id());
+        #[cfg(unix)]
+        let d = Path::new("/tmp").join(name);
+        #[cfg(windows)]
+        let d = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        SocketDir(d)
+    }
+}
+
+impl Drop for SocketDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// `p` as the inside of a TOML string: Windows' `\` escaped.
 pub fn toml_path(p: &Path) -> String {
     p.display().to_string().replace('\\', "\\\\")

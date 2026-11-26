@@ -119,8 +119,8 @@ mod tests {
     /// throughout, and once it leaves, a new one is.
     #[test]
     fn a_client_qemu_does_not_answer_says_why_at_its_timeout() {
-        let env = crate::testenv::Env::new("qmp-held");
-        let sock = env.root.join("qmp.sock");
+        let dir = crate::testenv::SocketDir::new("qmp-held");
+        let sock = dir.0.join("qmp.sock");
         one_client_qmp(&sock);
         let mut first = Qmp::connect(&sock, Duration::from_secs(5)).unwrap();
         let second = Qmp::connect(&sock, Duration::from_millis(200))
