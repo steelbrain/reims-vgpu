@@ -238,8 +238,9 @@
 //! **Its heap textures' moves.** A texture placed in a heap whose bytes another resource of that
 //! heap may have written since the texture's own last write (Vulkan's memory aliasing) has its
 //! image moved out of `VK_IMAGE_LAYOUT_UNDEFINED`, whole, before the next command that writes it:
-//! a dispatch's slot or declared write, a pass's attachment, a draw's write or a blit's
-//! destination. A heap buffer's use that may write it marks every heap texture over its bytes so,
+//! a dispatch's slot or declared write, a pass's attachment, a draw's write, a blit's destination
+//! or a host write's copy (a `replace_region` into it, moved in that write's own upload, ahead of
+//! the copy). A heap buffer's use that may write it marks every heap texture over its bytes so,
 //! and a read before the texture's next write takes no move. rt counts those moves
 //! (`Metrics::heap_moves`), and the counts line carries them as an amount, [`HEAP_MOVES_CODE`], so
 //! a boot's line says whether its heap textures took them.
