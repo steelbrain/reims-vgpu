@@ -203,12 +203,13 @@ the model.
   picture's decode (`cuvidGetDecodeStatus`) is read at its copy, and a
   failed one is bad data (`Error::DecodeFailed`). NVDEC reports a slice
   cut short failed (status 9, `cuvidDecodeStatus_Error_Concealed`). The
-  failure is noted (`Failures`, `src/nvidia/decode.rs`), and the decoder's next
-  decode sets the codec module's damaged state, so that each picture after
-  it is refused until an I picture (H.264) or an IRAP picture (HEVC). An
-  H.264 picture of a decoder that copies failed pictures (above) is copied
-  instead, its status kept (`AnnexBPicture::copied_failed`), and noted as no
-  failure. A
+  failure is noted (`Failures`, `src/nvidia/decode.rs`). In an HEVC stream
+  the decoder's next decode sets the codec module's damaged state, so that
+  each picture after it is refused until an IRAP picture; an H.264 stream's
+  pictures after it decode on from it, as after any picture that does not
+  decode (the codec module's H.264 decoder). A picture of a decoder that
+  copies failed pictures (above) is copied instead, its status kept
+  (`AnnexBPicture::copied_failed`), and noted as no failure. A
   picture whose copy is never made has its status read by no one: an HEVC
   picture with `pic_output_flag` 0, for one ([bugs.md](bugs.md), B41).
 - **H.264.** Slices as Annex B, each after a three-byte start code, with

@@ -3,9 +3,10 @@
 //!
 //! **A frame NVDEC fails.** NVDEC's status of a picture's decode is read at
 //! its copy, after the frame came out of the codec crate's decoder
-//! ([`Error::DecodeFailed`]). An H.264 or HEVC session then has its decoder
-//! fail each picture after it until an I picture (H.264) or an IRAP picture
-//! (HEVC) decodes ([`Failures`]).
+//! ([`Error::DecodeFailed`]). An HEVC session then has its decoder fail each
+//! picture after it until an IRAP picture decodes ([`Failures`]); an H.264
+//! session's decoder decodes on, as after any picture that does not decode
+//! (the codec crate's H.264 decoder).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

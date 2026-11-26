@@ -20,12 +20,12 @@
 //!   API's buffer imported on the picture's GPU (`crate::nvidia::external`), the
 //!   copy is within the GPU ([`AnnexBPicture::write_into_device`]).
 //! - **A picture NVDEC fails** fails its write or read back, as bad data
-//!   ([`Error::DecodeFailed`]), and the decoder then fails each picture
-//!   after it until an I picture (H.264) or an IRAP picture (HEVC) decodes
-//!   (`crate::nvidia::decode`'s `Failures`); or, where the caller asks
-//!   ([`AnnexBDecoder::copy_failed_pictures`]), is written or read back as
-//!   NVDEC left it, telling its status, and the pictures after it decode, as
-//!   a Mac's hardware decoders hand them on.
+//!   ([`Error::DecodeFailed`]), and the pictures after it decode on in an
+//!   H.264 stream, while an HEVC stream's decoder fails each until an IRAP
+//!   picture decodes (`crate::nvidia::decode`'s `Failures`); or, where the
+//!   caller asks ([`AnnexBDecoder::copy_failed_pictures`]), it is written or
+//!   read back as NVDEC left it, telling its status, and the pictures after
+//!   it decode, as a Mac's hardware decoders hand them on.
 //! - **A 4:4:4 picture** (HEVC's range extensions, where the caller lands
 //!   them, [`AnnexBDecoder::lands_4_4_4`]) decodes into three planes, luma,
 //!   Cb and Cr, each as large, which it reads back; its writes, of two
@@ -125,9 +125,10 @@ impl AnnexBDecoder {
     }
 
     /// Has each picture NVDEC answers failed written or read back as NVDEC
-    /// left it, rather than failed, and the pictures after it decoded as any,
-    /// predicting from it, rather than refused until an I (H.264) or IRAP
-    /// (HEVC) picture: as a Mac's hardware decoders hand their client a
+    /// left it, rather than failed, and, in an HEVC stream, the pictures after
+    /// it decoded as any, predicting from it, rather than refused until an
+    /// IRAP picture (an H.264 stream's decode on either way: the codec
+    /// module's decoder): as a Mac's hardware decoders hand their client a
     /// picture they decoded with an error, concealed, its status 0, and decode
     /// on from it. **Measured** on a MacBook Pro of 2019, macOS 26.7.1,
     /// VideoToolbox's hardware decode: of an H.264 stream of 90 pictures whose
@@ -203,10 +204,9 @@ impl AnnexBDecoder {
         let failed = self.failures.take();
         let on_failed = self.failed;
         let outputs = match &mut self.codec {
+            // An H.264 decoder decodes on after a picture NVDEC failed, as
+            // after any picture that does not decode (its doc).
             Codec::H264(decoder) => {
-                if failed {
-                    decoder.mark_failed();
-                }
                 let decoded = with_sample(
                     sample,
                     in_place,

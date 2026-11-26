@@ -132,6 +132,9 @@ impl H264Decoder {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 // Decoders and frames move between threads, and frames are read back from
 // any: libva is thread-safe (va.h, "Multithreading Guide"), and each
 // decoder is used by one thread at a time through `&mut`.

@@ -994,7 +994,7 @@ Redundant pictures are dropped.
 driver's profiles and sizes, so that a session the driver cannot serve
 fails when it is made. Through the graphics device, a refusal of one
 picture of the stream (`Error::is_picture_error`: its data, its references,
-and those after one that did not decode) lands nothing, its command buffer
+and, in an HEVC stream, those after one that did not decode) lands nothing, its command buffer
 completing as any, and every other refusal fails the decode's command
 buffer ([devices.md](devices.md), "A decode").
 
@@ -1013,9 +1013,12 @@ chroma exact; UHD 630, Mesa 26.2.7). Where a surface is not a shared
 texture, no stand-in is made, and what predicts from the lost frame is
 refused with `MissingReference`, as where the driver makes no image.
 
-After a sample that does not decode, each picture is still decoded, so
-that its references go on. Each is refused with `h264::Error::Unrecovered`,
-until an I picture, IDR or not, decodes.
+After a sample that does not decode, each picture decodes and comes out
+as any, predicting from what the DPB holds, a frame the failed sample lost
+stood in for by the copy above: a Mac's hardware decoder answers the
+pictures after a damaged one with no error and an image, concealed, until
+the next IDR picture (**measured** with VideoToolbox on a MacBook Pro of
+2019, macOS 26.7.1, UHD 630, 2026-11-20, potluck job m3-max-60715).
 
 A slice cut short does not start that state: the parser stops at its
 header, and radeonsi decodes what there is and reports nothing. After such
@@ -1928,10 +1931,10 @@ refusal included.
   `h264::nal::access_units`, which does not follow arbitrary slice order.
 - Where zero copy declines a frame, readback is a copy, since radeonsi
   offers no `USER_PTR` surfaces ("The AMD drivers").
-- No concealment of damage: a sample with an error decodes nothing, and
-  the pictures after it are refused until an I picture decodes ("The H.264
-  decoder", "What it refuses"). Only a frame lost to a `frame_num` gap is
-  concealed, with a copy of the last reference.
+- No concealment of damage within a picture: a sample with an error
+  decodes nothing, and the pictures after it decode on, a frame it lost
+  stood in for by a copy of the last reference, as a frame lost to a
+  `frame_num` gap is ("The H.264 decoder", "What it refuses").
 - HEVC long-term pictures, list modification, a slice header's set
   predicted from the SPS's, and PCM are checked by unit tests only: neither
   x265 nor kvazaar writes them ([bugs.md](bugs.md), T1). Like H.264's

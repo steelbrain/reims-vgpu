@@ -205,22 +205,37 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   lands nothing, and its command buffer completes as any other, its output keeping its bytes.
   One that does not decode is one whose bytes do not read as its standard reads them, one that
   predicts from a picture the decoder does not hold (a stream's first pictures, where it starts
-  at a P picture), or one after a picture that did not decode, before the next I (H.264) or IRAP
-  (HEVC) picture, from which the session decodes again (reims-vgpu's `graphics/video_host.rs`,
-  "A picture of the stream that does not decode"). A Mac's hardware decoders answer such a
-  picture alone and decode on too, H.264's with no error and HEVC's with
-  `kVTVideoDecoderBadDataErr` or `kVTVideoDecoderReferenceMissingErr` and no image (**measured**
-  with VideoToolbox on a MacBook Pro of 2019, macOS 26.7.1, 2026-11-20). In the guest, AppleGVA
-  hands the device every H.264 picture, and the client gets each such one with no error and the
-  output's earlier bytes; it answers an HEVC stream started at a P picture itself, as a Mac
-  does, `kVTVideoDecoderBadDataErr` and no image for each picture until the IRAP picture, and
-  none of them reaches the device (**measured** in the guest on a Radeon 780M, 2026-11-20).
+  at a P picture), or, in an HEVC stream, one after a picture that did not decode, before the
+  next IRAP picture, from which the session decodes again (reims-vgpu's
+  `graphics/video_host.rs`, "A picture of the stream that does not decode"). An H.264 picture
+  after one that did not decode decodes and lands as any, as a Mac's hardware decoder answers
+  it with no error and an image, concealed, until the next IDR picture (**measured** with
+  VideoToolbox on a MacBook Pro of 2019, macOS 26.7.1, potluck job m3-max-60715). A Mac's
+  hardware decoders answer a picture that does not decode alone and decode on too, H.264's with
+  no error and HEVC's with `kVTVideoDecoderBadDataErr` or `kVTVideoDecoderReferenceMissingErr`
+  and no image (**measured** with VideoToolbox on a MacBook Pro of 2019, macOS 26.7.1,
+  2026-11-20). In the guest, AppleGVA hands the device every H.264 picture, and the client gets
+  each one that does not decode with no error and the output's earlier bytes; it answers an
+  HEVC stream started at a P picture itself, as a Mac does, `kVTVideoDecoderBadDataErr` and no
+  image for each picture until the IRAP picture, and none of them reaches the device
+  (**measured** in the guest on a Radeon 780M, 2026-11-20).
   A stream the decoder does not take, an `avcC` or `hvcC` record's error, and the hardware's or
   the host API's errors still fault the command buffer. The range extensions' streams, HEVC's
   4:4:4 at 8 bits among them, are streams this decoder does not take: the caps offer 4:2:0
   alone, and its decoders land 4:2:0 pictures alone, where VideoToolbox's paravirtual decoders
   on arm64 guests land HEVC 4:4:4 at 8 bits on hosts that decode it
   ([design.md](../graphics-kext/design.md), "The answers are the host's arms'").
+- **A Mac's picture of an H.264 stream started at a P picture** is a decode against a
+  reference of zeros, the picture's residuals added, which shows green. On VideoToolbox on a
+  MacBook Pro of 2019 (macOS 26.7.1, its hardware decoder, 2026-11-25, potluck job
+  m3-max-74665; **measured**), a 1080p stream of our own with IDR pictures at 0 and 30, started
+  at its P picture 5, gave picture 5 a mean Y of 0.78 (min 0, max 89), Cb 3.96 and Cr 5.51,
+  picture 6 Y 1.20, Cb 6.62 and Cr 8.70, and picture 29, the last before the IDR picture,
+  Y 13.13 (max 253), Cb 48.05 and Cr 43.76, each with no error; the whole stream's picture 5
+  has Y 120.30, Cb 130.81 and Cr 130.08. From the IDR picture on, the pictures are the whole
+  stream's (picture 30: Y 122.23, Cb 132.28, Cr 129.05). Ours lands nothing in such a
+  picture's output (above), so a new output reads zeros, green as well, and an output the
+  client reused reads its older bytes, an earlier picture's.
 
 ## An encode
 

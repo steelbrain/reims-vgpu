@@ -123,8 +123,9 @@ pub trait Accelerator {
     /// A new picture holding what `from` holds, to stand in for a lost
     /// frame (8.2.5.2, a gap in `frame_num` where the SPS allows none), or
     /// `None` where the accelerator cannot copy one. With a stand-in, what
-    /// predicts from the lost frame decodes, as Apple's AVC decoder decodes
-    /// it; without one it is refused with [`Error::MissingReference`].
+    /// predicts from the lost frame decodes, as a Mac's hardware decoder
+    /// decodes it; without one it is refused with
+    /// [`Error::MissingReference`].
     fn conceal(&mut self, from: &Self::Picture) -> Result<Option<Self::Picture>, Self::Error> {
         let _ = from;
         Ok(None)
@@ -139,11 +140,19 @@ pub trait Accelerator {
 /// with [`Error::Interlaced`]; other chroma formats and bit depths, data
 /// partitioning and SP/SI slices with [`Error::Unsupported`].
 ///
-/// Errors follow Apple's AVC decoder: after a sample that does not decode,
-/// each picture is refused with [`Error::Unrecovered`] until an I picture
-/// decodes, and a frame lost from a stream that allows no gap in
-/// `frame_num` is stood in for by a copy of the last reference, where the
-/// accelerator makes one ([`Accelerator::conceal`]).
+/// Errors follow a Mac's hardware decoder: a sample that does not decode
+/// gives nothing, and the pictures after it decode and come out as any,
+/// predicting from what the DPB holds, a frame lost from a stream that
+/// allows no gap in `frame_num` stood in for by a copy of the last
+/// reference, where the accelerator makes one ([`Accelerator::conceal`]).
+/// **Measured** on a MacBook Pro of 2019 (macOS 26.7.1, VideoToolbox's
+/// hardware decode, 1080p, its UHD 630; held85's damage run, potluck job
+/// m3-max-60715): after an H.264 P picture cut to half, one with its slice
+/// header's bytes changed, and one whose length prefix runs past its
+/// sample, every picture until the next IDR picture came back with no
+/// error and an image, concealed. A picture that predicts from a frame the
+/// decoder never held, as a stream started at a P picture's do, is refused
+/// with [`Error::MissingReference`].
 pub struct Decoder<A: Accelerator> {
     accelerator: A,
     format: NalFormat,
@@ -157,8 +166,6 @@ pub struct Decoder<A: Accelerator> {
     /// `PrevRefFrameNum` (7.4.3), and whether a reference has been
     /// decoded since the start or a reset.
     prev_ref_frame_num: Option<u32>,
-    /// Whether a sample has failed since the last I picture decoded.
-    damaged: bool,
 }
 
 impl<A: Accelerator> Decoder<A> {
@@ -176,7 +183,6 @@ impl<A: Accelerator> Decoder<A> {
             poc: PocState::default(),
             dpb: Dpb::new(),
             prev_ref_frame_num: None,
-            damaged: false,
         }
     }
 
@@ -222,15 +228,10 @@ impl<A: Accelerator> Decoder<A> {
     /// display order, those the DPB bumps.
     ///
     /// A sample with an error decodes nothing of the picture it carries;
-    /// the parameter sets in it before the error are kept. Each picture
-    /// after it is decoded but refused with [`Error::Unrecovered`], until
-    /// one of I slices alone decodes.
+    /// the parameter sets in it before the error are kept. The pictures
+    /// after it decode and come out as any (the type's doc).
     pub fn decode(&mut self, sample: &[u8], id: u64) -> Result<Vec<Output<A::Picture>>, A::Error> {
-        let result = self.decode_sample(sample, id);
-        if result.is_err() {
-            self.damaged = true;
-        }
-        result
+        self.decode_sample(sample, id)
     }
 
     fn decode_sample(
@@ -289,16 +290,6 @@ impl<A: Accelerator> Decoder<A> {
         Ok(outputs)
     }
 
-    /// Takes a picture already decoded as one that failed: the hardware
-    /// reports so once its decode is done, after the sample that carried it
-    /// came out, as NVDEC's status does. Each picture after it is decoded
-    /// but refused with [`Error::Unrecovered`] until an I picture decodes,
-    /// as after a sample that fails here; an I picture that failed so ends
-    /// nothing.
-    pub fn mark_failed(&mut self) {
-        self.damaged = true;
-    }
-
     /// Emits every frame still waiting for output, in display order.
     /// References are kept, so decoding can go on. In decode order
     /// nothing waits, and nothing comes out.
@@ -314,7 +305,6 @@ impl<A: Accelerator> Decoder<A> {
         self.dpb.clear();
         self.poc = PocState::default();
         self.prev_ref_frame_num = None;
-        self.damaged = false;
     }
 
     fn parameter_set(&mut self, nal: NalUnit<'_>) -> Result<(), Error> {
@@ -512,14 +502,6 @@ impl<A: Accelerator> Decoder<A> {
             self.accelerator
                 .decode_picture(&picture, &params, &slice_params)?;
         }
-        // Apple's decoder gives no frame after one that failed until an I
-        // picture decodes; the picture still goes on as a reference.
-        let intra = slices.iter().all(|(h, _)| h.slice_type == SliceType::I);
-        let unrecovered = self.damaged && !intra;
-        if intra {
-            self.damaged = false;
-        }
-
         // Marking (8.2.5), then the order count's adjustment for
         // operation 5 (8.2.1).
         let reference = first.nal_ref_idc != 0;
@@ -569,17 +551,6 @@ impl<A: Accelerator> Decoder<A> {
             marking,
             pending,
         };
-        if unrecovered {
-            // Kept as a reference, never output.
-            if self.order == OutputOrder::Display && (first.idr || unmark_all) {
-                outputs.extend(self.dpb.bump_all());
-            }
-            self.dpb.remove_unused();
-            if reference {
-                self.dpb.entries.push(entry(None));
-            }
-            return Err(Error::Unrecovered.into());
-        }
         match self.order {
             OutputOrder::Decode => {
                 outputs.push(output);

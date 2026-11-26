@@ -63,12 +63,13 @@
 //!   ([`picture_error`], which the backend answers as its error, [`NotDecoded`], and the session
 //!   takes as no picture), its command buffer completing as any other: one whose bytes do not
 //!   read as its standard reads them, one that predicts from a picture the decoder does not
-//!   hold (as a stream's first pictures do where it starts at a P picture), and one after a
-//!   picture that did not decode, before the decoding starts afresh at an I (H.264) or IRAP
-//!   (HEVC) picture: the codec crate's `is_picture_error`. The session goes on, and decodes
-//!   again from that picture. A Mac's hardware decoders answer such a picture alone and go on
-//!   (measured with VideoToolbox on a UHD 630, macOS 26.7.1): H.264's with no error, and for
-//!   most of them an image it conceals; HEVC's with `kVTVideoDecoderBadDataErr` or
+//!   hold (as a stream's first pictures do where it starts at a P picture), and, in an HEVC
+//!   stream, one after a picture that did not decode, before the decoding starts afresh at an
+//!   IRAP picture: the codec crate's `is_picture_error`. The session goes on: the H.264 pictures
+//!   after one that did not decode decode and land as any (the codec crate's H.264 decoder),
+//!   and HEVC's from the IRAP picture. A Mac's hardware decoders answer such a picture alone and
+//!   go on (measured with VideoToolbox on a UHD 630, macOS 26.7.1): H.264's with no error, and
+//!   for most of them an image it conceals; HEVC's with `kVTVideoDecoderBadDataErr` or
 //!   `kVTVideoDecoderReferenceMissingErr` and no image. The output's earlier bytes, which the
 //!   guest's decoder hands on here, are the device's own, not Apple's concealment. What is no
 //!   picture's (a stream the decoder does not take, an `avcC` or `hvcC` record's error) and

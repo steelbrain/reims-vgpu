@@ -133,6 +133,26 @@ impl Stream {
         }
     }
 
+    /// Its samples, sample `at`'s first NAL unit's `forbidden_zero_bit` set, so that the
+    /// codec's parser refuses it (7.4.1): a sample that does not decode.
+    pub(super) fn damaged(&self, at: usize) -> Vec<Vec<u8>> {
+        let mut samples = self.samples.clone();
+        let sample = &mut samples[at];
+        // Its first unit's header: past its length prefix (the avcC's lengthSizeMinusOne + 1
+        // bytes), or past an Annex B start code.
+        let header = match &self.avcc {
+            Some(avcc) => usize::from(avcc[4] & 3) + 1,
+            None => {
+                let code = (sample.windows(3))
+                    .position(|w| w == [0, 0, 1])
+                    .expect("an Annex B start code");
+                code + 3
+            }
+        };
+        sample[header] |= 0x80;
+        samples
+    }
+
     pub(super) fn decoder(&self, display: &Display) -> H264Decoder {
         match &self.avcc {
             Some(avcc) => H264Decoder::new(display, avcc).expect("a decoder"),

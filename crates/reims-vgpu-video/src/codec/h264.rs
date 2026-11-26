@@ -61,11 +61,6 @@ pub enum Error {
     /// AVC decoder decodes none of its pictures, field, MBAFF or frame
     /// alike, and neither does this one.
     Interlaced,
-    /// A picture that is not all I slices, after one that did not decode
-    /// and before an I picture has: Apple's AVC decoder decodes none until
-    /// then. This decoder decodes it, so that its references go on, but
-    /// gives no frame for it.
-    Unrecovered,
     /// A picture of more slices than macroblocks: each slice holds one at
     /// least (7.3.4).
     MoreSlicesThanMacroblocks,
@@ -110,10 +105,6 @@ impl std::fmt::Display for Error {
             Self::MissingReference => write!(f, "a reference frame is missing"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Interlaced => write!(f, "interlaced: the SPS's frame_mbs_only_flag is 0"),
-            Self::Unrecovered => write!(
-                f,
-                "no I picture has decoded since a picture that did not decode"
-            ),
             Self::MoreSlicesThanMacroblocks => write!(f, "more slices than macroblocks"),
             Self::SpsChangedAtNonIdr => write!(f, "the SPS changed at a non-IDR picture"),
             Self::ParameterSetsChangedInPicture => {
@@ -132,12 +123,12 @@ impl Error {
     /// Whether the error is one picture's of the stream, after which the
     /// decoder goes on: the picture's bytes do not decode as the standard
     /// reads them, or it predicts from a frame the decoder does not hold
-    /// ([`Self::MissingReference`], [`Self::Unrecovered`]). The decoder
-    /// takes the next sample as it would any, decoding again from the next
-    /// I picture ([`Decoder::decode`]), as a Mac's hardware decoder answers
-    /// such a picture alone and decodes on. Not one picture's: what this
-    /// decoder does not take ([`Self::Unsupported`], [`Self::Interlaced`]),
-    /// and an `avcC` record's errors, which are no picture's.
+    /// ([`Self::MissingReference`]). The decoder takes the next sample as
+    /// it would any ([`Decoder::decode`]), as a Mac's hardware decoder
+    /// answers such a picture alone and decodes on. Not one picture's: what
+    /// this decoder does not take ([`Self::Unsupported`],
+    /// [`Self::Interlaced`]), and an `avcC` record's errors, which are no
+    /// picture's.
     pub fn is_picture_error(&self) -> bool {
         !matches!(
             self,

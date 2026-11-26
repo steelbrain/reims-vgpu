@@ -624,7 +624,6 @@ mod tests {
         use crate::codec::{h264, hevc};
         for error in [
             Error::Bitstream(h264::Error::MissingReference),
-            Error::Bitstream(h264::Error::Unrecovered),
             Error::HevcBitstream(hevc::Error::MissingReference),
             Error::HevcBitstream(hevc::Error::SkippedLeadingPicture),
         ] {

@@ -1134,10 +1134,10 @@ fn forbidden() -> Vec<u8> {
 }
 
 #[test]
-fn after_a_sample_that_fails_pictures_are_refused_until_an_i_picture_decodes() -> Result<(), Error>
-{
-    // Apple's AVC decoder answers each picture after a damaged one with
-    // kVTVideoDecoderBadDataErr until an I picture, IDR or not, decodes.
+fn after_a_sample_that_fails_the_pictures_after_it_come_out() -> Result<(), Error> {
+    // A Mac's hardware decoder answers the pictures after a damaged one
+    // with no error and an image, concealed, until the next IDR picture
+    // (the decoder's doc, held85's m3-max-60715).
     let spec = SpsSpec::default();
     let mut d = decoder(OutputOrder::Decode);
     let units = [sps(&spec), pps(false), slice(&idr(), &spec)];
@@ -1148,10 +1148,11 @@ fn after_a_sample_that_fails_pictures_are_refused_until_an_i_picture_decodes() -
         Some(Error::OutOfRange("forbidden_zero_bit"))
     );
     for (id, n) in [(3, 2), (4, 3)] {
-        let refused = d.decode(&sample(&[slice(&p(n, 2 * n), &spec)]), id);
-        assert_eq!(refused.err(), Some(Error::Unrecovered));
+        let out = d.decode(&sample(&[slice(&p(n, 2 * n), &spec)]), id)?;
+        assert_eq!(out.iter().map(|o| o.id).collect::<Vec<_>>(), [id]);
     }
-    // Both went to the accelerator, so that they stay references.
+    // The failed sample went nowhere; the pictures after it went to the
+    // accelerator, and stay references.
     assert_eq!(d.accelerator().submitted.len(), 4);
     let intra = SliceSpec {
         slice_type: 2,
@@ -1159,8 +1160,7 @@ fn after_a_sample_that_fails_pictures_are_refused_until_an_i_picture_decodes() -
     };
     assert_eq!(d.decode(&sample(&[slice(&intra, &spec)]), 5)?.len(), 1);
     assert_eq!(d.decode(&sample(&[slice(&p(5, 10), &spec)]), 6)?.len(), 1);
-    // The last P predicts from the I picture, then P4 and P3, which did
-    // not come out but were decoded.
+    // The last P predicts from the I picture, then P4 and P3.
     let last = d.accelerator().submitted.last().map(|s| s.lists[0].clone());
     assert_eq!(last, Some(vec![Some(4)]));
     let references = d.accelerator().submitted.last().map(|s| s.references.len());
@@ -1169,48 +1169,7 @@ fn after_a_sample_that_fails_pictures_are_refused_until_an_i_picture_decodes() -
 }
 
 #[test]
-fn a_picture_the_hardware_failed_fails_each_after_it_until_an_i_picture() -> Result<(), Error> {
-    // A truncated slice decodes here, and only the hardware's status, read
-    // once the picture is done, says it failed: Apple's AVC decoder answers
-    // it and each picture after it with kVTVideoDecoderBadDataErr until an
-    // I picture decodes.
-    let spec = SpsSpec::default();
-    let mut d = decoder(OutputOrder::Decode);
-    let units = [sps(&spec), pps(false), slice(&idr(), &spec)];
-    d.decode(&sample(&units), 0)?;
-    assert_eq!(d.decode(&sample(&[slice(&p(1, 2), &spec)]), 1)?.len(), 1);
-    d.mark_failed();
-    for (id, n) in [(2, 2), (3, 3)] {
-        let refused = d.decode(&sample(&[slice(&p(n, 2 * n), &spec)]), id);
-        assert_eq!(refused.err(), Some(Error::Unrecovered));
-    }
-    // Each was decoded, so that it stays a reference.
-    assert_eq!(d.accelerator().submitted.len(), 4);
-    let intra = |n| SliceSpec {
-        slice_type: 2,
-        ..p(n, 2 * n)
-    };
-    assert_eq!(d.decode(&sample(&[slice(&intra(4), &spec)]), 4)?.len(), 1);
-    assert_eq!(d.decode(&sample(&[slice(&p(5, 10), &spec)]), 5)?.len(), 1);
-
-    // An I picture the hardware failed ends nothing.
-    assert_eq!(d.decode(&sample(&[slice(&intra(6), &spec)]), 6)?.len(), 1);
-    d.mark_failed();
-    let refused = d.decode(&sample(&[slice(&p(7, 14), &spec)]), 7);
-    assert_eq!(refused.err(), Some(Error::Unrecovered));
-    assert_eq!(d.decode(&sample(&[slice(&intra(8), &spec)]), 8)?.len(), 1);
-
-    // A reset forgets it.
-    d.mark_failed();
-    d.reset();
-    let units = [sps(&spec), pps(false), slice(&idr(), &spec)];
-    assert_eq!(d.decode(&sample(&units), 9)?.len(), 1);
-    assert_eq!(d.decode(&sample(&[slice(&p(1, 2), &spec)]), 10)?.len(), 1);
-    Ok(())
-}
-
-#[test]
-fn in_display_order_a_picture_refused_after_a_failure_never_comes_out() -> Result<(), Error> {
+fn in_display_order_the_pictures_after_a_failure_come_out_in_order() -> Result<(), Error> {
     let spec = SpsSpec::default();
     let mut d = decoder(OutputOrder::Display);
     let units = [sps(&spec), pps(false), slice(&idr(), &spec)];
@@ -1223,8 +1182,11 @@ fn in_display_order_a_picture_refused_after_a_failure_never_comes_out() -> Resul
     );
     assert!(d.decode(&forbidden(), 2).is_err());
     for (id, slice_spec) in [(3, b(2, 2, false)), (4, p(2, 8))] {
-        let refused = d.decode(&sample(&[slice(&slice_spec, &spec)]), id);
-        assert_eq!(refused.err(), Some(Error::Unrecovered));
+        out.extend(
+            d.decode(&sample(&[slice(&slice_spec, &spec)]), id)?
+                .iter()
+                .map(|o| o.id),
+        );
     }
     let intra = SliceSpec {
         slice_type: 2,
@@ -1236,7 +1198,9 @@ fn in_display_order_a_picture_refused_after_a_failure_never_comes_out() -> Resul
             .map(|o| o.id),
     );
     out.extend(d.flush().iter().map(|o| o.id));
-    assert_eq!(out, [0, 1, 5]);
+    // In display order, by order count: the IDR picture (0), the B (2), P1
+    // (4), the P after the failed sample (8) and the I picture (12).
+    assert_eq!(out, [0, 3, 1, 4, 5]);
     Ok(())
 }
 
@@ -1329,9 +1293,8 @@ fn a_stream_started_at_a_p_picture_answers_picture_errors_until_an_i_picture() -
     Ok(())
 }
 
-/// One picture's errors are a picture's of the stream: its data, its references, and those after
-/// one that did not decode. What the decoder does not take and an `avcC` record's errors are no
-/// picture's.
+/// One picture's errors are a picture's of the stream: its data and its references. What the
+/// decoder does not take and an `avcC` record's errors are no picture's.
 #[test]
 fn what_is_one_picture_s_error() {
     for error in [
@@ -1340,7 +1303,6 @@ fn what_is_one_picture_s_error() {
         Error::BadLengthPrefix,
         Error::MissingPps(0),
         Error::MissingReference,
-        Error::Unrecovered,
         Error::TooManyReferences,
         Error::ReferenceOutsideDpb,
     ] {

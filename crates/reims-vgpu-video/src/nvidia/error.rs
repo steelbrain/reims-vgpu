@@ -152,7 +152,6 @@ mod tests {
     fn codec_errors_are_a_picture_s_unsupported_or_the_stream_s() {
         let picture = |e: &Error| matches!(e, Error::Picture(_));
         assert!(picture(&h264::Error::MissingReference.into()));
-        assert!(picture(&h264::Error::Unrecovered.into()));
         assert!(picture(&hevc::Error::MissingReference.into()));
         assert!(picture(&hevc::Error::Unrecovered.into()));
         let unsupported = Error::from(h264::Error::Unsupported("data partitioning"));
