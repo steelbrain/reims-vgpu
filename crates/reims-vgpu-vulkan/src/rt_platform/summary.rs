@@ -42,7 +42,8 @@
 //!   resolve images and the bytes of their memory; then the bytes of the texture blocks it holds,
 //!   of the sparse ones among them and their count; and the bytes of the Private allocations that
 //!   hold taken blocks, of the taken blocks in them, and of the sparse allocations among them and
-//!   their count.
+//!   their count; and the surface planes imported (a dma-buf's on Unix, a Direct3D 11 texture's on
+//!   Windows, each a dedicated import) and their bytes.
 //!
 //! A device made after the one before reads as counted from none again: each count is what it rose
 //! by, or what it is where it fell.
@@ -224,6 +225,8 @@ pub(crate) fn line(before: &rt::Metrics, now: &rt::Metrics, gauges: &rt::Gauges)
         private_take_bytes,
         private_take_sparse_bytes,
         private_take_sparse_allocations,
+        surface_imports,
+        surface_import_bytes,
     );
     format!(
         "rt: pipelines made {}, finished {} in {:.1} ms; first-use waits {} in {:.1} ms (variants \
@@ -375,6 +378,8 @@ mod tests {
         gauges.private_take_bytes = 18_874_368;
         gauges.private_take_sparse_bytes = 16_777_216;
         gauges.private_take_sparse_allocations = 1;
+        gauges.surface_imports = 2;
+        gauges.surface_import_bytes = 12_441_600;
         assert_eq!(
             line(&before, &now, &gauges),
             "rt: pipelines made 3, finished 2 in 3.4 ms; first-use waits 3 in 7.5 ms (variants 2 \
@@ -397,7 +402,7 @@ mod tests {
              texture_block_held_bytes 50331648, texture_block_sparse_bytes \
              16777216, texture_block_sparse_blocks 1, private_take_held_bytes 33554432, \
              private_take_bytes 18874368, private_take_sparse_bytes 16777216, \
-             private_take_sparse_allocations 1"
+             private_take_sparse_allocations 1, surface_imports 2, surface_import_bytes 12441600"
         );
         let mut fresh = rt::Metrics::default();
         fresh.pipelines_created = 2;
@@ -418,7 +423,8 @@ mod tests {
                  texture_block_bytes 0, texture_own_bytes 0, spilled_bytes 0, resolve_images 0, \
                  resolve_image_bytes 0, texture_block_held_bytes 0, texture_block_sparse_bytes 0, \
                  texture_block_sparse_blocks 0, private_take_held_bytes 0, private_take_bytes 0, \
-                 private_take_sparse_bytes 0, private_take_sparse_allocations 0"
+                 private_take_sparse_bytes 0, private_take_sparse_allocations 0, \
+                 surface_imports 0, surface_import_bytes 0"
             ),
             "{part}"
         );
