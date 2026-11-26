@@ -484,13 +484,16 @@ fn targets_let_go_give_back_their_memory() {
 }
 
 /// Pool textures let go give back their memory as they go, with no draw after (the module doc's
-/// opens): 16 shared textures of 3840 by 2160 luma samples, of 8-bit samples, each drawn from
-/// once, as a session's pool is, hold at least their 16 times 12.4 MB of the adapter's memory
-/// more while they live, and the draws keep an open of each; once they are let go, as a pool is
-/// at its session's end, the draws keep none, and less than a tenth of what they held is left.
-/// Before the draws let go of an open as its texture went, they did so only at their next draw
-/// from another texture, so a pool's memory stayed with the draws until the next video. Run
-/// holding the GPU, on the default adapter.
+/// opens). A cycle makes 16 shared textures of 3840 by 2160 luma samples, of 8-bit samples, draws
+/// from each once, as a session's pool is drawn from, and lets them go, as a pool is at its
+/// session's end: while they live the draws keep an open of each, and once they are let go none
+/// (the fix's own claim, by count). By memory, three cycles: the level after the last, against the
+/// level after the first, is up by less than a tenth of what a cycle's 16 textures held, so that
+/// what a pool left behind would add up past the bound. The level after the first cycle is not
+/// asserted: on the UHD Graphics 630 that cycle left 63,930,368 of the 466,493,440 bytes its
+/// textures held, with one flush of the draws' contexts and with a second after a wait for the GPU
+/// alike (**measured** 2026-11-26, driver 31.0.101.2145, potluck jobs m3-max-75548 and
+/// m3-max-75554); the test prints it. Run holding the GPU, on the default adapter.
 #[test]
 #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
 fn pool_textures_let_go_give_back_their_memory() {
@@ -499,38 +502,52 @@ fn pool_textures_let_go_give_back_their_memory() {
     let draw = PlaneDraw::new(None).expect("the plane draws");
     let to = draw.targets((64, 48), false).expect("the targets");
     let device = Device::new(None).expect("a Direct3D 12 device");
+    // A cycle (above): what its textures held above the level it began at, and the level after.
+    let cycle = |n: usize| -> (u64, u64) {
+        let start = memory_used(&draw);
+        let textures: Vec<Arc<SharedTexture>> = (0..16)
+            .map(|_| {
+                let texture = (device.shared_texture(SurfaceFormat::Nv12, SIZE.0, SIZE.1))
+                    .expect("a shared texture");
+                Arc::new(texture)
+            })
+            .collect();
+        for texture in &textures {
+            draw.draw(texture, (0, 0), &to, (64, 48))
+                .expect("the draw");
+        }
+        let held = memory_used(&draw).saturating_sub(start);
+        assert!(
+            held >= 16 * texture,
+            "cycle {n}: 16 pool textures hold {held} bytes more, of their {} bytes",
+            16 * texture
+        );
+        assert_eq!(
+            draw.state.lock().opened.len(),
+            16,
+            "cycle {n}: an open of each texture"
+        );
+        drop(textures);
+        assert_eq!(
+            draw.state.lock().opened.len(),
+            0,
+            "cycle {n}: no open of a texture let go"
+        );
+        (held, memory_used(&draw))
+    };
     let before = memory_used(&draw);
-    let textures: Vec<Arc<SharedTexture>> = (0..16)
-        .map(|_| {
-            let texture = (device.shared_texture(SurfaceFormat::Nv12, SIZE.0, SIZE.1))
-                .expect("a shared texture");
-            Arc::new(texture)
-        })
-        .collect();
-    for texture in &textures {
-        draw.draw(texture, (0, 0), &to, (64, 48)).expect("the draw");
-    }
-    let held = memory_used(&draw).saturating_sub(before);
+    let (held, first) = cycle(1);
+    println!(
+        "the first cycle left {} bytes of the {held} that its 16 pool textures held",
+        first.saturating_sub(before)
+    );
+    cycle(2);
+    let (held, last) = cycle(3);
+    let grown = last.saturating_sub(first);
     assert!(
-        held >= 16 * texture,
-        "16 pool textures hold {held} bytes more, of their {} bytes",
-        16 * texture
-    );
-    assert_eq!(
-        draw.state.lock().opened.len(),
-        16,
-        "an open of each texture"
-    );
-    drop(textures);
-    assert_eq!(
-        draw.state.lock().opened.len(),
-        0,
-        "no open of a texture let go"
-    );
-    let left = memory_used(&draw).saturating_sub(before);
-    assert!(
-        left < held / 10,
-        "{left} bytes of the {held} that 16 pool textures held are left once they are let go"
+        grown < held / 10,
+        "{grown} bytes more after the third cycle than after the first, of the {held} that a \
+         cycle's 16 pool textures held"
     );
 }
 
