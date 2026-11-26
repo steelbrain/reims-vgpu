@@ -94,32 +94,50 @@
 //!
 //! **The command buffers in flight** ([`Flights`]): a command buffer joins its device's list as
 //! its commit hands it to rt, and leaves it as its first completed handler runs (`super::command`'s
-//! commit), so the list holds those committed and not complete. Each is kept with the object id of
-//! the guest's command buffer (`CommandBuffer::names_work`), whose bits from 40 are its context, or
-//! none for the host's own; its commit's time on the wall clock; and its encoders' names
-//! ([`EncoderNames`]), in their order. An encoder's names are its kind; a render encoder's pass's
-//! attachments, each by its texture's guest id; and, by guest id, the heaps its `useHeap:` calls
-//! declare, the buffers and textures its `useResource:` calls declare, and the buffers its
-//! `set*Buffer:` calls bind, refused or not. Of each list an encoder keeps the first [`IDS_KEPT`]
-//! ids, each once, and counts the names of others past them, and those of objects with no guest
-//! id ([`Ids`]). An encoder's names join its command buffer's as it ends, or as it goes unended
-//! ([`Naming`]). A command buffer cut in parts is one entry for each part rt has.
+//! commit), so the list holds those committed and not complete; and so does a window swapchain's
+//! clear, at its retire, of an image taken and not presented, which the swapchain commits on rt
+//! itself (`super::swapchain`, "Destroying a swapchain"), from before its commit until its wait
+//! for it returns ([`CommittedBy`]). Each is kept with the object id of the guest's command buffer
+//! (`CommandBuffer::names_work`), whose bits from 40 are its context, or none for the host's own;
+//! its commit's time on the wall clock; and its encoders' names ([`EncoderNames`]), in their
+//! order. An encoder's names are its kind; a render encoder's pass's attachments, each by its
+//! texture's name; and, by name, the heaps its `useHeap:` calls declare, the buffers and textures
+//! its `useResource:` calls declare, and the buffers its `set*Buffer:` calls bind, refused or not.
+//! An encoder of a command buffer of the host's own (one its caller named no work for) names its
+//! operands too ([`Operands`]): a blit encoder, the buffers and textures its copies read, and
+//! those its copies, fills and mipmap generations write; a render encoder, the textures its
+//! `set*Texture:` calls bind. An object's name ([`Name`]) is its guest object id, where a
+//! decoder's table stores it, and what the host made it for, where the host or the platform told
+//! it ([`Role`]): a window swapchain's image, the scanout's import, a presented surface's texture
+//! and the display's view of it, the display colour's table and its ramps, the guest cursor's
+//! glyph, the window overlay's image, or a host read's target. Of each list an encoder keeps the
+//! first [`IDS_KEPT`] names, each once, and counts the names of others past them, and those of
+//! objects with neither a guest id nor a role ([`Ids`]). An encoder's names join its command
+//! buffer's as it ends, or as it goes unended ([`Naming`]). A command buffer cut in parts is one
+//! entry for each part rt has.
 //!
 //! The list's numbers are its device's commit order, across all its queues, which the platform's
 //! own texture and sampler indices go back by (`super::texture`'s `OwnIndices`): the number of the
 //! last command buffer committed ([`Flights::last`]), and the highest number up to which every
-//! command buffer has left the list ([`Flights::done_through`]).
+//! command buffer has left the list ([`Flights::done_through`]). A swapchain's clear at its retire
+//! takes a number, and the highest number passes over it: an index given back while it runs
+//! waits for the platform's command buffers alone, as where the clear is not listed. What the
+//! clear renders, a swapchain image's texture, goes only once the swapchain's wait for it returned.
 //!
 //! At the loss, two lines follow the fault's ([`Flights::lines`]): the first [`FLIGHTS_LISTED`]
 //! command buffers committed and not complete, the oldest committed first, each with its context,
-//! its commit's time against the loss and its encoders' kinds in order (runs of one kind counted,
-//! the first [`KINDS_LISTED`] runs listed), and a count of the rest; then the oldest's render
-//! passes, the first [`PASSES_LISTED`], and the resources its encoders name, the first
-//! [`IDS_KEPT`] of each list. The list costs, for each command buffer, a read of the wall clock
-//! and an entry added and removed under the list's lock; for each encoder, one push under its
-//! command buffer's lock; and for each buffer bound or object declared, under the encoder's lock,
-//! which each command takes already, a load of its id and a look through the at most [`IDS_KEPT`]
-//! ids its list keeps.
+//! its commit's time against the loss and its encoders in order, each by its kind and, where it
+//! names its operands, what it renders into, what it binds and what its blits read and write
+//! (runs of encoders told alike counted, the first [`KINDS_LISTED`] runs listed), and a count of
+//! the rest; then the oldest's render passes, the first [`PASSES_LISTED`], and the resources its
+//! encoders name, the first [`IDS_KEPT`] of each list. A command buffer of the host's own that rt
+//! ends as in flight names its encoders so on its own line too (`super::command`'s docs, "A lost
+//! device's line"; [`Flights::told`]). The list costs, for each command buffer, a read of the wall
+//! clock and an entry added and removed under the list's lock; for each encoder, one push under
+//! its command buffer's lock; and for each buffer bound or object declared, and in a command
+//! buffer of the host's own for each operand, under the encoder's lock, which each command takes
+//! already, a load of its id and its role and a look through the at most [`IDS_KEPT`] names its
+//! list keeps.
 //!
 //! **What is kept before the loss.** The tables are walked at the loss, with no record of them
 //! kept before it beside the history of their objects' releases. The rest is kept as it changes,
@@ -141,7 +159,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use metal2vulkan_runtime as rt;
@@ -525,19 +543,157 @@ fn context_of(id: u64) -> u32 {
 /// which the history names it by as it goes ([`Releases`]), and a command buffer's line where an
 /// encoder named it ([`EncoderNames`]): 0, none, for one no table stored, the host's own. The last
 /// id told is kept. The `Shared` buffer over a two-copy `Managed` texture's CPU copy is told the
-/// texture's id.
+/// texture's id. What the host made it for is told too, where the host or the platform tells it
+/// ([`Role`], [`name_role_buffer`], [`name_role_texture`]); the last told is kept.
 #[derive(Debug, Default)]
 pub struct Named {
     /// The guest's object id, 0 for none.
     id: AtomicU64,
     /// Whether it is the CPU-copy buffer of the `Managed` texture whose id it holds.
     copy: AtomicBool,
+    /// What the host made it for ([`Role`]'s value), 0 for nothing told.
+    role: AtomicU8,
+}
+
+/// What the host made an object for, which a lost device's lines name it by (the module's docs,
+/// "The command buffers in flight"): told by the host as it makes the object or presents it
+/// (`reims_vgpu`'s `graphics::fault_walk::name_role`), or by the platform as it makes a window
+/// swapchain's image's texture (`super::texture`'s `drawable`). The host's own objects have no
+/// guest id, so this is all a line can say of them; a presented surface's texture is the guest's,
+/// and is named by both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Role {
+    /// The texture over a window swapchain's image (`super::swapchain`), which a window's frame
+    /// draws into.
+    SwapchainImage = 1,
+    /// The no-copy buffer over the guest's scanout pages that a display's draws read
+    /// (`reims_vgpu`'s `graphics::sink`, "The import").
+    ScanoutImport = 2,
+    /// The guest's texture over an IOSurface a display presented (`PRESENT_SURFACE`), which a
+    /// window's frame copies from (`graphics::sink`, "A presented surface").
+    Presented = 3,
+    /// The display's own view of a presented surface's texture, which a window's passes sample
+    /// (`graphics::ShownView`).
+    DisplayView = 4,
+    /// The display colour's table (`graphics::sink`, "The colour as a table").
+    ColorTable = 5,
+    /// A ramp the display colour's table is drawn from, a texture's or the scanout's.
+    ColorRamp = 6,
+    /// The guest cursor's glyph, which a window draws over its frame (`graphics::sink`, "The
+    /// guest's cursor").
+    CursorGlyph = 7,
+    /// The window overlay's image (`graphics::sink`, "The window's overlay").
+    OverlayImage = 8,
+    /// The texture a host's read of the display draws into (`graphics::read`).
+    ReadTarget = 9,
+}
+
+impl Role {
+    /// The role of value `raw`; `None` for 0, nothing told, and for any value no role has.
+    fn from_raw(raw: u8) -> Option<Role> {
+        Some(match raw {
+            1 => Role::SwapchainImage,
+            2 => Role::ScanoutImport,
+            3 => Role::Presented,
+            4 => Role::DisplayView,
+            5 => Role::ColorTable,
+            6 => Role::ColorRamp,
+            7 => Role::CursorGlyph,
+            8 => Role::OverlayImage,
+            9 => Role::ReadTarget,
+            _ => return None,
+        })
+    }
+
+    /// Its name on the line.
+    fn text(self) -> &'static str {
+        match self {
+            Role::SwapchainImage => "a window's swapchain image",
+            Role::ScanoutImport => "the scanout's import",
+            Role::Presented => "a presented surface's texture",
+            Role::DisplayView => "the display's view of a presented surface's texture",
+            Role::ColorTable => "the display colour's table",
+            Role::ColorRamp => "a ramp of the display colour's table",
+            Role::CursorGlyph => "the guest cursor's glyph",
+            Role::OverlayImage => "the window overlay's image",
+            Role::ReadTarget => "a host read's target",
+        }
+    }
+}
+
+/// An object as a lost device's lines name it (the module's docs, "The command buffers in
+/// flight"): by its guest object id, 0 for none, and what the host made it for, where it was told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Name {
+    /// The guest's object id, 0 for none.
+    pub id: u64,
+    /// What the host made it for, where it was told.
+    pub role: Option<Role>,
+}
+
+impl Name {
+    /// The object of guest id `id`, with no role told.
+    pub fn of_id(id: u64) -> Name {
+        Name { id, role: None }
+    }
+
+    /// The host's object made for `role`, with no guest id.
+    pub fn of_role(role: Role) -> Name {
+        Name {
+            id: 0,
+            role: Some(role),
+        }
+    }
+
+    /// Whether it names the object: by a guest id or a role.
+    fn names(&self) -> bool {
+        self.id != 0 || self.role.is_some()
+    }
+
+    /// It as a list says it, an object it names: its id, with its role after it where it has one,
+    /// or its role.
+    fn text(&self) -> String {
+        match (self.id, self.role) {
+            (0, Some(role)) => role.text().to_owned(),
+            (id, Some(role)) => format!("{id:#x} ({})", role.text()),
+            (id, None) => format!("{id:#x}"),
+        }
+    }
+
+    /// It as a pass's attachment's texture: `texture <id>`, with its role after it where it has
+    /// one; its role; or a texture with neither.
+    fn texture_text(&self) -> String {
+        match (self.id, self.role) {
+            (0, None) => "a texture with no guest id or role".to_owned(),
+            (0, Some(role)) => role.text().to_owned(),
+            _ => format!("texture {}", self.text()),
+        }
+    }
 }
 
 impl Named {
     /// The guest's object id, 0 for none.
     pub fn id(&self) -> u64 {
         self.id.load(Ordering::Relaxed)
+    }
+
+    /// What the host made it for, where it was told.
+    pub fn role(&self) -> Option<Role> {
+        Role::from_raw(self.role.load(Ordering::Relaxed))
+    }
+
+    /// Its name on a lost device's lines: its id and its role, two loads.
+    pub fn name(&self) -> Name {
+        Name {
+            id: self.id(),
+            role: self.role(),
+        }
+    }
+
+    /// Tells it `role`: one store.
+    fn name_role(&self, role: Role) {
+        self.role.store(role as u8, Ordering::Relaxed);
     }
 
     /// The kind of object it is as the history records it: `object`, or a `Managed` texture's
@@ -550,7 +706,7 @@ impl Named {
     }
 
     /// Tells it `id`: one store.
-    fn name(&self, id: u64) {
+    fn name_id(&self, id: u64) {
         self.id.store(id, Ordering::Relaxed);
     }
 
@@ -563,7 +719,7 @@ impl Named {
 
 /// Tells `buffer` the guest's id `id`, under which a decoder's table stores it ([`Named`]).
 pub fn name_buffer(buffer: &RtObj<RtBuffer>, id: u64) {
-    buffer.named().name(id);
+    buffer.named().name_id(id);
 }
 
 /// Tells `buffer` that it is the `Shared` buffer over the CPU copy of the two-copy `Managed`
@@ -574,12 +730,22 @@ pub fn name_managed_copy(buffer: &RtObj<RtBuffer>, id: u64) {
 
 /// Tells `texture` the guest's id `id`, under which a decoder's table stores it ([`Named`]).
 pub fn name_texture(texture: &RtObj<RtTexture>, id: u64) {
-    texture.named().name(id);
+    texture.named().name_id(id);
 }
 
 /// Tells `heap` the guest's id `id`, under which a decoder's table stores it ([`Named`]).
 pub fn name_heap(heap: &RtObj<RtHeap>, id: u64) {
-    heap.named().name(id);
+    heap.named().name_id(id);
+}
+
+/// Tells `buffer` what the host made it for, `role` ([`Named`]).
+pub fn name_role_buffer(buffer: &RtObj<RtBuffer>, role: Role) {
+    buffer.named().name_role(role);
+}
+
+/// Tells `texture` what the host made it for, or presents it as, `role` ([`Named`]).
+pub fn name_role_texture(texture: &RtObj<RtTexture>, role: Role) {
+    texture.named().name_role(role);
 }
 
 /// How many released ranges a device's history keeps ([`Releases`]): the last so many, each older
@@ -783,64 +949,97 @@ impl EncoderKind {
     }
 }
 
-/// The guest's object ids an encoder names in one of its lists ([`EncoderNames`]): each once, in
-/// the order first named, the first [`IDS_KEPT`]; past them, the names of others counted; and the
-/// names of objects with no guest id ([`Named`]), counted.
+/// The objects an encoder names in one of its lists ([`EncoderNames`]), by their names
+/// ([`Name`]): each once, by its guest id, or by its role where it has no guest id, in the order
+/// first named, the first [`IDS_KEPT`]; past them, the names of others counted; and the names of
+/// objects with neither a guest id nor a role ([`Named`]), counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ids {
-    /// The ids named, each once, in the order first named: the first [`IDS_KEPT`].
-    kept: Vec<u64>,
-    /// How many names of ids past those kept.
+    /// The objects named, each once, in the order first named: the first [`IDS_KEPT`].
+    kept: Vec<Name>,
+    /// How many names of objects past those kept.
     past: u64,
-    /// How many names of objects with no guest id.
-    unnumbered: u64,
+    /// How many names of objects with neither a guest id nor a role.
+    unnamed: u64,
 }
 
 impl Ids {
-    /// Notes a name of `id`, 0 for an object with no guest id: a look through the at most
-    /// [`IDS_KEPT`] ids kept.
+    /// Notes a name of the object of guest id `id`, 0 for one with none, with no role told
+    /// ([`Self::note`]).
     pub fn add(&mut self, id: u64) {
-        if id == 0 {
-            self.unnumbered += 1;
-        } else if !self.kept.contains(&id) {
+        self.note(Name::of_id(id));
+    }
+
+    /// Notes a name of the object `named` names: its id and role loaded ([`Self::note`]).
+    pub fn add_named(&mut self, named: &Named) {
+        self.note(named.name());
+    }
+
+    /// Notes a name of the object `name` names: a look through the at most [`IDS_KEPT`] names kept,
+    /// for its guest id where it has one, else for its role.
+    pub fn note(&mut self, name: Name) {
+        if !name.names() {
+            self.unnamed += 1;
+            return;
+        }
+        let seen = match name.id {
+            0 => self.kept.contains(&name),
+            id => self.kept.iter().any(|kept| kept.id == id),
+        };
+        if !seen {
             match self.kept.len() < IDS_KEPT {
-                true => self.kept.push(id),
+                true => self.kept.push(name),
                 false => self.past += 1,
             }
         }
     }
 
-    /// Notes `other`'s ids and counts in this list.
+    /// Whether it holds no name.
+    fn is_empty(&self) -> bool {
+        self.kept.is_empty() && self.past == 0 && self.unnamed == 0
+    }
+
+    /// Notes `other`'s names and counts in this list.
     fn join(&mut self, other: &Ids) {
-        for &id in &other.kept {
-            self.add(id);
+        for &name in &other.kept {
+            self.note(name);
         }
         self.past += other.past;
-        self.unnumbered += other.unnumbered;
+        self.unnamed += other.unnamed;
     }
 
     /// The list as the line says it.
     fn text(&self) -> String {
-        if self.kept.is_empty() && self.past == 0 && self.unnumbered == 0 {
+        if self.is_empty() {
             return "none".to_owned();
         }
-        let mut parts = (self.kept.iter())
-            .map(|id| format!("{id:#x}"))
-            .collect::<Vec<_>>();
+        let mut parts = self.kept.iter().map(Name::text).collect::<Vec<_>>();
         if self.past > 0 {
             parts.push(format!(
-                "{} more names past the first {IDS_KEPT} ids",
+                "{} more names past the first {IDS_KEPT} objects",
                 self.past
             ));
         }
-        if self.unnumbered > 0 {
+        if self.unnamed > 0 {
             parts.push(format!(
-                "{} names of objects with no guest id",
-                self.unnumbered
+                "{} names of objects with no guest id or role",
+                self.unnamed
             ));
         }
         parts.join(", ")
     }
+}
+
+/// What an encoder of a command buffer of the host's own reads and writes beside its pass's
+/// attachments and the buffers it binds, by name (the module's docs, "The command buffers in
+/// flight").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Operands {
+    /// What it reads: a blit encoder's copies' sources; the textures a render encoder's
+    /// `set*Texture:` calls bind.
+    pub reads: Ids,
+    /// What a blit encoder's copies, fills and mipmap generations write.
+    pub writes: Ids,
 }
 
 /// What an encoder of a command buffer names (the module's docs, "The command buffers in
@@ -849,9 +1048,8 @@ impl Ids {
 pub struct EncoderNames {
     /// Its kind.
     pub kind: EncoderKind,
-    /// A render encoder's pass's attachments: each one's point and its texture's guest id, 0 for
-    /// one with none.
-    pub attachments: Vec<(Point, u64)>,
+    /// A render encoder's pass's attachments: each one's point and its texture's name.
+    pub attachments: Vec<(Point, Name)>,
     /// The heaps its `useHeap:` calls declare.
     pub heaps: Ids,
     /// The buffers its `useResource:` calls declare.
@@ -860,10 +1058,13 @@ pub struct EncoderNames {
     pub declared_textures: Ids,
     /// The buffers its `set*Buffer:` calls bind (`setTessellationFactorBuffer:` among them).
     pub bound_buffers: Ids,
+    /// What it reads and writes beside those, for an encoder that names its operands, of a
+    /// command buffer of the host's own; `None` for any other, which notes none.
+    pub operands: Option<Operands>,
 }
 
 impl EncoderNames {
-    /// An encoder of `kind` that names nothing yet.
+    /// An encoder of `kind` that names nothing yet, nor its operands.
     pub fn new(kind: EncoderKind) -> EncoderNames {
         EncoderNames {
             kind,
@@ -872,8 +1073,66 @@ impl EncoderNames {
             declared_buffers: Ids::default(),
             declared_textures: Ids::default(),
             bound_buffers: Ids::default(),
+            operands: None,
         }
     }
+
+    /// It, naming its operands from now on where `operands`: an encoder of a command buffer of
+    /// the host's own.
+    pub fn naming_operands(mut self, operands: bool) -> EncoderNames {
+        self.operands = operands.then(Operands::default);
+        self
+    }
+
+    /// The encoder as its command buffer's entry on the line lists it: its kind; and, where it
+    /// names its operands, a render encoder's attachments and the textures and buffers it binds,
+    /// a blit encoder's sources and destinations, a compute encoder's buffers bound.
+    fn told(&self) -> String {
+        let kind = self.kind.name();
+        let Some(operands) = &self.operands else {
+            return kind.to_owned();
+        };
+        let buffers = (!self.bound_buffers.is_empty())
+            .then(|| format!("the buffers {}", self.bound_buffers.text()));
+        match self.kind {
+            EncoderKind::Render => {
+                let into = attachments_text(&self.attachments);
+                let textures = (!operands.reads.is_empty())
+                    .then(|| format!("the textures {}", operands.reads.text()));
+                let bound = textures.into_iter().chain(buffers).collect::<Vec<_>>();
+                match bound.is_empty() {
+                    true => format!("{kind} into {into}"),
+                    false => format!("{kind} into {into}, binding {}", bound.join(" and ")),
+                }
+            }
+            EncoderKind::Blit => format!(
+                "{kind} from {} into {}",
+                operands.reads.text(),
+                operands.writes.text()
+            ),
+            EncoderKind::Compute => match buffers {
+                Some(buffers) => format!("{kind}, binding {buffers}"),
+                None => kind.to_owned(),
+            },
+        }
+    }
+}
+
+/// A render pass's attachments as a line says them: each one's point and its texture's name, or
+/// that there are none.
+fn attachments_text(attachments: &[(Point, Name)]) -> String {
+    if attachments.is_empty() {
+        return "no attachments".to_owned();
+    }
+    let attachments = attachments.iter().map(|&(point, name)| {
+        let point = match point {
+            Point::Color(i) => format!("colour {i}"),
+            Point::Depth => "depth".to_owned(),
+            Point::Stencil => "stencil".to_owned(),
+        };
+        format!("{point} {}", name.texture_text())
+    });
+    attachments.collect::<Vec<_>>().join(", ")
 }
 
 /// A command buffer's encoders' names, in their order: each joins as its encoder ends or goes
@@ -931,12 +1190,30 @@ impl Drop for Naming {
     }
 }
 
+/// A window swapchain's clear at its retire, as the line names it
+/// ([`CommittedBy::SwapchainRetire`]).
+const SWAPCHAIN_RETIRE: &str = "a command buffer of the host's own, a window swapchain's clear at \
+                                its retire of an image taken and not presented";
+
+/// What committed a command buffer the list holds ([`Flight`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommittedBy {
+    /// The platform's command buffer (`super::command`), in its device's commit order.
+    Platform,
+    /// A window swapchain's retire, its clear of an image taken and not presented, committed on rt
+    /// itself (`super::swapchain`, "Destroying a swapchain"): outside the commit order, which
+    /// [`Flights::done_through`] passes over.
+    SwapchainRetire,
+}
+
 /// A command buffer committed and not complete (the module's docs, "The command buffers in
 /// flight").
 #[derive(Debug)]
 pub struct Flight {
     /// The object id of the guest's command buffer, `None` for one of the host's own.
     pub cb: Option<u64>,
+    /// What committed it.
+    pub by: CommittedBy,
     /// When it was committed: nanoseconds since 1970, on the wall clock.
     pub committed: u64,
     /// Its encoders' names, in their order.
@@ -946,36 +1223,39 @@ pub struct Flight {
 impl Flight {
     /// The command buffer as the line names it.
     fn who(&self) -> String {
-        match self.cb {
-            Some(cb) => format!(
+        match (self.cb, self.by) {
+            (Some(cb), _) => format!(
                 "the guest's command buffer {cb:#x} of context {}",
                 context_of(cb)
             ),
-            None => "a command buffer of the host's own".to_owned(),
+            (None, CommittedBy::Platform) => "a command buffer of the host's own".to_owned(),
+            (None, CommittedBy::SwapchainRetire) => SWAPCHAIN_RETIRE.to_owned(),
         }
     }
 
-    /// Its encoders' kinds in order, as the line says them: each run of one kind once, with its
-    /// count where more than one; the first [`KINDS_LISTED`] runs, then a count of the rest.
+    /// Its encoders in order, as the line says them ([`EncoderNames::told`]): each run of encoders
+    /// told alike once, with its count where more than one; the first [`KINDS_LISTED`] runs, then
+    /// a count of the rest.
     fn kinds(&self) -> String {
         if self.encoders.is_empty() {
             return "with no encoders".to_owned();
         }
-        let mut runs: Vec<(EncoderKind, usize)> = Vec::new();
+        let mut runs: Vec<(String, usize)> = Vec::new();
         for encoder in &self.encoders {
+            let told = encoder.told();
             match runs.last_mut() {
-                Some((kind, n)) if *kind == encoder.kind => *n += 1,
-                _ => runs.push((encoder.kind, 1)),
+                Some((last, n)) if *last == told => *n += 1,
+                _ => runs.push((told, 1)),
             }
         }
         let listed = (runs.iter().take(KINDS_LISTED))
-            .map(|&(kind, n)| match n {
-                1 => kind.name().to_owned(),
-                n => format!("{n} {}", kind.name()),
+            .map(|(told, n)| match n {
+                1 => told.clone(),
+                n => format!("{n} {told}"),
             })
             .collect::<Vec<_>>();
         let rest = (runs.iter().skip(KINDS_LISTED))
-            .map(|&(_, n)| n)
+            .map(|(_, n)| n)
             .sum::<usize>();
         let rest = match rest {
             0 => String::new(),
@@ -989,8 +1269,8 @@ impl Flight {
     }
 
     /// What its encoders name, as the oldest's line says it: its render passes' attachments by
-    /// texture, the first [`PASSES_LISTED`] passes, then the heaps and resources its encoders
-    /// declare and the buffers they bind.
+    /// their textures' names, the first [`PASSES_LISTED`] passes, then the heaps and resources its
+    /// encoders declare and the buffers they bind.
     fn names(&self) -> String {
         let (mut passes, mut more_passes) = (Vec::new(), 0);
         let mut lists: [Ids; 4] = Default::default();
@@ -1011,23 +1291,7 @@ impl Flight {
                 more_passes += 1;
                 continue;
             }
-            let attachments = (encoder.attachments.iter())
-                .map(|&(point, id)| {
-                    let point = match point {
-                        Point::Color(i) => format!("colour {i}"),
-                        Point::Depth => "depth".to_owned(),
-                        Point::Stencil => "stencil".to_owned(),
-                    };
-                    match id {
-                        0 => format!("{point} a texture with no guest id"),
-                        id => format!("{point} texture {id:#x}"),
-                    }
-                })
-                .collect::<Vec<_>>();
-            let attachments = match attachments.is_empty() {
-                true => "no attachments".to_owned(),
-                false => attachments.join(", "),
-            };
+            let attachments = attachments_text(&encoder.attachments);
             passes.push(format!("encoder {}: {attachments}", at + 1));
         }
         let passes = match (passes.is_empty(), more_passes) {
@@ -1079,13 +1343,26 @@ impl Flights {
         self.0.lock().0
     }
 
-    /// The highest number N such that every command buffer numbered N or less has left the list,
-    /// its first completed handler run or its commit refused, whatever the order they left in,
-    /// across all its device's queues: the oldest's in it less one, or [`Flights::last`] where it
-    /// is empty. A later command buffer that completed first moves it nowhere.
+    /// The highest number N such that every command buffer of the platform's numbered N or less
+    /// has left the list, its first completed handler run or its commit refused, whatever the
+    /// order they left in, across all its device's queues: the oldest's in it less one, or
+    /// [`Flights::last`] where it holds none. A later command buffer that completed first moves it
+    /// nowhere, and a swapchain's clear at its retire holds it nowhere
+    /// ([`CommittedBy::SwapchainRetire`], the module's docs): an index given back waits for the
+    /// platform's command buffers committed before alone, as where the clear is not listed. The
+    /// list holds a clear only while its swapchain waits for it, so it passes over at most a few.
     pub fn done_through(&self) -> u64 {
         let flights = self.0.lock();
-        (flights.1.keys().next()).map_or(flights.0, |&oldest| oldest.saturating_sub(1))
+        let oldest = (flights.1.iter()).find(|(_, f)| f.by == CommittedBy::Platform);
+        oldest.map_or(flights.0, |(&oldest, _)| oldest.saturating_sub(1))
+    }
+
+    /// The encoders of the command buffer of number `number`, as its entry on the line says them
+    /// (`its encoders (n): ...`); `None` where it is not on the list. For the line of a command
+    /// buffer of the host's own that rt ends as in flight (`super::command`'s docs, "A lost
+    /// device's line"), before its first completed handler takes it off.
+    pub fn told(&self, number: u64) -> Option<String> {
+        self.0.lock().1.get(&number).map(Flight::kinds)
     }
 
     /// How many command buffers are committed and not complete.
@@ -2364,9 +2641,9 @@ mod tests {
         );
         let render = EncoderNames {
             attachments: vec![
-                (Point::Color(0), 0x300_0000_0020),
-                (Point::Color(1), 0),
-                (Point::Depth, 0x300_0000_0021),
+                (Point::Color(0), Name::of_id(0x300_0000_0020)),
+                (Point::Color(1), Name::default()),
+                (Point::Depth, Name::of_id(0x300_0000_0021)),
             ],
             heaps: ids(&[0x300_0000_0030]),
             bound_buffers: ids(&[0x300_0000_0040, 0, 0x300_0000_0040]),
@@ -2380,6 +2657,7 @@ mod tests {
         };
         let oldest = flights.add(Flight {
             cb: Some(0x300_0000_0010),
+            by: CommittedBy::Platform,
             committed: LOSS - 40 * MS,
             encoders: vec![
                 render,
@@ -2390,16 +2668,19 @@ mod tests {
         });
         let completed = flights.add(Flight {
             cb: Some(0x400_0000_0010),
+            by: CommittedBy::Platform,
             committed: LOSS - 30 * MS,
             encoders: Vec::new(),
         });
         flights.add(Flight {
             cb: None,
+            by: CommittedBy::Platform,
             committed: LOSS - 20 * MS,
             encoders: vec![EncoderNames::new(EncoderKind::Blit)],
         });
         flights.add(Flight {
             cb: Some(0x400_0000_0011),
+            by: CommittedBy::Platform,
             committed: LOSS - 10 * MS,
             encoders: Vec::new(),
         });
@@ -2421,11 +2702,11 @@ mod tests {
                 "reims-vgpu: the oldest command buffer committed and not complete at the loss of \
                  the rt platform's device on GPU (10de:2204), the guest's command buffer \
                  0x30000000010 of context 3: its render passes' attachments: encoder 1: colour 0 \
-                 texture 0x30000000020, colour 1 a texture with no guest id, depth texture \
-                 0x30000000021; the heaps its encoders declare (useHeap:): 0x30000000030; the \
-                 buffers they declare (useResource:): 0x30000000041; the textures they declare \
-                 (useResource:): 0x30000000022; the buffers they bind: 0x30000000040, \
-                 0x30000000042, 1 names of objects with no guest id\n",
+                 texture 0x30000000020, colour 1 a texture with no guest id or role, depth \
+                 texture 0x30000000021; the heaps its encoders declare (useHeap:): \
+                 0x30000000030; the buffers they declare (useResource:): 0x30000000041; the \
+                 textures they declare (useResource:): 0x30000000022; the buffers they bind: \
+                 0x30000000040, 0x30000000042, 1 names of objects with no guest id or role\n",
             ]
         );
         flights.remove(oldest);
@@ -2463,12 +2744,14 @@ mod tests {
         encoders[0].bound_buffers = ids(&many);
         flights.add(Flight {
             cb: Some(0x100_0000_0001),
+            by: CommittedBy::Platform,
             committed: LOSS - 50 * MS,
             encoders,
         });
         for at in 0..FLIGHTS_LISTED as u64 + 1 {
             flights.add(Flight {
                 cb: Some(0x100_0000_0002 + at),
+                by: CommittedBy::Platform,
                 committed: LOSS - 40 * MS,
                 encoders: Vec::new(),
             });
@@ -2502,12 +2785,165 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             lines[1].ends_with(&format!(
-                "; the buffers they bind: {}, 3 more names past the first 32 ids\n",
+                "; the buffers they bind: {}, 3 more names past the first 32 objects\n",
                 bound.join(", ")
             )),
             "{}",
             lines[1]
         );
+    }
+
+    /// A command buffer of the host's own is listed with what its encoders render into and bind
+    /// and what its blits read and write, each object by its guest id and its role, or by its
+    /// role where it has no guest id (a window's frame: a clear of the swapchain image, the
+    /// scanout's blits into it, the cursor's pass; a frame that copies a presented surface's
+    /// texture), runs of encoders told alike counted; a guest's command buffer by its encoders'
+    /// kinds alone. A swapchain's clear at its retire is listed as the host's own, saying what it
+    /// is. A host's command buffer's encoders are told so for its line as one lost in flight too,
+    /// while it is listed.
+    #[test]
+    fn a_host_command_buffer_is_listed_with_what_its_encoders_render_bind_read_and_write() {
+        let flights = Flights::default();
+        let image = Name::of_role(Role::SwapchainImage);
+        let render = || EncoderNames {
+            attachments: vec![(Point::Color(0), image)],
+            ..EncoderNames::new(EncoderKind::Render).naming_operands(true)
+        };
+        let blit = |from: Name| {
+            let mut blit = EncoderNames::new(EncoderKind::Blit).naming_operands(true);
+            let operands = blit.operands.as_mut().expect("it names its operands");
+            operands.reads.note(from);
+            operands.writes.note(image);
+            operands.writes.note(image);
+            blit
+        };
+        let scanout = blit(Name::of_role(Role::ScanoutImport));
+        let mut cursor = render();
+        let operands = cursor.operands.as_mut().expect("it names its operands");
+        operands.reads.note(Name::of_role(Role::CursorGlyph));
+        cursor.bound_buffers.add(0);
+        cursor.bound_buffers.add(0);
+        let frame = flights.add(Flight {
+            cb: None,
+            by: CommittedBy::Platform,
+            committed: LOSS - 20 * MS,
+            encoders: vec![render(), scanout.clone(), scanout, cursor],
+        });
+        flights.add(Flight {
+            cb: None,
+            by: CommittedBy::SwapchainRetire,
+            committed: LOSS - 10 * MS,
+            encoders: vec![render()],
+        });
+        let presented = Name {
+            id: 0x500_0000_0012,
+            role: Some(Role::Presented),
+        };
+        flights.add(Flight {
+            cb: None,
+            by: CommittedBy::Platform,
+            committed: LOSS - 5 * MS,
+            encoders: vec![blit(presented)],
+        });
+        flights.add(Flight {
+            cb: Some(0x500_0000_0010),
+            by: CommittedBy::Platform,
+            committed: LOSS - 4 * MS,
+            encoders: vec![
+                EncoderNames::new(EncoderKind::Render),
+                EncoderNames::new(EncoderKind::Blit),
+            ],
+        });
+        let frame_encoders = "its encoders (4): render into colour 0 a window's swapchain image, 2 \
+                              blit from the scanout's import into a window's swapchain image, \
+                              render into colour 0 a window's swapchain image, binding the \
+                              textures the guest cursor's glyph and the buffers 2 names of \
+                              objects with no guest id or role";
+        assert_eq!(flights.told(frame).as_deref(), Some(frame_encoders));
+        assert_eq!(flights.told(0), None);
+        let lines = flights.lines("GPU (1002:73ff)", LOSS);
+        assert_eq!(
+            lines[0],
+            format!(
+                "reims-vgpu: the rt platform's device on GPU (1002:73ff), at its loss, had 4 \
+                 command buffers committed and not complete, the oldest committed first: a \
+                 command buffer of the host's own, committed at 1795560000.230000 s since 1970 \
+                 (0.020000 s before the loss), {frame_encoders}; a command buffer of the host's \
+                 own, a window swapchain's clear at its retire of an image taken and not \
+                 presented, committed at 1795560000.240000 s since 1970 (0.010000 s before the \
+                 loss), its encoders (1): render into colour 0 a window's swapchain image; a \
+                 command buffer of the host's own, committed at 1795560000.245000 s since 1970 \
+                 (0.005000 s before the loss), its encoders (1): blit from 0x50000000012 (a \
+                 presented surface's texture) into a window's swapchain image; the guest's \
+                 command buffer 0x50000000010 of context 5, committed at 1795560000.246000 s \
+                 since 1970 (0.004000 s before the loss), its encoders (2): render, blit\n"
+            )
+        );
+        assert_eq!(
+            lines[1],
+            "reims-vgpu: the oldest command buffer committed and not complete at the loss of the \
+             rt platform's device on GPU (1002:73ff), a command buffer of the host's own: its \
+             render passes' attachments: encoder 1: colour 0 a window's swapchain image; encoder \
+             4: colour 0 a window's swapchain image; the heaps its encoders declare (useHeap:): \
+             none; the buffers they declare (useResource:): none; the textures they declare \
+             (useResource:): none; the buffers they bind: 2 names of objects with no guest id or \
+             role\n"
+        );
+    }
+
+    /// A list names each object once: by its guest id where it has one, whatever its role, and
+    /// by its role where it has none, each role once; an object with neither is counted.
+    #[test]
+    fn a_list_names_each_object_once_by_its_guest_id_or_its_role() {
+        let mut ids = Ids::default();
+        ids.note(Name::of_role(Role::ColorRamp));
+        ids.note(Name::of_role(Role::ColorTable));
+        ids.note(Name::of_role(Role::ColorRamp));
+        ids.note(Name {
+            id: 0x7,
+            role: Some(Role::Presented),
+        });
+        ids.add(0x7);
+        ids.add(0);
+        let named = Named::default();
+        assert_eq!(named.name(), Name::default());
+        named.name_role(Role::DisplayView);
+        assert_eq!(named.name(), Name::of_role(Role::DisplayView));
+        ids.add_named(&named);
+        assert_eq!(
+            ids.text(),
+            "a ramp of the display colour's table, the display colour's table, 0x7 (a presented \
+             surface's texture), the display's view of a presented surface's texture, 1 names of \
+             objects with no guest id or role"
+        );
+    }
+
+    /// A swapchain's clear at its retire takes a number on the list, but holds no index given back:
+    /// the highest number up to which every command buffer has left the list passes over it, as
+    /// where it is not listed.
+    #[test]
+    fn a_swapchain_s_clear_at_its_retire_holds_nothing_given_back() {
+        let flights = Flights::default();
+        let add = |by| {
+            flights.add(Flight {
+                cb: None,
+                by,
+                committed: LOSS,
+                encoders: Vec::new(),
+            })
+        };
+        let first = add(CommittedBy::Platform);
+        let clear = add(CommittedBy::SwapchainRetire);
+        let third = add(CommittedBy::Platform);
+        assert_eq!((first, clear, third), (1, 2, 3));
+        assert_eq!(flights.done_through(), 0);
+        flights.remove(first);
+        assert_eq!(flights.done_through(), 2);
+        flights.remove(third);
+        assert_eq!((flights.done_through(), flights.last()), (3, 3));
+        assert_eq!(flights.len(), 1);
+        flights.remove(clear);
+        assert_eq!(flights.done_through(), 3);
     }
 
     /// A decoder's table of one buffer, walked at the loss as a graphics device's is

@@ -123,6 +123,7 @@ use reims_vgpu_vulkan::core::platform::values::TextureDesc;
 use reims_vgpu_vulkan::core::platform::{Handle, Platform};
 use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_vulkan::rt_platform::fault::Role;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig, geometry};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -152,6 +153,7 @@ use crate::graphics::decode::{
     Then, compile_refusing, complete, make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
+use crate::graphics::fault_walk::HostObject;
 use crate::graphics::present::{Drawing, LetGo, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
 use crate::graphics::slow_answers::{
@@ -1667,6 +1669,8 @@ impl<P: Platform> ShownView<P> {
             return Some(view);
         }
         let view = no_catch(texture.new_texture_view(texture.pixel_format()))?;
+        // A lost device's lines name it so (`fault_walk::name_role`).
+        fault_walk::name_role::<P>(Role::DisplayView, HostObject::Texture(&view));
         // A draw on another thread that made one first keeps its own: this one goes.
         Some(self.0.get_or_init(|| view))
     }
@@ -1759,7 +1763,9 @@ impl<P: Platform> Presented<P> {
     /// `texture`, over a surface whose present was taken, held for the display from now, with
     /// `view`, the display's view of it ([`ShownView`]): the block at `span` it lies in is not
     /// given back until the display is done with it ([`DisplayHold`]). `queued`: every write of
-    /// the bytes it reads is the platform's work ([`DisplayHold`]'s `queued`).
+    /// the bytes it reads is the platform's work ([`DisplayHold`]'s `queued`). From now, a lost
+    /// device's lines name the texture as a presented surface's, beside its guest id
+    /// (`fault_walk::name_role`).
     fn hold(
         &self,
         texture: P::Texture,
@@ -1767,6 +1773,7 @@ impl<P: Platform> Presented<P> {
         span: Option<(u64, u64)>,
         queued: bool,
     ) -> ShownTexture<P> {
+        fault_walk::name_role::<P>(Role::Presented, HostObject::Texture(&texture));
         let hold = Arc::new(DisplayHold {
             span,
             answers: Mutex::default(),

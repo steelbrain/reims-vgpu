@@ -34,6 +34,10 @@
 //!   buffers ([`Unbuilt::Icb`]). Each encodes nothing, counted.
 //! - **The guest's RAM** is copied by no blit: the device copies none
 //!   (`GpuDevice::copies_guest_ram`), so each copy of it answers false.
+//! - **Its names for a lost device's lines** (`super::fault`'s docs, "The command buffers in
+//!   flight"): its kind, and, in a command buffer of the host's own, what its copies read and what
+//!   its copies, fills and mipmap generations write, by the guest's ids and the host's roles; they
+//!   join its command buffer's as it ends, or as it goes unended.
 //!
 //! A command rt refuses encodes nothing, counted under the refusal's kind
 //! ([`rt_refused_texture`]), the first texture copy of each kind naming its textures (with each
@@ -53,13 +57,14 @@ use crate::core::sync::Mutex;
 
 use super::command::{Kept, OpenMark};
 use super::diag::Use;
+use super::fault::{EncoderKind, EncoderNames, Naming, Operands};
 use super::unbuilt::{RtRefusal, Unbuilt, refuse, refused_as, rt_refused_texture};
 use super::{RtObj, RtPlatform, RtTexture};
 
 /// `id<MTLBlitCommandEncoder>` on metal2vulkan-runtime.
 pub struct RtBlitEncoder {
-    /// rt's encoder, until `endEncoding` ends it.
-    rt: Mutex<Option<rt::BlitCommandEncoder>>,
+    /// rt's encoder, until `endEncoding` ends it, and what it names.
+    rt: Mutex<Open>,
     /// Its command buffer's mark of it open, until it ends.
     open: OpenMark,
     /// What its command buffer keeps: its uses of textures, for the boot diagnostics
@@ -67,12 +72,32 @@ pub struct RtBlitEncoder {
     kept: Kept,
 }
 
+/// A blit encoder's rt encoder, until `endEncoding` ends it, and what it names.
+struct Open {
+    /// rt's encoder.
+    encoder: Option<rt::BlitCommandEncoder>,
+    /// What it names, for a lost device's lines (`super::fault`'s docs, "The command buffers in
+    /// flight"): in a command buffer of the host's own, what its copies read and what its copies,
+    /// fills and mipmap generations write; it joins its command buffer's as it ends or goes.
+    naming: Naming,
+}
+
 impl RtBlitEncoder {
     /// The encoder over rt's `encoder`, open as `open` marks it, its uses of textures noted in its
-    /// command buffer's `kept`.
-    pub fn new(encoder: rt::BlitCommandEncoder, open: OpenMark, kept: Kept) -> RtBlitEncoder {
+    /// command buffer's `kept`, naming its operands where `operands` (`super::fault`'s
+    /// `Operands`).
+    pub fn new(
+        encoder: rt::BlitCommandEncoder,
+        open: OpenMark,
+        kept: Kept,
+        operands: bool,
+    ) -> RtBlitEncoder {
+        let names = EncoderNames::new(EncoderKind::Blit).naming_operands(operands);
         RtBlitEncoder {
-            rt: Mutex::new(Some(encoder)),
+            rt: Mutex::new(Open {
+                encoder: Some(encoder),
+                naming: Naming::new(kept.encoded(), names),
+            }),
             open,
             kept,
         }
@@ -170,6 +195,96 @@ impl RtBlitEncoder {
             }
             _ => {}
         }
+    }
+}
+
+/// Notes in `operands` what `cmd`, a command of an encoder of a command buffer of the host's own,
+/// reads and writes, by name (`super::fault`'s docs, "The command buffers in flight"): a copy's
+/// source and destination, a fill's buffer and a mipmap generation's texture, each named or not,
+/// refused or not.
+fn note_operands(operands: &mut Operands, cmd: &BlitCmd<'_, RtPlatform>) {
+    let (reads, writes) = (&mut operands.reads, &mut operands.writes);
+    match *cmd {
+        BlitCmd::CopyBufferToTexture {
+            source_buffer,
+            destination_texture,
+            ..
+        } => {
+            reads.add_named(source_buffer.named());
+            writes.add_named(destination_texture.named());
+        }
+        BlitCmd::CopyBufferToTextureOptions {
+            source_buffer,
+            destination_texture,
+            ..
+        } => {
+            if let Some(buffer) = source_buffer {
+                reads.add_named(buffer.named());
+            }
+            if let Some(texture) = destination_texture {
+                writes.add_named(texture.named());
+            }
+        }
+        BlitCmd::CopyBufferToBuffer {
+            source_buffer,
+            destination_buffer,
+            ..
+        } => {
+            if let Some(buffer) = source_buffer {
+                reads.add_named(buffer.named());
+            }
+            if let Some(buffer) = destination_buffer {
+                writes.add_named(buffer.named());
+            }
+        }
+        BlitCmd::CopyTextureToBuffer {
+            source_texture,
+            destination_buffer,
+            ..
+        } => {
+            reads.add_named(source_texture.named());
+            writes.add_named(destination_buffer.named());
+        }
+        BlitCmd::CopyTextureToBufferOptions {
+            source_texture,
+            destination_buffer,
+            ..
+        } => {
+            if let Some(texture) = source_texture {
+                reads.add_named(texture.named());
+            }
+            if let Some(buffer) = destination_buffer {
+                writes.add_named(buffer.named());
+            }
+        }
+        BlitCmd::CopyTextureRegion {
+            source_texture,
+            destination_texture,
+            ..
+        }
+        | BlitCmd::CopyTextureRegionOptions {
+            source_texture,
+            destination_texture,
+            ..
+        }
+        | BlitCmd::CopyTextureSlices {
+            source_texture,
+            destination_texture,
+            ..
+        } => {
+            reads.add_named(source_texture.named());
+            writes.add_named(destination_texture.named());
+        }
+        BlitCmd::FillBuffer { buffer, .. } | BlitCmd::FillBufferPattern4 { buffer, .. } => {
+            writes.add_named(buffer.named());
+        }
+        BlitCmd::FillTexture { texture, .. } | BlitCmd::FillTextureColor { texture, .. } => {
+            writes.add_named(texture.named());
+        }
+        BlitCmd::GenerateMipmaps {
+            texture: Some(texture),
+        } => writes.add_named(texture.named()),
+        _ => {}
     }
 }
 
@@ -755,13 +870,17 @@ impl BlitEncoder<RtPlatform> for RtObj<RtBlitEncoder> {
             let mut open = self.rt.lock();
             let ending = matches!(cmd, BlitCmd::EndEncoding);
             self.note_uses(&cmd);
-            let stopped = match open.as_mut() {
+            if let Some(operands) = (open.naming.names()).and_then(|n| n.operands.as_mut()) {
+                note_operands(operands, &cmd);
+            }
+            let stopped = match open.encoder.as_mut() {
                 Some(e) => encode(e, cmd).err(),
                 None => Some(Stop::Metal("a command after endEncoding")),
             };
-            if ending && let Some(e) = open.take() {
+            if ending && let Some(e) = open.encoder.take() {
                 e.end_encoding();
                 self.open.end();
+                open.naming.end();
             }
             drop(open);
             report(sel, stopped);
@@ -812,7 +931,7 @@ impl BlitEncoder<RtPlatform> for RtObj<RtBlitEncoder> {
     #[cfg(unix)]
     fn release_to_external(&self, buffer: &<RtPlatform as Platform>::Buffer) -> Result<(), String> {
         let mut open = self.rt.lock();
-        let encoder = open.as_mut().ok_or("the encoder has ended")?;
+        let encoder = open.encoder.as_mut().ok_or("the encoder has ended")?;
         (encoder.release_to_external(buffer.rt())).map_err(|error| format!("rt's release: {error}"))
     }
 }

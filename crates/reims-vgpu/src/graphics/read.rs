@@ -35,8 +35,10 @@ use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_vulkan::rt_platform::fault::Role;
 use reims_vgpu_window::PixelRect;
 
+use super::fault_walk::{HostObject, name_role};
 use super::sink::ScanoutDraw;
 use super::{Presented, Shown};
 use crate::entry::no_catch;
@@ -216,6 +218,10 @@ impl<P: ApiPlatform> DisplayRead<P> {
         ));
         descriptor.set_usage(READ_USAGE);
         descriptor.set_resource_options(READ_RESOURCE_OPTIONS);
-        no_catch(draw.device.new_texture(OnFault::Die, &descriptor)).ok_or(Error::Metal)
+        let texture = no_catch(draw.device.new_texture(OnFault::Die, &descriptor));
+        let texture = texture.ok_or(Error::Metal)?;
+        // A lost device's lines name it so (`fault_walk::name_role`).
+        name_role::<P>(Role::ReadTarget, HostObject::Texture(&texture));
+        Ok(texture)
     }
 }

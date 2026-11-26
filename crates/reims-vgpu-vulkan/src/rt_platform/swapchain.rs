@@ -45,7 +45,10 @@
 //! made (a frame that encoded nothing), has had a command buffer with commands committed after
 //! that call complete, which carried its move home: the retire commits a clear of the image on a
 //! queue of the swapchain's own and waits for it ([`RtSwapchain::settle_acquired`]). Then its
-//! images' textures go, then their semaphores and the swapchain.
+//! images' textures go, then their semaphores and the swapchain. The clear is on the device's list
+//! of command buffers in flight from before its commit until the wait returns, so a loss's lines
+//! name it, with the swapchain image it renders (`super::fault`'s docs, "The command buffers in
+//! flight"), outside the commit order the platform's own indices go back by.
 //!
 //! **Without present fences** (no `swapchainMaintenance1` on the device), a retired swapchain's
 //! last present is known complete from Vulkan's rules alone, and where it is not in time, the
@@ -89,6 +92,8 @@ use crate::swapchain::{
 use super::RtObj;
 use super::command::RtCommandBuffer;
 use super::device::RtDevice;
+use super::diag::Point;
+use super::fault::{CommittedBy, EncoderKind, EncoderNames, Flight};
 use super::texture::{self, RtTexture};
 use super::unbuilt::rt_refused;
 use super::window_times;
@@ -101,6 +106,24 @@ const NEXT_DRAWABLE: &str = "nextDrawable";
 
 /// The call rt's refusals of a present are counted under.
 const PRESENT_DRAWABLE: &str = "presentDrawable:";
+
+/// A swapchain's clear at its retire of `texture`, an image's taken and not presented
+/// ([`RtSwapchain::settle_acquired`]), as the device's list of command buffers in flight holds it
+/// (`super::fault`'s docs, "The command buffers in flight"): a command buffer of the host's own,
+/// committed now, outside the commit order, of one render pass into the image, a window's
+/// swapchain image.
+fn retire_clear(texture: &RtObj<RtTexture>) -> Flight {
+    let clear = EncoderNames {
+        attachments: vec![(Point::Color(0), texture.named().name())],
+        ..EncoderNames::new(EncoderKind::Render).naming_operands(true)
+    };
+    Flight {
+        cb: None,
+        by: CommittedBy::SwapchainRetire,
+        committed: super::fault::wall_now(),
+        encoders: vec![clear],
+    }
+}
 
 /// One image of the swapchain.
 struct Image {
@@ -805,7 +828,9 @@ impl RtSwapchain {
     }
 
     /// A clear of `texture` in a command buffer of the swapchain's own queue, committed and waited
-    /// for.
+    /// for: listed among the device's command buffers committed and not complete, for a loss's
+    /// lines, from before its commit until the wait returns (`super::fault`'s docs, "The command
+    /// buffers in flight"; [`retire_clear`]), which changes nothing it commits or when.
     fn clear(&mut self, texture: &RtObj<RtTexture>) -> Result<(), rt::Error> {
         let queue = match &self.settling {
             Some(queue) => queue.clone(),
@@ -822,6 +847,7 @@ impl RtSwapchain {
         attachment.load_action = rt::LoadAction::Clear;
         attachment.store_action = rt::StoreAction::Store;
         command_buffer.render_command_encoder(&pass)?.end_encoding();
+        let _listed = self.device.loss().listing(retire_clear(texture));
         command_buffer.commit()?;
         command_buffer.wait_until_completed()
     }

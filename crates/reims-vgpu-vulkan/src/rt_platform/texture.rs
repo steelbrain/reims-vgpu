@@ -644,7 +644,8 @@ const USAGE_RENDER_TARGET: u64 = 0x4;
 
 /// The texture over a window swapchain's image (`super::swapchain`): rt's drawable `texture`, made
 /// of [`drawable_descriptor`]'s descriptor at `own`, one of the platform's own indices, which its
-/// drop gives back.
+/// drop gives back; named on a lost device's lines as a window's swapchain image
+/// (`super::fault`'s `Role`).
 pub(super) fn drawable(
     device: &RtObj<RtDevice>,
     texture: rt::Texture,
@@ -659,7 +660,7 @@ pub(super) fn drawable(
         usage: USAGE_RENDER_TARGET,
     };
     let made = Made::new(Call::Drawable, &shape);
-    RtObj::new(RtTexture {
+    let drawable = RtObj::new(RtTexture {
         named: super::fault::Named::default(),
         rt: texture,
         device: device.clone_ref(),
@@ -673,7 +674,9 @@ pub(super) fn drawable(
         copied: OnceLock::new(),
         over: OnceLock::new(),
         held: OnceLock::new(),
-    })
+    });
+    super::fault::name_role_texture(&drawable, super::fault::Role::SwapchainImage);
+    drawable
 }
 
 /// The descriptor of a drawable's texture over a swapchain's image of `width` x `height` pixels:
@@ -1888,11 +1891,12 @@ mod tests {
     /// with none committed waits for nothing, and one reserved since goes.
     #[test]
     fn own_indices_given_back_wait_for_every_command_buffer_committed_before() {
-        use super::super::fault::Flight;
+        use super::super::fault::{CommittedBy, Flight};
         let order = Arc::new(Flights::default());
         let commit = || {
             order.add(Flight {
                 cb: None,
+                by: CommittedBy::Platform,
                 committed: 0,
                 encoders: Vec::new(),
             })

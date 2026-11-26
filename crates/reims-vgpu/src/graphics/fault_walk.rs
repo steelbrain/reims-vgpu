@@ -9,7 +9,12 @@
 //!
 //! As a table stores a buffer, texture or heap, the object is told the guest's id for it
 //! ([`name`]), which the device's history of released ranges and its lines of the command buffers
-//! in flight name it by (`fault::Named`).
+//! in flight name it by (`fault::Named`). As the host makes a buffer or texture of its own that a
+//! display's draws use, or presents a guest's texture, the object is told what the host made it
+//! for ([`name_role`]: the scanout's import, a presented surface's texture and the display's view
+//! of it, the display colour's table and ramps, the guest cursor's glyph, the window overlay's
+//! image, a host read's target), which those lines name it by where it has no guest id
+//! (`fault::Role`).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -79,6 +84,35 @@ pub(super) fn name<P: Platform>(id: u64, object: TableObject<'_, P>) {
         TableObject::ManagedCopy(buffer) => {
             if let Some(buffer) = (buffer as &dyn Any).downcast_ref::<<Rt as Platform>::Buffer>() {
                 fault::name_managed_copy(buffer, id);
+            }
+        }
+    }
+}
+
+/// An object of the host's own, or a guest's it presents, to tell what the host made it for
+/// ([`name_role`]).
+pub(crate) enum HostObject<'a, P: Platform> {
+    /// A buffer.
+    Buffer(&'a P::Buffer),
+    /// A texture.
+    Texture(&'a P::Texture),
+}
+
+/// Tells `object` what the host made it for, or presents it as, `role` (`fault::Named`), where
+/// the platform is the rt platform: a downcast, which each platform's build settles, and an atomic
+/// store; nothing for any other platform.
+pub(crate) fn name_role<P: Platform>(role: fault::Role, object: HostObject<'_, P>) {
+    type Rt = RtPlatform;
+    match object {
+        HostObject::Buffer(buffer) => {
+            if let Some(buffer) = (buffer as &dyn Any).downcast_ref::<<Rt as Platform>::Buffer>() {
+                fault::name_role_buffer(buffer, role);
+            }
+        }
+        HostObject::Texture(texture) => {
+            let texture = (texture as &dyn Any).downcast_ref::<<Rt as Platform>::Texture>();
+            if let Some(texture) = texture {
+                fault::name_role_texture(texture, role);
             }
         }
     }

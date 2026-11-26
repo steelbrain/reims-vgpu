@@ -544,7 +544,7 @@ impl PassFields {
                 texture_type: d.texture_type.as_raw(),
                 samples: d.sample_count,
                 index: texture.rt().gpu_resource_id().index,
-                id: texture.named().id(),
+                name: texture.named().name(),
                 made: std::sync::Arc::clone(texture.made()),
             })
         };

@@ -519,18 +519,18 @@ fn note_copies(used: &Used, cmd: &ComputeCmd<'_, RtPlatform>) {
 }
 
 /// Notes in `names` what `cmd` names (`super::fault`'s docs, "The command buffers in flight"): the
-/// buffers it binds, and the heaps and resources it declares, by their guest ids.
+/// buffers it binds, and the heaps and resources it declares, by their names.
 fn note_names(names: &mut EncoderNames, cmd: &ComputeCmd<'_, RtPlatform>) {
     match cmd {
         ComputeCmd::SetBuffers { buffers, .. }
         | ComputeCmd::SetBuffersAttributeStrides { buffers, .. } => {
             for buffer in buffers.iter().flatten() {
-                names.bound_buffers.add(buffer.named().id());
+                names.bound_buffers.add_named(buffer.named());
             }
         }
         ComputeCmd::UseHeaps { heaps } => {
             for heap in heaps.iter().flatten() {
-                names.heaps.add(heap.named().id());
+                names.heaps.add_named(heap.named());
             }
         }
         ComputeCmd::UseResources { resources, .. } => note_declared(names, resources),
@@ -538,16 +538,16 @@ fn note_names(names: &mut EncoderNames, cmd: &ComputeCmd<'_, RtPlatform>) {
     }
 }
 
-/// Notes in `names` the resources a `useResources:` call declares, by their guest ids (an
-/// indirect command buffer, which rt builds none of, as none).
+/// Notes in `names` the resources a `useResources:` call declares, by their names (an indirect
+/// command buffer, which rt builds none of, as none).
 pub(super) fn note_declared(
     names: &mut EncoderNames,
     resources: &[Option<ResourceRef<'_, RtPlatform>>],
 ) {
     for resource in resources.iter().flatten() {
         match resource {
-            ResourceRef::Buffer(buffer) => names.declared_buffers.add(buffer.named().id()),
-            ResourceRef::Texture(texture) => names.declared_textures.add(texture.named().id()),
+            ResourceRef::Buffer(buffer) => names.declared_buffers.add_named(buffer.named()),
+            ResourceRef::Texture(texture) => names.declared_textures.add_named(texture.named()),
             ResourceRef::Icb(_) => {}
         }
     }

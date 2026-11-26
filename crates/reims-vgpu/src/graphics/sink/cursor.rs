@@ -48,10 +48,12 @@ use reims_vgpu_vulkan::core::platform::values::{
     ColorAttachmentDesc, FullRenderPipelineDesc, TextureDesc,
 };
 use reims_vgpu_vulkan::core::platform::{Handle as _, HostRange, Platform};
+use reims_vgpu_vulkan::rt_platform::fault::Role;
 use reims_vgpu_window::{DrawnCursor, DrawnOverlay, Glyph, PixelRect};
 
 use super::Converter;
 use crate::entry::no_catch;
+use crate::graphics::fault_walk::{HostObject, name_role};
 use crate::platform::ApiPlatform;
 
 /// The least `viewportBoundsRange` Vulkan sets every device: a viewport's edges lie inside it.
@@ -75,6 +77,8 @@ pub(super) struct CursorPass<P: Platform> {
     label: &'static str,
     /// What it draws, for its refusals' lines.
     draws: &'static str,
+    /// Its glyph's texture's name on a lost device's lines (`fault_walk::name_role`).
+    role: Role,
     /// The blending pipelines made so far, by the drawable's pixel format.
     pipelines: Vec<(u64, P::RenderPipeline)>,
     /// The glyph last drawn, and its texture.
@@ -84,19 +88,21 @@ pub(super) struct CursorPass<P: Platform> {
 impl<P: Platform> CursorPass<P> {
     /// The guest's cursor's pass.
     pub(super) fn cursor() -> Self {
-        CursorPass::new(CURSOR_PIPELINE_LABEL, "guest cursor")
+        CursorPass::new(CURSOR_PIPELINE_LABEL, "guest cursor", Role::CursorGlyph)
     }
 
     /// The window's overlay's pass.
     pub(super) fn overlay() -> Self {
-        CursorPass::new(OVERLAY_PIPELINE_LABEL, "overlay")
+        CursorPass::new(OVERLAY_PIPELINE_LABEL, "overlay", Role::OverlayImage)
     }
 
-    /// A pass whose pipelines are labelled `label`, drawing what `draws` names.
-    fn new(label: &'static str, draws: &'static str) -> Self {
+    /// A pass whose pipelines are labelled `label`, drawing what `draws` names, its glyph's
+    /// texture named `role` on a lost device's lines.
+    fn new(label: &'static str, draws: &'static str, role: Role) -> Self {
         CursorPass {
             label,
             draws,
+            role,
             pipelines: Vec::new(),
             glyph: None,
         }
@@ -160,6 +166,7 @@ impl<P: ApiPlatform> CursorPass<P> {
                 let Some(texture) = glyph_texture(platform, device, glyph) else {
                     return refused(self.draws, "a texture for its image");
                 };
+                name_role::<P>(self.role, HostObject::Texture(&texture));
                 self.glyph = Some((Arc::clone(glyph), texture.clone_ref()));
                 texture
             }

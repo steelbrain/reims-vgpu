@@ -150,6 +150,7 @@ use reims_vgpu_vulkan::core::platform::types::{MtlScissorRect, MtlViewport};
 use self::cursor::CursorPass;
 use super::color::DisplayColor;
 use super::decode::unkept::Kind;
+use super::fault_walk::{HostObject, name_role};
 use super::{DisplayHold, Drawable, DrawnPresents, Presented, Shown};
 use crate::entry::no_catch;
 use crate::platform::ApiPlatform;
@@ -158,6 +159,7 @@ use reims_vgpu_graphics::wire::{
 };
 use reims_vgpu_vulkan::core::platform::resource::Library as _;
 use reims_vgpu_vulkan::core::platform::values::RenderPipelineDesc;
+use reims_vgpu_vulkan::rt_platform::fault::Role;
 
 mod cursor;
 
@@ -680,12 +682,14 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 Some(Box::new(move || drop(keep))),
             ))
         });
-        if buffer.is_none() {
-            log::warn!(
+        match &buffer {
+            // A lost device's lines name it so (`fault_walk::name_role`).
+            Some(buffer) => name_role::<P>(Role::ScanoutImport, HostObject::Buffer(buffer)),
+            None => log::warn!(
                 target: "reims_vgpu::graphics",
                 "the platform refused the scanout's pages (0x{length:x} bytes at 0x{start:x} in \
                  the region): the window shows nothing of this scanout"
-            );
+            ),
         }
         buffer
     }
@@ -1195,6 +1199,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             }
             _ => {
                 let texture = self.new_texture(format, values, TABLE_USAGE, Some(PRIVATE))?;
+                name_role::<P>(Role::ColorTable, HostObject::Texture(&texture));
                 let drawn = Arc::new(AtomicBool::new(false));
                 *kept = Some(ColorTable {
                     made_for,
@@ -1278,6 +1283,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         }
         let (values, pixel) = table_values(format)?;
         let ramp = self.new_texture(format, values, RAMP_USAGE, None)?;
+        name_role::<P>(Role::ColorRamp, HostObject::Texture(&ramp));
         let bytes: Vec<u8> = (0..u32::try_from(values).ok()?).flat_map(pixel).collect();
         let length = u64::try_from(bytes.len()).ok()?;
         // SAFETY: the bytes live across the call, which copies them out and keeps no pointer.
@@ -1304,8 +1310,10 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     fn scanout_ramp(&self) -> Option<Arc<ScanoutRead<P>>> {
         self.scanout_ramp.get_or_make(|| {
             let bytes: Vec<u8> = (0..=u8::MAX).flat_map(|k| [k; 4]).collect();
+            let buffer = self.buffer_of(&bytes)?;
+            name_role::<P>(Role::ColorRamp, HostObject::Buffer(&buffer));
             Some(ScanoutRead {
-                buffer: self.buffer_of(&bytes)?,
+                buffer,
                 origin: (0, 0),
                 stride_words: u32::try_from(SCANOUT_VALUES).ok()?,
                 first_word: 0,

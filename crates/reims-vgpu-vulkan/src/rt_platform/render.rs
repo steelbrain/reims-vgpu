@@ -166,16 +166,18 @@ struct Seen {
 
 impl RtRenderEncoder {
     /// The encoder over rt's `encoder`, open as `mark` marks it, its pipeline states kept in
-    /// `kept`, of a pass of `targets`.
+    /// `kept`, of a pass of `targets`, naming its operands where `operands` (`super::fault`'s
+    /// `Operands`).
     pub fn new(
         encoder: rt::RenderCommandEncoder,
         mark: OpenMark,
         kept: Kept,
         targets: Vec<Target>,
+        operands: bool,
     ) -> RtRenderEncoder {
         let names = EncoderNames {
-            attachments: targets.iter().map(|t| (t.point, t.id)).collect(),
-            ..EncoderNames::new(EncoderKind::Render)
+            attachments: targets.iter().map(|t| (t.point, t.name)).collect(),
+            ..EncoderNames::new(EncoderKind::Render).naming_operands(operands)
         };
         RtRenderEncoder {
             open: ReentrantMutex::new(RefCell::new(Open {
@@ -915,26 +917,41 @@ fn note_copies(used: &Used, cmd: &RenderCmd<'_, RtPlatform>) {
 
 /// Notes in `names` what `cmd` names (`super::fault`'s docs, "The command buffers in flight"): the
 /// buffers it binds to a vertex or fragment slot or as the tessellation factor buffer, and the
-/// heaps and resources it declares, by their guest ids (rt keeps no mesh, object or tile buffers).
+/// heaps and resources it declares, by their names (rt keeps no mesh, object or tile buffers);
+/// and, where the encoder names its operands, in a command buffer of the host's own, the textures
+/// it binds to a vertex or fragment slot.
 fn note_names(names: &mut EncoderNames, cmd: &RenderCmd<'_, RtPlatform>) {
     match cmd {
         RenderCmd::SetFragmentBuffer { buffer, .. }
         | RenderCmd::SetVertexBuffer { buffer, .. }
         | RenderCmd::SetTessellationFactorBuffer { buffer, .. } => {
             if let Some(buffer) = buffer {
-                names.bound_buffers.add(buffer.named().id());
+                names.bound_buffers.add_named(buffer.named());
             }
         }
         RenderCmd::SetFragmentBuffers { buffers, .. }
         | RenderCmd::SetVertexBuffersAttributeStrides { buffers, .. }
         | RenderCmd::SetVertexBuffers { buffers, .. } => {
             for buffer in buffers.iter().flatten() {
-                names.bound_buffers.add(buffer.named().id());
+                names.bound_buffers.add_named(buffer.named());
+            }
+        }
+        RenderCmd::SetFragmentTexture { texture, .. } => {
+            if let (Some(operands), Some(texture)) = (&mut names.operands, texture) {
+                operands.reads.add_named(texture.named());
+            }
+        }
+        RenderCmd::SetFragmentTextures { textures, .. }
+        | RenderCmd::SetVertexTextures { textures, .. } => {
+            if let Some(operands) = &mut names.operands {
+                for texture in textures.iter().flatten() {
+                    operands.reads.add_named(texture.named());
+                }
             }
         }
         RenderCmd::UseHeaps { heaps } | RenderCmd::UseHeapsStages { heaps, .. } => {
             for heap in heaps.iter().flatten() {
-                names.heaps.add(heap.named().id());
+                names.heaps.add_named(heap.named());
             }
         }
         RenderCmd::UseResources { resources, .. }
