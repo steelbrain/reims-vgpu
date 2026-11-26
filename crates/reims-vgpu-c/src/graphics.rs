@@ -846,7 +846,9 @@ pub extern "C" fn rvg_quiesce_for_exit(timeout_ms: u64) -> bool {
 /// library's. Calls back: never.
 #[unsafe(no_mangle)]
 pub extern "C" fn rvg_write_counts() {
-    ffi::export(GraphicsDevice::<Plat>::write_counts)
+    ffi::export(|| {
+        GraphicsDevice::<Plat>::write_counts();
+    })
 }
 
 /// The device's region: its first byte, page-aligned, and, through `size` where it is not NULL,

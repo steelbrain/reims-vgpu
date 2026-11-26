@@ -452,6 +452,9 @@ int main(int argc, char **argv) {
     check_graphics();
     check_memory_files();
     check_displays();
+    /* As QEMU does when reims-ctl's report asks for them while the guest runs: the degradation
+     * counts on stderr now, where they changed since the library last wrote them. */
+    rvg_write_counts();
     /* As QEMU does at its quit, the last call before the exit, whose answer is whether the exit
      * may run; a second call answers at once, with the first answer. On false the harness ends as
      * QEMU then does: its streams flushed, then _Exit, which runs no exit handler. */
