@@ -513,8 +513,7 @@ fn pool_textures_let_go_give_back_their_memory() {
             })
             .collect();
         for texture in &textures {
-            draw.draw(texture, (0, 0), &to, (64, 48))
-                .expect("the draw");
+            draw.draw(texture, (0, 0), &to, (64, 48)).expect("the draw");
         }
         let held = memory_used(&draw).saturating_sub(start);
         assert!(
