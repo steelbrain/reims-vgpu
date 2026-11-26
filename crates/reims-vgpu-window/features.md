@@ -500,6 +500,21 @@ runtime's own device. The switches above apply, and `resolution=` too.
 - Sharp at any scale, fractional ones included: one drawable pixel per
   screen pixel, the swapchain made again whenever the window's pixels
   change, across screens and scale changes. `manual`
+- The reims-graphics guest is told the scale of the screen the window is
+  on, as on macOS (The picture): on Wayland the window's pixels a point; on
+  X11 and on a Windows host, where SDL's sizes are pixels and a window has
+  one pixel to each of them at any scale, the screen's content scale, SDL's
+  display scale of the window (on X11 the desktop's `Xft.dpi` over 96, else
+  GDK's scale; on Windows the monitor's scale setting, 150% telling the
+  guest 180 in 120ths). The drawable, the image and the pointer stay in the
+  window's pixels. So on a Windows screen at 150% an x86-64 guest starts
+  HiDPI at every window size from 2048 × 1536 pixels, as on macOS (a
+  2560 × 1600 screen's borderless window at 1280 × 800 points). A change of
+  the screen's scale, or a move to a screen of another, tells the guest the
+  new one.
+  `test: sdl::units::a_window_s_scale_is_its_density_where_sizes_are_points_else_its_screen_s`,
+  `test: geometry::the_layout_carries_the_screen_s_scale`, `manual` (a
+  Windows host at 150%, X11 at a content scale above 1)
 - The window resizes freely, keeping the guest's ratio between black bars,
   and follows the guest's mode until the person resizes it (a compositor's
   rounding by a point is not the person's).

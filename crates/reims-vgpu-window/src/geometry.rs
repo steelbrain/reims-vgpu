@@ -65,6 +65,24 @@ pub struct Layout {
     /// The drawable's pixels a point: the view's backing scale, 1 where it is not a positive
     /// number.
     pub scale: f64,
+    /// The pixels a host point of the screen the view is on, which the reims-graphics display
+    /// tells its guest: [`Layout::scale`] where the view's points are the host's (AppKit's, and
+    /// SDL's on Wayland), and the screen's own scale where they are the screen's pixels (SDL's on
+    /// X11 and Windows, whose drawable is a pixel a point at any scale:
+    /// [`Layout::on_screen_of`]).
+    pub screen_scale: f64,
+}
+
+impl Layout {
+    /// This layout on a screen of `scale` pixels a host point ([`Layout::screen_scale`]), its
+    /// drawable, image and pixels unchanged; a `scale` that is not a positive number keeps the
+    /// layout's own.
+    pub fn on_screen_of(self, scale: f64) -> Layout {
+        Layout {
+            screen_scale: valid_scale_or(scale, self.screen_scale),
+            ..self
+        }
+    }
 }
 
 /// `value` where it is finite and not below 0, else 0.
@@ -78,10 +96,15 @@ fn non_negative(value: f64) -> f64 {
 
 /// `scale` where it is finite and above 0, else 1.
 fn valid_scale(scale: f64) -> f64 {
+    valid_scale_or(scale, 1.0)
+}
+
+/// `scale` where it is finite and above 0, else `otherwise`.
+fn valid_scale_or(scale: f64, otherwise: f64) -> f64 {
     if scale.is_finite() && scale > 0.0 {
         scale
     } else {
-        1.0
+        otherwise
     }
 }
 
@@ -145,6 +168,7 @@ pub fn layout(bounds: (f64, f64), scale: f64, insets: Insets, guest: Option<(u16
         },
         pixels,
         scale,
+        screen_scale: scale,
     }
 }
 
@@ -468,16 +492,38 @@ mod tests {
     }
 
     /// The layout carries the scale of the screen the window is on, which the reims-graphics
-    /// display tells its guest, so the guest's density follows the screen at any window size
+    /// display tells its guest, so the guest's density follows the screen at any window size:
+    /// the view's backing scale, else, where the view's points are the screen's pixels (SDL's on
+    /// X11 and Windows), the screen's own scale, the drawable and the image left as they are
     #[test]
     fn the_layout_carries_the_screen_s_scale() {
         for scale in [1.0, 1.25, 2.0, 2.1] {
             for bounds in [(800.0, 600.0), (1371.0, 800.0), (1829.0, 1000.0)] {
-                assert_eq!(layout(bounds, scale, NO_INSETS, None).scale, scale);
+                let l = layout(bounds, scale, NO_INSETS, None);
+                assert_eq!((l.scale, l.screen_scale), (scale, scale));
             }
         }
         assert_eq!(layout((800.0, 600.0), f64::NAN, NO_INSETS, None).scale, 1.0);
-        assert_eq!(layout((800.0, 600.0), 0.0, NO_INSETS, None).scale, 1.0);
+        assert_eq!(
+            layout((800.0, 600.0), 0.0, NO_INSETS, None).screen_scale,
+            1.0
+        );
+        // A Windows screen of 2560 × 1600 at 150%: SDL's sizes are its pixels, a pixel a point to
+        // the drawable, and the guest is told 1.5.
+        let pixels = layout((2560.0, 1600.0), 1.0, NO_INSETS, Some((2560, 1600)));
+        let windows = pixels.on_screen_of(1.5);
+        assert_eq!(windows.screen_scale, 1.5);
+        assert_eq!(
+            Layout {
+                screen_scale: 1.0,
+                ..windows
+            },
+            pixels
+        );
+        assert_eq!(windows.drawable, (2560, 1600));
+        // A scale that is not a positive number keeps the layout's.
+        assert_eq!(windows.on_screen_of(f64::NAN).screen_scale, 1.5);
+        assert_eq!(pixels.on_screen_of(0.0).screen_scale, 1.0);
     }
 
     /// The mode offered for a drawable is its width rounded down to a multiple of 16 pixels and

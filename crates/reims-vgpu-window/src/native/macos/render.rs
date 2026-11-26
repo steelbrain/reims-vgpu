@@ -296,7 +296,7 @@ fn run(window: &Window) {
         }
         if presenting.draw(
             work.layout.drawable,
-            work.layout.scale,
+            work.layout.screen_scale,
             work.layout.pixels,
             cursor.as_ref(),
             None,

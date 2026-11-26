@@ -9,6 +9,14 @@
 //! for in pixels, its display bounds and usable bounds (the monitor's work area) are pixels, its
 //! modes have a pixel density of 1, and the content scale is the monitor's effective DPI over 96.
 //!
+//! So a window's pixels over its size in SDL's sizes are its screen's scale on Wayland alone: on
+//! X11 and Windows they are 1 at any scale, and the screen's scale is SDL's display scale of the
+//! window, which SDL documents as the pixel density times the content scale of the window's screen
+//! (`SDL_GetWindowDisplayScale`, docs/README-highdpi.md, read in SDL 3.4.18's code: X11's and
+//! Windows' drivers have no window content scale of their own, and Wayland's is the window's
+//! buffer scale). The scale a window's guest is told is chosen as a screen's is
+//! ([`pixels_per_point`]), from the window's density and that display scale.
+//!
 //! Linux and Windows size their windows here (`native/sdl_thread/sdl.rs`); macOS's SDL windows
 //! open in the frames AppKit's window takes, in points.
 
@@ -22,9 +30,11 @@ use crate::geometry;
 
 /// A screen's pixels per host point, from its current mode's `pixel_density` and SDL's
 /// `content_scale` of it: the density where it is above 1 (Wayland at a scale above 1), else the
-/// content scale (X11, where the desktop's scale is the content scale alone), else 1.
-pub(crate) fn pixels_per_point(pixel_density: f32, content_scale: f32) -> f64 {
-    let density = f64::from(pixel_density);
+/// content scale (X11 and Windows, where the desktop's scale is the content scale alone), else 1.
+/// A window's the same way, from its pixels over its size in SDL's sizes and SDL's display scale
+/// of it (the module doc): so on Wayland the density, as the window's pixels come (3841 over
+/// 1829 points at 2.1), and on X11 and Windows its screen's content scale.
+pub(crate) fn pixels_per_point(density: f64, content_scale: f32) -> f64 {
     if density > 1.0 {
         density
     } else if content_scale.is_finite() && content_scale > 0.0 {
@@ -52,7 +62,7 @@ impl Units {
     pub(crate) fn new(pixel_density: f32, content_scale: f32) -> Units {
         let in_120ths = |scale: f64| (scale * 120.0).round() / 120.0;
         let pixels = f64::from(pixel_density).max(1.0);
-        let scale = pixels_per_point(pixel_density, content_scale);
+        let scale = pixels_per_point(f64::from(pixel_density), content_scale);
         if pixels > 1.0 {
             Units {
                 pixels: in_120ths(pixels),
@@ -150,6 +160,25 @@ mod tests {
         assert_eq!(pixels_per_point(1.0, 1.25), 1.25);
         assert_eq!(pixels_per_point(1.0, f32::NAN), 1.0);
         assert_eq!(pixels_per_point(0.0, 0.0), 1.0);
+    }
+
+    /// A window's guest is told its pixels over its points where SDL's sizes are points (Wayland:
+    /// the ratio as its pixels come, not SDL's float of the scale), and where they are pixels, a
+    /// density of 1 at any scale (X11, Windows), SDL's display scale of it, its screen's content
+    /// scale: a Windows screen at 150% is 1.5, not 1
+    #[test]
+    fn a_window_s_scale_is_its_density_where_sizes_are_points_else_its_screen_s() {
+        // Wayland at 2×, at 2.1 and at 1×: the density, whatever SDL's display scale says.
+        assert_eq!(pixels_per_point(2.0, 2.0), 2.0);
+        assert_eq!(pixels_per_point(3841.0 / 1829.0, 2.1), 3841.0 / 1829.0);
+        assert_eq!(pixels_per_point(1.0, 1.0), 1.0);
+        // Windows at 150% and 125%, X11 at 200%: the content scale.
+        assert_eq!(pixels_per_point(1.0, 1.5), 1.5);
+        assert_eq!(pixels_per_point(1.0, 1.25), 1.25);
+        assert_eq!(pixels_per_point(1.0, 2.0), 2.0);
+        // No display scale known: 1.
+        assert_eq!(pixels_per_point(1.0, 0.0), 1.0);
+        assert_eq!(pixels_per_point(1.0, f32::INFINITY), 1.0);
     }
 
     /// A window opens at a guest point per host point in SDL's sizes: points on Wayland, and on

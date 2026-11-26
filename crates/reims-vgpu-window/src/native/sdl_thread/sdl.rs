@@ -14,6 +14,11 @@
 //! and its smallest are asked for in SDL's sizes (`crate::sdl::units`): points on Wayland, and on
 //! X11 and Windows pixels, the desktop's content scale of them to the point.
 //!
+//! **The scale the guest is told** is the screen's ([`screen_scale`]): on Wayland the window's
+//! pixels a point, and on X11 and Windows, where its drawable is a pixel a unit of SDL's sizes at
+//! any scale, the content scale of the screen SDL has it on. The drawable, the image and the
+//! pointer stay in SDL's sizes.
+//!
 //! **Borderless**: through the compositor's own full screen on its screen, over its panels.
 //!
 //! **The surface.** The window is made for Vulkan: its render thread makes the window's Vulkan
@@ -239,6 +244,19 @@ pub(crate) fn metrics(shell: &Shell) -> Option<((f64, f64), f64)> {
     }
     let density = f64::from(pw) / f64::from(w);
     Some(((f64::from(pw) / density, f64::from(ph) / density), density))
+}
+
+/// The pixels a host point of the screen the window is on, which its guest is told
+/// (`crate::geometry::Layout::screen_scale`), for a window of `density` pixels a unit of SDL's
+/// sizes ([`metrics`]): the density on Wayland, whose sizes are points; on X11 and Windows, whose
+/// sizes are pixels and whose windows have a density of 1 at any scale, SDL's display scale of
+/// the window, its screen's content scale (`crate::sdl::units`): 1.5 on a Windows screen at 150%.
+/// SDL tells a change of it (`SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED`), which lays the window out
+/// again (`crate::sdl::shell`).
+pub(crate) fn screen_scale(shell: &Shell, density: f64) -> f64 {
+    // SAFETY: the window is SDL's, on this thread.
+    let display_scale = unsafe { SDL_GetWindowDisplayScale(shell.sdl) };
+    units::pixels_per_point(density, display_scale)
 }
 
 /// The room the window keeps clear around the image: none.

@@ -18,9 +18,10 @@
 //!
 //! **The layout.** Whenever the window's size, its scale or the guest's mode changes, the image is
 //! laid out again ([`geometry::layout`]) over the window's points at its pixels per point
-//! ([`os::metrics`]), inside the room the OS keeps clear ([`os::insets`]), and the render thread
-//! draws a changed one: the drawable is the window's size in pixels, one pixel per screen pixel at
-//! any scale.
+//! ([`os::metrics`]), inside the room the OS keeps clear ([`os::insets`]), on a screen of the scale
+//! the guest is told ([`os::screen_scale`]: the window's pixels a point where SDL's sizes are
+//! points, else its screen's content scale), and the render thread draws a changed one: the
+//! drawable is the window's size in pixels, one pixel per screen pixel at any scale.
 //!
 //! **Events.** Closing the window (its close button, or the keyboard's or the window system's
 //! close) lets its input go and asks the person, in the OS's own dialog over the window
@@ -459,7 +460,8 @@ impl Shell {
             return;
         };
         let insets = os::insets(self);
-        let layout = geometry::layout(bounds, density, insets, self.window.mode());
+        let layout = geometry::layout(bounds, density, insets, self.window.mode())
+            .on_screen_of(os::screen_scale(self, density));
         if layout != self.layout || density.to_bits() != self.density.to_bits() {
             log::debug!(
                 target: "reims_vgpu_window",

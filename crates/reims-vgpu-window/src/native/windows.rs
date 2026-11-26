@@ -14,7 +14,10 @@
 //! - **DPI.** SDL's video start declares the process per-monitor DPI aware (v2), unless the
 //!   process has declared its awareness already (read from SDL 3.4.18's code,
 //!   `WIN_InitDPIAwareness`): SDL's sizes are then pixels, its modes have a pixel density of 1,
-//!   and a screen's content scale is its DPI over 96, as on X11 (`crate::sdl::units`).
+//!   and a screen's content scale is its DPI over 96, as on X11 (`crate::sdl::units`). A window's
+//!   pixels over its size are 1 at any scale, so the scale its guest is told is SDL's display
+//!   scale of the window, its monitor's content scale (`super::sdl_thread::sdl::screen_scale`):
+//!   1.5 at 150%.
 //! - **The keyboard grab** while captured (`SDL_SetWindowKeyboardGrab`) is a low-level keyboard
 //!   hook SDL installs on the UI thread while the window has the keyboard, which takes the
 //!   system's shortcuts (the Windows key, Alt+Tab, Alt+Esc) before Windows does (read from SDL

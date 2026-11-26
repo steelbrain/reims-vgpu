@@ -258,6 +258,12 @@ pub(crate) fn metrics(shell: &Shell) -> Option<((f64, f64), f64)> {
         .then_some(((size.width, size.height), scale))
 }
 
+/// The pixels a host point of the screen the window is on, which its guest is told: its backing
+/// scale, `density` ([`metrics`]), as AppKit's sizes are points.
+pub(crate) fn screen_scale(_shell: &Shell, density: f64) -> f64 {
+    density
+}
+
 /// The room the window keeps clear around the image: a borderless window's screen's safe area.
 pub(crate) fn insets(shell: &Shell) -> Insets {
     if !shell.os.borderless {
