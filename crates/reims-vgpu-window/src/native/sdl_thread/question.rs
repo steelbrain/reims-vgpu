@@ -754,8 +754,7 @@ mod tests {
     #[test]
     fn the_question_is_laid_out_at_the_screen_s_scale() {
         let x11 = |scale: f64| {
-            geometry::layout((2560.0, 1440.0), 1.0, Insets::default(), None)
-                .on_screen_of(scale)
+            geometry::layout((2560.0, 1440.0), 1.0, Insets::default(), None).on_screen_of(scale)
         };
         let at_2 = Question::new(vec![1], &x11(2.0));
         assert_eq!(at_2.shape, shape((2560, 1440), 2.0));
