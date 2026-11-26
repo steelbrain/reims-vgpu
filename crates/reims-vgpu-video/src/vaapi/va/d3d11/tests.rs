@@ -493,11 +493,13 @@ fn targets_let_go_give_back_their_memory() {
 /// as Windows charges it (`super::super::d3d12::process_gpu_memory`): an open of each texture's NT
 /// handle, which DXGI did not count, stayed charged for good, 16 times a texture's 12.4 MB a cycle
 /// (`super::super::d3d12`'s module doc), where the draws' wrap of its resource leaves nothing. The
-/// level after the first cycle is not asserted: on the UHD Graphics 630, with those opens, that
-/// cycle left 63,930,368 of the 466,493,440 bytes its textures held as DXGI counts them, with one
-/// flush of the draws' contexts and with a second after a wait for the GPU alike (**measured**
-/// 2026-11-26, driver 31.0.101.2145, potluck jobs m3-max-75548 and m3-max-75554); the test prints
-/// both. Run holding the GPU, on the default adapter.
+/// level after the first cycle is not asserted: on the UHD Graphics 630 that cycle left
+/// 63,930,368 bytes as DXGI counts them, with one flush of the draws' contexts and with a second
+/// after a wait for the GPU alike, of the 466,493,440 that its textures held in a shared heap with
+/// an open of each, and of the 265,150,464 that they hold in no shared heap, wrapped; and
+/// 64,036,864 bytes charged (**measured** 2026-11-26, driver 31.0.101.2145, potluck jobs
+/// m3-max-75548, m3-max-75554 and m3-max-75658); the test prints both. Run holding the GPU, on the
+/// default adapter.
 #[test]
 #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
 fn pool_textures_let_go_give_back_their_memory() {
