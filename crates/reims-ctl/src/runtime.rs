@@ -132,43 +132,46 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
                  yourself to the kvm group (sudo usermod -aG kvm $USER, then log in again)"
             );
         }
-        if c.graphics() == Graphics::ReimsVgpu
-            && let Some(problem) = host_kernel().and_then(kernel_problem)
-        {
-            bail!("{problem}");
-        }
+    }
+    if host.os == Os::Linux
+        && c.graphics() == Graphics::ReimsVgpu
+        && let Some(problem) = host_kernel().and_then(kernel_problem)
+    {
+        bail!("{problem}");
     }
     Ok(())
 }
 
-/// The oldest Linux whose KVM runs a VM on reims-vgpu's GPU. The guest's Shared memory is GPU
-/// memory the host's driver allocated, which QEMU maps into the guest. Before 6.13, KVM maps a
-/// page of a driver's mapping only where it can take a reference on the page, and the pages the
-/// drivers on TTM (amdgpu among them) allocate in higher orders have none: the guest's first
-/// write to them stops its vCPU (QEMU logs "kvm run failed Bad address"), and the VM hangs at
-/// boot. Read from Linux 6.12's `hva_to_pfn_remapped` and `ttm_pool_alloc_page`.
-pub const MIN_KVM_KERNEL: (u32, u32) = (6, 13);
+/// The oldest Linux that runs a VM on reims-vgpu's GPU, under any accelerator; QEMU's device
+/// refuses an older one at its realize too. The guest's pages reach the host's GPU as udmabuf
+/// dma-bufs of its RAM's memfd, which QEMU puts on huge pages, and before 7.2 a udmabuf over large
+/// folios has a malformed table, which an AMD GPU's import binds to the wrong pages (issue 185;
+/// read from Linux 7.1's and 7.2's `drivers/dma-buf/udmabuf.c`, upstream 5bf888673e0d). It holds
+/// KVM's own floor too: before 6.13 KVM can't map the pages TTM's drivers (amdgpu among them)
+/// allocate in higher orders, which back the guest's Shared memory (Linux 6.12's
+/// `hva_to_pfn_remapped`).
+pub const MIN_LINUX: (u32, u32) = (7, 2);
 
 /// The running kernel's version, major and minor (Linux).
 pub fn host_kernel() -> Option<(u32, u32)> {
     kernel_version(&std::fs::read_to_string("/proc/sys/kernel/osrelease").ok()?)
 }
 
-/// The major and minor version a kernel's release names: 6.12 for `6.12.117+deb13-amd64`.
+/// The major and minor version a kernel's release names: 7.1 for `7.1.9-arch1-1`.
 fn kernel_version(release: &str) -> Option<(u32, u32)> {
     let mut v = release.trim().split(|c: char| !c.is_ascii_digit());
     Some((v.next()?.parse().ok()?, v.next()?.parse().ok()?))
 }
 
-/// Why a kernel of version `v` runs no VM on reims-vgpu's GPU under KVM, if it does not
-/// ([`MIN_KVM_KERNEL`]).
+/// Why a kernel of version `v` runs no VM on reims-vgpu's GPU, if it does not ([`MIN_LINUX`]).
 pub fn kernel_problem(v: (u32, u32)) -> Option<String> {
-    (v < MIN_KVM_KERNEL).then(|| {
+    (v < MIN_LINUX).then(|| {
+        let min = format!("{}.{}", MIN_LINUX.0, MIN_LINUX.1);
         format!(
-            "this host runs Linux {}.{}, and a VM on reims-vgpu's GPU needs Linux {}.{} or later: \
-             an older kernel's KVM can't map the GPU's memory into the guest, so the VM hangs at \
-             boot. Install a newer kernel, then start the VM again",
-            v.0, v.1, MIN_KVM_KERNEL.0, MIN_KVM_KERNEL.1
+            "this host runs Linux {}.{}, and a VM on reims-vgpu's GPU needs Linux {min} or later: \
+             before {min} a udmabuf over large pages is malformed, and an AMD GPU is bound to the \
+             wrong pages of the guest's memory. Install a newer kernel, then start the VM again",
+            v.0, v.1
         )
     })
 }
@@ -1326,23 +1329,26 @@ impl Drop for TestQemu {
 mod tests {
     use super::*;
 
-    /// A start under KVM on reims-vgpu's GPU asks for Linux 6.13 or later: Debian 13's 6.12 is
-    /// refused with the reason and what to do, and 6.13 and every later release start.
+    /// A start on reims-vgpu's GPU asks for Linux 7.2 or later: 7.1 is refused with the reason
+    /// and what to do, as are Debian 13's 6.12 and the 6.18 line, and 7.2 and every later release
+    /// start.
     #[test]
-    fn a_kvm_start_on_our_gpu_asks_for_linux_6_13() {
+    fn a_start_on_our_gpu_asks_for_linux_7_2() {
         assert_eq!(kernel_version("6.12.117+deb13-amd64\n"), Some((6, 12)));
+        assert_eq!(kernel_version("7.1.9-arch1-1"), Some((7, 1)));
         assert_eq!(kernel_version("7.3.3-1-cachyos"), Some((7, 3)));
-        assert_eq!(kernel_version("6.13"), Some((6, 13)));
+        assert_eq!(kernel_version("7.2"), Some((7, 2)));
         assert_eq!(kernel_version("garbage"), None);
-        let m = kernel_problem((6, 12)).unwrap();
+        let m = kernel_problem((7, 1)).unwrap();
         assert!(
-            m.contains("Linux 6.12") && m.contains("Linux 6.13 or later") && m.contains("hangs"),
+            m.contains("Linux 7.1,") && m.contains("Linux 7.2 or later") && m.contains("udmabuf"),
             "{m}"
         );
-        assert!(kernel_problem((5, 19)).is_some());
-        assert!(kernel_problem((6, 13)).is_none());
-        assert!(kernel_problem((6, 18)).is_none());
-        assert!(kernel_problem((7, 0)).is_none());
+        assert!(kernel_problem((6, 12)).is_some());
+        assert!(kernel_problem((6, 18)).is_some());
+        assert!(kernel_problem((7, 2)).is_none());
+        assert!(kernel_problem((7, 3)).is_none());
+        assert!(kernel_problem((8, 0)).is_none());
     }
 
     /// A stop waits for QEMU to end after `quit` about twice the longest it was measured to take

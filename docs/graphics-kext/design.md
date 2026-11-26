@@ -119,22 +119,26 @@ Stages:
      libraries' staging chunks lie in the device's region (BAR 2) instead.
      Where the device offers no pool, Shared buffers and heaps lie in the
      region or in the process's own pages ("The Shared pool").
-   - Under KVM that needs Linux 6.13 or later. Before 6.13, KVM maps a page
+   - A Linux host needs Linux 7.2 or later, under any accelerator: before
+     7.2 a udmabuf over large pages is malformed, and an AMD GPU's import of
+     the guest's RAM is bound to the wrong pages ([qemu.md](../qemu.md),
+     "Linux hosts: guest RAM's pages and the kernel's release"). reims-ctl
+     refuses a start on an older kernel (`MIN_LINUX` in
+     `crates/reims-ctl/src/runtime.rs`), and QEMU's device its realize. The
+     floor holds KVM's own for this memory too: before 6.13, KVM maps a page
      of a driver's mapping only where it can take a reference on the page,
-     and the drivers on TTM (amdgpu among them) allocate higher-order pages
-     whose tail pages have none, so the guest's first write to them stops
-     its vCPU ("kvm run failed Bad address"; read from Linux 6.12's
-     `hva_to_pfn_remapped` and `ttm_pool_alloc_page`). reims-ctl refuses a
-     start on an older kernel (`MIN_KVM_KERNEL` in
-     `crates/reims-ctl/src/runtime.rs`).
+     which the tail pages of the higher-order pages that the drivers on TTM
+     (amdgpu among them) allocate lack, so the guest's first write to them
+     stops its vCPU ("kvm run failed Bad address"; read from Linux 6.12's
+     `hva_to_pfn_remapped` and `ttm_pool_alloc_page`).
    - Real discrete Macs keep Shared in system memory, so this is Metal's
      discrete model.
    - IOSurfaces are the one place the host reaches guest RAM: where the
      device has `RGFX_FEATURE_SURFACE_PAGES`, the host maps a surface's own
      guest pages for its GPU in place (Decided 14, "Today"), from the guest
      RAM's map QEMU gives it.
-   - VRAM mapped into the guest was considered and dropped. It needed kernel
-     6.13 or later and resizable BAR, and was good for guest writes only:
+   - VRAM mapped into the guest was considered and dropped. It needed
+     resizable BAR, and was good for guest writes only:
      measured on amdgpu, CPU reads from VRAM run at 15 MiB/s with memcpy,
      against about 10 GiB/s for writes. It returns only if a measured frame
      shows the GPU's reads of Shared memory across PCIe costing.

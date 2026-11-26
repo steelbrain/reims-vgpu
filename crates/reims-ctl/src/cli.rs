@@ -1874,11 +1874,11 @@ fn doctor(host: Host) -> Result<i32> {
             ),
         ),
     }
-    // KVM and the library's needs, for the x86-64 VMs Linux runs; KVM alone for the arm64 VMs
-    // arm64 Linux runs.
+    // The kernel a VM on reims-vgpu's GPU needs, under any accelerator; then KVM and the
+    // library's needs, for the x86-64 VMs Linux runs; KVM alone for the arm64 VMs arm64 Linux
+    // runs.
     let vms = registered_vms();
     if host.os == crate::host::Os::Linux
-        && profile.accel(host) == "kvm"
         && let Some(v) = runtime::host_kernel()
     {
         let problem = runtime::kernel_problem(v);

@@ -50,18 +50,17 @@
 //!   pages by pointer did (3.1), against 5.3 over 4 KiB pages.
 //!
 //! So a dma-buf of huge pages helps the RX 7900 XTX as the pages themselves would, and the Radeon
-//! 780M only within a window of a few MiB. On Linux 7.2 and later QEMU puts guest RAM's memfd on
-//! huge pages (its advice and a collapse after the prealloc, `vendor/qemu/backends/hostmem.c`);
-//! below 7.2 its pages are base pages: QEMU advises the RAM's mapping `MADV_NOHUGEPAGE`
-//! (`vendor/qemu/system/physmem.c`, `ram_block_add`), and the library each mapping of a file that
-//! could hold a huge page (`super::vm`'s `off_huge_pages`). Linux 6.11 to 7.1 build a udmabuf's
-//! table with an entry a base page that names a large folio's head page and the page's offset in
-//! it, past `PAGE_SIZE` (`sg_set_folio`, `get_sg_table`; fixed in 7.2 by 5bf888673e0d, read from
-//! code), and an importer that walks the table by DMA page counts such an entry as its offset and
-//! length: amdgpu's import (`drm_prime_sg_to_dma_addr_array`, under dma-direct, as an AMD
-//! integrated GPU runs by default) binds an entry at a folio's page k to k + 1 pages, so the
-//! buffer's pages after the first lie on other pages, past the folio's end for k of 256 or more. A
-//! macOS guest's kernel memory was overwritten so on a Radeon 890M with Linux 6.18.59 (issue 185).
+//! 780M only within a window of a few MiB. QEMU puts guest RAM's memfd on huge pages (its advice
+//! and a collapse after the prealloc, `vendor/qemu/backends/hostmem.c`), and a udmabuf of them
+//! binds right on the Linux a VM on the device needs, 7.2 or later (reims-ctl's start check and
+//! the device's realize refuse an older one): 7.2 builds a udmabuf's table from its pages
+//! themselves (`sg_alloc_table_from_pages` in `get_sg_table`, upstream 5bf888673e0d, read from
+//! code). Linux 6.11 to 7.1 built it with an entry a base page that names a large folio's head
+//! page and the page's offset in it, past `PAGE_SIZE` (`sg_set_folio`), and amdgpu's import
+//! (`drm_prime_sg_to_dma_addr_array`, under dma-direct, as an AMD integrated GPU runs by default)
+//! binds an entry at a folio's page k to k + 1 pages, so the buffer's pages after the first lie
+//! on other pages: a macOS guest's kernel memory was overwritten so on a Radeon 890M with Linux
+//! 6.18.59 (issue 185).
 //!
 //! What udmabuf takes besides ([`Refusal`]): memfds sealed against shrinking (`F_SEAL_SHRINK`,
 //! which QEMU's `seal=on`, its default, sets, and [`super::vm::memfd`] sets on the library's own),
