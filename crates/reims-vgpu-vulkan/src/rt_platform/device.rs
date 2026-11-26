@@ -1257,7 +1257,8 @@ impl From<rt::Error> for Unopened {
 }
 
 /// Makes the process's rt device (the module's docs), on a host of pages of `page_size` bytes,
-/// and logs it, then the answers rt chose its forms on there ([`RtForms`]).
+/// and logs it, then the answers rt chose its forms on there ([`RtForms`]), then, at warn, the
+/// library's build and the device's Shared memory type ([`BuildLine`]).
 pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
     let instance = crate::os::rt_instance(&crate::os::rt_instance_extensions())?;
     let listed = instance.physical_devices()?;
@@ -1381,6 +1382,21 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
         "{}",
         RtForms::of(floor, &device, facts.unified_memory)
     );
+    let shared = device.memory_types().shared;
+    // SAFETY: the instance listed the device and is alive.
+    let types = unsafe { raw.get_physical_device_memory_properties(physical.raw()) };
+    let shared_flags =
+        (types.memory_types_as_slice().get(shared as usize)).map(|t| t.property_flags);
+    log::warn!(
+        target: TARGET,
+        "{}",
+        BuildLine {
+            commit: crate::recorder::COMMIT,
+            pin: metal2vulkan_pin(),
+            shared,
+            shared_flags,
+        }
+    );
     let caps = answers::caps(&facts);
     let gpu = format!(
         "{} ({:04x}:{:04x})",
@@ -1473,6 +1489,94 @@ impl std::fmt::Display for RtForms<'_> {
             self.unified_memory
         )
     }
+}
+
+/// The workspace's manifest, whose `metal2vulkan-runtime` dependency names the metal2vulkan
+/// commit the library is built on ([`metal2vulkan_pin`]).
+const MANIFEST: &str = include_str!("../../../../Cargo.toml");
+
+/// The metal2vulkan commit the library is built on: the `rev` the workspace's `Cargo.toml` names
+/// for `metal2vulkan-runtime`, or `unknown` where it names none.
+fn metal2vulkan_pin() -> &'static str {
+    pin_in(MANIFEST).unwrap_or("unknown")
+}
+
+/// The `rev` of `manifest`'s `metal2vulkan-runtime` dependency line, where it names one.
+fn pin_in(manifest: &str) -> Option<&str> {
+    let line = (manifest.lines()).find(|l| l.starts_with("metal2vulkan-runtime = "))?;
+    let (_, rev) = line.split_once("rev = \"")?;
+    rev.split_once('"').map(|(rev, _)| rev)
+}
+
+/// The line [`open`] logs at warn once its device is made, so that a user's log at the level
+/// reims-ctl writes by default, warn, says what ran: `reims-vgpu <commit> on metal2vulkan <pin>;
+/// rt's Shared memory: type <index>, <its property flags>` ([`memory_flags`]). The commit is
+/// `crate::recorder::COMMIT` (`unknown` but in `cargo xtask dist`'s builds), the pin
+/// [`metal2vulkan_pin`]'s, and the type rt's `Device::memory_types().shared`, with the flags
+/// Vulkan's memory properties give it (`unlisted` where they list no such type). The log writes a
+/// warn line once per kind (`crate::core::logging`), so a later device in the same process, one
+/// made after the release of the last graphics device let go of the first, writes it at debug. A
+/// diagnostic: the guest sees nothing of it.
+struct BuildLine {
+    /// The library's commit.
+    commit: &'static str,
+    /// The metal2vulkan commit it is built on.
+    pin: &'static str,
+    /// rt's Shared memory type, its index among the device's memory types.
+    shared: u32,
+    /// That type's property flags, where Vulkan lists it.
+    shared_flags: Option<vk::MemoryPropertyFlags>,
+}
+
+impl std::fmt::Display for BuildLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reims-vgpu {} on metal2vulkan {}; rt's Shared memory: type {}, ",
+            self.commit, self.pin, self.shared
+        )?;
+        match self.shared_flags {
+            Some(flags) => f.write_str(&memory_flags(flags)),
+            None => f.write_str("unlisted"),
+        }
+    }
+}
+
+/// The memory property flags Vulkan names, each in `flags` by its name (`HOST_VISIBLE`), in the
+/// order of their bits.
+const MEMORY_FLAGS: [(vk::MemoryPropertyFlags, &str); 9] = {
+    use vk::MemoryPropertyFlags as F;
+    [
+        (F::DEVICE_LOCAL, "DEVICE_LOCAL"),
+        (F::HOST_VISIBLE, "HOST_VISIBLE"),
+        (F::HOST_COHERENT, "HOST_COHERENT"),
+        (F::HOST_CACHED, "HOST_CACHED"),
+        (F::LAZILY_ALLOCATED, "LAZILY_ALLOCATED"),
+        (F::PROTECTED, "PROTECTED"),
+        (F::DEVICE_COHERENT_AMD, "DEVICE_COHERENT_AMD"),
+        (F::DEVICE_UNCACHED_AMD, "DEVICE_UNCACHED_AMD"),
+        (F::RDMA_CAPABLE_NV, "RDMA_CAPABLE_NV"),
+    ]
+};
+
+/// `flags` as [`BuildLine`] writes them: the name of each of [`MEMORY_FLAGS`] it holds, then the
+/// bits left, in hex, joined by ` | `; `none` for none. (ash's `Debug` of the flags is behind a
+/// feature this build leaves off.)
+fn memory_flags(flags: vk::MemoryPropertyFlags) -> String {
+    let (mut parts, mut rest) = (Vec::new(), flags);
+    for (bit, name) in MEMORY_FLAGS {
+        if flags.contains(bit) {
+            parts.push(name.to_owned());
+            rest &= !bit;
+        }
+    }
+    if !rest.is_empty() {
+        parts.push(format!("{:#x}", rest.as_raw()));
+    }
+    if parts.is_empty() {
+        return "none".to_owned();
+    }
+    parts.join(" | ")
 }
 
 /// The options a device on `physical`, one of `instance`'s, is opened with both in the VM's
@@ -2573,6 +2677,63 @@ mod tests {
              texel_offset_operand false, attachment_reads true, feedback_loop false; profile: \
              max_compute_shared_memory_size 65536, push_window 256, subgroups [32, 64]; \
              unified_memory false"
+        );
+    }
+
+    /// The build line names the library's commit, the metal2vulkan commit it is built on, and
+    /// rt's Shared memory type with its property flags by name, a bit without one in hex, or that
+    /// it has none, or that Vulkan lists no such type
+    #[test]
+    fn the_build_line_names_the_commits_and_the_shared_memory_type() {
+        use vk::MemoryPropertyFlags as F;
+        let mut line = BuildLine {
+            commit: "f83b1ed0ce9989db78dedf7951dd01d59e25fdd4-dirty",
+            pin: "34fcb1ef08223e5bc708547fef99fb5f02920b0e",
+            shared: 2,
+            shared_flags: Some(F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED),
+        };
+        assert_eq!(
+            line.to_string(),
+            "reims-vgpu f83b1ed0ce9989db78dedf7951dd01d59e25fdd4-dirty on metal2vulkan \
+             34fcb1ef08223e5bc708547fef99fb5f02920b0e; rt's Shared memory: type 2, \
+             HOST_VISIBLE | HOST_COHERENT | HOST_CACHED"
+        );
+        line.shared_flags = None;
+        assert!(
+            line.to_string()
+                .ends_with("rt's Shared memory: type 2, unlisted")
+        );
+        line.shared_flags = Some(F::DEVICE_LOCAL | F::from_raw(1 << 12));
+        assert!(
+            line.to_string()
+                .ends_with("rt's Shared memory: type 2, DEVICE_LOCAL | 0x1000")
+        );
+        line.shared_flags = Some(F::empty());
+        assert!(
+            line.to_string()
+                .ends_with("rt's Shared memory: type 2, none")
+        );
+    }
+
+    /// The metal2vulkan commit the build line names is the `rev` the workspace's manifest names
+    /// for metal2vulkan-runtime, the one it names for metal2vulkan's Metal types too; a manifest
+    /// that names none for metal2vulkan-runtime answers none
+    #[test]
+    fn the_pin_is_the_rev_the_manifest_names() {
+        let pin = metal2vulkan_pin();
+        assert!(
+            pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{pin}"
+        );
+        let types = (MANIFEST.lines()).find(|l| l.starts_with("metal2vulkan = "));
+        assert!(
+            types.is_some_and(|l| l.contains(&format!("rev = \"{pin}\""))),
+            "{types:?}"
+        );
+        assert_eq!(pin_in("[workspace.dependencies]\n"), None);
+        assert_eq!(
+            pin_in("metal2vulkan-runtime = { path = \"../metal2vulkan\" }"),
+            None
         );
     }
 

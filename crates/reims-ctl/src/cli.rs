@@ -204,7 +204,8 @@ fn report_help() -> String {
          line that says how it ended: its exit status, that it was stopped after {} s, or that \
          vulkaninfo isn't installed (on Linux and on a Mac, the vulkan-tools package has it); \
          vm.toml, the VM's settings; launch.sh, the QEMU command reims-ctl runs; state.txt, \
-         whether the VM runs; and logs/, the end of each of its logs.",
+         whether the VM runs; and logs/, the end of each of its logs, where qemu.log says which \
+         commits of reims-vgpu and metal2vulkan the VM's GPU ran on.",
         logs::VULKANINFO_LIMIT.as_secs()
     )
 }
