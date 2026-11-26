@@ -17,7 +17,8 @@
 # - Linux on arm64 (Ubuntu or Debian, Fedora, Arch): arm64 VMs on KVM.
 # reims-ctl makes an arm64 VM by restoring macOS from an IPSW, and boots it
 # with Ambrosia. This script:
-#   1. checks the build's dependencies, and offers to install those missing
+#   1. checks the build's dependencies, and on Linux vulkan-tools, whose
+#      vulkaninfo reims-ctl report runs, and offers to install those missing
 #      (apt, pacman or dnf, through sudo; on a Mac, Homebrew's, and Xcode's
 #      command line tools are needed), and rustup through rustup.rs, beside
 #      any other cargo, whose installer asks its own questions;
@@ -362,25 +363,26 @@ fi
 # its own window, which a VM on VMware SVGA shows its display in; pipewire,
 # pulse and ALSA for its audio backends; libusb for USB passthrough; the
 # SPICE server for -spice; gnutls for the arm64 VMs' AES; bzip2 unpacks its
-# firmware); and clang, which builds reims-ctl's driver module for Ambrosia,
-# the arm64 VMs' firmware. A new x86-64 VM's OVMF comes from reims-util, with
-# its OpenCore image.
+# firmware); clang, which builds reims-ctl's driver module for Ambrosia, the
+# arm64 VMs' firmware; and vulkan-tools, whose vulkaninfo reims-ctl report runs
+# for a bug report's zip (the same name on Debian and Ubuntu, Fedora and Arch).
+# A new x86-64 VM's OVMF comes from reims-util, with its OpenCore image.
 apt_pkgs=(build-essential git curl ca-certificates pkg-config python3 python3-venv ninja-build
   flex bison bzip2 cmake binutils clang libglib2.0-dev libpixman-1-dev libslirp-dev
   zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libusb-1.0-0-dev
-  libspice-server-dev libgnutls28-dev libvulkan1
+  libspice-server-dev libgnutls28-dev libvulkan1 vulkan-tools
   libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev
   libxtst-dev libxkbcommon-dev libwayland-dev libwayland-bin libdecor-0-dev
   libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libgtk-3-dev)
 pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake clang
-  glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb spice gnutls vulkan-icd-loader
+  glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb spice gnutls vulkan-icd-loader vulkan-tools
   libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
   wayland libdecor mesa libdrm dbus systemd-libs gtk3)
 # Fedora's names for the same, each checked as rpm -q --whatprovides finds it.
 dnf_pkgs=(gcc gcc-c++ make git curl ca-certificates pkgconf-pkg-config python3 ninja-build
   flex bison bzip2 cmake binutils clang glib2-devel pixman-devel libslirp-devel
   zlib-devel libfdt-devel pipewire-devel pulseaudio-libs-devel alsa-lib-devel libusb1-devel
-  spice-server-devel gnutls-devel vulkan-loader
+  spice-server-devel gnutls-devel vulkan-loader vulkan-tools
   libX11-devel libXext-devel libXrandr-devel libXcursor-devel libXi-devel libXfixes-devel
   libXScrnSaver-devel libXtst-devel libxkbcommon-devel wayland-devel libdecor-devel
   libglvnd-devel libdrm-devel mesa-libgbm-devel dbus-devel systemd-devel gtk3-devel)

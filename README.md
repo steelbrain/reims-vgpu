@@ -53,7 +53,8 @@ scripts/install-ctl.sh
 ```
 
 It installs what the build needs (apt on Ubuntu and Debian, dnf on Fedora, pacman on Arch and
-CachyOS, Homebrew on a Mac; Rust through rustup.rs), fetches `vendor/qemu`, builds the library on Vulkan (on a Mac,
+CachyOS, Homebrew on a Mac; Rust through rustup.rs), and on Linux `vulkan-tools` too, whose `vulkaninfo` goes into
+`reims-ctl report`'s zip. It fetches `vendor/qemu`, builds the library on Vulkan (on a Mac,
 on Mesa's KosmicKrisp, from Homebrew's `mesa`) and QEMU on it, installs QEMU into `~/.local/share/reims-ctl/qemu`, and
 `reims-ctl` into `~/.cargo/bin`. Where x86-64 VMs run, it installs
 [reims-util](https://github.com/steelbrain/reims-util) beside it; where arm64 VMs run, it installs
