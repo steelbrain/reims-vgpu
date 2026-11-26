@@ -493,7 +493,37 @@ pub(super) fn file(
     if mapped == libc::MAP_FAILED {
         return Err(refused("a view of guest pages", false));
     }
-    Ok(mapped.addr().to_u64())
+    let first = mapped.addr().to_u64();
+    off_huge_pages(first, length, backing.offset);
+    Ok(first)
+}
+
+/// The size a huge page of a file's pages is aligned to in a mapping on a host of 4 KiB pages,
+/// whose multiples the larger pages of other hosts are: 2 MiB.
+const HUGE_ALIGN: u64 = 2 << 20;
+
+/// Advises `length` bytes from `at`, a shared mapping just made of a file from byte `offset`,
+/// `MADV_NOHUGEPAGE` where its address and the offset agree modulo [`HUGE_ALIGN`]: only there
+/// can a fault through the mapping back the file's pages with a huge folio, or khugepaged
+/// collapse them into one through it (`thp_vma_suitable_order`, Linux 6.18 and 7.3, read from
+/// code), as `shmem_enabled` at `always` or `within_size` lets both with no advice. Mappings
+/// that follow on in one file agree alike, so they get the same advice, and the kernel still
+/// joins them into one ([`mappings_added`]).
+///
+/// The guest's RAM, the files views are made of, stays on base pages so ([`super::dma_buf`],
+/// "The pages' size"): Linux 6.11 to 7.1 build a udmabuf's table with an entry a base page that
+/// names a large folio's head page and the page's offset in it, and amdgpu's import of such a
+/// dma-buf binds the buffer's pages after the first to other pages (upstream 5bf888673e0d fixed
+/// it in 7.2): the guest's kernel memory was overwritten so on a Radeon 890M with Linux 6.18.59
+/// (issue 185). QEMU advises the RAM's own mapping so (`vendor/qemu/system/physmem.c`,
+/// `ram_block_add`), before its prealloc touches a page. A refusal changes nothing: a kernel
+/// without transparent huge pages refuses the advice and makes none.
+fn off_huge_pages(at: u64, length: u64, offset: u64) {
+    if !at.wrapping_sub(offset).is_multiple_of(HUGE_ALIGN) {
+        return;
+    }
+    // SAFETY: advice on a mapping just made, which changes none of its bytes.
+    unsafe { libc::madvise(ptr(at), length.to_usize(), libc::MADV_NOHUGEPAGE) };
 }
 
 /// A fresh range of `len` bytes, rounded up to whole pages, of zeros, that a view can be made of:
@@ -1970,6 +2000,68 @@ pub(crate) mod tests {
                 .contains(&at)
                 .then(|| fields.next().unwrap_or("").to_owned())
         })
+    }
+
+    /// The `VmFlags` of the mapping `at` lies in, as `/proc/self/smaps` lists them, one word a
+    /// flag (`nh` for `MADV_NOHUGEPAGE`); `None` where no mapping holds it.
+    fn vm_flags_at(at: u64) -> Option<Vec<String>> {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        for line in smaps.lines() {
+            let first = line.split_whitespace().next().unwrap_or("");
+            if let Some((low, high)) = first.split_once('-')
+                && let (Ok(low), Ok(high)) =
+                    (u64::from_str_radix(low, 16), u64::from_str_radix(high, 16))
+            {
+                inside = (low..high).contains(&at);
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return Some(flags.split_whitespace().map(str::to_owned).collect());
+            }
+        }
+        None
+    }
+
+    /// A shared mapping of a file whose address agrees with its offset modulo 2 MiB, where a fault
+    /// or khugepaged could put the file's pages on a huge folio, is advised `MADV_NOHUGEPAGE`
+    /// (`off_huge_pages`), so the guest's RAM stays on base pages through the library's views of
+    /// it; two such that follow on in the file are still one mapping to the kernel, as the views'
+    /// budget counts them (`mappings_added`); one that does not agree is left without the advice
+    #[test]
+    fn a_files_mapping_that_could_hold_a_huge_page_is_advised_off_them() {
+        if !std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+            eprintln!("skipped: this kernel has no transparent huge pages to advise off");
+            return;
+        }
+        let p = page();
+        let v = vm();
+        let rw = VmProt::READ | VmProt::WRITE;
+        let fd = memfd(2 * HUGE_ALIGN).unwrap();
+        let backing = |offset| Backing {
+            file: Arc::clone(&fd),
+            offset,
+        };
+        let reserved = v.allocate_anywhere(4 * HUGE_ALIGN).unwrap();
+        let aligned = reserved.addr().to_u64().next_multiple_of(HUGE_ALIGN);
+        let half = HUGE_ALIGN / 2;
+        assert_eq!(file(Some(aligned), half, &backing(0), rw), Ok(aligned));
+        assert_eq!(
+            file(Some(aligned + half), half, &backing(half), rw),
+            Ok(aligned + half)
+        );
+        let flags = vm_flags_at(aligned).expect("the mapping");
+        assert!(flags.iter().any(|f| f == "nh"), "{flags:?}");
+        assert_eq!(
+            vm_flags_at(aligned + HUGE_ALIGN - 1),
+            Some(flags),
+            "the second piece's"
+        );
+        assert_eq!(kernel_mappings(aligned, aligned + HUGE_ALIGN), 1);
+
+        let apart = aligned + HUGE_ALIGN + p;
+        assert_eq!(file(Some(apart), p, &backing(HUGE_ALIGN), rw), Ok(apart));
+        let flags = vm_flags_at(apart).expect("the mapping");
+        assert!(!flags.iter().any(|f| f == "nh"), "{flags:?}");
+        assert!(v.deallocate(reserved, 4 * HUGE_ALIGN).is_success());
     }
 
     /// A graphics device's region's memory is one shared mapping, read and write, of a memfd of

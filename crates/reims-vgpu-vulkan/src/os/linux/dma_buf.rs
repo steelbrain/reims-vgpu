@@ -50,11 +50,17 @@
 //!   pages by pointer did (3.1), against 5.3 over 4 KiB pages.
 //!
 //! So a dma-buf of huge pages helps the RX 7900 XTX as the pages themselves would, and the Radeon
-//! 780M only within a window of a few MiB. Whether guest RAM's memfd pages are huge is the
-//! host's: QEMU advises it on every RAM block (`MADV_HUGEPAGE`, `vendor/qemu/system/physmem.c`),
-//! which the kernel takes for shared memory only where
-//! `/sys/kernel/mm/transparent_hugepage/shmem_enabled` allows it (`advise` where these were
-//! measured), and the library sets nothing of the host's.
+//! 780M only within a window of a few MiB. Guest RAM's memfd pages are base pages on every host
+//! all the same: QEMU advises the RAM's mapping `MADV_NOHUGEPAGE` (`vendor/qemu/system/physmem.c`,
+//! `ram_block_add`), and the library each mapping of a file that could hold a huge page
+//! (`super::vm`'s `off_huge_pages`). Linux 6.11 to 7.1 build a udmabuf's table with an entry a
+//! base page that names a large folio's head page and the page's offset in it, past `PAGE_SIZE`
+//! (`sg_set_folio`, `get_sg_table`; fixed in 7.2 by 5bf888673e0d, read from code), and an
+//! importer that walks the table by DMA page counts such an entry as its offset and length:
+//! amdgpu's import (`drm_prime_sg_to_dma_addr_array`, under dma-direct, as an AMD integrated GPU
+//! runs by default) binds an entry at a folio's page k to k + 1 pages, so the buffer's pages after
+//! the first lie on other pages, past the folio's end for k of 256 or more. A macOS guest's kernel
+//! memory was overwritten so on a Radeon 890M with Linux 6.18.59 (issue 185).
 //!
 //! What udmabuf takes besides ([`Refusal`]): memfds sealed against shrinking (`F_SEAL_SHRINK`,
 //! which QEMU's `seal=on`, its default, sets, and [`super::vm::memfd`] sets on the library's own),
