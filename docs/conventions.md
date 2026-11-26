@@ -169,10 +169,13 @@ repeats the ones code cites.
     process that held such an escaped copy: no degradation,
     docs/graphics-kext/design.md, "A buffer's escaped identity"), its VA-API
     video's on the rt platform on Windows (`rt-video-gpu-copy-declined`, a
-    picture the CPU copied, the GPU's copy declined; `video-pictures-drawn`,
-    a picture drawn into a cache's planes over Direct3D 11 textures, and
-    `video-drawn-kib`, the KiB of their crops: one GPU pass a picture that
-    a Mac does not make; `video-drawn-spares-used` and
+    picture the CPU copied, the GPU's copy declined;
+    `video-pictures-undrawn`, a picture whose draw into a cache's planes
+    over Direct3D 11 textures failed, which the CPU's copy landed there
+    instead; `video-pictures-drawn`, a picture drawn into a cache's planes
+    over Direct3D 11 textures, and `video-drawn-kib`, the KiB of their
+    crops: one GPU pass a picture that a Mac does not make;
+    `video-drawn-spares-used` and
     `video-drawn-spares-missed`, such a cache's surfaces that used a spare
     made ahead and those made on the guest's ring-0 thread,
     `video-drawn-spares-waited`, those that waited for the spare being made

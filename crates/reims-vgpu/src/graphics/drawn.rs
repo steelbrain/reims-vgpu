@@ -31,7 +31,10 @@
 //!
 //! Each draw is counted by picture ([`DRAWN_CODE`]) and by the KiB of its planes' crop
 //! ([`DRAWN_KIB_CODE`]). A real Mac decodes straight into the surface the guest reads, so the
-//! draw is one GPU pass per picture that a Mac does not make.
+//! draw is one GPU pass per picture that a Mac does not make. Each picture not drawn, its draw
+//! failed, is counted too ([`UNDRAWN_CODE`]): a degradation, since the CPU's copy then lands it
+//! in the textures, read back and staged (`vaapi`'s third way), the first line of each kind of
+//! failure logged (`vaapi`'s `copied_because`).
 
 use std::sync::Arc;
 
@@ -47,6 +50,10 @@ pub(crate) const DRAWN_CODE: &str = "video-pictures-drawn";
 
 /// The code of the KiB of the planes' crops drawn (the module doc), counted per picture.
 pub(crate) const DRAWN_KIB_CODE: &str = "video-drawn-kib";
+
+/// The code of a picture not drawn into a cache's planes over Direct3D 11 textures, its draw
+/// failed, which the CPU's copy lands there instead (the module doc), counted per picture.
+pub(crate) const UNDRAWN_CODE: &str = "video-pictures-undrawn";
 
 /// The Direct3D 11 textures under a cache's planes, and the draws that write a picture into them.
 pub(crate) struct DrawnPlanes {
@@ -78,8 +85,8 @@ impl DrawnPlanes {
     /// Draws `frame`'s crop into the textures once its decode is done, telling `decoded` between
     /// the two (the module doc), over zeros where the crop is smaller than them, and counts it.
     /// `Err` says why it was not drawn, the textures
-    /// cleared to the zeros they owe first ([`Self::unwritten`]); `decoded` is told only of a
-    /// decode that is done.
+    /// cleared to the zeros they owe first ([`Self::unwritten`]), counted ([`UNDRAWN_CODE`]);
+    /// `decoded` is told only of a decode that is done.
     pub(crate) fn draw(&self, frame: &Frame, decoded: &mut dyn FnMut()) -> Result<(), String> {
         let drawn = frame
             .sync()
@@ -97,7 +104,7 @@ impl DrawnPlanes {
             });
         if let Err(why) = drawn {
             self.unwritten();
-            return Err(why);
+            return Err(undrawn(why));
         }
         reims_vgpu_vulkan::answer::count_kind(DRAWN_CODE);
         reims_vgpu_vulkan::answer::count_kind_by(DRAWN_KIB_CODE, crop_bytes(frame) >> 10);
@@ -134,6 +141,13 @@ impl DrawnPlanes {
     }
 }
 
+/// A picture not drawn, `why`, counted by its code ([`UNDRAWN_CODE`]): the CPU's copy lands it
+/// (the module doc). Answers `why`.
+fn undrawn(why: String) -> String {
+    reims_vgpu_vulkan::answer::count_kind(UNDRAWN_CODE);
+    why
+}
+
 /// The bytes of `frame`'s crop in its two planes: the luma's samples and the chroma's pairs.
 fn crop_bytes(frame: &Frame) -> u64 {
     let sample: u64 = if frame.bit_depth() > 8 { 2 } else { 1 };
@@ -166,5 +180,31 @@ impl<P: Platform> DrawnTarget<P> {
             identity: self.identity.clone(),
             texture: self.texture.clone_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each picture not drawn is counted by its code, one a picture, in the degradation counts,
+    /// and its draw's why is what the landing logs (the module doc).
+    #[test]
+    fn a_picture_not_drawn_is_counted_by_its_code() {
+        let counted = || {
+            (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+                .find(|&(code, _)| code == UNDRAWN_CODE)
+                .map_or(0, |(_, n)| n)
+        };
+        let before = counted();
+        for n in 1..=2 {
+            assert_eq!(undrawn(format!("draw {n} failed")), format!("draw {n} failed"));
+            assert_eq!(counted(), before + n);
+        }
+        let in_counts = reims_vgpu_vulkan::answer::degradation_counts();
+        assert!(
+            (in_counts.iter()).any(|(code, n)| code == UNDRAWN_CODE && *n >= 2),
+            "{in_counts:?}"
+        );
     }
 }
