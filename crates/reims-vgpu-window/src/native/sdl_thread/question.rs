@@ -1,9 +1,11 @@
 //! The question a close asks on Linux, drawn by the library in the VM's own window
 //! (`crate::close`): it needs nothing installed on the host and shows the same on every desktop,
-//! Wayland's and X11's. [`Question`] lays it out for the window's drawable and pixel density
-//! ([`shape`]), draws it into an image ([`draw`]) that the window's render thread draws over the
-//! frame ([`DrawnOverlay`], `super::render`), and takes the window's keys and clicks while it is
-//! open (`super::sdl`).
+//! Wayland's and X11's. [`Question`] lays it out for the window's drawable at the pixels a point
+//! of the screen the window is on ([`shape`], `crate::geometry::Layout::screen_scale`: on Wayland
+//! the window's pixels a point, on X11 the desktop's content scale, the drawable a pixel a unit of
+//! SDL's sizes there at any scale), draws it into an image ([`draw`]) that the window's render
+//! thread draws over the frame ([`DrawnOverlay`], `super::render`), and takes the window's keys
+//! and clicks while it is open (`super::sdl`).
 //!
 //! **What it shows**: macOS's words and buttons ([`close::QUESTION`], [`close::DETAIL`],
 //! [`close::TURN_OFF`], [`close::CANCEL`]), in ASCII: the title over the detail, wrapped at a
@@ -15,8 +17,8 @@
 //! **The font** ([`FONT`]) is the 8 by 8 one SDL draws its debug text with, its glyphs `!` to `~`
 //! copied from SDL 3.4.18's `src/render/SDL_render_debug_font.h`: Marcel Sondaar's `font8_8`, of
 //! IBM's VGA font, which that file marks public domain. Each of its pixels is a square of a whole
-//! number of the drawable's pixels ([`scale_for`]): about 1.5 a point of the window's, so a line is
-//! about 12 points high at every scale, fractional ones included; less where the question would
+//! number of the drawable's pixels ([`scale_for`]): about 1.5 a point of the screen's, so a line
+//! is about 12 points high at every scale, fractional ones included; less where the question would
 //! not fit the drawable otherwise.
 //!
 //! **Its keys** ([`Question::key`]), by their USB usages: Return, the keypad's Enter and Escape
@@ -27,6 +29,7 @@
 use std::sync::Arc;
 
 use crate::close::{self, Answer};
+use crate::geometry::Layout;
 use crate::handle::{DrawnOverlay, Glyph};
 
 /// The font's glyphs for `!` (0x21) to `~` (0x7e), 8 rows each from the top, a row's lowest bit
@@ -464,10 +467,10 @@ pub(super) struct Question {
 }
 
 impl Question {
-    /// The question for windows `ids`, laid out for a drawable of `drawable` pixels at `density`
-    /// pixels a point, the focus on Cancel.
-    pub(super) fn new(ids: Vec<u64>, drawable: (u64, u64), density: f64) -> Question {
-        let shape = shape(drawable, density);
+    /// The question for windows `ids`, laid out for the window's `layout`: its drawable, at the
+    /// pixels a point of the screen the window is on (the module doc), the focus on Cancel.
+    pub(super) fn new(ids: Vec<u64>, layout: &Layout) -> Question {
+        let shape = shape(layout.drawable, layout.screen_scale);
         let image = Arc::new(draw(&shape, Button::Cancel));
         Question {
             ids,
@@ -486,10 +489,10 @@ impl Question {
         }
     }
 
-    /// The window was laid out again, its drawable now `drawable` pixels at `density` pixels a
-    /// point: whether the question changed, and is drawn again.
-    pub(super) fn relayout(&mut self, drawable: (u64, u64), density: f64) -> bool {
-        let shape = shape(drawable, density);
+    /// The window was laid out again, to `layout` ([`Question::new`]): whether the question
+    /// changed, and is drawn again.
+    pub(super) fn relayout(&mut self, layout: &Layout) -> bool {
+        let shape = shape(layout.drawable, layout.screen_scale);
         if shape == self.shape {
             return false;
         }
@@ -545,10 +548,21 @@ impl Question {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::{self, Insets};
+
+    /// A Wayland window's layout: a drawable of `drawable` pixels at `density` pixels a point.
+    fn wayland(drawable: (u64, u64), density: f64) -> Layout {
+        Layout {
+            drawable,
+            scale: density,
+            screen_scale: density,
+            ..Layout::default()
+        }
+    }
 
     /// A question for window 1 in a 1920 x 1080 drawable at 1 pixel a point.
     fn question() -> Question {
-        Question::new(vec![1], (1920, 1080), 1.0)
+        Question::new(vec![1], &wayland((1920, 1080), 1.0))
     }
 
     /// The centre of `button` in the drawable's pixels.
@@ -637,7 +651,7 @@ mod tests {
     /// filled with the accent and the focus's ring around it
     #[test]
     fn the_question_is_drawn_in_squares_of_the_scale() {
-        let q = Question::new(vec![1], (3840, 2160), 2.0);
+        let q = Question::new(vec![1], &wayland((3840, 2160), 2.0));
         let image = &q.image;
         let s = q.shape.scale;
         assert_eq!((image.width, image.height), q.shape.pixels());
@@ -724,12 +738,35 @@ mod tests {
     fn a_new_layout_places_and_draws_the_question_again() {
         let mut q = question();
         let image = Arc::clone(&q.image);
-        assert!(!q.relayout((1920, 1080), 1.0));
+        assert!(!q.relayout(&wayland((1920, 1080), 1.0)));
         assert!(Arc::ptr_eq(&image, &q.image));
-        assert!(q.relayout((1280, 720), 1.0));
+        assert!(q.relayout(&wayland((1280, 720), 1.0)));
         assert_eq!(q.overlay().at, q.shape.at);
-        assert!(q.relayout((2560, 1440), 2.0));
+        assert!(q.relayout(&wayland((2560, 1440), 2.0)));
         assert_eq!(q.shape.scale, 3);
         assert!(!Arc::ptr_eq(&image, &q.overlay().image));
+    }
+
+    /// The question is laid out at the pixels a point of the screen the window is on: on X11 at a
+    /// content scale of 2, whose drawable is a pixel a unit of SDL's sizes, as on Wayland at 2 over
+    /// the same pixels, a line 24 pixels high (12 points), not 16; at 1.5, 16 pixels; and a change
+    /// of the screen's scale lays it out again
+    #[test]
+    fn the_question_is_laid_out_at_the_screen_s_scale() {
+        let x11 = |scale: f64| {
+            geometry::layout((2560.0, 1440.0), 1.0, Insets::default(), None)
+                .on_screen_of(scale)
+        };
+        let at_2 = Question::new(vec![1], &x11(2.0));
+        assert_eq!(at_2.shape, shape((2560, 1440), 2.0));
+        assert_eq!(CELL * at_2.shape.scale, 24);
+        let on_wayland = geometry::layout((1280.0, 720.0), 2.0, Insets::default(), None);
+        assert_eq!(on_wayland.drawable, (2560, 1440));
+        assert_eq!(Question::new(vec![1], &on_wayland).shape, at_2.shape);
+        assert_eq!(CELL * Question::new(vec![1], &x11(1.5)).shape.scale, 16);
+        let mut q = Question::new(vec![1], &x11(1.0));
+        assert_eq!(q.shape.scale, 2);
+        assert!(q.relayout(&x11(2.0)));
+        assert_eq!(q.shape, at_2.shape);
     }
 }

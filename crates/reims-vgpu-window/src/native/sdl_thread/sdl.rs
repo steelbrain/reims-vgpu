@@ -17,7 +17,8 @@
 //! **The scale the guest is told** is the screen's ([`screen_scale`]): on Wayland the window's
 //! pixels a point, and on X11 and Windows, where its drawable is a pixel a unit of SDL's sizes at
 //! any scale, the content scale of the screen SDL has it on. The drawable, the image and the
-//! pointer stay in SDL's sizes.
+//! pointer stay in SDL's sizes; the question a close asks in the window is laid out at the told
+//! scale (`super::question`).
 //!
 //! **Borderless**: through the compositor's own full screen on its screen, over its panels.
 //!
@@ -512,7 +513,7 @@ fn ask_in_the_window(shell: &mut Shell, ids: Vec<u64>) -> Result<(), Vec<u64>> {
     if layout.drawable.0 == 0 || layout.drawable.1 == 0 {
         return Err(ids);
     }
-    let question = super::question::Question::new(ids, layout.drawable, layout.scale);
+    let question = super::question::Question::new(ids, &layout);
     shell.window.surface().set_overlay(Some(question.overlay()));
     shell.os.question = Some(question);
     // SAFETY: the window is SDL's, on this thread.
@@ -621,7 +622,7 @@ pub(crate) fn asks(_shell: &Shell) -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) fn laid_out(shell: &mut Shell) {
     if let Some(question) = shell.os.question.as_mut()
-        && question.relayout(shell.layout.drawable, shell.layout.scale)
+        && question.relayout(&shell.layout)
     {
         shell.window.surface().set_overlay(Some(question.overlay()));
     }

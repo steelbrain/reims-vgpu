@@ -680,7 +680,8 @@ runtime's own device. The switches above apply, and `resolution=` too.
   every desktop: a dark panel centred over the frame, Cancel left of Turn
   Off, in an 8 by 8 pixel font each of whose pixels is a whole square of
   the screen's, a line about 12 points high at every scale, fractional
-  ones and 4K included; Tab and the arrows move the focus, Space answers
+  ones and 4K included, and on X11 at the desktop's content scale (24
+  pixels at 200%); Tab and the arrows move the focus, Space answers
   the focused button, a click answers the button it went down and up on,
   the host's arrow shows over the window, and a minimized window is
   restored and raised. Where the window draws no more (its GPU lost, or no
@@ -708,6 +709,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: native::sdl_thread::input::a_key_down_after_the_close_s_lift_never_reaches_the_guest`,
   `test: native::sdl_thread::question::the_question_s_words_are_macos_s_in_the_font`,
   `test: native::sdl_thread::question::the_font_scales_with_the_density`,
+  `test: native::sdl_thread::question::the_question_is_laid_out_at_the_screen_s_scale`,
   `test: native::sdl_thread::question::return_and_escape_cancel_and_space_answers_the_focus`,
   `test: native::sdl_thread::question::a_click_answers_the_button_it_went_down_and_up_on`,
   `test: native::sdl_thread::render::an_overlay_is_drawn_and_told_unshown_once`,
