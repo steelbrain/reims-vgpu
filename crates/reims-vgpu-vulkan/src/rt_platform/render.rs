@@ -2341,16 +2341,62 @@ mod tests {
         ]
     }
 
+    /// Whether the device stores a kernel's write at a slot of the test's 8-bit sRGB texture of
+    /// pixel format `format` through its UNORM twin, by its own Vulkan answers (`None` for a
+    /// format of no twin): where the twin's optimal tiling holds the storage image and its writes
+    /// without a format, the texture "takes the storage usage for those views
+    /// (`VK_IMAGE_CREATE_EXTENDED_USAGE_BIT`), where the device's image format query makes that
+    /// image with every usage, flag and sample count it makes the plain one with" (rt's README,
+    /// Textures). Its plain usage: the transfers, sampling, and the colour attachment rt gives a
+    /// one-sample colour texture for resolves.
+    fn twin_stores(device: &RtObj<RtDevice>, format: u64) -> Option<bool> {
+        use ash::vk::{self, FormatFeatureFlags2 as F, ImageCreateFlags as C, ImageUsageFlags as U};
+        let (srgb, unorm) = match format {
+            71 => (vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM),
+            81 => (vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM),
+            _ => return None,
+        };
+        let raw = device.rt().raw();
+        let (instance, physical) = (raw.instance, raw.physical_device);
+        let mut features = vk::FormatProperties3::default();
+        let mut asked = vk::FormatProperties2::default().push_next(&mut features);
+        // SAFETY: the instance and physical device are rt's, read only, while `device` lives;
+        // rt's instance is at Vulkan 1.3, where both structures are core.
+        unsafe { instance.get_physical_device_format_properties2(physical, unorm, &mut asked) };
+        let stored = (features.optimal_tiling_features)
+            .contains(F::STORAGE_IMAGE | F::STORAGE_WRITE_WITHOUT_FORMAT);
+        let formats = [srgb, unorm];
+        let mut list = vk::ImageFormatListCreateInfo::default().view_formats(&formats);
+        let usage =
+            U::TRANSFER_SRC | U::TRANSFER_DST | U::SAMPLED | U::COLOR_ATTACHMENT | U::STORAGE;
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(srgb)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .flags(C::MUTABLE_FORMAT | C::EXTENDED_USAGE)
+            .push_next(&mut list);
+        let mut properties = vk::ImageFormatProperties2::default();
+        // SAFETY: as above.
+        let made = unsafe {
+            instance.get_physical_device_image_format_properties2(physical, &info, &mut properties)
+        };
+        Some(stored && made.is_ok())
+    }
+
     /// A render encoder's `useResources:` reaches rt: once it declares a write of a texture with
     /// no storage element, a draw whose fragment function writes a texture beyond its slots
     /// (through an argument buffer) is rt's refusal, which draws nothing and is counted under
     /// `rt-refused-gap`, as the compute encoder's dispatch of a kernel that writes the same
     /// texture at a slot is, wherever that dispatch is, and also for an 8-bit sRGB texture,
-    /// which a kernel's write at a slot stores through its UNORM twin on every device while a
-    /// write beyond the slots has no storage element for it. The same draw before the
-    /// declaration, after a declaration for reading alone, and after a declared write of a
-    /// texture with a storage element draws, and so does a draw of a function that reaches no
-    /// texture beyond its slots after the declared write.
+    /// whose write beyond the slots has no storage element on any device. A kernel's write of
+    /// that texture at a slot is stored through its UNORM twin exactly where the device's own
+    /// answers say so ([`twin_stores`]), and is rt's refusal, counted, elsewhere: a driver that
+    /// makes no such extended image for an 8-bit sRGB texture made for shader writes leaves it
+    /// no storage element (rt's known gaps of textures; Intel's Windows driver on the UHD 630
+    /// answers no). The same draw before the declaration, after a declaration for reading
+    /// alone, and after a declared write of a texture with a storage element draws, and so does
+    /// a draw of a function that reaches no texture beyond its slots after the declared write.
     #[test]
     fn a_draw_after_a_declared_write_of_a_texture_with_no_storage_element_is_refused_on_vulkan() {
         // `MTLResourceUsageRead`, `MTLResourceUsageWrite` and `MTLRenderStageFragment`.
@@ -2463,12 +2509,14 @@ mod tests {
             });
             let unstored = stores_none(&candidate);
             // `RGBA8Unorm_sRGB` and `BGRA8Unorm_sRGB`: stored at a slot through the UNORM twin
-            // on every device, and no storage element beyond the slots.
-            let srgb8 = matches!(format, 71 | 81);
-            assert!(
-                !(srgb8 && unstored),
-                "{format}: a slot's write of it is stored"
-            );
+            // exactly where the device's answers say so, and no storage element beyond the
+            // slots.
+            let twin = twin_stores(&device, format);
+            let srgb8 = twin.is_some();
+            if let Some(stored) = twin {
+                eprintln!("{format}: the device stores a slot's write through its twin: {stored}");
+                assert_eq!(!unstored, stored, "{format}: whether a slot's write is stored");
+            }
             let declared_refused = unstored || srgb8;
             let declared = [Some(ResourceRef::Texture(&candidate))];
 
