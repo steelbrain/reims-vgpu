@@ -1222,7 +1222,9 @@ impl CommandBuffer<RtPlatform> for RtObj<RtCommandBuffer> {
                     Ok(encoder) => {
                         let (mark, kept) = (self.opened(), self.kept.clone());
                         let operands = self.names_operands();
-                        Some(RtObj::new(RtBlitEncoder::new(encoder, mark, kept, operands)))
+                        Some(RtObj::new(RtBlitEncoder::new(
+                            encoder, mark, kept, operands,
+                        )))
                     }
                     Err(error) => {
                         rt_refused_create("blitCommandEncoder", &error);
