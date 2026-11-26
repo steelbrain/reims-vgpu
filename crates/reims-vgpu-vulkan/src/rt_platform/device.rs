@@ -1361,16 +1361,20 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
             text(driver.driver_info_as_c_str())
         )
     };
+    // The alignment of rt's buffers on the device, as Vulkan's memory requirements answered it
+    // (rt's `Device::buffer_alignment`), so a user's log shows it.
     log::info!(
         target: TARGET,
         "the rt platform's device: {} ({:04x}:{:04x}), driver {driver}, registry ID {:#x}; \
-         instance extensions {:?}; device extensions {:?}; present fences: {present_fences}",
+         instance extensions {:?}; device extensions {:?}; present fences: {present_fences}; \
+         buffer alignment {}",
         facts.name,
         facts.vendor_id,
         facts.device_id,
         facts.registry_id,
         instance.extensions(),
-        device.extensions()
+        device.extensions(),
+        device.buffer_alignment()
     );
     log::info!(
         target: TARGET,
