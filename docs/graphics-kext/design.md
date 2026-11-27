@@ -4392,18 +4392,26 @@ tablet. So the guest gets a mouse of its own, whose motion has no edge:
   buttons owed after it, so a press or a release is never merged into a move;
   past 64 owed, the last takes the new buttons. A reset forgets the hidden
   cursor and the owed motion.
-- **The window.** Captured, once the guest's cursor has stayed hidden for 50
-  ms (`reims_vgpu_window::game::SETTLE_NS`: past WindowServer's dozen hides
-  and shows as it starts, and the hide and show of the cursor crossing
-  displays, which the device counts from a second after its `POINTER_OVER`), the window's next move locks the host's pointer where it is and
+- **The window.** Captured, a hide's first move goes to the tablet, as while
+  the guest shows its cursor. Once the guest's cursor has stayed hidden for
+  50 ms past that move (`reims_vgpu_window::game::SETTLE_NS`), the window's
+  next move locks the host's pointer where it is and
   hands its motion to the guest's mouse in the device's own counts,
   unaccelerated, so the guest accelerates it once, as its mouse settings say:
   SDL's relative mode with `SDL_MOUSE_RELATIVE_SYSTEM_SCALE` 0 on Linux, and
   on macOS `CGAssociateMouseAndMouseCursorPosition(false)` with the events'
-  `kCGEventUnacceleratedPointerMovementX` and `Y`. Buttons pressed meanwhile
+  `kCGEventUnacceleratedPointerMovementX` and `Y`. A hide that outlives a move
+  is a game's: macOS hides the cursor while text is typed until the mouse
+  moves, and shows it at that move (about 1 ms after the move that reached
+  the guest: lane ptrswitch, potluck job m3-max-75911, x86-64 26.7.2), so
+  typing never drives the guest's mouse and no move after it is lost; a show,
+  or a hide that reads shorter than at its first move, starts the count over,
+  and so does a change of capture. The settle is also past WindowServer's
+  dozen hides and shows as it starts, and the hide and show of the cursor
+  crossing displays, which the device counts from a second after its
+  `POINTER_OVER`. Buttons pressed meanwhile
   and a mouse wheel's notches go to the guest's mouse too. At the guest's next
-  show of its cursor (the game's menu, or a move after typing hid it, where
-  the guest shows the cursor where its mouse moved it), the pointer is the
+  show of its cursor (the game's menu), the pointer is the
   tablet's again, the host's pointer let go over the guest's cursor where it
   shows on the window's display, else where it was held; releasing capture,
   losing the keyboard and closing let it go where it was held. A button comes

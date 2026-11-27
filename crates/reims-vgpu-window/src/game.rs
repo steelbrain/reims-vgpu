@@ -7,15 +7,18 @@
 //! hides the cursor and turns its camera by the mouse's motion (a disassociated cursor's deltas,
 //! GCMouse) then gets no motion past the edge: the tablet stays where it is. Where the guest has
 //! its own mouse ([`PointerMotion`], the reims-graphics device's `POINTER_MOTION`), the window,
-//! captured, with the guest's cursor hidden on every display for [`SETTLE_NS`], holds the host's
-//! pointer still where it is ([`Hold::Raw`]: the OS's pointer lock, which hides it and reports
-//! its moves as the device's own counts) and hands each move to the guest's mouse
+//! captured, once the guest has hidden its cursor on every display and kept it hidden for
+//! [`SETTLE_NS`] past the hide's first move, which the tablet takes ([`Game::begin`]), holds the
+//! host's pointer still where it is ([`Hold::Raw`]: the OS's pointer lock, which hides it and
+//! reports its moves as the device's own counts) and hands each move to the guest's mouse
 //! ([`Game::moved`]), which the guest accelerates once, as its own settings say: the camera turns
-//! as far as the mouse moves. Once the guest shows its cursor again ([`Game::shown`]), the pointer
-//! is the window's again, the host's pointer let go over the guest's cursor where it shows on the
-//! window's display, else where it was held; letting go of capture (the release chord, the
-//! keyboard lost, the window's end) lets it go where it was held ([`Game::end`]). On the desktop,
-//! where the guest shows its cursor, the pointer stays the absolute one, exact.
+//! as far as the mouse moves. A cursor hidden until the mouse moves, as macOS hides it while text
+//! is typed, shows at that first move, so the pointer stays the window's and no move of it is
+//! lost. Once the guest shows its cursor again ([`Game::shown`]), the pointer is the window's
+//! again, the host's pointer let go over the guest's cursor where it shows on the window's
+//! display, else where it was held; letting go of capture (the release chord, the keyboard lost,
+//! the window's end) lets it go where it was held ([`Game::end`]). On the desktop, where the guest
+//! shows its cursor, the pointer stays the absolute one, exact.
 //!
 //! A button goes up by the route it went down by: one pressed while the guest's mouse is driven
 //! goes down and up through it, one pressed before through the tablet, whenever each comes up
@@ -25,10 +28,16 @@
 use crate::beyond::Hold;
 use crate::config::PointerMotion;
 
-/// How long the guest's cursor stays hidden on every display it sees before the captured
-/// pointer drives the guest's mouse: past a hide and a show in a row. WindowServer hides and
-/// shows the cursor a dozen times as it starts (lane gamemouse, potluck job m3-max-35167), and the
-/// cursor going from one display to the next is hidden on the one before it shows on the other.
+/// How long the guest's cursor stays hidden on every display it sees, past the hide's first
+/// captured move, which the tablet takes, before the captured pointer drives the guest's mouse
+/// ([`Game::begin`]). A hide that outlives a move is a game's: macOS hides the cursor while text
+/// is typed until the mouse moves and shows it at the move, about 1 ms after the move that
+/// reached the guest (lane ptrswitch, potluck job m3-max-75911, an x86-64 26.7.2 guest on an RX
+/// 7900 XTX), where a game keeps it hidden. A count from the hide alone takes the first move
+/// after typing for a game's: that move is lost to the tablet, and the next goes to the guest's
+/// mouse. The settle is past a hide and a show in a row too: WindowServer hides and shows the
+/// cursor a dozen times as it starts (lane gamemouse, potluck job m3-max-35167), and the cursor
+/// going from one display to the next is hidden on the one before it shows on the other.
 pub const SETTLE_NS: u64 = 50_000_000;
 
 /// The captured pointer driving the guest's mouse, or not (the module doc).
@@ -43,6 +52,10 @@ pub struct Game {
     rest: (f64, f64),
     /// The OS refused to lock the host's pointer: no new start until capture changes.
     refused: bool,
+    /// How long the guest had hidden its cursor at the hide's first captured move, which the
+    /// tablet took ([`Self::begin`]): `None` while the guest shows its cursor, before that move,
+    /// and while the pointer drives the guest's mouse.
+    first_move: Option<u64>,
 }
 
 impl Game {
@@ -63,19 +76,42 @@ impl Game {
     }
 
     /// Whether the captured pointer at `point`, in the window's points, begins to drive the
-    /// guest's mouse `motion`: the guest has hidden its cursor on every display for
-    /// [`SETTLE_NS`], and the OS did not refuse the lock since capture last changed. Where it
-    /// does, the host's pointer is held there ([`Hold::Raw`]).
+    /// guest's mouse `motion`: the guest has hidden its cursor on every display and kept it
+    /// hidden for [`SETTLE_NS`] past the hide's first move, and the OS did not refuse the lock
+    /// since capture last changed. Where it does, the host's pointer is held there
+    /// ([`Hold::Raw`]). Where it does not, the move is the window's, as while the guest shows its
+    /// cursor: the hide's first move goes to the tablet, and a cursor hidden until the mouse
+    /// moves shows at it.
     pub fn begin(&mut self, motion: &dyn PointerMotion, point: (f64, f64)) -> Option<Hold> {
         if self.held.is_some() || self.refused {
             return None;
         }
-        if !motion.hidden_for().is_some_and(|ns| ns >= SETTLE_NS) {
+        let hidden = self.hidden_for(motion)?;
+        let Some(first) = self.first_move else {
+            self.first_move = Some(hidden);
+            return None;
+        };
+        if hidden.saturating_sub(first) < SETTLE_NS {
             return None;
         }
         self.held = Some(point);
         self.rest = (0.0, 0.0);
+        self.first_move = None;
         Some(Hold::Raw)
+    }
+
+    /// How long the guest has hidden its cursor on every display, `None` while it shows it on
+    /// one. The hide's first move is forgotten where the guest shows its cursor, or where the
+    /// hide reads shorter than it did at that move: a later hide, the cursor shown between.
+    fn hidden_for(&mut self, motion: &dyn PointerMotion) -> Option<u64> {
+        let hidden = motion.hidden_for();
+        if self
+            .first_move
+            .is_some_and(|first| hidden.is_none_or(|now| now < first))
+        {
+            self.first_move = None;
+        }
+        hidden
     }
 
     /// The host's pointer moved by `by`, its device's counts: the guest's mouse moves by the whole
@@ -105,14 +141,16 @@ impl Game {
     /// Whether the guest shows its cursor again: the pointer is then the window's again, the
     /// host's pointer let go at `cursor`, the window's point over the guest's cursor where it
     /// shows on the window's display, else where it was held. `None` while the guest hides it,
-    /// or where the pointer did not drive the mouse.
+    /// or where the pointer did not drive the mouse. The window asks at each show and hide of
+    /// the guest's, so a show forgets the hide's first move, and a later hide counts from its own.
     pub fn shown(
         &mut self,
         motion: &dyn PointerMotion,
         cursor: Option<(f64, f64)>,
     ) -> Option<Hold> {
+        let hidden = self.hidden_for(motion);
         let held = self.held?;
-        if motion.hidden_for().is_some() {
+        if hidden.is_some() {
             return None;
         }
         self.held = None;
@@ -170,10 +208,12 @@ impl Game {
     }
 
     /// Capture changed (released, the keyboard lost, the window's end): the pointer is the
-    /// window's again, the host's pointer let go where it was held, and a refused lock may be
-    /// tried again at the next capture. `None` where it did not drive the mouse.
+    /// window's again, the host's pointer let go where it was held, a refused lock may be tried
+    /// again at the next capture, and a hide counts from the next capture's first move. `None`
+    /// where it did not drive the mouse.
     pub fn end(&mut self) -> Option<Hold> {
         self.refused = false;
+        self.first_move = None;
         let held = self.held.take()?;
         Some(Hold::Unlock(held))
     }
@@ -225,29 +265,97 @@ pub(crate) mod tests {
         }
     }
 
-    /// The captured pointer drives the guest's mouse only once the guest has hidden its cursor
-    /// for the settle: not while it shows it, not over a hide and a show in a row
+    /// `game` at `point` begins to drive `mouse`: the guest hides its cursor, the hide's first
+    /// move is the window's, and the hide outlives it by the settle.
+    pub(crate) fn begun(game: &mut Game, mouse: &Mouse, point: (f64, f64)) -> Option<Hold> {
+        mouse.hide_for(0);
+        assert_eq!(game.begin(mouse, point), None, "the hide's first move");
+        mouse.hide_for(SETTLE_NS);
+        game.begin(mouse, point)
+    }
+
+    /// The captured pointer drives the guest's mouse only once the guest's hide of its cursor
+    /// has outlived the hide's first move by the settle: not while it shows it, not at the hide's
+    /// first move however long the guest has hidden it, not within the settle past that move, and
+    /// not across a show
     #[test]
     fn the_guest_s_mouse_is_driven_once_its_cursor_stays_hidden() {
         let mouse = Mouse::default();
         let mut game = Game::new();
-        assert_eq!(game.begin(&mouse, (5.0, 5.0)), None, "shown");
-        mouse.hide_for(SETTLE_NS - 1);
+        let at = (5.0, 5.0);
+        assert_eq!(game.begin(&mouse, at), None, "shown");
+        mouse.hide_for(20 * SETTLE_NS);
         assert_eq!(
-            game.begin(&mouse, (5.0, 5.0)),
+            game.begin(&mouse, at),
             None,
-            "hidden for less than the settle"
+            "the hide's first move, however long the hide"
+        );
+        mouse.hide_for(21 * SETTLE_NS - 1);
+        assert_eq!(
+            game.begin(&mouse, at),
+            None,
+            "less than the settle past that move"
         );
         mouse.show();
         assert_eq!(
-            game.begin(&mouse, (5.0, 5.0)),
+            game.begin(&mouse, at),
             None,
             "shown again: the count starts over"
         );
-        mouse.hide_for(SETTLE_NS);
-        assert_eq!(game.begin(&mouse, (5.0, 5.0)), Some(Hold::Raw));
+        mouse.hide_for(30 * SETTLE_NS);
+        assert_eq!(game.begin(&mouse, at), None, "the next hide's first move");
+        mouse.hide_for(31 * SETTLE_NS);
+        assert_eq!(game.begin(&mouse, at), Some(Hold::Raw));
         assert!(game.is_on());
         assert_eq!(game.begin(&mouse, (6.0, 6.0)), None, "begun once");
+    }
+
+    /// A cursor hidden until the mouse moves, as macOS hides it while text is typed, shows at the
+    /// hide's first move, which the window lets through: the guest's mouse is never driven,
+    /// however long each hide, and each later hide counts from its own first move, whether the
+    /// window saw the show at a move or at the guest's show itself ([`Game::shown`])
+    #[test]
+    fn a_hide_a_move_ends_drives_nothing() {
+        let mouse = Mouse::default();
+        let mut game = Game::new();
+        let at = (5.0, 5.0);
+        mouse.hide_for(2_000_000_000);
+        assert_eq!(
+            game.begin(&mouse, at),
+            None,
+            "the first move after typing is the window's"
+        );
+        mouse.show();
+        assert_eq!(game.shown(&mouse, None), None, "nothing to let go");
+        mouse.hide_for(5_000_000_000);
+        assert_eq!(
+            game.begin(&mouse, at),
+            None,
+            "typed again: that hide's first move"
+        );
+        mouse.show();
+        assert_eq!(game.begin(&mouse, at), None, "shown at that move");
+        mouse.hide_for(9_000_000_000);
+        assert_eq!(game.begin(&mouse, at), None, "typed again");
+        assert!(!game.is_on());
+        assert_eq!(mouse.take(), vec![]);
+    }
+
+    /// A hide that reads shorter than it did at the hide's first move is a later hide, the
+    /// cursor shown between where the window did not see it: the count starts over at that move
+    #[test]
+    fn a_new_hide_starts_the_count_over() {
+        let mouse = Mouse::default();
+        let mut game = Game::new();
+        let at = (5.0, 5.0);
+        mouse.hide_for(20 * SETTLE_NS);
+        assert_eq!(game.begin(&mouse, at), None, "a hide's first move");
+        mouse.hide_for(SETTLE_NS);
+        assert_eq!(game.begin(&mouse, at), None, "a later hide's first move");
+        mouse.hide_for(2 * SETTLE_NS - 1);
+        assert_eq!(game.begin(&mouse, at), None, "within the settle past it");
+        mouse.hide_for(2 * SETTLE_NS);
+        assert_eq!(game.begin(&mouse, at), Some(Hold::Raw));
     }
 
     /// Each move goes to the guest's mouse in whole counts, the parts below one carried on, and
@@ -256,8 +364,7 @@ pub(crate) mod tests {
     fn moves_go_to_the_guest_s_mouse_until_it_shows_its_cursor() {
         let mouse = Mouse::default();
         let mut game = Game::new();
-        mouse.hide_for(SETTLE_NS);
-        game.begin(&mouse, (5.0, 6.0));
+        assert_eq!(begun(&mut game, &mouse, (5.0, 6.0)), Some(Hold::Raw));
         assert_eq!(game.moved(&mouse, (2.5, -1.25), Some((9.0, 9.0))), None);
         assert_eq!(game.moved(&mouse, (0.75, -0.75), None), None);
         assert_eq!(game.moved(&mouse, (0.25, 0.0), None), None);
@@ -277,8 +384,7 @@ pub(crate) mod tests {
         assert_eq!(game.moved(&mouse, (1.0, 0.0), None), None, "not driven now");
         assert_eq!(mouse.take(), vec![]);
         // Shown elsewhere: let go where it was held.
-        mouse.hide_for(SETTLE_NS);
-        game.begin(&mouse, (7.0, 8.0));
+        assert_eq!(begun(&mut game, &mouse, (7.0, 8.0)), Some(Hold::Raw));
         mouse.show();
         assert_eq!(game.shown(&mouse, None), Some(Hold::Unlock((7.0, 8.0))));
     }
@@ -293,8 +399,7 @@ pub(crate) mod tests {
         let mut game = Game::new();
         // Pressed through the tablet, before: not the mouse's, then or after the switch.
         assert!(!game.press(Some(&mouse), 2));
-        mouse.hide_for(SETTLE_NS);
-        game.begin(&mouse, (0.0, 0.0));
+        assert_eq!(begun(&mut game, &mouse, (0.0, 0.0)), Some(Hold::Raw));
         assert!(!game.release(Some(&mouse), 2), "the tablet's to lift");
         // Pressed through the mouse, released after the switch back: the mouse's.
         assert!(game.press(Some(&mouse), 1));
@@ -312,34 +417,48 @@ pub(crate) mod tests {
         let mouse = Mouse::default();
         let mut game = Game::new();
         assert!(!game.wheel(Some(&mouse), 1), "not driven");
-        mouse.hide_for(SETTLE_NS);
-        game.begin(&mouse, (0.0, 0.0));
+        assert_eq!(begun(&mut game, &mouse, (0.0, 0.0)), Some(Hold::Raw));
         game.press(Some(&mouse), 1);
         assert!(game.wheel(Some(&mouse), -2));
         assert_eq!(mouse.take(), vec![((0, 0), 0, 1), ((0, 0), -2, 1)]);
     }
 
     /// Capture's end lets the host's pointer go where it was held, and a refused lock is tried
-    /// again only once capture changed; the keyboard lost lifts the mouse's buttons
+    /// again only once capture changed, a hide counted from the next capture's first move; the
+    /// keyboard lost lifts the mouse's buttons
     #[test]
     fn capture_s_end_and_a_refused_lock_give_the_pointer_back_where_held() {
         let mouse = Mouse::default();
         let mut game = Game::new();
-        mouse.hide_for(SETTLE_NS);
-        game.begin(&mouse, (3.0, 4.0));
+        assert_eq!(begun(&mut game, &mouse, (3.0, 4.0)), Some(Hold::Raw));
         game.press(Some(&mouse), 1);
         game.lift(Some(&mouse));
         assert_eq!(game.end(), Some(Hold::Unlock((3.0, 4.0))));
         assert_eq!(game.end(), None);
         assert_eq!(mouse.take(), vec![((0, 0), 0, 1), ((0, 0), 0, 0)]);
-        game.begin(&mouse, (1.0, 1.0));
+        assert_eq!(begun(&mut game, &mouse, (1.0, 1.0)), Some(Hold::Raw));
         assert_eq!(game.refused(), Some(Hold::Unlock((1.0, 1.0))));
+        mouse.hide_for(10 * SETTLE_NS);
         assert_eq!(
             game.begin(&mouse, (1.0, 1.0)),
             None,
             "refused until capture changes"
         );
         assert_eq!(game.end(), None);
-        assert_eq!(game.begin(&mouse, (1.0, 1.0)), Some(Hold::Raw));
+        // Capture changed: the hide counts from the next capture's first move.
+        mouse.hide_for(0);
+        assert_eq!(
+            game.begin(&mouse, (1.0, 1.0)),
+            None,
+            "the hide's first move"
+        );
+        assert_eq!(game.end(), None);
+        mouse.hide_for(SETTLE_NS);
+        assert_eq!(
+            game.begin(&mouse, (1.0, 1.0)),
+            None,
+            "the next capture's first move"
+        );
+        assert_eq!(begun(&mut game, &mouse, (1.0, 1.0)), Some(Hold::Raw));
     }
 }

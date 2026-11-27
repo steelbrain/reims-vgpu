@@ -38,14 +38,15 @@
 //!   every key goes to the guest while the window is key, ⌘ shortcuts included, taken from
 //!   AppKit before its menu as while captured. A game gets the absolute pointer alone, which
 //!   stops at the image's edge.
-//! - **For games**, where the guest has its own mouse ([`crate::PointerMotion`]): captured, while
-//!   the guest hides its cursor on every display, the window holds the host's pointer still
-//!   (`CGAssociateMouseAndMouseCursorPosition(false)`, which the view applies) and hands its
-//!   unaccelerated motion (the events' `kCGEventUnacceleratedPointerMovementX` and `Y`, else
-//!   their deltas), its buttons pressed meanwhile and a mouse wheel's notches to the guest's
-//!   mouse ([`crate::game`]), until the guest shows its cursor again, where the host's pointer
-//!   is let go over it; a button comes up by the route it went down by. Releasing capture,
-//!   losing the keyboard and closing let the pointer go where it was held.
+//! - **For games**, where the guest has its own mouse ([`crate::PointerMotion`]): captured, once
+//!   the guest's hide of its cursor on every display has outlived the hide's first move, which
+//!   the tablet takes, by the settle ([`crate::game::SETTLE_NS`]), the window holds the host's
+//!   pointer still (`CGAssociateMouseAndMouseCursorPosition(false)`, which the view applies) and
+//!   hands its unaccelerated motion (the events' `kCGEventUnacceleratedPointerMovementX` and
+//!   `Y`, else their deltas), its buttons pressed meanwhile and a mouse wheel's notches to the
+//!   guest's mouse ([`crate::game`]), until the guest shows its cursor again, where the host's
+//!   pointer is let go over it; a button comes up by the route it went down by. Releasing
+//!   capture, losing the keyboard and closing let the pointer go where it was held.
 //!
 //! While captured, the window holds the system's hot keys off ([`super::hotkeys`]), the host's
 //! pointer over the image ([`InputState::pointer_confinement`], which the view applies), and its
@@ -1565,8 +1566,8 @@ mod tests {
     }
 
     /// Outside a game the tablet hears exactly what it hears with no guest's mouse, and the
-    /// guest's mouse nothing: captured while the guest shows its cursor or has hidden it for less
-    /// than the settle
+    /// guest's mouse nothing: captured while the guest shows its cursor, or hides it for less than
+    /// the settle past the hide's first move, however long the hide
     #[test]
     fn the_tablet_s_events_are_unchanged_outside_a_game() {
         let desk_work = |logic: &mut InputLogic| {
@@ -1586,7 +1587,7 @@ mod tests {
         };
         let plain = desk_work(&mut captured());
         assert!(!plain.is_empty());
-        for hidden in [None, Some(SETTLE_NS - 1)] {
+        for hidden in [None, Some(SETTLE_NS - 1), Some(20 * SETTLE_NS)] {
             let mouse = Arc::new(Mouse::default());
             *mouse.hidden.lock() = hidden;
             let mut logic = captured_with(&mouse);
@@ -1596,14 +1597,23 @@ mod tests {
         }
     }
 
-    /// Captured, once the guest has hidden its cursor for the settle, the pointer is held still
-    /// and its unaccelerated motion, by whole counts, and a mouse wheel's notches drive the
-    /// guest's mouse; the tablet hears nothing. Once the guest shows its cursor, the pointer is
-    /// the window's again, let go over the guest's cursor, else where it was held
+    /// Captured, once the guest's hide of its cursor has outlived the hide's first move, which
+    /// the tablet takes, by the settle, the pointer is held still and its unaccelerated motion,
+    /// by whole counts, and a mouse wheel's notches drive the guest's mouse; the tablet hears
+    /// nothing. Once the guest shows its cursor, the pointer is the window's again, let go over
+    /// the guest's cursor, else where it was held
     #[test]
     fn a_hidden_cursor_s_motion_drives_the_guest_s_mouse_until_it_shows() {
         let mouse = Arc::new(Mouse::default());
         let mut logic = captured_with(&mouse);
+        mouse.hide_for(0);
+        logic.moved((1.0, 0.0), &at((999.0, 350.0)));
+        assert_eq!(logic.hold.take(), None, "the hide's first move");
+        assert_eq!(
+            sent(&mut logic),
+            vec![pointer(1798, 600, 0)],
+            "the tablet's"
+        );
         mouse.hide_for(SETTLE_NS);
         logic.moved((1.0, 0.0), &at((1000.0, 350.0)));
         assert_eq!(logic.hold.take(), Some(Hold::Raw));
@@ -1636,6 +1646,13 @@ mod tests {
         assert_eq!(logic.hold.take(), Some(Hold::Unlock((150.25, 80.25))));
         logic.moved((0.0, 0.0), &at((150.25, 80.25)));
         assert_eq!(sent(&mut logic), vec![pointer(100, 60, 0)]);
+        mouse.hide_for(0);
+        logic.moved((1.0, 0.0), &at((151.0, 80.0)));
+        assert_eq!(
+            sent(&mut logic),
+            vec![pointer(102, 60, 0)],
+            "the next hide's first move"
+        );
         mouse.hide_for(SETTLE_NS);
         logic.moved((1.0, 0.0), &at((150.0, 80.0)));
         assert_eq!(logic.hold.take(), Some(Hold::Raw));
@@ -1652,13 +1669,24 @@ mod tests {
         let mut logic = captured_with(&mouse);
         logic.button_down(BUTTON_RIGHT, 0, &at((600.0, 350.0)));
         assert_eq!(sent(&mut logic), vec![pointer(1000, 600, BUTTON_RIGHT)]);
+        mouse.hide_for(0);
+        logic.moved((1.0, 0.0), &at((601.0, 350.0)));
+        assert_eq!(
+            sent(&mut logic),
+            vec![pointer(1002, 600, BUTTON_RIGHT)],
+            "the hide's first move, the tablet's drag"
+        );
         mouse.hide_for(SETTLE_NS);
         logic.moved((1.0, 0.0), &at((600.0, 350.0)));
         assert_eq!(logic.hold.take(), Some(Hold::Raw));
         logic.button_down(BUTTON_LEFT, 0, &at((600.0, 350.0)));
         logic.button_up(BUTTON_RIGHT, &at((600.0, 350.0)));
         assert_eq!(mouse.take(), vec![((0, 0), 0, BUTTON_LEFT)]);
-        assert_eq!(sent(&mut logic), vec![pointer(1000, 600, 0)]);
+        assert_eq!(
+            sent(&mut logic),
+            vec![pointer(1002, 600, 0)],
+            "the tablet's comes up where it last was"
+        );
         mouse.show();
         logic.cursor_changed(&at((600.0, 350.0)));
         assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
@@ -1674,11 +1702,18 @@ mod tests {
     #[test]
     fn letting_go_of_a_game_gives_the_pointer_back_where_it_was_held() {
         let mouse = Arc::new(Mouse::default());
-        mouse.hide_for(SETTLE_NS);
         let in_game = || {
             let mut logic = captured_with(&mouse);
+            mouse.hide_for(0);
+            logic.moved((1.0, 0.0), &at((599.0, 350.0)));
+            mouse.hide_for(SETTLE_NS);
             logic.moved((1.0, 0.0), &at((600.0, 350.0)));
             assert_eq!(logic.hold.take(), Some(Hold::Raw));
+            assert_eq!(
+                sent(&mut logic),
+                vec![pointer(998, 600, 0)],
+                "the hide's first move"
+            );
             logic
         };
         let mut logic = in_game();
@@ -1715,11 +1750,38 @@ mod tests {
         logic.release_capture();
         logic.button_down(BUTTON_LEFT, 0, &at((602.0, 350.0)));
         logic.moved((1.0, 0.0), &at((604.0, 350.0)));
+        assert_eq!(logic.hold.take(), None, "the next capture's first move");
+        mouse.hide_for(2 * SETTLE_NS);
+        logic.moved((1.0, 0.0), &at((606.0, 350.0)));
         assert_eq!(
             logic.hold.take(),
             Some(Hold::Raw),
             "tried again at the next capture"
         );
+        assert_eq!(mouse.take(), vec![]);
+    }
+
+    /// A cursor hidden until the mouse moves, as macOS hides it while text is typed, shows at the
+    /// hide's first move, which the tablet takes: the guest's mouse is never driven and the
+    /// tablet hears every move, however long each hide
+    #[test]
+    fn a_cursor_hidden_until_the_mouse_moves_drives_nothing() {
+        let mouse = Arc::new(Mouse::default());
+        let mut logic = captured_with(&mouse);
+        for (typed, x, pixel) in [(2, 600.0, 1000), (9, 700.0, 1200)] {
+            mouse.hide_for(typed * 1_000_000_000);
+            logic.moved((1.0, 0.0), &at((x, 350.0)));
+            // The guest shows its cursor at that move.
+            mouse.show();
+            logic.cursor_changed(&at((x, 350.0)));
+            logic.moved((1.0, 0.0), &at((x + 1.0, 350.0)));
+            assert_eq!(logic.hold.take(), None, "typed for {typed} s");
+            assert_eq!(
+                sent(&mut logic),
+                vec![pointer(pixel, 600, 0), pointer(pixel + 2, 600, 0)],
+                "every move the tablet's"
+            );
+        }
         assert_eq!(mouse.take(), vec![]);
     }
 
