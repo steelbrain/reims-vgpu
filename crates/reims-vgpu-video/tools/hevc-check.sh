@@ -236,6 +236,9 @@ encode() {
   if (( bits > 8 )); then
     pix=yuv${csp}p${bits}le
     depth=(--input-depth "$bits" --output-depth "$bits")
+  elif [[ $csp != 420 ]]; then
+    # x265's main422-10 profile writes 10 bits unless told the depth.
+    depth=(--output-depth 8)
   fi
   # shellcheck disable=SC2086 # $opts is a list of options
   if ! ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i "$(source_filter "$kind" "$size")" \
