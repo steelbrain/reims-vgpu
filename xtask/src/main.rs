@@ -445,6 +445,31 @@ mod tests {
         }
     }
 
+    /// Text is checked out with LF line ends whatever core.autocrlf says (5fdd3c05f): Git for
+    /// Windows' installer sets it true, and a user's install then stopped in `cargo xtask dist`,
+    /// where reims-vgpu-vulkan's build script hashed CRLF .metal sources against the committed
+    /// metallibs. Asked of git for files the build and its checks read byte for byte.
+    #[test]
+    fn text_is_checked_out_with_lf_whatever_autocrlf_says() {
+        let files = [
+            "crates/reims-vgpu-vulkan/src/gpu/shaders.metal",
+            "crates/reims-vgpu-c/include/reims_vgpu.h",
+            "guest/prebuilt/ReimsGraphics.kext/Contents/Info.plist",
+        ];
+        let out = std::process::Command::new("git")
+            .args(["check-attr", "text", "eol", "--"])
+            .args(files)
+            .current_dir(repo_root())
+            .output()
+            .expect("git check-attr");
+        assert!(out.status.success(), "{out:?}");
+        let said: String = files
+            .iter()
+            .map(|f| format!("{f}: text: auto\n{f}: eol: lf\n"))
+            .collect();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), said);
+    }
+
     /// Each test binary's `../lib`, once a directory: under Cargo's build-dir layout each binary
     /// has a directory of its own, and before it they share `deps`.
     #[test]
