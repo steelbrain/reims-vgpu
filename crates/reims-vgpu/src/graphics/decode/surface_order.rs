@@ -16,7 +16,9 @@
 //!   `done`) is a compare. Only the rest are GPU waits, which hold back none of the buffer's
 //!   records, nor its queue: it gets its `CB_SUBMITTED` at its take and its `CB_SCHEDULED` at its
 //!   commit, as a Mac's order of IOSurface accesses holds back none (`cmdbuf`'s `Line`); but one
-//!   that names a buffer the host has not walked yet begins after that buffer's commit (below).
+//!   that names a buffer the host has not walked yet begins after that buffer's commit, and one
+//!   that comes after a decode whose planes are not yet said written begins after they are
+//!   (below).
 //!   Two buffers that share no surface never wait for each other, since neither names the other.
 //! - **A buffer that holds no op pays nothing** but two atomic operations on its own queue's
 //!   [`Marks`], with no lock: it notes itself taken, and signals only where a buffer of another
@@ -44,7 +46,10 @@
 //!   ([`SurfaceOrder::ready`]), so it holds no ticket. It holds its queue's claim on its ring
 //!   through its begin (`begin_taken`), so no later buffer of its queue is answered or taken
 //!   meanwhile. So no wait of the buffer it names, posted before it, is for it, nor any wait
-//!   behind that one.
+//!   behind that one. The same holds of a begin held for a decode's planes (below): the decode's
+//!   buffer was posted before the held one, and its landing waits only for the hardware, for
+//!   the session's earlier pictures and for the decode's own fill, made at its begin before the
+//!   held buffer was begun, none of them for the held buffer.
 //! - **Names written wrong.** A process that writes the surfaces' slots itself can name a buffer
 //!   not yet posted (the bundle never does), and two buffers of two queues, of any processes, can
 //!   then name each other, both published before either begins. Each begin then waits for the
@@ -90,6 +95,37 @@
 //!   ([`super::AheadSinks`]). The decode's buffer signals its queue's timeline whether it holds
 //!   the op or not. A lock's download needs no such wait: it waits for the caches' users' ends,
 //!   the decode's buffer among them ([`super::surface_cache`]).
+//! - **A buffer named after a decode whose planes are not yet said written.** A session whose
+//!   picture lands by the host's own work (VA-API's or NVDEC's, and on Windows its draw over
+//!   Direct3D 11 textures) writes the output's planes off the platform's queues, and the
+//!   platform's reads see that write only in the command buffers committed after the landing
+//!   says it done (`SurfaceMemory`'s `external_writes_done`, the acquire, recorded ahead of every
+//!   command buffer committed after it). So no command buffer that uses the output and comes
+//!   after the decode is committed between the decode's start and that acquire. A GPU wait for
+//!   the decode's buffer's end does not keep that: the buffer would be committed before the
+//!   acquire, and read what the planes held before. The key is the decode's buffer, by its queue
+//!   and seqno, as a buffer of another queue comes after it: named in its `SURFACE_ORDER`, which
+//!   names surfaces, whatever shape of one the buffer binds (a plane shape or a plain one), or
+//!   kept among the decodes completed ahead of their ends for a block it uses
+//!   ([`CompletedAhead`]): the buffers the guest orders after the decode by its early
+//!   `CB_COMPLETE` alone, which name nothing of the output. Each such decode is kept in its
+//!   buffer's queue's [`Marks`] from the buffer's walk, before its commit raises the queue's
+//!   mark ([`Marks::landing`]), until its session signals the decode's value, which the landing
+//!   gives once the planes are said written, or once the picture ended without landing (skipped,
+//!   failed, or not drawn and copied by the CPU). The buffer's begin, after the wait above, is
+//!   held on its queue's thread with no lock held: until each such buffer its ring published is
+//!   committed, then until each decode that buffer handed has its value
+//!   ([`SurfaceOrder::after_decodes`]). Its `CB_SUBMITTED`, its uses among the device caches'
+//!   users, its ticket and its commit all come after. Counted, those that waited for a decode's
+//!   landing among them, with the longest; a hold past [`BEGIN_WAIT_LOGGED`] is named in the log
+//!   with what it waits for, and again as it ends. Nothing times it out: it ends with the
+//!   session's signal, or as the queue waited for or the buffer's own ends, or the device
+//!   resets. Not held here: a buffer of the decode's own queue, which its ring orders behind the
+//!   decode's buffer; a buffer answered on a doorbell's thread, which has its ticket already
+//!   (a doorbell answers no buffer that names a buffer not yet finished, nor one that uses a
+//!   block of a decode completed ahead of its end, so such a buffer comes after no decode it is
+//!   held for); and a named buffer its ring has not published and the host has not committed,
+//!   which gets no order (below), counted.
 //!
 //! The order's state is the decoder's `surface_order` lock, a leaf: held while a buffer's waits
 //! and signal are encoded, never across a platform call that may wait. A command buffer made only
@@ -133,6 +169,41 @@ pub(crate) const BEGIN_WAIT_LOGGED: Duration = Duration::from_secs(2);
 /// not; `None` where the queue has ended at the device. Given by the host as the queue is made.
 pub(crate) type Published = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
+/// A decode a queue's buffer handed a session whose picture lands by the host's own work, from
+/// another API (`super::super::video_host`): the session signals the decode's value once the
+/// landing is over, after its picture's planes are said written (`SurfaceMemory`'s
+/// `external_writes_done`), or once it ended without landing (the module doc, "A buffer named
+/// after a decode whose planes are not yet said written").
+pub(crate) trait Landing: Send + Sync {
+    /// Whether the session signalled the decode's value.
+    fn over(&self) -> bool;
+    /// Waits on the CPU, at most `milliseconds`, for the value; whether it came.
+    fn wait(&self, milliseconds: u64) -> bool;
+    /// The value the session signals.
+    fn value(&self) -> u64;
+}
+
+/// A [`Landing`]: the session's event and the decode's value.
+pub(crate) struct DecodeLanding<P: Platform> {
+    pub(crate) event: P::SharedEvent,
+    pub(crate) value: u64,
+}
+
+impl<P: Platform> Landing for DecodeLanding<P> {
+    fn over(&self) -> bool {
+        self.event.signaled_value() >= self.value
+    }
+
+    fn wait(&self, milliseconds: u64) -> bool {
+        self.event
+            .wait_until_signaled_value(self.value, milliseconds)
+    }
+
+    fn value(&self) -> u64 {
+        self.value
+    }
+}
+
 /// One queue's marks, shared with its table entry (`tables::QueueCounts`), so a buffer that holds
 /// no op reads and writes them with no lock ([`Self::quiet`]). Each only rises.
 #[derive(Default)]
@@ -157,9 +228,29 @@ pub(crate) struct Marks {
     /// How many waits of entries removed from its context's table are for its buffers' commits
     /// ([`super::tables::Pending`]): a buffer's end looks at its table only where any is.
     parked: AtomicUsize,
+    /// The decodes its buffers handed sessions whose pictures land by the host's own work, by the
+    /// seqno of the buffer that handed each, kept from the buffer's walk, before its commit
+    /// raises `commit`, until the session signals the decode's value ([`Landing`]).
+    landings: Mutex<Vec<(u64, Arc<dyn Landing>)>>,
 }
 
 impl Marks {
+    /// The queue's buffer at `seqno` handed a session `landing`, walking it: kept until the
+    /// session signals its value; those signalled already go.
+    pub(crate) fn landing(&self, seqno: u64, landing: Arc<dyn Landing>) {
+        let mut landings = self.landings.lock();
+        landings.retain(|(_, l)| !l.over());
+        landings.push((seqno, landing));
+    }
+
+    /// The decodes the queue's buffer at `seqno` handed sessions whose values are still to come.
+    pub(crate) fn landings_at(&self, seqno: u64) -> Vec<Arc<dyn Landing>> {
+        (self.landings.lock().iter())
+            .filter(|(s, l)| *s == seqno && !l.over())
+            .map(|(_, l)| Arc::clone(l))
+            .collect()
+    }
+
     /// An entry removed from the queue's context's table waits for one of its buffers' commits.
     pub(crate) fn park(&self) {
         self.parked.fetch_add(1, Ordering::SeqCst);
@@ -357,6 +448,15 @@ pub(crate) struct OrderCounts {
     /// ([`SurfaceOrder::unwalked`]), and the longest such wait, in microseconds.
     pub(crate) begins_waited: u64,
     pub(crate) begin_wait_longest_us: u64,
+    /// Begins held for a decode they come after until its picture's planes were said written
+    /// ([`SurfaceOrder::after_decodes`]), of them how many waited for a decode's landing and not
+    /// only for a named buffer's commit, and the longest hold, in microseconds.
+    pub(crate) landing_holds: u64,
+    pub(crate) landing_holds_for_planes: u64,
+    pub(crate) landing_hold_longest_us: u64,
+    /// Buffers such a begin came after that their rings had not published and the host had not
+    /// committed, which held nothing ([`SurfaceOrder::after_decodes`]).
+    pub(crate) unpublished: u64,
 }
 
 /// The decodes whose command buffers posted their `CB_COMPLETE` ahead of their platform end, by
@@ -500,6 +600,38 @@ impl CompletedAhead {
         waits
     }
 
+    /// The decodes of other queues than `queue` whose outputs lie in `blocks`, as
+    /// [`Self::waits_for`] answers them, with nothing noted: what a buffer's begin is held for
+    /// until their planes are said written ([`SurfaceOrder::after_decodes`]).
+    pub(crate) fn decodes_for(
+        &self,
+        queue: u64,
+        blocks: impl Iterator<Item = u64>,
+    ) -> Vec<RgfxSurfaceOrderWait> {
+        if self.live.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        let map = self.blocks.lock();
+        (blocks.filter_map(|block| map.get(&block)))
+            .filter(|ahead| ahead.queue != queue)
+            .map(|ahead| RgfxSurfaceOrderWait {
+                queue_obj_id: ahead.queue,
+                seqno: ahead.seqno,
+            })
+            .collect()
+    }
+
+    /// Whether it keeps no decode whose output lies in `blocks`, its lock not waited for: `None`
+    /// where the lock is held, for an answer on a doorbell's thread, which waits for nothing
+    /// (`super::cmdbuf`'s `answer_at_doorbell`).
+    pub(crate) fn try_none_of(&self, mut blocks: impl Iterator<Item = u64>) -> Option<bool> {
+        if self.live.load(Ordering::Acquire) == 0 {
+            return Some(true);
+        }
+        let map = self.blocks.try_lock()?;
+        Some(!blocks.any(|block| map.contains_key(&block)))
+    }
+
     /// Whether it keeps a decode (for the tests).
     #[cfg(test)]
     pub(crate) fn holds(&self, block: u64) -> bool {
@@ -639,6 +771,47 @@ impl<P: Platform> SurfaceOrder<P> {
         let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
         self.counts.begins_waited += 1;
         self.counts.begin_wait_longest_us = self.counts.begin_wait_longest_us.max(us);
+    }
+
+    /// The buffers of other queues a buffer of queue `queue` comes after, whose decodes it is
+    /// held for until their pictures' planes are said written (the module doc, "A buffer named
+    /// after a decode whose planes are not yet said written"): those `waits` holds, its
+    /// `SURFACE_ORDER`'s and the decodes completed ahead of their ends whose outputs it uses, each
+    /// once, with its queue's id and marks, and whether its ring has published it. Only a queue
+    /// the host holds and has not ended names one.
+    ///
+    /// One its ring has not published, and that is not yet committed, holds nothing: counted
+    /// (`unpublished`), as a buffer neither this hold nor [`Self::unwalked`]'s waits for.
+    pub(crate) fn after_decodes(
+        &mut self,
+        queue: u64,
+        waits: impl Iterator<Item = RgfxSurfaceOrderWait>,
+    ) -> Vec<(u64, Arc<Marks>, u64, bool)> {
+        let mut after: Vec<(u64, Arc<Marks>, u64, bool)> = Vec::new();
+        for w in waits {
+            let (q, s) = (w.queue_obj_id, w.seqno);
+            if q == queue || q == 0 || s == 0 || after.iter().any(|a| a.0 == q && a.2 == s) {
+                continue;
+            }
+            let Some(named) = self.queues.get(&q).filter(|n| n.held && !n.ended) else {
+                continue;
+            };
+            let published = (named.published.as_ref().and_then(|p| p())).is_some_and(|p| s <= p);
+            if !published && !named.marks.commit.committed_through(s) {
+                self.counts.unpublished += 1;
+            }
+            after.push((q, Arc::clone(&named.marks), s, published));
+        }
+        after
+    }
+
+    /// A buffer's begin was held `took` for decodes it comes after ([`Self::after_decodes`]),
+    /// waiting for a decode's landing where `planes`: counted, the longest kept.
+    pub(crate) fn landing_held(&mut self, took: Duration, planes: bool) {
+        let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        self.counts.landing_holds += 1;
+        self.counts.landing_holds_for_planes += u64::from(planes);
+        self.counts.landing_hold_longest_us = self.counts.landing_hold_longest_us.max(us);
     }
 
     /// The marks of queue `queue`, which the host holds from now where it did not (the tests'
@@ -824,9 +997,11 @@ impl<P: Platform> SurfaceOrder<P> {
                 "surface order: {} command buffers named {} buffers of other queues: {} GPU \
                  waits ({} for buffers not yet taken), {} naming no buffer; {} begins waited for \
                  a buffer named that the host had not walked to be committed (the longest {} \
-                 us); {} signals for buffers that did not run; {} decodes completed ahead of \
-                 their ends, {} buffers and {} presents held behind them (the longest begun {} \
-                 us before one's end)",
+                 us); {} begins held for a decode they come after until its picture's planes \
+                 were said written, {} of them for a landing (the longest {} us), {} buffers \
+                 they came after not yet published, which held none; {} signals for buffers \
+                 that did not run; {} decodes completed ahead of their ends, {} buffers and {} \
+                 presents held behind them (the longest begun {} us before one's end)",
                 c.buffers,
                 c.named,
                 c.waits,
@@ -834,6 +1009,10 @@ impl<P: Platform> SurfaceOrder<P> {
                 c.stale,
                 c.begins_waited,
                 c.begin_wait_longest_us,
+                c.landing_holds,
+                c.landing_holds_for_planes,
+                c.landing_hold_longest_us,
+                c.unpublished,
                 c.released,
                 kept.posts(),
                 c.held,

@@ -61,7 +61,6 @@ use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdenti
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video::core::surfaces::{SurfaceError, SurfaceLayout};
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, SourceFrame, Stream};
-#[cfg(unix)]
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
@@ -77,6 +76,7 @@ use reims_vgpu_vulkan::core::raise::RaiseResult;
 use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::FromBytes;
 
+use super::surface_order::{DecodeLanding, Landing};
 use super::worker::Worker;
 use super::{Entry, GraphicsDecoder, ObjHandle, bad_reference, op_fault};
 
@@ -884,15 +884,18 @@ fn encode_codec(tag: u16) -> Option<u32> {
 
 /// Decodes one video-encoder op: `tag` its op, `payload` its body (the bytes after its
 /// [`RgfxOpHeader`](reims_vgpu_graphics::ops::RgfxOpHeader)), on `session`, and has `cb`'s later work
-/// wait for it, and its completion read whether its picture landed, from `landings`. `Ok(false)`
-/// for a tag the host does not know.
+/// wait for it, and its completion read whether its picture landed, from `landings`; a decode on
+/// a session whose picture lands by the host's own work goes in `decodes`, what the buffers of
+/// other queues that come after the command buffer are held for until the session signals its
+/// value (`super::surface_order`, "A buffer named after a decode whose planes are not yet said
+/// written"). `Ok(false)` for a tag the host does not know.
 pub(super) fn decode_op<P: Platform>(
     tag: u16,
     payload: &[u8],
     objs: &GraphicsDecoder<P>,
     session: &Arc<dyn GraphicsVideoSession<P>>,
     cb: &P::CommandBuffer,
-    landings: &mut Vec<Arc<Landed>>,
+    (landings, decodes): (&mut Vec<Arc<Landed>>, &mut Vec<Arc<dyn Landing>>),
 ) -> RaiseResult<bool> {
     if let Some(codec) = encode_codec(tag) {
         encode_op(tag, codec, payload, objs, session, cb)?;
@@ -936,6 +939,17 @@ pub(super) fn decode_op<P: Platform>(
         (objs.surface_caches).decoded(device.as_ref(), block, !done.skipped)?;
     }
     cb.encode_wait(Some(session.event()), done.value)?;
+    // Its picture lands by the host's own work where the session tells whether it landed: its
+    // event, which the host signals, reaches the value once the landing is over
+    // (`super::super::video_host`).
+    if done.landed.is_some()
+        && let EventRef::Shared(event) = session.event()
+    {
+        decodes.push(Arc::new(DecodeLanding::<P> {
+            event: event.clone_ref(),
+            value: done.value,
+        }));
+    }
     landings.extend(done.landed);
     Ok(true)
 }

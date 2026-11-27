@@ -6392,6 +6392,37 @@ committed in. The bundle names the order instead, as it posts each buffer:
   doorbell's thread never answers it, as the buffer it names has not finished,
   so it holds no ticket; it keeps its queue's claim on its ring, so no later
   buffer of its queue is taken or answered meanwhile. No wait is for it.
+- A buffer that comes after a decode whose picture the host lands by work of
+  its own (VA-API, NVDEC, and on Windows a draw over Direct3D 11 textures) is
+  held at its begin until the picture's planes are said written. That work
+  writes the planes off the platform's queues, and the platform's reads see it
+  only in command buffers committed after the landing says it done (the
+  acquire, `SurfaceMemory`'s `external_writes_done`, recorded ahead of every
+  command buffer committed after it). A GPU wait for the decode's end does not
+  keep that: the reader would be committed first, and read the planes as they
+  were before (seen on the Windows host: a reader taken after the decode's
+  buffer and committed before its acquire read the surface's earlier picture
+  through a plain shape). The key is the decode's buffer, named in the
+  reader's `SURFACE_ORDER` (which names surfaces, whatever shape of one the
+  reader binds), or kept by the host for a block the reader uses as a decode
+  completed ahead of its end (above), which is how a reader ordered by the
+  decode's early `CB_COMPLETE` alone comes after it. The begin waits, on its
+  queue's thread, until that buffer is committed, where its ring has published
+  it, and then until the session signals the decode's value, which the host's
+  landing gives once the planes are said written, or once the picture ended
+  without landing. So the reader's `CB_SUBMITTED`, its ticket and its commit
+  come after the acquire. Nothing times the hold out: it ends with the
+  session's signal, the end of either queue, or a reset. The decode's buffer
+  was posted before the reader, and the landing waits only for the hardware,
+  the session's earlier pictures and the decode's own fill, made while the
+  reader was not begun, so the hold ends. A doorbell's thread answers no buffer
+  that uses the block of a decode completed ahead of its end, so a held buffer
+  holds no ticket. A buffer of the decode's own queue is not held: its ring
+  orders it behind the decode's buffer, which the platform holds on the host
+  until the session's value (below). Counted on the order's summary line, with
+  how many waited for a landing, the longest, and the buffers named that their
+  rings had not published, which nothing holds; past 2 s a hold is named in
+  the log with what it waits for.
 - Names written wrong (a process that writes the slots itself, naming a buffer
   not yet posted) can name each other across two queues, of any processes, both
   published before either begins. Their two queues' threads, and their
@@ -6418,7 +6449,7 @@ committed in. The bundle names the order instead, as it posts each buffer:
   its platform has scheduled it, past its waits. A read posted meanwhile names
   none of it and waits for none of it, and nor does a CPU lock.
 - The wait for a buffer the host has walked is an order on the GPU and nothing
-  more, as a Mac's is: a Mac answers
+  more (but for a decode's planes, above), as a Mac's is: a Mac answers
   a command buffer it runs after another queue's or process's pending access to
   a surface submitted and scheduled within a millisecond of its commit (the 630,
   and the M3 in a run's first round, within 1 to 5 ms), and completes it after

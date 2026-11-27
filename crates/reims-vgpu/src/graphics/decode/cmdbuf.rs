@@ -213,6 +213,9 @@ struct EventOps {
     /// Whether each of its decodes' pictures landed: the buffer completes failed where one did
     /// not ([`video::Landed`]).
     landings: Vec<Arc<video::Landed>>,
+    /// Its decodes whose pictures land by the host's own work, kept in its queue's marks from its
+    /// walk until their sessions signal them ([`super::surface_order::Marks::landing`]).
+    decodes: Vec<Arc<dyn super::surface_order::Landing>>,
 }
 
 /// A buffer's [`Signals`], made at its first signal of a shared event and held for its completion
@@ -644,6 +647,11 @@ impl Askable {
 /// Vulkan platform's, wait while a queue holds 64, and a buffer leaves the count as its completion
 /// handler ends, which may come before the platform lets its place go.
 const TAKE_IN_FLIGHT_MAX: usize = 48;
+
+/// How long each slice of a begin's hold for a decode's planes lasts
+/// ([`GraphicsDecoder::hold_for_decodes`]), between its looks at whether the queue waited for or
+/// its own has ended, or the device resets; the session's signal ends a slice at once.
+const LANDING_WAIT_SLICE_MS: u64 = 10;
 
 /// A command buffer's place in its queue's count of the host's command buffers made on the queue
 /// and not completed, which it leaves when dropped: with its completion handler, once that has run
@@ -1490,7 +1498,9 @@ impl<P: Platform> Decoders<P> {
     /// asked before it that it follows, [`super::surface_cache::Caches::waits_for_nothing`]), it
     /// uses no block whose `SURFACE_PAGES` the surface worker is still carrying out
     /// ([`super::worker::Unsettled`]), which its begin waits for, waits for no buffer of another
-    /// queue ([`super::surface_order`]), names in its `COMMIT_ORDER` only buffers begun
+    /// queue ([`super::surface_order`]) and uses no block of a decode completed ahead of its end,
+    /// whose planes its begin may be held for ([`GraphicsDecoder::hold_for_decodes`]), names in
+    /// its `COMMIT_ORDER` only buffers begun
     /// ([`super::commit_order`]), no buffer before it holds its queue, its queue holds fewer than
     /// [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed and no answered buffer not yet
     /// begun, and each lock it takes is free, each tried. Its turn in its queue's lane and its
@@ -1524,6 +1534,7 @@ impl<P: Platform> Decoders<P> {
             || context_of(m.queue_obj_id) != context
             || shared.surface_caches.waits_for_nothing(glance.uses()) != Some(true)
             || shared.unsettled.try_any(glance.used_blocks()) != Some(false)
+            || shared.completed_ahead.try_none_of(glance.used_blocks()) != Some(true)
         {
             return false;
         }
@@ -1980,6 +1991,130 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
+    /// Holds the command buffer `m`, whose stream is `take`, at its begin until the decodes it
+    /// comes after whose pictures land by the host's own work have their pictures' planes said
+    /// written: the buffers of other queues its `SURFACE_ORDER` names, and the decodes completed
+    /// ahead of their ends whose outputs it uses ([`super::surface_order::SurfaceOrder::after_decodes`];
+    /// the module doc of `surface_order`, "A buffer named after a decode whose planes are not yet
+    /// said written"). With no lock held, on its queue's thread: first until each such buffer
+    /// its ring published is committed, so its walk has kept its decodes
+    /// ([`super::surface_order::Marks::landing`]); then until each decode kept of it has its value
+    /// signalled by its session; or until the queue waited for or `m`'s ends, or the device
+    /// resets. Nothing times it out. Counted where it waited, with the longest; a hold past
+    /// [`BEGIN_WAIT_LOGGED`] is named in the log with what it waits for, and again as it ends.
+    fn hold_for_decodes(&self, m: &RgfxCommandBuffer, take: &Take) {
+        let (queue, seqno) = (m.queue_obj_id, m.header.seqno);
+        let blocks = take.uses.iter().map(|u| u.block_offset);
+        let ahead = self.shared.completed_ahead.decodes_for(queue, blocks);
+        let named = take.order.iter().flatten().copied();
+        let after = (self.shared.surface_order.lock()).after_decodes(queue, named.chain(ahead));
+        if after.is_empty() {
+            return;
+        }
+        let own = self.queue_counts(queue).map(|c| Arc::clone(&c.order));
+        let cancel = &self.shared.commit_cancel;
+        let begun = cancel.now();
+        let clock = self.shared.platform.clock();
+        let start = clock.now_mono();
+        // What it waits for, named once past `BEGIN_WAIT_LOGGED`.
+        let mut named_in_log = false;
+        let mut tell = |_: usize| {
+            if named_in_log || clock.now_mono().saturating_duration_since(start) < BEGIN_WAIT_LOGGED
+            {
+                return;
+            }
+            named_in_log = true;
+            let waits: Vec<String> = (after.iter())
+                .filter_map(|(q, marks, s, _)| {
+                    if !marks.commit.committed_through(*s) {
+                        let (taken, committed, _) = marks.progress();
+                        return Some(format!(
+                            "queue {q:#x}'s buffer {s}, not yet committed (the host took that \
+                             queue's buffers through {taken} and committed them through \
+                             {committed})"
+                        ));
+                    }
+                    let values: Vec<String> = (marks.landings_at(*s).iter())
+                        .map(|l| l.value().to_string())
+                        .collect();
+                    (!values.is_empty()).then(|| {
+                        format!(
+                            "queue {q:#x}'s buffer {s}'s decodes, whose sessions have not \
+                             signalled {} (their pictures' planes not yet said written)",
+                            values.join(", ")
+                        )
+                    })
+                })
+                .collect();
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "surface order: queue {queue:#x}'s buffer {seqno} has been held {BEGIN_WAIT_LOGGED:?} \
+                 at its begin for {}, which it comes after; it waits on",
+                waits.join("; ")
+            );
+        };
+        // First, each buffer its ring published that is not yet committed: its walk keeps its
+        // decodes before its commit raises its queue's mark.
+        let uncommitted: Vec<(Arc<Marks>, u64)> = (after.iter())
+            .filter(|(_, marks, s, published)| *published && !marks.commit.committed_through(*s))
+            .map(|(_, marks, s, _)| (Arc::clone(marks), *s))
+            .collect();
+        let until = (Until::Committed, "surface-order-decode");
+        let waited = super::commit_order::wait_telling(
+            &uncommitted,
+            own.as_deref(),
+            cancel,
+            until,
+            &mut tell,
+        );
+        let (mut slept, mut cut) = (waited.slept, waited.cut_short);
+        // Then each decode kept of those committed whose value has not come.
+        let mut planes = false;
+        let ended = |marks: &Marks| {
+            marks.commit.has_ended()
+                || own.as_ref().is_some_and(|own| own.commit.has_ended())
+                || cancel.cut_since(begun)
+        };
+        'decodes: for (_, marks, s, _) in &after {
+            if cut || !marks.commit.committed_through(*s) {
+                continue;
+            }
+            for landing in marks.landings_at(*s) {
+                if landing.over() {
+                    continue;
+                }
+                (planes, slept) = (true, true);
+                let began = reims_vgpu_vulkan::core::long_waits::begin();
+                while !landing.wait(LANDING_WAIT_SLICE_MS) {
+                    if ended(marks) {
+                        cut = true;
+                        break;
+                    }
+                    tell(0);
+                }
+                began.end("surface-order-planes");
+                if cut {
+                    break 'decodes;
+                }
+            }
+        }
+        let took = clock.now_mono().saturating_duration_since(start);
+        if slept {
+            (self.shared.surface_order.lock()).landing_held(took, planes);
+        }
+        if named_in_log {
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "surface order: queue {queue:#x}'s buffer {seqno} began after {took:?}{}",
+                if cut {
+                    ", its hold ended by a queue's end or the device's reset"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
     /// Begins the `COMMAND_BUFFER` `message`, whose completion handler will hold `drain`: opens a
     /// command buffer on the named queue, readies the device caches its `SURFACE_USE` ops use
     /// (filling each that holds an older generation), has it wait on the GPU for the buffers of
@@ -2011,6 +2146,16 @@ impl<P: Platform> GraphicsDecoder<P> {
             && let Some(order) = take.order.as_deref()
         {
             self.wait_for_unwalked(m, order);
+        }
+        // Then the decodes it comes after whose pictures land by the host's own work: until their
+        // planes are said written, so it is committed after the platform's acquire of what the
+        // landing wrote ([`Self::hold_for_decodes`]). Not where an answer on a doorbell's thread
+        // took its ticket already, which answers no buffer such a decode holds.
+        if let Some((m, _, take)) = &parsed
+            && self.mark.get().is_none()
+            && (take.order.is_some() || !take.uses.is_empty())
+        {
+            self.hold_for_decodes(m, take);
         }
         // The buffers of its process's other queues it is committed after, as its `COMMIT_ORDER`
         // names them ([`super::commit_order`]).
@@ -2340,6 +2485,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             )?,
             None => self.walk_ops(ops, &mut cb, &mut events, &mut split)?,
         };
+        // Its decodes that land by the host's own work, kept from now, before its commit raises
+        // its queue's mark, for the buffers of other queues that come after it
+        // ([`super::surface_order`], "A buffer named after a decode whose planes are not yet said
+        // written"), its walk faulted or not: a decode handed over lands all the same.
+        for landing in events.decodes.drain(..) {
+            marks.landing(seqno, landing);
+        }
         if let Err(e) = walked {
             return Ok(Err(e));
         }
@@ -3886,7 +4038,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(OpenEncoder::Video(session)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "video"));
                     };
-                    let landings = &mut events.landings;
+                    let landings = (&mut events.landings, &mut events.decodes);
                     match video::decode_op(tag, body, self, session.session(), cb, landings) {
                         Ok(true) => {}
                         Ok(false) => return Err(unknown_op(tag)),
@@ -6289,10 +6441,13 @@ mod tests {
     }
 
     /// A buffer of another queue that uses a decode's output, begun after the decode's
-    /// completion went at its decode, which the guest's slots then name no more, waits on the GPU
-    /// for the decode's buffer's end as for a buffer it named: for the value of the decode's
-    /// queue's timeline the decode's buffer signals. Counted as a buffer held; one begun after
-    /// that end waits for nothing.
+    /// completion went at its decode, which the guest's slots then name no more, is held at its
+    /// begin until the decode's picture's planes are said written, which its session tells by
+    /// signalling the decode's value (here the test, as the host's landing does); a hold past
+    /// [`BEGIN_WAIT_LOGGED`] is named in the log, with what it waits for, and again as it ends.
+    /// It then waits on the GPU for the decode's buffer's end as for a buffer it named: for the
+    /// value of the decode's queue's timeline the decode's buffer signals. Counted as a buffer
+    /// held and as a begin held for a decode's planes; one begun after that end waits for nothing.
     #[test]
     fn a_reader_of_a_decode_completed_ahead_waits_on_the_gpu_for_its_end() {
         let (mut r, seen, records, _) = video_posting();
@@ -6308,13 +6463,35 @@ mod tests {
             .collect();
         Arc::clone(&seen.landings.lock()[0]).decoded();
         assert_eq!(posted(&records).len(), 1);
+        let planes = seen.events.lock()[0].clone_ref();
+        // Buffer 100's message ends, its commit noted, as its queue's thread notes it.
+        r.dec.end_message();
+        let message = reads_cached_video(200, 1);
+        let mut reader = r.dec.sender(None, super::super::Sinks::default());
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let mut logged = Vec::new();
         let mark = r.p.call_log().mark();
-        assert_eq!(
-            r.dec
-                .decode(&r.device, &reads_cached_video(200, 1))
-                .unwrap(),
-            Ok(())
-        );
+        std::thread::scope(|scope| {
+            let read = scope.spawn(|| reader.decode(&r.p.device(), &message).unwrap());
+            let holds = || {
+                (r.p.call_log().since(mark).iter())
+                    .any(|c| c.obj == planes.id() && c.sel == "waitUntilSignaledValue:timeoutMS:")
+            };
+            let held = crate::graphics::tests::eventually(|| read.is_finished() || holds());
+            assert!(
+                held && !read.is_finished(),
+                "the reader was begun before the decode's planes were said written"
+            );
+            r.p.virtual_clock()
+                .advance(BEGIN_WAIT_LOGGED + Duration::from_millis(20));
+            let named = crate::graphics::tests::eventually(|| {
+                logged.extend(logs.take());
+                (logged.iter()).any(|(_, _, line)| line.contains("has been held"))
+            });
+            assert!(named && !read.is_finished(), "held past 2 s");
+            planes.set_signaled_value(1).unwrap();
+            assert_eq!(read.join().unwrap(), Ok(()));
+        });
         let waits = |r: &super::super::surface_pages::tests::Rig, mark| {
             (event_calls(r, mark).into_iter())
                 .filter(|&(signals, ..)| !signals)
@@ -6327,7 +6504,30 @@ mod tests {
             signals.contains(&(true, event, value)),
             "the decode's buffer signals {event} to {value} at its end: {signals:?}"
         );
-        assert_eq!(r.dec.shared.surface_order.lock().counts().held, 1);
+        let order = r.dec.shared.surface_order.lock().counts();
+        assert_eq!(
+            (
+                order.held,
+                order.landing_holds,
+                order.landing_holds_for_planes
+            ),
+            (1, 1, 1)
+        );
+        logged.extend(logs.take());
+        let held = (logged.iter())
+            .position(|(level, _, line)| {
+                *level == log::Level::Warn
+                    && line.contains("queue 0x9's buffer 1 has been held 2s at its begin")
+                    && line.contains(
+                        "queue 0x1's buffer 1's decodes, whose sessions have not signalled 1",
+                    )
+            })
+            .unwrap_or_else(|| panic!("the hold past 2 s is named: {logged:?}"));
+        assert!(
+            (logged[held..].iter()).any(|(level, _, line)| *level == log::Level::Info
+                && line.contains("queue 0x9's buffer 1 began after")),
+            "its end is named: {logged:?}"
+        );
 
         r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
@@ -6478,6 +6678,9 @@ mod tests {
         );
         Arc::clone(&seen.landings.lock()[0]).decoded();
         assert_eq!(posted(&records).len(), 1);
+        // Its picture's planes said written, as the host's landing signals them: the blit's
+        // begin, held until then, goes on.
+        seen.events.lock()[0].set_signaled_value(1).unwrap();
 
         let surface_use = RgfxOpSurfaceUse {
             block_offset: BLOCK,
@@ -6897,7 +7100,9 @@ mod tests {
     /// fill waits on the GPU for none of its end. Begun first, the reader's end would be among the
     /// fill's waits while the reader waits on the GPU for the decode's signal, which the decode's
     /// commit carries after its walk, and the walk waits on the CPU for that fill: neither would
-    /// ever finish. The begin's wait is counted, and no fill behind a later buffer is
+    /// ever finish. The begin's wait is counted, and no fill behind a later buffer is. (The
+    /// reader is then held for the decode's picture's planes until they are said written,
+    /// [`a_reader_named_after_a_decode_is_committed_once_its_planes_are_said_written`].)
     #[test]
     fn a_buffer_naming_a_decode_not_yet_walked_begins_after_its_commit() {
         use super::super::surface_pages::tests::BLOCK;
@@ -6957,6 +7162,9 @@ mod tests {
                 Ok(())
             );
             first.end_message();
+            // Its picture's planes said written, as the host's landing signals them: the reader,
+            // held at its begin until then, goes on.
+            seen.events.lock()[0].set_signaled_value(1).unwrap();
             assert_eq!(taken_first.join().unwrap(), Ok(()));
         });
         p.world().complete_all(CompleteOn::Caller);
@@ -7144,6 +7352,15 @@ mod tests {
             event.set_signaled_value(1).unwrap();
             assert_eq!(reading.join().unwrap(), Ok(()));
         });
+        let order = r.dec.shared.surface_order.lock().counts();
+        assert_eq!(
+            (
+                order.landing_holds,
+                order.landing_holds_for_planes,
+                order.unpublished
+            ),
+            (1, 1, 0)
+        );
         let calls = p.call_log().since(mark);
         let written = (calls.iter())
             .position(|c| c.obj == event.id() && c.sel == "setSignaledValue:")
