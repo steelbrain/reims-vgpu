@@ -142,6 +142,19 @@ fn is_asked(size: (i32, i32), asked: (i32, i32)) -> bool {
     (size.0 - asked.0).abs() <= 1 && (size.1 - asked.1).abs() <= 1
 }
 
+/// The layout of a window of `bounds` points at `density` pixels a point, inside `insets`, for
+/// the guest's `mode` ([`geometry::layout`]), on a screen of the scale `screen_scale` answers for
+/// that density ([`os::screen_scale`]), which the guest is told.
+pub(crate) fn window_layout(
+    bounds: (f64, f64),
+    density: f64,
+    insets: geometry::Insets,
+    mode: Option<(u16, u16)>,
+    screen_scale: impl FnOnce(f64) -> f64,
+) -> Layout {
+    geometry::layout(bounds, density, insets, mode).on_screen_of(screen_scale(density))
+}
+
 /// Opens `window`'s SDL window (the module doc), unless the window has ended.
 pub(crate) fn open(window: &Arc<Window>) {
     if window.is_closed() || with_shell(window.id(), |_| ()).is_some() {
@@ -460,8 +473,9 @@ impl Shell {
             return;
         };
         let insets = os::insets(self);
-        let layout = geometry::layout(bounds, density, insets, self.window.mode())
-            .on_screen_of(os::screen_scale(self, density));
+        let layout = window_layout(bounds, density, insets, self.window.mode(), |density| {
+            os::screen_scale(self, density)
+        });
         if layout != self.layout || density.to_bits() != self.density.to_bits() {
             log::debug!(
                 target: "reims_vgpu_window",

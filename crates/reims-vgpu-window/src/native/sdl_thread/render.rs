@@ -36,7 +36,7 @@ use reims_vgpu_vulkan::os::OsThreads;
 use sdl3_sys::everything::{SDL_Vulkan_CreateSurface, SDL_Window};
 
 use crate::geometry::Layout;
-use crate::handle::{DrawnOverlay, Window};
+use crate::handle::{DrawnCursor, DrawnOverlay, Window};
 use crate::present::{Presenting, RETRY, VulkanTarget};
 
 /// The render thread's stack: 8 MiB, as the process's main thread has. The render thread's
@@ -287,10 +287,9 @@ fn run(window: &Window) {
         }
         let cursor = window.drawn_cursor();
         let overlay = surface.overlay();
-        if presenting.draw(
-            work.layout.drawable,
-            work.layout.screen_scale,
-            work.layout.pixels,
+        if draw(
+            &mut presenting,
+            &work.layout,
             cursor.as_ref(),
             overlay.as_ref(),
         ) {
@@ -305,6 +304,24 @@ fn run(window: &Window) {
     drop(presenting);
     let id = window.id();
     super::ui::post(move || crate::sdl::shell::released(id));
+}
+
+/// Has `presenting` draw the frame into `layout`'s drawable, over its pixels, at the scale the
+/// guest is told of its screen ([`Layout::screen_scale`]), with `cursor` and `overlay` over it:
+/// whether to draw again after [`RETRY`].
+fn draw(
+    presenting: &mut Presenting,
+    layout: &Layout,
+    cursor: Option<&DrawnCursor>,
+    overlay: Option<&DrawnOverlay>,
+) -> bool {
+    presenting.draw(
+        layout.drawable,
+        layout.screen_scale,
+        layout.pixels,
+        cursor,
+        overlay,
+    )
 }
 
 #[cfg(test)]
