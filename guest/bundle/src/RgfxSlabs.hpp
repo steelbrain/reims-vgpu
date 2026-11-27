@@ -37,12 +37,14 @@
  * THE SIZES. A buffer of up to kSmallMax bytes takes a range of one of its class's slabs, first
  * fit over the slabs in the order they were made, so older slabs fill first and newer ones empty.
  * A class's slabs grow from kSlabFirst, doubling, to kSlabMax, and are never smaller than twice
- * the buffer that makes one. A larger buffer takes a slab of its own (dedicated), its length
- * rounded up to the source's unit; once freed, that slab is cached for a later buffer of the same
- * class that needs at least half of it, oldest let go first past a sixteenth of the source's
- * capacity, and let go after kCacheIdleMs unused. A first source, or the own source where no
- * first is set, may say larger limits of its own (smallMax, slabMax), which hold for its slabs;
- * the region's slabs keep these.
+ * the buffer that makes one; a class left with no slab, none holding a buffer and none kept,
+ * starts again from kSlabFirst, so a buffer that comes once its class's slabs went takes a slab of
+ * kSlabFirst, or of twice its own size, not of the largest size the class grew to. A larger buffer
+ * takes a slab of its own (dedicated), its length rounded up to the source's unit; once freed,
+ * that slab is cached for a later buffer of the same class that needs at least half of it, oldest
+ * let go first past a sixteenth of the source's capacity, and let go after kCacheIdleMs unused. A
+ * first source, or the own source where no first is set, may say larger limits of its own
+ * (smallMax, slabMax), which hold for its slabs; the region's slabs keep these.
  *
  * CHUNKED SLABS GROW. Where the kext gives chunks, a class's slabs of the process's own pages
  * grow past 2 MiB, doubling, to kChunkedSlabMax (16 MiB), each one heap over its block, and a
@@ -633,7 +635,7 @@ private:
 	struct Class {
 		std::vector<Slab *> slabs;           // its slabs of small buffers
 		std::set<Slab *, BySerial> open;     // of them, those with free bytes
-		uint64_t nextSize = kSlabFirst;
+		uint64_t nextSize = kSlabFirst; // kSlabFirst again once it holds no slab (doom)
 		unsigned empty = 0;
 	};
 

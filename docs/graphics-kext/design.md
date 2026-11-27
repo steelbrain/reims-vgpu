@@ -4938,8 +4938,10 @@ the host's import, and the kext's block table holds one entry per slab:
   one made with bytes, and none for one over the app's own memory, which its
   program wrote ("Managed storage", below).
 - A buffer up to 1 MiB shares a slab of its class, the slabs growing from
-  128 KiB to 2 MiB; a larger one takes a slab of its own, which is cached for
-  reuse at offset 0 once freed (a sixteenth of the region at most, 2 s idle).
+  128 KiB to 2 MiB, and a class left with no slab, none holding a buffer and
+  none kept, starts again at 128 KiB; a larger one takes a slab of its own,
+  which is cached for reuse at offset 0 once freed (a sixteenth of the region
+  at most, 2 s idle).
 - A class keeps two empty slabs, each for 2 s at most, so a process at rest
   holds only the slabs its buffers lie in. A slab let go destroys its heap,
   then frees its block on the background thread, so no buffer's free waits

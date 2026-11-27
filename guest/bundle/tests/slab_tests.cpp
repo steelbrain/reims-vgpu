@@ -1872,10 +1872,11 @@ void test_pool_slab_source()
 	CHECK(kext.blocks.empty() && slabs.stats().slabs == 0);
 	CHECK(slabs.churn().emptyLetGo == 2 && slabs.churn().refilled == 1);
 	CHECK(pool.takes().given == 3 && pool.takes().taken == 3);
-	// A later buffer of the class takes a block again, kept once it goes.
+	// A later buffer of the class takes a block again, of the class's first size, as the class
+	// holds no slab (THE SIZES), kept once it goes.
 	RgfxSlabs::Range later;
 	CHECK(slabs.take(0x1000, kShared, 0, &later) && log.size() == 7);
-	CHECK(log.back().rfind("take ", 0) == 0 && kext.blocks.size() == 1);
+	CHECK(log.back() == "take 131072" && kext.blocks.size() == 1);
 	drain();
 	slabs.give(later);
 	CHECK(log.size() == 7 && slabs.stats().emptySlabs == 1);
@@ -2012,10 +2013,10 @@ void test_pool_slab_source_at_host_addresses()
 	                 {"destroy " + std::to_string(heap.obj_id), "give 131072"}));
 
 	// A host address where a pick of the process's starts: the heap's drop leaves the pick held.
-	// (The class's next slab may be larger than its first: the give names the take's size.)
+	// (The class holds no slab, so its next is of its first size again: THE SIZES.)
 	kext.gpuBase = picked - Pool::kUnit;
 	RgfxSlabs::Range c;
-	CHECK(slabs.take(0x1000, kShared, 0, &c) && log.back().rfind("take ", 0) == 0);
+	CHECK(slabs.take(0x1000, kShared, 0, &c) && log.back() == "take 131072");
 	const std::string took = log.back().substr(5);
 	auto cheap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_POOL);
 	CHECK(cheap.region_offset == Pool::kUnit && cheap.gpu_address == picked);
@@ -2201,6 +2202,81 @@ void test_pool_slab_churn_is_bounded()
 	drain();
 }
 
+// A class left with no slab, none holding a buffer and none kept, grows from its first size again
+// (THE SIZES): a buffer that comes once its class's slabs went takes a slab of 128 KiB, not of the
+// largest size the class grew to. While the class keeps an empty slab, a new one goes on at the
+// size it grew to. Over the test's own source, and over the Shared pool's.
+void test_slab_class_starts_again_once_empty()
+{
+	Source source(64 * kMiB);
+	RgfxSlabs slabs(source);
+	auto lastTake = [&]() -> std::string {
+		for (auto it = source.log.rbegin(); it != source.log.rend(); ++it) {
+			if (it->rfind("take ", 0) == 0)
+				return *it;
+		}
+		return "";
+	};
+	// Slabs of 128 KiB, 256, 512, 1 MiB, then 2 MiB; all emptied, the first two kept.
+	std::vector<RgfxSlabs::Range> held;
+	while (source.takes < 7) {
+		RgfxSlabs::Range r;
+		CHECK(slabs.take(0x10000, kShared, 0, &r));
+		held.push_back(r);
+	}
+	CHECK(lastTake() == "take 2097152");
+	for (auto &r : held)
+		slabs.give(r);
+	CHECK(slabs.stats().emptySlabs == 2 && slabs.stats().slabs == 2);
+	// A buffer neither kept slab holds takes a new slab of 2 MiB, the size the class grew to; a
+	// third empty slab, it goes with its buffer.
+	RgfxSlabs::Range wide;
+	CHECK(slabs.take(0x60000, kShared, 0, &wide) && lastTake() == "take 2097152");
+	CHECK(source.takes == 8);
+	slabs.give(wide);
+	CHECK(slabs.stats().slabs == 2);
+	// Once the kept slabs go too, the class starts again at 128 KiB, and grows from there.
+	CHECK(slabs.reclaim() && slabs.stats().slabs == 0);
+	RgfxSlabs::Range again, more;
+	CHECK(slabs.take(0x1000, kShared, 0, &again) && lastTake() == "take 131072");
+	CHECK(slabs.take(0x20000, kShared, 0, &more) && lastTake() == "take 262144");
+	CHECK(source.takes == 10);
+	slabs.give(again);
+	slabs.give(more);
+
+	// The pool's: a 4 MiB buffer's slab of 8 MiB, kept once empty and taken from again; once it
+	// went, a buffer of a page takes a block of 128 KiB, not of 16 MiB.
+	using Pool = RgfxPoolSlabSource;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PoolKext kext(64 * kMiB, &log, &ring);
+	RgfxPoolMemory calls;
+	calls.context = &kext;
+	calls.take = &PoolKext::take;
+	calls.give = &PoolKext::give;
+	Pool pool(region, ser, calls, kPoolCapacity);
+	RgfxSlabs poolSlabs(pool);
+	RgfxSlabs::Range big, after, small;
+	CHECK(poolSlabs.take(4 * kMiB, kShared, 0, &big) && log.back() == "take 8388608");
+	poolSlabs.give(big);
+	CHECK(poolSlabs.take(0x1000, kShared, 0, &after) && after.slab == big.slab && log.size() == 1);
+	poolSlabs.give(after);
+	CHECK(poolSlabs.reclaim() && kext.blocks.empty() && log.back() == "give 8388608");
+	CHECK(poolSlabs.take(0x1000, kShared, 0, &small) && log.back() == "take 131072");
+	poolSlabs.give(small);
+	CHECK(poolSlabs.reclaim() && kext.blocks.empty());
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (ring.next(&h, &bytes)) {
+	}
+}
+
 } // namespace
 
 void rgfxSlabTests()
@@ -2230,4 +2306,5 @@ void rgfxSlabTests()
 	test_pool_slab_source_at_host_addresses();
 	test_pool_managed_buffers_at_their_copies();
 	test_pool_slab_churn_is_bounded();
+	test_slab_class_starts_again_once_empty();
 }

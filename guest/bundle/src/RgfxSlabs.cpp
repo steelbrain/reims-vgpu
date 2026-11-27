@@ -784,6 +784,9 @@ void RgfxSlabs::doom(Slab *slab)
 		auto it = std::find(cls.slabs.begin(), cls.slabs.end(), slab);
 		if (it != cls.slabs.end())
 			cls.slabs.erase(it);
+		// A class with no slab left, live or kept, grows from its first size again (THE SIZES).
+		if (cls.slabs.empty())
+			cls.nextSize = kSlabFirst;
 		if (slab->used == 0) {
 			if (cls.empty > 0)
 				cls.empty--;
