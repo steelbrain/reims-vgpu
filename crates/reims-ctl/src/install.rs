@@ -501,6 +501,52 @@ mod tests {
         assert_eq!(left, [&builds[2], &builds[3], &builds[4]]);
     }
 
+    /// QEMU's configure gets the library's pkg-config directory first and the shell's own
+    /// PKG_CONFIG_PATH after it (pull request 186): where pkg-config finds the host's libraries
+    /// only through that variable (NixOS in a nix-shell), a configure handed the library's
+    /// directory alone found no glib-2.0 and stopped. With none in the shell, the library's
+    /// directory alone, with no empty entry. The script's configure line is the one after its
+    /// "Configuring QEMU" message, run here with a configure that prints what it was handed.
+    #[test]
+    fn qemus_configure_keeps_the_shells_pkg_config_path_after_the_librarys() {
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let text =
+            std::fs::read_to_string(Path::new(&manifest).join("../../scripts/install-ctl.sh"))
+                .unwrap();
+        let at = text
+            .find("say \"Configuring QEMU\"\n")
+            .expect("the script's configure step");
+        let line = text[at..].lines().nth(1).expect("the configure line");
+        assert!(line.contains("\"${CONFIGURE[@]}\""), "{line}");
+        let configure = |shell: Option<&str>| {
+            let mut bash = std::process::Command::new("bash");
+            bash.arg("-c")
+                .arg(format!(
+                    "set -euo pipefail\nBUILD=.\nPC=/dist/lib/pkgconfig\n\
+                     CONFIGURE=(printenv PKG_CONFIG_PATH)\n{line}\n"
+                ))
+                .env("MSYSTEM", "CLANG64")
+                .env("CHERE_INVOKING", "1");
+            match shell {
+                Some(path) => bash.env("PKG_CONFIG_PATH", path),
+                None => bash.env_remove("PKG_CONFIG_PATH"),
+            };
+            let out = bash.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(
+            configure(Some("/nix/store/glib/lib/pkgconfig")),
+            "/dist/lib/pkgconfig:/nix/store/glib/lib/pkgconfig\n"
+        );
+        assert_eq!(configure(None), "/dist/lib/pkgconfig\n");
+    }
+
     /// Runs `body` in bash with the installer's `set_aside` and `put_back` defined, in `dir`;
     /// returns its standard output.
     fn with_set_aside(dir: &Path, body: &str) -> String {
