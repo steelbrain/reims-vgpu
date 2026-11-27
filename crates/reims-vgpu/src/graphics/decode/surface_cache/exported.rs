@@ -894,13 +894,18 @@ impl<P: Platform> SurfaceCaches<P> {
     /// hold their make's zeros where a decode took their first fill as met
     /// ([`super::SurfaceCache::zeros`]) as a command buffer that used them finishes, and that
     /// owe zeros: no decode answered a picture over them, so none is drawn, and the caller
-    /// clears them to the zeros a fill would have left before the buffer's commit (module doc).
-    pub(super) fn undrawn(&self, counts: &[super::Count]) -> Vec<Arc<DrawnPlanes>> {
+    /// clears them to the zeros a fill would have left before the buffer's commit, and says them
+    /// written to the surface's memory, which each comes with (module doc).
+    pub(super) fn undrawn(
+        &self,
+        counts: &[super::Count],
+    ) -> Vec<(Arc<DrawnPlanes>, Arc<dyn ImportedSurfaceMemory>)> {
         (counts.iter())
             .filter_map(|count| {
                 let cache = self.by_block.get(&count.block)?;
                 let made = cache.surface.made.as_ref().filter(|_| cache.zeros)?;
-                made.drawn.owes_zeros().then(|| Arc::clone(&made.drawn))
+                (made.drawn.owes_zeros())
+                    .then(|| (Arc::clone(&made.drawn), Arc::clone(&made.memory)))
             })
             .collect()
     }
@@ -1195,12 +1200,23 @@ mod drawn_tests {
     use super::super::tests::cached;
     use super::*;
 
-    /// The memory of the rig's surface, whose writes the tests make none of.
-    struct Unwritten;
+    /// The memory of the rig's surface: how many times its planes were said written.
+    #[derive(Default)]
+    struct Told {
+        done: std::sync::atomic::AtomicUsize,
+    }
 
-    impl ImportedSurfaceMemory for Unwritten {
+    impl ImportedSurfaceMemory for Told {
         fn external_writes_done(&self) -> Result<(), String> {
+            self.done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    impl Told {
+        /// How many times the planes were said written.
+        fn times(&self) -> usize {
+            self.done.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1223,9 +1239,9 @@ mod drawn_tests {
 
     /// The rig's cache made for the host's video, its surface's planes over the Direct3D 11
     /// textures `draw` makes, its plane shapes owing their fills from the buffer, as
-    /// [`SurfaceCaches::add_drawn_planes`] leaves a new surface's: the textures, and the CPU
-    /// generation of the first fill the cache owes.
-    fn drawn_cache(r: &Rig, draw: &Arc<PlaneDraw>) -> (Arc<DrawnPlanes>, u64) {
+    /// [`SurfaceCaches::add_drawn_planes`] leaves a new surface's: the textures, the CPU
+    /// generation of the first fill the cache owes, and the surface's memory.
+    fn drawn_cache(r: &Rig, draw: &Arc<PlaneDraw>) -> (Arc<DrawnPlanes>, u64, Arc<Told>) {
         let drawn = Arc::new(DrawnPlanes::new(draw, (64, 48), false).expect("the textures"));
         let images: [<FakePlatform as Platform>::Texture; 2] = std::array::from_fn(|n| {
             let desc = r.p.texture_descriptor(&TextureDesc {
@@ -1259,13 +1275,14 @@ mod drawn_tests {
                     .insert_drawn_plane(key, image.clone_ref(), true, 0),
             );
         }
+        let memory = Arc::new(Told::default());
         cache.surface.made = Some(DrawnSurface {
             planes: images,
-            memory: Arc::new(Unwritten),
+            memory: Arc::clone(&memory) as Arc<dyn ImportedSurfaceMemory>,
             drawn: Arc::clone(&drawn),
             life: MemoryLife::new(),
         });
-        (drawn, owed)
+        (drawn, owed, memory)
     }
 
     /// The use of a decode that writes the rig's block at CPU generation `cpu_gen`.
@@ -1308,7 +1325,7 @@ mod drawn_tests {
     fn a_decode_into_a_new_drawn_cache_fills_no_plane_shape_and_waits_for_none() {
         let r = cached();
         let draw = Arc::new(PlaneDraw::new(None).expect("the plane draws"));
-        let (drawn, owed) = drawn_cache(&r, &draw);
+        let (drawn, owed, _) = drawn_cache(&r, &draw);
         let queue = r.device.new_command_queue().unwrap();
         let cb = queue.command_buffer(ON).unwrap().unwrap();
         let caches = &r.dec.surface_caches;
@@ -1418,16 +1435,17 @@ mod drawn_tests {
     }
 
     /// Where such a decode answers nothing at all, its command buffer's finish clears the
-    /// textures to the zeros they owe; where it answers no picture, the cache's first fill is
-    /// made, which fills the plane shapes from the buffer: either way the textures owe nothing
-    /// after the finish
+    /// textures to the zeros they owe and says them written to the surface's memory, before the
+    /// commit; where it answers no picture, the cache's first fill is made, which fills the plane
+    /// shapes from the buffer, and nothing writes the textures: either way the textures owe
+    /// nothing after the finish
     #[test]
     #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
     fn a_drawn_cache_no_picture_lands_in_owes_nothing_after_the_finish() {
         let draw = Arc::new(PlaneDraw::new(None).expect("the plane draws"));
         for answer in [None, Some(false)] {
             let r = cached();
-            let (drawn, owed) = drawn_cache(&r, &draw);
+            let (drawn, owed, memory) = drawn_cache(&r, &draw);
             let queue = r.device.new_command_queue().unwrap();
             let cb = queue.command_buffer(ON).unwrap().unwrap();
             let caches = &r.dec.surface_caches;
@@ -1437,8 +1455,19 @@ mod drawn_tests {
             if let Some(picture) = answer {
                 caches.decoded(Some(&r.device), BLOCK, picture).unwrap();
             }
-            (caches.finish(&r.device, 7, None, &cb, uses.unwrap(), || cb.commit(ON))).unwrap();
+            let told = std::cell::Cell::new(None);
+            let commit = || {
+                told.set(Some(memory.times()));
+                cb.commit(ON)
+            };
+            (caches.finish(&r.device, 7, None, &cb, uses.unwrap(), commit)).unwrap();
             assert!(!drawn.owes_zeros(), "{answer:?}: owed after the finish");
+            let cleared = usize::from(answer.is_none());
+            assert_eq!(
+                told.get(),
+                Some(cleared),
+                "{answer:?}: the planes said written before the commit"
+            );
             let filled = r.dec.caches().counts().shapes.fills;
             let expected = if answer.is_some() { 2 } else { 0 };
             assert_eq!(filled, expected, "{answer:?}: the plane shapes filled");

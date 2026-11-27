@@ -24,7 +24,10 @@
 //! to zeros first where its picture is smaller than the planes (reims-vgpu-video's
 //! `PlaneTargets::owe_zeros`). Where no picture is drawn, they are cleared alone
 //! ([`DrawnPlanes::unwritten`]): a draw that fails, before the CPU's copy, and a command buffer
-//! whose decode answered nothing, at its finish. A fill of the shapes from the buffer since
+//! whose decode answered nothing, at its finish. Each such clear is waited for and then said
+//! written to the surface's memory (`ImportedSurfaceMemory::external_writes_done`), as a draw's
+//! writes are, before the CPU's copy or the command buffer's commit that follows it, so that the
+//! platform's later uses of the planes see the zeros. A fill of the shapes from the buffer since
 //! leaves them owing nothing ([`DrawnPlanes::filled`]). A picture smaller than the planes owes
 //! the zeros whatever the textures held, another picture's: its draw clears them first, so that
 //! no texel past it keeps what it held (`video_host`'s module docs, "A short picture").
@@ -84,10 +87,15 @@ impl DrawnPlanes {
 
     /// Draws `frame`'s crop into the textures once its decode is done, telling `decoded` between
     /// the two (the module doc), over zeros where the crop is smaller than them, and counts it.
-    /// `Err` says why it was not drawn, the textures
-    /// cleared to the zeros they owe first ([`Self::unwritten`]), counted ([`UNDRAWN_CODE`]);
-    /// `decoded` is told only of a decode that is done.
-    pub(crate) fn draw(&self, frame: &Frame, decoded: &mut dyn FnMut()) -> Result<(), String> {
+    /// `Err` says why it was not drawn, the textures cleared to the zeros they owe first and
+    /// said written to `memory`, the surface's ([`Self::not_drawn`]); `decoded` is told only of
+    /// a decode that is done.
+    pub(crate) fn draw(
+        &self,
+        frame: &Frame,
+        memory: &dyn ImportedSurfaceMemory,
+        decoded: &mut dyn FnMut(),
+    ) -> Result<(), String> {
         let drawn = frame
             .sync()
             .map_err(|error| error.to_string())
@@ -103,8 +111,7 @@ impl DrawnPlanes {
                     .draw(&texture, frame.crop_origin(), &self.targets, extent)
             });
         if let Err(why) = drawn {
-            self.unwritten();
-            return Err(undrawn(why));
+            return Err(self.not_drawn(memory, why));
         }
         reims_vgpu_vulkan::answer::count_kind(DRAWN_CODE);
         reims_vgpu_vulkan::answer::count_kind_by(DRAWN_KIB_CODE, crop_bytes(frame) >> 10);
@@ -128,14 +135,32 @@ impl DrawnPlanes {
         self.targets.owes_zeros()
     }
 
+    /// A picture whose draw failed, `why`: the textures cleared to the zeros they owe and said
+    /// written to `memory` ([`Self::unwritten`]) before the CPU's copy lands the picture, and
+    /// the picture counted ([`UNDRAWN_CODE`]). Answers `why`.
+    fn not_drawn(&self, memory: &dyn ImportedSurfaceMemory, why: String) -> String {
+        self.unwritten(memory);
+        undrawn(why)
+    }
+
     /// Clears the textures to the zeros they owe, where no picture is drawn into them (the module
-    /// doc), and returns once the GPU did; nothing where they owe none. A failure is logged.
-    pub(crate) fn unwritten(&self) {
+    /// doc), and returns once the GPU did; nothing where they owe none. Then says them written to
+    /// `memory`, the surface's, so that the platform's later uses of the planes see what the
+    /// clear wrote. A failure of either is logged; a clear that failed is not said written.
+    pub(crate) fn unwritten(&self, memory: &dyn ImportedSurfaceMemory) {
         if let Err(why) = self.draw.zero_owed(&self.targets) {
             log::warn!(
                 target: "reims_vgpu::graphics", kind:% = why;
                 "a video cache's Direct3D 11 textures were not cleared to the zeros they owe: \
                  {why}"
+            );
+            return;
+        }
+        if let Err(why) = memory.external_writes_done() {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = why;
+                "a video cache's Direct3D 11 textures, cleared to the zeros they owe, were not \
+                 said written to the platform: {why}"
             );
         }
     }
@@ -185,7 +210,37 @@ impl<P: Platform> DrawnTarget<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    /// A surface's memory: how many times its planes were said written.
+    #[derive(Default)]
+    struct Told(AtomicUsize);
+
+    impl ImportedSurfaceMemory for Told {
+        fn external_writes_done(&self) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A picture whose draw failed has the textures cleared to the zeros they owe, and then says
+    /// them written to the surface's memory, once, before the CPU's copy lands it (the module
+    /// doc); the picture is counted not drawn, and its draw's why is what the landing logs.
+    #[test]
+    #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+    fn a_picture_not_drawn_says_its_zeros_written_to_the_surface() {
+        let draw = Arc::new(PlaneDraw::new(None).expect("the plane draws"));
+        let drawn = DrawnPlanes::new(&draw, (64, 48), false).expect("the textures");
+        drawn.fill_taken();
+        assert!(drawn.owes_zeros(), "owed before");
+        let memory = Told::default();
+        let why = drawn.not_drawn(&memory, "the draw failed".to_owned());
+        assert_eq!(why, "the draw failed");
+        assert!(!drawn.owes_zeros(), "the zeros written");
+        assert_eq!(memory.0.load(Ordering::SeqCst), 1, "said written once");
+    }
 
     /// Each picture not drawn is counted by its code, one a picture, in the degradation counts,
     /// and its draw's why is what the landing logs (the module doc).

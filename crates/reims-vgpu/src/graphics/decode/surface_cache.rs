@@ -8076,11 +8076,11 @@ impl<P: Platform> Caches<P> {
         };
         let (signalled, buffers) = signalled;
         // Textures no picture is drawn into are cleared to the zeros they owe before the commit,
-        // with the lock let go of, so every later use of their caches reads them
-        // (`exported::undrawn`).
+        // with the lock let go of, and said written to their surfaces' memory, so every later
+        // use of their caches reads them (`exported::undrawn`).
         #[cfg(windows)]
-        for drawn in undrawn {
-            drawn.unwritten();
+        for (drawn, memory) in undrawn {
+            drawn.unwritten(&*memory);
         }
         let done = signalled.and_then(|()| commit());
         if done.is_ok() {

@@ -1658,7 +1658,7 @@ impl<P: Platform> HostPicture<P> for VaPicture<P> {
         #[cfg(windows)]
         let undrawn = match (&to.luma.drawn, &to.chroma.drawn) {
             (Some(luma), Some(_)) => {
-                match luma.planes.draw(&self.frame, &mut || to.decode_done()) {
+                match (luma.planes).draw(&self.frame, &*luma.memory, &mut || to.decode_done()) {
                     Ok(()) => {
                         luma.memory.external_writes_done()?;
                         return Ok(());
