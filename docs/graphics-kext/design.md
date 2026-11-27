@@ -1851,7 +1851,14 @@ Stages:
     - **The answers are the host's arms'.** `decs` lists one decoder for
       each codec the caps decode, `dcap` its profiles and level from the
       caps' entry; a codec the host lacks is not listed, so VideoToolbox
-      decodes it in software as on a Mac without it. A create of a listed
+      decodes it in software as on a Mac without it. AV1 is listed with no
+      entry in the caps, which carry what an x86-64 guest's AppleGVA reads,
+      and AppleGVA decodes no AV1: where the arm's own query lists AV1's
+      Main profile, `decs` lists `av01`, `dcap` profile 0 at level 19 (6.3,
+      the top level an M3's own AV1 decoder lists), and a stream of another
+      profile is refused at its session's start, as no output format holds
+      its frames whole ([devices.md](../video/devices.md), "AV1 on arm64
+      guests"). A create of a listed
       decoder starts a decoder session (`reims_vgpu_video::paravirt`'s
       `decoder`), whose pictures the host's video arm decodes and lands in
       the surface the guest lent for each (`crates/reims-vgpu/src/graphics/vt.rs`;
@@ -1900,7 +1907,8 @@ Stages:
       each tile or frame, and every tile a session takes lands in the
       format its `TDrs` names. The refusal's warning names the stream and
       why: the codec's refusal or the arm's decline, its codec, its
-      profile (HEVC's `general_profile_idc`, H.264's `profile_idc`), its
+      profile (HEVC's `general_profile_idc`, H.264's `profile_idc`, AV1's
+      `seq_profile`), its
       `chroma_format_idc`, its luma and chroma bit depths and its coded
       size, written for the first stream of each codec, profile, chroma
       format and depths in a boot, and counted for the rest. On arm64 macOS 26.6.2 under TCG on a 780M host

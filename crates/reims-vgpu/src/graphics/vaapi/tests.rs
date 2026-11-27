@@ -920,6 +920,7 @@ pub(super) fn each_picture(
             let frames = match &mut decoder {
                 Codec::H264(d) => d.decode(unit, id),
                 Codec::Hevc(d) => d.decode(unit, id),
+                Codec::Av1(d) => d.decode(unit, id),
             };
             let frames = match frames {
                 Ok(frames) => frames,

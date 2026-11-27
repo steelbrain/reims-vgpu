@@ -197,6 +197,7 @@ impl Guest {
         let (fourcc, profiles, max_level) = match codec {
             Codec::H264 => (*b"avc1", vec![66, 77, 100], 52),
             Codec::Hevc => (*b"hvc1", vec![1, 2, 3], 156),
+            Codec::Av1 => (*b"av01", vec![0], 19),
         };
         let decoders = vec![Decoder {
             codec,
@@ -1284,3 +1285,5 @@ fn a_tile_that_does_not_decode_is_emitted_with_its_status_and_the_next_gets_the_
     assert_eq!(calls.len(), 2);
     assert!(calls.iter().all(|(sets, _, _)| *sets == annex_b_sets()));
 }
+
+mod av1;

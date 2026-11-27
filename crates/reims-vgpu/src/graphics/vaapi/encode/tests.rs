@@ -818,6 +818,7 @@ fn a_guest_encoder_encodes_the_frames_of_the_surfaces_it_is_lent() {
         let codec = match encoder.codec {
             Codec::H264 => RGFX_VIDEO_CODEC_H264,
             Codec::Hevc => RGFX_VIDEO_CODEC_HEVC,
+            Codec::Av1 => unreachable!("no arm encodes AV1"),
         };
         let units: Vec<Vec<u8>> = (samples.iter())
             .map(|s| annex_b(codec, s.configuration.as_deref(), &s.data).unwrap())

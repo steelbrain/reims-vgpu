@@ -44,8 +44,9 @@ AppleGVA no video driver; where the guest took `RGFX_FEATURE_VT_MESSAGES` and th
 decoder, it publishes VideoToolbox's paravirtualization service, and the guest's VideoToolbox
 registers each decoder and encoder the host lists, running each session as `VT_MESSAGE`s on
 ring 0. The host lists a decoder for each H.264 or HEVC decode entry of the caps (`vt_features`
-and the decoder list beside it in `graphics.rs`), and an encoder for each codec its arm encodes a
-profile of (`guest_encoders` in `graphics/vaapi.rs` and `graphics/nvidia.rs`). So on a Linux host
+and the decoder list beside it in `graphics.rs`), an AV1 decoder where the arm decodes AV1
+("AV1 on arm64 guests", below), and an encoder for each codec its arm encodes a profile of
+(`guest_encoders` in `graphics/vaapi.rs` and `graphics/nvidia.rs`). So on a Linux host
 an arm64 guest decodes H.264 and HEVC and encodes H.264 and HEVC Main and Main 10 in hardware; on
 a Windows host it decodes alone, as the Windows arm answers no encoder. Its decoders land 4:2:0
 pictures, and HEVC's range extensions, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits, where the
@@ -62,6 +63,85 @@ AppleGVA's vendor driver serves is x86-64's: with its keys an arm64 macOS 14.6.1
 VA-API host answered `VTIsHardwareDecodeSupported` true for HEVC, while a session requiring a
 hardware HEVC decoder failed −17692, one requiring H.264 −12906, and no session reached the
 host (measured 2026-11-16).
+
+### AV1 on arm64 guests
+
+An arm64 guest's VideoToolbox gets an AV1 decoder where the arm's own capability query lists
+AV1's Main profile: VA-API's `VAProfileAV1Profile0` decoder (`av1_limits` in the video crate's
+`vaapi::va::av1`), or NVDEC's `cudaVideoCodec_AV1` at 4:2:0 (`graphics/nvidia.rs`). Each arm
+logs it at info (`hardware video: ...: AV1 for VideoToolbox's decoders, Main at 8 and 10 bits
+up to 8192x4352`, radeonsi's on the RX 7900 XTX). The
+decoder list names `av01` with profile 0 at level 19, AV1's 6.3, the top level Apple's own AV1
+decoder lists (`VTCopyAV1DecoderCapabilitiesDictionary` on an M3 Max, macOS 27.0.1, measured
+2026-11-27: `VTMaxDecodeLevel` 19 for profiles 0, 1 and 2). The device's caps list no AV1, as
+the x86-64 guest's video driver, AppleGVA, decodes none (its strings name no AV1), so AV1's
+number among an arm's codecs, `HOST_VIDEO_CODEC_AV1` (`graphics/av1.rs`), is the host's own
+and reaches no guest: the wire, the caps and the option ROM are unchanged, and the host offers
+an x86-64 guest no AV1 decoder.
+
+A session's `av1C` record is read as H.264's and HEVC's records are
+(`paravirt/decoder/av1.rs`): the stream is told by the sequence header among its `configOBUs`,
+or by the record's own fields where it carries none, and lands in `420v` or `420f` at 8 bits
+and in `x420` or `xf20` at 10, by its range. Each sample, a temporal unit, goes to the arm
+whole, and the video crate's AV1 decoder (`codec::av1`) reads its OBUs, the sequence and frame
+headers and the tile groups, keeps the eight reference slots, and hands the hardware each
+frame's tile data.
+
+Profile 0 (Main) alone is listed. High (profile 1) is 4:4:4, which neither arm's AV1 decoder
+lands. Professional (profile 2) is 4:2:2 below 12 bits (the AV1 specification, 5.5.2) and
+4:2:0 only at 12 bits, which the guest's output formats, two planes of 10 bits at most, would
+cut by two bits; of the lab's cards only the RX 7900 XTX's radeonsi lists Professional at all.
+A session of either profile is refused at its start, and so is a Main stream past the depths
+or the largest frame the arm lists, or below the smallest: NVDEC's caps list one (128x128 on
+the RTX 3090), and VA-API's where the driver gives the AV1 decoder's surfaces a minimum size
+(16x16 on radeonsi, none on iHD; m3-max-77432 and m3-max-77435) (`av1::declines`). The codec module refuses the same at a sequence header
+(`codec::av1::check_supported`), which covers a record that carries none, whose stream is
+known only at its first sample. The guest has nothing to fall back on:
+arm64 macOS decodes no AV1 in software, and with no decoder from the host a session that asks
+for AV1 fails −12906 (measured on an arm64 macOS 26.6.2 guest, 2026-11-27).
+
+A picture the hardware reports failed fails to the guest as a decode error, as an H.264 or
+HEVC picture does on this route: VideoToolbox's decoders copy no failed picture. NVDEC on the
+RTX 3090 decodes a superres stream's inter frames wrongly and reports each failed, so the guest
+gets the key frame and an error for each of those: of our `aom-superres`, 1 picture and 5
+errors, −12909 (an arm64 macOS 26.6.2 guest, measured 2026-11-27, m3-max-77410;
+[nvidia.md](nvidia.md), "The decoders"; [bugs.md](bugs.md), U36).
+
+Film grain is applied by the hardware, and the frame with grain is what the guest gets, as the
+specification's output is: VA-API decodes into `current_frame`, which later frames predict
+from, and the driver writes the frame with grain into `current_display_picture`; NVDEC decodes
+into `decodePicIdx` and writes the frame with grain into `CurrPicIdx`. Each driver draws the
+grain itself, and the guest gets that driver's:
+- **AMD (radeonsi, the RX 7900 XTX) and NVIDIA (NVDEC, the RTX 3090)** add the grain the
+  specification describes: each frame with grain equals libdav1d's.
+- **Intel (iHD, the Iris Xe)** draws grain of its own: noise of the specification's strength
+  and shape in a different pattern, so no frame with grain equals libdav1d's, while each frame
+  before grain does, and ffmpeg's own VA-API decode on iHD gives the same frames as ours
+  ([bugs.md](bugs.md), U35). The card test judges it by its statistics against the
+  specification's grain ([backends.md](backends.md), "Tests").
+
+(Measured 2026-11-27: m3-max-77429, m3-max-77421 and m3-max-77438.)
+
+How fast the guest decodes AV1 beside HEVC on the same route, the same frames of `testsrc2`
+coded by SVT-AV1 and by x265, each decode a session that requires hardware, AV1 and HEVC in
+turns, frames per second and the guest's CPU seconds for the run (measured with the guest's CPU
+emulated, not on an arm64 host: an arm64 macOS 26.6.2 guest on 4 emulated CPUs, 2026-11-27):
+
+| card (job) | size | AV1: fps, guest CPU s | HEVC: fps, guest CPU s |
+|---|---|---|---|
+| Radeon 780M (m3-max-77412) | 1920x1080, 60 frames | 70.8, 3.40; 16.7, 14.33; 14.7, 16.32; 89.7, 2.68; 98.6, 2.44; 97.2, 2.48 | 92.0, 2.59; 100.6, 2.38; 95.4, 2.52; 92.4, 2.61; 74.2, 3.24; 92.3, 2.61 |
+| Radeon 780M (m3-max-77412) | 8192x4352, 8 frames | 19.3, 1.67; 23.5, 1.36; 23.8, 1.35; 21.0, 1.52; 23.2, 1.37; 23.4, 1.36 | 22.7, 1.44; 23.4, 1.36; 23.2, 1.45; 22.5, 1.42; 22.3, 1.45; 23.2, 1.38 |
+| RX 7900 XTX (m3-max-77361) | 1920x1080, 60 frames | 89.6, 2.67; 95.5, 2.53 | 83.2, 2.90; 87.8, 2.72 |
+| Iris Xe (m3-max-77386) | 1920x1080, 60 frames | 88.8, 2.72; 97.0, 2.48 | 93.4, 2.57; 92.9, 2.58 |
+| RTX 3090 (m3-max-77410) | 1920x1080, 60 frames | 96.6, 2.49; 114.6, 2.09 | 105.0, 2.27; 115.6, 2.06 |
+
+On the 780M, the medians of the six runs are AV1 80.2 and HEVC 92.4 fps at 1920x1080, a ratio
+of 0.87, and 23.3 and 22.9 fps at 8192x4352, 1.02. Two of the first AV1 runs at 1920x1080 were
+slow while the guest's CPU was busy with other work after its login: the decoding process's own
+CPU stayed at 0.44 s, as in every run, and the guest's came to 14.3 and 16.3 s. At 1920x1080 the
+other cards' ratios, of their runs' means, are 1.08 on the RX 7900 XTX, 1.00 on the Iris Xe and
+0.96 on the RTX 3090. At that size the guest's CPU seconds come to about its 4 CPUs' whole time
+over each run, so the emulated CPUs, not the card, set the rate.
 
 ## The caps
 

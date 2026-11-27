@@ -118,6 +118,12 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn guest_decoder(&self, _codec: u32) -> Option<Box<dyn GuestDecoder<P>>> {
         None
     }
+    /// What the arm decodes of AV1 for VideoToolbox's decoders, which [`Self::guest_decoder`]
+    /// answers a decoder of as `HOST_VIDEO_CODEC_AV1` (`super::super::av1`); `None`, the
+    /// default, where it decodes none.
+    fn guest_av1(&self) -> Option<super::super::av1::GuestAv1> {
+        None
+    }
     /// Whether [`Self::guest_decoder`] answers a decoder of each codec [`Self::caps`] decodes.
     fn guest_decodes(&self) -> bool {
         false

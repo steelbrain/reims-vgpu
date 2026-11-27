@@ -169,6 +169,7 @@ use crate::trail;
 use crate::window::WindowLink;
 
 mod answers;
+mod av1;
 mod color;
 mod compile;
 mod completion;
@@ -957,8 +958,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                         decoder.lent_views(),
                         gpu_device.clone_ref(),
                     );
+                    let mut decoders = vt_decoders(&caps);
+                    decoders.extend(video.guest_av1().map(|_| av1::vt_decoder()));
                     vt = paravirt::Host::with_backend(
-                        vt_decoders(&caps),
+                        decoders,
                         Arc::new(backend),
                         crate::video::runtime::PlatformRuntime::of(&platform),
                     );

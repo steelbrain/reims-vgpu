@@ -9,17 +9,19 @@
 //! session's queue.
 //!
 //! - **`dsta`** starts the session once: its format description (`,fds`) names the codec, the
-//!   size and the configuration record (`avcC`, `hvcC`). A record of 3-byte NAL unit lengths, and
+//!   size and the configuration record (`avcC`, `hvcC`, `av1C`). A record of 3-byte NAL unit lengths, and
 //!   a stream whose pictures the host decodes none of, are refused with
 //!   `kVTVideoDecoderUnsupportedDataFormatErr`, an H.264 SPS that lets pictures be fields with
 //!   `kVTVideoDecoderMalfunctionErr`, and the backend refuses what it does not decode, each with
-//!   no `Dpba`. The host decodes 4:2:0 pictures at 8 bits, HEVC's at 10 too, and HEVC's range
-//!   extensions pictures (4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits) where the arm does, in
-//!   the profiles and tools the codec's `check_supported` takes, which every arm's decode of a
-//!   picture checks: a stream of monochrome pictures (a HEIC image's alpha), of deeper samples,
-//!   or of a chroma format and depth the arm declines ([`Backend::declines`], from its own
-//!   query of the host's decoder; a HEIC image's 4:4:4 thumbnail where the arm decodes no 4:4:4)
-//!   is refused at its start, not at each frame, with a warning that names why, and the stream's
+//!   no `Dpba`. The host decodes 4:2:0 pictures at 8 bits, HEVC's at 10 too, HEVC's range
+//!   extensions pictures (4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits) where the arm does, and
+//!   AV1's Main profile at 8 and 10 bits, whose samples go to the backend whole, temporal units
+//!   of OBUs, after the record's `configOBUs` (`av1`), in the profiles and tools the codec's
+//!   `check_supported` takes, which every arm's decode of a picture checks: a stream of
+//!   monochrome pictures (a HEIC image's alpha), of deeper samples, or of a chroma format and
+//!   depth the arm declines ([`Backend::declines`], from its own query of the host's decoder; a
+//!   HEIC image's 4:4:4 thumbnail where the arm decodes no 4:4:4) is refused at its start, not
+//!   at each frame, with a warning that names why, and the stream's
 //!   profile, chroma format, bit depths and size ([`Undecoded`]). A started session sends `Dpba`,
 //!   the attributes the guest's output buffers are to have: the two-plane CoreVideo format of its
 //!   chroma, depth and range that the guest's own software decoder lands the stream in
@@ -75,7 +77,9 @@ use crate::core::fourcc::FourCc;
 use crate::core::runtime::Runtime;
 use crate::paravirt::WireError;
 use crate::paravirt::host::Codec;
-use crate::paravirt::image_description::{AVC_CONFIGURATION, HEVC_CONFIGURATION, ImageDescription};
+use crate::paravirt::image_description::{
+    AV1_CONFIGURATION, AVC_CONFIGURATION, HEVC_CONFIGURATION, ImageDescription,
+};
 use crate::paravirt::message::{
     GuestUuid, Message, MessageFlags, MessageHeader, MessageWriter, ValueType,
 };
@@ -1001,6 +1005,7 @@ fn config_from_description(description: &ImageDescription) -> Option<DecoderConf
     let record = match codec {
         Codec::H264 => AVC_CONFIGURATION,
         Codec::Hevc => HEVC_CONFIGURATION,
+        Codec::Av1 => AV1_CONFIGURATION,
     };
     Some(DecoderConfig {
         codec,
@@ -1016,6 +1021,7 @@ fn config_from_format(format: &SerializedFormatDescription) -> Option<DecoderCon
     let record = match codec {
         Codec::H264 => "avcC",
         Codec::Hevc => "hvcC",
+        Codec::Av1 => "av1C",
     };
     Some(DecoderConfig {
         codec,
@@ -1058,8 +1064,9 @@ fn tile_region(origin: (i32, i32), size: (i32, i32), at: (i32, i32)) -> Option<T
 
 /// What the host reads of a configuration record.
 struct Record {
+    /// The bytes before each NAL unit of a sample; 0 for AV1's, whose samples go whole.
     length_size: u8,
-    /// Its parameter sets, Annex B.
+    /// Its parameter sets, Annex B; AV1's `configOBUs`.
     parameter_sets: Vec<u8>,
     /// The CoreVideo format its pictures land in ([`pixel_format`]), where it has one.
     format: Option<PixelFormat>,
@@ -1121,6 +1128,7 @@ impl Undecoded {
         let codec = match self.stream.codec {
             Codec::H264 => "AVC",
             Codec::Hevc => "HEVC",
+            Codec::Av1 => "AV1",
         };
         format!(
             "{codec} profile {} chroma format {}, luma {} bits, chroma {} bits",
@@ -1138,6 +1146,7 @@ impl std::fmt::Display for Undecoded {
         let (codec, profile) = match stream.codec {
             Codec::H264 => ("H.264", "profile_idc"),
             Codec::Hevc => ("HEVC", "general_profile_idc"),
+            Codec::Av1 => ("AV1", "seq_profile"),
         };
         write!(
             f,
@@ -1185,6 +1194,7 @@ fn undecoded(backend: &dyn Backend, record: &Record) -> Option<Undecoded> {
 fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
     let unsupported = status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT;
     let (length_size, units, full_range, stream, undecoded) = match config.codec {
+        Codec::Av1 => return av1::read_record(config),
         Codec::H264 => {
             let record =
                 avcc::DecoderConfiguration::parse(&config.record).map_err(|_| unsupported)?;
@@ -1258,8 +1268,12 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
 }
 
 /// A sample's NAL units, each after a `length_size`-byte length, in Annex-B form; a sample whose
-/// lengths run past it is `kVTVideoDecoderBadDataErr`.
+/// lengths run past it is `kVTVideoDecoderBadDataErr`. An AV1 sample (`length_size` 0) is taken
+/// as it is.
 fn annex_b(data: &[u8], length_size: u8) -> Result<Vec<u8>, OsStatus> {
+    if length_size == 0 {
+        return Ok(data.to_vec());
+    }
     let mut out = Vec::with_capacity(data.len() + 16);
     for unit in LengthPrefixed::new(data, length_size) {
         let unit = unit.map_err(|_| status::VIDEO_DECODER_BAD_DATA)?;
@@ -1269,5 +1283,6 @@ fn annex_b(data: &[u8], length_size: u8) -> Result<Vec<u8>, OsStatus> {
     Ok(out)
 }
 
+mod av1;
 #[cfg(test)]
 mod tests;

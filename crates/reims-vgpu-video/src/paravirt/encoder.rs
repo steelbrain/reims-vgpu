@@ -910,6 +910,8 @@ fn configuration_atom(codec: Codec) -> &'static str {
     match codec {
         Codec::H264 => "avcC",
         Codec::Hevc => "hvcC",
+        // No arm encodes AV1: its encoder is never listed, nor its session started.
+        Codec::Av1 => "av1C",
     }
 }
 
@@ -918,6 +920,7 @@ fn codec_name(codec: Codec) -> &'static str {
     match codec {
         Codec::H264 => "H.264",
         Codec::Hevc => "HEVC",
+        Codec::Av1 => "AV1",
     }
 }
 

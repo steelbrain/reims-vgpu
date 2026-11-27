@@ -64,6 +64,10 @@ has no player for them at all:
 - **VP9 decoding on Intel Mac guests.** macOS 26.7.2 sends VP9 to a GPU driver like ours, but
   never tells it where to put each decoded picture.
 - **AV1 decoding on Intel Mac guests.** Intel macOS has no AV1 decoding that a GPU can provide.
+- **AV1 at 4:4:4, 4:2:2 or 12 bits on arm64 guests.** Arm64 guests decode AV1 on your GPU in its
+  common form: 4:2:0 colour at 8 or 10 bits. Other AV1 videos have no player in the guest. Your
+  GPU's AV1 decoder doesn't decode 4:4:4 or 4:2:2, its 12-bit pictures would lose two bits on
+  the way to the guest, and macOS in a virtual machine has no AV1 decoder of its own.
 - **HEVC encoding on Intel Mac guests.** macOS 26.7.2 sends hardware HEVC encoding to an Intel
   GPU, even when an app asks for ours, so apps encode HEVC in software. On Linux hosts, H.264
   encoding uses your GPU.
@@ -83,6 +87,14 @@ has no player for them at all:
   asked directly, but no app's route asks it.
 - **MPEG-1, MPEG-2, MPEG-4 Part 2, VC-1 and VP8 decoding, and VP9 and AV1 encoding.** We found no
   way in macOS for a GPU to take these.
+
+## AV1 video using superres fails to play on the NVIDIA GPU we tested
+
+Some AV1 videos use superres, which codes frames at a lower width and stretches them back out.
+On the NVIDIA GPU we tested, the GPU's decoder fails each frame of such a video that is built
+from earlier frames, which is most of them. An arm64 guest gets a decode error for each of
+those frames rather than a wrong picture. Other AV1 videos play. We haven't seen this on AMD or
+Intel GPUs.
 
 ## Sound comes after video on Windows
 

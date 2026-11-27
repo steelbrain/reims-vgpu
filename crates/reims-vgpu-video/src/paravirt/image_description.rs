@@ -13,6 +13,8 @@ pub const HEADER_SIZE: usize = 86;
 pub const AVC_CONFIGURATION: FourCc = FourCc::new(*b"avcC");
 /// The `hvcC` extension: an HEVCDecoderConfigurationRecord.
 pub const HEVC_CONFIGURATION: FourCc = FourCc::new(*b"hvcC");
+/// The `av1C` extension: an AV1CodecConfigurationRecord.
+pub const AV1_CONFIGURATION: FourCc = FourCc::new(*b"av1C");
 
 /// A video format description, as far as the host reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,7 +102,11 @@ pub(crate) mod tests {
         bytes.extend_from_slice(&name);
         bytes.extend_from_slice(&[0, 24, 0xff, 0xff]);
         bytes.extend_from_slice(&(record.len() as u32 + 8).to_be_bytes());
-        bytes.extend_from_slice(if codec == b"hvc1" { b"hvcC" } else { b"avcC" });
+        bytes.extend_from_slice(match codec {
+            b"hvc1" => b"hvcC",
+            b"av01" => b"av1C",
+            _ => b"avcC",
+        });
         bytes.extend_from_slice(record);
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         let size = bytes.len() as u32;

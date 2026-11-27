@@ -127,6 +127,7 @@ use reims_vgpu_video::core::device_wait::KeptMark;
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
+use reims_vgpu_video::vaapi::{AV1_PROFILE0, Av1Decoder, av1_decodes_ten_bit, av1_limits};
 use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
     H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, Target,
@@ -148,6 +149,7 @@ use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, ExportedMemory, S
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
+use super::av1::{GuestAv1, HOST_VIDEO_CODEC_AV1};
 use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
 };
@@ -381,6 +383,10 @@ struct VaapiVideo<P: Platform> {
     /// The driver's HEVC range extensions decoders it lists: what VideoToolbox's sessions of
     /// those streams decode on ([`declines_range_extensions`]).
     hevc_range_extensions: Vec<ConfigCapabilities>,
+    /// What the driver decodes of AV1 for VideoToolbox's decoders (`super::av1`): its
+    /// `AV1Profile0` decoder's largest and smallest frames and depths; `None` where it lists
+    /// none.
+    av1: Option<GuestAv1>,
     /// The kernel that writes VideoToolbox's 4:4:4 pictures into their surfaces (`xyuv`), made at
     /// its first use and kept for the device's decoders.
     #[cfg(unix)]
@@ -435,6 +441,29 @@ impl<P: Platform> VaapiVideo<P> {
             writes_imports.p010(),
             writes_imports.xyuv(),
         );
+        // The smallest frame is the AV1 decoder's surfaces' where the driver lists one.
+        let av1_surfaces = (capabilities.find(AV1_PROFILE0, Entrypoint::VLD))
+            .and_then(|config| config.surfaces.as_ref().ok());
+        let av1 = av1_limits(&display).map(|limits| GuestAv1 {
+            max_width: limits.max_width,
+            max_height: limits.max_height,
+            ten_bit: av1_decodes_ten_bit(&display),
+            min_width: av1_surfaces.and_then(|s| s.min_width).unwrap_or(0),
+            min_height: av1_surfaces.and_then(|s| s.min_height).unwrap_or(0),
+        });
+        if let Some(av1) = av1 {
+            log::info!(
+                "hardware video: {NAME} at {at}: AV1 for VideoToolbox's decoders, Main at {} up \
+                 to {}x{}",
+                if av1.ten_bit {
+                    "8 and 10 bits"
+                } else {
+                    "8 bits"
+                },
+                av1.max_width,
+                av1.max_height,
+            );
+        }
         let imports = Arc::new(GuestWrites::new(&display));
         let targets = CacheTargets::new(
             device,
@@ -455,6 +484,7 @@ impl<P: Platform> VaapiVideo<P> {
             copies,
             targets,
             hevc_range_extensions,
+            av1,
             #[cfg(unix)]
             gathers: Arc::new(GatherPipeline::new(device)),
         })
@@ -548,8 +578,12 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
     }
 
     /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where the driver's
-    /// decoder of their chroma format and depth decodes them ([`declines_range_extensions`]).
+    /// decoder of their chroma format and depth decodes them ([`declines_range_extensions`]);
+    /// AV1's at the depths and sizes the driver lists (`super::av1::declines`).
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
+        if codec == HOST_VIDEO_CODEC_AV1 {
+            return super::av1::declines(NAME, self.av1, stream);
+        }
         if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
             return declines_range_extensions(&self.hevc_range_extensions, stream);
         }
@@ -578,11 +612,27 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         Ok(Box::new(encoder))
     }
 
+    fn guest_av1(&self) -> Option<GuestAv1> {
+        self.av1
+    }
+
     /// An HEVC decoder lands the range extensions' pictures too, which [`Self::guest_declines`]
-    /// lets through where the driver decodes them.
+    /// lets through where the driver decodes them. AV1's is the driver's `AV1Profile0` decoder,
+    /// where it lists one.
     fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder<P>>> {
-        (self.caps.iter()).find(|c| c.codec == codec && c.direction == RGFX_VIDEO_DECODE)?;
+        let listed =
+            (self.caps.iter()).any(|c| c.codec == codec && c.direction == RGFX_VIDEO_DECODE);
+        if !listed && codec != HOST_VIDEO_CODEC_AV1 {
+            return None;
+        }
         let codec = match codec {
+            HOST_VIDEO_CODEC_AV1 => {
+                let av1 = self.av1?;
+                Codec::Av1(Box::new(Av1Decoder::without_record(
+                    &self.display,
+                    av1.limits(),
+                )))
+            }
             RGFX_VIDEO_CODEC_H264 => Codec::H264(H264Decoder::new_annex_b(&self.display)),
             RGFX_VIDEO_CODEC_HEVC => {
                 let mut decoder = HevcDecoder::new_annex_b(&self.display);
@@ -1257,6 +1307,9 @@ fn say(said: &Mutex<Vec<String>>, why: String) {
 enum Codec {
     H264(H264Decoder),
     Hevc(HevcDecoder),
+    /// AV1's, which VideoToolbox's decoders alone make, its frames decoded into no cache; boxed,
+    /// as its eight slots' state is far larger than the other decoders.
+    Av1(Box<Av1Decoder>),
 }
 
 /// A session's decoder, and what its pictures land through.
@@ -1296,6 +1349,7 @@ impl<P: Platform> VaDecoder<P> {
         match &mut self.codec {
             Codec::H264(decoder) => decoder.decode_into(au, id, target_for),
             Codec::Hevc(decoder) => decoder.decode_into(au, id, target_for),
+            Codec::Av1(decoder) => decoder.decode(au, id),
         }
     }
 }
@@ -1314,11 +1368,15 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
         output: &DecodeOutput<P>,
     ) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError> {
         let codec = match self.codec {
-            Codec::H264(_) => TargetCodec::H264,
-            Codec::Hevc(_) => TargetCodec::Hevc,
+            Codec::H264(_) => Some(TargetCodec::H264),
+            Codec::Hevc(_) => Some(TargetCodec::Hevc),
+            Codec::Av1(_) => None,
         };
         let target_for = (self.targets.as_ref())
-            .and_then(|targets| targets.target_for(codec, output, &self.said, &self.roles));
+            .zip(codec)
+            .and_then(|(targets, codec)| {
+                targets.target_for(codec, output, &self.said, &self.roles)
+            });
         let mut frames = match self.frames(au, target_for) {
             Ok(frames) => frames,
             Err(error) if error.is_picture_error() => return Err(picture_error(error)),
@@ -1346,6 +1404,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
         match self.codec {
             Codec::H264(_) => H264Decoder::SPARE_FRAMES,
             Codec::Hevc(_) => HevcDecoder::SPARE_FRAMES,
+            Codec::Av1(_) => Av1Decoder::SPARE_FRAMES,
         }
     }
 
@@ -1353,6 +1412,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
         match &self.codec {
             Codec::H264(decoder) => decoder.last_picture(),
             Codec::Hevc(decoder) => decoder.last_picture(),
+            Codec::Av1(_) => None,
         }
     }
 }
@@ -1385,6 +1445,7 @@ impl<P: Platform> VaGuestDecoder<P> {
         let frames = match &mut self.codec {
             Codec::H264(decoder) => decoder.decode_into(bytes, id, None),
             Codec::Hevc(decoder) => decoder.decode_into(bytes, id, None),
+            Codec::Av1(decoder) => decoder.decode(bytes, id),
         };
         frames.map_err(video_error)
     }
@@ -1615,7 +1676,9 @@ fn work_ended(error: &reims_vgpu_video::vaapi::Error, since: KeptMark) -> Failed
 fn video_error(error: reims_vgpu_video::vaapi::Error) -> VideoError {
     use reims_vgpu_video::vaapi::Error;
     match error {
-        Error::Bitstream(_) | Error::HevcBitstream(_) => VideoError::BadData(error.to_string()),
+        Error::Bitstream(_) | Error::HevcBitstream(_) | Error::Av1Bitstream(_) => {
+            VideoError::BadData(error.to_string())
+        }
         Error::Unsupported(why) => VideoError::Unsupported(why),
         error => VideoError::Malfunction(error.to_string()),
     }

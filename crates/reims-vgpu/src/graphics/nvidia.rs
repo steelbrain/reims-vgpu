@@ -112,6 +112,7 @@ use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, ExportedMemory};
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
+use super::av1::{GuestAv1, HOST_VIDEO_CODEC_AV1};
 use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
 };
@@ -207,6 +208,9 @@ struct NvidiaVideo<P: Platform> {
     h264: Option<RgfxVideoCodecCaps>,
     /// The caps of HEVC's decode; `None` where NVDEC has none.
     hevc: Option<RgfxVideoCodecCaps>,
+    /// What NVDEC decodes of AV1 for VideoToolbox's decoders (`super::av1`); `None` where its
+    /// caps list no AV1 at 8 bits.
+    av1: Option<GuestAv1>,
     /// The profiles NVENC encodes, and the encode entries they give (`encode`'s module doc).
     encoders: Vec<EncodeProfileSupport>,
     encode: Vec<RgfxVideoCodecCaps>,
@@ -289,6 +293,19 @@ impl<P: Platform> NvidiaVideo<P> {
                 }
             })
         };
+        // NVDEC decodes AV1 from its caps' smallest frame (128x128 on the RTX 3090: **measured**,
+        // 2026-11-27, m3-max-77421): a smaller stream is declined at its session's start
+        // (`super::av1::declines`). A picture
+        // NVDEC answers Error or Error_Concealed fails to the guest as a decode error, as every
+        // codec's does on VideoToolbox's route (`NvGuestDecoder`, which copies no failed
+        // picture): its superres pictures, on the RTX 3090 (`docs/video/nvidia.md`).
+        let av1 = asked(NvdecCodec::Av1, 8).map(|caps| GuestAv1 {
+            max_width: caps.max_width,
+            max_height: caps.max_height,
+            ten_bit: asked(NvdecCodec::Av1, 10).is_some(),
+            min_width: caps.min_width,
+            min_height: caps.min_height,
+        });
         let encoders = match encode_profiles(Arc::clone(&gpu)) {
             Ok(encoders) => encoders,
             Err(error) => {
@@ -330,12 +347,26 @@ impl<P: Platform> NvidiaVideo<P> {
             encodes(RGFX_VIDEO_CODEC_H264),
             encodes(RGFX_VIDEO_CODEC_HEVC),
         );
+        if let Some(av1) = av1 {
+            log::info!(
+                "hardware video: {NAME} at {address}: AV1 for VideoToolbox's decoders, Main at \
+                 {} up to {}x{}",
+                if av1.ten_bit {
+                    "8 and 10 bits"
+                } else {
+                    "8 bits"
+                },
+                av1.max_width,
+                av1.max_height,
+            );
+        }
         let imports = imports_caches::<P>(device, &gpu, runtime);
         Some(Self {
             gpu,
             device: device.clone_ref(),
             h264,
             hevc,
+            av1,
             encoders,
             encode,
             runtime: Arc::clone(runtime),
@@ -594,11 +625,19 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
         Ok(Box::new(encoder))
     }
 
+    fn guest_av1(&self) -> Option<GuestAv1> {
+        self.0.av1
+    }
+
     fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder<P>>> {
         let video = &self.0;
         let annex_b = match codec {
             RGFX_VIDEO_CODEC_H264 if video.h264.is_some() => AnnexBCodec::H264,
             RGFX_VIDEO_CODEC_HEVC if video.hevc.is_some() => AnnexBCodec::Hevc,
+            HOST_VIDEO_CODEC_AV1 => {
+                let av1 = video.av1?;
+                AnnexBCodec::Av1(av1.limits())
+            }
             _ => return None,
         };
         let mut decoder = AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime);
@@ -620,8 +659,12 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
     }
 
     /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where NVDEC decodes them
-    /// ([`declines_range_extensions`]).
+    /// ([`declines_range_extensions`]); AV1's at the depths and sizes its caps list
+    /// (`super::av1::declines`).
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
+        if codec == HOST_VIDEO_CODEC_AV1 {
+            return super::av1::declines(NAME, self.0.av1, stream);
+        }
         if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
             return declines_range_extensions(&self.0.gpu, stream);
         }

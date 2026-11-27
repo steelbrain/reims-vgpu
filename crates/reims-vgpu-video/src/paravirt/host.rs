@@ -23,6 +23,8 @@ pub enum Codec {
     H264,
     /// HEVC, `hvc1`.
     Hevc,
+    /// AV1, `av01`.
+    Av1,
 }
 
 impl Codec {
@@ -31,12 +33,13 @@ impl Codec {
         FourCc::new(match self {
             Self::H264 => *b"avc1",
             Self::Hevc => *b"hvc1",
+            Self::Av1 => *b"av01",
         })
     }
 
     /// The codec the CoreMedia codec type `fourcc` names, where the host decodes it.
     pub fn from_fourcc(fourcc: FourCc) -> Option<Self> {
-        [Self::H264, Self::Hevc]
+        [Self::H264, Self::Hevc, Self::Av1]
             .into_iter()
             .find(|codec| codec.fourcc() == fourcc)
     }
@@ -48,10 +51,10 @@ pub struct Decoder {
     /// Its codec.
     pub codec: Codec,
     /// The profiles it decodes, as VideoToolbox numbers them (H.264's `profile_idc`, HEVC's
-    /// `general_profile_idc`), in ascending order.
+    /// `general_profile_idc`, AV1's `seq_profile`), in ascending order.
     pub profiles: Vec<u32>,
     /// The highest level it decodes, as the codec numbers it (H.264's `level_idc`, HEVC's
-    /// `general_level_idc`).
+    /// `general_level_idc`, AV1's `seq_level_idx`).
     pub max_level: u32,
 }
 

@@ -72,11 +72,13 @@ impl<P: Platform> VtBackend<P> {
     }
 }
 
-/// The device's number of `codec` (`RGFX_VIDEO_CODEC_*`).
+/// The device's number of `codec` (`RGFX_VIDEO_CODEC_*`); AV1's is the host's own
+/// (`super::av1::HOST_VIDEO_CODEC_AV1`).
 fn codec_of(codec: Codec) -> u32 {
     match codec {
         Codec::H264 => RGFX_VIDEO_CODEC_H264,
         Codec::Hevc => RGFX_VIDEO_CODEC_HEVC,
+        Codec::Av1 => super::av1::HOST_VIDEO_CODEC_AV1,
     }
 }
 
