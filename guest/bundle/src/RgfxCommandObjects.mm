@@ -3496,7 +3496,7 @@ static NSError *rgfxInvalidInputError()
 - (void)encodeSignalEventScheduled:(id<MTLEvent>)event value:(uint64_t)value
 {
 	if ([(id)event isKindOfClass:[RgfxEvent class]]) {
-		rgfxLogLine(@"MTLEvent passed to API expecting MTLSharedEvent");
+		rgfxLogDeathLine(@"MTLEvent passed to API expecting MTLSharedEvent");
 		abort();
 	}
 	if (event == nil && _retained)

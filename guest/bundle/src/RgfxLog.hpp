@@ -2,7 +2,8 @@
 // identifier, so `log config --subsystem ai.aneesiqbal.reims-graphics` sets the level those lines
 // are kept at and persisted to, on every release: a line on OS_LOG_DEFAULT has no subsystem, and
 // no mode persists its debug lines (docs/lessons.md). Its Objective-C sources log through
-// rgfxLogLine, at the default level, which the log store keeps, with their text public.
+// rgfxLogLine, at the default level, which the log store keeps, with their text public, and the
+// words of a death through rgfxLogDeathLine, which also go to the process's stderr.
 // tests/bundle_log_check.sh keeps the subsystem equal to Info.plist's CFBundleIdentifier and the
 // bundle off OS_LOG_DEFAULT and NSLog.
 
@@ -18,7 +19,7 @@
 // The bundle's log object, made at the first call in a process and never released.
 os_log_t rgfxLog();
 
-// Whether a line also goes to the process's stderr, as NSLog's does: where it is a file, a
+// Whether a death's line also goes to the process's stderr, as NSLog's does: where it is a file, a
 // socket, a pipe or a terminal, not /dev/null or nothing.
 bool rgfxLogToStderr();
 
@@ -35,13 +36,26 @@ void rgfxNoteNil(const char *creator, const char *cause, const char *asked);
 
 #include <stdio.h>
 
-// A line of the bundle's at the default level, on its subsystem, with all of its text public:
-// it is formatted here, as NSLog formats, and logged as one public string, and written to stderr
-// where NSLog writes there too (a death's words among them, which tests/shell_tests.mm's death
-// checks read). An NSLog argument the unified log takes for private (an object, or a string made
-// at run time) reads `<private>` on macOS 26, so a line naming what a guest's framework asked for
-// named nothing there.
+// A line of the bundle's at the default level, on its subsystem, with all of its text public: it
+// is formatted here, as NSLog formats, and logged as one public string. An NSLog argument the
+// unified log takes for private (an object, or a string made at run time) reads `<private>` on
+// macOS 26, so a line naming what a guest's framework asked for named nothing there. It goes to
+// the unified log alone, never to the process's stderr, where a Mac's Metal writes nothing of
+// its own: a command-line program whose stderr joins its output shows none of the bundle's lines.
 NS_FORMAT_FUNCTION(1, 2) static inline void rgfxLogLine(NSString *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
+	va_end(args);
+	os_log(rgfxLog(), "%{public}@", line);
+}
+
+// The words of a death, logged as rgfxLogLine logs a line and written to the process's stderr
+// where NSLog writes there too, as Metal writes its words at the deaths whose calls end the
+// process here (tests/shell_tests.mm's death checks read them there). Its caller ends the
+// process next.
+NS_FORMAT_FUNCTION(1, 2) static inline void rgfxLogDeathLine(NSString *format, ...)
 {
 	va_list args;
 	va_start(args, format);

@@ -825,7 +825,7 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	// A type past MTLTextureTypeTextureBuffer ends the process with no words, at each creator of
 	// both x86 Macs (oracle_texdesc type10).
 	if (type > MTLTextureTypeTextureBuffer) {
-		rgfxLogLine(@"RGFX: texture type %llu ends the process, as Metal's creators do", ull(type));
+		rgfxLogDeathLine(@"RGFX: texture type %llu ends the process, as Metal's creators do", ull(type));
 		abort();
 	}
 	NSString *typeName = rgfxTextureTypeName(type);

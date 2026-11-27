@@ -18,7 +18,7 @@ namespace {
 // removes-nil).
 [[noreturn]] void endsTheProcess(const char *call)
 {
-	rgfxLogLine(@"RGFX: -[RgfxResidencySet %s] of a nil allocation ends the process, as Metal's set does",
+	rgfxLogDeathLine(@"RGFX: -[RgfxResidencySet %s] of a nil allocation ends the process, as Metal's set does",
 	            call);
 	abort();
 }

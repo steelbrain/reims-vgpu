@@ -670,7 +670,7 @@ bool isRendererPluginData(NSData *data)
 - (void)setPluginData:(id)pluginData
 {
 	(void)pluginData;
-	rgfxLogLine(@"RGFX: -[%s setPluginData:] ends the process, as Metal's function does",
+	rgfxLogDeathLine(@"RGFX: -[%s setPluginData:] ends the process, as Metal's function does",
 	            class_getName([self class]));
 	abort();
 }

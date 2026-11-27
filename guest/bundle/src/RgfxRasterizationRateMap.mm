@@ -47,7 +47,7 @@ float floatOf(uint64_t bits)
 // creation, and compiles a Mutable map at its creation, so no answer of its is the host's.
 [[noreturn]] void endsTheProcess(const char *call)
 {
-	rgfxLogLine(@"RGFX: -[RgfxRasterizationRateMap %s] ends the process, as Metal's map does", call);
+	rgfxLogDeathLine(@"RGFX: -[RgfxRasterizationRateMap %s] ends the process, as Metal's map does", call);
 	abort();
 }
 

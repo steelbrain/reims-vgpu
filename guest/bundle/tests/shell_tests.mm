@@ -1771,6 +1771,37 @@ static void checkDies(const char *name, const char *words)
 	CHECK(err.find(words) != std::string::npos);
 }
 
+// A line of the bundle's (rgfxLogLine) goes to the unified log alone: run again with --log-line,
+// this binary logs one with its stderr a pipe, where NSLog would write, and writes nothing there.
+// So a command-line program whose stderr joins its output prints none of the bundle's lines, as
+// on a Mac. A death's words (rgfxLogDeathLine) still reach stderr: the death checks read them.
+static void test_log_lines_stay_off_stderr()
+{
+	int fds[2];
+	CHECK(pipe(fds) == 0);
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+	posix_spawn_file_actions_addclose(&fa, fds[0]);
+	char *args[] = {const_cast<char *>(g_self), const_cast<char *>("--log-line"), nullptr};
+	pid_t pid = 0;
+	CHECK(posix_spawn(&pid, g_self, &fa, nullptr, args, *_NSGetEnviron()) == 0);
+	posix_spawn_file_actions_destroy(&fa);
+	close(fds[1]);
+	std::string err;
+	char chunk[512];
+	ssize_t n;
+	while ((n = read(fds[0], chunk, sizeof chunk)) > 0)
+		err.append(chunk, static_cast<size_t>(n));
+	close(fds[0]);
+	int status = 0;
+	CHECK(waitpid(pid, &status, 0) == pid);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (err.find("RGFX:") != std::string::npos)
+		std::fprintf(stderr, "--log-line wrote on its stderr:\n%s\n", err.c_str());
+	CHECK(err.find("RGFX:") == std::string::npos);
+}
+
 // A .metallib of one function, `rgfx_exported`, of the TYPE a dynamic library's exported function
 // has (3), in metallibOf's layout.
 static std::vector<uint8_t> exportedFunctionMetallib();
@@ -22741,6 +22772,10 @@ int main(int argc, char **argv)
 	g_self = argv[0];
 	if (argc == 3 && std::strcmp(argv[1], "--dies") == 0)
 		return dies_case(argv[2]);
+	if (argc == 2 && std::strcmp(argv[1], "--log-line") == 0) {
+		rgfxLogLine(@"RGFX: a line of the unified log alone");
+		return 0;
+	}
 	if (argc == 3 && std::strcmp(argv[1], "--queue-dies") == 0)
 		return rgfxQueueDiesCase(argv[2]);
 	if (argc == 3 && std::strcmp(argv[1], "--queue-lock") == 0)
@@ -22961,6 +22996,7 @@ int main(int argc, char **argv)
 		test_no_copy_shadows_lie_in_slabs();
 		test_binds_note_shadow_writes();
 		test_block_call();
+		test_log_lines_stay_off_stderr();
 		rgfxProtocolTests(argv[0]); // tests/protocol_tests.mm
 		rgfxArchiveTests();  // tests/archive_tests.mm
 		rgfxResourceTests(); // tests/resource_tests.mm
