@@ -5104,17 +5104,16 @@ fn a_held_walk_answered_its_submitted_holds_only_its_process_s_later_commits() {
     );
 }
 
-/// Two processes that share a surface stay in the order of IOSurface accesses with no wait for
-/// each other's commits (`decode`'s `sequencer`, `surface_order`): process 1's buffer that writes
-/// a surface, answered its `CB_SUBMITTED` and held in its walk, and process 2's buffer that reads
-/// the surface after it, naming it in its `SURFACE_ORDER` as the bundle does. The reader is
-/// committed with the writer still walking, and waits on the GPU for the writer's queue's surface
-/// timeline to reach the writer's seqno, the signal the writer's commit carries once its walk
-/// ends: the GPU runs the write first, as a Mac orders such accesses on the GPU alone
-/// (docs/graphics-kext/dgpu-oracle.md, Q16), though the reader reached the platform first. A write
-/// after another process's answered read is the same to the host: the bundle names the reader's
-/// queue and seqno from the surface's reader slots, and the host waits for a named buffer
-/// whichever slot named it
+/// Two processes that share a surface stay in the order of IOSurface accesses (`decode`'s
+/// `sequencer`, `surface_order`): process 1's buffer that writes a surface, answered its
+/// `CB_SUBMITTED` and held in its walk, and process 2's buffer that reads the surface after it,
+/// naming it in its `SURFACE_ORDER` as the bundle does. The reader, taken with the writer still
+/// walking, begins only once the writer is committed (`surface_order`, "A buffer named before
+/// the host walks it"), and waits on the GPU for the writer's queue's surface timeline to reach
+/// the writer's seqno, the signal the writer's commit carries: the GPU runs the write first, as a
+/// Mac orders such accesses (docs/graphics-kext/dgpu-oracle.md, Q16). A write after another
+/// process's answered read is the same to the host: the bundle names the reader's queue and seqno
+/// from the surface's reader slots, and the host waits for a named buffer whichever slot named it
 #[test]
 fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
     use reims_vgpu_graphics::ops::{
@@ -5155,9 +5154,8 @@ fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
         [(RGFX_EVT_CB_SUBMITTED, 100, 0)]
     );
 
-    // Process 2's reader names the writer's queue at its seqno: committed and completed with the
-    // writer's walk held, its commit carrying the GPU wait.
-    let mark = platform.call_log().mark();
+    // Process 2's reader names the writer's queue at its seqno: taken with the writer's walk
+    // held, it is not committed.
     let wait = RgfxSurfaceOrderWait {
         queue_obj_id: obj(1, 1),
         seqno: 1,
@@ -5172,30 +5170,37 @@ fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
         ],
     );
     reader.send(&device, at(read, 1));
-    assert_eq!(
-        ring_events(&platform, &mut reader, 1),
-        [(RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK))],
-        "the reader waited for the writer's commit"
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "the reader was committed before the writer it names"
     );
-    let waits = events(&platform.call_log().since(mark), WAIT);
+
+    // The writer's commit signals its timeline to its seqno, and the reader's, after it, waits on
+    // the GPU for that value.
+    let mark = platform.call_log().mark();
+    gate.open();
+    committed(&platform, 2);
+    let calls = platform.call_log().since(mark);
+    let waits = events(&calls, WAIT);
     assert_eq!(
         waits.len(),
         1,
         "the reader does not wait for the writer: {waits:?}"
     );
     assert_eq!(waits[0].1, Some(1), "the reader waits for another seqno");
-
-    // The writer's commit signals that timeline to that value.
-    let mark = platform.call_log().mark();
-    gate.open();
+    let signals = events(&calls, SIGNAL);
+    assert!(
+        signals.contains(&waits[0]),
+        "the writer does not signal what the reader waits for: {signals:?} against {waits:?}"
+    );
     assert_eq!(
         ring_events(&platform, &mut writer, 1),
         [(RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK))]
     );
-    let signals = events(&platform.call_log().since(mark), SIGNAL);
-    assert!(
-        signals.contains(&waits[0]),
-        "the writer does not signal what the reader waits for: {signals:?} against {waits:?}"
+    assert_eq!(
+        ring_events(&platform, &mut reader, 1),
+        [(RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK))]
     );
 }
 
@@ -6258,12 +6263,12 @@ fn a_buffer_that_does_not_ask_rings_no_doorbell_behind_a_walk() {
     );
 }
 
-/// A queue's buffers decide their signals of its surface timeline in their turns: a buffer of
-/// another queue that names the first of two buffers, sent while the first is still walked and
-/// the second, which holds no `SURFACE_ORDER`, has been walked whole beside it, waits on the GPU
-/// for the first's signal, which comes once the first is walked. Had the second noted itself
-/// taken at its walk's end, the order would read the first as taken with no signal and the
-/// buffer would wait for nothing
+/// A queue's buffers decide their signals of its surface timeline, and note themselves taken, in
+/// their turns: a buffer of another queue that names the first of two buffers, sent while the
+/// first is still walked and the second, which holds no `SURFACE_ORDER`, has been walked whole
+/// beside it, begins only once the first is committed, and waits on the GPU for the first's
+/// signal. Had the second noted itself taken at its walk's end, the order would read the first
+/// as taken with no signal: the buffer would begin at once and wait for nothing
 #[test]
 fn a_buffer_named_while_its_queue_s_later_buffer_is_walked_first_is_waited_for() {
     use reims_vgpu_graphics::ops::{
@@ -6317,23 +6322,22 @@ fn a_buffer_named_while_its_queue_s_later_buffer_is_walked_first_is_waited_for()
     };
     let waiting = command_buffer_of(obj(1, 2), 200, &[(RGFX_OP_SURFACE_ORDER, wait.as_bytes())]);
     second.send(&device, at(waiting, 1));
-    committed(&platform, 1);
-    assert_eq!(
-        platform
-            .call_log()
-            .sels_since(mark)
-            .iter()
-            .filter(|&&s| s == WAIT)
-            .count(),
-        1,
-        "the buffer named does not wait for queue 1's buffer"
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "queue 2's buffer was committed before the buffer it names"
     );
-    let mark = platform.call_log().mark();
     gate.open();
     committed(&platform, 3);
+    let sels = platform.call_log().sels_since(mark);
     assert!(
-        platform.call_log().sels_since(mark).contains(&SIGNAL),
+        sels.contains(&SIGNAL),
         "queue 1's named buffer did not signal its timeline"
+    );
+    assert_eq!(
+        sels.iter().filter(|&&s| s == WAIT).count(),
+        1,
+        "queue 2's buffer does not wait for queue 1's buffer"
     );
     for cb in [100, 101] {
         assert!(complete_until_event(&platform, &mut first), "no completion");

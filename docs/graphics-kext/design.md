@@ -6369,6 +6369,35 @@ committed in. The bundle names the order instead, as it posts each buffer:
 - So each buffer named was posted before the post that names it read the
   slots: the buffers' waits run from later posts to earlier ones, and cannot
   meet in a cycle.
+- A buffer named that the host has not walked yet holds back the buffer that
+  names it until it is committed. The host takes each queue's ring on a thread
+  of its own, so it may take a buffer before one it names on another queue is
+  walked. Waiting on the GPU alone, the naming buffer could wait for itself:
+  the named buffer's begin may fill a device cache the naming buffer uses (a
+  decode's output, for the CPU's newer generation); the fill waits for the end
+  of each buffer that used the cache before, the naming buffer among them where
+  it was begun and finished first; the naming buffer waits on the GPU for the
+  named buffer's signal, which comes with that buffer's commit after its walk;
+  and the walk's decode waits on the CPU for the fill. Seen on the Windows host,
+  where a guest's video decodes stopped there. So the naming buffer's
+  begin waits, on its queue's thread, until the named buffer is committed,
+  before any of its uses counts among a cache's users and before it takes its
+  ticket in the commit order ("Commit order", below); then it waits on the GPU
+  as any other buffer. Only a queue the host holds, whose ring has published
+  the seqno named, is waited for so. Past 2 s the wait is named in the log, with
+  the buffer it waits for and how far the host took and committed that queue.
+- That wait, too, runs from a later post to an earlier one, and every other
+  wait of a begin, a walk or a commit is for a buffer posted or begun before
+  the one that waits. A buffer waiting at its begin is not begun, and a
+  doorbell's thread never answers it, as the buffer it names has not finished,
+  so it holds no ticket; it keeps its queue's claim on its ring, so no later
+  buffer of its queue is taken or answered meanwhile. No wait is for it.
+- Names written wrong (a process that writes the slots itself, naming a buffer
+  not yet posted) can name each other across two queues, of any processes, both
+  published before either begins. Their two queues' threads, and their
+  doorbells' answers, then hold until either queue is destroyed or its
+  process's context closes, or the device resets, which ends both waits.
+  Nothing else of the host is held.
 - The host keeps each queue's surface timeline, a shared event. A buffer that
   holds `SURFACE_ORDER` signals its queue's to its seqno as it ends, and waits
   first, on the GPU, for each named queue's to reach the seqno named, except
@@ -6388,7 +6417,8 @@ committed in. The bundle names the order instead, as it posts each buffer:
   names its writes to the kext at its `CB_SCHEDULED`, which the host posts once
   its platform has scheduled it, past its waits. A read posted meanwhile names
   none of it and waits for none of it, and nor does a CPU lock.
-- The wait is an order on the GPU and nothing more, as a Mac's is: a Mac answers
+- The wait for a buffer the host has walked is an order on the GPU and nothing
+  more, as a Mac's is: a Mac answers
   a command buffer it runs after another queue's or process's pending access to
   a surface submitted and scheduled within a millisecond of its commit (the 630,
   and the M3 in a run's first round, within 1 to 5 ms), and completes it after

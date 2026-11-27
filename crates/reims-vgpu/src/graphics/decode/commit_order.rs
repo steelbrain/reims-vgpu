@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 
 use super::surface_order::Marks;
 
@@ -196,13 +196,30 @@ pub(crate) fn wait(
     cancel: &Cancel,
     until: Until,
 ) -> Waited {
+    let what = match until {
+        Until::Begun => "commit-order-begun",
+        Until::Committed => "commit-order",
+    };
+    wait_telling(after, own, cancel, (until, what), &mut |_| {})
+}
+
+/// [`wait`], timed among the long waits as `what`, telling `slept` after each slice it slept,
+/// with no lock held, the index in `after` of the queue it waits for then: so its caller names a
+/// long wait in the log ([`super::surface_order::BEGIN_WAIT_LOGGED`]).
+pub(crate) fn wait_telling(
+    after: &[(Arc<Marks>, u64)],
+    own: Option<&Marks>,
+    cancel: &Cancel,
+    (until, what): (Until, &'static str),
+    slept: &mut dyn FnMut(usize),
+) -> Waited {
     let mut waited = Waited::default();
     let began = reims_vgpu_vulkan::core::long_waits::begin();
     let begun = cancel.now();
     let over = || {
         own.is_some_and(|own| own.commit.ended.load(Ordering::SeqCst)) || cancel.cut_since(begun)
     };
-    for (marks, seqno) in after {
+    for (at, (marks, seqno)) in after.iter().enumerate() {
         let mark = &marks.commit;
         if mark.reached(*seqno, until) {
             continue;
@@ -219,6 +236,7 @@ pub(crate) fn wait(
             }
             waited.slept = true;
             let _ = mark.moved.wait_for(&mut guard, WAIT_SLICE);
+            MutexGuard::unlocked(&mut guard, || slept(at));
         }
         drop(guard);
         mark.waiters.fetch_sub(1, Ordering::SeqCst);
@@ -226,10 +244,7 @@ pub(crate) fn wait(
             break;
         }
     }
-    began.end(match until {
-        Until::Begun => "commit-order-begun",
-        Until::Committed => "commit-order",
-    });
+    began.end(what);
     waited
 }
 

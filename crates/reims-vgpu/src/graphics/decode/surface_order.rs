@@ -15,18 +15,52 @@
 //!   order already. One the host has seen finish (its completed handler raised the queue's
 //!   `done`) is a compare. Only the rest are GPU waits, which hold back none of the buffer's
 //!   records, nor its queue: it gets its `CB_SUBMITTED` at its take and its `CB_SCHEDULED` at its
-//!   commit, as a Mac's order of IOSurface accesses holds back none (`cmdbuf`'s `Line`). Two
-//!   buffers that share no surface never wait for each other, since neither names the other.
+//!   commit, as a Mac's order of IOSurface accesses holds back none (`cmdbuf`'s `Line`); but one
+//!   that names a buffer the host has not walked yet begins after that buffer's commit (below).
+//!   Two buffers that share no surface never wait for each other, since neither names the other.
 //! - **A buffer that holds no op pays nothing** but two atomic operations on its own queue's
 //!   [`Marks`], with no lock: it notes itself taken, and signals only where a buffer of another
 //!   queue waits past what its queue signalled ([`Marks::quiet`]).
-//! - **A buffer named before the host takes it.** Each queue's ring is taken on a thread of its
-//!   own, so a buffer may be decoded before a buffer it names, committed earlier on another queue,
-//!   is taken. Its wait is then for a value not yet signalled (Metal and the Vulkan platform wait
-//!   for a value signalled later), and the named queue's buffer at that seqno signals it when the
-//!   host takes it, whether or not it holds the op (`waited`). The waiter raises `waited` and then
-//!   reads `taken`, and a buffer taken raises `taken` and then reads `waited`, each sequentially
-//!   consistent, so at least one of the two sees the other.
+//! - **A buffer named before the host walks it.** Each queue's ring is taken on a thread of its
+//!   own, so a buffer may be taken before a buffer it names, committed earlier on another queue,
+//!   is walked. Its begin then waits, on its queue's thread with no lock held, until that buffer
+//!   is committed ([`SurfaceOrder::unwalked`], [`commit_order::wait_telling`]), before any of its
+//!   uses counts among a device cache's users and before it takes its place among the commit
+//!   order's tickets; then it waits on the GPU as any other. Waiting on the GPU alone, it could
+//!   wait for itself: the named buffer's begin may fill a cache the buffer uses (a decode's
+//!   output, for the CPU's newer generation), the fill waits on the GPU for the ends of the
+//!   cache's users, the buffer among them where it was begun and finished first, the buffer
+//!   waits on the GPU for the named buffer's signal, which comes with its commit after its walk,
+//!   and the walk's video op waits on the CPU for the fill (`video`'s `wait_for_cache`). Counted,
+//!   with the longest; a wait past [`BEGIN_WAIT_LOGGED`] is named in the log with what it waits
+//!   for, and again as it ends. A queue the host does not hold, or a seqno its ring has not
+//!   published, is not waited for so.
+//! - **The begins' waits end.** Each of the order's waits is for a buffer posted before the one
+//!   that waits, or begun before it: the bundle names a buffer only once a surface's slot names
+//!   it, after its post, and so do `COMMIT_ORDER` and a queue's ring order; the tickets of the
+//!   commit order and the users of a cache a fill follows were begun before. A buffer waiting at
+//!   its begin is neither: it is not begun, and it is never answered on a doorbell's thread,
+//!   which answers a buffer only where every buffer it names has finished
+//!   ([`SurfaceOrder::ready`]), so it holds no ticket. It holds its queue's claim on its ring
+//!   through its begin (`begin_taken`), so no later buffer of its queue is answered or taken
+//!   meanwhile. So no wait of the buffer it names, posted before it, is for it, nor any wait
+//!   behind that one.
+//! - **Names written wrong.** A process that writes the surfaces' slots itself can name a buffer
+//!   not yet posted (the bundle never does), and two buffers of two queues, of any processes, can
+//!   then name each other, both published before either begins. Each begin then waits for the
+//!   other's commit: the two queues' service threads hold, and so do their doorbells' answers,
+//!   until either queue ends (its destroy, or its context's close) or the device resets
+//!   ([`commit_order::Cancel`]), which ends both waits; each buffer then goes on as one whose
+//!   named queue ended does. Nothing else of the host is held: other queues' buffers, and ring 0,
+//!   go on.
+//! - **A buffer named before the host takes it**, on the GPU. A buffer whose named buffer was not
+//!   published when its begin looked, or whose queue the host does not hold yet (from the
+//!   queue's create's answer until its handle is made), may still wait for a value not yet
+//!   signalled (Metal and the Vulkan platform wait for a value signalled later), and the named
+//!   queue's buffer at that seqno signals it when the host takes it, whether or not it holds the
+//!   op (`waited`). The waiter raises `waited` and then reads `taken`, and a buffer taken raises
+//!   `taken` and then reads `waited`, each sequentially consistent, so at least one of the two
+//!   sees the other.
 //! - **Nothing waits for good.** A named buffer that does not run still signals: a stand-in
 //!   signals at its seqno, and a buffer with none gets a command buffer of its own on its queue
 //!   that only signals ([`SurfaceOrder::release`]). A queue's destroy and its context's close
@@ -90,6 +124,10 @@ const ON: OnFault = OnFault::Return;
 /// holds the op after it logs them. A summary at info comes at most once a minute, however many
 /// command buffers a guest sends (docs/conventions.md).
 const LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a buffer's begin waits for a buffer it names that the host has not walked before the
+/// wait is named in the log ([`SurfaceOrder::unwalked`]).
+pub(crate) const BEGIN_WAIT_LOGGED: Duration = Duration::from_secs(2);
 
 /// What a queue's submission ring has published: the highest seqno of a message on it, taken or
 /// not; `None` where the queue has ended at the device. Given by the host as the queue is made.
@@ -315,6 +353,10 @@ pub(crate) struct OrderCounts {
     /// Waits for a decode completed ahead of its end that a buffer's named waits did not cover
     /// ([`CompletedAhead`]): the buffers it held.
     pub(crate) held: u64,
+    /// Begins that waited for a buffer they named that the host had not walked
+    /// ([`SurfaceOrder::unwalked`]), and the longest such wait, in microseconds.
+    pub(crate) begins_waited: u64,
+    pub(crate) begin_wait_longest_us: u64,
 }
 
 /// The decodes whose command buffers posted their `CB_COMPLETE` ahead of their platform end, by
@@ -555,6 +597,50 @@ impl<P: Platform> SurfaceOrder<P> {
         self.counts
     }
 
+    /// The buffers of other queues that `waits`, the `SURFACE_ORDER` of a buffer of queue
+    /// `queue`, names and the host has not walked yet, which the buffer's begin waits for until
+    /// they are committed (the module doc, "A buffer named before the host walks it"): each
+    /// queue once, at its highest seqno named, with its id and its marks. Only a queue the host
+    /// holds and has not ended, whose ring has published the seqno, and whose buffers the host
+    /// has neither taken nor committed through it, names one; a queue whose ring's seqnos the
+    /// host gave nothing to read of (the decoder's own tests) names none.
+    pub(crate) fn unwalked(
+        &self,
+        queue: u64,
+        waits: impl Iterator<Item = RgfxSurfaceOrderWait>,
+    ) -> Vec<(u64, Arc<Marks>, u64)> {
+        let mut after: Vec<(u64, Arc<Marks>, u64)> = Vec::new();
+        for w in waits {
+            let (q, s) = (w.queue_obj_id, w.seqno);
+            if q == queue || q == 0 || s == 0 {
+                continue;
+            }
+            let Some(named) = self.queues.get(&q).filter(|n| n.held && !n.ended) else {
+                continue;
+            };
+            let published = named.published.as_ref().and_then(|p| p());
+            if published.is_none_or(|p| s > p)
+                || named.marks.taken.load(Ordering::SeqCst) >= s
+                || (named.marks.commit).reached(s, commit_order::Until::Committed)
+            {
+                continue;
+            }
+            match after.iter_mut().find(|(aq, ..)| *aq == q) {
+                Some((_, _, v)) => *v = (*v).max(s),
+                None => after.push((q, Arc::clone(&named.marks), s)),
+            }
+        }
+        after
+    }
+
+    /// A buffer's begin waited `took` for buffers it named that the host had not walked
+    /// ([`Self::unwalked`]): counted, the longest kept.
+    pub(crate) fn begin_waited(&mut self, took: Duration) {
+        let us = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        self.counts.begins_waited += 1;
+        self.counts.begin_wait_longest_us = self.counts.begin_wait_longest_us.max(us);
+    }
+
     /// The marks of queue `queue`, which the host holds from now where it did not (the tests'
     /// look at a queue's marks; a create takes them from [`Self::made`]).
     #[cfg(test)]
@@ -736,14 +822,18 @@ impl<P: Platform> SurfaceOrder<P> {
             log::info!(
                 target: "reims_vgpu::graphics",
                 "surface order: {} command buffers named {} buffers of other queues: {} GPU \
-                 waits ({} for buffers not yet taken), {} naming no buffer; {} signals for \
-                 buffers that did not run; {} decodes completed ahead of their ends, {} buffers \
-                 and {} presents held behind them (the longest begun {} us before one's end)",
+                 waits ({} for buffers not yet taken), {} naming no buffer; {} begins waited for \
+                 a buffer named that the host had not walked to be committed (the longest {} \
+                 us); {} signals for buffers that did not run; {} decodes completed ahead of \
+                 their ends, {} buffers and {} presents held behind them (the longest begun {} \
+                 us before one's end)",
                 c.buffers,
                 c.named,
                 c.waits,
                 c.ahead,
                 c.stale,
+                c.begins_waited,
+                c.begin_wait_longest_us,
                 c.released,
                 kept.posts(),
                 c.held,
@@ -1320,7 +1410,7 @@ mod tests {
 
     /// A buffer that holds no op waits for nothing, signals nothing and makes nothing; one that
     /// names a queue the host does not hold, or a seqno past every one the named queue's ring has
-    /// published, waits for nothing
+    /// published, waits for nothing; one that names a buffer within it, walked, waits on the GPU
     #[test]
     fn buffers_that_share_no_named_buffer_wait_for_nothing() {
         let mut r = rig();
@@ -1337,6 +1427,10 @@ mod tests {
         let (_, calls) = r.commit(B, 1, &ops(Some(&[(unknown, 4), (A, 11)]), &[]));
         assert!(events(&calls, WAIT).is_empty());
         assert_eq!(r.timeline(A)[2], 0, "nothing waits for A");
+        // A's buffer at 10, walked, signals 10; a buffer named within what A published that the
+        // host had not walked would hold the begin of the buffer that names it until committed.
+        let (outcome, _) = r.commit(A, 10, &ops(Some(&[]), &[]));
+        assert_eq!(outcome, Ok(()));
         let (_, calls) = r.commit(B, 2, &ops(Some(&[(A, 10)]), &[]));
         assert_eq!(
             events(&calls, WAIT),
@@ -1837,6 +1931,132 @@ mod tests {
                 (DONE, d)
             ],
             "posted once each"
+        );
+    }
+
+    /// A decoder for a message of `queue`'s, as the host makes one for each.
+    fn sender(r: &Rig, queue: u64) -> GraphicsDecoder<FakePlatform> {
+        (r.dec.decoders()).sender(Some(context(queue)), r.dec.sinks.clone())
+    }
+
+    /// Carries out queue `queue`'s buffer at `seqno` of `ops` on a thread of its own, as a queue's
+    /// service thread does: begun, then walked and committed, and let go of. Its outcome, and
+    /// whether queue `named`'s buffers were committed through `through` as its begin ended.
+    fn carry_out(
+        r: &Rig,
+        queue: u64,
+        seqno: u64,
+        ops: &[u8],
+        (named, through): (u64, u64),
+    ) -> std::thread::JoinHandle<(bool, Result<(), DecodeError>)> {
+        let mut dec = sender(r, queue);
+        let marks = r.dec.shared.surface_order.lock().marks(named);
+        let (p, message) = (Arc::clone(&r.p), message(queue, seqno, ops));
+        std::thread::spawn(move || {
+            let device = p.device();
+            let begun = dec.begin_taken(&device, &message, Some(queue), false);
+            let after = marks.commit.committed_through(through);
+            let done = match begun.unwrap() {
+                Ok(begun) => dec.finish_command_buffer(&device, &message, begun).unwrap(),
+                Err(e) => Err(e),
+            };
+            (after, done)
+        })
+    }
+
+    /// Two buffers whose `SURFACE_ORDER`s name each other, as names written wrong do (the bundle
+    /// names only buffers posted before the post that names them), both published on their rings
+    /// and neither walked, hold each other's begin: both queues' threads wait, and past
+    /// [`BEGIN_WAIT_LOGGED`] each begin names in the log the buffer it waits for. A guest's own
+    /// teardown ends the hold: the close of one buffer's process ends its queue, and with it both
+    /// waits, and the other process's buffer goes on as one whose named queue ended does
+    #[test]
+    fn buffers_naming_each_other_hold_their_queues_until_a_process_closes() {
+        let r = rig();
+        for queue in [A, B] {
+            r.dec.surface_order_queue_made(queue, Arc::new(|| Some(1)));
+        }
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let x = carry_out(&r, A, 1, &ops(Some(&[(B, 1)]), &[]), (B, 1));
+        let y = carry_out(&r, B, 1, &ops(Some(&[(A, 1)]), &[]), (A, 1));
+        let (a, b) = {
+            let mut order = r.dec.shared.surface_order.lock();
+            (order.marks(A), order.marks(B))
+        };
+        assert!(
+            crate::graphics::tests::eventually(|| a.commit.has_waiters() && b.commit.has_waiters()),
+            "each begin waits for the other's buffer"
+        );
+        r.p.virtual_clock().advance(BEGIN_WAIT_LOGGED);
+        let line = |queue: u64, named: u64| {
+            format!(
+                "queue {queue:#x}'s buffer 1 has waited {BEGIN_WAIT_LOGGED:?} at its begin for \
+                 queue {named:#x}'s buffer 1 (the host took that queue's buffers through 0 and \
+                 committed them through 0)"
+            )
+        };
+        let mut lines = Vec::new();
+        let both = crate::graphics::tests::eventually(|| {
+            lines.extend(logs.take().into_iter().map(|(_, _, line)| line));
+            [line(A, B), line(B, A)]
+                .iter()
+                .all(|want| lines.iter().any(|l| l.contains(want.as_str())))
+        });
+        assert!(both, "each begin's wait is named: {lines:?}");
+        assert!(!x.is_finished() && !y.is_finished(), "a begin went on");
+
+        r.dec.drop_context(&r.device, context(A));
+        assert!(
+            crate::graphics::tests::eventually(|| x.is_finished() && y.is_finished()),
+            "the close ended neither wait"
+        );
+        let _ = x.join().unwrap();
+        let (_, done) = y.join().unwrap();
+        assert_eq!(done, Ok(()), "process 2's buffer goes on");
+        assert_eq!(r.dec.shared.surface_order.lock().counts().begins_waited, 2);
+    }
+
+    /// A buffer whose begin waits for a buffer it names that the host has not walked holds no
+    /// ticket of the commit order meanwhile: a doorbell's thread does not answer it, as the
+    /// buffer it names has not finished, so the named buffer, carried out meanwhile, is committed
+    /// waiting for nothing of it, and only then does the waiting buffer begin, get its
+    /// `CB_SUBMITTED` and commit. Answered on the doorbell's thread, it would take its ticket
+    /// before the named buffer's begin; the named buffer's commit would wait for that ticket, and
+    /// the ticket's buffer for the named buffer's commit
+    #[test]
+    fn a_buffer_waiting_for_one_it_names_is_answered_on_no_doorbell() {
+        let mut r = rig();
+        let posted = posting(&mut r);
+        for queue in [A, B] {
+            r.dec.surface_order_queue_made(queue, Arc::new(|| Some(1)));
+        }
+        let waiting = message(B, 1, &ops(Some(&[(A, 1)]), &asks()));
+        let answered = (r.dec.decoders()).answer_at_doorbell(context(B), &waiting, |_| true);
+        assert!(!answered, "answered with the buffer it names not walked");
+        let x = carry_out(&r, B, 1, &ops(Some(&[(A, 1)]), &asks()), (A, 1));
+        let a = r.dec.shared.surface_order.lock().marks(A);
+        assert!(
+            crate::graphics::tests::eventually(|| a.commit.has_waiters()),
+            "its begin does not wait"
+        );
+        assert!(of(&posted, &[cb(B, 1)]).is_empty(), "answered at its take");
+
+        let named = message(A, 1, &ops(Some(&[]), &[]));
+        let mut dec = sender(&r, A);
+        let begun = (dec.begin_taken(&r.device, &named, Some(A), false).unwrap()).unwrap();
+        let done = dec.finish_command_buffer(&r.device, &named, begun).unwrap();
+        assert_eq!(done, Ok(()));
+        drop(dec);
+        assert!(
+            crate::graphics::tests::eventually(|| x.is_finished()),
+            "the waiting buffer never began"
+        );
+        let (after, done) = x.join().unwrap();
+        assert!(after, "begun before the buffer it names was committed");
+        assert_eq!(done, Ok(()));
+        assert!(
+            of(&posted, &[cb(B, 1)]).contains(&(RGFX_EVT_CB_SUBMITTED, cb(B, 1))),
+            "no CB_SUBMITTED"
         );
     }
 }

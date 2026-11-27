@@ -171,7 +171,7 @@ use super::shares::FanOut;
 use super::split::{Estimate, PACE_WAIT_MOST, Parts, Progress, QueueRate, SplitHold};
 use super::surface_cache::shapes::ShapeRef;
 use super::surface_cache::{Reach, Uses};
-use super::surface_order::{AheadEntry, Marks, Signalled};
+use super::surface_order::{AheadEntry, BEGIN_WAIT_LOGGED, Marks, Signalled};
 use super::tables::{FOUND_A_HOLD, QueueCounts};
 use super::{
     DecodeError, Decoders, Drain, FinishedSink, GraphicsDecoder, ObjHandle, ScheduledSink,
@@ -1917,10 +1917,74 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.turn.get_mut().take()
     }
 
+    /// Waits, with no lock held, until each buffer of another queue that `order`, the
+    /// `SURFACE_ORDER` of the buffer `m`, names and the host has not walked yet is committed, or
+    /// its queue or `m`'s ends, or the device resets
+    /// ([`super::surface_order::SurfaceOrder::unwalked`]; the module doc of `surface_order`, "A
+    /// buffer named before the host walks it"): counted, with the longest. A wait past
+    /// [`BEGIN_WAIT_LOGGED`] is named in the log with what it waits for, and again as it ends.
+    fn wait_for_unwalked(&self, m: &RgfxCommandBuffer, order: &[RgfxSurfaceOrderWait]) {
+        let (queue, seqno) = (m.queue_obj_id, m.header.seqno);
+        let unwalked = (self.shared.surface_order.lock()).unwalked(queue, order.iter().copied());
+        if unwalked.is_empty() {
+            return;
+        }
+        let after: Vec<(Arc<Marks>, u64)> = (unwalked.iter())
+            .map(|(_, marks, s)| (Arc::clone(marks), *s))
+            .collect();
+        let own = self.queue_counts(queue).map(|c| Arc::clone(&c.order));
+        let clock = self.shared.platform.clock();
+        let start = clock.now_mono();
+        let mut named = false;
+        let mut slept = |_: usize| {
+            if named || clock.now_mono().saturating_duration_since(start) < BEGIN_WAIT_LOGGED {
+                return;
+            }
+            named = true;
+            let waits: Vec<String> = (unwalked.iter())
+                .filter(|(_, marks, s)| !marks.commit.reached(*s, Until::Committed))
+                .map(|(q, marks, s)| {
+                    let (taken, committed, _) = marks.progress();
+                    format!(
+                        "queue {q:#x}'s buffer {s} (the host took that queue's buffers through \
+                         {taken} and committed them through {committed})"
+                    )
+                })
+                .collect();
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "surface order: queue {queue:#x}'s buffer {seqno} has waited \
+                 {BEGIN_WAIT_LOGGED:?} at its begin for {}, which its SURFACE_ORDER names and \
+                 the host has not committed; it waits on",
+                waits.join(", ")
+            );
+        };
+        let cancel = &self.shared.commit_cancel;
+        let until = (Until::Committed, "surface-order-begin");
+        let waited =
+            super::commit_order::wait_telling(&after, own.as_deref(), cancel, until, &mut slept);
+        let took = clock.now_mono().saturating_duration_since(start);
+        if waited.slept {
+            self.shared.surface_order.lock().begin_waited(took);
+        }
+        if named {
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "surface order: queue {queue:#x}'s buffer {seqno} began after {took:?}{}",
+                if waited.cut_short {
+                    ", its wait ended by a queue's end or the device's reset"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
     /// Begins the `COMMAND_BUFFER` `message`, whose completion handler will hold `drain`: opens a
     /// command buffer on the named queue, readies the device caches its `SURFACE_USE` ops use
     /// (filling each that holds an older generation), has it wait on the GPU for the buffers of
-    /// other queues its `SURFACE_ORDER` names that have not finished, and makes its
+    /// other queues its `SURFACE_ORDER` names that have not finished, once those the host had
+    /// not walked are committed ([`Self::wait_for_unwalked`]), and makes its
     /// `CB_SUBMITTED` and, where it waits for an event or a deferred copy of a cache, its hold of
     /// its queue ([`Begun`]); where it gets its records at its take, they are posted before its
     /// fills, its ticket in the commit order issued first
@@ -1939,6 +2003,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         // ([`GraphicsDecoder::refill_managed`]).
         if let Some((m, _, _)) = &parsed {
             self.refill_managed(device, context_of(m.queue_obj_id));
+        }
+        // The buffers of other queues its `SURFACE_ORDER` names that the host has not walked yet
+        // are committed before it begins, before its uses count among a device cache's users and
+        // before it takes its ticket ([`Self::wait_for_unwalked`]).
+        if let Some((m, _, take)) = &parsed
+            && let Some(order) = take.order.as_deref()
+        {
+            self.wait_for_unwalked(m, order);
         }
         // The buffers of its process's other queues it is committed after, as its `COMMIT_ORDER`
         // names them ([`super::commit_order`]).
@@ -6738,8 +6810,12 @@ mod tests {
     /// [`cached_video`]'s rig with command queue 3 made too, and two buffers: queue 3's reader of
     /// the block at seqno 1, which names in its `SURFACE_ORDER` queue 1's buffer at seqno 2; and
     /// that buffer, a decode into the block at the CPU's generation 1, past the generation 0 queue
-    /// 1's buffer at seqno 1 fills the cache at ([`writes_cached_video`]).
-    fn named_ahead() -> (
+    /// 1's buffer at seqno 1 fills the cache at ([`writes_cached_video`]). Where `published`, the
+    /// two queues' rings have published both buffers, as the host reads its rings; else the
+    /// order is given nothing of them to read, as the decoder's own tests give it.
+    fn named_ahead(
+        published: bool,
+    ) -> (
         super::super::surface_pages::tests::Rig,
         Arc<VideoSeen>,
         [Vec<u8>; 2],
@@ -6761,6 +6837,10 @@ mod tests {
             ..RgfxQueueCreate::default()
         };
         assert_eq!(r.dec.decode(&r.device, queue.as_bytes()).unwrap(), Ok(()));
+        if published {
+            r.dec.surface_order_queue_made(1, Arc::new(|| Some(2)));
+            r.dec.surface_order_queue_made(3, Arc::new(|| Some(1)));
+        }
         let on = |queue_obj_id: u64, cb_obj_id: u64, seqno: u64, ops: &[u8]| {
             let mut message = command_buffer_message(cb_obj_id, seqno, ops);
             let (mut m, _) = RgfxCommandBuffer::read_from_prefix(&message).unwrap();
@@ -6808,13 +6888,15 @@ mod tests {
     /// not yet walked, and that uses the decode's output, is begun only once the decode is
     /// committed, though its queue's thread took it first: so the decode's begin, which fills the
     /// output's cache for the CPU's newer generation, finds it among no user of the cache, and its
-    /// fill waits on the GPU for none of its end. Begun first, as the guest's order across queues
-    /// was not, the reader's end was among the fill's waits, while the reader waited on the GPU
-    /// for the decode's signal, which the decode's commit carries after its walk, and its walk
-    /// waited on the CPU for that fill: the host's video stall on Windows (lane stallread).
+    /// fill waits on the GPU for none of its end. Begun first, the reader's end would be among the
+    /// fill's waits while the reader waits on the GPU for the decode's signal, which the decode's
+    /// commit carries after its walk, and the walk waits on the CPU for that fill: neither would
+    /// ever finish. The begin's wait is counted, and no fill behind a later buffer is
     #[test]
     fn a_buffer_naming_a_decode_not_yet_walked_begins_after_its_commit() {
-        let (r, seen, [reader, decoding]) = named_ahead();
+        use super::super::surface_pages::tests::BLOCK;
+
+        let (r, seen, [reader, decoding]) = named_ahead(true);
         let p = Arc::clone(&r.p);
         let device = p.device();
         let marks = Arc::clone(&r.dec.queue_counts(1).expect("queue 1").order);
@@ -6855,6 +6937,11 @@ mod tests {
                 .begin_taken(device, &decoding, Some(1), false)
                 .unwrap())
             .expect("the decode is begun");
+            let named = r.dec.caches().waits_named(BLOCK);
+            assert!(
+                named.contains("queue 0x1's end") && !named.contains("queue 0x3"),
+                "the decode's fill waits for the reader: {named}"
+            );
             // The decode's begin filled the cache; done, its decode lands.
             p.world().complete_all(CompleteOn::Caller);
             assert_eq!(
@@ -6868,18 +6955,23 @@ mod tests {
         });
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(seen.decodes.lock().len(), 1, "the decode is handed over");
+        assert_eq!(r.dec.caches().counts().behind_later, 0);
+        let order = r.dec.shared.surface_order.lock().counts();
+        assert_eq!((order.begins_waited, order.ahead), (1, 0));
     }
 
     /// A fill that waits on the GPU, among the command buffers that used its cache, for one that
     /// waits on the GPU for the buffer whose begin asked the fill is counted, and named in what a
     /// video op's wait for it waits on ([`super::super::surface_cache::CacheCounts::behind_later`]):
     /// here queue 3's reader, begun and finished before the decode it names, and the decode's
-    /// fill of its output, which its video op waits for on the CPU.
+    /// fill of its output, which its video op waits for on the CPU. The rings have published
+    /// nothing the order reads, so the reader's begin waits for nothing
+    /// ([`a_buffer_naming_a_decode_not_yet_walked_begins_after_its_commit`] is the host's order).
     #[test]
     fn a_fill_behind_a_buffer_ordered_after_its_asker_is_counted_and_named() {
         use super::super::surface_pages::tests::BLOCK;
 
-        let (r, seen, [reader, decoding]) = named_ahead();
+        let (r, seen, [reader, decoding]) = named_ahead(false);
         let p = Arc::clone(&r.p);
         let device = p.device();
         let mut first = r.dec.sender(None, super::super::Sinks::default());
