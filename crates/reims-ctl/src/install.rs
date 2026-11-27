@@ -547,6 +547,79 @@ mod tests {
         assert_eq!(configure(None), "/dist/lib/pkgconfig\n");
     }
 
+    /// On Windows every C and C++ part of an install builds with CLANG64's clang and llvm-ar,
+    /// whatever compiler the environment names (bd239b6dd): a user's CC named Visual Studio's
+    /// cl.exe, and SDL3's CMake build took it and stopped. The exports of the script's Windows
+    /// toolchain block (the one that sets RUSTUP_TOOLCHAIN) run here over an environment that
+    /// names cl.exe.
+    #[test]
+    fn a_windows_install_builds_c_with_clang_whatever_cc_names() {
+        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let text =
+            std::fs::read_to_string(Path::new(&manifest).join("../../scripts/install-ctl.sh"))
+                .unwrap();
+        let start = text
+            .find("if [[ $WINDOWS == 1 ]]; then\n  CHANNEL=")
+            .expect("the script's Windows toolchain block");
+        let end = start + text[start..].find("\nfi\n").expect("the block's end");
+        // Its exports but RUSTUP_TOOLCHAIN's, each with the lines it goes on to.
+        let mut exports = String::new();
+        let mut going = false;
+        for l in text[start..end].lines() {
+            let export = l.trim_start().starts_with("export ") && !l.contains("RUSTUP_TOOLCHAIN");
+            if going || export {
+                exports.push_str(l);
+                exports.push('\n');
+                going = l.ends_with('\\');
+            }
+        }
+        // Each variable, then its form for the Windows target, which cc-rs and the cmake crate take
+        // first.
+        let want: Vec<(String, &str)> = [
+            ("CC", "clang"),
+            ("CXX", "clang++"),
+            ("AR", "llvm-ar"),
+            ("CMAKE_GENERATOR", "MSYS Makefiles"),
+        ]
+        .into_iter()
+        .flat_map(|(n, v)| {
+            [
+                (n.to_owned(), v),
+                (format!("{n}_x86_64_pc_windows_gnullvm"), v),
+            ]
+        })
+        .collect();
+        let names: Vec<&str> = want.iter().map(|(n, _)| n.as_str()).collect();
+        let print = format!(
+            "for n in {}; do printf '%s=%s\\n' \"$n\" \"${{!n-}}\"; done\n",
+            names.join(" ")
+        );
+        let mut bash = std::process::Command::new("bash");
+        bash.arg("-c")
+            .arg(format!("set -euo pipefail\n{exports}{print}"))
+            .env("MSYSTEM", "CLANG64")
+            .env("CHERE_INVOKING", "1");
+        for (n, _) in &want {
+            bash.env(
+                n,
+                if n.starts_with("AR") {
+                    "lib.exe"
+                } else {
+                    "cl.exe"
+                },
+            );
+        }
+        let out = bash.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let said: String = want.iter().map(|(n, v)| format!("{n}={v}\n")).collect();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), said);
+    }
+
     /// Runs `body` in bash with the installer's `set_aside` and `put_back` defined, in `dir`;
     /// returns its standard output.
     fn with_set_aside(dir: &Path, body: &str) -> String {
