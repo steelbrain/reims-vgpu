@@ -1450,18 +1450,19 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 				std::lock_guard<std::mutex> hold(g_sessionLock);
 				g_sessions.push_back(context);
 			} else if (codec != 0) {
-				// An H.264 stream of a coded size the host does not decode is refused here, where
+				// A stream of a coded size the host does not decode is refused here, where
 				// VideoToolbox hears of it and turns to its software decoder: AppleGVA's H.264
-				// decoder hears of no failure later (RgfxVideoStatus.hpp).
-				if (codec == RGFX_VIDEO_CODEC_H264 &&
-				    !rgfx::video::sizeTaken(rgfx::video::hostCodec(codec, RGFX_VIDEO_DECODE),
+				// decoder hears of no failure later, and its HEVC decoder hears of one only as
+				// a failed frame and every frame after it (RgfxVideoStatus.hpp).
+				if (!rgfx::video::sizeTaken(rgfx::video::hostCodec(codec, RGFX_VIDEO_DECODE),
 				                            fi->width, fi->height)) {
-					static std::atomic<bool> said;
-					if (!said.exchange(true))
+					static std::atomic<bool> said[2];
+					const bool hevc = codec == RGFX_VIDEO_CODEC_HEVC;
+					if (!said[hevc].exchange(true))
 						os_log_error(rgfxLog(),
-						             "RGFX: video: an H.264 decode of %ux%u refused at its create: "
+						             "RGFX: video: an %s decode of %ux%u refused at its create: "
 						             "the host decodes no picture of its coded size",
-						             fi->width, fi->height);
+						             hevc ? "HEVC" : "H.264", fi->width, fi->height);
 				} else {
 					context->session = rgfx::video::openSession(codec, RGFX_VIDEO_DECODE);
 				}

@@ -23,9 +23,12 @@
  * host, 2026-11-07, every picture failed on the host). Its pipelines schedule their commands one
  * at a time and keep no decode's result (read from AppleGVA's code on macOS 26.7.1). So an H.264
  * schedule does not wait for the host, as waiting would only cost: its frames reach the guest as
- * decoded, as AppleGVA leaves no way to say otherwise. What the driver can tell before the first
- * picture, a coded size the host does not decode (sizeTaken), it refuses at the context's create,
- * which fails the client's session create, so VideoToolbox decodes the stream in software.
+ * decoded, as AppleGVA leaves no way to say otherwise.
+ *
+ * What the driver can tell before the first picture, a coded size the host does not decode
+ * (sizeTaken), it refuses at the context's create, for both codecs: that fails the client's
+ * session create, so VideoToolbox decodes the stream in software for a client that allows it,
+ * where an HEVC picture refused at its schedule would end the session's frames in -12911.
  */
 
 #ifndef RGFX_VIDEO_STATUS_HPP_
