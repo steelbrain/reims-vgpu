@@ -411,6 +411,27 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
   scrolling setting decides it, not the host's.
   `test: scroll::the_guest_gets_the_physical_direction`
 
+On an x86-64 guest whose kext has its own mouse up (docs/graphics-kext/design.md,
+"Scrolling"), every scroll over the image goes to that mouse, on every host,
+and QEMU's `usb-tablet`, which has no sideways wheel, gets none of it:
+
+- A mouse wheel scrolls one notch per notch, up, down and sideways. Each notch
+  is the tablet's notch: the same line and point deltas and the same
+  acceleration (measured on x86-64 26.7.2 and 11.7.11).
+  `test: native::sdl_thread::input::the_guest_s_own_devices_take_the_wheel_where_they_scroll`,
+  `test: native::macos::input::the_guest_s_own_devices_take_scrolling_where_they_scroll`,
+  `test: reims-vgpu-graphics::device::tests::motion::scrolling_goes_to_the_devices_the_guest_names`,
+  `manual` (an x86-64 guest on a Linux host: a sideways scroll in Finder and
+  Safari)
+- A touchpad scrolls one notch per 10 points of movement, a line as SDL
+  reports it, sideways too, the rest carried on to the next event and counted
+  afresh where the scrolling turns back. On Windows this is read from the code
+  and tested with the window's own events: the lab's Windows host has no
+  touchpad.
+  `test: reims-vgpu-graphics::device::tests::motion::a_mouse_alone_gets_a_notch_per_10_points`,
+  `test: native::sdl_thread::input::the_guest_s_own_devices_take_the_wheel_where_they_scroll`,
+  `manual` (a touchpad on a Linux host)
+
 ## Cursor
 
 - Over the image, the host's cursor takes the guest's shape and hot spot, at
@@ -780,6 +801,7 @@ captured through SDL's resizable flag. `manual`
 ## Not provided
 
 - Horizontal scrolling with QEMU's `usb-tablet`, which has no horizontal
-  wheel.
+  wheel: the firmware's, a guest without our kext's, and a VM with no window
+  of ours.
 - Fn/Globe: QEMU's USB keyboard cannot carry it.
 - HDR output.
