@@ -92,6 +92,8 @@ use crate::core::sync::Mutex;
 use crate::os::{OsClock, OsThreads, OsVm};
 
 pub use blit::RtBlitEncoder;
+#[cfg(target_os = "linux")]
+pub use buffer::import_host_block;
 pub use buffer::{KnownBlocks, RtBuffer, import_known};
 pub use command::RtCommandBuffer;
 pub use compute::RtComputeEncoder;

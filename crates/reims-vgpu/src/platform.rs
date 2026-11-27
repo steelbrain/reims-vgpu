@@ -137,6 +137,19 @@ pub trait ApiPlatform: Platform {
         None
     }
 
+    /// The source of the guest's Shared pool's blocks on `device` where the host asks for blocks
+    /// of host memory (`GraphicsConfig::pool_host_memory`): memory of the process's own that the
+    /// GPU imports, which the host maps into the guest as it maps the guest's RAM. `None` by
+    /// default, where the platform makes none: the pool's blocks are then the process's own
+    /// memory where [`Self::block_source`] gives none, and the device refuses the ask otherwise.
+    fn host_memory_block_source(
+        &self,
+        device: &Self::Device,
+    ) -> Option<Arc<dyn crate::pool::BlockSource>> {
+        let _ = device;
+        None
+    }
+
     /// What imports a pages block's view as a block the platform knows, on a platform that keeps
     /// a pin only inside a block it knows ([`ApiPlatform::PINS_IN_BLOCKS`]): a graphics device on
     /// it answers a pages block's `SURFACE_PAGES` with its view's import's own GPU address

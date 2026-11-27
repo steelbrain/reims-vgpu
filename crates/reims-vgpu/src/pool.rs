@@ -84,6 +84,8 @@
 
 mod addresses;
 mod host_blocks;
+#[cfg(target_os = "linux")]
+mod host_memory_blocks;
 mod private_blocks;
 mod rt_blocks;
 mod takes;
@@ -109,6 +111,8 @@ pub(crate) use addresses::{
     HOST_BASE, HOST_END, IMPORT_BASE, IMPORT_END, PRIVATE_BASE, PRIVATE_END,
 };
 pub(crate) use host_blocks::HostBlocks;
+#[cfg(target_os = "linux")]
+pub(crate) use host_memory_blocks::HostMemoryBlocks;
 pub(crate) use private_blocks::{
     PrivateBlocks, PrivateGive, TakeAnswer as PrivateTakeAnswer, TakeError as PrivateTakeError,
 };

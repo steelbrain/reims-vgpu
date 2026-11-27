@@ -43,6 +43,7 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
         display_windows: std::ptr::null(),
         pool_physical_address: 0,
         pool_physical_length: 0,
+        pool_host_memory: 0,
     }
 }
 
@@ -562,6 +563,54 @@ unsafe extern "C-unwind" fn pool_add(
 
 unsafe extern "C-unwind" fn pool_remove(_ctx: *mut c_void, physical_address: u64, length: u64) {
     POOL_ASKS.lock().push((false, physical_address, length));
+}
+
+/// A host asks for the pool's blocks of host memory with `pool_host_memory` 1, which a device
+/// with a pool takes on Linux, the pool then answering its range, and refuses on a platform that
+/// makes no such blocks (macOS, Windows); 0 asks for the GPU's own memory, as a config whose
+/// `struct_size` ends before the field does, whatever lies past it; any other value is refused.
+#[test]
+fn a_pool_s_host_memory_blocks_are_the_host_s_ask() {
+    const BASE: u64 = 52 << 30;
+    let with_pool = RvgGraphicsCallbacks {
+        pool_add: Some(pool_add),
+        pool_remove: Some(pool_remove),
+        destroy: None,
+        ..callbacks()
+    };
+    let config = |host_memory: u32, struct_size: usize| RvgGraphicsDeviceConfig {
+        struct_size: struct_size as u32,
+        pool_physical_address: BASE,
+        pool_physical_length: 2 << 20,
+        pool_host_memory: host_memory,
+        ..config(&with_pool)
+    };
+    let whole = size_of::<RvgGraphicsDeviceConfig>();
+    let before = std::mem::offset_of!(RvgGraphicsDeviceConfig, pool_host_memory);
+    let made = |host_memory, size| {
+        let c = config(host_memory, size);
+        let mut device = std::ptr::null_mut();
+        // SAFETY: a live config and out-pointer; then a live device, released.
+        unsafe {
+            let status = rvg_graphics_device_create(&c, &mut device);
+            if status == RVG_OK {
+                let mut length = 0;
+                assert_eq!(rvg_graphics_device_pool_range(device, &mut length), BASE);
+                assert_eq!(length, 2 << 20);
+                rvg_graphics_device_release(device);
+            }
+            status
+        }
+    };
+    assert_eq!(made(0, whole), RVG_OK);
+    assert_eq!(made(7, before), RVG_OK, "a size before the field: 0");
+    assert_eq!(made(2, whole), RVG_ERR_INVALID_ARGUMENT);
+    let host_memory = if cfg!(target_os = "linux") {
+        RVG_OK
+    } else {
+        RVG_ERR_INVALID_ARGUMENT
+    };
+    assert_eq!(made(1, whole), host_memory);
 }
 
 /// A pool needs both of its callbacks and a range of whole 2 MiB; a device without one refuses

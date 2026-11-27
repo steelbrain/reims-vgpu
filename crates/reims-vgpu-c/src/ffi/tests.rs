@@ -126,6 +126,7 @@ fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
             display_windows: std::ptr::null(),
             pool_physical_address: 0,
             pool_physical_length: 0,
+            pool_host_memory: 0,
         };
         // SAFETY: a live config; a NULL out-pointer, which the create refuses.
         let _ =
