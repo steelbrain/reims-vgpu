@@ -25,6 +25,15 @@ sdl3-sys.workspace = true
 # libwayland-client's calls, looked up in the library SDL opened (`native/linux/feedback.rs`).
 libc.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# The shell's full-screen mark of a borderless window (`native/windows.rs`): COM, and the taskbar
+# list's class ID.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
 [features]
 default = ["macos-sdl"]
 # SDL's library left unbuilt and unlinked: for a check of the Linux or Windows target on another

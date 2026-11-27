@@ -20,7 +20,10 @@
 //! pointer stay in SDL's sizes; the question a close asks in the window is laid out at the told
 //! scale (`super::question`).
 //!
-//! **Borderless**: through the compositor's own full screen on its screen, over its panels.
+//! **Borderless**: through the compositor's own full screen on its screen, over its panels. On
+//! Windows the shell is also told the window is full screen, so a taskbar set to hide itself stays
+//! down over it (`super::super::windows`, "Full screen to the shell"), until the window hides at
+//! the display's end ([`close()`]).
 //!
 //! **The surface.** The window is made for Vulkan: its render thread makes the window's Vulkan
 //! surface of SDL's window (`super::render`), so SDL's window goes only once that thread has let
@@ -80,6 +83,9 @@ pub(crate) struct State {
     /// The question a close asks in the window, while it is open ([`ask`]).
     #[cfg(target_os = "linux")]
     question: Option<super::question::Question>,
+    /// The shell's mark of the window as full screen, while SDL has it so.
+    #[cfg(target_os = "windows")]
+    full_screen: Option<super::super::windows::FullScreenMark>,
 }
 
 /// A window's input: SDL's events, queued until the shell sends them (`super::input`).
@@ -192,6 +198,10 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         }
         SDL_ShowWindow(sdl);
     }
+    // SAFETY: `sdl` is the window just made, on this thread; a borderless one is full screen once
+    // shown (SDL applies the full screen asked of a hidden window as it shows it).
+    #[cfg(target_os = "windows")]
+    let full_screen = unsafe { super::super::windows::FullScreenMark::of(sdl, window.title()) };
     window.surface().set_target(Target(sdl));
     window.surface().set_visible(true);
     log::debug!(
@@ -217,6 +227,8 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
             display,
             #[cfg(target_os = "linux")]
             question: None,
+            #[cfg(target_os = "windows")]
+            full_screen,
         },
     })
 }
@@ -716,8 +728,9 @@ fn answer_of(shown: bool, chosen: c_int) -> Answer {
     }
 }
 
-/// The display ended: the window hides, and a question open in it ends as cancelled. SDL's
-/// window goes once the render thread has let go (`crate::sdl::shell::released`), never before.
+/// The display ended: the window hides, and a question open in it ends as cancelled; on Windows
+/// the shell's full-screen mark goes first. SDL's window goes once the render thread has let go
+/// (`crate::sdl::shell::released`), never before.
 pub(crate) fn close(shell: &mut Shell) -> bool {
     #[cfg(target_os = "linux")]
     if let Some(question) = shell.os.question.take() {
@@ -725,6 +738,8 @@ pub(crate) fn close(shell: &mut Shell) -> bool {
         let ids = question.ids;
         super::ui::post(move || shell::answered(&ids, Answer::Cancel));
     }
+    #[cfg(target_os = "windows")]
+    drop(shell.os.full_screen.take());
     // SAFETY: the window is SDL's, on this thread.
     unsafe { SDL_HideWindow(shell.sdl) };
     false

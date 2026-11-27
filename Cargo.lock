@@ -508,6 +508,7 @@ dependencies = [
  "objc2-quartz-core",
  "reims-vgpu-vulkan",
  "sdl3-sys",
+ "windows-sys",
 ]
 
 [[package]]

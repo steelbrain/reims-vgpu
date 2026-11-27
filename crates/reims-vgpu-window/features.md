@@ -479,6 +479,13 @@ runtime's own device. The switches above apply, and `resolution=` too.
   screen rounded to whole points, so its pixels can pass the screen's by one
   (3841 × 2161 on a 3840 × 2160 screen at 2.1); the reims-graphics guest is
   offered the screen's own 3840 × 2160 (above). `manual`
+- On a Windows host a borderless window is SDL's full screen, and it tells
+  the shell so (`ITaskbarList2::MarkFullscreenWindow`) from when it shows
+  until it hides at the display's end: a taskbar set to hide itself stays
+  down while the window is active, with the pointer at the screen's bottom
+  edge too. Where Windows refuses the mark, that is logged and the window
+  opens as before. `manual` (a Windows host with the taskbar set to hide
+  itself)
 - The host's screens are SDL's: the primary first, then top to bottom and
   left to right, each at its scale (fractional ones included) and the
   refresh rate it is set to (its current mode's, as above); a change of
