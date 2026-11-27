@@ -55,6 +55,24 @@ memory is used behind that figure: over two of those 4K plays it grew by 11.5 Gi
 available memory didn't drop and its committed memory didn't rise. We haven't measured this on an
 NVIDIA or AMD card on a Windows host.
 
+## Some video formats don't use your GPU
+
+Your GPU may decode or encode video formats that the guest doesn't get from it. For these, we
+found no way in macOS to hand the work to our virtual GPU, so the guest uses its own software, or
+has no player for them at all:
+
+- **VP9 decoding on Intel Mac guests.** macOS 26.7.2 sends VP9 to a GPU driver like ours, but
+  never tells it where to put each decoded picture.
+- **AV1 decoding on Intel Mac guests.** Intel macOS has no AV1 decoding that a GPU can provide.
+- **HEVC encoding on Intel Mac guests.** macOS 26.7.2 sends hardware HEVC encoding to an Intel
+  GPU, even when an app asks for ours, so apps encode HEVC in software. On Linux hosts, H.264
+  encoding uses your GPU.
+- **HEVC at 4:2:2, 4:4:4 or 12 bits on Intel Mac guests.** macOS 26.7.2 would only take these
+  from a GPU as 4:2:0 at 10 bits, which loses colour detail, so the guest keeps decoding them in
+  software at full quality.
+- **MPEG-1, MPEG-2, MPEG-4 Part 2, VC-1 and VP8 decoding, and VP9 and AV1 encoding.** We found no
+  way in macOS for a GPU to take these.
+
 ## Sound comes after video on Windows
 
 On a Windows host, a VM's sound reaches your speakers about 0.1 s after the guest sends it, and
