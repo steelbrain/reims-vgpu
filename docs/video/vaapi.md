@@ -1273,6 +1273,60 @@ the driver's answer elsewhere. `HevcDecoder::new` checks the `hvcC` record's fir
 profile and its largest size, so that a session the driver cannot serve
 fails when it is made.
 
+## The VP9 decoder
+
+VP9 decodes for VideoToolbox's paravirtual decoders alone: the device has no VP9 op, and its
+caps entry (codec 3) is for the arm64 guest's decoder list ([devices.md](devices.md)).
+
+### Shape
+
+`vp9::Decoder<A: Accelerator>` (`src/codec/vp9`) does everything above a frame's compressed
+header:
+- a sample's frames: a superframe split by its index (Annex B), each frame's size checked
+  against the bytes before the index; a sample with no index is one frame;
+- each frame's uncompressed header (6.2, 7.2): its size coded or taken from the reference it
+  names, the render size, the loop filter's deltas and the segmentation's features kept from
+  frame to frame and set up again at an intra or error-resilient frame
+  (`setup_past_independence`), the quantizer, the tiles, and the compressed header's size, which
+  must lie in the frame;
+- the eight reference slots, a frame that shows a slot (`show_existing_frame`), and each
+  segment's quantizer scales and filter levels (8.6.1, 8.8.1, as libvpx derives them);
+- before the accelerator: an inter frame's references in their slots, of its depth and
+  subsampling, at a scale it predicts from (twice its size to a sixteenth, 8.5.2.3); a frame
+  past 16384 a side (`MAX_SIDE`), which no lab driver decodes.
+
+A frame that does not decode leaves the slots and the kept state as they were. The
+interpolation filter goes in libvpx's numbering (EIGHTTAP 0, EIGHTTAP_SMOOTH 1), which
+va_dec_vp9.h and NVDEC take.
+
+The VA accelerator (`src/vaapi/va/vp9.rs`) sends each frame whole, its uncompressed header
+first, as one slice (`VA_SLICE_DATA_FLAG_ALL`), with a `VADecPictureParameterBufferVP9` (the
+eight slots' surfaces, `VA_INVALID_SURFACE` for an empty one, and the two headers' sizes) and a
+`VASliceParameterBufferVP9` holding each segment's reference and skip features, where
+segmentation is on, and its derived scales and filter levels, as ffmpeg's `vaapi_vp9.c` fills
+them. The map's prediction probabilities go as 255 where its update is not temporal.
+
+### Surfaces and what it refuses
+
+- Profile 0 decodes into NV12 (`VAProfileVP9Profile0`), profile 2 at 10 bits into P010
+  (`VAProfileVP9Profile2`, `VA_RT_FORMAT_YUV420_10`), where the driver's VLD config lists the
+  format and the frame's size (`Vp9Decoder::supports`, which answers the guest's stream at its
+  session's start).
+- A context is made for each run of frames of one format and size; a frame's references stay
+  the surfaces of the frames its slots hold, of whichever context.
+- Refused with `Error::Vp9Bitstream(vp9::Error::Unsupported(..))`, before anything reaches the
+  driver: profiles 1 and 3 (4:4:4, 4:2:2 and 4:4:0) and 12 bits. A frame that predicts from an
+  empty slot, as a stream started after its key frame does, is a picture's error, until a key
+  frame fills the slots.
+- Malformed superframe indexes and headers are refused as bad data, with nothing taken from a
+  field before it is checked against the bytes (the codec module's fuzz targets `vp9-streams`
+  and `vp9-samples`).
+
+The tree's two libvpx streams (`src/codec/vp9/tests`: 640x360, profile 0 and profile 2, three
+superframes each with a hidden altref frame) decode frame by frame equal to vpxdec's MD5s
+(the ignored `vaapi::va::vp9` tests): on the RX 7900 XTX's radeonsi (potluck job m3-max-77352)
+and the Iris Xe's iHD (potluck job m3-max-77387), 2026-11-27.
+
 ## The encoders
 
 H.264 (Constrained Baseline, Main, High) and HEVC (Main, Main 10) on

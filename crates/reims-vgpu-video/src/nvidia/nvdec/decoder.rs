@@ -901,6 +901,12 @@ impl Picture {
         &self.inner.gpu
     }
 
+    /// Whether it is one of `decoder`'s surfaces, which `decoder`'s
+    /// pictures may name as a reference.
+    pub(crate) fn is_of(&self, decoder: &Decoder) -> bool {
+        Arc::ptr_eq(&self.inner, &decoder.inner)
+    }
+
     /// Another picture of this one's surface, to stand in for a lost frame
     /// that later frames predict from (ours). NVDEC's surfaces are written
     /// by a decode alone, and a decoded surface is decoded into again only

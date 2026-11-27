@@ -48,6 +48,8 @@ pub enum Error {
     },
     /// The stream is malformed, or uses what the decoder refuses.
     Bitstream(crate::codec::h264::Error),
+    /// The VP9 stream is malformed, or uses what the decoder refuses.
+    Vp9Bitstream(crate::codec::vp9::Error),
     /// The HEVC stream is malformed, or uses what the decoder refuses.
     HevcBitstream(crate::codec::hevc::Error),
     /// The AV1 stream is malformed, or uses what the decoder refuses.
@@ -78,6 +80,7 @@ impl std::fmt::Display for Error {
                 status,
                 message,
             } => write!(f, "{call} failed: {message} ({status:#x})"),
+            Self::Vp9Bitstream(e) => write!(f, "{e}"),
             Self::Bitstream(e) => write!(f, "{e}"),
             Self::HevcBitstream(e) => write!(f, "{e}"),
             Self::Av1Bitstream(e) => write!(f, "{e}"),
@@ -91,10 +94,11 @@ impl std::fmt::Display for Error {
 
 impl Error {
     /// Whether the error is one picture's of the stream, after which the decoder goes on (the
-    /// codec crate's `is_picture_error`, H.264's, HEVC's and AV1's): the rest are the decoder's own or
-    /// the driver's.
+    /// codec crate's `is_picture_error`, H.264's, HEVC's, AV1's and VP9's): the rest are the
+    /// decoder's own or the driver's.
     pub fn is_picture_error(&self) -> bool {
         match self {
+            Self::Vp9Bitstream(e) => e.is_picture_error(),
             Self::Bitstream(e) => e.is_picture_error(),
             Self::HevcBitstream(e) => e.is_picture_error(),
             Self::Av1Bitstream(e) => e.is_picture_error(),
@@ -108,6 +112,12 @@ impl std::error::Error for Error {}
 impl From<crate::codec::h264::Error> for Error {
     fn from(e: crate::codec::h264::Error) -> Self {
         Self::Bitstream(e)
+    }
+}
+
+impl From<crate::codec::vp9::Error> for Error {
+    fn from(e: crate::codec::vp9::Error) -> Self {
+        Self::Vp9Bitstream(e)
     }
 }
 

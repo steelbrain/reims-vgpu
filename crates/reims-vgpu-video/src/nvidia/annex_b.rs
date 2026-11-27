@@ -34,6 +34,10 @@
 //!   low-overhead format, after its record's `configOBUs` as its
 //!   parameter sets (`nvdec::av1`); a picture NVDEC fails is followed by
 //!   the next decodes, as an H.264 stream's is.
+//! - **A VP9 stream** is handed over as its container's samples, a frame
+//!   or a superframe each, whole, with no parameter sets; each frame is sent
+//!   where it lies in the sample (`nvdec::vp9`), and a frame NVDEC fails is
+//!   followed by the next decodes, as an H.264 stream's is.
 //! - **A picture holds its decode surface** until it drops: the decoder has
 //!   [`AnnexBDecoder::SPARE_PICTURES`] surfaces beyond its references and
 //!   the picture being decoded, and a decode with none free is
@@ -46,6 +50,7 @@ use crate::codec::PictureStart;
 use crate::codec::av1::{Decoder as Av1Decoder, Limits as Av1Limits};
 use crate::codec::h264::{Decoder as H264Decoder, nal::NalFormat};
 use crate::codec::hevc::Decoder as HevcDecoder;
+use crate::codec::vp9::Decoder as Vp9Decoder;
 use crate::core::device_memory::DeviceMemory;
 use crate::core::runtime::Runtime;
 use crate::core::surfaces::crop_within;
@@ -60,6 +65,7 @@ use crate::nvidia::nvdec::decoder::{
 };
 use crate::nvidia::nvdec::h264::NvdecH264;
 use crate::nvidia::nvdec::hevc::NvdecHevc;
+use crate::nvidia::nvdec::vp9::NvdecVp9;
 use crate::nvidia::wait::Deadline;
 
 /// A codec an [`AnnexBDecoder`] decodes.
@@ -75,6 +81,9 @@ pub enum AnnexBCodec {
     /// limits (NVDEC's largest and smallest, as its capability query lists
     /// them).
     Av1(Av1Limits),
+    /// VP9, profile 0 and profile 2 at 10 bits, 4:2:0: not Annex B, but
+    /// samples of a frame or a superframe each (module doc).
+    Vp9,
 }
 
 /// One stream's decoder of whole Annex B access units on NVDEC (module
@@ -95,6 +104,7 @@ enum Codec {
     Hevc(HevcDecoder<NvdecHevc>),
     /// Boxed: its eight slots' state is far larger than the other decoders.
     Av1(Box<Av1Decoder<NvdecAv1>>),
+    Vp9(Vp9Decoder<NvdecVp9>),
 }
 
 /// How an [`AnnexBDecoder`]'s pictures reached NVDEC: as a run of their
@@ -133,6 +143,7 @@ impl AnnexBDecoder {
                 NvdecAv1::new(Arc::clone(gpu)),
                 limits,
             ))),
+            AnnexBCodec::Vp9 => Codec::Vp9(Vp9Decoder::new(NvdecVp9::new(Arc::clone(gpu)))),
         };
         Self {
             codec,
@@ -178,8 +189,15 @@ impl AnnexBDecoder {
 
     /// Takes parameter sets (H.264's SPS and PPS, HEVC's VPS, SPS and PPS),
     /// units in Annex B form; AV1's sequence header OBUs, a record's
-    /// `configOBUs`; units that make a picture are an error.
+    /// `configOBUs`; units that make a picture are an error, as is any byte
+    /// for VP9, which has none.
     pub fn parameter_sets(&mut self, sets: &[u8]) -> Result<(), Error> {
+        if matches!(self.codec, Codec::Vp9(_)) {
+            return match sets {
+                [] => Ok(()),
+                _ => Err(Error::Bitstream("parameter sets for VP9".to_owned())),
+            };
+        }
         match self.decode_sample(sets, false)? {
             None => Ok(()),
             Some(_) => Err(Error::Bitstream(
@@ -208,6 +226,7 @@ impl AnnexBDecoder {
             Codec::H264(decoder) => decoder.last_picture(),
             Codec::Hevc(decoder) => decoder.last_picture(),
             Codec::Av1(_) => None,
+            Codec::Vp9(_) => None,
         }
     }
 
@@ -217,6 +236,7 @@ impl AnnexBDecoder {
             Codec::H264(decoder) => &decoder.accelerator().in_place,
             Codec::Hevc(decoder) => &decoder.accelerator().in_place,
             Codec::Av1(decoder) => &decoder.accelerator().in_place,
+            Codec::Vp9(decoder) => &decoder.accelerator().in_place,
         };
         Bitstreams {
             in_place: in_place.in_place,
@@ -276,6 +296,15 @@ impl AnnexBDecoder {
                     })
                     .collect::<Vec<_>>()
             }
+            // A VP9 decoder decodes on after a frame NVDEC failed, from what
+            // NVDEC left, as an H.264 one does; a sample shows one frame at
+            // most, the whole of it.
+            Codec::Vp9(decoder) => (decoder.decode(sample, id)?.into_iter())
+                .map(|out| {
+                    let (width, height) = out.size;
+                    (out.picture, (0, 0, width, height))
+                })
+                .collect::<Vec<_>>(),
         };
         let mut outputs = outputs.into_iter();
         let picture = outputs.next();
@@ -693,3 +722,5 @@ impl AnnexBPicture {
 mod av1_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vp9_tests;

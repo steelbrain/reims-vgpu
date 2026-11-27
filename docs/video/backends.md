@@ -11,7 +11,7 @@ crate, the traits between them, and how each is tested.
 | module | what it is |
 |---|---|
 | `core` (`src/core.rs`) | What the arms share: the threads and clock the host gives them, their locks, a guest surface's memory as a device reaches it, and their bounded waits ([core.md](core.md)) |
-| `codec` (`src/codec.rs`) | The codecs above the hardware, in plain Rust: H.264's and HEVC's syntax, order counts and DPB over an `Accelerator` that decodes the slice data, AV1's OBUs, headers, tile groups and reference slots over one that decodes the tile data, and the encoders' portable half: settings, GOP, parameter sets, slice headers and configuration records |
+| `codec` (`src/codec.rs`) | The codecs above the hardware, in plain Rust: H.264's and HEVC's syntax, order counts and DPB over an `Accelerator` that decodes the slice data, AV1's OBUs, headers, tile groups and reference slots over one that decodes the tile data, VP9's superframes, frame headers and reference slots over one that decodes a frame's compressed header and tiles, and the encoders' portable half: settings, GOP, parameter sets, slice headers and configuration records |
 | `vaapi` (`src/vaapi.rs`, Linux and Windows) | VA-API through libva, loaded at run time: the decoders and encoders on the codec module, the import check and zero copy ([vaapi.md](vaapi.md)) |
 | `nvidia` (`src/nvidia.rs`, Linux) | NVDEC and NVENC over the CUDA driver API, loaded at run time: the decoder of whole access units and the encoder ([nvidia.md](nvidia.md)) |
 | `paravirt` (`src/paravirt.rs`) | VideoToolbox's paravirtual protocol, the host's side: the `vtpv` messages an arm64 guest's VideoToolbox sends through the device's `VT_MESSAGE`, the decoder list and capabilities answered from the arm's decoders, the decoder sessions, each on a thread of its own over a backend that lands its pictures in the buffers the guest lends, and the encoder sessions, over a backend that encodes the source frames the guest lends (on VA-API, written by the GPU from a buffer over their pages into an input of the encoder's, memory of the runtime device's that the encoder's display imports, on NVENC into memory CUDA imported, which NVENC registers as input, else read through the host's view of the pages and uploaded), whose samples the session emits ([design.md](../graphics-kext/design.md), "Decided", 17) |
@@ -106,5 +106,10 @@ decode, MD5 by MD5, and the streams the decoder must refuse refused ([vaapi.md](
 ignored hardware tests ([nvidia.md](nvidia.md)).
 
 x264, x265, kvazaar and ffmpeg are test oracles alone: they write the test streams and the
-reference MD5s under `build/`, and nothing they write is committed. Each script runs in a potluck
+reference MD5s under `build/`, and nothing they write is committed. VP9 has no such suite: the
+codec module's VP9 tests carry two streams of their own, committed (`src/codec/vp9/tests`:
+ffmpeg's `testsrc2` encoded by libvpx at 640x360, profile 0 and profile 2, 60 and 56 KB), with
+vpxdec's MD5 of each frame, which ffmpeg's own VP9 decoder matched frame for frame; each arm's
+ignored VP9 tests decode them against those MD5s ([vaapi.md](vaapi.md), "The VP9 decoder";
+[nvidia.md](nvidia.md), "Tests"). Each script runs in a potluck
 job that holds the render node's GPU (`--gpu`).

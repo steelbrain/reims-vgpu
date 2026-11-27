@@ -1,7 +1,8 @@
 //! NVDEC's declarations (libnvcuvid's decoder half, `cuviddec.h`), the
 //! subset this crate uses: capabilities, the decoder, picture parameters
-//! for H.264, HEVC and AV1 ([`av1`]), mapping and status. NVIDIA's parser
-//! (`nvcuvid.h`) is not used: our own parsers fill the picture parameters.
+//! for H.264, HEVC, AV1 ([`av1`]) and VP9 ([`vp9`]), mapping and status.
+//! NVIDIA's parser (`nvcuvid.h`) is not used: our own parsers fill the
+//! picture parameters.
 //!
 //! Field names are the header's, so that `crate::nvidia::layout`'s test can check
 //! each size, offset and bit-field against ffnvcodec's `dynlink_cuviddec.h`
@@ -25,6 +26,7 @@ pub(crate) use crate::nvidia::dl::Zeroed;
 use crate::nvidia::dl::functions;
 
 pub(crate) mod av1;
+pub(crate) mod vp9;
 
 /// `CUvideodecoder`.
 pub(crate) type CUvideodecoder = *mut c_void;
@@ -46,6 +48,7 @@ pub(crate) type cuvidDecodeStatus = c_uint;
 pub(crate) const cudaVideoCodec_H264: cudaVideoCodec = 4;
 pub(crate) const cudaVideoCodec_HEVC: cudaVideoCodec = 8;
 pub(crate) const cudaVideoCodec_AV1: cudaVideoCodec = 11;
+pub(crate) const cudaVideoCodec_VP9: cudaVideoCodec = 10;
 
 pub(crate) const cudaVideoChromaFormat_Monochrome: cudaVideoChromaFormat = 0;
 pub(crate) const cudaVideoChromaFormat_420: cudaVideoChromaFormat = 1;
@@ -326,6 +329,7 @@ pub(crate) union CuvidCodecSpecific {
     pub(crate) h264: CUVIDH264PICPARAMS,
     pub(crate) hevc: CUVIDHEVCPICPARAMS,
     pub(crate) av1: av1::CUVIDAV1PICPARAMS,
+    pub(crate) vp9: vp9::CUVIDVP9PICPARAMS,
     pub(crate) CodecReserved: [c_uint; 1024],
 }
 

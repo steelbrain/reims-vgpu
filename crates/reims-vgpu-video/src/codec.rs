@@ -16,6 +16,10 @@
 //! - [`hevc`] is HEVC's: NAL units, `hvcC`, parameter sets with their
 //!   reference picture sets, slice segment headers, order counts and the
 //!   DPB, over an `Accelerator` likewise. It shares H.264's bit reader.
+//! - [`vp9`] is VP9's: superframes, `vpcC`, the uncompressed header and
+//!   what it keeps between frames, the derived quantizer scales and filter
+//!   levels, and the eight reference slots, over an `Accelerator` that
+//!   decodes the compressed header and the tiles.
 
 // The crate's lint set, core's but its division lint: the decoding
 // processes divide by what the standards divide by. Tests are exempt as in
@@ -61,6 +65,7 @@ pub mod encode;
 pub mod h264;
 pub mod hevc;
 mod num;
+pub mod vp9;
 
 /// Whether a later picture of its stream may predict from a picture, as its first slice says:
 /// what each codec's decoder tells its accelerator as it asks for the picture's storage

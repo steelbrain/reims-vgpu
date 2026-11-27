@@ -96,6 +96,12 @@ Everything known to be wrong, untested or put off in the reims-graphics device's
 - **Why it waits:** decoding a reference into its cache would have the decoder read memory that rt acquired for the device's GPU work. Vulkan leaves an acquired resource's contents undefined to other queue families, and lets the implementation write a resource it acquired even in an apparently read-only operation (Vulkan 7.7.6), so a decoder reading one is undocumented. The documented form releases the surface to the external queue family before each decode that names it as a reference, and acquires it again after (`external_writes_done`, `crates/reims-vgpu-vulkan/src/rt_platform/surface.rs`). It would tie every such decode to the completion of a submission of rt's. rt's surface makes, each of which waits for one, took 1.3 to 2.5 ms, 5.0 to 6.0 ms and 27 to 58 ms at the 4K start of three such boots (**measured**, the same GPU and file, 2026-11-19).
 - **Fix:** take the copy off the frame's chain. A reference lands at its decode's completion, with its copy running behind it, and a read of its output waits for the copy and its acquire: a commit that names the output's textures or buffer, and a guest lock. The next decode never waits for the copy, since its references are the decoder's own surfaces.
 
+### B96. On NVDEC, a VP9 frame of another size than the frames it predicts from does not decode
+
+- **What:** VP9 lets an inter frame change the stream's size and predict from frames of the old size, scaled (8.5.2.3), as senders that adapt their resolution do. The NVDEC accelerator makes a decoder for each run of frames of one size, and NVDEC names a frame's references by their surfaces in its own decoder, so such a frame's references lie in the decoder before. It is refused as a picture's error, and so is each frame after it that predicts from them, until an intra frame fills the slots (`src/nvidia/nvdec/vp9.rs`); the guest's VideoToolbox gets those frames as bad data. VA-API's VP9 decoder hands the driver the old context's surfaces as references, which no stream of ours checks either.
+- **Why it waits:** none of our streams resizes, and no run has shown one.
+- **Fix:** one decoder at the largest size the stream may reach, each frame decoded at its own size, checked with a stream that resizes on each arm.
+
 ## Upstream bugs
 
 Bugs in drivers, libraries and tools that our code or our checks work around.

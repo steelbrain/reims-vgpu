@@ -349,6 +349,7 @@ fn nvdec_checks(checks: &mut Checks) {
         size_of::<dec::CuvidCodecSpecific>(),
     );
     av1_checks(checks);
+    vp9_checks(checks);
     layout!(checks, dec::CUVIDPROCPARAMS, "CUVIDPROCPARAMS" {
         progressive_frame, second_field, top_field_first, unpaired_field, reserved_flags,
         reserved_zero, raw_input_dptr, raw_input_pitch, raw_input_format, raw_output_dptr,
@@ -495,6 +496,28 @@ fn av1_checks(checks: &mut Checks) {
         invalid, wmtype,
     });
     checks.constant("cudaVideoCodec_AV1", dec::cudaVideoCodec_AV1.into());
+}
+
+/// `CUVIDVP9PICPARAMS`: its fields and its words' bit-fields.
+fn vp9_checks(checks: &mut Checks) {
+    use dec::vp9::{self as vp9, CUVIDVP9PICPARAMS as P};
+    layout!(checks, P, "CUVIDVP9PICPARAMS" {
+        width, height, LastRefIdx, GoldenRefIdx, AltRefIdx, colorSpace, reserved16Bits,
+        refFrameSignBias, bitDepthMinus8Luma, bitDepthMinus8Chroma, loopFilterLevel,
+        loopFilterSharpness, modeRefLfEnabled, log2_tile_columns, log2_tile_rows,
+        segmentFeatureEnable, segmentFeatureData, mb_segment_tree_probs, segment_pred_probs,
+        reservedSegment16Bits, qpYAc, qpYDc, qpChDc, qpChAc, activeRefIdx, resetFrameContext,
+        mcomp_filter_type, mbRefLfDelta, mbModeLfDelta, frameTagSize, offsetToDctParts,
+        reserved128Bits,
+    });
+    bit_fields!(checks, P, "CUVIDVP9PICPARAMS", frame_word: u16, vp9::bits::frame {
+        profile, frameContextIdx, frameType, showFrame, errorResilient, frameParallelDecoding,
+        subSamplingX, subSamplingY, intraOnly, allow_high_precision_mv, refreshEntropyProbs,
+    });
+    bit_fields!(checks, P, "CUVIDVP9PICPARAMS", segmentation_word: u8, vp9::bits::segmentation {
+        segmentEnabled, segmentMapUpdate, segmentMapTemporalUpdate, segmentFeatureMode,
+    });
+    checks.constant("cudaVideoCodec_VP9", dec::cudaVideoCodec_VP9.into());
 }
 
 fn nvenc_checks(checks: &mut Checks) {

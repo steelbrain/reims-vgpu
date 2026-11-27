@@ -50,6 +50,10 @@ impl Profile {
     pub const HEVC_MAIN444_10: Self = Self(ffi::VAProfileHEVCMain444_10);
     /// `VAProfileHEVCMain444_12`: the range extensions' 4:4:4 at 12 bits.
     pub const HEVC_MAIN444_12: Self = Self(ffi::VAProfileHEVCMain444_12);
+    /// `VAProfileVP9Profile0`: 4:2:0 at 8 bits.
+    pub const VP9_PROFILE0: Self = Self(ffi::vp9::VAProfileVP9Profile0);
+    /// `VAProfileVP9Profile2`: 4:2:0 at 10 or 12 bits.
+    pub const VP9_PROFILE2: Self = Self(ffi::vp9::VAProfileVP9Profile2);
 
     /// va.h's name for the profile, without its `VAProfile` prefix.
     pub fn name(self) -> Option<&'static str> {

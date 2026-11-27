@@ -9,6 +9,7 @@ pub(crate) mod decoder;
 pub(crate) mod ffi;
 pub(crate) mod h264;
 pub(crate) mod hevc;
+pub(crate) mod vp9;
 
 use std::sync::OnceLock;
 
@@ -51,17 +52,20 @@ pub enum NvdecCodec {
     Hevc,
     /// AV1.
     Av1,
+    /// VP9.
+    Vp9,
 }
 
 impl NvdecCodec {
     /// Every codec, in `cudaVideoCodec`'s order.
-    pub const ALL: [Self; 3] = [Self::H264, Self::Hevc, Self::Av1];
+    pub const ALL: [Self; 4] = [Self::H264, Self::Hevc, Self::Av1, Self::Vp9];
 
     pub(crate) fn raw(self) -> ffi::cudaVideoCodec {
         match self {
             Self::H264 => ffi::cudaVideoCodec_H264,
             Self::Hevc => ffi::cudaVideoCodec_HEVC,
             Self::Av1 => ffi::cudaVideoCodec_AV1,
+            Self::Vp9 => ffi::cudaVideoCodec_VP9,
         }
     }
 }

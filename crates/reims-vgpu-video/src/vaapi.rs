@@ -3,7 +3,7 @@
 //! codecs of [`crate::codec`].
 //!
 //! - The libva binding and the decoders on it: [`Display`],
-//!   [`H264Decoder`], [`HevcDecoder`], [`Frame`].
+//!   [`H264Decoder`], [`HevcDecoder`], [`Vp9Decoder`], [`Frame`].
 //! - [`VideoEncoder`] runs [`crate::codec::encode`]'s encoders on VA-API.
 
 mod va;
@@ -27,6 +27,8 @@ pub use va::SharedTexture;
 /// each, which another device imports (`PlaneDraw::draw`).
 #[cfg(windows)]
 pub use va::{PlaneDraw, PlaneTargets};
+
+pub use va::Vp9Decoder;
 
 pub use va::{
     TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,

@@ -16,9 +16,9 @@ driver 13.4, on CachyOS) unless they say otherwise.
 |---|---|
 | Loading the driver's libraries, and the function tables | `src/nvidia/dl.rs` |
 | The CUDA driver API: a GPU, its primary context, copies | `src/nvidia/cuda.rs`, `src/nvidia/cuda/ffi.rs` |
-| NVDEC's binding: caps, decoder, pictures, mapping, status, reconfiguration | `src/nvidia/nvdec.rs`, `src/nvidia/nvdec/ffi.rs` |
+| NVDEC's binding: caps, decoder, pictures, mapping, status, reconfiguration | `src/nvidia/nvdec.rs`, `src/nvidia/nvdec/ffi.rs`, `src/nvidia/nvdec/ffi/vp9.rs` |
 | An NVDEC decoder and its pictures: surfaces, stand-ins, the copy out | `src/nvidia/nvdec/decoder.rs` |
-| The codec module's accelerators on NVDEC, one a codec | `src/nvidia/nvdec/h264.rs`, `hevc.rs`, and AV1's, for VideoToolbox's decoders alone ([devices.md](devices.md), "AV1 on arm64 guests"), `av1.rs` with its binding `src/nvidia/nvdec/ffi/av1.rs` |
+| The codec module's accelerators on NVDEC, one a codec | `src/nvidia/nvdec/h264.rs`, `hevc.rs`, and AV1's, for VideoToolbox's decoders alone ([devices.md](devices.md), "AV1 on arm64 guests"), `av1.rs` with its binding `src/nvidia/nvdec/ffi/av1.rs`, and VP9's, likewise, `vp9.rs` |
 | The decoder of whole Annex B access units, which the reims-graphics device's video drives | `src/nvidia/annex_b.rs` |
 | The failures NVDEC reports, which fail the pictures after them | `src/nvidia/decode.rs` |
 | Zero copy: guest memory registered with CUDA ("Zero copy") | `src/nvidia/zero_copy.rs` |
@@ -232,6 +232,17 @@ the model.
   it. VideoToolbox's paravirtual decoders write it so into a scratch of the
   runtime device's, whose kernel then writes the guest's surface's two
   planes (reims-vgpu's `graphics::nvidia` and `graphics::gather`).
+- **VP9**, for VideoToolbox's paravirtual decoders alone (`src/nvidia/nvdec/vp9.rs`):
+  `CUVIDVP9PICPARAMS` from the codec module's uncompressed header and slots, as ffmpeg's
+  `nvdec_vp9.c` fills it: the last, golden and altref frames by surface index (255 in an intra
+  frame), their slots in `activeRefIdx` and their sign biases from `refFrameSignBias[1]`, the
+  filter in libvpx's numbering, the loop filter's deltas as `int`s in its `unsigned int`s, each
+  segment's features as coded with the skip feature's data 0, and `frameTagSize` and
+  `offsetToDctParts` the two headers' sizes. The frame goes whole, where it lies in the sample,
+  as one slice at its start; NVDEC reads its compressed header and tiles. Profile 0 decodes into
+  NV12 and profile 2 at 10 bits into P016, on a decoder made at the frame's size
+  (`cudaVideoCodec_VP9`, 10); the caps' entry lists each profile where NVDEC answers VP9 at its
+  depth.
 - **HEVC.** The references by surface index with their order counts and
   long-term flags; `RefPicSetStCurrBefore`, `StCurrAfter` and `LtCurr` as
   indices into them, in the order 8.3.2 derives them, which the codec
@@ -312,6 +323,13 @@ DPB names it follows NVIDIA's parser, measured on 2026-10-24:
 - A stream past NVDEC's sizes, as unsupported, or under them, as too small
   (`Error::TooSmall`). The device's caps give the guest NVDEC's own sizes
   ([bugs.md](bugs.md), D14).
+- A VP9 frame whose references lie in another decoder's surfaces, as a
+  picture's error: a decoder is made for each run of frames of one size,
+  and NVDEC names references by their surfaces, so a frame of another
+  size than the frames it predicts from (a resize between key frames,
+  which VP9 allows) does not decode, nor do the frames after it until an
+  intra frame fills the slots ([bugs.md](bugs.md), B96). VP9's profiles 1
+  and 3 and 12 bits, as unsupported, before NVDEC sees a frame.
 - An HEVC picture with more than 8 pictures in one of its current
   reference sets, as unsupported: `CUVIDHEVCPICPARAMS` holds 8 a set
   (`current_set`, `src/nvidia/nvdec/hevc.rs`, "NVDEC takes 8"). The caps answer 8 current references
@@ -425,6 +443,11 @@ unmapped, freed or destroyed until it has.
   - `access_units_decode_in_place_and_land_by_the_gpu_as_they_read_back`
     (`src/nvidia/annex_b/tests.rs`): whole access units decoded in place, each
     picture written by the GPU equal to its read back;
+  - `libvpx_streams_decode_to_libvpx_frames` and
+    `a_stream_that_starts_after_its_key_frame_decodes_from_the_key_frame`
+    (`src/nvidia/annex_b/vp9_tests.rs`): the codec module's two libvpx
+    streams, every frame equal to vpxdec's MD5, each frame sent in place,
+    the hidden ones too (an RTX 3090, potluck job m3-max-77353, 2026-11-27);
   - `what_each_lock_returns` and
     `a_lock_past_its_deadline_stalls_the_session_until_nvenc_is_done`
     (`src/nvidia/nvenc/encoder.rs`): NVENC's locks ([bugs.md](bugs.md), U19).
