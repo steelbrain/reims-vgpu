@@ -736,9 +736,99 @@ pub fn remove_set_aside_programs() {
     }
 }
 
+/// What the interface draws with in the output mode of the console's screen buffer: line ends
+/// and escape sequences acted on (`ENABLE_PROCESSED_OUTPUT`, `ENABLE_VIRTUAL_TERMINAL_PROCESSING`)
+/// and lines wrapped at its edge (`ENABLE_WRAP_AT_EOL_OUTPUT`). The console wrote reims-ctl's line
+/// ends and escape sequences as characters after an update's install script in a Windows
+/// Terminal, and wrote past the line's end over its last column, as it does with these off.
+pub const DRAWS_WITH: u32 = windows_sys::Win32::System::Console::ENABLE_PROCESSED_OUTPUT
+    | windows_sys::Win32::System::Console::ENABLE_WRAP_AT_EOL_OUTPUT
+    | windows_sys::Win32::System::Console::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+
+/// The console this process is attached to, by `name`, `CONIN$` for its input or `CONOUT$` for
+/// its screen buffer, whatever its standard handles are, with its mode; None where it has no
+/// console. The handle is the caller's to close.
+fn open_console(name: &str) -> Option<(windows_sys::Win32::Foundation::HANDLE, u32)> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::GetConsoleMode;
+    let name = wide(name);
+    // SAFETY: name is NUL-terminated; GetConsoleMode fails on a handle that is no console's, which
+    // is closed here.
+    unsafe {
+        let h = CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut mode = 0;
+        if GetConsoleMode(h, &mut mode) == 0 {
+            CloseHandle(h);
+            return None;
+        }
+        Some((h, mode))
+    }
+}
+
+/// The console's modes, its input's and its screen buffer's output's, as [`keep_console_modes`]
+/// found them, which it gives back to the console as it drops: a program run on the console can
+/// end leaving modes of its own ([`DRAWS_WITH`]).
+pub struct ConsoleModes(Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>);
+
+/// [`ConsoleModes`], from now; none where this process has no console.
+pub fn keep_console_modes() -> ConsoleModes {
+    ConsoleModes(
+        ["CONIN$", "CONOUT$"]
+            .into_iter()
+            .filter_map(open_console)
+            .collect(),
+    )
+}
+
+impl Drop for ConsoleModes {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Console::SetConsoleMode;
+        for &(h, mode) in &self.0 {
+            // SAFETY: h is a console handle open_console opened, closed once here.
+            unsafe {
+                SetConsoleMode(h, mode);
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
+/// Turns on in the output mode of the console's screen buffer what the interface draws with
+/// ([`DRAWS_WITH`]), which a program run on the console before may have left off; its other
+/// flags stay. Nothing where this process has no console.
+pub fn console_for_drawing() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Console::SetConsoleMode;
+    if let Some((h, mode)) = open_console("CONOUT$") {
+        // SAFETY: h is the console handle open_console opened, closed once here.
+        unsafe {
+            SetConsoleMode(h, mode | DRAWS_WITH);
+            CloseHandle(h);
+        }
+    }
+}
+
 /// Runs `cmd` in the console to its end. Ctrl+C and Ctrl+Break reach every process attached to
 /// the console, so this one takes them as handled until `cmd` exits, and `cmd` gets them as it
-/// would from a shell: a handler is not inherited, as ignoring them would be.
+/// would from a shell: a handler is not inherited, as ignoring them would be. The console gets
+/// back the modes it had before `cmd` ([`keep_console_modes`]).
 pub fn run_in_terminal(mut cmd: Command) -> io::Result<ExitStatus> {
     use windows_sys::Win32::System::Console::{
         CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
@@ -748,7 +838,9 @@ pub fn run_in_terminal(mut cmd: Command) -> io::Result<ExitStatus> {
     }
     // SAFETY: handled is a function for the process's life, removed again below.
     unsafe { SetConsoleCtrlHandler(Some(handled), 1) };
+    let modes = keep_console_modes();
     let status = cmd.status();
+    drop(modes);
     // SAFETY: as above.
     unsafe { SetConsoleCtrlHandler(Some(handled), 0) };
     status
@@ -1427,12 +1519,12 @@ mod tests {
             .is_some_and(|i| b[i..].contains(&b'c'))
     }
 
-    /// The answer a terminal sends to a query reaches [`read_terminal`] as the terminal sent it,
-    /// escape sequence and all, under [`terminal_answers`]: in a pseudoconsole, whose console
-    /// answers the device attributes query itself or passes it on to this test, which answers as
-    /// a terminal does.
-    #[test]
-    fn a_terminals_answer_reaches_read_terminal_as_sent() {
+    /// Runs this binary's test `test` in a pseudoconsole of 80 by 25, as a terminal runs a
+    /// program, with `arg` its argument, and waits at most `wait` for it to end, ending it then.
+    /// Returns whether it ended in that time (`WAIT_OBJECT_0`), its exit code, and what the
+    /// console wrote to the terminal, which answers each device attributes query (DA1) the
+    /// console passes on, as a terminal does.
+    fn in_pseudoconsole(test: &str, arg: &str, wait: std::time::Duration) -> (u32, u32, Vec<u8>) {
         use std::io::{Read, Write};
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
@@ -1445,7 +1537,6 @@ mod tests {
             PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
             STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
         };
-        let out = std::env::temp_dir().join(format!("reims-ctl-console-{}", std::process::id()));
         let (in_read, mut in_write) = std::io::pipe().unwrap();
         let (mut out_read, out_write) = std::io::pipe().unwrap();
         let mut pc: HPCON = 0;
@@ -1507,11 +1598,7 @@ mod tests {
         si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
         si.lpAttributeList = attrs;
         let exe = std::env::current_exe().unwrap();
-        let mut line = wide(&format!(
-            "\"{}\" --exact os::windows::tests::console_child \"{CONSOLE_CHILD}{}\"",
-            exe.display(),
-            out.display()
-        ));
+        let mut line = wide(&format!("\"{}\" --exact {test} \"{arg}\"", exe.display()));
         let mut pi = PROCESS_INFORMATION::default();
         // SAFETY: line is NUL-terminated and writable; si and its list live past the call.
         let ok = unsafe {
@@ -1533,7 +1620,7 @@ mod tests {
         // SAFETY: pi's handles are the child's, closed once here; the list and the console are
         // this test's, ended once the child has.
         let waited = unsafe {
-            let waited = WaitForSingleObject(pi.hProcess, 30_000);
+            let waited = WaitForSingleObject(pi.hProcess, wait.as_millis() as u32);
             if waited != WAIT_OBJECT_0 {
                 TerminateProcess(pi.hProcess, 1);
             }
@@ -1544,7 +1631,22 @@ mod tests {
             ClosePseudoConsole(pc);
             waited
         };
-        let seen = terminal.join().unwrap();
+        (waited, code, terminal.join().unwrap())
+    }
+
+    /// The answer a terminal sends to a query reaches [`read_terminal`] as the terminal sent it,
+    /// escape sequence and all, under [`terminal_answers`]: in a pseudoconsole, whose console
+    /// answers the device attributes query itself or passes it on to this test, which answers as
+    /// a terminal does.
+    #[test]
+    fn a_terminals_answer_reaches_read_terminal_as_sent() {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        let out = std::env::temp_dir().join(format!("reims-ctl-console-{}", std::process::id()));
+        let (waited, code, seen) = in_pseudoconsole(
+            "os::windows::tests::console_child",
+            &format!("{CONSOLE_CHILD}{}", out.display()),
+            std::time::Duration::from_secs(30),
+        );
         let got = std::fs::read(&out).unwrap_or_default();
         let _ = std::fs::remove_file(&out);
         let console = String::from_utf8_lossy(&seen);
@@ -1557,6 +1659,174 @@ mod tests {
             da1_answer(&got),
             "read {:?}; the console wrote {console:?}",
             String::from_utf8_lossy(&got)
+        );
+    }
+
+    /// The console's input mode and the output mode of its screen buffer, as this process's
+    /// standard input and output name them: `IN OUT`, in hex.
+    fn console_modes() -> String {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        let mode = |which| {
+            let mut mode = 0;
+            // SAFETY: GetStdHandle has no preconditions; GetConsoleMode fails on a handle that
+            // is no console's.
+            match unsafe { GetConsoleMode(GetStdHandle(which), &mut mode) } {
+                0 => "-".to_string(),
+                _ => format!("{mode:x}"),
+            }
+        };
+        format!("{} {}", mode(STD_INPUT_HANDLE), mode(STD_OUTPUT_HANDLE))
+    }
+
+    /// The argument that has [`console_breaker`] change the console's modes.
+    const BREAKER: &str = "reims-ctl-console-breaker";
+
+    /// What the console-mode tests run as a program that ends leaving the console's modes
+    /// changed: the output mode with [`DRAWS_WITH`] off, as the console was left after an
+    /// update's install script in a Windows Terminal, and the input mode with line input, echo
+    /// and Ctrl+C's processing off; in a run of the tests, nothing.
+    #[test]
+    fn console_breaker() {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode,
+            GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        };
+        if !std::env::args().any(|a| a == BREAKER) {
+            return;
+        }
+        let off = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
+        let (mut input, mut output) = (0, 0);
+        // SAFETY: GetStdHandle has no preconditions; the mode calls fail on a handle that is no
+        // console's, which the asserts catch.
+        unsafe {
+            let (i, o) = (
+                GetStdHandle(STD_INPUT_HANDLE),
+                GetStdHandle(STD_OUTPUT_HANDLE),
+            );
+            assert_ne!(GetConsoleMode(i, &mut input), 0);
+            assert_ne!(GetConsoleMode(o, &mut output), 0);
+            assert_ne!(SetConsoleMode(i, input & !off), 0);
+            assert_ne!(SetConsoleMode(o, output & !DRAWS_WITH), 0);
+        }
+    }
+
+    /// [`console_breaker`], as a program.
+    fn breaker() -> Command {
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args(["--exact", "os::windows::tests::console_breaker", BREAKER]);
+        c
+    }
+
+    /// The argument that has [`modes_child`] run, followed by how and `=` and its file.
+    const MODES_CHILD: &str = "reims-ctl-modes-child:";
+
+    /// What the console-mode tests run in a pseudoconsole: [`breaker`] as reims-ctl runs a
+    /// program, by how its argument names: `update`, through `update::run_on_console`, as an
+    /// update runs the install script; `terminal`, through [`run_in_terminal`], as the interface
+    /// runs less; `drawing`, alone, then [`console_for_drawing`], as the interface starts. Then
+    /// the breaker alone, which leaves the modes changed. It writes the console's modes before,
+    /// after the first run and after the second, a line each ([`console_modes`]), and whether the
+    /// runs succeeded, into the file its argument names; in a run of the tests, nothing.
+    #[test]
+    fn modes_child() {
+        let Some(arg) =
+            std::env::args().find_map(|a| a.strip_prefix(MODES_CHILD).map(String::from))
+        else {
+            return;
+        };
+        let (how, out) = arg.split_once('=').unwrap();
+        let before = console_modes();
+        let first = match how {
+            "update" => crate::update::run_on_console(&mut breaker()),
+            "terminal" => run_in_terminal(breaker()),
+            _ => {
+                let s = breaker().status();
+                console_for_drawing();
+                s
+            }
+        };
+        let after = console_modes();
+        let second = breaker().status();
+        let left = console_modes();
+        let ran = |r: io::Result<ExitStatus>| r.is_ok_and(|s| s.success());
+        let text = format!("{before}\n{after}\n{left}\n{} {}", ran(first), ran(second));
+        std::fs::write(out, text).unwrap();
+    }
+
+    /// The console's modes as [`modes_child`] found them, run in a pseudoconsole as `how` names:
+    /// before, after what it ran, and after the breaker alone, each input's then output's. Fails
+    /// where a run failed, or where the breaker alone left the output mode with any of
+    /// [`DRAWS_WITH`] or the input mode as it was, which would make the tests pass whatever
+    /// reims-ctl does.
+    fn modes_around(how: &str) -> [(u32, u32); 3] {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        let out =
+            std::env::temp_dir().join(format!("reims-ctl-modes-{how}-{}", std::process::id()));
+        let (waited, code, seen) = in_pseudoconsole(
+            "os::windows::tests::modes_child",
+            &format!("{MODES_CHILD}{how}={}", out.display()),
+            std::time::Duration::from_secs(30),
+        );
+        let got = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        let console = String::from_utf8_lossy(&seen);
+        assert_eq!(
+            (waited, code),
+            (WAIT_OBJECT_0, 0),
+            "the console wrote {console:?}"
+        );
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(
+            lines.get(3),
+            Some(&"true true"),
+            "the child wrote {got:?}; the console wrote {console:?}"
+        );
+        let modes = |line: &str| {
+            let hex = |m: &str| u32::from_str_radix(m, 16).ok();
+            line.split_once(' ')
+                .and_then(|(i, o)| Some((hex(i)?, hex(o)?)))
+                .unwrap_or_else(|| panic!("no console modes in {line:?}"))
+        };
+        let m = [modes(lines[0]), modes(lines[1]), modes(lines[2])];
+        assert_eq!(m[2].1 & DRAWS_WITH, 0, "the breaker left {:x?}", m[2]);
+        assert_ne!(
+            m[2].0, m[0].0,
+            "the breaker left the input mode {:x}",
+            m[0].0
+        );
+        m
+    }
+
+    /// An update gives the console back the modes it had before the program it ran there,
+    /// before reims-ctl writes anything or starts the new reims-ctl: after an update's install
+    /// script, a Windows Terminal's console wrote reims-ctl's line ends and escape sequences as
+    /// characters.
+    #[test]
+    fn what_an_update_runs_leaves_the_console_in_the_modes_it_found() {
+        let [before, after, _] = modes_around("update");
+        assert_eq!(after, before, "the console's modes after, then before");
+    }
+
+    /// A program run in the terminal, as the interface runs less, leaves the console in the
+    /// modes it found, in which the interface draws again.
+    #[test]
+    fn a_program_run_in_the_terminal_leaves_the_console_in_the_modes_it_found() {
+        let [before, after, _] = modes_around("terminal");
+        assert_eq!(after, before, "the console's modes after, then before");
+    }
+
+    /// The interface draws with line ends and escape sequences acted on and lines wrapped,
+    /// whatever a program run before left off.
+    #[test]
+    fn the_interface_starts_drawing_with_what_a_program_left_off() {
+        let [_, after, _] = modes_around("drawing");
+        assert_eq!(
+            after.1 & DRAWS_WITH,
+            DRAWS_WITH,
+            "the output mode {:x}",
+            after.1
         );
     }
 }

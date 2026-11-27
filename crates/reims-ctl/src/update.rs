@@ -107,15 +107,23 @@ pub fn update(channel: Option<Channel>) -> Result<Outcome> {
     for v in GIT_REPOSITORY_ENV {
         bash.env_remove(v);
     }
-    let status = bash
-        .arg("--update")
-        .current_dir(&i.repo)
-        .status()
+    bash.arg("--update").current_dir(&i.repo);
+    let status = run_on_console(&mut bash)
         .with_context(|| format!("run {}", bash.get_program().to_string_lossy()))?;
     if !status.success() {
         bail!("the update failed (exit {})", status.code().unwrap_or(-1));
     }
     Ok(Outcome::Updated)
+}
+
+/// Runs `cmd`, which an update runs on the console (the install script's bash, git), to its end,
+/// and gives the console back the modes it had before (`os::keep_console_modes`), before
+/// reims-ctl writes anything after it or starts the new reims-ctl. On Windows these are MSYS2's
+/// programs where the install ran in MSYS2's shell, and an update that ran there left a Windows
+/// Terminal's console writing reims-ctl's line ends and escape sequences as characters.
+pub(crate) fn run_on_console(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    let _console = crate::os::keep_console_modes();
+    cmd.status()
 }
 
 /// The install's commit, as recorded, where an update would build it again and change nothing:
@@ -248,7 +256,7 @@ pub(crate) fn git_command(repo: &Path) -> Command {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<()> {
-    let status = git_command(repo).args(args).status().context("run git")?;
+    let status = run_on_console(git_command(repo).args(args)).context("run git")?;
     if !status.success() {
         bail!("git {} failed", args.join(" "));
     }

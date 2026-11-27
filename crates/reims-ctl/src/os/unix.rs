@@ -338,6 +338,19 @@ pub fn no_glob(_c: &mut Command) {}
 /// sets no program aside here (`update::remove_set_aside`).
 pub fn remove_set_aside_programs() {}
 
+/// Nothing: on Windows this gives the console back the modes [`keep_console_modes`] found, which
+/// a program run on it can leave changed. A terminal here has no console modes.
+pub struct ConsoleModes;
+
+/// [`ConsoleModes`]: nothing to keep.
+pub fn keep_console_modes() -> ConsoleModes {
+    ConsoleModes
+}
+
+/// Nothing: on Windows this turns on the console's processing of line ends and escape sequences,
+/// which a program run on it before may have left off. A terminal here has no console modes.
+pub fn console_for_drawing() {}
+
 /// Runs `cmd` in the terminal to its end, as system(3) runs a command: Ctrl+C and Ctrl+\ reach
 /// the terminal's whole foreground process group, so this process ignores them until `cmd`
 /// exits, and `cmd` gets them as it would from a shell.

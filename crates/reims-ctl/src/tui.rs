@@ -51,6 +51,9 @@ pub fn run() -> Result<()> {
             kind: TextKind::Help,
         });
     }
+    // The console may be left writing escape sequences as text by what ran on it before, as the
+    // update's install script, which this reims-ctl follows, left it on Windows.
+    crate::os::console_for_drawing();
     let mut terminal = ratatui::init();
     app.kitty_keys = ratatui::crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let kitty_keys = app.kitty_keys;
