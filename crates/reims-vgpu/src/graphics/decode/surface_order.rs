@@ -1952,16 +1952,18 @@ mod tests {
         let mut dec = sender(r, queue);
         let marks = r.dec.shared.surface_order.lock().marks(named);
         let (p, message) = (Arc::clone(&r.p), message(queue, seqno, ops));
-        std::thread::spawn(move || {
-            let device = p.device();
-            let begun = dec.begin_taken(&device, &message, Some(queue), false);
-            let after = marks.commit.committed_through(through);
-            let done = match begun.unwrap() {
-                Ok(begun) => dec.finish_command_buffer(&device, &message, begun).unwrap(),
-                Err(e) => Err(e),
-            };
-            (after, done)
-        })
+        (std::thread::Builder::new().name(format!("queue-{queue:#x}")))
+            .spawn(move || {
+                let device = p.device();
+                let begun = dec.begin_taken(&device, &message, Some(queue), false);
+                let after = marks.commit.committed_through(through);
+                let done = match begun.unwrap() {
+                    Ok(begun) => dec.finish_command_buffer(&device, &message, begun).unwrap(),
+                    Err(e) => Err(e),
+                };
+                (after, done)
+            })
+            .unwrap()
     }
 
     /// Two buffers whose `SURFACE_ORDER`s name each other, as names written wrong do (the bundle
