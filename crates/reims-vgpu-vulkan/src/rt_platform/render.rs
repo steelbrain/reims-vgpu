@@ -1875,7 +1875,8 @@ mod tests {
     /// A declaration of no usage (`useResources:` of 0, in each form) declares nothing and is no
     /// refusal, as the compute encoder's (`super::compute`'s docs, "No usage"), where a usage
     /// with a bit past sample is Metal's refusal, counted; the draw after either draws, as does
-    /// one after `useHeaps:` in each form.
+    /// one after `useHeaps:` in each form, and the command buffer keeps a heap it uses until it
+    /// retires.
     #[test]
     fn a_declaration_of_no_usage_is_no_refusal_on_vulkan() {
         // `MTLRenderStageFragment`.
@@ -1938,6 +1939,8 @@ mod tests {
         }
         // `useHeaps:` in each form is rt's `use_heap` of each heap but nil, which records nothing:
         // the draw after it draws, and nothing is refused.
+        let placed = || device.rt().counters().gauges().shared_placed_bytes;
+        let unheaped = placed();
         let heap = device.new_heap(&HeapDesc {
             size: 0x10000,
             heap_type: 0,
@@ -1945,6 +1948,9 @@ mod tests {
             pinned_gpu_address: None,
         });
         let heap = heap.expect("never a raise").heap.expect("a heap");
+        // The Shared block the heap holds.
+        let len = placed() - unheaped;
+        assert!(len >= 0x10000, "the heap's block is {len} bytes");
         let heaps = [Some(&heap), None];
         let before = counted(metal);
         let mut cmds = vec![
@@ -1966,6 +1972,45 @@ mod tests {
         assert_eq!(run(&made(), &pass(&target, 2), cmds), done);
         assert_eq!(counted(metal), before);
         assert_eq!(texels(), green);
+        // A command buffer that uses the heap keeps its block until it retires, whatever reaches
+        // the heap: held in flight behind a wait, it keeps the block once the heap is gone, and
+        // gives it back as it completes.
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::os::clock::Clock as _;
+        let shared = device.new_shared_event().expect("a shared event");
+        let held = made();
+        assert_eq!(held.encode_wait(Some(EventRef::Shared(&shared)), 1), Ok(()));
+        let encoder = held
+            .render_encoder(on, &pass(&target, 2))
+            .expect("never a raise");
+        let encoder = encoder.expect("a render encoder");
+        for cmd in [
+            RenderCmd::UseHeaps { heaps: &heaps },
+            RenderCmd::EndEncoding,
+        ] {
+            assert_eq!(encoder.encode(on, cmd), Ok(()));
+        }
+        drop(encoder);
+        assert_eq!(held.commit(on), Ok(()));
+        let with_heap = placed();
+        drop(heap);
+        assert_eq!(
+            placed(),
+            with_heap,
+            "the heap's block, kept by the command buffer in flight"
+        );
+        assert_eq!(shared.set_signaled_value(1), Ok(()));
+        assert_eq!(held.wait_until_completed(on), Ok(()));
+        let clock = crate::os::OsClock::new();
+        let start = clock.now_mono();
+        while placed() + len > with_heap {
+            let waited = clock.now_mono().saturating_duration_since(start);
+            assert!(
+                waited.as_secs() < 10,
+                "the heap's block given back at the end"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// The commands that set `state` and `vertices` at vertex buffer 0, then `draw`.

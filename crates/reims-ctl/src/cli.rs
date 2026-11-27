@@ -2185,6 +2185,32 @@ mod tests {
     use super::*;
     use crate::testenv::Env;
 
+    /// doctor's kernel line fails on Linux 7.1, naming the 7.2 a VM on reims-vgpu's GPU needs,
+    /// and is ok on 7.3: on arm64 Linux, where doctor probes no GPU.
+    #[test]
+    fn doctor_fails_linux_7_1_on_its_kernel_line() {
+        let _env = Env::new("doctor-kernel");
+        let host = Host {
+            os: crate::host::Os::Linux,
+            arch: crate::host::Arch::Aarch64,
+        };
+        let kernel_line = |v: (u32, u32)| {
+            let mut lines = Vec::new();
+            doctor_on(host, &move || Some(v), &mut |l| lines.push(l)).unwrap();
+            lines.into_iter().find(|l| l.contains(" kernel: "))
+        };
+        let old = kernel_line((7, 1)).unwrap_or_default();
+        assert!(
+            old.starts_with("FAIL kernel: this host runs Linux 7.1,"),
+            "{old}"
+        );
+        assert!(old.contains("Linux 7.2 or later"), "{old}");
+        assert_eq!(
+            kernel_line((7, 3)).as_deref(),
+            Some("ok   kernel: Linux 7.3")
+        );
+    }
+
     /// `create --help`'s examples head the x86-64 guest's by the host's own system where it
     /// makes that guest, Windows on Windows, and by the hosts that do elsewhere; on Windows their
     /// paths have `\` alone. The examples are the same on every host.

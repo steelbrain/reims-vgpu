@@ -271,3 +271,20 @@ fn unmarked(title: &str, step: &str, refused: Option<HRESULT>) {
 fn hresult(result: HRESULT) -> String {
     format!("{:#010x}", result.cast_unsigned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Windows build's title names the release chord in Windows' keys, Ctrl+Alt+Win: the
+    /// constant the SDL thread passes is Windows' (the module doc), not Linux's Super.
+    #[test]
+    fn a_windows_build_names_the_release_chord_in_windows_keys() {
+        assert_eq!(HOST_OS, HostOs::Windows);
+        let title = crate::capture::captured_suffix(HOST_OS);
+        assert!(
+            title.contains("Ctrl+Alt+Win") && !title.contains("Super"),
+            "{title}"
+        );
+    }
+}

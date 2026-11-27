@@ -325,6 +325,21 @@ mod tests {
         assert!(!smbios_takes_memory_type(&refuses));
     }
 
+    /// A QEMU that takes the probe's options takes `memory_type`: a stand-in that ends with 0
+    /// only when it is asked for `type=17,memory_type=26`, as reims-vgpu's QEMU does.
+    #[test]
+    fn a_qemu_that_takes_the_probe_takes_the_memory_type() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-smbios-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let takes = crate::testenv::program(
+            &d.join("qemu"),
+            "#!/bin/sh\ncase \" $* \" in *\" -smbios type=17,memory_type=26 \"*) exit 0 ;; esac\nexit 1\n",
+        );
+        let answer = smbios_takes_memory_type(&takes);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(answer, "a QEMU that takes memory_type is said not to");
+    }
+
     /// The installer's prune keeps a build older than the newest three while a QEMU runs from
     /// it, started as reims-ctl starts it, through `qemu/current`, which a newer build then
     /// took; and removes the old builds nothing runs. The test runs on Linux alone, whose /proc

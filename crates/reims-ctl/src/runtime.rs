@@ -1361,6 +1361,34 @@ mod tests {
         assert!(kernel_problem((8, 0)).is_none());
     }
 
+    /// A start's check refuses a VM on reims-vgpu's GPU on Linux 7.1, naming the 7.2 it needs,
+    /// and takes it on Linux 7.2: an arm64 VM, which x86-64 Linux runs on TCG, with no /dev/kvm.
+    #[test]
+    fn a_start_on_our_gpu_refuses_linux_7_1_itself() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-floor-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let config = "name = \"t\"\nprofile = \"vmapple-arm64\"\ncpus = 2\nmemory_mib = 4096\n\
+                      disk = \"disk.img\"\n[vmapple]\naux = \"aux.img\"\necid = \"0x1\"\n";
+        std::fs::write(d.join(crate::vm::CONFIG_FILE), config).unwrap();
+        std::fs::write(d.join("disk.img"), "").unwrap();
+        std::fs::write(d.join("aux.img"), "").unwrap();
+        let vm = Vm::load(&d).unwrap();
+        let linux = Host {
+            os: Os::Linux,
+            arch: crate::host::Arch::X86_64,
+        };
+        let on =
+            |v: (u32, u32)| preflight_on(&vm, linux, &move || Some(v)).map_err(|e| e.to_string());
+        let (old, floor) = (on((7, 1)), on((7, 2)));
+        let _ = std::fs::remove_dir_all(&d);
+        let e = old.unwrap_err();
+        assert!(
+            e.contains("Linux 7.1,") && e.contains("Linux 7.2 or later"),
+            "{e}"
+        );
+        assert_eq!(floor, Ok(()));
+    }
+
     /// A stop waits for QEMU to end after `quit` about twice the longest it was measured to take
     /// on the host's OS, and 10 s at least, before it ends QEMU: 15 s on Windows, where QEMU took
     /// 28.1 s, fails the rule, and 60 s follows it.
