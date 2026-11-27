@@ -120,6 +120,8 @@ pub(super) const DEVICE_CREATE_COMMAND_QUEUE: usize = 8;
 const DEVICE_CREATE_COMMAND_ALLOCATOR: usize = 9;
 const DEVICE_CREATE_COMMAND_LIST: usize = 12;
 const DEVICE_CREATE_COMMITTED_RESOURCE: usize = 27;
+#[cfg(test)]
+pub(super) const DEVICE_CREATE_SHARED_HANDLE: usize = 31;
 pub(super) const DEVICE_CREATE_FENCE: usize = 36;
 const QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 pub(super) const QUEUE_SIGNAL: usize = 14;
@@ -758,6 +760,269 @@ impl Device {
                 value: 0,
                 event,
             })
+        }
+    }
+
+    /// Writes `planes`, the luma's bytes and the chroma's, each row after row with nothing
+    /// between them, into `to`, a texture of the device's, from an upload buffer on a copy queue
+    /// of its own (`CopyTextureRegion` of each plane's footprint, as `GetCopyableFootprints`
+    /// places it), and returns once the copy is done: a picture of a test's own. `Err` where a
+    /// plane's length is not its footprint's, a call failed, or the copy was not done in 10 s.
+    #[cfg(test)]
+    pub(crate) fn upload(&self, to: &SharedTexture, planes: [&[u8]; 2]) -> Result<(), String> {
+        const D3D12_HEAP_TYPE_UPLOAD: u32 = 2;
+        const D3D12_RESOURCE_DIMENSION_BUFFER: u32 = 1;
+        const D3D12_TEXTURE_LAYOUT_ROW_MAJOR: u32 = 1;
+        const D3D12_RESOURCE_STATE_GENERIC_READ: u32 = 0xac3;
+        const D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX: u32 = 0;
+        const D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT: u32 = 1;
+        const DEVICE_GET_COPYABLE_FOOTPRINTS: usize = 38;
+        const RESOURCE_MAP: usize = 8;
+        const RESOURCE_UNMAP: usize = 9;
+        const LIST_COPY_TEXTURE_REGION: usize = 16;
+        /// `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`: where a subresource's rows start in a buffer, its
+        /// format, width, height and depth, and how far apart its rows are.
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct PlacedFootprint {
+            offset: u64,
+            format: u32,
+            width: u32,
+            height: u32,
+            depth: u32,
+            row_pitch: u32,
+        }
+        /// `D3D12_TEXTURE_COPY_LOCATION`: a resource, the kind of location, and the union of a
+        /// placed footprint and a subresource's index, which is the union's first 4 bytes.
+        #[repr(C)]
+        struct CopyLocation {
+            resource: *mut c_void,
+            type_: u32,
+            footprint: PlacedFootprint,
+        }
+        if to.device != self.device.raw().addr() {
+            return Err("a texture of another Direct3D 12 device".to_owned());
+        }
+        let format = match to.format {
+            SurfaceFormat::Nv12 => DXGI_FORMAT_NV12,
+            SurfaceFormat::P010 => DXGI_FORMAT_P010,
+            SurfaceFormat::Xyuv => return Err("no shared texture of XYUV".to_owned()),
+        };
+        let desc = ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            alignment: 0,
+            width: u64::from(to.size.0),
+            height: to.size.1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        };
+        let mut layouts = [PlacedFootprint::default(); 2];
+        let mut rows = [0_u32; 2];
+        let mut row_sizes = [0_u64; 2];
+        let mut total = 0_u64;
+        // SAFETY: the method is ID3D12Device's `GetCopyableFootprints`, of the texture's
+        // description, for its two planes' subresources, with room for each's answers.
+        unsafe {
+            let footprints: unsafe extern "system" fn(
+                *mut c_void,
+                *const ResourceDesc,
+                u32,
+                u32,
+                u64,
+                *mut PlacedFootprint,
+                *mut u32,
+                *mut u64,
+                *mut u64,
+            ) = self.device.method(DEVICE_GET_COPYABLE_FOOTPRINTS);
+            footprints(
+                self.device.raw(),
+                &desc,
+                0,
+                2,
+                0,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                row_sizes.as_mut_ptr(),
+                &mut total,
+            );
+        }
+        let shapes: Vec<(usize, usize)> = (rows.iter().zip(&row_sizes))
+            .map(|(&rows, &size)| (rows as usize, usize::try_from(size).unwrap_or(usize::MAX)))
+            .collect();
+        for (plane, (&(rows, size), bytes)) in shapes.iter().zip(&planes).enumerate() {
+            if bytes.len() != rows * size {
+                return Err(format!(
+                    "plane {plane}: {} bytes for {rows} rows of {size}",
+                    bytes.len()
+                ));
+            }
+        }
+        let heap = HeapProperties {
+            type_: D3D12_HEAP_TYPE_UPLOAD,
+            cpu_page_property: 0,
+            memory_pool_preference: 0,
+            creation_node_mask: 0,
+            visible_node_mask: 0,
+        };
+        let buffer_desc = ResourceDesc {
+            dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            alignment: 0,
+            width: total,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            flags: 0,
+        };
+        let mut out = null_mut();
+        // SAFETY: the method is `CreateCommittedResource`, with valid descriptions of a buffer
+        // on an upload heap, in the state such a buffer is made in, and ID3D12Resource's IID.
+        let result = unsafe {
+            let create: unsafe extern "system" fn(
+                *mut c_void,
+                *const HeapProperties,
+                u32,
+                *const ResourceDesc,
+                u32,
+                *const c_void,
+                *const Guid,
+                *mut *mut c_void,
+            ) -> Hresult = self.device.method(DEVICE_CREATE_COMMITTED_RESOURCE);
+            create(
+                self.device.raw(),
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &buffer_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                null(),
+                &IID_ID3D12_RESOURCE,
+                &mut out,
+            )
+        };
+        let buffer = Com::made("CreateCommittedResource", result, out)?;
+        let mut data = null_mut::<c_void>();
+        // SAFETY: the methods are ID3D12Resource's `Map` and `Unmap`, of the buffer's one
+        // subresource, which holds `total` bytes: each plane's rows are written at its
+        // footprint's offset, `row_pitch` apart, each no longer than the pitch.
+        unsafe {
+            let map: unsafe extern "system" fn(
+                *mut c_void,
+                u32,
+                *const c_void,
+                *mut *mut c_void,
+            ) -> Hresult = buffer.method(RESOURCE_MAP);
+            check(
+                "ID3D12Resource::Map",
+                map(buffer.raw(), 0, null(), &mut data),
+            )?;
+            for ((layout, &(rows, size)), bytes) in layouts.iter().zip(&shapes).zip(&planes) {
+                for row in 0..rows {
+                    let at = data
+                        .cast::<u8>()
+                        .add(layout.offset as usize + row * layout.row_pitch as usize);
+                    std::ptr::copy_nonoverlapping(bytes[row * size..].as_ptr(), at, size);
+                }
+            }
+            let unmap: unsafe extern "system" fn(*mut c_void, u32, *const c_void) =
+                buffer.method(RESOURCE_UNMAP);
+            unmap(buffer.raw(), 0, null());
+        }
+        let mut copies = self.copies()?;
+        copies.value = 1;
+        // SAFETY: each method is the named one of its object's interface, on objects of this
+        // device's: the list, made closed, is reset on its allocator, records a copy of each
+        // plane from its footprint in the buffer into the texture's subresource of that plane
+        // (the texture in the common state, promoted to the copy's and back on a copy queue),
+        // and is closed, then executed, and the fence signalled after it; the buffer lives until
+        // the wait below has seen the fence pass, or the copies' objects and it are let go with
+        // the error.
+        let done = unsafe {
+            let reset: unsafe extern "system" fn(*mut c_void) -> Hresult =
+                copies.allocator.method(ALLOCATOR_RESET);
+            let reset_list: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> Hresult = copies.list.method(LIST_RESET);
+            let copy: unsafe extern "system" fn(
+                *mut c_void,
+                *const CopyLocation,
+                u32,
+                u32,
+                u32,
+                *const CopyLocation,
+                *const c_void,
+            ) = copies.list.method(LIST_COPY_TEXTURE_REGION);
+            let close: unsafe extern "system" fn(*mut c_void) -> Hresult =
+                copies.list.method(LIST_CLOSE);
+            let execute: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
+                copies.queue.method(QUEUE_EXECUTE_COMMAND_LISTS);
+            let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> Hresult =
+                copies.queue.method(QUEUE_SIGNAL);
+            let on_completion: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> Hresult =
+                copies.fence.method(FENCE_SET_EVENT_ON_COMPLETION);
+            check(
+                "ID3D12CommandAllocator::Reset",
+                reset(copies.allocator.raw()),
+            )?;
+            check(
+                "ID3D12GraphicsCommandList::Reset",
+                reset_list(copies.list.raw(), copies.allocator.raw(), null_mut()),
+            )?;
+            for (plane, layout) in layouts.iter().enumerate() {
+                let into = CopyLocation {
+                    resource: to.resource.raw(),
+                    type_: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    footprint: PlacedFootprint {
+                        offset: plane as u64,
+                        ..PlacedFootprint::default()
+                    },
+                };
+                let from = CopyLocation {
+                    resource: buffer.raw(),
+                    type_: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    footprint: *layout,
+                };
+                copy(copies.list.raw(), &into, 0, 0, 0, &from, null());
+            }
+            check("ID3D12GraphicsCommandList::Close", close(copies.list.raw()))?;
+            let lists = [copies.list.raw()];
+            execute(copies.queue.raw(), 1, lists.as_ptr());
+            check(
+                "ID3D12CommandQueue::Signal",
+                signal(copies.queue.raw(), copies.fence.raw(), copies.value),
+            )?;
+            check(
+                "ID3D12Fence::SetEventOnCompletion",
+                on_completion(copies.fence.raw(), copies.value, copies.event.0.as_ptr()),
+            )?;
+            WaitForSingleObject(copies.event.0.as_ptr(), 10_000) == WAIT_OBJECT_0
+        };
+        match copies.completed() {
+            Completed::Done if done => Ok(()),
+            Completed::Removed => Err("the device was removed".to_owned()),
+            _ => Err("the upload was not done in 10 s".to_owned()),
+        }
+    }
+
+    /// What the device answers as why it was removed (`ID3D12Device::GetDeviceRemovedReason`):
+    /// `S_OK` (0) where it was not.
+    #[cfg(test)]
+    pub(super) fn removed_reason(&self) -> Hresult {
+        const DEVICE_GET_DEVICE_REMOVED_REASON: usize = 37;
+        // SAFETY: the method is ID3D12Device's `GetDeviceRemovedReason`.
+        unsafe {
+            let reason: unsafe extern "system" fn(*mut c_void) -> Hresult =
+                self.device.method(DEVICE_GET_DEVICE_REMOVED_REASON);
+            reason(self.device.raw())
         }
     }
 }

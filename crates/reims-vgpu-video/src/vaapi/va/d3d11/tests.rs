@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::core::runtime::{Runtime as _, StdRuntime};
@@ -381,6 +381,250 @@ fn zero_owed_clears_only_targets_that_owe_zeros() {
             "{ten_bit}: every byte reads zero"
         );
     }
+}
+
+/// How many draws each arm of [`reads_as_draws_return`] makes. A draws' fence signalled on the
+/// Direct3D 12 queue after the context's flush passed ahead of the context's stream at 12.0 to
+/// 19.7% of a macOS guest's drawn pictures in each of 16 passes of an adaptive stream's playback
+/// on the UHD 630 (2676 of 17663 in all, 2026-11-26), so that at the lowest pass's rate 37 draws
+/// miss it less than once in 100 runs (0.88^37 < 0.01). The three arms' 7200 draws miss a rate
+/// of 0.064% a draw (ln 100 / 7200) less than once in 100 runs.
+const DRAWS_READ_AS_THEY_RETURN: usize = 2400;
+
+/// What an arm of [`reads_as_draws_return`] saw.
+#[derive(Debug, Default)]
+struct Arm {
+    /// The draws whose read was not the picture, each with how many of its bytes were still the
+    /// clear's (the arm over a clear) or zero (the arms into new targets).
+    wrong: Vec<(usize, usize)>,
+    /// The draws whose wait returned with the probe of the context's stream not yet passed
+    /// (`super::Probe`): the fence the draw waited for passed ahead of the draws.
+    early: Vec<usize>,
+    /// Of those, the draws whose probe had still not passed once their read returned.
+    early_past_the_read: usize,
+}
+
+/// What the native device reads back from a draw's targets as each draw returns, read at once
+/// as the platform's copy out of a cache's planes is submitted once a landing's wait returns,
+/// and whether the probe of the context's stream (`super::Probe`), which the context signals
+/// after the draws and ahead of their own fence, had passed by then; in three arms of
+/// [`DRAWS_READ_AS_THEY_RETURN`] draws, the draws' fence signalled ahead of the context's flush
+/// where `signal_ahead`. Meanwhile a second plane draw (a device and queue of its own) keeps the
+/// GPU busy with clears of 1080p targets of its own, and a thread a CPU spins, as a VM's
+/// virtual CPUs keep the host's busy. The picture is in a pool texture of 1080p NV12 written a
+/// luma of 0x80 and a chroma of 0x40 and 0xbf from an upload buffer (`Device::upload`), which
+/// holds no zero byte. The arms:
+/// - the same targets from the same pool texture, cleared before each draw (the luma to 0xff,
+///   the chroma's texels to 255): a wrong read is one that is not the picture as read once the
+///   GPU had long been idle;
+/// - new targets for each draw, as a cache's new surface's after a size switch (the targets'
+///   first use): a wrong read is not the picture, and its zero bytes a guest sees as green;
+/// - a new pool texture and new targets for each draw, as a new decoder's pool after a size
+///   switch (the first use of both).
+///
+/// Then how many clears the busy draw made, and how many threads spun.
+///
+/// What a guest's drawn picture has that these draws have not: the pool texture's picture is
+/// the decoder's (Mesa's `vaon12`, on the same Direct3D 12 device, `D3D12CreateDevice`'s one an
+/// adapter), not an upload's; the draws are of several sessions at a time, each at the stream's
+/// rate, beside the decoder's work and other sessions' clears and flushes; and the reader is
+/// the runtime's Vulkan device, whose copy is submitted once the landing's wait returns, not
+/// the native Direct3D 11 device's.
+fn reads_as_draws_return(signal_ahead: bool) -> ([Arm; 3], u32, usize) {
+    const SIZE: (u32, u32) = (1920, 1080);
+    let draw = PlaneDraw::new(None).expect("the plane draws");
+    (draw.probe_the_stream()).unwrap_or_else(|why| failed(&draw, "the stream's probe", &why));
+    let device = Device::new(None).expect("a Direct3D 12 device");
+    let luma = vec![0x80_u8; (SIZE.0 * SIZE.1) as usize];
+    let chroma = [0x40_u8, 0xbf].repeat((SIZE.0 / 2 * (SIZE.1 / 2)) as usize);
+    let new_texture = || {
+        let texture = (device.shared_texture(SurfaceFormat::Nv12, SIZE.0, SIZE.1))
+            .unwrap_or_else(|why| failed(&draw, "a shared texture", &why));
+        (device.upload(&texture, [&luma, &chroma]))
+            .unwrap_or_else(|why| failed(&draw, "the picture's upload", &why));
+        Arc::new(texture)
+    };
+    let new_targets =
+        || (draw.targets(SIZE, false)).unwrap_or_else(|why| failed(&draw, "the targets", &why));
+    let clear = |to: &PlaneTargets| {
+        (draw.clear_to(to, [255.0; 4]))
+            .unwrap_or_else(|why| failed(&draw, "the targets' clear", &why));
+    };
+    let read = |to: &PlaneTargets| {
+        (draw.read_back(to)).unwrap_or_else(|why| failed(&draw, "the targets' read back", &why))
+    };
+    // A draw, its read at once, and whether the probe had passed as the draw returned and as
+    // the read did.
+    let draw_and_read = |texture: &Arc<SharedTexture>, to: &PlaneTargets| {
+        (draw.draw(texture, (0, 0), to, SIZE))
+            .unwrap_or_else(|why| failed(&draw, "the draw", &why));
+        let passed = draw.probe_passed() == Some(true);
+        let got = read(to);
+        (got, passed, draw.probe_passed() == Some(true))
+    };
+    let texture = new_texture();
+    let to = new_targets();
+    // The picture as the native device reads it once the GPU has long been idle, and the clear
+    // it is drawn over, which it differs from in every byte.
+    clear(&to);
+    let cleared = read(&to);
+    (draw.draw(&texture, (0, 0), &to, SIZE)).unwrap_or_else(|why| failed(&draw, "a draw", &why));
+    std::thread::sleep(Duration::from_millis(500));
+    let picture = read(&to);
+    for (plane, (p, c)) in ["luma", "chroma"].iter().zip(picture.iter().zip(&cleared)) {
+        assert!(
+            p.iter().zip(c).all(|(p, c)| p != c) && !p.contains(&0),
+            "the {plane}'s picture differs from the clear in every byte, and holds no zero"
+        );
+    }
+    if signal_ahead {
+        draw.signal_ahead_of_the_flush();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let busy = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let other = PlaneDraw::new(None).expect("a second plane draw");
+            let targets = (other.targets(SIZE, false))
+                .unwrap_or_else(|why| failed(&other, "its targets", &why));
+            let mut clears = 0_u32;
+            while !stop.load(Ordering::Acquire) {
+                let value = f32::from(u8::try_from(clears % 255).unwrap_or(0)) / 255.0;
+                (other.clear_to(&targets, [value; 4]))
+                    .unwrap_or_else(|why| failed(&other, "its targets' clear", &why));
+                clears += 1;
+            }
+            clears
+        })
+    };
+    let spinners = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let spinning: Vec<_> = (0..spinners)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        })
+        .collect();
+    let mut arms: [Arm; 3] = Default::default();
+    let tally = |arm: &mut Arm, n: usize, passed: bool, passed_by_the_read: bool| {
+        if !passed {
+            arm.early.push(n);
+            arm.early_past_the_read += usize::from(!passed_by_the_read);
+        }
+    };
+    let zeros = |got: &[Vec<u8>; 2]| -> usize {
+        (got.iter())
+            .map(|p| p.iter().filter(|&&b| b == 0).count())
+            .sum()
+    };
+    for n in 0..DRAWS_READ_AS_THEY_RETURN {
+        clear(&to);
+        let (got, passed, by_the_read) = draw_and_read(&texture, &to);
+        tally(&mut arms[0], n, passed, by_the_read);
+        if got != picture {
+            let still = (got.iter().zip(&cleared))
+                .map(|(r, c)| r.iter().zip(c).filter(|(r, c)| r == c).count())
+                .sum::<usize>();
+            arms[0].wrong.push((n, still));
+        }
+    }
+    for n in 0..DRAWS_READ_AS_THEY_RETURN {
+        let fresh = new_targets();
+        let (got, passed, by_the_read) = draw_and_read(&texture, &fresh);
+        tally(&mut arms[1], n, passed, by_the_read);
+        if got != picture {
+            arms[1].wrong.push((n, zeros(&got)));
+        }
+    }
+    for n in 0..DRAWS_READ_AS_THEY_RETURN {
+        let (texture, fresh) = (new_texture(), new_targets());
+        let (got, passed, by_the_read) = draw_and_read(&texture, &fresh);
+        tally(&mut arms[2], n, passed, by_the_read);
+        if got != picture {
+            arms[2].wrong.push((n, zeros(&got)));
+        }
+    }
+    stop.store(true, Ordering::Release);
+    for spinner in spinning {
+        spinner.join().expect("a spinning thread");
+    }
+    let clears = busy.join().expect("the busy draws");
+    (arms, clears, spinners)
+}
+
+/// The arms' counts, for a test's message: each arm's wrong reads and early fences.
+fn told(arms: &[Arm; 3], clears: u32, spinners: usize) -> String {
+    let names = [
+        "over a clear",
+        "into new targets",
+        "from a new texture into new targets",
+    ];
+    let arms = (names.iter().zip(arms))
+        .map(|(name, arm)| {
+            format!(
+                "{name}: {} of {DRAWS_READ_AS_THEY_RETURN} reads wrong (draw, bytes still the \
+                 clear's or zero: {:?}), {} early fences (draws {:?}), {} of them still early \
+                 once the read returned",
+                arm.wrong.len(),
+                &arm.wrong[..arm.wrong.len().min(20)],
+                arm.early.len(),
+                &arm.early[..arm.early.len().min(20)],
+                arm.early_past_the_read
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{arms}; while {clears} clears kept the GPU busy and {spinners} threads spun")
+}
+
+/// Panics with what failed, why, and the reasons `draw`'s devices answer for a removal, so that
+/// a removed device names its cause.
+fn failed(draw: &PlaneDraw, what: &str, why: &str) -> ! {
+    panic!("{what}: {why}; {}", draw.removed_reasons())
+}
+
+/// A draw's targets hold its picture whole once `draw` returns, however busy the GPU and the
+/// CPUs are, at a target's or a pool texture's first use too: the fence the draw waits for
+/// passes only after its draws ran, and so after the probe of the context's stream that the
+/// context signals after them, so a device that reads the targets at once, as the platform's
+/// copies out of a cache's planes do, reads the picture and not what the targets held before it,
+/// and a new target's read holds no zero ([`reads_as_draws_return`]). Run holding the GPU, on the
+/// default adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn a_draws_targets_hold_its_picture_as_it_returns_however_busy_the_gpu() {
+    let (arms, clears, spinners) = reads_as_draws_return(false);
+    assert!(
+        arms.iter()
+            .all(|arm| arm.wrong.is_empty() && arm.early.is_empty()),
+        "read back as each draw returned, the targets did not hold the picture, or the draws' \
+         fence passed ahead of the context's stream: {}",
+        told(&arms, clears, spinners)
+    );
+}
+
+/// The control of [`a_draws_targets_hold_its_picture_as_it_returns_however_busy_the_gpu`]: with
+/// the draws' fence signalled on the queue ahead of the context's flush on purpose, so that it
+/// may pass before the GPU ran the draws, some read as a draw returns does not hold the picture.
+/// A pass of the test counts only where this fails to hold the picture. Run holding the GPU, on
+/// the default adapter.
+#[test]
+#[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
+fn a_fence_signalled_ahead_of_its_flush_passes_before_the_draws_ran() {
+    let (arms, clears, spinners) = reads_as_draws_return(true);
+    assert!(
+        arms.iter().any(|arm| !arm.wrong.is_empty()),
+        "with the fence signalled ahead of the flush, every draw's targets read back as the \
+         draw returned held the picture: {}",
+        told(&arms, clears, spinners)
+    );
+    println!(
+        "signalled ahead of the flush: {}",
+        told(&arms, clears, spinners)
+    );
 }
 
 const IID_IDXGI_DEVICE: Guid = guid(
