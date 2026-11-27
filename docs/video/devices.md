@@ -118,7 +118,10 @@ decoder lists (`VTCopyAV1DecoderCapabilitiesDictionary` on an M3 Max, macOS 27.0
 the x86-64 guest's video driver, AppleGVA, decodes none (its strings name no AV1), so AV1's
 number among an arm's codecs, `HOST_VIDEO_CODEC_AV1` (`graphics/av1.rs`), is the host's own
 and reaches no guest: the wire, the caps and the option ROM are unchanged, and the host offers
-an x86-64 guest no AV1 decoder.
+an x86-64 guest no AV1 decoder. The route serves arm64 macOS 14.6.1 as it does 26.6.2: on an
+RTX 3090 (NVDEC) under 14.6.1, the 17 pictures of our `svt-main8` stream, decoded in a session
+that requires hardware, equal its reference frame by frame (**measured** 2026-11-27, under
+TCG, potluck job m3-max-77531).
 
 A session's `av1C` record is read as H.264's and HEVC's records are
 (`paravirt/decoder/av1.rs`): the stream is told by the sequence header among its `configOBUs`,
