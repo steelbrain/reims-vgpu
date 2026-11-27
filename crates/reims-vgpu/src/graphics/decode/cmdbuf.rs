@@ -5283,6 +5283,10 @@ mod tests {
         /// Each decode tells of itself done before it answers, as a session whose decode ended
         /// before its command buffer's commit does.
         decoded_at_once: std::sync::atomic::AtomicBool,
+        /// Each session's event, in the order the sessions were made: a test sets it to a
+        /// decode's value as the host's landing does once the picture's planes are said written
+        /// (`super::super::super::video_host`).
+        events: Mutex<Vec<<FakePlatform as Platform>::SharedEvent>>,
     }
 
     /// A fake host's video of H.264 and HEVC decode, recording into its [`VideoSeen`]; each of
@@ -5310,10 +5314,12 @@ mod tests {
             if !codecs.contains(&codec) || direction != RGFX_VIDEO_DECODE {
                 return None;
             }
+            let event = self.1.new_shared_event()?;
+            self.0.events.lock().push(event.clone_ref());
             Some(Arc::new(FakeSession {
                 codec,
                 seen: Arc::clone(&self.0),
-                event: self.1.new_shared_event()?,
+                event,
                 decodes: AtomicUsize::new(0),
             }))
         }
@@ -7024,6 +7030,132 @@ mod tests {
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(seen.decodes.lock().len(), 1, "the decode is handed over");
         assert_eq!(r.dec.caches().counts().behind_later, 1);
+    }
+
+    /// Queue 3's reader of [`named_ahead`]'s block, at seqno 1, which names queue 1's decode at
+    /// seqno 2 in its `SURFACE_ORDER` and nothing else orders: it uses the block at the decode's
+    /// generation and copies the output's luma plane out through texture 7, a storage texture
+    /// over the plane (a plain shape of the cache's, not a plane shape), into buffer 2.
+    fn reads_a_plain_shape_after_the_decode() -> Vec<u8> {
+        use super::super::surface_pages::tests::BLOCK;
+        use reims_vgpu_graphics::ops::blit::{
+            RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER, RgfxBlitOpCopyTextureToBuffer,
+        };
+        use reims_vgpu_graphics::ops::{
+            RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RgfxOpSurfaceUse, RgfxSurfaceOrderWait,
+        };
+
+        let named = RgfxSurfaceOrderWait {
+            queue_obj_id: 1,
+            seqno: 2,
+        };
+        let surface_use = RgfxOpSurfaceUse {
+            block_offset: BLOCK,
+            cpu_gen: 1,
+            flags: 0,
+            reserved_14: 0,
+        };
+        let texels = RgfxBlitOpCopyTextureToBuffer {
+            source_texture_obj_id: 7,
+            destination_buffer_obj_id: 2,
+            source_size_width: 64,
+            source_size_height: 16,
+            source_size_depth: 1,
+            destination_bytes_per_row: 64,
+            destination_bytes_per_image: 64 * 16,
+            ..RgfxBlitOpCopyTextureToBuffer::default()
+        };
+        let mut ops = op(RGFX_OP_SURFACE_ORDER, named.as_bytes());
+        ops.extend(op(RGFX_OP_SURFACE_USE, surface_use.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        ops.extend(op(RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER, texels.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        on_queue(command_buffer_message(300, 1, &ops), 3)
+    }
+
+    /// A reader of another queue that names a decode in its `SURFACE_ORDER`, taken after the
+    /// decode's buffer was committed and before the decode's picture's planes are said written,
+    /// is committed only once they are: the platform's reads see what another API wrote only in
+    /// the command buffers committed after the write is said done (`SurfaceMemory`'s
+    /// `external_writes_done`, the acquire, rt's precondition), and the host's landing says so
+    /// before its session signals the decode's value, which here the test sets as it. Ordered
+    /// by its order wait alone, on the GPU, behind the decode's buffer's end, and committed
+    /// before the acquire, the reader would read the output's earlier picture through its plain
+    /// shape, as picture 423's reader did on the Windows host
+    #[test]
+    fn a_reader_named_after_a_decode_is_committed_once_its_planes_are_said_written() {
+        let (r, seen, [_, decoding]) = named_ahead(true);
+        let reader = reads_a_plain_shape_after_the_decode();
+        let p = Arc::clone(&r.p);
+        let device = p.device();
+        let mut first = r.dec.sender(None, super::super::Sinks::default());
+        let mut second = r.dec.sender(None, super::super::Sinks::default());
+        // Queue 1's first buffer fills the cache at generation 0, and is committed and done.
+        let message = writes_cached_video(100, 1, false);
+        let begun = first
+            .begin_taken(&device, &message, Some(1), false)
+            .unwrap();
+        let begun = begun.unwrap();
+        assert_eq!(
+            first
+                .finish_command_buffer(&device, &message, begun)
+                .unwrap(),
+            Ok(())
+        );
+        first.end_message();
+        p.world().complete_all(CompleteOn::Caller);
+        // The decode is begun, its fill done, walked and committed: its session took the picture,
+        // whose planes are not yet said written.
+        let begun = (first
+            .begin_taken(&device, &decoding, Some(1), false)
+            .unwrap())
+        .expect("the decode is begun");
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            first
+                .finish_command_buffer(&device, &decoding, begun)
+                .unwrap(),
+            Ok(())
+        );
+        first.end_message();
+        assert_eq!(seen.decodes.lock().len(), 1, "the decode is handed over");
+        let event = seen.events.lock()[0].clone_ref();
+        let mark = p.call_log().mark();
+        std::thread::scope(|scope| {
+            let device = &device;
+            let reading = (std::thread::Builder::new().name("queue-0x3".to_owned()))
+                .spawn_scoped(scope, || {
+                    let begun = (second.begin_taken(device, &reader, Some(3), false).unwrap())
+                        .expect("the reader is begun");
+                    let done = (second.finish_command_buffer(device, &reader, begun)).unwrap();
+                    second.end_message();
+                    done
+                })
+                .unwrap();
+            let waits = || {
+                (p.call_log().since(mark).iter())
+                    .any(|c| c.obj == event.id() && c.sel == "waitUntilSignaledValue:timeoutMS:")
+            };
+            let held = crate::graphics::tests::eventually(|| reading.is_finished() || waits());
+            assert!(
+                held && !reading.is_finished(),
+                "the reader was committed before the decode's planes were said written"
+            );
+            event.set_signaled_value(1).unwrap();
+            assert_eq!(reading.join().unwrap(), Ok(()));
+        });
+        let calls = p.call_log().since(mark);
+        let written = (calls.iter())
+            .position(|c| c.obj == event.id() && c.sel == "setSignaledValue:")
+            .expect("the planes are said written");
+        let committed = (calls.iter())
+            .position(|c| c.sel == "commit" && c.thread.as_deref() == Some("queue-0x3"))
+            .expect("the reader is committed");
+        assert!(
+            committed > written,
+            "the reader committed at {committed}, the planes said written at {written}"
+        );
+        p.world().complete_all(CompleteOn::Caller);
     }
 
     /// A decoder's output that its client locks to read each picture is copied into its pages
