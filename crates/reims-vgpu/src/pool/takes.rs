@@ -63,10 +63,14 @@
 //! waits for its write, the take workers among them, nor does any of the Private blocks'
 //! ([`super::private_blocks`], whose ledger, lock and workers it shares nothing with). One take
 //! may: where a take's first fit holds bytes of the claimed chunk, its worker waits for the chunk's
-//! write and mark, the zeroer claiming no other chunk meanwhile, and then carves that first fit,
-//! counted with its wait, in all and at its longest ([`super::TAKE_CLAIM_WAITS_CODE`]): one chunk's
-//! write at most. So the zeroer moves no carve: a block lies where it would with no zeroer, first
-//! fit over the carves alone. The device's release ends the zeroer once its chunk is written, and
+//! write and mark, the zeroer claiming no other chunk meanwhile, and then carves the first fit it
+//! finds then, counted with its wait, in all and at its longest ([`super::TAKE_CLAIM_WAITS_CODE`]):
+//! one chunk's write at most. Every block is a first fit over the carves at the moment it is
+//! carved, but not always where it would lie with no zeroer: the zeroer lets its claim go before
+//! it wakes the waiting take, and a later take, of the waiting take's context or another's,
+//! carried out between the claim's end and that wake carves that first fit at once, so the
+//! waiting take's block lies past it. A context's takes are still answered in its order, by its
+//! one worker. The device's release ends the zeroer once its chunk is written, and
 //! waits for it and for the take workers to let go of the pool ([`super::Threads`]). The guest
 //! writes no freed carve's bytes: the kext takes a block's mapping out of the process before its
 //! give, and the device frees it once the context's command buffers have finished.

@@ -881,11 +881,12 @@ fn the_release_returns_once_no_pool_thread_holds_the_pool() {
         let takes: Vec<Answers> = (1..=4)
             .map(|context| take(&ledger, context, TAKE_ALIGN))
             .collect();
-        for rx in &takes {
-            assert!(taken(rx).is_some());
-        }
-        // One of the piece's four blocks freed: the zeroer runs.
-        let Give::Given(carve) = ledger.give(1, 0, TAKE_ALIGN, |_, _| false) else {
+        let blocks: Vec<Taken> = takes.iter().map(|rx| taken(rx).expect("a block")).collect();
+        // One of the piece's four blocks freed: the zeroer runs. Context 1's is the block its take
+        // answered, which lies past a later take's where it waited for the zeroer's claim
+        // (`a_take_waiting_for_the_zeroers_claim_may_be_carved_after_a_later_take`).
+        let Give::Given(carve) = ledger.give(1, blocks[0].offset, blocks[0].length, |_, _| false)
+        else {
             panic!("not given");
         };
         ledger.free(&[carve]);
@@ -897,6 +898,50 @@ fn the_release_returns_once_no_pool_thread_holds_the_pool() {
             "a pool thread still holds the pool"
         );
     }
+}
+
+/// A take whose first fit holds bytes of the zeroer's claimed chunk is carved by its worker once
+/// the claim goes, and a later take carried out between the claim's end and the zeroer's wake
+/// carves that first fit before it: with context 1's take waiting for the claim of the piece's
+/// first chunk, which the zeroer claims last of a fresh piece, context 2's block lies at offset 0
+/// and context 1's past it. So the release test gives back the block context 1's take answered,
+/// and its give of offset 0 would find context 2's block
+#[test]
+fn a_take_waiting_for_the_zeroers_claim_may_be_carved_after_a_later_take() {
+    let host = Arc::new(Host::default());
+    let (mut pool, _blocks, ledger) = live_pool_unzeroed(&host, LONG);
+    // The zeroer's claim, set here with its zeroer shut, so it stands until the test ends it.
+    pool.shared.state.lock().claim = Some((BASE, 0..takes::ZERO_CHUNK));
+    let first = take(&ledger, 1, TAKE_ALIGN);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pool.shared.state.lock().claim_waits == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the take did not wait for the chunk"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The claim ends, its waiters not woken yet, as the zeroer lets it go before its wake.
+    pool.shared.state.lock().claim = None;
+    let second = take(&ledger, 2, TAKE_ALIGN);
+    assert_eq!(answer(&second), Some((0, TAKE_ALIGN)));
+    let first = taken(&first).expect("a block");
+    assert_eq!((first.offset, first.length), (TAKE_ALIGN, TAKE_ALIGN));
+    assert!(matches!(
+        ledger.give(1, 0, TAKE_ALIGN, |_, _| false),
+        Give::NotFound
+    ));
+    let Give::Given(carve) = ledger.give(1, first.offset, first.length, |_, _| false) else {
+        panic!("not given");
+    };
+    ledger.free(&[carve]);
+    drop(ledger);
+    pool.close();
+    assert_eq!(
+        Arc::strong_count(&pool.shared),
+        1,
+        "a pool thread still holds the pool"
+    );
 }
 
 #[test]
