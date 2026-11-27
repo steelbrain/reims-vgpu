@@ -21,7 +21,10 @@
 //!   [`crate::scroll::POINTS_PER_LINE`] points a line, with its notches, in no gesture (SDL gives
 //!   no phases). The guest gets the device's own direction: SDL's "flipped" (natural scrolling)
 //!   deltas are flipped back, so the guest's own setting applies; left is above 0, as the host's
-//!   callbacks take it.
+//!   callbacks take it. Where the guest's own devices take scrolling
+//!   ([`crate::PointerMotion::scrolled`]), it goes to them instead: an event in whole lines as
+//!   its notches, one in parts of a line (a touchpad's) as its distance, at the same
+//!   [`crate::scroll::POINTS_PER_LINE`].
 //! - **Keys** by position ([`super::keymap`]), one down and one up each: the host's repeats are
 //!   dropped, since the guest repeats a held key itself. With no menu of the host's to drive,
 //!   every key goes to the guest, captured or not, but what the compositor keeps for itself while
@@ -523,7 +526,17 @@ impl Input {
             fixed(sign * POINTS_PER_LINE * lines.0),
             fixed(-sign * POINTS_PER_LINE * lines.1),
         );
-        if notches != (0, 0) || smooth != (0, 0) {
+        if notches == (0, 0) && smooth == (0, 0) {
+            return;
+        }
+        // Lines in parts are a precise device's (a touchpad's); whole lines, a wheel's notches.
+        let precise = lines.0.fract() != 0.0 || lines.1.fract() != 0.0;
+        let delta = if precise { smooth } else { notches };
+        if !self
+            .motion
+            .as_ref()
+            .is_some_and(|motion| motion.scrolled(delta, precise))
+        {
             self.out.push(ToHost::Wheel { notches, smooth });
         }
     }
@@ -1039,6 +1052,50 @@ mod tests {
                 ToHost::Wheel {
                     notches: (0, -2),
                     smooth: (0, -5120)
+                },
+            ]
+        );
+    }
+
+    /// Where the guest's own devices take scrolling, the wheel goes to them and the host hears
+    /// none of it, after the pointer's position: whole lines as their notches, lines in parts (a
+    /// touchpad's) as their distance, at 10 points a line, up and left in the device's own
+    /// direction; a guest whose devices do not take it leaves it to the host
+    #[test]
+    fn the_guest_s_own_devices_take_the_wheel_where_they_scroll() {
+        let wheel = |notches, lines, flipped| Wheel {
+            notches,
+            lines,
+            flipped,
+        };
+        let mouse = Arc::new(Mouse::scrolling());
+        let mut input = Input::with_links(None, Some(Arc::clone(&mouse) as Arc<dyn PointerMotion>));
+        input.focus_gained(0);
+        input.wheel(wheel((0, 1), (0.0, 1.0), false), &at((10.0, 10.0)));
+        input.wheel(wheel((-2, 0), (-2.0, 0.0), true), &at((10.0, 10.0)));
+        input.wheel(wheel((0, 0), (0.25, -0.5), false), &at((10.0, 10.0)));
+        input.wheel(wheel((0, 1), (0.0, 1.375), true), &at((10.0, 10.0)));
+        assert_eq!(input.take(), vec![pointer(20, 20, 0)]);
+        assert_eq!(
+            mouse.take_scrolled(),
+            vec![
+                ((1, 0), false),
+                ((0, -2), false),
+                ((-1280, -640), true),
+                ((-3520, 0), true),
+            ]
+        );
+        let mouse = Arc::new(Mouse::default());
+        let mut input = Input::with_links(None, Some(Arc::clone(&mouse) as Arc<dyn PointerMotion>));
+        input.focus_gained(0);
+        input.wheel(wheel((0, 0), (0.25, 0.0), false), &at((10.0, 10.0)));
+        assert_eq!(
+            input.take(),
+            vec![
+                pointer(20, 20, 0),
+                ToHost::Wheel {
+                    notches: (0, 0),
+                    smooth: (0, -640)
                 },
             ]
         );

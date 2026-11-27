@@ -66,7 +66,8 @@ pub enum MomentumPhase {
 pub struct ScrollEvent {
     /// The distance up (away from the person), in 1/256 of the host's point: the device's own
     /// direction, so the guest's scrolling setting applies. A notched wheel's event is its lines
-    /// at 10 points each.
+    /// at 10 points each, and so is every event of a host that reports lines (SDL's, on Linux
+    /// and Windows).
     pub dy: i32,
     /// The distance left, as `dy`.
     pub dx: i32,
@@ -123,6 +124,15 @@ pub trait PointerMotion: Send + Sync {
     /// turned its wheel `wheel` notches up, and holds the `BUTTON_*` `buttons` after it: the
     /// guest's mouse does the same. Whether the guest took it.
     fn moved(&self, by: (i32, i32), wheel: i32, buttons: u32) -> bool;
+    /// The wheel turned `delta` notches (up, left), or, where `precise`, a precise device (a
+    /// trackpad) scrolled `delta` (up, left, in 1/256 point), captured or not. Where the guest's
+    /// own devices take scrolling (an x86-64 guest's, whose tablet has no sideways wheel: the
+    /// reims-graphics device's `SCROLL`), they scroll, and the host's callbacks hear nothing of
+    /// it. Whether they took it.
+    fn scrolled(&self, delta: (i32, i32), precise: bool) -> bool {
+        let _ = (delta, precise);
+        false
+    }
 }
 
 impl std::fmt::Debug for dyn PointerMotion {
@@ -154,7 +164,8 @@ pub enum Landed {
 pub struct WindowCallbacks {
     /// The pointer moved, or a button went down or up.
     pub pointer: Option<PointerFn>,
-    /// The wheel turned.
+    /// The wheel turned. Neither it nor `scroll` hears what the guest's own devices take
+    /// ([`PointerMotion::scrolled`]).
     pub wheel: Option<WheelFn>,
     /// A key went down or up.
     pub key: Option<KeyFn>,

@@ -794,6 +794,11 @@ private:
 	void startPointerDevice();
 	void stopPointerDevice();
 	void pointerMotion(const volatile UInt8 *payload, UInt32 size);
+#if defined(__x86_64__)
+	// handleEvent's SCROLL, which hands the mouse the event's notches on the work loop: the host
+	// sends it once the start has named the mouse (SCROLL_DEVICES, design.md "Scrolling").
+	void pointerScroll(const volatile UInt8 *payload, UInt32 size);
+#endif
 #if defined(__arm64e__)
 	// The arm64e kext's VideoToolbox service (RgfxVtService.hpp), display 0's alone: whether the
 	// host took VT_MESSAGES, set at the start's features; the service, published once the

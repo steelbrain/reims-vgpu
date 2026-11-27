@@ -16,6 +16,9 @@ RgfxPointerDevice *RgfxPointerDevice::withProvider(IOService *provider)
 	if (!device)
 		return nullptr;
 	device->reportBuffer = nullptr;
+#if !RGFX_GUEST_ARM64
+	device->buttons = 0;
+#endif
 	if (!device->init(nullptr)) {
 		device->release();
 		return nullptr;
@@ -43,7 +46,21 @@ void RgfxPointerDevice::post(const RgfxMotion &motion)
 		reportBuffer->setLength(kRgfxMouseReportBytes);
 		handleReport(reportBuffer, kIOHIDReportTypeInput, 0);
 	}
+#if !RGFX_GUEST_ARM64
+	buttons = motion.buttons;
+#endif
 }
+
+#if !RGFX_GUEST_ARM64
+void RgfxPointerDevice::scroll(const RgfxScrolled &scrolled)
+{
+	RgfxMotion motion = {};
+	motion.wheel = scrolled.notchesUp;
+	motion.pan = scrolled.notchesRight;
+	motion.buttons = buttons;
+	post(motion);
+}
+#endif
 
 IOReturn RgfxPointerDevice::newReportDescriptor(IOMemoryDescriptor **descriptor) const
 {

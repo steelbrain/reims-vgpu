@@ -15,6 +15,11 @@
 
 #include <stdint.h>
 
+// The distance, in 1/256 point, of a notch counted in a precise device's scrolling for a guest
+// with no precise device of its own: 10 points, a line of a host that reports lines (SDL's), so
+// a touchpad there turns the guest's wheel a notch a line, as SDL counts the tablet's.
+#define FINE_PER_NOTCH (10 * 256)
+
 // `setRenderPipelineState:` ([`RgfxIcbObject`]).
 #define RGFX_ICB_OP_RENDER_PIPELINE 1
 
@@ -2009,6 +2014,10 @@
 // [`RGFX_FEATURE_CURSOR_COLOR`]: not answered.
 #define RGFX_CMD_CURSOR_COLOR 10
 
+// Command `SCROLL_DEVICES` ([`RgfxScrollDevices`]), where the guest took
+// [`RGFX_FEATURE_POINTER_MOTION`]: not answered.
+#define RGFX_CMD_SCROLL_DEVICES 11
+
 // Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 #define RGFX_EVT_COMPLETE 256
 
@@ -2030,6 +2039,11 @@
 // [`RGFX_FEATURE_POINTER_MOTION`]: the host's pointing device moved, turned its wheel or pressed
 // or let go of a button, and the guest's relative pointing device does the same.
 #define RGFX_EVT_POINTER_MOTION 261
+
+// Event `SCROLL` ([`RgfxScroll`]), sent only to a guest whose devices since its last start
+// ([`RGFX_CMD_SCROLL_DEVICES`]) take it: the host's wheel or trackpad scrolled, and the guest's
+// own devices scroll as far.
+#define RGFX_EVT_SCROLL 262
 
 // `COMPLETE`'s status: the command was done.
 #define RGFX_STATUS_OK 0
@@ -2885,6 +2899,14 @@
 
 // Where a `DISPLAYS` message's first display record starts: right after `count`.
 #define RGFX_DISPLAYS_ENTRIES_OFFSET 20
+
+// [`RgfxScrollDevices`]'s `devices`: the guest's mouse takes wheel notches, up and sideways
+// ([`RgfxScroll`]'s `notches_up` and `notches_right`).
+#define RGFX_SCROLL_DEVICE_WHEEL (1 << 0)
+
+// [`RgfxScrollDevices`]'s `devices`, beside [`RGFX_SCROLL_DEVICE_WHEEL`]: a precise device of
+// the guest's takes a trackpad's distance ([`RgfxScroll`]'s `fine_up` and `fine_right`).
+#define RGFX_SCROLL_DEVICE_PRECISE (1 << 1)
 
 // [`RgfxPointerOver`]'s `buttons`: the left button held.
 #define RGFX_POINTER_BUTTON_LEFT (1 << 0)
@@ -7978,6 +8000,44 @@ typedef struct {
   // `height`.
   uint64_t height;
 } RgfxScissorRectElem;
+
+// `SCROLL`: the host's wheel turned `notches_up` notches up (away from the person) and
+// `notches_right` to the right, or its precise device (a trackpad) scrolled `fine_up` up and
+// `fine_right` right, in 1/256 of the host's point; each in the device's own direction, whatever
+// the host's scrolling setting, so the guest's applies. A host that reports lines and not points
+// (SDL's, on Linux and Windows) gives 10 points a line. A precise device's distance goes only to
+// a guest whose devices take it ([`RGFX_SCROLL_DEVICE_PRECISE`]), and to another as the notches
+// in it, one per 10 points counted on; a wheel's notches go as notches. Scrolling that finds the
+// ring held or full is added to the next `SCROLL`.
+typedef struct {
+  // [`RGFX_EVT_SCROLL`], `seqno` 0.
+  RgfxMsgHeader header;
+  // Wheel notches, above 0 up.
+  int32_t notches_up;
+  // Wheel notches, above 0 right.
+  int32_t notches_right;
+  // The precise distance up, in 1/256 point.
+  int32_t fine_up;
+  // The precise distance right, in 1/256 point.
+  int32_t fine_right;
+} RgfxScroll;
+
+// `SCROLL_DEVICES`: the guest's own devices that scroll, `devices` (`RGFX_SCROLL_DEVICE_*`
+// bits), which its driver sends once they are up after each start. Where they take a wheel's
+// notches ([`RGFX_SCROLL_DEVICE_WHEEL`]), the scrolling of the device's windows goes to them as
+// [`RGFX_EVT_SCROLL`] and no longer to the host's own pointing device (QEMU's USB tablet, which
+// has no sideways wheel), until the next reset or a `SCROLL_DEVICES` of none
+// (docs/graphics-kext/design.md, "Scrolling"). The x86-64 kext sends it once its mouse
+// ([`RGFX_FEATURE_POINTER_MOTION`]) is up; the arm64e kext, whose tablet scrolls smoothly and
+// sideways, sends none.
+typedef struct {
+  // [`RGFX_CMD_SCROLL_DEVICES`].
+  RgfxMsgHeader header;
+  // The devices: `RGFX_SCROLL_DEVICE_*` bits.
+  uint32_t devices;
+  // 0.
+  uint32_t reserved_14;
+} RgfxScrollDevices;
 
 // `SET_CURSOR`: the display's cursor is `height` rows of `width` premultiplied BGRA8 pixels,
 // `width * 4` bytes a row, from `offset` in the region, its hot spot at (`hot_x`, `hot_y`). A

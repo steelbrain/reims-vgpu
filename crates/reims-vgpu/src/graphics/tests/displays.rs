@@ -421,7 +421,8 @@ fn a_captured_pointer_past_the_shared_edge_goes_on_through_the_other_display_s_w
 /// A device with a window offers `POINTER_MOTION`, and a headless one does not; a window the
 /// device gives the guest's mouse ([`crate::window::give_motion`]), one with a pointer callback,
 /// is told how long the guest has hidden its cursor, and its motion reaches a guest that took
-/// `POINTER_MOTION` as the event; a window with no pointer callback is given no mouse
+/// `POINTER_MOTION` as the event, and its scrolling a guest that named its devices that scroll as
+/// `SCROLL`; a window with no pointer callback is given no mouse
 #[test]
 fn a_window_s_device_offers_pointer_motion_and_drives_the_guest_s_mouse() {
     let offers = |device: &GraphicsDevice<FakePlatform>| {
@@ -483,4 +484,25 @@ fn a_window_s_device_offers_pointer_motion_and_drives_the_guest_s_mouse() {
     );
     carried(&device, &mut guest, move_cursor(0, 10, 10));
     assert_eq!(mouse.hidden_for(), None, "shown again");
+    // The guest's devices that scroll take the window's scrolling, sideways to the right.
+    assert!(!mouse.scrolled((1, 2), false), "no devices named");
+    let devices = RgfxScrollDevices {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SCROLL_DEVICES,
+            size: 0,
+            seqno: 0,
+        },
+        devices: RGFX_SCROLL_DEVICE_WHEEL | RGFX_SCROLL_DEVICE_PRECISE,
+        reserved_14: 0,
+    };
+    carried(&device, &mut guest, devices.as_bytes().to_vec());
+    let scroll = |guest: &mut Guest| {
+        let s = RgfxScroll::read_from_bytes(&guest.event().unwrap()).unwrap();
+        assert_eq!(s.header.r#type, RGFX_EVT_SCROLL);
+        (s.notches_up, s.notches_right, s.fine_up, s.fine_right)
+    };
+    assert!(mouse.scrolled((1, 2), false));
+    assert_eq!(scroll(&mut guest), (1, -2, 0, 0));
+    assert!(mouse.scrolled((256, 512), true));
+    assert_eq!(scroll(&mut guest), (0, 0, 256, -512));
 }

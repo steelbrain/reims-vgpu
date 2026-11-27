@@ -21,7 +21,9 @@
 //!   it moved: a window that is not key gets no moves, and the guest scrolls where the host's
 //!   pointer is. Where the host takes smooth scrolling, each event goes with its phases, and a
 //!   gesture that began over the image goes to its end, momentum included ([`crate::scroll`]);
-//!   else the guest gets wheel notches.
+//!   else the guest gets wheel notches. Where the guest's own devices take scrolling
+//!   ([`crate::PointerMotion::scrolled`]), each event goes to them instead, a precise device's
+//!   (a trackpad's, momentum included) with its distance in points.
 //! - **Keys** by position ([`crate::keymap`]), one down and one up each: the host's repeats are
 //!   dropped, since the guest repeats a held key itself. A key, or a click sent to the guest,
 //!   that AppKit reports with a modifier the window did not see change (one pressed before the
@@ -452,11 +454,26 @@ impl InputLogic {
             return Reaction::default();
         };
         let (dy, dx) = self.scroll.feed(input);
-        if dy != 0 || dx != 0 {
+        if self.guest_scrolls((dy, dx), input) {
+            self.move_pointer(point, cx.image, mode);
+        } else if dy != 0 || dx != 0 {
             self.move_pointer(point, cx.image, mode);
             self.out.push(ToHost::Wheel { dy, dx });
         }
         Reaction::default()
+    }
+
+    /// Whether the guest's own devices took the event ([`PointerMotion::scrolled`]): a precise
+    /// device's distance, else its `notches`.
+    fn guest_scrolls(&self, notches: (i32, i32), input: ScrollInput) -> bool {
+        let delta = if input.precise {
+            scroll::smooth(input)
+        } else {
+            notches
+        };
+        self.motion
+            .as_ref()
+            .is_some_and(|motion| motion.scrolled(delta, input.precise))
     }
 
     /// Smooth scrolling: the event goes where [`Gesture::route`] sends it, the pointer at `at`,
@@ -489,7 +506,9 @@ impl InputLogic {
         if let Some((point, mode)) = over {
             self.move_pointer(point, image, mode);
         }
-        self.out.push(ToHost::Scroll(event));
+        if !self.guest_scrolls(event.notches, input) {
+            self.out.push(ToHost::Scroll(event));
+        }
     }
 
     /// A key went down (`keyDown:`).
@@ -1240,6 +1259,45 @@ mod tests {
             phase,
             momentum,
             ..ScrollInput::default()
+        }
+    }
+
+    /// Where the guest's own devices take scrolling, each event goes to them and the host hears
+    /// none of it, after the pointer's position, with the host's smooth scrolling and without: a
+    /// notched wheel's as its notches, a precise device's with its points, the momentum after a
+    /// gesture (a Mac's coasting) included, up and left in the device's own direction
+    #[test]
+    fn the_guest_s_own_devices_take_scrolling_where_they_scroll() {
+        use MomentumPhase as M;
+        use ScrollPhase as P;
+        let wheel = ScrollInput {
+            lines: (-1, 2),
+            ..ScrollInput::default()
+        };
+        for smooth in [false, true] {
+            let mouse = Arc::new(Mouse::scrolling());
+            let mut logic = InputLogic::new(false);
+            logic.motion = Some(Arc::clone(&mouse) as Arc<dyn PointerMotion>);
+            let over = at((580.0, 350.0));
+            logic.scrolled(wheel, smooth, &over);
+            logic.scrolled(swipe(6.0, P::Began, M::None), smooth, &over);
+            logic.scrolled(swipe(0.0, P::Ended, M::None), smooth, &over);
+            logic.scrolled(swipe(-2.5, P::None, M::Began), smooth, &over);
+            assert_eq!(
+                sent(&mut logic),
+                vec![pointer(960, 600, 0)],
+                "smooth {smooth}"
+            );
+            assert_eq!(
+                mouse.take_scrolled(),
+                vec![
+                    ((2, -1), false),
+                    ((1536, 0), true),
+                    ((0, 0), true),
+                    ((-640, 0), true),
+                ],
+                "smooth {smooth}"
+            );
         }
     }
 

@@ -1,7 +1,7 @@
 //! The control commands (`wire`'s `RGFX_CMD_*`), as the control thread takes them: each checked,
 //! done, and answered with a `COMPLETE` carrying its `seqno` and a status, or with `DISPLAYS`
-//! for `GET_DISPLAYS`; `MOVE_CURSOR`, `DISPLAY_BOUNDS` and `CURSOR_COLOR` are not answered. A
-//! command that is refused changes nothing. A message of a type the device has no command for is
+//! for `GET_DISPLAYS`; `MOVE_CURSOR`, `DISPLAY_BOUNDS`, `CURSOR_COLOR` and `SCROLL_DEVICES` are
+//! not answered. A command that is refused changes nothing. A message of a type the device has no command for is
 //! answered [`RGFX_STATUS_UNKNOWN_COMMAND`], and one shorter than its command
 //! [`RGFX_STATUS_INVALID_ARGUMENT`]. A display command naming a display the guest does not see
 //! (`Shared::seen_display`: past the device's count, or past display 0 where the guest did not
@@ -51,6 +51,12 @@ pub(crate) fn answer(shared: &Shared, message: &Message) -> Option<Vec<u8>> {
         }
         RGFX_CMD_CURSOR_COLOR => {
             cursor_color(shared, message);
+            return None;
+        }
+        RGFX_CMD_SCROLL_DEVICES => {
+            if let Some(command) = read::<RgfxScrollDevices>(message) {
+                shared.scroll_devices(command.devices);
+            }
             return None;
         }
         RGFX_CMD_SET_VBLANK => read(message).map_or(RGFX_STATUS_INVALID_ARGUMENT, |command| {

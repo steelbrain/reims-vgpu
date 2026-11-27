@@ -40,6 +40,11 @@ public:
 	// Hands the HID stack the reports of one POINTER_MOTION, in order. On the framebuffer's work
 	// loop, one call at a time.
 	void post(const RgfxMotion &motion);
+#if !RGFX_GUEST_ARM64
+	// Hands it a SCROLL's notches as reports, with the buttons the last POINTER_MOTION left held,
+	// as post does.
+	void scroll(const RgfxScrolled &scrolled);
+#endif
 
 	IOReturn newReportDescriptor(IOMemoryDescriptor **descriptor) const override;
 	OSString *newManufacturerString() const override;
@@ -95,6 +100,10 @@ private:
 
 	// The buffer each report is written into before the HID stack reads it.
 	IOBufferMemoryDescriptor *reportBuffer;
+#if !RGFX_GUEST_ARM64
+	// The buttons the last report held.
+	uint32_t buttons;
+#endif
 };
 
 #endif // RGFX_POINTER_DEVICE_HPP_

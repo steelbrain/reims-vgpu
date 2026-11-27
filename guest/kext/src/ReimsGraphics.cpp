@@ -1219,6 +1219,12 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// The host's pointer drives the guest's own mouse (RgfxPointerDevice.hpp).
 		pointerMotion(payload, size);
 		return;
+#if defined(__x86_64__)
+	case RGFX_EVT_SCROLL:
+		// The host's scrolling scrolls the guest's own mouse (RgfxPointerMotion.hpp).
+		pointerScroll(payload, size);
+		return;
+#endif
 #if defined(__arm64e__)
 	case RGFX_EVT_VT_MESSAGE:
 		// The host's side's message, for the guest's VideoToolbox (RgfxVtService.hpp).
@@ -1258,6 +1264,13 @@ void ReimsGraphics::startPointerDevice()
 	}
 	__atomic_store_n(&pointerDevice, made, __ATOMIC_RELEASE);
 	IOLog("ReimsGraphics: the guest's mouse for POINTER_MOTION is up\n");
+#if defined(__x86_64__)
+	// The host's scrolling goes to it from here, sideways included, until the next reset.
+	RgfxScrollDevices devices = {};
+	devices.devices = RGFX_SCROLL_DEVICE_WHEEL;
+	if (post(RGFX_CMD_SCROLL_DEVICES, &devices, sizeof(devices), nullptr) != kIOReturnSuccess)
+		IOLog("ReimsGraphics: SCROLL_DEVICES was not sent: the tablet keeps the scrolling\n");
+#endif
 }
 
 // Display 0's stop, once the work loop hands the device nothing more: the device stops and goes.
@@ -1284,6 +1297,23 @@ void ReimsGraphics::pointerMotion(const volatile UInt8 *payload, UInt32 size)
 	}
 	mouse->post(motion);
 }
+
+#if defined(__x86_64__)
+// handleEvent's SCROLL, on the device's work loop: its notches to the guest's mouse.
+void ReimsGraphics::pointerScroll(const volatile UInt8 *payload, UInt32 size)
+{
+	RgfxScrolled scrolled = {};
+	RgfxPointerDevice *mouse = __atomic_load_n(&pointerDevice, __ATOMIC_ACQUIRE);
+	if (!mouse || !rgfxScrollRead(payload, size, &scrolled)) {
+		static char unread;
+		if (rgfxFirstCalls(&unread, size, 1))
+			IOLog("ReimsGraphics: a SCROLL of %u bytes scrolls nothing%s\n", size,
+			      mouse ? "" : " (no mouse is up)");
+		return;
+	}
+	mouse->scroll(scrolled);
+}
+#endif
 
 // Hands a lifecycle message's answer to its waiting thread, or keeps a deferred create's for its
 // process: false where neither waits for an answer of this type to `seqno`.

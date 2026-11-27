@@ -59,7 +59,8 @@ pub type RvgWindowPointerFn = Option<
 /// setting, so the guest's applies.
 ///
 /// Thread, and what it may call: as RvgWindowPointerFn. Not called where the table has
-/// `scroll`. Without either, scrolling goes nowhere.
+/// `scroll`, nor for scrolling the guest's own devices take (as `scroll`). Without either,
+/// scrolling goes nowhere.
 pub type RvgWindowWheelFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, dy: i32, dx: i32)>;
 
 /// `key(ctx, usage, down)`: the key with USB HID keyboard usage `usage` (page 0x07) went down
@@ -119,7 +120,8 @@ pub struct RvgWindowScroll {
     pub struct_size: u32,
     /// The distance up (away from the person), in 1/256 of the host's point: the device's own
     /// direction, whatever the host's scrolling setting, so the guest's applies. A notched
-    /// wheel's event is its lines at 10 points each.
+    /// wheel's event is its lines at 10 points each, and so is every event on Linux and Windows,
+    /// whose windows report lines.
     pub dy: i32,
     /// The distance left, as `dy`.
     pub dx: i32,
@@ -140,6 +142,12 @@ pub struct RvgWindowScroll {
 /// the call. A gesture that begins over the image comes here to its end, momentum included,
 /// wherever the pointer goes; one that begins elsewhere does not, and an event of no phase comes
 /// where the pointer is over the image.
+///
+/// Not called for scrolling the guest's own devices take: an x86-64 guest whose driver has a
+/// mouse of its own on the graphics device (its kext's, from the time it starts until its next
+/// reset) gets every scroll of the device's windows there, sideways included, which the USB
+/// tablet has no wheel for; the window's distance then reaches its precise device at the same 10
+/// points a line where the window reports lines.
 ///
 /// Thread, and what it may call: as RvgWindowPointerFn. With it, scrolling comes here and not to
 /// `wheel`.

@@ -322,6 +322,8 @@ include = [
     "RgfxSamplerState",
     "RgfxScheduledAsk",
     "RgfxScissorRectElem",
+    "RgfxScroll",
+    "RgfxScrollDevices",
     "RgfxSetCursor",
     "RgfxSetDisplayPower",
     "RgfxSetScanout",

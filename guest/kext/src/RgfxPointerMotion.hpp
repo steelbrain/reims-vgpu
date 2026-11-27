@@ -15,6 +15,11 @@
 // buttons it leaves held: the host sends a press or a release in an event of its own, which the
 // device joins to no motion of other buttons, so the guest takes it where the host made it.
 //
+// The x86-64 kext's mouse scrolls sideways too: an 8-bit AC Pan (consumer page 0x0C, usage
+// 0x238) in byte 6, above 0 right, so 7 bytes a report, which IOHIDEventDriver makes the scroll
+// event's sideways axis. Its SCROLL's notches go to it (design.md, "Scrolling"). The arm64e
+// kext's mouse has no pan: its guest's tablet scrolls sideways.
+//
 // Header-only and free of the kernel's headers, so its native test (tests/pointer_motion_test.cpp)
 // builds it as the kext does.
 //
@@ -27,6 +32,10 @@
 
 #include "RgfxDisplayTable.hpp"
 #include "reims_graphics_wire.h"
+
+#ifndef RGFX_GUEST_ARM64
+#define RGFX_GUEST_ARM64 0
+#endif
 
 // The device's HID report descriptor.
 constexpr uint8_t kRgfxMouseReportDescriptor[] = {
@@ -60,28 +69,50 @@ constexpr uint8_t kRgfxMouseReportDescriptor[] = {
     0x75, 0x08,       //     Report Size (8)
     0x95, 0x01,       //     Report Count (1)
     0x81, 0x06,       //     Input (Data, Variable, Relative)
+#if !RGFX_GUEST_ARM64
+    0x05, 0x0c,       //     Usage Page (Consumer)
+    0x0a, 0x38, 0x02, //     Usage (AC Pan)
+    0x15, 0x81,       //     Logical Minimum (-127)
+    0x25, 0x7f,       //     Logical Maximum (127)
+    0x75, 0x08,       //     Report Size (8)
+    0x95, 0x01,       //     Report Count (1)
+    0x81, 0x06,       //     Input (Data, Variable, Relative)
+#endif
     0xc0,             //   End Collection
     0xc0,             // End Collection
 };
 
 // The size of one report.
-constexpr size_t kRgfxMouseReportBytes = 6;
+constexpr size_t kRgfxMouseReportBytes = RGFX_GUEST_ARM64 ? 6 : 7;
 
-// The most one report moves on an axis, and turns the wheel.
+// The most one report moves on an axis, and turns the wheel (or pans).
 constexpr int32_t kRgfxMouseReportMotionMax = 32767;
 constexpr int32_t kRgfxMouseReportWheelMax = 127;
 
-// The most reports one POINTER_MOTION makes: a motion of i32's range on an axis takes 65538 of
-// 32767, more than any host sends; the device sends at most this many, the motion past them
-// dropped.
+// The most reports one POINTER_MOTION or SCROLL makes: a motion of i32's range on an axis takes
+// 65538 of 32767, more than any host sends; the device sends at most this many, the motion past
+// them dropped, as are notches past 8 x 127 either way.
 constexpr uint32_t kRgfxMouseReportsMax = 8;
 
-// POINTER_MOTION's motion, wheel and buttons (RgfxPointerMotion past its header).
+// POINTER_MOTION's motion, wheel and buttons (RgfxPointerMotion past its header), and on x86-64 a
+// SCROLL's sideways notches, above 0 right.
 struct RgfxMotion {
 	int32_t dx;
 	int32_t dy;
 	int32_t wheel;
 	uint32_t buttons;
+#if !RGFX_GUEST_ARM64
+	int32_t pan;
+#endif
+};
+
+// SCROLL's notches and distance (RgfxScroll past its header): up and right, the distance in
+// 1/256 point.
+struct RgfxScrolled {
+	int32_t notchesUp;
+	int32_t notchesRight;
+	int32_t fineUp;
+	int32_t fineRight;
 };
 
 // The motion, wheel and buttons of a POINTER_MOTION whose payload (past its header) is `size`
@@ -94,6 +125,19 @@ inline bool rgfxPointerMotionRead(const volatile uint8_t *payload, uint32_t size
 	motion->dy = static_cast<int32_t>(rgfxPayload32(payload, 4));
 	motion->wheel = static_cast<int32_t>(rgfxPayload32(payload, 8));
 	motion->buttons = rgfxPayload32(payload, 12);
+	return true;
+}
+
+// The notches and distance of a SCROLL whose payload (past its header) is `size` bytes at
+// `payload`: false where it is too short to hold them.
+inline bool rgfxScrollRead(const volatile uint8_t *payload, uint32_t size, RgfxScrolled *scroll)
+{
+	if (size < 4 * sizeof(uint32_t))
+		return false;
+	scroll->notchesUp = static_cast<int32_t>(rgfxPayload32(payload, 0));
+	scroll->notchesRight = static_cast<int32_t>(rgfxPayload32(payload, 4));
+	scroll->fineUp = static_cast<int32_t>(rgfxPayload32(payload, 8));
+	scroll->fineRight = static_cast<int32_t>(rgfxPayload32(payload, 12));
 	return true;
 }
 
@@ -115,6 +159,9 @@ inline uint32_t rgfxMouseReports(const RgfxMotion &motion,
 {
 	using rgfx_pointer_motion_detail::take;
 	int32_t dx = motion.dx, dy = motion.dy, wheel = motion.wheel;
+#if !RGFX_GUEST_ARM64
+	int32_t pan = motion.pan;
+#endif
 	const uint8_t buttons = static_cast<uint8_t>(motion.buttons & 0x1f);
 	uint32_t n = 0;
 	do {
@@ -128,7 +175,12 @@ inline uint32_t rgfxMouseReports(const RgfxMotion &motion,
 		r[3] = static_cast<uint8_t>(static_cast<uint16_t>(y) & 0xff);
 		r[4] = static_cast<uint8_t>(static_cast<uint16_t>(y) >> 8);
 		r[5] = static_cast<uint8_t>(static_cast<int8_t>(w));
+#if !RGFX_GUEST_ARM64
+		r[6] = static_cast<uint8_t>(static_cast<int8_t>(take(&pan, kRgfxMouseReportWheelMax)));
+	} while ((dx || dy || wheel || pan) && n < kRgfxMouseReportsMax);
+#else
 	} while ((dx || dy || wheel) && n < kRgfxMouseReportsMax);
+#endif
 	return n;
 }
 

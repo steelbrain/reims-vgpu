@@ -166,7 +166,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/queue_publish_test $(BUILD)/tests/doorbell_pages_test $(BUILD)/tests/top_down_test \
 	$(BUILD)/tests/display_table_test $(BUILD)/tests/agdc_displays_test \
 	$(BUILD)/tests/pointer_over_test $(BUILD)/tests/display_bounds_test $(BUILD)/tests/display_places_test \
-	$(BUILD)/tests/pointer_motion_test $(BUILD)/tests/register_hold_test $(BUILD)/tests/vt_routes_test \
+	$(BUILD)/tests/pointer_motion_test $(BUILD)/tests/pointer_motion_arm64_test \
+	$(BUILD)/tests/register_hold_test $(BUILD)/tests/vt_routes_test \
 	$(BUILD)/tests/vt_ring_test $(BUILD)/tests/pat_test \
 	$(BUILD)/tests/block_zero_test $(BUILD)/tests/block_zero_arm64_test $(BUILD)/tests/pool_blocks_test \
 	$(BUILD)/tests/lifecycle_answers_test $(BUILD)/tests/lifecycle_answers_arm64_test
@@ -182,6 +183,11 @@ $(BUILD)/tests/arm64_region_test: tests/arm64_region_test.cpp $(HEADERS) ../../c
 
 # Ring 0's writes as the arm64e kext makes them (RgfxControlRing.hpp): no write-combined part.
 $(BUILD)/tests/control_ring_arm64_test: tests/control_ring_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
+
+# The guest's mouse as the arm64e kext builds it (RgfxPointerMotion.hpp): no pan.
+$(BUILD)/tests/pointer_motion_arm64_test: tests/pointer_motion_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 

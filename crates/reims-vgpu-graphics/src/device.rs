@@ -1306,6 +1306,33 @@ struct Pointer {
     /// another thread, full, or behind answers handed over goes at the next motion or the next
     /// refresh of any display ([`Shared::pointer_motion`]).
     motion: VecDeque<RgfxPointerMotion>,
+    /// The guest's devices that scroll, as its last `SCROLL_DEVICES` named them
+    /// (`RGFX_SCROLL_DEVICE_*`).
+    scroll_devices: u32,
+    /// The `SCROLL` not posted yet, posted after the owed motion as it is ([`Shared::scroll`]):
+    /// scrolling joins it.
+    scroll: Option<RgfxScroll>,
+    /// A precise device's distance, up and right in 1/256 point, not yet a notch, for a guest
+    /// with no precise device ([`FINE_PER_NOTCH`]).
+    fine_left: (i64, i64),
+}
+
+/// The distance, in 1/256 point, of a notch counted in a precise device's scrolling for a guest
+/// with no precise device of its own: 10 points, a line of a host that reports lines (SDL's), so
+/// a touchpad there turns the guest's wheel a notch a line, as SDL counts the tablet's.
+pub const FINE_PER_NOTCH: i64 = 10 * 256;
+
+/// The notches in `left` and `fine` on, the rest left in `left`: counted afresh where `fine` goes
+/// the other way, each notch toward zero.
+fn count_notches(left: &mut i64, fine: i32) -> i32 {
+    let fine = i64::from(fine);
+    if *left * fine < 0 {
+        *left = 0;
+    }
+    *left += fine;
+    let notches = *left / FINE_PER_NOTCH;
+    *left -= notches * FINE_PER_NOTCH;
+    notches as i32
 }
 
 /// A display's cursor image as `SET_CURSOR` gave it: its size and its hot spot, in pixels.
@@ -1478,6 +1505,19 @@ impl PointerLink {
         self.shared
             .upgrade()
             .is_some_and(|shared| shared.pointer_motion(dx, dy, wheel, buttons))
+    }
+
+    /// The host's wheel turned `delta` notches (up, right), or, where `precise`, its precise
+    /// device scrolled `delta` (up, right, in 1/256 point): where the guest's devices take
+    /// scrolling (`SCROLL_DEVICES`), it is sent `SCROLL` ([`RgfxScroll`]), a precise device's
+    /// distance as it is where the guest has a precise device, else as the notches in it, one per
+    /// [`FINE_PER_NOTCH`]. Waits for no other thread, as [`Self::motion`]. Whether the guest takes
+    /// it: false, and nothing sent, where its devices do not, it is not started, and once the
+    /// device has ended; the host's own pointing device scrolls then.
+    pub fn scroll(&self, delta: (i32, i32), precise: bool) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.scroll(delta, precise))
     }
 }
 
@@ -2937,6 +2977,54 @@ impl Shared {
         true
     }
 
+    /// `SCROLL_DEVICES`: the guest's devices that scroll are `devices` until the next reset.
+    pub(crate) fn scroll_devices(&self, devices: u32) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.pointer.lock().at(epoch).scroll_devices = devices;
+    }
+
+    /// [`PointerLink::scroll`]: the scrolling joins the owed `SCROLL`, which goes out after the
+    /// owed motion. Whether the guest takes it.
+    pub(crate) fn scroll(&self, delta: (i32, i32), precise: bool) -> bool {
+        if !self.started() {
+            return false;
+        }
+        let epoch = self.epoch.load(Ordering::Acquire);
+        {
+            let mut pointer = self.pointer.lock();
+            let pointer = pointer.at(epoch);
+            let devices = pointer.scroll_devices;
+            if devices & RGFX_SCROLL_DEVICE_WHEEL == 0 {
+                return false;
+            }
+            let fine = precise && devices & RGFX_SCROLL_DEVICE_PRECISE != 0;
+            let (up, right) = if precise && !fine {
+                (
+                    count_notches(&mut pointer.fine_left.0, delta.0),
+                    count_notches(&mut pointer.fine_left.1, delta.1),
+                )
+            } else {
+                delta
+            };
+            if (up, right) == (0, 0) {
+                return true;
+            }
+            let owed = pointer.scroll.get_or_insert(RgfxScroll {
+                header: event_header(RGFX_EVT_SCROLL),
+                ..RgfxScroll::default()
+            });
+            let (owed_up, owed_right) = if fine {
+                (&mut owed.fine_up, &mut owed.fine_right)
+            } else {
+                (&mut owed.notches_up, &mut owed.notches_right)
+            };
+            *owed_up = owed_up.saturating_add(up);
+            *owed_right = owed_right.saturating_add(right);
+        }
+        self.post_motion(epoch, false);
+        true
+    }
+
     /// Posts the `POINTER_MOTION`s owed at reset count `epoch`, oldest first, waiting for the
     /// ring held elsewhere and for room where `wait`; stops at the first not posted, which stays
     /// owed with those after it, as does one that finds answers handed over before it. Where
@@ -2948,6 +3036,7 @@ impl Shared {
         };
         loop {
             let Some(event) = self.pointer.lock().at(epoch).motion.front().copied() else {
+                self.post_scroll(epoch, wait);
                 return;
             };
             if self.control_handing.load(Ordering::Acquire) {
@@ -2973,6 +3062,39 @@ impl Shared {
                 front.dx = front.dx.saturating_sub(event.dx);
                 front.dy = front.dy.saturating_sub(event.dy);
                 front.wheel = front.wheel.saturating_sub(event.wheel);
+            }
+        }
+    }
+
+    /// Posts the `SCROLL` owed at reset count `epoch`, as [`Self::post_motion`] does the motion,
+    /// whose lock its caller holds: what joined it while it was posted stays owed.
+    fn post_scroll(&self, epoch: u64, wait: bool) {
+        let Some(event) = self.pointer.lock().at(epoch).scroll else {
+            return;
+        };
+        if self.control_handing.load(Ordering::Acquire)
+            || !matches!(
+                self.post_on(&sized(&event), epoch, wait),
+                Post::Done | Post::Dropped
+            )
+        {
+            return;
+        }
+        let mut pointer = self.pointer.lock();
+        let pointer = pointer.at(epoch);
+        if let Some(owed) = &mut pointer.scroll {
+            owed.notches_up = owed.notches_up.saturating_sub(event.notches_up);
+            owed.notches_right = owed.notches_right.saturating_sub(event.notches_right);
+            owed.fine_up = owed.fine_up.saturating_sub(event.fine_up);
+            owed.fine_right = owed.fine_right.saturating_sub(event.fine_right);
+            if (
+                owed.notches_up,
+                owed.notches_right,
+                owed.fine_up,
+                owed.fine_right,
+            ) == (0, 0, 0, 0)
+            {
+                pointer.scroll = None;
             }
         }
     }

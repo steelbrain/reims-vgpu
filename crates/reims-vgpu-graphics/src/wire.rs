@@ -929,6 +929,9 @@ pub const RGFX_CMD_DISPLAY_BOUNDS: u32 = 9;
 /// Command `CURSOR_COLOR` ([`RgfxCursorColor`]), where the guest took
 /// [`RGFX_FEATURE_CURSOR_COLOR`]: not answered.
 pub const RGFX_CMD_CURSOR_COLOR: u32 = 10;
+/// Command `SCROLL_DEVICES` ([`RgfxScrollDevices`]), where the guest took
+/// [`RGFX_FEATURE_POINTER_MOTION`]: not answered.
+pub const RGFX_CMD_SCROLL_DEVICES: u32 = 11;
 /// Event `COMPLETE` ([`RgfxComplete`]): a command's answer, with its `seqno`.
 pub const RGFX_EVT_COMPLETE: u32 = 0x100;
 /// Event `DISPLAYS` ([`RgfxDisplays`]): `GET_DISPLAYS`'s answer, with its `seqno`.
@@ -945,6 +948,10 @@ pub const RGFX_EVT_POINTER_OVER: u32 = 0x104;
 /// [`RGFX_FEATURE_POINTER_MOTION`]: the host's pointing device moved, turned its wheel or pressed
 /// or let go of a button, and the guest's relative pointing device does the same.
 pub const RGFX_EVT_POINTER_MOTION: u32 = 0x105;
+/// Event `SCROLL` ([`RgfxScroll`]), sent only to a guest whose devices since its last start
+/// ([`RGFX_CMD_SCROLL_DEVICES`]) take it: the host's wheel or trackpad scrolled, and the guest's
+/// own devices scroll as far.
+pub const RGFX_EVT_SCROLL: u32 = 0x106;
 
 /// `COMPLETE`'s status: the command was done.
 pub const RGFX_STATUS_OK: u32 = 0;
@@ -2154,6 +2161,59 @@ pub struct RgfxPointerMotion {
     pub buttons: u32,
 }
 
+/// `SCROLL_DEVICES`: the guest's own devices that scroll, `devices` (`RGFX_SCROLL_DEVICE_*`
+/// bits), which its driver sends once they are up after each start. Where they take a wheel's
+/// notches ([`RGFX_SCROLL_DEVICE_WHEEL`]), the scrolling of the device's windows goes to them as
+/// [`RGFX_EVT_SCROLL`] and no longer to the host's own pointing device (QEMU's USB tablet, which
+/// has no sideways wheel), until the next reset or a `SCROLL_DEVICES` of none
+/// (docs/graphics-kext/design.md, "Scrolling"). The x86-64 kext sends it once its mouse
+/// ([`RGFX_FEATURE_POINTER_MOTION`]) is up; the arm64e kext, whose tablet scrolls smoothly and
+/// sideways, sends none.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxScrollDevices {
+    /// [`RGFX_CMD_SCROLL_DEVICES`].
+    pub header: RgfxMsgHeader,
+    /// The devices: `RGFX_SCROLL_DEVICE_*` bits.
+    pub devices: u32,
+    /// 0.
+    pub reserved_14: u32,
+}
+
+/// [`RgfxScrollDevices`]'s `devices`: the guest's mouse takes wheel notches, up and sideways
+/// ([`RgfxScroll`]'s `notches_up` and `notches_right`).
+pub const RGFX_SCROLL_DEVICE_WHEEL: u32 = 1 << 0;
+/// [`RgfxScrollDevices`]'s `devices`, beside [`RGFX_SCROLL_DEVICE_WHEEL`]: a precise device of
+/// the guest's takes a trackpad's distance ([`RgfxScroll`]'s `fine_up` and `fine_right`).
+pub const RGFX_SCROLL_DEVICE_PRECISE: u32 = 1 << 1;
+
+/// `SCROLL`: the host's wheel turned `notches_up` notches up (away from the person) and
+/// `notches_right` to the right, or its precise device (a trackpad) scrolled `fine_up` up and
+/// `fine_right` right, in 1/256 of the host's point; each in the device's own direction, whatever
+/// the host's scrolling setting, so the guest's applies. A host that reports lines and not points
+/// (SDL's, on Linux and Windows) gives 10 points a line. A precise device's distance goes only to
+/// a guest whose devices take it ([`RGFX_SCROLL_DEVICE_PRECISE`]), and to another as the notches
+/// in it, one per 10 points counted on; a wheel's notches go as notches. Scrolling that finds the
+/// ring held or full is added to the next `SCROLL`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxScroll {
+    /// [`RGFX_EVT_SCROLL`], `seqno` 0.
+    pub header: RgfxMsgHeader,
+    /// Wheel notches, above 0 up.
+    pub notches_up: i32,
+    /// Wheel notches, above 0 right.
+    pub notches_right: i32,
+    /// The precise distance up, in 1/256 point.
+    pub fine_up: i32,
+    /// The precise distance right, in 1/256 point.
+    pub fine_right: i32,
+}
+
 /// [`RgfxPointerOver`]'s `buttons`: the left button held.
 pub const RGFX_POINTER_BUTTON_LEFT: u32 = 1 << 0;
 /// [`RgfxPointerOver`]'s `buttons`: the right button held.
@@ -2218,6 +2278,9 @@ const _: () = {
     assert!(size_of::<RgfxPointerMotion>() == 32);
     assert!(offset_of!(RgfxPointerMotion, wheel) == 24);
     assert!(offset_of!(RgfxPointerMotion, buttons) == 28);
+    assert!(size_of::<RgfxScrollDevices>() == 24);
+    assert!(size_of::<RgfxScroll>() == 32);
+    assert!(offset_of!(RgfxScroll, fine_up) == 24);
     assert!(size_of::<RgfxDisplayBounds>() == 40);
     assert!(RGFX_CONTROL_RING_DATA_SIZE.is_power_of_two());
     assert!(
@@ -5865,7 +5928,8 @@ const _: () = {
     assert!(size_of::<RgfxMeshPipelineReflection>() == 24);
     // Each exact size above is a multiple of 8, as a ring message must be.
     // The stage-3 opcodes do not collide with the stage-2 ones or each other.
-    assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_POINTER_MOTION);
+    assert!(RGFX_CMD_QUEUE_CREATE > RGFX_EVT_SCROLL);
+    assert!(RGFX_EVT_SCROLL > RGFX_EVT_POINTER_MOTION);
     assert!(RGFX_EVT_POINTER_MOTION > RGFX_EVT_POINTER_OVER);
     assert!(RGFX_CMD_COMMAND_BUFFER > RGFX_CMD_FENCE_CREATE);
     assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER_IN_REGION);

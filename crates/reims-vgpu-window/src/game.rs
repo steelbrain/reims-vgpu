@@ -262,11 +262,17 @@ pub(crate) mod tests {
     /// What a guest's mouse was sent, in order: each motion, wheel and buttons.
     pub(crate) type Sent = Vec<((i32, i32), i32, u32)>;
 
-    /// A guest's mouse: how long its cursor is hidden, and what it was sent.
+    /// What a guest's devices that scroll were sent, in order: each event's delta, and whether
+    /// it is a precise device's distance.
+    pub(crate) type Scrolled = Vec<((i32, i32), bool)>;
+
+    /// A guest's mouse: how long its cursor is hidden, and what it was sent; and, where the guest
+    /// has devices that scroll, what they were sent.
     #[derive(Debug, Default)]
     pub(crate) struct Mouse {
         pub(crate) hidden: Mutex<Option<u64>>,
         pub(crate) sent: Mutex<Sent>,
+        pub(crate) scrolled: Mutex<Option<Scrolled>>,
     }
 
     impl PointerMotion for Mouse {
@@ -276,6 +282,13 @@ pub(crate) mod tests {
         fn moved(&self, by: (i32, i32), wheel: i32, buttons: u32) -> bool {
             self.sent.lock().push((by, wheel, buttons));
             true
+        }
+        fn scrolled(&self, delta: (i32, i32), precise: bool) -> bool {
+            let mut scrolled = self.scrolled.lock();
+            scrolled
+                .as_mut()
+                .map(|s| s.push((delta, precise)))
+                .is_some()
         }
     }
 
@@ -288,6 +301,19 @@ pub(crate) mod tests {
         }
         pub(crate) fn take(&self) -> Sent {
             std::mem::take(&mut *self.sent.lock())
+        }
+        /// A mouse whose guest has devices that scroll.
+        pub(crate) fn scrolling() -> Mouse {
+            let mouse = Mouse::default();
+            *mouse.scrolled.lock() = Some(Vec::new());
+            mouse
+        }
+        pub(crate) fn take_scrolled(&self) -> Scrolled {
+            self.scrolled
+                .lock()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
         }
     }
 

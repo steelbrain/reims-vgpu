@@ -56,8 +56,9 @@ pub(crate) fn tell_pointer(
 }
 
 /// Has a window, `config`'s, drive the guest's own mouse with its captured pointer while the guest
-/// hides its cursor (docs/graphics-kext/design.md, "A pointer for games"): through `link`, once
-/// the device is made, the device's `POINTER_MOTION`, which a guest that took it hands its mouse.
+/// hides its cursor (docs/graphics-kext/design.md, "A pointer for games"), and scroll the guest's
+/// devices that scroll ("Scrolling"): through `link`, once the device is made, the device's
+/// `POINTER_MOTION` and `SCROLL`, which a guest that took them hands its devices.
 /// A window with no pointer callback gives the guest no pointer, and so no mouse either.
 pub(crate) fn give_motion(config: &mut WindowConfig, link: &Arc<OnceLock<PointerLink>>) {
     if config.callbacks.pointer.is_none() {
@@ -83,6 +84,14 @@ impl PointerMotion for GuestMouse {
         self.link
             .get()
             .is_some_and(|link| link.motion(by.0, by.1, wheel, buttons))
+    }
+
+    /// The device's `SCROLL` (docs/graphics-kext/design.md, "Scrolling"), whose sideways is to
+    /// the right where the window's is to the left.
+    fn scrolled(&self, (up, left): (i32, i32), precise: bool) -> bool {
+        self.link
+            .get()
+            .is_some_and(|link| link.scroll((up, left.saturating_neg()), precise))
     }
 }
 

@@ -3300,6 +3300,7 @@ named.
 | 8 | `SET_DISPLAY_POWER` | display u32, on u32; 0 turns the display's panel off (`DISPLAY_POWER`) | `COMPLETE` |
 | 9 | `DISPLAY_BOUNDS` | display u32, min_x i32, min_y i32, max_x i32, max_y i32, a reserved u32: the display's rectangle in the guest's desktop, in points (`DISPLAY_BOUNDS`) | none |
 | 10 | `CURSOR_COLOR` | display u32, on u32, then the source's curves (red, green, blue: form u32 and seven f32 parameters each), the source's matrix to XYZ and the matrix from XYZ to the blend space (nine f32 each, row by row), and the blend space's curves (`CURSOR_COLOR`) | none |
+| 11 | `SCROLL_DEVICES` | devices u32 (`RGFX_SCROLL_DEVICE_WHEEL` 1, `_PRECISE` 2), a reserved u32: the guest's own devices that scroll, after each start ("Scrolling") | none |
 
 Scanout pixels are 32-bit BGRA8 (`kIO32BGRAPixelFormat`), the one format in
 stage 2.
@@ -3314,6 +3315,7 @@ stage 2.
 | 0x103 | `VBLANK` | display u32, count u64, host time in ns u64 |
 | 0x104 | `POINTER_OVER` | display u32, x i32, y i32, buttons u32 (`RGFX_POINTER_BUTTON_*`); only to a guest that took `POINTER_OVER` |
 | 0x105 | `POINTER_MOTION` | dx i32, dy i32 (right, down), wheel i32 (notches up), buttons u32 (`RGFX_POINTER_BUTTON_*`, held after it); only to a guest that took `POINTER_MOTION` |
+| 0x106 | `SCROLL` | notches_up i32, notches_right i32, fine_up i32, fine_right i32 (1/256 point); only to a guest whose `SCROLL_DEVICES` named its wheel ("Scrolling") |
 
 **Display.** The modes offered are the host window's size, its width rounded
 down to a multiple of 16 pixels and its height to even, and its screen's
@@ -4432,6 +4434,48 @@ tablet. So the guest gets a mouse of its own, whose motion has no edge:
   event, its hidden cursor drives nothing, and the window's pointer is the
   tablet's only, as before. A kext that does not know the event passes over
   it (`handleEvent`'s default).
+
+## Scrolling
+
+QEMU's USB tablet, an x86-64 guest's pointer, has a vertical wheel and no
+sideways one: a sideways scroll of the host's never reached the guest. An
+x86-64 guest's scrolling goes to its own mouse ("A pointer for games")
+instead:
+- **The guest.** The x86-64 kext's mouse has AC Pan (consumer page 0x0C,
+  usage 0x238) after its wheel, both 8-bit relative, which IOHIDEventDriver
+  makes the scroll event's sideways axis (IOHIDFamily's
+  `IOHIDEventDriver::handleScrollReport`). A notch either way is the tablet's
+  notch field by field: line delta 1, point delta 1, not continuous, and the
+  same acceleration, since the mouse declares the tablet's resolution, none
+  (9 notches an inch, `HIDScrollResolution`), and notches 16 ms apart scroll
+  as far through both, 585 points for ten (measured, lane scrollhid, potluck
+  job m3-max-75987, x86-64 26.7.2). Once its mouse is up, after each start,
+  the kext sends `SCROLL_DEVICES` (11) naming it (`RGFX_SCROLL_DEVICE_WHEEL`),
+  and hands each `SCROLL` (0x106, `RgfxScroll`) to it as reports of at most
+  127 notches each way, with the buttons its last `POINTER_MOTION` left
+  held. The arm64e kext sends none: vmapple's tablet scrolls smoothly and
+  sideways.
+- **The device.** From a guest's `SCROLL_DEVICES` to its next reset, a
+  window's scroll (`PointerLink::scroll`) is owed as a `SCROLL` and posted
+  after the owed motion, joined into the owed one while the ring is held or
+  full, field by field, saturating. A precise device's distance goes where
+  the guest names a precise device (`RGFX_SCROLL_DEVICE_PRECISE`), and
+  otherwise as the notches in it, one per 10 points each way
+  (`FINE_PER_NOTCH`, a line of SDL's, so a touchpad on Linux and Windows
+  turns the guest's wheel a notch a line, as SDL counts the tablet's), the
+  rest counted on and counted afresh where the scrolling turns back.
+- **The window.** Where the guest's devices take scrolling
+  (`PointerMotion::scrolled`), every scroll over the image goes to them, and
+  the host's `wheel` and `scroll` callbacks hear none of it: a wheel's whole
+  notches, and a precise device's distance (SDL's events in parts of a line,
+  at 10 points a line, on Linux and Windows; AppKit's precise events,
+  momentum included, in points). The
+  pointer's position still goes by the tablet, before the scroll, by another
+  path: a scroll that follows a move within a tablet's poll may land where
+  the cursor was.
+- **Compatibility.** A guest that does not send `SCROLL_DEVICES` (the arm64e
+  kext, a kext built before it, the option ROM, Ambrosia's module) is sent no
+  `SCROLL`, and its scrolling reaches the tablet as before.
 
 ## Stage 3 wire protocol: the Metal-call stream
 

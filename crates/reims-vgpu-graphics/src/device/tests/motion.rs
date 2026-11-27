@@ -1,7 +1,8 @@
 //! A pointer for games (docs/graphics-kext/design.md, "A pointer for games"): the offer of
 //! `POINTER_MOTION`, the guest's cursor hidden on every display it sees (but on its way to the
 //! next), and the `POINTER_MOTION`s a window's captured pointer sends, in their order, joined
-//! while the ring has no room, a press or a release never lost.
+//! while the ring has no room, a press or a release never lost; and the `SCROLL`s a window sends
+//! the guest's devices that scroll (docs/graphics-kext/design.md, "Scrolling").
 
 use super::*;
 
@@ -270,4 +271,122 @@ fn a_reset_forgets_the_hidden_cursor_and_the_motion() {
     assert_eq!(link.cursor_hidden_for(), None, "never moved since");
     assert!(link.motion(2, 3, 0, 0));
     assert_eq!(motion(&mut rig), (2, 3, 0, 0));
+}
+
+/// A `SCROLL_DEVICES` naming `devices`.
+fn scroll_devices(devices: u32) -> Vec<u8> {
+    RgfxScrollDevices {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SCROLL_DEVICES,
+            ..Default::default()
+        },
+        devices,
+        reserved_14: 0,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// The next event, as a `SCROLL`: its notches up and right, then its distance up and right.
+fn scrolled(rig: &mut Rig) -> (i32, i32, i32, i32) {
+    let s = RgfxScroll::read_from_bytes(&rig.event().expect("a SCROLL")).unwrap();
+    assert_eq!(
+        (s.header.r#type, s.header.size, s.header.seqno),
+        (RGFX_EVT_SCROLL, 32, 0)
+    );
+    (s.notches_up, s.notches_right, s.fine_up, s.fine_right)
+}
+
+/// Scrolling goes to the guest's own devices from its `SCROLL_DEVICES` on, and until one that
+/// names none or a reset: a wheel's notches as notches, a precise device's distance where the
+/// guest has a precise device, else the notches in it, one per 10 points counted on. Before it, or
+/// after, nothing is sent, and the host's own pointing device scrolls
+#[test]
+fn scrolling_goes_to_the_devices_the_guest_names() {
+    let mut rig = motion_rig(1);
+    take_and_start(&rig, RGFX_FEATURE_POINTER_MOTION);
+    let link = rig.device.pointer_link();
+    assert!(!link.scroll((1, 0), false), "no devices named");
+    moved(&mut rig, scroll_devices(RGFX_SCROLL_DEVICE_WHEEL));
+    assert!(link.scroll((2, -3), false));
+    assert_eq!(scrolled(&mut rig), (2, -3, 0, 0));
+    moved(
+        &mut rig,
+        scroll_devices(RGFX_SCROLL_DEVICE_WHEEL | RGFX_SCROLL_DEVICE_PRECISE),
+    );
+    assert!(link.scroll((100, -200), true));
+    assert_eq!(scrolled(&mut rig), (0, 0, 100, -200));
+    assert!(link.scroll((0, 1), false), "a wheel's notch stays a notch");
+    assert_eq!(scrolled(&mut rig), (0, 1, 0, 0));
+    moved(&mut rig, scroll_devices(0));
+    assert!(!link.scroll((1, 0), false), "none named");
+    moved(&mut rig, scroll_devices(RGFX_SCROLL_DEVICE_WHEEL));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
+    take_and_start(&rig, RGFX_FEATURE_POINTER_MOTION);
+    assert!(!link.scroll((1, 0), false), "none named since the reset");
+    assert!(rig.quiet_for(100));
+}
+
+/// A guest with a mouse and no precise device gets a precise device's distance as notches, one
+/// per 10 points (a line of SDL's) each way, the rest counted on and counted afresh where the
+/// scrolling turns back; a distance of i32's range overruns nothing
+#[test]
+fn a_mouse_alone_gets_a_notch_per_10_points() {
+    let mut rig = motion_rig(1);
+    take_and_start(&rig, RGFX_FEATURE_POINTER_MOTION);
+    moved(&mut rig, scroll_devices(RGFX_SCROLL_DEVICE_WHEEL));
+    let link = rig.device.pointer_link();
+    assert_eq!(FINE_PER_NOTCH, 2560);
+    assert!(
+        link.scroll((1280, -640), true),
+        "taken, though no notch yet"
+    );
+    assert!(rig.quiet_for(100), "no notch yet");
+    assert!(link.scroll((1280, -1920), true));
+    assert_eq!(scrolled(&mut rig), (1, -1, 0, 0));
+    assert!(link.scroll((6000, 0), true));
+    assert_eq!(scrolled(&mut rig), (2, 0, 0, 0));
+    assert!(
+        link.scroll((-1000, 0), true),
+        "back the other way: counted afresh"
+    );
+    assert!(link.scroll((-1600, 0), true));
+    assert_eq!(scrolled(&mut rig), (-1, 0, 0, 0));
+    assert!(link.scroll((i32::MAX, i32::MIN), true));
+    assert_eq!(scrolled(&mut rig), (i32::MAX / 2560, i32::MIN / 2560, 0, 0));
+}
+
+/// Scrolling that finds the control completion ring full is owed, joined into one `SCROLL` to
+/// the field, saturating, and the next refresh sends it after the owed motion
+#[test]
+fn owed_scrolling_joins_after_the_motion() {
+    let mut rig = motion_rig(1);
+    take_and_start(&rig, RGFX_FEATURE_POINTER_MOTION);
+    moved(
+        &mut rig,
+        scroll_devices(RGFX_SCROLL_DEVICE_WHEEL | RGFX_SCROLL_DEVICE_PRECISE),
+    );
+    let count = 1400u64;
+    for _ in 0..count {
+        rig.send(vblank(0));
+    }
+    assert!(
+        eventually(|| !rig.degraded.lock().is_empty()),
+        "the ring never filled"
+    );
+    let link = rig.device.pointer_link();
+    assert!(link.motion(1, 2, 0, 0));
+    assert!(link.scroll((1, 2), false));
+    assert!(link.scroll((300, -5), true));
+    assert!(link.scroll((3, 0), false));
+    assert!(link.scroll((i32::MAX, 0), false));
+    for seqno in 3..=count + 2 {
+        assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    }
+    rig.refresh();
+    assert_eq!(motion(&mut rig), (1, 2, 0, 0));
+    assert_eq!(scrolled(&mut rig), (i32::MAX, 2, 300, -5));
+    assert!(rig.quiet_for(100), "nothing more");
 }

@@ -178,7 +178,8 @@
 //    bundle;
 //  - POINTER_MOTION (bit 51), both kexts: the framebuffer publishes the guest's own mouse
 //    (RgfxPointerDevice.hpp) and hands it each POINTER_MOTION's reports
-//    (RgfxPointerMotion.hpp), which needs nothing of the bundle;
+//    (RgfxPointerMotion.hpp), and on x86-64 names it to the host for scrolling
+//    (SCROLL_DEVICES) and hands it each SCROLL's, which needs nothing of the bundle;
 //  - VT_MESSAGES (bit 52), the arm64e kext alone: the framebuffer publishes the VideoToolbox
 //    service where the host's caps list a decoder, carries its clients' messages to the host as
 //    VT_MESSAGEs and hands them the host's VT_MESSAGE events (RgfxVtService.hpp), which needs
