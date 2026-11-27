@@ -6713,6 +6713,124 @@ mod tests {
         p.world().complete_all(CompleteOn::Caller);
     }
 
+    /// A buffer of another queue that names in its `SURFACE_ORDER` a decode its queue's thread has
+    /// not yet walked, and that uses the decode's output, is begun only once the decode is
+    /// committed, though its queue's thread took it first: so the decode's begin, which fills the
+    /// output's cache for the CPU's newer generation, finds it among no user of the cache, and its
+    /// fill waits on the GPU for none of its end. Begun first, as the guest's order across queues
+    /// was not, the reader's end was among the fill's waits, while the reader waited on the GPU
+    /// for the decode's signal, which the decode's commit carries after its walk, and its walk
+    /// waited on the CPU for that fill: the host's video stall on Windows (lane stallread).
+    #[test]
+    fn a_buffer_naming_a_decode_not_yet_walked_begins_after_its_commit() {
+        use super::super::surface_pages::tests::BLOCK;
+        use reims_vgpu_graphics::ops::{
+            RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse,
+            RgfxSurfaceOrderWait,
+        };
+
+        let (mut r, seen) = cached_video();
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 3,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(r.dec.decode(&r.device, queue.as_bytes()).unwrap(), Ok(()));
+        let on = |queue_obj_id: u64, cb_obj_id: u64, seqno: u64, ops: &[u8]| {
+            let mut message = command_buffer_message(cb_obj_id, seqno, ops);
+            let (mut m, _) = RgfxCommandBuffer::read_from_prefix(&message).unwrap();
+            m.queue_obj_id = queue_obj_id;
+            message[..size_of::<RgfxCommandBuffer>()].copy_from_slice(m.as_bytes());
+            message
+        };
+        let surface_use = |cpu_gen: u64, flags: u32| {
+            let u = RgfxOpSurfaceUse {
+                block_offset: BLOCK,
+                cpu_gen,
+                flags,
+                reserved_14: 0,
+            };
+            op(RGFX_OP_SURFACE_USE, u.as_bytes())
+        };
+        // Queue 3's reader of the block, which names queue 1's buffer at seqno 2, the decode.
+        let named = RgfxSurfaceOrderWait {
+            queue_obj_id: 1,
+            seqno: 2,
+        };
+        let mut ops = op(RGFX_OP_SURFACE_ORDER, named.as_bytes());
+        ops.extend(surface_use(0, 0));
+        let reader = on(3, 300, 1, &ops);
+        // Queue 1's decode into the block at the CPU's generation 1, past the cache's 0.
+        let decode = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 0,
+            bitstream_size: 100,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            ..RgfxVideoOpDecodeH264::default()
+        };
+        let mut ops = surface_use(1, RGFX_SURFACE_USE_WRITES);
+        let pass = RgfxOpVideoPass { session_obj_id: 40 };
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes()));
+        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let decoding = on(1, 101, 2, &ops);
+
+        let p = Arc::clone(&r.p);
+        let device = p.device();
+        let marks = Arc::clone(&r.dec.queue_counts(1).expect("queue 1").order);
+        let mut first = r.dec.sender(None, super::super::Sinks::default());
+        let mut second = r.dec.sender(None, super::super::Sinks::default());
+        // Queue 1's first buffer fills the cache at generation 0, and is committed and done.
+        let message = writes_cached_video(100, 1, false);
+        let begun = first.begin_taken(&device, &message, Some(1), false).unwrap();
+        let begun = begun.unwrap();
+        assert_eq!(
+            first
+                .finish_command_buffer(&device, &message, begun)
+                .unwrap(),
+            Ok(())
+        );
+        first.end_message();
+        p.world().complete_all(CompleteOn::Caller);
+        std::thread::scope(|scope| {
+            let device = &device;
+            // Queue 3's thread takes the reader first.
+            let taken_first = scope.spawn(|| {
+                let begun = (second.begin_taken(device, &reader, Some(3), false).unwrap())
+                    .expect("the reader is begun");
+                let done = (second.finish_command_buffer(device, &reader, begun)).unwrap();
+                second.end_message();
+                done
+            });
+            let waits = crate::graphics::tests::eventually(|| {
+                marks.commit.has_waiters() || taken_first.is_finished()
+            });
+            assert!(
+                waits && !taken_first.is_finished(),
+                "the reader was begun before the decode it names was committed"
+            );
+            let begun = (first.begin_taken(device, &decoding, Some(1), false).unwrap())
+                .expect("the decode is begun");
+            // The decode's begin filled the cache; done, its decode lands.
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                first
+                    .finish_command_buffer(device, &decoding, begun)
+                    .unwrap(),
+                Ok(())
+            );
+            first.end_message();
+            assert_eq!(taken_first.join().unwrap(), Ok(()));
+        });
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(seen.decodes.lock().len(), 1, "the decode is handed over");
+    }
+
     /// A decoder's output that its client locks to read each picture is copied into its pages
     /// behind the next decode into it, by a command buffer of the host's committed on the
     /// decode's own queue right after it, and the lock's download that follows copies nothing
