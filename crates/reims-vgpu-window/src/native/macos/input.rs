@@ -46,7 +46,9 @@
 //!   `Y`, else their deltas), its buttons pressed meanwhile and a mouse wheel's notches to the
 //!   guest's mouse ([`crate::game`]), until the guest shows its cursor again, where the host's
 //!   pointer is let go over it; a button comes up by the route it went down by. Releasing
-//!   capture, losing the keyboard and closing let the pointer go where it was held.
+//!   capture, losing the keyboard and closing let the pointer go where it was held; releasing
+//!   capture (the release chord, Release Input) also leaves the rest of that hide to the tablet,
+//!   captured again or not, until the guest shows its cursor ([`Game::released`]).
 //!
 //! While captured, the window holds the system's hot keys off ([`super::hotkeys`]), the host's
 //! pointer over the image ([`InputState::pointer_confinement`], which the view applies), and its
@@ -410,10 +412,19 @@ impl InputLogic {
         }
     }
 
-    /// Capture ended (released, the keyboard lost, the window's end): the pointer driving the
-    /// guest's mouse is the window's again, where it was held.
+    /// Capture ended (the keyboard lost, the window's end): the pointer driving the guest's mouse
+    /// is the window's again, where it was held.
     fn end_game(&mut self) {
         if let Some(hold) = self.game.end() {
+            self.hold = Some(hold);
+        }
+    }
+
+    /// The person released capture (the release chord, Release Input): as [`Self::end_game`],
+    /// and the rest of a hide the pointer drove the guest's mouse in is the tablet's
+    /// ([`Game::released`]).
+    fn release_game(&mut self) {
+        if let Some(hold) = self.game.released(self.motion.as_deref()) {
             self.hold = Some(hold);
         }
     }
@@ -526,7 +537,7 @@ impl InputLogic {
             return Reaction::default();
         }
         self.lift_keys();
-        self.end_game();
+        self.release_game();
         Reaction::capture(self.capture.release())
     }
 
@@ -558,7 +569,7 @@ impl InputLogic {
     fn release_capture(&mut self) -> Reaction {
         let was = self.capture.release();
         self.lift_keys();
-        self.end_game();
+        self.release_game();
         Reaction::capture(was)
     }
 
@@ -1782,6 +1793,83 @@ mod tests {
                 "every move the tablet's"
             );
         }
+        assert_eq!(mouse.take(), vec![]);
+    }
+
+    /// The release chord or Release Input while the pointer drives the guest's mouse leaves the
+    /// rest of that hide to the tablet, as a recorded or shared screen keeps the cursor hidden:
+    /// captured again by a click, every move is the tablet's however long the hide, until the
+    /// guest shows its cursor, and the next hide is a game's again. Losing the keyboard instead
+    /// leaves the hide a game's: captured again, it switches as before
+    #[test]
+    fn the_release_chord_leaves_the_rest_of_that_hide_to_the_tablet() {
+        let mouse = Arc::new(Mouse::default());
+        let in_game = || {
+            let mut logic = captured_with(&mouse);
+            mouse.hide_for(0);
+            logic.moved((1.0, 0.0), &at((599.0, 350.0)));
+            mouse.hide_for(SETTLE_NS);
+            logic.moved((1.0, 0.0), &at((600.0, 350.0)));
+            assert_eq!(logic.hold.take(), Some(Hold::Raw));
+            sent(&mut logic);
+            logic
+        };
+        let chord: fn(&mut InputLogic) = |logic| {
+            logic.flags_changed(key(KVK_CONTROL, L_CONTROL));
+            logic.flags_changed(key(KVK_OPTION, L_CONTROL | L_OPTION));
+            logic.flags_changed(key(KVK_COMMAND, L_CONTROL | L_OPTION | L_COMMAND));
+        };
+        let menu: fn(&mut InputLogic) = |logic| {
+            logic.release_capture();
+        };
+        for (how, release) in [("the chord", chord), ("Release Input", menu)] {
+            let mut logic = in_game();
+            release(&mut logic);
+            assert!(!logic.capture.is_captured(), "{how}");
+            assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
+            logic.button_down(BUTTON_LEFT, 0, &at((600.0, 350.0)));
+            logic.button_up(BUTTON_LEFT, &at((600.0, 350.0)));
+            assert!(logic.capture.is_captured());
+            sent(&mut logic);
+            for (n, x) in [(3, 595.0), (20, 610.0), (200, 625.0)] {
+                mouse.hide_for(n * SETTLE_NS);
+                logic.moved((1.0, 0.0), &at((x, 350.0)));
+            }
+            assert_eq!(logic.hold.take(), None, "{how}: the same hide");
+            assert_eq!(
+                sent(&mut logic),
+                vec![
+                    pointer(990, 600, 0),
+                    pointer(1020, 600, 0),
+                    pointer(1050, 600, 0),
+                ],
+                "{how}: every move the tablet's"
+            );
+            mouse.show();
+            logic.cursor_changed(&at((625.0, 350.0)));
+            mouse.hide_for(0);
+            logic.moved((1.0, 0.0), &at((640.0, 350.0)));
+            mouse.hide_for(SETTLE_NS);
+            logic.moved((1.0, 0.0), &at((655.0, 350.0)));
+            assert_eq!(logic.hold.take(), Some(Hold::Raw), "{how}: the next hide");
+        }
+
+        let mut logic = in_game();
+        logic.focus_lost();
+        assert_eq!(logic.hold.take(), Some(Hold::Unlock((600.0, 350.0))));
+        logic.button_down(BUTTON_LEFT, 0, &at((600.0, 350.0)));
+        logic.button_up(BUTTON_LEFT, &at((600.0, 350.0)));
+        assert!(logic.capture.is_captured());
+        mouse.hide_for(3 * SETTLE_NS);
+        logic.moved((1.0, 0.0), &at((595.0, 350.0)));
+        assert_eq!(logic.hold.take(), None, "the next capture's first move");
+        mouse.hide_for(4 * SETTLE_NS);
+        logic.moved((1.0, 0.0), &at((610.0, 350.0)));
+        assert_eq!(
+            logic.hold.take(),
+            Some(Hold::Raw),
+            "the keyboard lost leaves the hide a game's"
+        );
         assert_eq!(mouse.take(), vec![]);
     }
 

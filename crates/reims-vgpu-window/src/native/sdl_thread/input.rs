@@ -51,7 +51,8 @@
 //!   buttons pressed meanwhile and its wheel to the guest's mouse ([`crate::game`]), until the
 //!   guest shows its cursor again, where the host's pointer is let go over it; a button comes up
 //!   by the route it went down by. Releasing capture, losing the keyboard and closing let the
-//!   pointer go where it was held.
+//!   pointer go where it was held; releasing capture also leaves the rest of that hide to the
+//!   tablet, captured again or not, until the guest shows its cursor ([`Game::released`]).
 //! - **Past the image's edge**, where the host gives the window the guest's other displays
 //!   ([`crate::PointerBeyond`]): the captured pointer moving toward an edge another display meets,
 //!   within reach of it, goes on onto it ([`crate::beyond`]). The window locks the host's pointer
@@ -565,10 +566,13 @@ impl Input {
         }
     }
 
-    /// Releases capture, lifting every key held.
+    /// Releases capture (the release chord), lifting every key held: the rest of a hide the
+    /// pointer drove the guest's mouse in is the tablet's ([`Game::released`]).
     pub(crate) fn release_capture(&mut self) -> Reaction {
         self.lift_keys();
-        self.end_game();
+        if let Some(hold) = self.game.released(self.motion.as_deref()) {
+            self.hold = Some(hold);
+        }
         self.let_go_away();
         Reaction {
             capture_changed: self.capture.release(),
@@ -1471,6 +1475,73 @@ mod tests {
                 "every move the tablet's"
             );
         }
+        assert_eq!(mouse.take(), vec![]);
+    }
+
+    /// The release chord while the pointer drives the guest's mouse leaves the rest of that hide
+    /// to the tablet, as a recorded or shared screen keeps the cursor hidden: captured again by a
+    /// click, every move is the tablet's however long the hide, until the guest shows its cursor,
+    /// and the next hide is a game's again. Losing the keyboard instead leaves the hide a game's:
+    /// captured again, it switches as before
+    #[test]
+    fn the_release_chord_leaves_the_rest_of_that_hide_to_the_tablet() {
+        let mouse = Arc::new(Mouse::default());
+        let in_game = || {
+            let mut input = captured_by(Some(Arc::clone(&mouse)));
+            mouse.hide_for(0);
+            input.moved(&at((25.0, 10.0)));
+            mouse.hide_for(SETTLE_NS);
+            input.moved(&at((30.0, 10.0)));
+            assert_eq!(input.take_hold(), Some(Hold::Raw));
+            input.take();
+            input
+        };
+        let mut input = in_game();
+        for usage in [0xE0, 0xE2, 0xE3] {
+            input.key(usage, true, false);
+        }
+        assert!(!input.is_captured());
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((30.0, 10.0))));
+        input.button_down(BUTTON_LEFT, 5_000_000_000, &at((30.0, 10.0)));
+        input.button_up(BUTTON_LEFT, &at((30.0, 10.0)));
+        assert!(input.is_captured());
+        input.take();
+        for (n, x) in [(3, 37.5), (20, 50.0), (200, 62.5)] {
+            mouse.hide_for(n * SETTLE_NS);
+            input.moved(&at((x, 10.0)));
+        }
+        assert_eq!(input.take_hold(), None, "the same hide, captured again");
+        assert!(!input.drives_the_guest_s_mouse());
+        assert_eq!(
+            input.take(),
+            vec![pointer(75, 20, 0), pointer(100, 20, 0), pointer(125, 20, 0)],
+            "every move the tablet's"
+        );
+        mouse.show();
+        input.cursor_changed(&at((62.5, 10.0)));
+        mouse.hide_for(0);
+        input.moved(&at((75.0, 10.0)));
+        mouse.hide_for(SETTLE_NS);
+        input.moved(&at((80.0, 10.0)));
+        assert_eq!(input.take_hold(), Some(Hold::Raw), "the next hide");
+
+        let mut input = in_game();
+        input.focus_lost();
+        assert_eq!(input.take_hold(), Some(Hold::Unlock((30.0, 10.0))));
+        input.focus_gained(10_000_000_000);
+        input.button_down(BUTTON_LEFT, 12_000_000_000, &at((30.0, 10.0)));
+        input.button_up(BUTTON_LEFT, &at((30.0, 10.0)));
+        assert!(input.is_captured());
+        mouse.hide_for(3 * SETTLE_NS);
+        input.moved(&at((37.5, 10.0)));
+        assert_eq!(input.take_hold(), None, "the next capture's first move");
+        mouse.hide_for(4 * SETTLE_NS);
+        input.moved(&at((50.0, 10.0)));
+        assert_eq!(
+            input.take_hold(),
+            Some(Hold::Raw),
+            "the keyboard lost leaves the hide a game's"
+        );
         assert_eq!(mouse.take(), vec![]);
     }
 

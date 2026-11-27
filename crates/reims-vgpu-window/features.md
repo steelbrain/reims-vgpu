@@ -238,12 +238,20 @@ Unset or unparsable values give the defaults below.
   on the window's display, else where it was held. A button comes up by the
   route it went down by, so one held across either switch is never left
   down. Releasing capture, losing the keyboard and closing let the pointer go
-  where it was held. On the desktop, and with a guest whose kext does not
-  take `POINTER_MOTION` (one built before it, the option ROM, Ambrosia's
-  module), the pointer is the absolute one only.
+  where it was held. The release chord, or Release Input on macOS, also keeps
+  the absolute pointer until the guest next shows its cursor, captured again
+  or not: the way out of a hide that is not a game's, such as macOS's while
+  the guest's screen is recorded or shared. So a player who presses it
+  mid-game gets the guest's mouse back only once the game shows its cursor and
+  hides it again, and switching away and back does not bring it back sooner.
+  Losing the keyboard keeps nothing: captured again in a game's hide, the
+  pointer drives the guest's mouse as before. On the desktop, and with a guest
+  whose kext does not take `POINTER_MOTION` (one built before it, the option
+  ROM, Ambrosia's module), the pointer is the absolute one only.
   `test: game::the_guest_s_mouse_is_driven_once_its_cursor_stays_hidden`,
   `test: game::a_hide_a_move_ends_drives_nothing`,
   `test: game::a_new_hide_starts_the_count_over`,
+  `test: game::the_person_s_release_leaves_the_rest_of_that_hide_to_the_tablet`,
   `test: game::moves_go_to_the_guest_s_mouse_until_it_shows_its_cursor`,
   `test: game::a_button_comes_up_by_the_route_it_went_down_by`,
   `test: game::the_wheel_goes_to_the_driven_mouse`,
@@ -253,6 +261,7 @@ Unset or unparsable values give the defaults below.
   `test: native::macos::input::a_button_held_across_the_switch_comes_up_by_its_own_route`,
   `test: native::macos::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
   `test: native::macos::input::a_cursor_hidden_until_the_mouse_moves_drives_nothing`,
+  `test: native::macos::input::the_release_chord_leaves_the_rest_of_that_hide_to_the_tablet`,
   `test: reims-vgpu::graphics::tests::displays::a_window_s_device_offers_pointer_motion_and_drives_the_guest_s_mouse`,
   `test: reims-vgpu-graphics::device::tests::motion::a_crossing_s_hide_is_not_a_game_s`,
   `test: reims-vgpu-graphics::device::tests::motion::a_guest_that_did_not_take_pointer_motion_gets_none`,
@@ -614,15 +623,17 @@ runtime's own device. The switches above apply, and `resolution=` too.
   raw motion on X11), its buttons pressed meanwhile and the wheel's notches,
   until the guest shows its cursor, where the host's pointer is let go over
   it; a button comes up by the route it went down by; releasing capture
-  (Ctrl+Alt+Super), losing the keyboard and closing let it go where it was
-  held. Gone past a shared edge when the guest hides its cursor, the pointer
-  drives the guest's mouse from there. Where the compositor refuses the lock,
-  the pointer stays the absolute one until capture changes.
+  (Ctrl+Alt+Super), losing the keyboard and closing let it go where it was held,
+  and the release chord keeps the absolute pointer until the guest next shows
+  its cursor (Pointer). Gone past a shared edge when the guest hides its cursor,
+  the pointer drives the guest's mouse from there. Where the compositor refuses
+  the lock, the pointer stays the absolute one until capture changes.
   `test: native::sdl_thread::input::the_tablet_s_events_are_unchanged_outside_a_game`,
   `test: native::sdl_thread::input::a_hidden_cursor_s_motion_drives_the_guest_s_mouse_until_it_shows`,
   `test: native::sdl_thread::input::a_button_held_across_the_switch_comes_up_by_its_own_route`,
   `test: native::sdl_thread::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
   `test: native::sdl_thread::input::a_cursor_hidden_until_the_mouse_moves_drives_nothing`,
+  `test: native::sdl_thread::input::the_release_chord_leaves_the_rest_of_that_hide_to_the_tablet`,
   `test: reims-vgpu-graphics::device::tests::motion::motion_reaches_a_guest_that_took_it`,
   `test: reims-vgpu-graphics::device::tests::motion::a_crossing_s_hide_is_not_a_game_s`,
   `manual` (as on macOS, on a Linux host's guest boot)

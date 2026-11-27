@@ -17,8 +17,13 @@
 //! lost. Once the guest shows its cursor again ([`Game::shown`]), the pointer is the window's
 //! again, the host's pointer let go over the guest's cursor where it shows on the window's
 //! display, else where it was held; letting go of capture (the release chord, the keyboard lost,
-//! the window's end) lets it go where it was held ([`Game::end`]). On the desktop, where the guest
-//! shows its cursor, the pointer stays the absolute one, exact.
+//! the window's end) lets it go where it was held ([`Game::end`]). The person releasing capture
+//! (the release chord, or the menu's Release Input on macOS) also leaves the rest of that hide to
+//! the tablet, captured again or not, until the guest shows its cursor ([`Game::released`]): the
+//! way out of a hide that is not a game's, such as the one macOS keeps while the guest's screen is
+//! recorded or shared. The keyboard lost does not, so a player who switches away from a game and
+//! clicks back gets the guest's mouse again. On the desktop, where the guest shows its cursor, the
+//! pointer stays the absolute one, exact.
 //!
 //! A button goes up by the route it went down by: one pressed while the guest's mouse is driven
 //! goes down and up through it, one pressed before through the tablet, whenever each comes up
@@ -56,6 +61,12 @@ pub struct Game {
     /// tablet took ([`Self::begin`]): `None` while the guest shows its cursor, before that move,
     /// and while the pointer drives the guest's mouse.
     first_move: Option<u64>,
+    /// How long the guest had hidden its cursor when the person released capture while the pointer
+    /// drove the guest's mouse ([`Self::released`]): the rest of that hide is the tablet's. `None`
+    /// once the guest shows its cursor, or its hide reads shorter than it did then (a later hide).
+    /// Capture's end leaves it: every show and hide of the guest's reaches [`Self::shown`] (the
+    /// window asks at each), so it never outlives its hide.
+    released_hide: Option<u64>,
 }
 
 impl Game {
@@ -77,7 +88,8 @@ impl Game {
 
     /// Whether the captured pointer at `point`, in the window's points, begins to drive the
     /// guest's mouse `motion`: the guest has hidden its cursor on every display and kept it
-    /// hidden for [`SETTLE_NS`] past the hide's first move, and the OS did not refuse the lock
+    /// hidden for [`SETTLE_NS`] past the hide's first move, the person did not release capture on
+    /// this hide while the pointer drove the guest's mouse, and the OS did not refuse the lock
     /// since capture last changed. Where it does, the host's pointer is held there
     /// ([`Hold::Raw`]). Where it does not, the move is the window's, as while the guest shows its
     /// cursor: the hide's first move goes to the tablet, and a cursor hidden until the mouse
@@ -87,6 +99,9 @@ impl Game {
             return None;
         }
         let hidden = self.hidden_for(motion)?;
+        if self.released_hide.is_some() {
+            return None;
+        }
         let Some(first) = self.first_move else {
             self.first_move = Some(hidden);
             return None;
@@ -101,15 +116,17 @@ impl Game {
     }
 
     /// How long the guest has hidden its cursor on every display, `None` while it shows it on
-    /// one. The hide's first move is forgotten where the guest shows its cursor, or where the
-    /// hide reads shorter than it did at that move: a later hide, the cursor shown between.
+    /// one. The hide's first move, and a hide the person released capture on, are forgotten where
+    /// the guest shows its cursor, or where the hide reads shorter than it did then: a later hide,
+    /// the cursor shown between.
     fn hidden_for(&mut self, motion: &dyn PointerMotion) -> Option<u64> {
         let hidden = motion.hidden_for();
-        if self
-            .first_move
-            .is_some_and(|first| hidden.is_none_or(|now| now < first))
-        {
+        let over = |then: u64| hidden.is_none_or(|now| now < then);
+        if self.first_move.is_some_and(over) {
             self.first_move = None;
+        }
+        if self.released_hide.is_some_and(over) {
+            self.released_hide = None;
         }
         hidden
     }
@@ -216,6 +233,15 @@ impl Game {
         self.first_move = None;
         let held = self.held.take()?;
         Some(Hold::Unlock(held))
+    }
+
+    /// The person released capture (the release chord, or the menu's Release Input): as
+    /// [`Self::end`], and where the pointer drove the guest's `motion`, the rest of that hide is
+    /// the tablet's, captured again or not, until the guest shows its cursor ([`Self::begin`]).
+    pub fn released(&mut self, motion: Option<&dyn PointerMotion>) -> Option<Hold> {
+        let hold = self.end()?;
+        self.released_hide = motion.and_then(PointerMotion::hidden_for);
+        Some(hold)
     }
 
     /// The OS refused to lock the host's pointer: the pointer is the window's again, where it
@@ -460,5 +486,55 @@ pub(crate) mod tests {
             "the next capture's first move"
         );
         assert_eq!(begun(&mut game, &mouse, (1.0, 1.0)), Some(Hold::Raw));
+    }
+
+    /// The person releasing capture while the pointer drives the guest's mouse leaves the rest of
+    /// that hide to the tablet, however long it goes on and however often capture comes back, as
+    /// a recorded or shared screen keeps the cursor hidden; once the guest shows its cursor the
+    /// next hide is a game's again, as is a later hide whose show went unseen. Capture's other
+    /// ends (the keyboard lost, the window's end) leave the hide a game's
+    #[test]
+    fn the_person_s_release_leaves_the_rest_of_that_hide_to_the_tablet() {
+        let mouse = Mouse::default();
+        let mut game = Game::new();
+        assert_eq!(begun(&mut game, &mouse, (3.0, 4.0)), Some(Hold::Raw));
+        mouse.hide_for(2 * SETTLE_NS);
+        assert_eq!(game.released(Some(&mouse)), Some(Hold::Unlock((3.0, 4.0))));
+        for (n, at) in [(3, (5.0, 5.0)), (20, (6.0, 5.0)), (200, (7.0, 5.0))] {
+            mouse.hide_for(n * SETTLE_NS);
+            assert_eq!(game.begin(&mouse, at), None, "{n} settles into the hide");
+            assert_eq!(game.end(), None, "capture changes");
+        }
+        mouse.show();
+        assert_eq!(game.shown(&mouse, None), None);
+        assert_eq!(
+            begun(&mut game, &mouse, (5.0, 5.0)),
+            Some(Hold::Raw),
+            "the next hide"
+        );
+
+        mouse.hide_for(30 * SETTLE_NS);
+        assert_eq!(game.released(Some(&mouse)), Some(Hold::Unlock((5.0, 5.0))));
+        assert_eq!(
+            begun(&mut game, &mouse, (6.0, 6.0)),
+            Some(Hold::Raw),
+            "a later hide, its show unseen"
+        );
+
+        // The keyboard lost: the same hide, captured again, is a game's.
+        mouse.hide_for(40 * SETTLE_NS);
+        assert_eq!(game.end(), Some(Hold::Unlock((6.0, 6.0))));
+        mouse.hide_for(41 * SETTLE_NS);
+        assert_eq!(
+            game.begin(&mouse, (7.0, 7.0)),
+            None,
+            "the next capture's first move"
+        );
+        mouse.hide_for(42 * SETTLE_NS);
+        assert_eq!(
+            game.begin(&mouse, (7.0, 7.0)),
+            Some(Hold::Raw),
+            "the keyboard lost leaves the hide a game's"
+        );
     }
 }

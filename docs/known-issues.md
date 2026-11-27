@@ -117,11 +117,10 @@ has captured input, the pointer switches to the way it works for games 50 ms aft
 the mouse, and stays that way until the recording or share stops. The guest then moves the cursor
 by your mouse's own movement and the guest's mouse settings rather than your host's pointer speed,
 so it can feel slower. Your host's pointer also stays hidden inside the window, and can't move on
-to another of the VM's displays. Releasing capture (Ctrl+Alt+Super, Ctrl+Alt+Win on Windows, or
-⌃⌥⌘ on a Mac) gives you the normal pointer back, but only until you click into the guest's picture
-again: once you're captured and move the mouse, it switches again. To avoid the switch for the whole
-share, turn off **Capture input** in the VM's settings (`reims-ctl set <vm> --capture false`), which
-applies at the VM's next start.
+to another of the VM's displays. To get the normal pointer back, press the release chord once
+(Ctrl+Alt+Super, Ctrl+Alt+Win on Windows, or ⌃⌥⌘ on a Mac, where Window ▸ Release Input does the
+same). The pointer then stays normal until macOS shows its cursor again, which it does when the
+recording or share stops, even if you click back into the guest's picture meanwhile.
 
 ## On a Mac
 

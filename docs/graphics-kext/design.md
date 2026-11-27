@@ -4414,7 +4414,13 @@ tablet. So the guest gets a mouse of its own, whose motion has no edge:
   show of its cursor (the game's menu), the pointer is the
   tablet's again, the host's pointer let go over the guest's cursor where it
   shows on the window's display, else where it was held; releasing capture,
-  losing the keyboard and closing let it go where it was held. A button comes
+  losing the keyboard and closing let it go where it was held. The release
+  chord (and macOS's Release Input) also leaves the rest of that hide to the
+  tablet, captured again or not, until the guest shows its cursor: the way out
+  of a hide that is not a game's, as macOS keeps one while the guest's screen
+  is recorded or shared (lane ptrswitch, potluck job m3-max-75965: the
+  framebuffer saw one `setCursorState(x, y, false)` and no call while the
+  pointer moved, as in a game's hide). A button comes
   up by the route it went down by, the tablet or the guest's mouse, so one
   held across either switch never stays down. On a device of several
   displays, a pointer gone past a shared edge ("A drag across displays")
