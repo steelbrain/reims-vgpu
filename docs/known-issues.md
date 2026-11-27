@@ -57,9 +57,9 @@ NVIDIA or AMD card on a Windows host.
 
 ## Some video formats don't use your GPU
 
-Your GPU may decode or encode video formats that the guest doesn't get from it. For these, we
-found no way in macOS to hand the work to our virtual GPU, so the guest uses its own software, or
-has no player for them at all:
+Your GPU may decode or encode video formats that the guest doesn't get from it. For most of these,
+we found no way in macOS to hand the work to our virtual GPU, so the guest uses its own software,
+or has no player for them at all:
 
 - **VP9 decoding on Intel Mac guests.** macOS 26.7.2 sends VP9 to a GPU driver like ours, but
   never tells it where to put each decoded picture.
@@ -85,6 +85,10 @@ has no player for them at all:
   hardware by name before they hand a photo or a Motion JPEG video to a GPU. Our virtual
   machines have neither, so they decode JPEG in software. Our virtual GPU decodes JPEG when
   asked directly, but no app's route asks it.
+- **VP9 at 4:2:2 or 4:4:4, or at 12 bits, on arm64 guests.** On a Linux host whose GPU decodes
+  VP9, arm64 guests decode it there at 4:2:0 in 8 and 10 bits. macOS hands the other VP9 formats
+  to our virtual GPU too, but our virtual GPU doesn't take them yet, and arm64 macOS has no VP9
+  decoding of its own, so the guest has no player for them.
 - **MPEG-1, MPEG-2, MPEG-4 Part 2, VC-1 and VP8 decoding, and VP9 and AV1 encoding.** We found no
   way in macOS for a GPU to take these.
 

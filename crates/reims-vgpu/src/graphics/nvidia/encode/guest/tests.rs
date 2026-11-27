@@ -534,7 +534,7 @@ fn a_guest_encoders_frames_code_alike_from_the_cpu_and_the_gpu_and_decode_back()
                     match encoder.codec {
                         Codec::H264 => AnnexBCodec::H264,
                         Codec::Hevc => AnnexBCodec::Hevc,
-                        Codec::Av1 => unreachable!("no arm encodes AV1"),
+                        Codec::Av1 | Codec::Vp9 => unreachable!("no arm encodes AV1 or VP9"),
                     },
                     &runtime,
                 );

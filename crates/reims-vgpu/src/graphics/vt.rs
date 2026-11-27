@@ -26,8 +26,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use reims_vgpu_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VT_SURFACE_PLANES,
-    RgfxVtSurface,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_CODEC_VP9, RGFX_VIDEO_DECODE,
+    RGFX_VT_SURFACE_PLANES, RgfxVtSurface,
 };
 use reims_vgpu_video::codec::encode::{Coded, FailedSample};
 use reims_vgpu_video::core::backend::{BackendError as VideoError, Chroma, PixelFormat};
@@ -79,6 +79,7 @@ fn codec_of(codec: Codec) -> u32 {
         Codec::H264 => RGFX_VIDEO_CODEC_H264,
         Codec::Hevc => RGFX_VIDEO_CODEC_HEVC,
         Codec::Av1 => super::av1::HOST_VIDEO_CODEC_AV1,
+        Codec::Vp9 => RGFX_VIDEO_CODEC_VP9,
     }
 }
 

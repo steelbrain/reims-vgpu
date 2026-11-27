@@ -25,6 +25,8 @@ pub enum Codec {
     Hevc,
     /// AV1, `av01`.
     Av1,
+    /// VP9, `vp09`: decoded alone, as the host has no VP9 encoder.
+    Vp9,
 }
 
 impl Codec {
@@ -34,12 +36,13 @@ impl Codec {
             Self::H264 => *b"avc1",
             Self::Hevc => *b"hvc1",
             Self::Av1 => *b"av01",
+            Self::Vp9 => *b"vp09",
         })
     }
 
     /// The codec the CoreMedia codec type `fourcc` names, where the host decodes it.
     pub fn from_fourcc(fourcc: FourCc) -> Option<Self> {
-        [Self::H264, Self::Hevc, Self::Av1]
+        [Self::H264, Self::Hevc, Self::Av1, Self::Vp9]
             .into_iter()
             .find(|codec| codec.fourcc() == fourcc)
     }
@@ -536,6 +539,73 @@ mod tests {
                 .property_list_bytes(names::DECODER_CAPABILITIES)
                 .unwrap(),
             Some(&[][..])
+        );
+    }
+
+    /// A host that decodes VP9 lists `vp09` beside the others, its profiles and level as `vpcC`
+    /// numbers them, and answers its capabilities; a create of it opens a session.
+    #[test]
+    fn a_vp9_decoder_is_listed_and_answers_its_capabilities() {
+        let mut list = decoders();
+        list.push(Decoder {
+            codec: Codec::Vp9,
+            profiles: vec![0, 2],
+            max_level: 62,
+        });
+        let host = Host::new(list);
+        let mut decs = request(b"decs");
+        decs.u32(names::VERSION, 6);
+        let reply = one_reply(&host.deliver(&decs.finish()), b"decs");
+        let message = Message::parse(&reply).unwrap();
+        let listed = plist::decode(
+            message
+                .property_list_bytes(names::DECODERS)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let Value::Array(entries) = listed else {
+            panic!("a list")
+        };
+        assert_eq!(entries.len(), 3, "H.264, HEVC and VP9");
+        let details = ["0", "2"]
+            .map(|p| (p.to_owned(), levels(62, &["VTMaxDecodeLevel"])))
+            .to_vec();
+        let expected = Value::dictionary([
+            (
+                "CMClassImplementationID",
+                Value::string("reims-vgpu-video.videodecoder.vp9"),
+            ),
+            (
+                "CMClassImplementationName",
+                Value::string("reims-vgpu-video Decoder - VP9"),
+            ),
+            ("IsPreferredInternalPlugin", Value::Boolean(false)),
+            ("VTCodecType", Value::Array(vec![Value::string("vp09")])),
+            ("VTRating", Value::Integer(400)),
+            (
+                "VTDecoderCapabilities",
+                Value::dictionary([
+                    ("VTPerProfileDetails", Value::Dictionary(details)),
+                    ("VTSupportedProfileArray", integers(&[0, 2])),
+                ]),
+            ),
+        ]);
+        assert_eq!(entries[2], expected);
+        let mut dcap = request(b"dcap");
+        dcap.s32(names::CODEC, FourCc::new(*b"vp09").0.cast_signed());
+        let reply = one_reply(&host.deliver(&dcap.finish()), b"dcap");
+        let message = Message::parse(&reply).unwrap();
+        let capabilities = plist::decode(
+            message
+                .property_list_bytes(names::DECODER_CAPABILITIES)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            capabilities.get("VTSupportedProfiles"),
+            Some(&integers(&[0, 2]))
         );
     }
 

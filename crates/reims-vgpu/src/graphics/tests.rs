@@ -13583,6 +13583,54 @@ fn vt_decoders_are_the_caps_decode_entries() {
     assert_eq!(vt_decoders(&main10)[0].profiles, vec![2]);
 }
 
+/// A newer host's caps list VP9 decode beside H.264 and HEVC, as codec 3, an added entry: the
+/// paravirtual path lists `vp09` with its profiles as `vpcC` numbers them, and the H.264 and
+/// HEVC decoders as an older host's caps give them. Caps with no VP9 entry, an older host's, list
+/// no `vp09`, so a newer guest's VideoToolbox finds none there.
+#[test]
+fn vt_decoders_list_vp9_beside_the_others_where_the_caps_decode_it() {
+    let entry = |codec, profiles, max_level| RgfxVideoCodecCaps {
+        codec,
+        direction: RGFX_VIDEO_DECODE,
+        profiles,
+        max_level,
+        ..RgfxVideoCodecCaps::default()
+    };
+    let mut older = RgfxVideoCaps {
+        version: RGFX_VIDEO_CAPS_VERSION,
+        codec_count: 2,
+        ..RgfxVideoCaps::default()
+    };
+    older.codecs[0] = entry(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_H264_HIGH, 62);
+    older.codecs[1] = entry(RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_HEVC_MAIN_10, 186);
+    let mut newer = older;
+    newer.codec_count = 3;
+    newer.codecs[2] = entry(
+        RGFX_VIDEO_CODEC_VP9,
+        RGFX_VIDEO_VP9_PROFILE_0 | RGFX_VIDEO_VP9_PROFILE_2,
+        62,
+    );
+    let listed = vt_decoders(&newer);
+    assert_eq!(listed[..2], vt_decoders(&older)[..]);
+    assert_eq!(
+        listed[2],
+        paravirt::Decoder {
+            codec: paravirt::Codec::Vp9,
+            profiles: vec![0, 2],
+            max_level: 62,
+        }
+    );
+    assert!(
+        (vt_decoders(&older).iter()).all(|d| d.codec != paravirt::Codec::Vp9),
+        "an older host's caps list no vp09"
+    );
+    // Profile 2 alone lists 2; no profile lists nothing.
+    newer.codecs[2].profiles = RGFX_VIDEO_VP9_PROFILE_2;
+    assert_eq!(vt_decoders(&newer)[2].profiles, vec![2]);
+    newer.codecs[2].profiles = 0;
+    assert_eq!(vt_decoders(&newer).len(), 2);
+}
+
 /// The pool takes as many of the addresses its config gives as the GPU's memory heaps hold,
 /// every heap summed, rounded up to 2 MiB, from their start, and stops at their end where they
 /// hold less; a device with no pool answers no range

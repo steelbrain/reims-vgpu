@@ -95,8 +95,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT,
     RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
     RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION,
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_H264_BASELINE,
-    RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_CODEC_VP9, RGFX_VIDEO_DECODE,
+    RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN,
+    RGFX_VIDEO_HEVC_MAIN_10, RGFX_VIDEO_VP9_PROFILE_0, RGFX_VIDEO_VP9_PROFILE_2,
     RGFX_VT_STATUS_MALFORMED, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages,
     RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor,
     RgfxEventSignalled, RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState,
@@ -4721,9 +4722,9 @@ fn vt_features(vt: &paravirt::Host) -> u64 {
 }
 
 /// The decoders VideoToolbox's paravirtual path lists ([`paravirt::Host`]): one for each decode
-/// entry of `caps` of H.264 or HEVC with a profile, its profiles as VideoToolbox numbers them
+/// entry of `caps` of H.264, HEVC or VP9 with a profile, its profiles as VideoToolbox numbers them
 /// (H.264's `profile_idc`; HEVC's `general_profile_idc`, Main Still Picture where Main is, whose
-/// decoder takes its streams) and its level the caps'.
+/// decoder takes its streams; VP9's profile, as `vpcC` numbers it) and its level the caps'.
 fn vt_decoders(caps: &RgfxVideoCaps) -> Vec<paravirt::Decoder> {
     let count = usize::try_from(caps.codec_count)
         .unwrap_or(usize::MAX)
@@ -4761,6 +4762,13 @@ fn vt_decoders(caps: &RgfxVideoCaps) -> Vec<paravirt::Decoder> {
                             (RGFX_VIDEO_HEVC_MAIN_10, 2),
                             (RGFX_VIDEO_HEVC_MAIN, 3),
                         ],
+                    ),
+                ),
+                RGFX_VIDEO_CODEC_VP9 => (
+                    paravirt::Codec::Vp9,
+                    numbered(
+                        c.profiles,
+                        &[(RGFX_VIDEO_VP9_PROFILE_0, 0), (RGFX_VIDEO_VP9_PROFILE_2, 2)],
                     ),
                 ),
                 _ => return None,

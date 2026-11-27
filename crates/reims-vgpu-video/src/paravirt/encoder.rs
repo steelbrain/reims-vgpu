@@ -912,6 +912,7 @@ fn configuration_atom(codec: Codec) -> &'static str {
         Codec::Hevc => "hvcC",
         // No arm encodes AV1: its encoder is never listed, nor its session started.
         Codec::Av1 => "av1C",
+        Codec::Vp9 => "vpcC",
     }
 }
 
@@ -921,6 +922,7 @@ fn codec_name(codec: Codec) -> &'static str {
         Codec::H264 => "H.264",
         Codec::Hevc => "HEVC",
         Codec::Av1 => "AV1",
+        Codec::Vp9 => "VP9",
     }
 }
 

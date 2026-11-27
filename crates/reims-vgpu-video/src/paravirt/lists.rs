@@ -42,6 +42,7 @@ fn decoder_id(codec: Codec) -> &'static str {
         Codec::H264 => "reims-vgpu-video.videodecoder.avc",
         Codec::Hevc => "reims-vgpu-video.videodecoder.hevc",
         Codec::Av1 => "reims-vgpu-video.videodecoder.av1",
+        Codec::Vp9 => "reims-vgpu-video.videodecoder.vp9",
     }
 }
 
@@ -50,6 +51,7 @@ fn decoder_name(codec: Codec) -> &'static str {
         Codec::H264 => "reims-vgpu-video Decoder - AVC",
         Codec::Hevc => "reims-vgpu-video Decoder - HEVC",
         Codec::Av1 => "reims-vgpu-video Decoder - AV1",
+        Codec::Vp9 => "reims-vgpu-video Decoder - VP9",
     }
 }
 
@@ -171,12 +173,14 @@ pub(crate) fn decoder_capabilities(
 /// VideoToolbox of macOS 27, 2026-11-16; seen on a macOS 26.6.2 guest: a session that requires
 /// a hardware encoder fails so, and one that allows one is given a software encoder, while the
 /// list names this host's encoders by IDs of its own).
-/// No arm encodes AV1, so no AV1 encoder is listed: its ID is ours, and never sent.
+/// No arm encodes AV1 or VP9, so no encoder of either is listed: their IDs are ours, and never
+/// sent.
 pub(crate) fn apple_encoder_id(codec: Codec) -> &'static str {
     match codec {
         Codec::H264 => "com.apple.videotoolbox.videoencoder.ave.avc",
         Codec::Hevc => "com.apple.videotoolbox.videoencoder.ave.hevc",
         Codec::Av1 => "reims-vgpu-video.videoencoder.av1",
+        Codec::Vp9 => "reims-vgpu-video.videoencoder.vp9",
     }
 }
 
@@ -185,6 +189,7 @@ fn encoder_name(codec: Codec) -> &'static str {
         Codec::H264 => "reims-vgpu-video Encoder - AVC",
         Codec::Hevc => "reims-vgpu-video Encoder - HEVC",
         Codec::Av1 => "reims-vgpu-video Encoder - AV1",
+        Codec::Vp9 => "reims-vgpu-video Encoder - VP9",
     }
 }
 
@@ -202,6 +207,7 @@ fn encoder_entry(encoder: &Encoder) -> Value {
                 Codec::H264 => "H.264",
                 Codec::Hevc => "HEVC",
                 Codec::Av1 => "AV1",
+                Codec::Vp9 => "VP9",
             }),
         ),
         (

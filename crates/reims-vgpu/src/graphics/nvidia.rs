@@ -56,6 +56,10 @@
 //!   output's pages above, else read back and copied by the CPU, each reason logged once a
 //!   decoder. So every decode codec of the caps has one, and the device offers `VT_MESSAGES`
 //!   where NVDEC decodes H.264 or HEVC.
+//!   - **VP9** decodes there alone, profile 0 where NVDEC decodes VP9 at 8 bits and profile 2
+//!     where it does at 10 ([`vp9_caps`]), each sample a frame or a superframe whole, and lands as
+//!     H.264's and HEVC's 4:2:0 pictures do. Its caps entry, codec 3, is skipped by an x86
+//!     guest's kexts, and no device session takes it.
 //!   - **HEVC's range extensions**, the codec crate's 4:2:0 and 4:4:4 at 8, 10 and 12 bits, have a
 //!     paravirtual session where NVDEC's caps say it decodes HEVC at the stream's chroma format
 //!     and depth into the output the decoder makes (NV12 or P016; 4:4:4's three planes, 8-bit or
@@ -87,12 +91,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
 use reims_vgpu_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_ENCODE,
-    RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
-    RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
-    RgfxVideoEncodeCaps,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_CODEC_VP9, RGFX_VIDEO_DECODE,
+    RGFX_VIDEO_ENCODE, RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE,
+    RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10,
+    RGFX_VIDEO_VP9_PROFILE_0, RGFX_VIDEO_VP9_PROFILE_2, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
-use reims_vgpu_video::codec::PictureStart;
+use reims_vgpu_video::codec::{PictureStart, vp9};
 use reims_vgpu_video::core::backend::{BackendError as VideoError, Chroma};
 use reims_vgpu_video::core::device_memory::{
     DeviceImports, GuestTarget, MemoryIdentity, TargetPlane,
@@ -211,6 +215,9 @@ struct NvidiaVideo<P: Platform> {
     /// What NVDEC decodes of AV1 for VideoToolbox's decoders (`super::av1`); `None` where its
     /// caps list no AV1 at 8 bits.
     av1: Option<GuestAv1>,
+    /// The caps of VP9's decode, for VideoToolbox's paravirtual decoders alone; `None` where
+    /// NVDEC has none.
+    vp9: Option<RgfxVideoCodecCaps>,
     /// The profiles NVENC encodes, and the encode entries they give (`encode`'s module doc).
     encoders: Vec<EncodeProfileSupport>,
     encode: Vec<RgfxVideoCodecCaps>,
@@ -306,6 +313,7 @@ impl<P: Platform> NvidiaVideo<P> {
             min_width: caps.min_width,
             min_height: caps.min_height,
         });
+        let vp9 = vp9_caps(asked(NvdecCodec::Vp9, 8), asked(NvdecCodec::Vp9, 10));
         let encoders = match encode_profiles(Arc::clone(&gpu)) {
             Ok(encoders) => encoders,
             Err(error) => {
@@ -322,12 +330,18 @@ impl<P: Platform> NvidiaVideo<P> {
             return None;
         }
         log::info!(
-            "hardware video: {NAME} on {} at {address}: H.264 {}, HEVC {}",
+            "hardware video: {NAME} on {} at {address}: H.264 {}, HEVC {}, VP9 {}",
             gpu.info().name,
             if h264.is_some() { "yes" } else { "no" },
             match &hevc {
                 Some(caps) if caps.profiles & RGFX_VIDEO_HEVC_MAIN_10 != 0 => "Main and Main 10",
                 Some(_) => "Main",
+                None => "no",
+            },
+            match vp9.map(|caps| caps.profiles) {
+                Some(RGFX_VIDEO_VP9_PROFILE_0) => "profile 0",
+                Some(RGFX_VIDEO_VP9_PROFILE_2) => "profile 2",
+                Some(_) => "profiles 0 and 2",
                 None => "no",
             },
         );
@@ -367,6 +381,7 @@ impl<P: Platform> NvidiaVideo<P> {
             h264,
             hevc,
             av1,
+            vp9,
             encoders,
             encode,
             runtime: Arc::clone(runtime),
@@ -533,6 +548,67 @@ fn declines_range_extensions(gpu: &Gpu, stream: &Stream) -> Option<String> {
     }
 }
 
+/// VP9's decode, for VideoToolbox's paravirtual decoders alone (module doc): profile 0 where
+/// NVDEC decodes VP9 at 8 bits (`eight`), into NV12, and profile 2 where it does at 10 (`ten`),
+/// into P010, at the least of their sizes and the codec crate's bound (`vp9::MAX_SIDE`). NVDEC
+/// answers no level, so VP9's top one. A frame references three of the eight slots, which with
+/// the frame itself the DPB holds.
+fn vp9_caps(
+    eight: Option<DecodeCapabilities>,
+    ten: Option<DecodeCapabilities>,
+) -> Option<RgfxVideoCodecCaps> {
+    let answered: Vec<DecodeCapabilities> = [&eight, &ten].into_iter().flatten().cloned().collect();
+    if answered.is_empty() {
+        return None;
+    }
+    let mut entry = RgfxVideoCodecCaps {
+        max_level: vp9::TOP_LEVEL,
+        max_dpb_pictures: 9,
+        max_references: 3,
+        ..decode_caps(RGFX_VIDEO_CODEC_VP9, &answered)
+    };
+    if eight.is_some() {
+        entry.profiles |= RGFX_VIDEO_VP9_PROFILE_0;
+        entry.formats |= RGFX_VIDEO_FORMAT_NV12;
+    }
+    if ten.is_some() {
+        entry.profiles |= RGFX_VIDEO_VP9_PROFILE_2;
+        entry.formats |= RGFX_VIDEO_FORMAT_P010;
+    }
+    entry.max_size = entry.max_size.map(|side| side.min(vp9::MAX_SIDE));
+    Some(entry)
+}
+
+/// Why NVDEC's decoders take none of `stream`'s pictures, a VP9 stream at 4:2:0, by VP9's `caps`
+/// ([`vp9_caps`]): a profile and depth they lack, or a size outside theirs; `None` where they
+/// take it.
+fn declines_vp9(caps: Option<&RgfxVideoCodecCaps>, stream: &Stream) -> Option<String> {
+    let Some(caps) = caps else {
+        return Some(format!("{NAME} does not decode VP9"));
+    };
+    let profile = match (stream.profile, stream.luma_bits) {
+        (0, 8) => RGFX_VIDEO_VP9_PROFILE_0,
+        (2, 10) => RGFX_VIDEO_VP9_PROFILE_2,
+        _ => 0,
+    };
+    let (width, height) = (stream.width, stream.height);
+    let [min_width, min_height] = caps.min_size;
+    let [max_width, max_height] = caps.max_size;
+    if caps.profiles & profile == 0 {
+        Some(format!(
+            "{NAME} does not decode VP9 profile {} at {} bits",
+            stream.profile, stream.luma_bits
+        ))
+    } else if width < min_width || height < min_height || width > max_width || height > max_height {
+        Some(format!(
+            "{NAME} decodes VP9 from {min_width}x{min_height} up to {max_width}x{max_height}, \
+             not {width}x{height}"
+        ))
+    } else {
+        None
+    }
+}
+
 /// The caps of `codec`'s decode at the least of the sizes NVDEC answers in `answered`, at least
 /// one; its profiles, formats, level and DPB are the caller's.
 fn decode_caps(codec: u32, answered: &[DecodeCapabilities]) -> RgfxVideoCodecCaps {
@@ -550,7 +626,9 @@ fn decode_caps(codec: u32, answered: &[DecodeCapabilities]) -> RgfxVideoCodecCap
 
 impl<P: Platform> GraphicsVideo<P> for Shared<P> {
     fn caps(&self) -> Vec<RgfxVideoCodecCaps> {
-        let decode = self.0.h264.into_iter().chain(self.0.hevc);
+        let decode = (self.0.h264.into_iter())
+            .chain(self.0.hevc)
+            .chain(self.0.vp9);
         decode.chain(self.0.encode.iter().copied()).collect()
     }
 
@@ -638,6 +716,7 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
                 let av1 = video.av1?;
                 AnnexBCodec::Av1(av1.limits())
             }
+            RGFX_VIDEO_CODEC_VP9 if video.vp9.is_some() => AnnexBCodec::Vp9,
             _ => return None,
         };
         let mut decoder = AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime);
@@ -658,15 +737,19 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
         }))
     }
 
-    /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where NVDEC decodes them
-    /// ([`declines_range_extensions`]); AV1's at the depths and sizes its caps list
-    /// (`super::av1::declines`).
+    /// 4:2:0 streams of Main and Main 10, HEVC's range extensions where NVDEC decodes them
+    /// ([`declines_range_extensions`]), AV1's at the depths and sizes its caps list
+    /// (`super::av1::declines`), and VP9's where NVDEC decodes the stream's profile at its depth
+    /// and size ([`declines_vp9`]).
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
         if codec == HOST_VIDEO_CODEC_AV1 {
             return super::av1::declines(NAME, self.0.av1, stream);
         }
         if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
             return declines_range_extensions(&self.0.gpu, stream);
+        }
+        if codec == RGFX_VIDEO_CODEC_VP9 && stream.chroma_format_idc == 1 {
+            return declines_vp9(self.0.vp9.as_ref(), stream);
         }
         (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
             format!(

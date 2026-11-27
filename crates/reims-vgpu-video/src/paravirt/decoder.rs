@@ -9,7 +9,8 @@
 //! session's queue.
 //!
 //! - **`dsta`** starts the session once: its format description (`,fds`) names the codec, the
-//!   size and the configuration record (`avcC`, `hvcC`, `av1C`). A record of 3-byte NAL unit lengths, and
+//!   size and the configuration record (`avcC`, `hvcC`, `av1C`, `vpcC`). A record of 3-byte NAL
+//!   unit lengths, a `vpcC` record that does not read, and
 //!   a stream whose pictures the host decodes none of, are refused with
 //!   `kVTVideoDecoderUnsupportedDataFormatErr`, an H.264 SPS that lets pictures be fields with
 //!   `kVTVideoDecoderMalfunctionErr`, and the backend refuses what it does not decode, each with
@@ -33,7 +34,9 @@
 //!   access unit into it and returns once the picture is there; the host emits the frame
 //!   (`Demt`, waiting [`EMIT_REPLY_WAIT`]) and lets go of the surface (`rels`). A frame that does
 //!   not decode is emitted with the backend's status and no buffer, and its buffer named unused
-//!   (`Dfub`). Frames come out in decode order, one a `dfrm`. The `dfrm` reply says noErr, with
+//!   (`Dfub`). Frames come out in decode order, one a `dfrm`. A VP9 sample goes to the backend
+//!   whole, as the guest sent it: a frame, or a superframe of hidden frames and the one it shows,
+//!   which the backend splits itself (`crate::codec::vp9::superframe`). The `dfrm` reply says noErr, with
 //!   `kVTDecodeInfo_Asynchronous` for a frame sent with the asynchronous flag, whose reply goes
 //!   as soon as its buffer is in hand. With no decoder (before `dsta`, after one refused, after
 //!   `dinv`) it answers [`NO_DECODER`] and sends nothing else.
@@ -72,13 +75,14 @@ use crate::codec::h264::{self, avcc};
 use crate::codec::hevc::nal::nal_type;
 use crate::codec::hevc::sps::Sps as HevcSps;
 use crate::codec::hevc::{self, hvcc};
+use crate::codec::vp9::{self, config::VpCodecConfiguration};
 use crate::core::backend::{Chroma, PixelFormat};
 use crate::core::fourcc::FourCc;
 use crate::core::runtime::Runtime;
 use crate::paravirt::WireError;
 use crate::paravirt::host::Codec;
 use crate::paravirt::image_description::{
-    AV1_CONFIGURATION, AVC_CONFIGURATION, HEVC_CONFIGURATION, ImageDescription,
+    AV1_CONFIGURATION, AVC_CONFIGURATION, HEVC_CONFIGURATION, ImageDescription, VP_CONFIGURATION,
 };
 use crate::paravirt::message::{
     GuestUuid, Message, MessageFlags, MessageHeader, MessageWriter, ValueType,
@@ -134,6 +138,10 @@ const THREAD_NAME: &str = "reims-vgpu-video.vt-decoder";
 /// The four-byte start code an Annex-B NAL unit follows.
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// A record's [`Record::length_size`] for a codec whose samples go to the backend whole, as the
+/// guest sent them: AV1's, temporal units of OBUs, and VP9's, which has no NAL units.
+const WHOLE_SAMPLES: u8 = 0;
+
 /// A decoder's configuration, from a `dsta`'s format description or a sample's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecoderConfig {
@@ -143,7 +151,7 @@ pub struct DecoderConfig {
     pub width: u32,
     /// The height the description gives.
     pub height: u32,
-    /// The configuration record (`avcC`, `hvcC`).
+    /// The configuration record (`avcC`, `hvcC`, `vpcC`).
     pub record: Vec<u8>,
 }
 
@@ -206,14 +214,15 @@ pub trait Backend: Send + Sync {
     }
 }
 
-/// What a stream's SPS says it is: what a refusal of it names ([`Backend::declines`]).
+/// What a stream's SPS, or VP9's `vpcC`, says it is: what a refusal of it names
+/// ([`Backend::declines`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stream {
     /// The stream's codec.
     pub codec: Codec,
-    /// HEVC's `general_profile_idc`, H.264's `profile_idc`.
+    /// HEVC's `general_profile_idc`, H.264's `profile_idc`, VP9's `profile` (its `vpcC`'s).
     pub profile: u8,
-    /// `chroma_format_idc`.
+    /// `chroma_format_idc`; for VP9, its `vpcC`'s chroma subsampling so numbered.
     pub chroma_format_idc: u8,
     /// `BitDepthY`.
     pub luma_bits: u8,
@@ -230,9 +239,10 @@ pub struct Stream {
 
 /// One open decoder, called on its session's thread, one call at a time.
 pub trait BackendDecoder: Send {
-    /// Decodes `access_unit`, NAL units in Annex-B form, after `parameter_sets` (the record's,
-    /// Annex-B, at the first decode of a configuration; else empty), into `output`, and returns
-    /// once the picture is there, or the status the guest sees for a sample that does not decode.
+    /// Decodes `access_unit`, NAL units in Annex-B form, or a VP9 sample whole, after
+    /// `parameter_sets` (the record's, Annex-B, at the first decode of a configuration; else, and
+    /// for VP9, empty), into `output`, and returns once the picture is there, or the status the
+    /// guest sees for a sample that does not decode.
     fn decode(
         &mut self,
         parameter_sets: &[u8],
@@ -1006,6 +1016,7 @@ fn config_from_description(description: &ImageDescription) -> Option<DecoderConf
         Codec::H264 => AVC_CONFIGURATION,
         Codec::Hevc => HEVC_CONFIGURATION,
         Codec::Av1 => AV1_CONFIGURATION,
+        Codec::Vp9 => VP_CONFIGURATION,
     };
     Some(DecoderConfig {
         codec,
@@ -1022,6 +1033,7 @@ fn config_from_format(format: &SerializedFormatDescription) -> Option<DecoderCon
         Codec::H264 => "avcC",
         Codec::Hevc => "hvcC",
         Codec::Av1 => "av1C",
+        Codec::Vp9 => "vpcC",
     };
     Some(DecoderConfig {
         codec,
@@ -1064,7 +1076,7 @@ fn tile_region(origin: (i32, i32), size: (i32, i32), at: (i32, i32)) -> Option<T
 
 /// What the host reads of a configuration record.
 struct Record {
-    /// The bytes before each NAL unit of a sample; 0 for AV1's, whose samples go whole.
+    /// The bytes before each NAL unit of its samples, or [`WHOLE_SAMPLES`] (AV1's and VP9's).
     length_size: u8,
     /// Its parameter sets, Annex B; AV1's `configOBUs`.
     parameter_sets: Vec<u8>,
@@ -1129,6 +1141,7 @@ impl Undecoded {
             Codec::H264 => "AVC",
             Codec::Hevc => "HEVC",
             Codec::Av1 => "AV1",
+            Codec::Vp9 => "VP9",
         };
         format!(
             "{codec} profile {} chroma format {}, luma {} bits, chroma {} bits",
@@ -1147,6 +1160,7 @@ impl std::fmt::Display for Undecoded {
             Codec::H264 => ("H.264", "profile_idc"),
             Codec::Hevc => ("HEVC", "general_profile_idc"),
             Codec::Av1 => ("AV1", "seq_profile"),
+            Codec::Vp9 => ("VP9", "profile"),
         };
         write!(
             f,
@@ -1249,6 +1263,7 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
                 undecoded,
             )
         }
+        Codec::Vp9 => return read_vp9_record(config),
     };
     if length_size == 3 || !matches!(length_size, 1 | 2 | 4) {
         return Err(unsupported);
@@ -1267,11 +1282,47 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
     })
 }
 
+/// A VP9 stream's record, from its `vpcC` (the VP codec ISO media file format binding's): the
+/// profile, bit depth, chroma subsampling and range it names, which a session is refused on as an
+/// SPS's are, at the description's size. VP9 has no parameter sets, and its samples go to the
+/// backend whole ([`WHOLE_SAMPLES`]). A record that does not read, or is not there,
+/// `kVTVideoDecoderUnsupportedDataFormatErr`.
+fn read_vp9_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
+    let vpcc = VpCodecConfiguration::parse(&config.record)
+        .map_err(|_| status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT)?;
+    let stream = Stream {
+        codec: Codec::Vp9,
+        profile: vpcc.profile,
+        // `chromaSubsampling` 2 is 4:2:2 and 3 is 4:4:4, as `chroma_format_idc` numbers them.
+        chroma_format_idc: if vpcc.is_4_2_0() {
+            1
+        } else {
+            vpcc.chroma_subsampling
+        },
+        luma_bits: vpcc.bit_depth,
+        chroma_bits: vpcc.bit_depth,
+        width: config.width,
+        height: config.height,
+        range_extensions: false,
+    };
+    let undecoded = (vp9::check_supported(&vpcc).err()).map(|error| Undecoded {
+        why: error.to_string(),
+        stream,
+    });
+    Ok(Record {
+        length_size: WHOLE_SAMPLES,
+        parameter_sets: Vec::new(),
+        format: pixel_format(&stream, vpcc.full_range),
+        stream,
+        undecoded,
+    })
+}
+
 /// A sample's NAL units, each after a `length_size`-byte length, in Annex-B form; a sample whose
-/// lengths run past it is `kVTVideoDecoderBadDataErr`. An AV1 sample (`length_size` 0) is taken
-/// as it is.
+/// lengths run past it is `kVTVideoDecoderBadDataErr`. A sample of a codec whose samples go whole
+/// ([`WHOLE_SAMPLES`], AV1's and VP9's) is itself.
 fn annex_b(data: &[u8], length_size: u8) -> Result<Vec<u8>, OsStatus> {
-    if length_size == 0 {
+    if length_size == WHOLE_SAMPLES {
         return Ok(data.to_vec());
     }
     let mut out = Vec::with_capacity(data.len() + 16);

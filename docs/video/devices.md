@@ -43,15 +43,56 @@ arm64e kext ([design.md](../graphics-kext/design.md), "Decided", 17). The arm64e
 AppleGVA no video driver; where the guest took `RGFX_FEATURE_VT_MESSAGES` and the caps list a
 decoder, it publishes VideoToolbox's paravirtualization service, and the guest's VideoToolbox
 registers each decoder and encoder the host lists, running each session as `VT_MESSAGE`s on
-ring 0. The host lists a decoder for each H.264 or HEVC decode entry of the caps (`vt_features`
-and the decoder list beside it in `graphics.rs`), an AV1 decoder where the arm decodes AV1
-("AV1 on arm64 guests", below), and an encoder for each codec its arm encodes a profile of
-(`guest_encoders` in `graphics/vaapi.rs` and `graphics/nvidia.rs`). So on a Linux host
-an arm64 guest decodes H.264 and HEVC and encodes H.264 and HEVC Main and Main 10 in hardware; on
-a Windows host it decodes alone, as the Windows arm answers no encoder. Its decoders land 4:2:0
-pictures, and HEVC's range extensions, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits, where the
-arm's own query lists a decoder of the stream (`guest_declines`; "HEVC's range extensions on arm64
-guests", below).
+ring 0. The host lists a decoder for each H.264, HEVC or VP9 decode entry of the caps
+(`vt_features` and the decoder list beside it in `graphics.rs`), an AV1 decoder where the arm
+decodes AV1 ("AV1 on arm64 guests", below), and an encoder for each codec its arm encodes a
+profile of (`guest_encoders` in `graphics/vaapi.rs` and `graphics/nvidia.rs`). So on a Linux host
+an arm64 guest decodes H.264, HEVC and VP9 and encodes H.264 and HEVC Main and Main 10 in
+hardware; on a Windows host it decodes alone, as the Windows arm answers no encoder. Its decoders
+land 4:2:0 pictures, and HEVC's range extensions, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits,
+where the arm's own query lists a decoder of the stream (`guest_declines`; "HEVC's range
+extensions on arm64 guests", below).
+
+VP9 reaches the host by this route alone. Its caps entry (codec 3, `RGFX_VIDEO_CODEC_VP9`) lists
+profile 0, into NV12, where the arm decodes VP9 at 8 bits, and profile 2, into P010, where it
+decodes VP9 at 10 (`vp9_caps` in `graphics/vaapi.rs` and `graphics/nvidia.rs`), at the arm's sizes
+up to 16384 a side, and VP9's top level as `vpcC` numbers it (62, level 6.2). An x86-64 guest's
+kexts read no entry past HEVC's, and the device takes no session of codec 3 ("A decode"). The
+guest's VideoToolbox lists the VP9 decoder only once a process calls
+`VTRegisterSupplementalVideoDecoderIfAvailable` for `vp09`, as on a Mac, and as browsers do: before
+that every VP9 session's create fails −12906 (`kVTCouldNotFindVideoDecoderErr`) in the guest and
+none reaches the host; after it a session decodes on the host. arm64 macOS 26.6.2 has no VP9
+decoder of its own, and the M3's macOS 27.0.1 none in software: a session that allows no hardware
+fails −12906 before and after (**measured** under TCG on an RX 7900 XTX host, and on the M3,
+2026-11-27, potluck jobs m3-max-77263 and m3-max-77262). So a VP9 stream the host does not decode,
+a Profile 1 or 3 stream or one at 12 bits, or any VP9 on a host whose driver lists none, is not
+decoded in the guest at all. The guest's VideoToolbox does hand such a stream to the host's
+decoder, though its profiles name 0 and 2 alone: an 8-bit 4:4:4 Profile 1 stream's session reached
+the host, whose `dsta` refused it (−12910, `kVTVideoDecoderUnsupportedDataFormatErr`, whether the
+session required hardware or allowed it), and a session that allowed no hardware failed −12906
+(**measured** on the Iris Xe host, whose driver lists profiles 1 and 3, 2026-11-27, potluck job
+m3-max-77382). Each sample, a frame or a superframe whole, is split into its frames on the host,
+which decodes them all and lands the one it shows. The guest's pictures of our two libvpx streams
+equal vpxdec's, frame by frame, by the IVF route (the probe's own `vpcC`) and the MP4 route
+(AVFoundation's), in sessions that require hardware: on an RX 7900 XTX (radeonsi), an Iris Xe
+(iHD) and an RTX 3090 (NVDEC) under arm64 macOS 26.6.2, and on the RTX 3090 under macOS 14.6.1,
+all under TCG (**measured** 2026-11-27, potluck jobs m3-max-77354, m3-max-77382, m3-max-77355
+and m3-max-77373). A VP9 decode runs as fast as HEVC's on the same route, measured with the guest's
+CPU emulated (TCG, 4 CPUs): the rates are the emulated guest's, not the GPU's, and at 1080p the
+three proof cards' VP9 rates lie within 5% of each other (one run each: 89.1, 90.7 and 93.2 frames
+a second on the RX 7900 XTX, the Iris Xe and the RTX 3090, against HEVC's 79.9, 90.9 and 94.2, in
+jobs m3-max-77354, m3-max-77382 and m3-max-77355). Each measure took
+sessions that require hardware, VP9's and HEVC's in turns, four runs each, at 1920x1080 (60
+frames) and at 8192x4352 (8 frames): the largest picture both codecs' entries take, as the drivers
+answer up to 8192x4352 on the AMD cards and 16384x16384 on the Iris Xe for both, and both
+entries' level, 6.2, bounds a picture at 35,651,584 luma samples, which 8192x4352 fills. As
+medians, VP9's frames a second and seconds of guest CPU against HEVC's: on the RX 7900 XTX, with
+the node to itself (potluck job m3-max-77411), 84.4 and 2.85 s against 78.6 and 3.14 s at 1080p,
+and 21.2 and 1.55 s against 20.7 and 1.56 s at 8192x4352, the guest CPU's medians there leaving
+out one run of each codec that read 0.00 s, as the guest's tick count did not move in its 0.3 s;
+and on the Radeon 780M, beside a job of another card's (m3-max-77433), 92.7 and 2.58 s against 94.4
+and 2.55 s at 1080p, and 22.6 and 1.43 s against 20.6 and 1.57 s at 8192x4352, leaving out one
+HEVC run there that read 0.00 s likewise (**measured** 2026-11-27).
 
 Where the host lists no decoder, the kext publishes no service, and the guest's VideoToolbox
 answers as above for decoders. Its encoders are then the OS's own: arm64 macOS 27.0.1 lists no
@@ -220,7 +261,9 @@ direction. Each session has a shared event, which the host signals.
 ## A decode
 
 A decode is an op (`DECODE_H264` 0x4000, `DECODE_H265` 0x4001) in a video encoder of a
-command buffer of the session's process (`graphics/decode/video.rs`):
+command buffer of the session's process (`graphics/decode/video.rs`). VP9 has no op: its caps
+entry serves VideoToolbox's paravirtual decoders alone ("Which hardware"), and a
+`VIDEO_SESSION_CREATE` of codec 3 is refused as any codec without a session.
 
 - **The op's objects** are resolved as the command buffer is taken: the bitstream buffer, and
   the buffers the output surface's planes lie in. An op faults the command buffer where it is

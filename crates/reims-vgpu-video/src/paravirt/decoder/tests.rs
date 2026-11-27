@@ -198,6 +198,7 @@ impl Guest {
             Codec::H264 => (*b"avc1", vec![66, 77, 100], 52),
             Codec::Hevc => (*b"hvc1", vec![1, 2, 3], 156),
             Codec::Av1 => (*b"av01", vec![0], 19),
+            Codec::Vp9 => (*b"vp09", vec![0, 2], 62),
         };
         let decoders = vec![Decoder {
             codec,
@@ -1284,6 +1285,92 @@ fn a_tile_that_does_not_decode_is_emitted_with_its_status_and_the_next_gets_the_
     let calls = guest.calls.lock();
     assert_eq!(calls.len(), 2);
     assert!(calls.iter().all(|(sets, _, _)| *sets == annex_b_sets()));
+}
+
+/// A `vpcC` record's payload, version 1: `profile`, level 3.1, `bit_depth`, `chroma`
+/// subsampling, `full_range`, BT.709.
+fn vpcc(profile: u8, bit_depth: u8, chroma: u8, full_range: bool) -> Vec<u8> {
+    let packed = (bit_depth << 4) | (chroma << 1) | u8::from(full_range);
+    vec![1, 0, 0, 0, profile, 31, packed, 1, 1, 1, 0, 0]
+}
+
+#[test]
+fn each_vp9_stream_lands_in_its_format_or_is_refused_at_its_start() {
+    // profile, bit depth, chroma subsampling, range, and the format its frames land in.
+    for (profile, depth, chroma, full_range, format) in [
+        (0, 8, 1, false, Some(b"420v")),
+        (0, 8, 0, true, Some(b"420f")),
+        (2, 10, 1, false, Some(b"x420")),
+        (2, 10, 1, true, Some(b"xf20")),
+        (2, 12, 1, false, None),
+        (1, 8, 3, false, None),
+        (1, 8, 2, false, None),
+        (3, 10, 3, false, None),
+    ] {
+        let what = format!("profile {profile}, {depth} bits, chroma {chroma}, {full_range}");
+        let record = vpcc(profile, depth, chroma, full_range);
+        starts_in(Codec::Vp9, &record, false, format, &what);
+    }
+    // A record that does not read, or is not there, or is of version 0, refuses the session.
+    let mut version_0 = vpcc(0, 8, 1, false);
+    version_0[0] = 0;
+    for record in [Vec::new(), vec![1; 11], version_0] {
+        let config = DecoderConfig {
+            codec: Codec::Vp9,
+            width: 64,
+            height: 48,
+            record,
+        };
+        assert_eq!(
+            read_record(&config).err(),
+            Some(status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT)
+        );
+    }
+}
+
+#[test]
+fn a_vp9_sample_goes_to_the_backend_whole_with_no_parameter_sets() {
+    let guest = Guest::of(Codec::Vp9, Ok(Decoded::Landed), None);
+    guest.start(&vpcc(0, 8, 1, false));
+    guest.next_of(b"Dpba");
+    guest.next_of(b"dsta");
+    let buffer = GuestUuid([0xb0; 16]);
+    // A frame's first bytes in a superframe of one, its index's sizes two bytes each, as a
+    // container holds it: the host neither splits nor converts it.
+    let superframe = [0x82, 0x49, 0x83, 0x86, 0x40, 0xc8, 0x05, 0x00, 0xc8];
+    for frame in 0..2 {
+        guest.frame(frame, 0, &one_sample(&superframe, None, false));
+        let (dbuf, _) = guest.next_of(b"Dbuf");
+        guest.answer(&dbuf, 0, Some((buffer, 7)));
+        let (demt, emitted) = guest.next_of(b"Demt");
+        assert_eq!(status_of(&emitted), Some(0));
+        guest.answer(&demt, 0, None);
+        assert_eq!(guest.next(), surface_release(&[7]), "the surface goes back");
+        guest.next_of(b"dfrm");
+    }
+    let calls = guest.calls.lock();
+    assert_eq!(calls.len(), 2);
+    for call in calls.iter() {
+        assert_eq!(*call, (Vec::new(), superframe.to_vec(), 7));
+    }
+}
+
+#[test]
+fn a_refused_vp9_stream_is_named_by_its_profile_chroma_depths_and_size() {
+    let arm = FakeBackend::landing();
+    let refused = undecoded_on(&arm, Codec::Vp9, vpcc(1, 8, 3, false)).expect("refused");
+    assert_eq!(
+        refused.to_string(),
+        "unsupported: VP9 other than 4:2:0 (VP9 profile 1, chroma_format_idc 3, luma 8 bits, \
+         chroma 8 bits, 64x48)"
+    );
+    assert_eq!(
+        refused.kind(),
+        "VP9 profile one chroma format three, luma eight bits, chroma eight bits"
+    );
+    let twelve = undecoded_on(&arm, Codec::Vp9, vpcc(2, 12, 1, false)).expect("refused");
+    assert_eq!(twelve.why, "unsupported: VP9 at 12 bits");
+    assert_eq!(undecoded_on(&arm, Codec::Vp9, vpcc(2, 10, 0, false)), None);
 }
 
 mod av1;

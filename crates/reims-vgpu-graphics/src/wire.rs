@@ -5021,6 +5021,9 @@ pub const RGFX_VIDEO_CAPS_CODECS: usize = 16;
 pub const RGFX_VIDEO_CODEC_H264: u32 = 1;
 /// [`RgfxVideoCodecCaps::codec`] and [`RgfxVideoSessionCreate::codec`]: HEVC.
 pub const RGFX_VIDEO_CODEC_HEVC: u32 = 2;
+/// [`RgfxVideoCodecCaps::codec`]: VP9, which an arm64 guest's VideoToolbox decodes through its
+/// paravirtual decoders (`RGFX_FEATURE_VT_MESSAGES`); no session of the device takes it.
+pub const RGFX_VIDEO_CODEC_VP9: u32 = 3;
 
 /// [`RgfxVideoCodecCaps::direction`] and [`RgfxVideoSessionCreate::direction`]: decode.
 pub const RGFX_VIDEO_DECODE: u32 = 1;
@@ -5040,6 +5043,11 @@ pub const RGFX_VIDEO_H264_HIGH: u32 = 1 << 2;
 pub const RGFX_VIDEO_HEVC_MAIN: u32 = 1 << 0;
 /// [`RgfxVideoCodecCaps::profiles`] of HEVC: Main 10 (2).
 pub const RGFX_VIDEO_HEVC_MAIN_10: u32 = 1 << 1;
+
+/// [`RgfxVideoCodecCaps::profiles`] of VP9: profile 0, 4:2:0 at 8 bits.
+pub const RGFX_VIDEO_VP9_PROFILE_0: u32 = 1 << 0;
+/// [`RgfxVideoCodecCaps::profiles`] of VP9: profile 2 at 10 bits, 4:2:0.
+pub const RGFX_VIDEO_VP9_PROFILE_2: u32 = 1 << 1;
 
 /// [`RgfxVideoCodecCaps::formats`]: 8-bit 4:2:0 in two planes, NV12 (`'420v'`, `'420f'`).
 pub const RGFX_VIDEO_FORMAT_NV12: u32 = 1 << 0;
@@ -5065,7 +5073,8 @@ pub struct RgfxVideoCodecCaps {
     /// The profiles taken, `RGFX_VIDEO_<codec>_*` bits.
     pub profiles: u32,
     /// The highest level taken, as the codec numbers it (H.264's `level_idc`, 52 for 5.2; HEVC's
-    /// `general_level_idc`, 153 for 5.1).
+    /// `general_level_idc`, 153 for 5.1; VP9's ten times the level, as `vpcC` numbers it, 62 for
+    /// 6.2).
     pub max_level: u32,
     /// The smallest coded picture: width, height.
     pub min_size: [u32; 2],

@@ -15,6 +15,8 @@ pub const AVC_CONFIGURATION: FourCc = FourCc::new(*b"avcC");
 pub const HEVC_CONFIGURATION: FourCc = FourCc::new(*b"hvcC");
 /// The `av1C` extension: an AV1CodecConfigurationRecord.
 pub const AV1_CONFIGURATION: FourCc = FourCc::new(*b"av1C");
+/// The `vpcC` extension: a VP codec configuration record, version and flags first.
+pub const VP_CONFIGURATION: FourCc = FourCc::new(*b"vpcC");
 
 /// A video format description, as far as the host reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +107,7 @@ pub(crate) mod tests {
         bytes.extend_from_slice(match codec {
             b"hvc1" => b"hvcC",
             b"av01" => b"av1C",
+            b"vp09" => b"vpcC",
             _ => b"avcC",
         });
         bytes.extend_from_slice(record);

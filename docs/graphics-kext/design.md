@@ -1940,6 +1940,33 @@ Stages:
       refusal in its reply's `,err`, as for a codec the host lacks.
       A host with no arm offers no caps and the kext publishes no service:
       the guest's VideoToolbox is then not a guest's.
+    - **VP9 is this route's alone.** Its caps entry is codec 3
+      (`RGFX_VIDEO_CODEC_VP9`), with `RGFX_VIDEO_VP9_PROFILE_0` (4:2:0 at 8
+      bits) and `RGFX_VIDEO_VP9_PROFILE_2` (4:2:0 at 10) as the arm decodes
+      them, and its level as `vpcC` numbers it, ten times VP9's: 62, level
+      6.2, the top one, as the arms answer no level. Apple numbers its own
+      levels so: the M3's AV1 decoder answers `VTMaxDecodeLevel` 63 for
+      level 6.3, and lists no capabilities of VP9's, whose decoder is
+      supplemental (read from AppleAVD's registry on the M3, macOS 27.0.1,
+      potluck job m3-max-77311). The x86-64 kexts read no entry past
+      HEVC's, so an older guest skips it and a newer one on an older host
+      finds none, and the device makes no session of codec 3. `decs` lists
+      VP9's decoder as `reims-vgpu-video.videodecoder.vp9`, `dcap` its two
+      profiles as 0 and 2; `encs` lists no VP9 encoder. A session's samples
+      come one container sample a `dfrm`, a superframe whole, hidden altref
+      frames inside it (measured: libvpx's streams on arm64 macOS 26.6.2
+      under TCG on an RX 7900 XTX host, 2026-11-27, potluck job
+      m3-max-77263), and `dsta` carries the stream's `vpcC`. The host splits
+      each superframe by its index and decodes every frame, after checking
+      each size against the bytes it holds (`reims_vgpu_video::codec::vp9`).
+      `dsta` refuses with `kVTVideoDecoderUnsupportedDataFormatErr` a
+      stream of profile 1 or 3, of 12 bits, or one the arm declines (a
+      profile or size its driver lacks), and arm64 macOS then has no VP9
+      decoder for it (devices.md, "Which hardware"). The guest's
+      VideoToolbox, on macOS 14.6.1 as on 26.6.2, lists the decoder once a
+      process registers VP9, and hands it every VP9 stream, a Profile 1
+      stream too, which the host then refuses at `dsta` (measured under
+      TCG, 2026-11-27, potluck jobs m3-max-77373 and m3-max-77382).
     - **The host offers `VT_MESSAGES` where its arm lands decodes in the
       guest's surfaces**: on VA-API and on NVDEC, each where it decodes
       H.264 or HEVC. The arm64e kext publishes the service on macOS 14

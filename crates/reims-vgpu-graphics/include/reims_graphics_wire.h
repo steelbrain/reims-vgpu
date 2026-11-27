@@ -3381,6 +3381,10 @@
 // [`RgfxVideoCodecCaps::codec`] and [`RgfxVideoSessionCreate::codec`]: HEVC.
 #define RGFX_VIDEO_CODEC_HEVC 2
 
+// [`RgfxVideoCodecCaps::codec`]: VP9, which an arm64 guest's VideoToolbox decodes through its
+// paravirtual decoders (`RGFX_FEATURE_VT_MESSAGES`); no session of the device takes it.
+#define RGFX_VIDEO_CODEC_VP9 3
+
 // [`RgfxVideoCodecCaps::direction`] and [`RgfxVideoSessionCreate::direction`]: decode.
 #define RGFX_VIDEO_DECODE 1
 
@@ -3403,6 +3407,12 @@
 
 // [`RgfxVideoCodecCaps::profiles`] of HEVC: Main 10 (2).
 #define RGFX_VIDEO_HEVC_MAIN_10 (1 << 1)
+
+// [`RgfxVideoCodecCaps::profiles`] of VP9: profile 0, 4:2:0 at 8 bits.
+#define RGFX_VIDEO_VP9_PROFILE_0 (1 << 0)
+
+// [`RgfxVideoCodecCaps::profiles`] of VP9: profile 2 at 10 bits, 4:2:0.
+#define RGFX_VIDEO_VP9_PROFILE_2 (1 << 1)
 
 // [`RgfxVideoCodecCaps::formats`]: 8-bit 4:2:0 in two planes, NV12 (`'420v'`, `'420f'`).
 #define RGFX_VIDEO_FORMAT_NV12 (1 << 0)
@@ -8544,7 +8554,8 @@ typedef struct {
   // The profiles taken, `RGFX_VIDEO_<codec>_*` bits.
   uint32_t profiles;
   // The highest level taken, as the codec numbers it (H.264's `level_idc`, 52 for 5.2; HEVC's
-  // `general_level_idc`, 153 for 5.1).
+  // `general_level_idc`, 153 for 5.1; VP9's ten times the level, as `vpcC` numbers it, 62 for
+  // 6.2).
   uint32_t max_level;
   // The smallest coded picture: width, height.
   uint32_t min_size[2];

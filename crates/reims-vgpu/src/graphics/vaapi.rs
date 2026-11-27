@@ -92,6 +92,9 @@
 //!   GPU where the import check passed XYUV (`xyuv`). The rest are read back and split by the
 //!   CPU, each picture counted (`video-pictures-cpu-converted`). Every other stream that is not
 //!   4:2:0 Main or Main 10 is refused at its session's start, naming why.
+//!   VP9 decodes there alone, profile 0 and profile 2 at 10 bits where the driver lists them
+//!   (`Vp9Decoder`, each sample a frame or a superframe whole), and lands as H.264's and HEVC's
+//!   4:2:0 pictures do.
 //! - **VideoToolbox's paravirtual encoders** (`encode::VaGuestEncoder`, `super::vt`): an arm64
 //!   guest's encoder reads each source frame from the IOSurface its kext lent: written by the
 //!   runtime device's GPU from a buffer over its pages into an input of the encoder's, as an x86
@@ -108,14 +111,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
 use reims_vgpu_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_ENCODE,
-    RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
-    RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
-    RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_CODEC_VP9, RGFX_VIDEO_DECODE,
+    RGFX_VIDEO_ENCODE, RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE,
+    RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10,
+    RGFX_VIDEO_VP9_PROFILE_0, RGFX_VIDEO_VP9_PROFILE_2, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
+    RgfxVideoOutputLayout,
 };
 #[cfg(unix)]
 use reims_vgpu_video::codec::PictureRole;
-use reims_vgpu_video::codec::PictureStart;
+use reims_vgpu_video::codec::{PictureStart, vp9};
 use reims_vgpu_video::core::backend::{BackendError as VideoError, DeviceWrite, PixelFormat};
 #[cfg(unix)]
 use reims_vgpu_video::core::device_memory::{
@@ -131,7 +135,7 @@ use reims_vgpu_video::vaapi::{AV1_PROFILE0, Av1Decoder, av1_decodes_ten_bit, av1
 use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
     H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, Target,
-    TargetCodec, TargetFor, VideoEncoder, encoder_support,
+    TargetCodec, TargetFor, VideoEncoder, Vp9Decoder, encoder_support,
 };
 #[cfg(unix)]
 use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, TargetChecks, TargetPlane, TargetShape};
@@ -577,15 +581,26 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         true
     }
 
-    /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where the driver's
-    /// decoder of their chroma format and depth decodes them ([`declines_range_extensions`]);
-    /// AV1's at the depths and sizes the driver lists (`super::av1::declines`).
+    /// 4:2:0 streams of Main and Main 10, HEVC's range extensions where the driver's decoder of
+    /// their chroma format and depth decodes them ([`declines_range_extensions`]), AV1's at the
+    /// depths and sizes the driver lists (`super::av1::declines`), and VP9's where the driver's
+    /// config of the stream's profile takes its depth and size.
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
         if codec == HOST_VIDEO_CODEC_AV1 {
             return super::av1::declines(NAME, self.av1, stream);
         }
         if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
             return declines_range_extensions(&self.hevc_range_extensions, stream);
+        }
+        if codec == RGFX_VIDEO_CODEC_VP9 && stream.chroma_format_idc == 1 {
+            return Vp9Decoder::supports(
+                &self.display,
+                stream.profile,
+                stream.luma_bits,
+                (stream.width, stream.height),
+            )
+            .err()
+            .map(|error| format!("{NAME}: {error}"));
         }
         (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
             format!(
@@ -639,6 +654,7 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
                 decoder.lands_range_extensions();
                 Codec::Hevc(decoder)
             }
+            RGFX_VIDEO_CODEC_VP9 => Codec::Vp9(Vp9Decoder::new(&self.display)),
             _ => return None,
         };
         Some(Box::new(VaGuestDecoder {
@@ -719,10 +735,13 @@ fn declines_range_extensions(configs: &[ConfigCapabilities], stream: &Stream) ->
     }
 }
 
-/// The caps of H.264 and HEVC decode the driver's answers give (module doc); an entry for each
-/// codec of which it lists a profile it decodes.
+/// The caps of H.264, HEVC and VP9 decode the driver's answers give (module doc); an entry for
+/// each codec of which it lists a profile it decodes.
 pub(crate) fn caps_of(caps: &Capabilities) -> Vec<RgfxVideoCodecCaps> {
-    h264_caps(caps).into_iter().chain(hevc_caps(caps)).collect()
+    (h264_caps(caps).into_iter())
+        .chain(hevc_caps(caps))
+        .chain(vp9_caps(caps))
+        .collect()
 }
 
 /// `profile`'s VLD config where the driver lists one that decodes `rt_format` (or names no
@@ -821,6 +840,30 @@ fn hevc_caps(caps: &Capabilities) -> Option<RgfxVideoCodecCaps> {
     // The current reference sets' pictures together (the module doc): a picture of more is
     // refused, and radeonsi decodes one wrongly.
     entry.max_references = 8;
+    Some(entry)
+}
+
+/// VP9 decode, for VideoToolbox's paravirtual decoders alone: profile 0 where its config decodes
+/// 8-bit 4:2:0, into NV12, and profile 2 where its config decodes 10-bit 4:2:0, into P010, at
+/// sizes up to the codec crate's bound (`vp9::MAX_SIDE`). A frame references three of the eight
+/// slots, which with the frame itself the DPB holds.
+fn vp9_caps(caps: &Capabilities) -> Option<RgfxVideoCodecCaps> {
+    let zero = vld(caps, Profile::VP9_PROFILE0, RT_YUV420);
+    let two = vld(caps, Profile::VP9_PROFILE2, RT_YUV420_10);
+    let configs: Vec<&ConfigCapabilities> = [zero, two].into_iter().flatten().collect();
+    let mut entry = decode_caps(RGFX_VIDEO_CODEC_VP9, &configs)?;
+    if zero.is_some() {
+        entry.profiles |= RGFX_VIDEO_VP9_PROFILE_0;
+        entry.formats |= RGFX_VIDEO_FORMAT_NV12;
+    }
+    if two.is_some() {
+        entry.profiles |= RGFX_VIDEO_VP9_PROFILE_2;
+        entry.formats |= RGFX_VIDEO_FORMAT_P010;
+    }
+    entry.max_size = entry.max_size.map(|side| side.min(vp9::MAX_SIDE));
+    entry.max_level = vp9::TOP_LEVEL;
+    entry.max_dpb_pictures = 9;
+    entry.max_references = 3;
     Some(entry)
 }
 
@@ -1303,13 +1346,15 @@ fn say(said: &Mutex<Vec<String>>, why: String) {
     }
 }
 
-/// A session's decoder.
+/// A session's decoder: VP9's VideoToolbox's alone (`VaGuestDecoder`), as no session of the
+/// device takes VP9.
 enum Codec {
     H264(H264Decoder),
     Hevc(HevcDecoder),
     /// AV1's, which VideoToolbox's decoders alone make, its frames decoded into no cache; boxed,
     /// as its eight slots' state is far larger than the other decoders.
     Av1(Box<Av1Decoder>),
+    Vp9(Vp9Decoder),
 }
 
 /// A session's decoder, and what its pictures land through.
@@ -1350,6 +1395,7 @@ impl<P: Platform> VaDecoder<P> {
             Codec::H264(decoder) => decoder.decode_into(au, id, target_for),
             Codec::Hevc(decoder) => decoder.decode_into(au, id, target_for),
             Codec::Av1(decoder) => decoder.decode(au, id),
+            Codec::Vp9(decoder) => decoder.decode(au, id),
         }
     }
 }
@@ -1371,6 +1417,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
             Codec::H264(_) => Some(TargetCodec::H264),
             Codec::Hevc(_) => Some(TargetCodec::Hevc),
             Codec::Av1(_) => None,
+            Codec::Vp9(_) => None,
         };
         let target_for = (self.targets.as_ref())
             .zip(codec)
@@ -1405,6 +1452,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
             Codec::H264(_) => H264Decoder::SPARE_FRAMES,
             Codec::Hevc(_) => HevcDecoder::SPARE_FRAMES,
             Codec::Av1(_) => Av1Decoder::SPARE_FRAMES,
+            Codec::Vp9(_) => Vp9Decoder::SPARE_FRAMES,
         }
     }
 
@@ -1413,6 +1461,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
             Codec::H264(decoder) => decoder.last_picture(),
             Codec::Hevc(decoder) => decoder.last_picture(),
             Codec::Av1(_) => None,
+            Codec::Vp9(_) => None,
         }
     }
 }
@@ -1446,6 +1495,7 @@ impl<P: Platform> VaGuestDecoder<P> {
             Codec::H264(decoder) => decoder.decode_into(bytes, id, None),
             Codec::Hevc(decoder) => decoder.decode_into(bytes, id, None),
             Codec::Av1(decoder) => decoder.decode(bytes, id),
+            Codec::Vp9(decoder) => decoder.decode(bytes, id),
         };
         frames.map_err(video_error)
     }

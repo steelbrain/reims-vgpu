@@ -94,6 +94,49 @@ fn the_caps_are_the_driver_s_answers() {
     );
 }
 
+/// VP9's entry, for VideoToolbox's paravirtual decoders, is profile 0 where its config decodes
+/// 8-bit 4:2:0 and profile 2 where its config decodes 10-bit, each into its format, at the least
+/// of their sizes held to the codec crate's bound, VP9's top level, and the eight slots and the
+/// frame; a profile 2 config of 8-bit surfaces alone gives no profile 2
+#[test]
+fn vp9_s_caps_are_its_profiles_configs_within_the_codec_s_bound() {
+    let caps = caps_of(&driver(vec![
+        config(Profile::VP9_PROFILE0, RT_YUV420, (16384, 16384), None),
+        config(Profile::VP9_PROFILE2, RT_YUV420_10, (32768, 16384), None),
+    ]));
+    assert_eq!(caps.len(), 1);
+    let vp9 = caps[0];
+    assert_eq!(
+        (vp9.codec, vp9.direction),
+        (RGFX_VIDEO_CODEC_VP9, RGFX_VIDEO_DECODE)
+    );
+    assert_eq!(
+        vp9.profiles,
+        RGFX_VIDEO_VP9_PROFILE_0 | RGFX_VIDEO_VP9_PROFILE_2
+    );
+    assert_eq!(vp9.formats, RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010);
+    assert_eq!(vp9.max_size, [16384, 16384]);
+    assert_eq!(
+        (vp9.max_level, vp9.max_dpb_pictures, vp9.max_references),
+        (62, 9, 3)
+    );
+    let eight_bit_only = caps_of(&driver(vec![
+        config(Profile::VP9_PROFILE0, RT_YUV420, (8192, 8192), None),
+        config(Profile::VP9_PROFILE2, RT_YUV420, (8192, 8192), None),
+    ]));
+    assert_eq!(eight_bit_only[0].profiles, RGFX_VIDEO_VP9_PROFILE_0);
+    assert_eq!(eight_bit_only[0].formats, RGFX_VIDEO_FORMAT_NV12);
+    assert!(
+        caps_of(&driver(vec![config(
+            Profile::VP9_PROFILE2,
+            RT_YUV420,
+            (8192, 8192),
+            None
+        )]))
+        .is_empty()
+    );
+}
+
 /// H.264's largest size keeps its pictures to `H264_MAX_MACROBLOCKS`: radeonsi's 4096x4096, which
 /// it decodes nothing at (bugs.md, U28), and iHD's 8192x8192, whose pictures past 4096 wide it
 /// refuses, are both answered 4096x4080, which holds 3840x2160 and 4096x2160; sizes within the
@@ -921,6 +964,7 @@ pub(super) fn each_picture(
                 Codec::H264(d) => d.decode(unit, id),
                 Codec::Hevc(d) => d.decode(unit, id),
                 Codec::Av1(d) => d.decode(unit, id),
+                Codec::Vp9(_) => panic!("an Annex B stream decoded as VP9"),
             };
             let frames = match frames {
                 Ok(frames) => frames,

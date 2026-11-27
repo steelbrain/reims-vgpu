@@ -143,6 +143,18 @@ fn the_rt_platforms_caps_name_what_nvdec_decodes_and_nvenc_encodes() {
         if hevc_profiles != 0 {
             expected.push((RGFX_VIDEO_CODEC_HEVC, hevc_profiles));
         }
+        let vp9_profiles = (if decodes(NvdecCodec::Vp9, 8) {
+            RGFX_VIDEO_VP9_PROFILE_0
+        } else {
+            0
+        }) | (if decodes(NvdecCodec::Vp9, 10) {
+            RGFX_VIDEO_VP9_PROFILE_2
+        } else {
+            0
+        });
+        if vp9_profiles != 0 {
+            expected.push((RGFX_VIDEO_CODEC_VP9, vp9_profiles));
+        }
         assert!(!expected.is_empty(), "NVDEC decodes neither codec");
         let encodes: Vec<(u32, u32)> = (nvdec.encode.iter())
             .map(|caps| (caps.codec, caps.profiles))
@@ -161,8 +173,8 @@ fn the_rt_platforms_caps_name_what_nvdec_decodes_and_nvenc_encodes() {
         for (caps, (codec, profiles)) in decodes.iter().zip(&expected) {
             assert_eq!((caps.codec, caps.direction), (*codec, RGFX_VIDEO_DECODE));
             assert_eq!(caps.profiles & profiles, *profiles, "codec {codec:#x}");
-            if *codec == RGFX_VIDEO_CODEC_HEVC {
-                assert_eq!(caps.profiles, *profiles, "HEVC's profiles");
+            if *codec != RGFX_VIDEO_CODEC_H264 {
+                assert_eq!(caps.profiles, *profiles, "codec {codec:#x}'s profiles");
             }
         }
         for (caps, (codec, profiles)) in encoded.iter().zip(&encodes) {
@@ -755,6 +767,74 @@ fn a_4_4_4_pictures_cb_and_cr_are_interleaved_into_the_surfaces_chroma_plane() {
         interleave_planes(&read[..2], &planes, &mut surface, 1),
         Err("2 planes read back for 3".to_owned())
     );
+}
+
+/// What NVDEC answers of VP9 at `bit_depth`, up to `max` from `min`.
+fn vp9_answer(bit_depth: u32, max: (u32, u32), min: (u32, u32)) -> DecodeCapabilities {
+    DecodeCapabilities {
+        codec: NvdecCodec::Vp9,
+        chroma: ChromaFormat::Yuv420,
+        bit_depth,
+        supported: true,
+        engines: 1,
+        output_formats: vec![SurfaceFormat::Nv12, SurfaceFormat::P016],
+        max_width: max.0,
+        max_height: max.1,
+        max_macroblocks: (max.0 / 16) * (max.1 / 16),
+        min_width: min.0,
+        min_height: min.1,
+    }
+}
+
+/// VP9's entry is profile 0 where NVDEC decodes VP9 at 8 bits and profile 2 where it does at 10,
+/// each into its format, at the least of their sizes, VP9's top level, and the eight slots and
+/// the frame; a stream is declined by the profile and depth it lacks and by its size.
+#[test]
+fn vp9_s_caps_are_nvdec_s_answers_and_decline_what_they_lack() {
+    assert_eq!(vp9_caps(None, None), None);
+    let both = vp9_caps(
+        Some(vp9_answer(8, (8192, 8192), (128, 128))),
+        Some(vp9_answer(10, (8192, 4096), (144, 128))),
+    )
+    .expect("an entry");
+    assert_eq!(
+        (both.codec, both.direction),
+        (RGFX_VIDEO_CODEC_VP9, RGFX_VIDEO_DECODE)
+    );
+    assert_eq!(
+        both.profiles,
+        RGFX_VIDEO_VP9_PROFILE_0 | RGFX_VIDEO_VP9_PROFILE_2
+    );
+    assert_eq!(
+        both.formats,
+        RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010
+    );
+    assert_eq!((both.min_size, both.max_size), ([144, 128], [8192, 4096]));
+    assert_eq!(
+        (both.max_level, both.max_dpb_pictures, both.max_references),
+        (62, 9, 3)
+    );
+    let eight = vp9_caps(Some(vp9_answer(8, (32768, 32768), (128, 128))), None).expect("an entry");
+    assert_eq!(eight.profiles, RGFX_VIDEO_VP9_PROFILE_0);
+    assert_eq!(eight.max_size, [16384, 16384], "the codec crate's bound");
+
+    let stream = |profile: u8, luma_bits: u8, width: u32, height: u32| Stream {
+        codec: reims_vgpu_video::paravirt::Codec::Vp9,
+        profile,
+        chroma_format_idc: 1,
+        luma_bits,
+        chroma_bits: luma_bits,
+        width,
+        height,
+        range_extensions: false,
+    };
+    assert_eq!(declines_vp9(Some(&both), &stream(0, 8, 1920, 1080)), None);
+    assert_eq!(declines_vp9(Some(&both), &stream(2, 10, 3840, 2160)), None);
+    assert!(declines_vp9(Some(&eight), &stream(2, 10, 640, 360)).is_some());
+    assert!(declines_vp9(Some(&both), &stream(2, 12, 640, 360)).is_some());
+    assert!(declines_vp9(Some(&both), &stream(0, 8, 64, 64)).is_some());
+    assert!(declines_vp9(Some(&both), &stream(0, 8, 8192, 8192)).is_some());
+    assert!(declines_vp9(None, &stream(0, 8, 640, 360)).is_some());
 }
 
 /// A VideoToolbox decoder sees a stream that does not decode, or a picture NVDEC failed, as bad
