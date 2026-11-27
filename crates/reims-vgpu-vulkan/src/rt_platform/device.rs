@@ -25,7 +25,10 @@
 //! device IDs), `DRI_PRIME` or `VK_LOADER_DEVICE_SELECT`. The library's rule that a candidate
 //! lists the device extensions a display's window takes holds here: the window takes
 //! `VK_KHR_swapchain` alone, which rt's floor takes, so it passes over no device that meets the
-//! floor.
+//! floor. A listed device below the floor is logged at info with every item rt says it lacks
+//! ([`below_floor_line`]); where Honeykrisp, Mesa's driver for Apple's GPUs, lacks
+//! `vertexPipelineStoresAndAtomics`, the line names the driver's opt-in to it,
+//! `hk_enable_vertex_pipeline_stores_atomics=true` in the environment, instead.
 //!
 //! **Its window system.** The instance enables the OS's surface extensions and present fences'
 //! where the loader lists them, and the device the extension of present fences where it lists
@@ -1267,6 +1270,55 @@ impl From<rt::Error> for Unopened {
     }
 }
 
+/// The driver option with which Honeykrisp, Mesa's Vulkan driver for Apple's GPUs, reports
+/// `vertexPipelineStoresAndAtomics`, a feature of rt's floor. Mesa 26.2.7's Honeykrisp on an
+/// M1 Pro reports the feature false, and true with this in the environment (**measured**,
+/// 2026-11-24, by `vulkaninfo`).
+const HONEYKRISP_VERTEX_STORES_OPT_IN: &str = "hk_enable_vertex_pipeline_stores_atomics=true";
+
+/// The line saying why a listed device is not a candidate ([`open`]): its name, then rt's
+/// refusal. Where Honeykrisp lacks `vertexPipelineStoresAndAtomics`, the line names the driver's
+/// opt-in ([`HONEYKRISP_VERTEX_STORES_OPT_IN`]) in place of the feature, the other items as rt
+/// gives them.
+fn below_floor_line(name: &str, driver: vk::DriverId, below: &rt::floor::BelowFloor) -> String {
+    let vertex_stores = |item: &rt::floor::Missing| {
+        matches!(item, rt::floor::Missing::Feature { structure, member }
+            if *structure == "VkPhysicalDeviceFeatures" && member == "vertexPipelineStoresAndAtomics")
+    };
+    // ash 0.38 names Honeykrisp's ID (26) MESA_AGXV; later Vulkan headers name it
+    // MESA_HONEYKRISP.
+    if driver != vk::DriverId::MESA_AGXV || !below.missing.iter().any(vertex_stores) {
+        return format!("{name}: {below}");
+    }
+    let items: Vec<String> = (below.missing.iter())
+        .map(|item| {
+            if vertex_stores(item) {
+                format!(
+                    "{HONEYKRISP_VERTEX_STORES_OPT_IN} in the environment, Honeykrisp's opt-in \
+                     to vertexPipelineStoresAndAtomics"
+                )
+            } else {
+                item.to_string()
+            }
+        })
+        .collect();
+    // rt's own lead, which a refusal of no items prints alone.
+    let lead = rt::floor::BelowFloor {
+        missing: Vec::new(),
+    };
+    format!("{name}: {lead}{}", items.join("; "))
+}
+
+/// The ID of the driver of a device the instance listed.
+fn driver_id(raw: &ash::Instance, physical: vk::PhysicalDevice) -> vk::DriverId {
+    let mut driver = vk::PhysicalDeviceDriverProperties::default();
+    let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+    // SAFETY: the caller's instance listed the device and is alive; rt's instance is at Vulkan
+    // 1.3, where the structure is core.
+    unsafe { raw.get_physical_device_properties2(physical, &mut asked) };
+    driver.driver_id
+}
+
 /// Makes the process's rt device (the module's docs), on a host of pages of `page_size` bytes,
 /// and logs it, then the answers rt chose its forms on there ([`RtForms`]), then, at warn, the
 /// library's build and the device's Shared memory type ([`BuildLine`]).
@@ -1284,7 +1336,11 @@ pub fn open(page_size: u64) -> Result<RtObj<RtDevice>, Unopened> {
             .unwrap_or_default();
         match physical.check() {
             Ok(floor) => candidates.push((physical, floor)),
-            Err(why) => below.push(format!("{name}: {why}")),
+            Err(why) => below.push(below_floor_line(
+                &name,
+                driver_id(raw, physical.raw()),
+                &why,
+            )),
         }
     }
     for line in &below {
@@ -2656,6 +2712,59 @@ mod tests {
         let ceiling = crate::os::compile_helper::Limits::of_host().memory;
         assert_ne!(ceiling, 0);
         assert_eq!(options.stage_memory_ceiling, ceiling);
+    }
+
+    /// rt's refusal of a device lacking `vertexPipelineStoresAndAtomics`, and, where `more`, an
+    /// extension before it.
+    fn lacking_vertex_stores(more: bool) -> rt::floor::BelowFloor {
+        let mut missing = Vec::new();
+        if more {
+            missing.push(rt::floor::Missing::Extension(ash::ext::robustness2::NAME));
+        }
+        missing.push(rt::floor::Missing::Feature {
+            structure: "VkPhysicalDeviceFeatures",
+            member: "vertexPipelineStoresAndAtomics".to_owned(),
+        });
+        rt::floor::BelowFloor { missing }
+    }
+
+    /// Honeykrisp lacking `vertexPipelineStoresAndAtomics` is named with the driver's opt-in in
+    /// place of the feature, after rt's lead.
+    #[test]
+    fn honeykrisp_below_the_floor_names_its_vertex_stores_opt_in() {
+        let line = below_floor_line(
+            "Apple M1 Pro (G13S C0)",
+            vk::DriverId::MESA_AGXV,
+            &lacking_vertex_stores(false),
+        );
+        assert_eq!(
+            line,
+            "Apple M1 Pro (G13S C0): the device is below the runtime's floor: it lacks \
+             hk_enable_vertex_pipeline_stores_atomics=true in the environment, Honeykrisp's \
+             opt-in to vertexPipelineStoresAndAtomics"
+        );
+    }
+
+    /// The opt-in takes the feature's place among the other items Honeykrisp lacks, each of
+    /// which rt names as it does.
+    #[test]
+    fn honeykrisp_below_the_floor_keeps_its_other_items() {
+        let line = below_floor_line("gpu", vk::DriverId::MESA_AGXV, &lacking_vertex_stores(true));
+        assert_eq!(
+            line,
+            "gpu: the device is below the runtime's floor: it lacks VK_EXT_robustness2; \
+             hk_enable_vertex_pipeline_stores_atomics=true in the environment, Honeykrisp's \
+             opt-in to vertexPipelineStoresAndAtomics"
+        );
+    }
+
+    /// Another driver lacking the feature is named by rt's refusal alone.
+    #[test]
+    fn another_driver_below_the_floor_is_named_by_rts_refusal() {
+        let below = lacking_vertex_stores(true);
+        let line = below_floor_line("gpu", vk::DriverId::MESA_LLVMPIPE, &below);
+        assert_eq!(line, format!("gpu: {below}"));
+        assert!(line.ends_with("VkPhysicalDeviceFeatures.vertexPipelineStoresAndAtomics"));
     }
 
     /// The line of the answers rt chose its forms on gives each floor answer by its name, in
