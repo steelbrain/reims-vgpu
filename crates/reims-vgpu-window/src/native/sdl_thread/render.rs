@@ -328,6 +328,8 @@ fn draw(
 mod tests {
     use super::*;
     use crate::geometry::{self, Insets};
+    use crate::handle::PixelRect;
+    use crate::present::{Drawn, Presenter};
 
     /// The process's device is made and let go on a thread of the render thread's own stack, as
     /// the render thread's presenter can ask for it first: the process's first device, so the
@@ -420,6 +422,51 @@ mod tests {
         assert!(surface.state.lock().take().is_some());
         surface.close();
         assert!(surface.next(None).is_none());
+    }
+
+    /// A presenter keeping the scale each draw is told.
+    struct Told(Arc<Mutex<Vec<f64>>>);
+
+    impl Presenter for Told {
+        fn draw(
+            &mut self,
+            _drawable: (u64, u64),
+            scale: f64,
+            _region: PixelRect,
+            _cursor: Option<&DrawnCursor>,
+            _overlay: Option<&DrawnOverlay>,
+        ) -> Drawn {
+            self.0.lock().push(scale);
+            Drawn::Presented
+        }
+    }
+
+    /// The guest is told the scale of its window's screen, from SDL's display scale of the
+    /// window (`os::screen_scale`, faked here) through the layout to the draw: a window whose
+    /// sizes are pixels (Windows, X11) on a screen at 150% tells 1.5, not its density of 1 (a
+    /// user's report), and one whose sizes are points (Wayland) still tells its density
+    #[test]
+    fn the_guest_is_told_its_screen_s_scale() {
+        let wayland = 3841.0 / 1829.0;
+        for (density, display_scale, told) in [(1.0, 1.5_f32, 1.5), (wayland, 2.1, wayland)] {
+            let layout = crate::sdl::shell::window_layout(
+                (1829.0, 1000.0),
+                density,
+                Insets::default(),
+                Some((2560, 1600)),
+                |d| crate::sdl::units::pixels_per_point(d, display_scale),
+            );
+            let surface = Surface::new();
+            surface.set_target(a_target());
+            surface.set_visible(true);
+            surface.set_layout(layout);
+            let work = surface.next(None).unwrap();
+            let scales = Arc::new(Mutex::new(Vec::new()));
+            let mut presenting = Presenting::default();
+            presenting.make(|| Some(Box::new(Told(Arc::clone(&scales)))));
+            draw(&mut presenting, &work.layout, None, None);
+            assert_eq!(*scales.lock(), [told], "{density} pixels a unit");
+        }
     }
 
     /// An overlay set or taken away asks for a draw; the UI thread is told once an overlay that

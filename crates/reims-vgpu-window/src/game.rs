@@ -526,9 +526,12 @@ pub(crate) mod tests {
         assert_eq!(begun(&mut game, &mouse, (3.0, 4.0)), Some(Hold::Raw));
         mouse.hide_for(2 * SETTLE_NS);
         assert_eq!(game.released(Some(&mouse)), Some(Hold::Unlock((3.0, 4.0))));
-        for (n, at) in [(3, (5.0, 5.0)), (20, (6.0, 5.0)), (200, (7.0, 5.0))] {
-            mouse.hide_for(n * SETTLE_NS);
-            assert_eq!(game.begin(&mouse, at), None, "{n} settles into the hide");
+        // Captured again, each capture's moves past the settle stay the tablet's.
+        for first in [3, 300] {
+            for (n, at) in [(first, (5.0, 5.0)), (first + 20, (6.0, 5.0))] {
+                mouse.hide_for(n * SETTLE_NS);
+                assert_eq!(game.begin(&mouse, at), None, "{n} settles into the hide");
+            }
             assert_eq!(game.end(), None, "capture changes");
         }
         mouse.show();

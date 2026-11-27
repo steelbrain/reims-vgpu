@@ -925,7 +925,7 @@ fn a_picture_of_the_stream_that_does_not_decode_lands_nothing_and_completes() {
     assert_eq!((counts.skipped, counts.not_decoded), (3, 2));
 }
 
-/// Of a session's pictures of the stream that do not decode, only its first is said
+/// Of a session's pictures of the stream that do not decode, only its first is said, at `warn`
 /// ([`HostVideoSession::not_decoded`] answers whether it said it), each session's own.
 #[test]
 fn a_session_says_its_first_picture_that_does_not_decode_alone() {
@@ -935,11 +935,20 @@ fn a_session_says_its_first_picture_that_does_not_decode_alone() {
         session(&p, Vec::new(), &Log::default()),
         session(&p, Vec::new(), &Log::default()),
     );
+    let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
     assert_eq!(
         [one.not_decoded(&not), one.not_decoded(&not)],
         [true, false]
     );
     assert!(two.not_decoded(&not));
+    // Each session's first is said at warn, the level a report carries by default.
+    let said: Vec<_> = logs
+        .take()
+        .into_iter()
+        .filter(|(_, _, line)| line.contains("does not decode"))
+        .map(|(level, ..)| level)
+        .collect();
+    assert_eq!(said, [log::Level::Warn; 2]);
     assert_eq!(one.counts.lock().not_decoded, 2);
     assert_eq!(two.counts.lock().not_decoded, 1);
 }
