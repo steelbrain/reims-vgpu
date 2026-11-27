@@ -176,6 +176,8 @@ mod compile;
 mod completion;
 mod create_waits;
 mod decode;
+#[cfg(any(target_os = "linux", windows))]
+mod decode_sizes;
 mod device_info;
 #[cfg(windows)]
 mod drawn;

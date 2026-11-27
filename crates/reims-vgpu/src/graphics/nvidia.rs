@@ -120,6 +120,7 @@ use super::av1::{GuestAv1, HOST_VIDEO_CODEC_AV1};
 use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
 };
+use super::decode_sizes::DecodeSizes;
 use super::gather::{GatherPipeline, Gatherer, Planar, gathers};
 use super::video_host::{
     BackendError, CONVERTED_CODE, DecodeOutput, Extent, Failed, HostDecoder, HostEncodeSession,
@@ -485,17 +486,34 @@ fn supported(gpu: &Gpu, codec: NvdecCodec, bit_depth: u32) -> Option<DecodeCapab
     }
 }
 
+/// What NVDEC answers of a codec at a chroma format and a depth ([`decode_capabilities`]), or
+/// why it answers nothing: the arm's own caps, which a session's start is checked against.
+type CapsOf<'a> = &'a dyn Fn(NvdecCodec, ChromaFormat, u32) -> Result<DecodeCapabilities, String>;
+
+/// Why NVDEC's decoders take none of `stream`'s pictures, a stream of `codec` the codec module
+/// takes, by what `caps` answers: an HEVC stream of the range extensions as
+/// [`declines_range_extensions`] says; any other but 4:2:0's; `None` where they decode it.
+fn declines(caps: CapsOf<'_>, codec: u32, stream: &Stream) -> Option<String> {
+    if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
+        return declines_range_extensions(caps, stream);
+    }
+    (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
+        format!(
+            "{NAME}'s decoders land 4:2:0 pictures, and HEVC's range extensions where NVDEC \
+             decodes them, alone"
+        )
+    })
+}
+
 /// Why NVDEC's decoders take none of `stream`'s pictures, an HEVC stream of the range
-/// extensions: NVDEC's caps of HEVC at the stream's chroma format and depth, which are to say it
-/// decodes it, into the output the decoder makes of them (4:2:0 into `SurfaceFormat::Nv12` at 8
-/// bits and `P016` past; 4:4:4 into its three planes, `Yuv444` at 8 bits and `Yuv444_16Bit`
-/// past), at the stream's size; `None` where they do. A 4:2:2 stream is declined whatever they
+/// extensions: `caps` of HEVC at the stream's chroma format and depth, which are to say it
+/// decodes it ([`declines_by`]); `None` where they do. A 4:2:2 stream is declined whatever they
 /// say: no decode of it into NVDEC's 4:2:2 outputs is built here.
-fn declines_range_extensions(gpu: &Gpu, stream: &Stream) -> Option<String> {
+fn declines_range_extensions(caps: CapsOf<'_>, stream: &Stream) -> Option<String> {
     let bits = u32::from(stream.luma_bits);
-    let (chroma, name) = match stream.chroma_format_idc {
-        1 => (ChromaFormat::Yuv420, "4:2:0"),
-        3 => (ChromaFormat::Yuv444, "4:4:4"),
+    let (chroma, what) = match stream.chroma_format_idc {
+        1 => (ChromaFormat::Yuv420, "HEVC 4:2:0"),
+        3 => (ChromaFormat::Yuv444, "HEVC 4:4:4"),
         2 => {
             return Some(format!(
                 "{NAME}'s decoders here land no HEVC 4:2:2 pictures"
@@ -507,13 +525,31 @@ fn declines_range_extensions(gpu: &Gpu, stream: &Stream) -> Option<String> {
             ));
         }
     };
-    let caps = match decode_capabilities(gpu, NvdecCodec::Hevc, chroma, bits) {
+    declines_by(
+        caps(NvdecCodec::Hevc, chroma, bits),
+        what,
+        chroma,
+        bits,
+        stream,
+    )
+}
+
+/// Why NVDEC's decoder of `answer`, the caps of `what` at `chroma` and `bits`, decodes none of
+/// `stream`'s pictures: where they do not say it decodes it, into the output the decoder makes
+/// of it (4:2:0 into `SurfaceFormat::Nv12` at 8 bits and `P016` past; 4:4:4 into its three
+/// planes, `Yuv444` at 8 bits and `Yuv444_16Bit` past), at the stream's size (`nMinWidth` and
+/// `nMinHeight` up to `nMaxWidth`, `nMaxHeight` and `nMaxMBCount`), as the decoder's make checks
+/// them; `None` where they do.
+fn declines_by(
+    answer: Result<DecodeCapabilities, String>,
+    what: &str,
+    chroma: ChromaFormat,
+    bits: u32,
+    stream: &Stream,
+) -> Option<String> {
+    let caps = match answer {
         Ok(caps) => caps,
-        Err(error) => {
-            return Some(format!(
-                "{NAME}'s caps of HEVC {name} at {bits} bits: {error}"
-            ));
-        }
+        Err(error) => return Some(format!("{NAME}'s caps of {what} at {bits} bits: {error}")),
     };
     let output = match (chroma, bits > 8) {
         (ChromaFormat::Yuv444, false) => SurfaceFormat::Yuv444,
@@ -521,30 +557,24 @@ fn declines_range_extensions(gpu: &Gpu, stream: &Stream) -> Option<String> {
         (_, true) => SurfaceFormat::P016,
         (_, false) => SurfaceFormat::Nv12,
     };
-    let (width, height) = (stream.width, stream.height);
+    let sizes = DecodeSizes {
+        min: (caps.min_width, caps.min_height),
+        max: (caps.max_width, caps.max_height),
+        max_macroblocks: Some(caps.max_macroblocks),
+    };
     if !caps.supported {
-        Some(format!("{NAME} does not decode HEVC {name} at {bits} bits"))
+        Some(format!("{NAME} does not decode {what} at {bits} bits"))
     } else if !caps.output_formats.contains(&output) {
         Some(format!(
-            "{NAME} writes HEVC {name} at {bits} bits as {:?}, not {output:?}",
+            "{NAME} writes {what} at {bits} bits as {:?}, not {output:?}",
             caps.output_formats
         ))
-    } else if width < caps.min_width || height < caps.min_height {
-        Some(format!(
-            "{NAME} decodes HEVC {name} from {}x{}, not {width}x{height}",
-            caps.min_width, caps.min_height
-        ))
-    } else if width > caps.max_width
-        || height > caps.max_height
-        || u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16))
-            > u64::from(caps.max_macroblocks)
-    {
-        Some(format!(
-            "{NAME} decodes HEVC {name} up to {}x{} ({} macroblocks), not {width}x{height}",
-            caps.max_width, caps.max_height, caps.max_macroblocks
-        ))
     } else {
-        None
+        sizes.declines(
+            &format!("{NAME} decodes {what}"),
+            stream.width,
+            stream.height,
+        )
     }
 }
 
@@ -737,26 +767,22 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
         }))
     }
 
-    /// 4:2:0 streams of Main and Main 10, HEVC's range extensions where NVDEC decodes them
-    /// ([`declines_range_extensions`]), AV1's at the depths and sizes its caps list
-    /// (`super::av1::declines`), and VP9's where NVDEC decodes the stream's profile at its depth
+    /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where NVDEC decodes them,
+    /// by NVDEC's own caps ([`declines`]); AV1's at the depths and sizes its caps list
+    /// (`super::av1::declines`); and VP9's where NVDEC decodes the stream's profile at its depth
     /// and size ([`declines_vp9`]).
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
         if codec == HOST_VIDEO_CODEC_AV1 {
             return super::av1::declines(NAME, self.0.av1, stream);
         }
-        if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
-            return declines_range_extensions(&self.0.gpu, stream);
-        }
         if codec == RGFX_VIDEO_CODEC_VP9 && stream.chroma_format_idc == 1 {
             return declines_vp9(self.0.vp9.as_ref(), stream);
         }
-        (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
-            format!(
-                "{NAME}'s decoders land 4:2:0 pictures, and HEVC's range extensions where NVDEC \
-                 decodes them, alone"
-            )
-        })
+        let gpu = &self.0.gpu;
+        let caps = |codec, chroma, bits| {
+            decode_capabilities(gpu, codec, chroma, bits).map_err(|error| error.to_string())
+        };
+        declines(&caps, codec, stream)
     }
 }
 

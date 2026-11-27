@@ -137,9 +137,9 @@ use reims_vgpu_video::vaapi::{
     H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, Target,
     TargetCodec, TargetFor, VideoEncoder, Vp9Decoder, encoder_support,
 };
+use reims_vgpu_video::vaapi::{SurfaceCapabilities, range_extensions_decoder, rt_format_names};
 #[cfg(unix)]
 use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, TargetChecks, TargetPlane, TargetShape};
-use reims_vgpu_video::vaapi::{range_extensions_decoder, rt_format_names};
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::num::ToUsize as _;
@@ -157,6 +157,7 @@ use super::av1::{GuestAv1, HOST_VIDEO_CODEC_AV1};
 use super::decode::{
     GraphicsVideo, GraphicsVideoSession, GuestDecoder, GuestEncoder, GuestOutput, PlanePages,
 };
+use super::decode_sizes::DecodeSizes;
 use reims_vgpu_video::paravirt::{Encoder, EncoderConfig, Stream};
 
 #[cfg(unix)]
@@ -384,9 +385,9 @@ struct VaapiVideo<P: Platform> {
     /// What writes pictures into device caches through their memory, where the platform makes
     /// caches of dma-bufs and the driver's checks passed anything (`cache_writes`, on Unix).
     targets: Option<Arc<CacheTargets<P>>>,
-    /// The driver's HEVC range extensions decoders it lists: what VideoToolbox's sessions of
-    /// those streams decode on ([`declines_range_extensions`]).
-    hevc_range_extensions: Vec<ConfigCapabilities>,
+    /// The driver's H.264 and HEVC decoders it lists: what VideoToolbox's sessions decode on,
+    /// checked at each one's start ([`declines`]).
+    decoders: Vec<ConfigCapabilities>,
     /// What the driver decodes of AV1 for VideoToolbox's decoders (`super::av1`): its
     /// `AV1Profile0` decoder's largest and smallest frames and depths; `None` where it lists
     /// none.
@@ -420,7 +421,12 @@ impl<P: Platform> VaapiVideo<P> {
         };
         let mut caps = caps_of(&capabilities);
         caps.extend(encode::encode_caps_of(&encoders, &capabilities));
-        let hevc_range_extensions = [
+        let decoders = [
+            Profile::H264_CONSTRAINED_BASELINE,
+            Profile::H264_MAIN,
+            Profile::H264_HIGH,
+            Profile::HEVC_MAIN,
+            Profile::HEVC_MAIN10,
             Profile::HEVC_MAIN12,
             Profile::HEVC_MAIN422_10,
             Profile::HEVC_MAIN422_12,
@@ -487,7 +493,7 @@ impl<P: Platform> VaapiVideo<P> {
             imports,
             copies,
             targets,
-            hevc_range_extensions,
+            decoders,
             av1,
             #[cfg(unix)]
             gathers: Arc::new(GatherPipeline::new(device)),
@@ -581,16 +587,13 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         true
     }
 
-    /// 4:2:0 streams of Main and Main 10, HEVC's range extensions where the driver's decoder of
-    /// their chroma format and depth decodes them ([`declines_range_extensions`]), AV1's at the
-    /// depths and sizes the driver lists (`super::av1::declines`), and VP9's where the driver's
-    /// config of the stream's profile takes its depth and size.
+    /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where the driver's
+    /// decoder of their chroma format and depth decodes them, by the driver's own answers
+    /// ([`declines`]); AV1's at the depths and sizes the driver lists (`super::av1::declines`);
+    /// and VP9's where the driver's config of the stream's profile takes its depth and size.
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
         if codec == HOST_VIDEO_CODEC_AV1 {
             return super::av1::declines(NAME, self.av1, stream);
-        }
-        if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
-            return declines_range_extensions(&self.hevc_range_extensions, stream);
         }
         if codec == RGFX_VIDEO_CODEC_VP9 && stream.chroma_format_idc == 1 {
             return Vp9Decoder::supports(
@@ -602,12 +605,7 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
             .err()
             .map(|error| format!("{NAME}: {error}"));
         }
-        (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
-            format!(
-                "{NAME}'s decoders land 4:2:0 pictures, and HEVC's range extensions where the \
-                 driver decodes them, alone"
-            )
-        })
+        declines(&self.decoders, codec, stream)
     }
 
     /// One for each codec the driver encodes a profile of (`encode::guest_encoders`).
@@ -670,6 +668,42 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
     }
 }
 
+/// Why the driver's decoders among `configs` take none of `stream`'s pictures, a stream of
+/// `codec` the codec module takes: an HEVC stream of the range extensions as
+/// [`declines_range_extensions`] says; any other but 4:2:0's; `None` where they decode it.
+fn declines(configs: &[ConfigCapabilities], codec: u32, stream: &Stream) -> Option<String> {
+    if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
+        return declines_range_extensions(configs, stream);
+    }
+    (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
+        format!(
+            "{NAME}'s decoders land 4:2:0 pictures, and HEVC's range extensions where the \
+             driver decodes them, alone"
+        )
+    })
+}
+
+/// The sizes `config`'s decoder takes, of `surfaces`: from the least its surfaces list (0 where
+/// they list none) up to the largest the config lists, else its surfaces.
+fn sizes_of(config: &ConfigCapabilities, surfaces: Option<&SurfaceCapabilities>) -> DecodeSizes {
+    let listed = |of: fn(&SurfaceCapabilities) -> Option<u32>| surfaces.and_then(of);
+    DecodeSizes {
+        min: (
+            listed(|s| s.min_width).unwrap_or(0),
+            listed(|s| s.min_height).unwrap_or(0),
+        ),
+        max: (
+            (config.max_width)
+                .or(listed(|s| s.max_width))
+                .unwrap_or(u32::MAX),
+            (config.max_height)
+                .or(listed(|s| s.max_height))
+                .unwrap_or(u32::MAX),
+        ),
+        max_macroblocks: None,
+    }
+}
+
 /// Why the driver decodes none of an HEVC range extensions `stream`'s pictures into the surfaces
 /// the VA crate's decoder lands them from, `None` where it decodes them: on the decoder among
 /// `configs` of the profile of the stream's chroma format and depth (`range_extensions_decoder`),
@@ -710,29 +744,11 @@ fn declines_range_extensions(configs: &[ConfigCapabilities], stream: &Stream) ->
             formats.join(", ")
         ));
     }
-    let (width, height) = (stream.width, stream.height);
-    let (min_width, min_height) = (
-        surfaces.min_width.unwrap_or(0),
-        surfaces.min_height.unwrap_or(0),
-    );
-    let (max_width, max_height) = (
-        config.max_width.or(surfaces.max_width).unwrap_or(u32::MAX),
-        config
-            .max_height
-            .or(surfaces.max_height)
-            .unwrap_or(u32::MAX),
-    );
-    if width < min_width || height < min_height {
-        Some(format!(
-            "{NAME} decodes {name} from {min_width}x{min_height}, not {width}x{height}"
-        ))
-    } else if width > max_width || height > max_height {
-        Some(format!(
-            "{NAME} decodes {name} up to {max_width}x{max_height}, not {width}x{height}"
-        ))
-    } else {
-        None
-    }
+    sizes_of(config, Some(surfaces)).declines(
+        &format!("{NAME} decodes {name}"),
+        stream.width,
+        stream.height,
+    )
 }
 
 /// The caps of H.264, HEVC and VP9 decode the driver's answers give (module doc); an entry for
