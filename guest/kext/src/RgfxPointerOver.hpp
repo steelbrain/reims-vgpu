@@ -4,16 +4,12 @@
 // the display its cursor is on, so the kext moves the cursor onto that display, at that point,
 // before the tablet's next position comes (ReimsGraphicsPointer.cpp).
 //
-// The point is in WindowServer's global space, in which it placed each display: on x86-64 each
-// framebuffer holds its display's rectangle there as WindowServer gave it (IOFBSetBounds, which
-// IOFramebuffer::getBoundingRect reads), the space the cursor's moves arrive in
-// (IOFramebuffer::extSetCursorPosition); on arm64 the kext learns each one from its own moves
-// (RgfxDisplayPlaces.hpp). The display's pixel lies in that rectangle as the pixel
-// lies in the display's mode, scaled from the mode's pixels to the rectangle's size. Measured on
-// x86-64 macOS 11.7.11, 15.8.2 and 26.7.2 with two 1920 x 1080 displays side by side: each
-// framebuffer's rectangle is the display's CGDisplayBounds, and IOHIDSystem's mouse-moved posted
-// at a point of display 1's rectangle puts the cursor there (lane ptrcross, potluck jobs
-// m3-max-34583 to 34585).
+// IOHIDSystem's post takes a point in WindowServer's virtual desktop. On x86-64 the framebuffer
+// holds the virtual rectangle WindowServer gave it (IOFBSetBounds); on arm64 the kext learns
+// each rectangle from its own moves (RgfxDisplayPlaces.hpp). Scale the scanout pixels into that
+// rectangle. Measured on x86-64 macOS 11.7.11, 15.8.2 and 26.7.2 with two 1920 x 1080 displays
+// side by side: a mouse-moved posted at a point in display 1's CGDisplayBounds puts the cursor
+// there (lane ptrcross, potluck jobs m3-max-34583 to 34585).
 //
 // The move is a mouse-moved where no button is held, and the drag of the button held where one is,
 // as IOHIDSystem's own moves are (the left button's before the right's, the right's before any

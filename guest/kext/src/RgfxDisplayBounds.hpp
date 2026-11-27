@@ -1,7 +1,7 @@
 // RgfxDisplayBounds: which displays' rectangles the kext tells the host in DISPLAY_BOUNDS
 // (design.md, "Multiple displays", "A drag across displays"). On x86-64 each framebuffer holds its
-// display's rectangle in WindowServer's global space as WindowServer placed it (IOFBSetBounds,
-// which IOFramebuffer::getBoundingRect reads; RgfxPointerOver.hpp), and on arm64 the kext holds
+// display's virtual desktop rectangle as WindowServer placed it (IOFBSetBounds, which
+// IOFramebuffer::getBoundingRect reads; RgfxPointerOver.hpp), and on arm64 the kext holds
 // each one a landing of its own moves of the cursor confirmed (RgfxDisplayPlaces.hpp); the host
 // carries its captured pointer past one display's edge onto the display whose rectangle meets it
 // there. Each move of the cursor, on any display, tells the host every display's rectangle that
@@ -20,6 +20,15 @@
 
 #include "RgfxPointerOver.hpp"
 #include "reims_graphics_wire.h"
+
+// IOFramebuffer's getBoundingRect returns its physical and virtual rectangles in order.
+// IOFBSetBounds supplies both, or IOFramebuffer uses the sole rectangle for both.
+template <class Bounds>
+inline RgfxGlobalRect rgfxFramebufferDesktopBounds(const Bounds *bounds)
+{
+	const Bounds &rect = bounds[1];
+	return {rect.minx, rect.miny, rect.maxx, rect.maxy};
+}
 
 // The rectangle the host was last told of each display, by id, where it was told one.
 struct RgfxBoundsTold {

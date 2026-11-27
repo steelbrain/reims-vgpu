@@ -19,10 +19,38 @@ void check(bool ok, const char *what)
 		std::exit(1);
 	}
 }
+
+void mixedScaleDesktop()
+{
+	// IOFramebuffer keeps the physical and virtual desktop rectangles, in that order.
+	const RgfxGlobalRect framebuffers[2][2] = {
+	    {{0, 0, 3840, 2160}, {0, 0, 1920, 1080}},
+	    {{3840, 0, 6400, 1440}, {1920, 0, 4480, 1440}},
+	};
+	const RgfxGlobalRect left = rgfxFramebufferDesktopBounds(framebuffers[0]);
+	const RgfxGlobalRect right = rgfxFramebufferDesktopBounds(framebuffers[1]);
+	int32_t x = 0, y = 0;
+	check(rgfxPointerGlobal(right, 2560, 1440, 2, 653, &x, &y) && x == 1922 && y == 653,
+	      "crossing onto the native display uses its virtual origin");
+	check(rgfxPointerGlobal(left, 3840, 2160, 3834, 943, &x, &y) && x == 1917 && y == 471,
+	      "crossing back scales scanout pixels into the HiDPI desktop rectangle");
+
+	// Both displays were native before the switch. Their physical rectangles stay the same.
+	RgfxBoundsTold told = {};
+	rgfxBoundsWereTold(&told, 0, framebuffers[0][0]);
+	rgfxBoundsWereTold(&told, 1, framebuffers[1][0]);
+	check(rgfxBoundsToTell(told, 0, left) && rgfxBoundsToTell(told, 1, right),
+	      "a HiDPI switch reports the resized display and the moved neighbor");
+	const RgfxDisplayBounds command = rgfxBoundsCommand(1, right);
+	check(command.min_x == 1920 && command.max_x == 4480 && command.max_y == 1440,
+	      "DISPLAY_BOUNDS uses the same desktop rectangle as the pointer post");
+}
 } // namespace
 
 int main()
 {
+	mixedScaleDesktop();
+
 	// The wire's command: 40 bytes, the display then the rectangle past the 16-byte header.
 	check(sizeof(RgfxDisplayBounds) == 40 && RGFX_CMD_DISPLAY_BOUNDS == 9, "the wire's");
 	check(offsetof(RgfxDisplayBounds, display) == 16 && offsetof(RgfxDisplayBounds, min_x) == 20 &&
