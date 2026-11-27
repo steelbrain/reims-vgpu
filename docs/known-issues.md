@@ -71,9 +71,9 @@ has no player for them at all:
   from a GPU as 4:2:0 at 10 bits, which loses colour detail, so the guest keeps decoding them in
   software at full quality.
 - **JPEG decoding on arm64 guests.** macOS 14.6.1 and 26.6.2 look for Apple's own JPEG and scaler
-  hardware by name before they hand a photo or a Motion JPEG video to a GPU. A virtual machine
-  has neither, so they decode JPEG in software. Our virtual GPU decodes JPEG when asked
-  directly, but no app's route asks it.
+  hardware by name before they hand a photo or a Motion JPEG video to a GPU. Our virtual
+  machines have neither, so they decode JPEG in software. Our virtual GPU decodes JPEG when
+  asked directly, but no app's route asks it.
 - **MPEG-1, MPEG-2, MPEG-4 Part 2, VC-1 and VP8 decoding, and VP9 and AV1 encoding.** We found no
   way in macOS for a GPU to take these.
 
