@@ -110,6 +110,11 @@ impl CommitMark {
         self.wake();
     }
 
+    /// The highest seqno of the queue's ring whose buffer was committed, stood in for or failed.
+    pub(crate) fn through(&self) -> u64 {
+        self.through.load(Ordering::SeqCst)
+    }
+
     /// Whether the queue's buffers through `seqno` were committed, stood in for or failed, the
     /// queue's end aside.
     pub(crate) fn committed_through(&self, seqno: u64) -> bool {

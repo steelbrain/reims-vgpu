@@ -2050,12 +2050,25 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         };
         let answer = early.then_some(&mut answer as &mut dyn FnMut());
+        // The fills its uses ask are its, which a fill behind a buffer ordered after it finds
+        // ([`super::surface_cache::CacheCounts::behind_later`]).
+        let asker = super::surface_cache::Asker {
+            queue: m.queue_obj_id,
+            marks: Arc::clone(&counts.order),
+            seqno: m.header.seqno,
+        };
         let super::surface_cache::Begin {
             waits: fill_waits,
             follows,
             out_of_memory,
-            uses,
-        } = (self.surface_caches).before_answering(device, &cb, &take.uses, &reach, answer)?;
+            mut uses,
+        } = (self.surface_caches).before_answering(
+            device,
+            &cb,
+            &take.uses,
+            (&reach, Some(&asker)),
+            answer,
+        )?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
         // off it (`surface_order`): those its op names, and the decodes completed ahead of their
         // ends whose outputs it uses, which the guest's slots no longer name.
@@ -2080,6 +2093,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             Vec::new()
         };
         let waits_for_order = !order_waits.is_empty();
+        // What its end waits for on the GPU, for a later fill of a cache it uses
+        // ([`super::surface_cache::Uses::waits_on`]).
+        if let Some(uses) = uses.as_mut() {
+            uses.waits_on(
+                order_waits
+                    .iter()
+                    .map(super::surface_order::OrderWait::held),
+            );
+        }
         *self.order_waits.borrow_mut() = order_waits;
         // Those GPU waits hold back none of its records, nor its queue ([`Line`]), and nor do the
         // fills of caches made at its begin: only an event's wait, or a deferred copy's, does.
@@ -6713,16 +6735,15 @@ mod tests {
         p.world().complete_all(CompleteOn::Caller);
     }
 
-    /// A buffer of another queue that names in its `SURFACE_ORDER` a decode its queue's thread has
-    /// not yet walked, and that uses the decode's output, is begun only once the decode is
-    /// committed, though its queue's thread took it first: so the decode's begin, which fills the
-    /// output's cache for the CPU's newer generation, finds it among no user of the cache, and its
-    /// fill waits on the GPU for none of its end. Begun first, as the guest's order across queues
-    /// was not, the reader's end was among the fill's waits, while the reader waited on the GPU
-    /// for the decode's signal, which the decode's commit carries after its walk, and its walk
-    /// waited on the CPU for that fill: the host's video stall on Windows (lane stallread).
-    #[test]
-    fn a_buffer_naming_a_decode_not_yet_walked_begins_after_its_commit() {
+    /// [`cached_video`]'s rig with command queue 3 made too, and two buffers: queue 3's reader of
+    /// the block at seqno 1, which names in its `SURFACE_ORDER` queue 1's buffer at seqno 2; and
+    /// that buffer, a decode into the block at the CPU's generation 1, past the generation 0 queue
+    /// 1's buffer at seqno 1 fills the cache at ([`writes_cached_video`]).
+    fn named_ahead() -> (
+        super::super::surface_pages::tests::Rig,
+        Arc<VideoSeen>,
+        [Vec<u8>; 2],
+    ) {
         use super::super::surface_pages::tests::BLOCK;
         use reims_vgpu_graphics::ops::{
             RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse,
@@ -6780,6 +6801,20 @@ mod tests {
         ops.extend(op(RGFX_OP_ENCODER_END, &[]));
         let decoding = on(1, 101, 2, &ops);
 
+        (r, seen, [reader, decoding])
+    }
+
+    /// A buffer of another queue that names in its `SURFACE_ORDER` a decode its queue's thread has
+    /// not yet walked, and that uses the decode's output, is begun only once the decode is
+    /// committed, though its queue's thread took it first: so the decode's begin, which fills the
+    /// output's cache for the CPU's newer generation, finds it among no user of the cache, and its
+    /// fill waits on the GPU for none of its end. Begun first, as the guest's order across queues
+    /// was not, the reader's end was among the fill's waits, while the reader waited on the GPU
+    /// for the decode's signal, which the decode's commit carries after its walk, and its walk
+    /// waited on the CPU for that fill: the host's video stall on Windows (lane stallread).
+    #[test]
+    fn a_buffer_naming_a_decode_not_yet_walked_begins_after_its_commit() {
+        let (r, seen, [reader, decoding]) = named_ahead();
         let p = Arc::clone(&r.p);
         let device = p.device();
         let marks = Arc::clone(&r.dec.queue_counts(1).expect("queue 1").order);
@@ -6787,7 +6822,9 @@ mod tests {
         let mut second = r.dec.sender(None, super::super::Sinks::default());
         // Queue 1's first buffer fills the cache at generation 0, and is committed and done.
         let message = writes_cached_video(100, 1, false);
-        let begun = first.begin_taken(&device, &message, Some(1), false).unwrap();
+        let begun = first
+            .begin_taken(&device, &message, Some(1), false)
+            .unwrap();
         let begun = begun.unwrap();
         assert_eq!(
             first
@@ -6814,8 +6851,10 @@ mod tests {
                 waits && !taken_first.is_finished(),
                 "the reader was begun before the decode it names was committed"
             );
-            let begun = (first.begin_taken(device, &decoding, Some(1), false).unwrap())
-                .expect("the decode is begun");
+            let begun = (first
+                .begin_taken(device, &decoding, Some(1), false)
+                .unwrap())
+            .expect("the decode is begun");
             // The decode's begin filled the cache; done, its decode lands.
             p.world().complete_all(CompleteOn::Caller);
             assert_eq!(
@@ -6829,6 +6868,70 @@ mod tests {
         });
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(seen.decodes.lock().len(), 1, "the decode is handed over");
+    }
+
+    /// A fill that waits on the GPU, among the command buffers that used its cache, for one that
+    /// waits on the GPU for the buffer whose begin asked the fill is counted, and named in what a
+    /// video op's wait for it waits on ([`super::super::surface_cache::CacheCounts::behind_later`]):
+    /// here queue 3's reader, begun and finished before the decode it names, and the decode's
+    /// fill of its output, which its video op waits for on the CPU.
+    #[test]
+    fn a_fill_behind_a_buffer_ordered_after_its_asker_is_counted_and_named() {
+        use super::super::surface_pages::tests::BLOCK;
+
+        let (r, seen, [reader, decoding]) = named_ahead();
+        let p = Arc::clone(&r.p);
+        let device = p.device();
+        let mut first = r.dec.sender(None, super::super::Sinks::default());
+        let mut second = r.dec.sender(None, super::super::Sinks::default());
+        let message = writes_cached_video(100, 1, false);
+        let begun = first
+            .begin_taken(&device, &message, Some(1), false)
+            .unwrap();
+        let begun = begun.unwrap();
+        assert_eq!(
+            first
+                .finish_command_buffer(&device, &message, begun)
+                .unwrap(),
+            Ok(())
+        );
+        first.end_message();
+        p.world().complete_all(CompleteOn::Caller);
+        let begun = (second
+            .begin_taken(&device, &reader, Some(3), false)
+            .unwrap())
+        .expect("the reader is begun");
+        let done = second.finish_command_buffer(&device, &reader, begun);
+        assert_eq!(done.unwrap(), Ok(()));
+        second.end_message();
+        assert_eq!(r.dec.caches().counts().behind_later, 0);
+        let begun = (first
+            .begin_taken(&device, &decoding, Some(1), false)
+            .unwrap())
+        .expect("the decode is begun");
+        assert_eq!(r.dec.caches().counts().behind_later, 1, "the decode's fill");
+        let named = r.dec.caches().waits_named(BLOCK);
+        assert!(
+            named.contains("asked by queue 0x1's buffer 2")
+                && named.contains(
+                    "queue 0x3's end at 1 (its buffer at end 1 waits on the GPU for \
+                                   queue 0x1's buffer 2, which the host took through 1 and \
+                                   committed through 1, ordered after the buffer that asked the \
+                                   fill)"
+                ),
+            "{named}"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            first
+                .finish_command_buffer(&device, &decoding, begun)
+                .unwrap(),
+            Ok(())
+        );
+        first.end_message();
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(seen.decodes.lock().len(), 1, "the decode is handed over");
+        assert_eq!(r.dec.caches().counts().behind_later, 1);
     }
 
     /// A decoder's output that its client locks to read each picture is copied into its pages

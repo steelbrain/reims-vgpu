@@ -536,6 +536,7 @@ use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 
 use super::refusing;
+use super::surface_order::Marks;
 use super::surface_pages::{PagesRefusal, SurfaceView, Unmade, buffer_over};
 use super::worker::Worker;
 use crate::device_writes::{self, Watcher};
@@ -676,6 +677,9 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// Each queue whose command buffers used the cache since its last copy, with the value of the
     /// queue's end event the latest of them signals.
     users: HashMap<u64, u64>,
+    /// What its last fill waited for on the GPU, for the log of a wait for it
+    /// ([`Caches::waits_named`]).
+    fill_waited: FillWaited,
     /// The copies of the cache asked while command buffers they follow were begun and not
     /// finished ([`Deferred`]): how many were asked, and how many made, each its number in that
     /// order; and the event each signals to its number once it is made, which the command buffers
@@ -2261,6 +2265,12 @@ pub(crate) struct CacheCounts {
     /// buffers' uses of a cache: each where the platform made no event to wait on the GPU with
     /// ([`Caches::before_answering`]), or a decode's for a deferred fill ([`Caches::wait_filled`]).
     pub(crate) cpu_waits: u64,
+    /// Fills that waited on the GPU, among the command buffers that used their cache, for one
+    /// that waits on the GPU for the buffer whose begin asked the fill, or for a later buffer of
+    /// its queue, not yet finished ([`SurfaceCaches::held`]): a fill behind a command buffer the
+    /// guest ordered after the one that asked it. Where that buffer's video ops wait on the CPU
+    /// for the fill ([`Caches::wait_filled`]), neither ever finishes.
+    pub(crate) behind_later: u64,
     /// Command buffers that use a cache and ask for their `CB_SUBMITTED`, looked at on a
     /// doorbell's thread with the caches' lock free ([`Caches::waits_for_nothing`]): those that
     /// wait for no copy of their caches, which the doorbell may answer, and those that wait for
@@ -2506,6 +2516,57 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// ([`Self::fill`], [`Self::fill_shapes`]): a begin's fails its command buffer
     /// ([`Begin::out_of_memory`]).
     memory_refused: bool,
+    /// The command buffers finished that used a cache and wait on the GPU for a buffer of another
+    /// queue that had not finished then, each as the cache's users name it: by its queue and the
+    /// value of its end event. Those finished since are let go of as another is kept
+    /// ([`Self::after`]).
+    held: Vec<HeldUser>,
+    /// The command buffer whose begin asks the fill being made or asked now
+    /// ([`Caches::before_answering`]), taken by that fill ([`Self::fill`], [`Self::fill_shapes`],
+    /// [`Self::defer_fill`], [`Self::defer_shapes_fill`]); `None` for any other fill.
+    asker: Option<Asker>,
+}
+
+/// A command buffer whose begin asks a cache's fill ([`Caches::before_answering`]): its queue,
+/// the queue's marks in the surface order, and its seqno ([`CacheCounts::behind_later`]).
+#[derive(Clone)]
+pub(crate) struct Asker {
+    pub(crate) queue: u64,
+    pub(crate) marks: Arc<Marks>,
+    pub(crate) seqno: u64,
+}
+
+/// A command buffer that used a cache and, when it was finished, waited on the GPU for a buffer
+/// of another queue not yet finished ([`SurfaceCaches::held`]).
+struct HeldUser {
+    /// Its queue, and the value of the queue's end event it signals.
+    queue: u64,
+    end: u64,
+    /// The queue it waits for, with its marks, and the seqno.
+    on: u64,
+    marks: Arc<Marks>,
+    seqno: u64,
+}
+
+impl HeldUser {
+    /// Whether it waits, still, for `by`'s buffer or a later one of its queue.
+    fn behind(&self, by: &Asker) -> bool {
+        Arc::ptr_eq(&self.marks, &by.marks)
+            && self.seqno >= by.seqno
+            && !self.marks.finished(self.seqno)
+    }
+}
+
+/// What a cache's fill waited for on the GPU ([`SurfaceCaches::fill`],
+/// [`SurfaceCaches::fill_shapes`]): for the log of a wait for it ([`Caches::waits_named`]).
+#[derive(Default)]
+struct FillWaited {
+    /// The command buffer whose begin asked it, where one did: its queue and seqno.
+    by: Option<(u64, u64)>,
+    /// The cache's users then, each queue with the value of its end event, by queue.
+    users: Vec<(u64, u64)>,
+    /// It waited for the cache's copy into its pages still landing.
+    out: bool,
 }
 
 /// The name of the threads, `<name>-<i>`, that carry out a staged copy out of a cache once its
@@ -2619,6 +2680,8 @@ enum Asked<P: Platform> {
         /// Of the shapes alone ([`SurfaceCaches::fill_shapes`]): the generation and the host's
         /// writes are those the cache holds when it is asked.
         shapes: bool,
+        /// The command buffer whose begin asked it ([`SurfaceCaches::asker`]).
+        by: Option<Asker>,
     },
     /// A copy out of the cache.
     Out(CopyOut<P>),
@@ -2772,6 +2835,8 @@ impl<P: Platform> SurfaceCaches<P> {
             let_go: Vec::new(),
             lands_out: Arc::new(Worker::new(INTO_PAGES_THREADS)),
             memory_refused: false,
+            held: Vec::new(),
+            asker: None,
         }
     }
 
@@ -3066,6 +3131,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 owner: None,
                 zeros: false,
                 users: HashMap::default(),
+                fill_waited: FillWaited::default(),
                 asked: 0,
                 made: 0,
                 event: None,
@@ -3333,6 +3399,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 owner: None,
                 zeros: false,
                 users: HashMap::default(),
+                fill_waited: FillWaited::default(),
                 asked: 0,
                 made: 0,
                 event: None,
@@ -3842,6 +3909,76 @@ impl<P: Platform> SurfaceCaches<P> {
             fills: Arc::clone(&t.fills),
             value: cache.filled_at,
         })
+    }
+
+    /// [`Caches::waits_named`] under the lock.
+    pub(crate) fn waits_named(&self, block: u64) -> String {
+        use std::fmt::Write as _;
+
+        let Some(cache) = self.by_block.get(&block) else {
+            return "nothing: the block has no device cache".to_owned();
+        };
+        let mut named = String::new();
+        if self.fill_deferred(block) {
+            let _ = write!(
+                named,
+                "its fill, asked behind the command buffers begun and not finished that use the \
+                 cache ({} now) and not yet made",
+                self.pending(block, false)
+            );
+        } else if let Some(t) = self.transfer.as_ref()
+            && cache.filled_at != 0
+            && !t.fills.reached(cache.filled_at)
+        {
+            let waited = &cache.fill_waited;
+            let _ = write!(named, "its fill at transfer value {}", cache.filled_at);
+            if let Some((queue, seqno)) = waited.by {
+                let _ = write!(named, ", asked by queue {queue:#x}'s buffer {seqno}");
+            }
+            named.push_str(", which waits on the GPU for");
+            if waited.users.is_empty() {
+                named.push_str(" no command buffer's end");
+            }
+            for (i, &(queue, end)) in waited.users.iter().enumerate() {
+                let sep = if i == 0 { "" } else { "," };
+                let _ = write!(named, "{sep} queue {queue:#x}'s end at {end}");
+                for h in (self.held.iter()).filter(|h| h.queue == queue && h.end <= end) {
+                    let (taken, committed, done) = h.marks.progress();
+                    if done >= h.seqno {
+                        continue;
+                    }
+                    let after = (waited.by).is_some_and(|(q, s)| h.on == q && h.seqno >= s);
+                    let _ = write!(
+                        named,
+                        " (its buffer at end {} waits on the GPU for queue {:#x}'s buffer {}, \
+                         which the host took through {taken} and committed through \
+                         {committed}{})",
+                        h.end,
+                        h.on,
+                        h.seqno,
+                        if after {
+                            ", ordered after the buffer that asked the fill"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            if waited.out {
+                named.push_str(", and the cache's copy into its pages");
+            }
+        }
+        let landing = (cache.read_back.copy.as_ref()).is_some_and(|c| !c.landing.landed());
+        if landing {
+            if !named.is_empty() {
+                named.push_str("; ");
+            }
+            named.push_str("its early copy into its pages, still landing");
+        }
+        if named.is_empty() {
+            named.push_str("nothing of the caches' now");
+        }
+        named
     }
 
     /// Whether a fill of the block at `block`'s cache is asked and not yet made: there is a
@@ -4821,6 +4958,7 @@ impl<P: Platform> SurfaceCaches<P> {
             host: self.watched.writes(block),
             filled: Arc::clone(&filled),
             shapes: false,
+            by: self.asker.take(),
         };
         self.defer(device, block, false, fill);
         self.owes_none(block);
@@ -4841,6 +4979,7 @@ impl<P: Platform> SurfaceCaches<P> {
             host,
             filled: Arc::clone(&filled),
             shapes: true,
+            by: self.asker.take(),
         };
         self.defer(device, block, false, fill);
         self.counts.shapes.fills_deferred += 1;
@@ -4913,8 +5052,10 @@ impl<P: Platform> SurfaceCaches<P> {
                 generation,
                 filled,
                 shapes,
+                by,
                 ..
             } => {
+                self.asker = by;
                 let made = match refusing(|| match shapes {
                     true => self.fill_shapes(&device, block),
                     false => self.fill(&device, block, generation),
@@ -4930,6 +5071,7 @@ impl<P: Platform> SurfaceCaches<P> {
                         None
                     }
                 };
+                self.asker = None;
                 let fills = self.transfer.as_ref().map(|t| Arc::clone(&t.fills));
                 filled.set(made.zip(fills).map(|(value, fills)| (fills, value)));
                 // A present waiting for it is told as for a fill that finished.
@@ -5086,13 +5228,15 @@ impl<P: Platform> SurfaceCaches<P> {
     /// Ends command buffer `cb` of queue `queue`, whose counts among the caches' users are
     /// `counts`: it signals the queue's end event, which a later copy of each cache waits for,
     /// the cache's next or, where the buffer was counted after a deferred copy of it was asked,
-    /// the next after that copy ([`Since`]).
+    /// the next after that copy ([`Since`]). Where it waits on the GPU for buffers of other
+    /// queues not yet finished (`holds`, [`Uses::waits_on`]), it is kept among [`Self::held`].
     pub(crate) fn after(
         &mut self,
         device: &P::Device,
         queue: u64,
         cb: &P::CommandBuffer,
         counts: &[Count],
+        holds: &[(u64, Arc<Marks>, u64)],
     ) -> RaiseResult<()> {
         if counts.is_empty() {
             return Ok(());
@@ -5109,6 +5253,20 @@ impl<P: Platform> SurfaceCaches<P> {
             cb.encode_signal(Some(EventRef::Event(event)), *value)?;
             *value
         };
+        if !holds.is_empty() {
+            (self.held).retain(|h| !h.marks.finished(h.seqno) && !h.marks.commit.has_ended());
+            for (on, marks, seqno) in holds {
+                if !marks.finished(*seqno) {
+                    self.held.push(HeldUser {
+                        queue,
+                        end: value,
+                        on: *on,
+                        marks: Arc::clone(marks),
+                        seqno: *seqno,
+                    });
+                }
+            }
+        }
         for c in counts {
             match self.since_mut(c.block, c.number) {
                 Some(since) => {
@@ -5275,6 +5433,7 @@ impl<P: Platform> SurfaceCaches<P> {
         block: u64,
         generation: u64,
     ) -> RaiseResult<Option<u64>> {
+        let asker = self.asker.take();
         self.touch_shapes(block);
         if !self.make_transfer(device)? {
             return Ok(None);
@@ -5307,6 +5466,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         wait_before::<P>(&cb, signal.as_ref())?;
         wait_for_users::<P>(&cb, &self.ends, cache)?;
+        note_fill_waits(cache, asker, &self.held, &mut self.counts);
         let timed = self.staged.as_ref();
         let mut reserve = self.reserved.remove(&block).unwrap_or_default();
         reserve.extend(self.left_over.remove(&block).unwrap_or_default());
@@ -5388,6 +5548,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// another shape copies through the buffer, its memory made. The transfer event's value at
     /// which it is done; `None` where it made none, as where nothing was left to fill.
     fn fill_shapes(&mut self, device: &P::Device, block: u64) -> RaiseResult<Option<u64>> {
+        let asker = self.asker.take();
         self.touch_shapes(block);
         if self.take_zeros(block) {
             return Ok(None);
@@ -5427,6 +5588,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         wait_before::<P>(&cb, signal.as_ref())?;
         wait_for_users::<P>(&cb, &self.ends, cache)?;
+        note_fill_waits(cache, asker, &self.held, &mut self.counts);
         #[cfg(windows)]
         let planes = cache.shapes.iter().any(|s| s.plane && s.owed);
         let timed = self.staged.as_ref();
@@ -6815,9 +6977,20 @@ pub(crate) struct Uses<P: Platform> {
     /// Its work is video alone ([`Reach::video`]): its uses' writes are its decodes', into the
     /// caches' buffers ([`SurfaceCaches::unseen_writes`]).
     video: bool,
+    /// What it waits for on the GPU of other queues' buffers ([`Self::waits_on`]).
+    holds: Vec<(u64, Arc<Marks>, u64)>,
 }
 
 impl<P: Platform> Uses<P> {
+    /// The command buffer waits on the GPU for `holds`, buffers of other queues, each its queue,
+    /// the queue's marks and the value of its surface timeline waited for
+    /// ([`super::surface_order::OrderWait::held`]): kept where they have not finished as it is
+    /// finished, so a later fill of a cache it used finds what its end waits for
+    /// ([`SurfaceCaches::held`]).
+    pub(crate) fn waits_on(&mut self, holds: impl IntoIterator<Item = (u64, Arc<Marks>, u64)>) {
+        self.holds.extend(holds);
+    }
+
     /// The command buffer's walk saw `blocks` written through textures over their caches or
     /// their wide homes, and copied each write into the other side ([`Caches::reconcile`]).
     pub(crate) fn saw_written(&mut self, blocks: impl IntoIterator<Item = u64>) {
@@ -7721,7 +7894,7 @@ impl<P: Platform> Caches<P> {
         uses: &[RgfxOpSurfaceUse],
         reach: &Reach,
     ) -> RaiseResult<(bool, Option<Uses<P>>)> {
-        let begin = self.before_answering(device, cb, uses, reach, None)?;
+        let begin = self.before_answering(device, cb, uses, (reach, None), None)?;
         Ok((begin.waits, begin.uses))
     }
 
@@ -7761,7 +7934,7 @@ impl<P: Platform> Caches<P> {
         device: &P::Device,
         cb: &P::CommandBuffer,
         uses: &[RgfxOpSurfaceUse],
-        reach: &Reach,
+        (reach, asker): (&Reach, Option<&Asker>),
         answer: Option<&mut dyn FnMut()>,
     ) -> RaiseResult<Begin<P>> {
         if uses.is_empty() && (!reach.work || self.unlocked.nothing_to_do(device.recoveries())) {
@@ -7796,7 +7969,7 @@ impl<P: Platform> Caches<P> {
                 state = self.lock();
             }
         }
-        let before = self.before_locked(state, device, cb, uses, reach);
+        let before = self.before_locked(state, device, cb, uses, (reach, asker));
         drop(answered);
         let (waits, out_of_memory, uses) = before?;
         let follows = uses.as_ref().is_some_and(|u| !u.follows.is_empty());
@@ -7817,7 +7990,7 @@ impl<P: Platform> Caches<P> {
         device: &P::Device,
         cb: &P::CommandBuffer,
         uses: &[RgfxOpSurfaceUse],
-        reach: &Reach,
+        (reach, asker): (&Reach, Option<&Asker>),
     ) -> RaiseResult<(bool, bool, Option<Uses<P>>)> {
         // The pieces the first fills the buffer's work reaches, and a recovery's refills, would
         // make for want of a spare are made with the lock let go of, and reserved for their
@@ -7928,6 +8101,7 @@ impl<P: Platform> Caches<P> {
             shapes: Vec::new(),
             over: Vec::new(),
             video: reach.video && !reach.work,
+            holds: Vec::new(),
         };
         let mut waits = reached;
         let mut raised = None;
@@ -7937,7 +8111,10 @@ impl<P: Platform> Caches<P> {
             let video = reach.video && !reach.work;
             let named = named.contains(&u.block_offset);
             let reaches = (decoded, video, reach.video, named);
+            // The fill the use makes or asks, if any, takes it ([`SurfaceCaches::asker`]).
+            state.asker = asker.cloned();
             let (count, follows) = state.before_one(device, cb, u, reaches);
+            state.asker = None;
             // Counted at once, so a later copy of the block follows this buffer.
             held.blocks.extend(count);
             match follows {
@@ -8072,7 +8249,10 @@ impl<P: Platform> Caches<P> {
                     })
                 })
                 .collect();
-            (state.after(device, queue, cb, &uses.blocks), buffers)
+            (
+                state.after(device, queue, cb, &uses.blocks, &uses.holds),
+                buffers,
+            )
         };
         let (signalled, buffers) = signalled;
         // Textures no picture is drawn into are cleared to the zeros they owe before the commit,
@@ -8746,6 +8926,16 @@ impl<P: Platform> Caches<P> {
         done
     }
 
+    /// What a video op's wait for the block at `block`'s cache waits on now ([`Self::wait_filled`],
+    /// [`Self::wait_copied_out`]), for its log: the cache's last fill, asked and not yet made, or
+    /// made and not done, with the command buffer whose begin asked it and the ends of the
+    /// queues it waits for on the GPU, each with what that queue's buffers wait for of other
+    /// queues not yet finished ([`SurfaceCaches::held`]); and its copy into its pages still
+    /// landing.
+    pub(crate) fn waits_named(&self, block: u64) -> String {
+        self.lock().waits_named(block)
+    }
+
     /// Waits, on the calling thread, for an early copy of the block at `block`'s cache into its
     /// pages still in flight to land ([`SurfaceCaches::early_copies`]), until `over` answers true
     /// ([`Over`]), with no lock held, woken as it lands: for work the host starts outside a
@@ -8847,6 +9037,33 @@ fn download_op<P: Platform>(
             failed(raise);
         }
     })
+}
+
+/// Notes in `cache` what its fill, asked by `asker` where a command buffer's begin asked it,
+/// waits for on the GPU ([`wait_for_users`]), for the log of a wait for it
+/// ([`Caches::waits_named`]); counted in `counts` where one of the cache's users waits on the GPU,
+/// as `held` says, for `asker`'s buffer or a later one of its queue
+/// ([`CacheCounts::behind_later`]).
+fn note_fill_waits<P: Platform>(
+    cache: &mut SurfaceCache<P>,
+    asker: Option<Asker>,
+    held: &[HeldUser],
+    counts: &mut CacheCounts,
+) {
+    let mut users: Vec<(u64, u64)> = cache.users.iter().map(|(&q, &v)| (q, v)).collect();
+    users.sort_unstable();
+    let behind = asker.as_ref().is_some_and(|by| {
+        (held.iter()).any(|h| {
+            h.behind(by) && (users.iter()).any(|&(queue, end)| queue == h.queue && end >= h.end)
+        })
+    });
+    counts.behind_later += u64::from(behind);
+    let out = (cache.out.as_ref()).is_some_and(|out| out.own.is_some() && !out.landing.landed());
+    cache.fill_waited = FillWaited {
+        by: asker.map(|a| (a.queue, a.seqno)),
+        users,
+        out,
+    };
 }
 
 /// Makes `cb` wait for the latest command buffer of each queue that used `cache`; how many it
@@ -11447,7 +11664,7 @@ pub(super) mod tests {
                     &r.device,
                     &answered,
                     &reading(BLOCK, 1),
-                    &NO_REACH,
+                    (&NO_REACH, None),
                     Some(&mut answer as &mut dyn FnMut()),
                 )
                 .unwrap();

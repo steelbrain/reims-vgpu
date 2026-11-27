@@ -1268,7 +1268,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// as the platform sees its command buffer complete, which it does on every path, failed
     /// where the GPU faulted or its device was lost. A reset of the device ends the wait, as it
     /// ends every wait of the decoder's ([`super::commit_order::Cancel`]), and the op faults. A
-    /// wait past [`CACHE_WAIT_LOGGED`] is named in the log, and again once it ends.
+    /// wait past [`CACHE_WAIT_LOGGED`] is named in the log, with what it waits on
+    /// ([`super::surface_cache::Caches::waits_named`]), and again once it ends.
     fn wait_for_cache(&self, tag: u16, block: u64) -> RaiseResult<()> {
         use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
 
@@ -1288,7 +1289,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 log::warn!(
                     target: "reims_vgpu::graphics",
                     "video op {tag:#06x}: the host's work on its surface's device cache at \
-                     {block:#x} has not finished after {CACHE_WAIT_LOGGED:?}; it waits on"
+                     {block:#x} has not finished after {CACHE_WAIT_LOGGED:?}; it waits on {}",
+                    self.surface_caches.waits_named(block)
                 );
             }
             false

@@ -146,6 +146,23 @@ impl Marks {
         self.taken.fetch_max(seqno, Ordering::SeqCst);
         self.waited.load(Ordering::SeqCst) <= self.signalled.load(Ordering::SeqCst)
     }
+
+    /// Whether the queue's buffers through `seqno` have finished, as far as its timeline's
+    /// signals tell (`done`).
+    pub(crate) fn finished(&self, seqno: u64) -> bool {
+        self.done.load(Ordering::Acquire) >= seqno
+    }
+
+    /// How far the queue's buffers have got, for the log: the highest seqno the host took, the
+    /// highest committed, stood in for or failed, and the highest signalled whose command buffer
+    /// has finished.
+    pub(crate) fn progress(&self) -> (u64, u64, u64) {
+        (
+            self.taken.load(Ordering::SeqCst),
+            self.commit.through(),
+            self.done.load(Ordering::Acquire),
+        )
+    }
 }
 
 /// A signal a command buffer carries: its queue's `done` rises to `seqno` once it finishes.
@@ -254,10 +271,19 @@ impl<P: Platform> Release<P> {
 pub(crate) struct OrderWait<P: Platform> {
     event: P::SharedEvent,
     value: u64,
+    /// The queue waited for, and its marks.
+    queue: u64,
     marks: Arc<Marks>,
 }
 
 impl<P: Platform> OrderWait<P> {
+    /// The queue waited for, its marks, and the value of its timeline waited for: what the
+    /// caches keep of a command buffer that waits, for a later fill behind its end
+    /// ([`super::surface_cache::Uses::waits_on`]).
+    pub(crate) fn held(&self) -> (u64, Arc<Marks>, u64) {
+        (self.queue, Arc::clone(&self.marks), self.value)
+    }
+
     /// Waits on the CPU, at most `milliseconds`, for the buffer waited for to finish; whether it
     /// did.
     fn wait(&self, milliseconds: u64) -> bool {
@@ -774,6 +800,7 @@ impl<P: Platform> SurfaceOrder<P> {
                 made.push(OrderWait {
                     event: event.clone_ref(),
                     value,
+                    queue: q,
                     marks: Arc::clone(&named.marks),
                 });
             }
