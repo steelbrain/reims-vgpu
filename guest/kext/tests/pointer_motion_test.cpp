@@ -4,8 +4,10 @@
 // X and Y and an 8-bit wheel, six bytes a report, and as the x86-64 kext builds it an 8-bit AC
 // Pan after the wheel, seven bytes, which a SCROLL's notches turn, and the precise scroller's
 // descriptor and counts, which a SCROLL's distance turns (pointer_motion_arm64_test builds it as
-// the arm64e kext does, which has neither).
+// the arm64e kext does, which has neither), and the HID transport the mouse names.
 #include "RgfxPointerMotion.hpp"
+
+#include <IOKit/hid/IOHIDKeys.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -225,6 +227,16 @@ int main()
 		      "which every report carries");
 	}
 #endif
+	// The transport the mouse names: on arm64 IOHIDKeys.h's Virtual, a string, so a lookup of it
+	// through the mouse's parents stops before display 0's framebuffer and its dictionary of the
+	// same key (a desktop-killing exception in macOS 26.6.2's WindowServer, m3-max-35949); none on
+	// x86-64, whose framebuffer has none.
+	if (RGFX_GUEST_ARM64)
+		check(kRgfxMouseTransport != nullptr &&
+		          std::strcmp(kRgfxMouseTransport, kIOHIDTransportVirtualValue) == 0,
+		      "the arm64 mouse names the Virtual transport");
+	else
+		check(kRgfxMouseTransport == nullptr, "the x86-64 mouse names no transport");
 	std::printf("pointer_motion_test: %d checks passed\n", checks);
 	return 0;
 }

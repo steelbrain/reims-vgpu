@@ -148,7 +148,7 @@ OSNumber *RgfxPointerDevice::newPrimaryUsagePageNumber() const
 #if defined(__arm64e__)
 OSString *RgfxPointerDevice::newTransportString() const
 {
-	return OSString::withCString(kIOHIDTransportVirtualValue);
+	return OSString::withCString(kRgfxMouseTransport);
 }
 #endif
 

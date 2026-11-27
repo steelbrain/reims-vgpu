@@ -86,6 +86,13 @@ constexpr uint8_t kRgfxMouseReportDescriptor[] = {
 // The size of one report.
 constexpr size_t kRgfxMouseReportBytes = RGFX_GUEST_ARM64 ? 6 : 7;
 
+// The HID transport the mouse names (RgfxPointerDevice's newTransportString): "Virtual",
+// IOHIDKeys.h's kIOHIDTransportVirtualValue, on arm64, where display 0's framebuffer, the mouse's
+// provider, carries IOMobileFramebuffer's own "Transport", a dictionary, which a lookup of the
+// mouse's transport through its parents finds where the mouse names none (RgfxPointerDevice.hpp);
+// none on x86-64, whose framebuffer has no "Transport".
+constexpr const char *kRgfxMouseTransport = RGFX_GUEST_ARM64 ? "Virtual" : nullptr;
+
 // The most one report moves on an axis, and turns the wheel (or pans).
 constexpr int32_t kRgfxMouseReportMotionMax = 32767;
 constexpr int32_t kRgfxMouseReportWheelMax = 127;
