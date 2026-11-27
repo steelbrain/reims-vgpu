@@ -529,6 +529,116 @@ pub(crate) mod tests {
         assert!(!caps.flags.supports_native_hardware_fp16);
     }
 
+    /// Facts of a device below Metal's limits, with none of the features the facts may lack: the
+    /// limits `vulkan_limits_bound_the_answers` reads, 16 KiB of shared memory, rt's linear
+    /// alignment of 256 and none of BGRA8.
+    fn tight() -> Facts {
+        let mut facts = roomy();
+        facts.name = "a tight GPU".to_owned();
+        facts.limits.max_image_dimension2_d = 8192;
+        facts.limits.max_image_array_layers = 256;
+        facts.limits.max_compute_shared_memory_size = 16384;
+        facts.limits.max_compute_work_group_invocations = 512;
+        facts.limits.max_compute_work_group_size = [1024, 1024, 64];
+        facts.limits.max_viewports = 1;
+        facts.float16 = false;
+        facts.unified_memory = false;
+        facts.bc = false;
+        facts.barycentrics = false;
+        facts.float32_filtering = false;
+        facts.float32_msaa = false;
+        facts.linear_alignment_largest = 256;
+        facts.linear_alignment_bgra8 = None;
+        facts.indirect_tokens = None;
+        facts.function_pointers = false;
+        facts.max_threadgroup_memory_length = 16368;
+        facts
+    }
+
+    /// Metal's answers on the M3 Max are the probes' values: 31 compute buffers, 64 KiB of
+    /// compute threadgroup memory, predicates nested to `u32::MAX`, tile shaders, ordered
+    /// atomics, and no compressed texture writes from compute (an Apple M4 answers yes).
+    #[test]
+    fn metal_s_answers_are_the_probes() {
+        assert_eq!(metal::LIMITS.max_compute_buffers, 31);
+        assert_eq!(metal::LIMITS.max_compute_threadgroup_memory, 65536);
+        assert_eq!(
+            metal::LIMITS.max_predicated_nesting_depth,
+            u64::from(u32::MAX)
+        );
+        let f = metal::FLAGS;
+        assert_eq!(
+            (
+                f.supports_tile_shaders,
+                f.supports_memory_order_atomics,
+                f.supports_compute_compressed_texture_write
+            ),
+            (true, true, false)
+        );
+    }
+
+    /// The answers no document describes are Metal's on every device: a compute function's
+    /// threadgroup memory, large MRT, conditional loads and stores, and no compressed texture
+    /// writes from compute.
+    #[test]
+    fn the_undocumented_answers_are_metal_s_on_every_device() {
+        for facts in [roomy(), tight()] {
+            let caps = caps(&facts);
+            let (l, f, name) = (caps.limits, caps.flags, &facts.name);
+            assert_eq!(
+                l.max_compute_threadgroup_memory,
+                metal::LIMITS.max_compute_threadgroup_memory,
+                "{name}"
+            );
+            assert_eq!(
+                f.is_large_mrt_supported,
+                metal::FLAGS.is_large_mrt_supported,
+                "{name}"
+            );
+            assert_eq!(
+                f.supports_compute_compressed_texture_write,
+                metal::FLAGS.supports_compute_compressed_texture_write,
+                "{name}"
+            );
+            assert_eq!(
+                f.supports_conditional_load_store,
+                metal::FLAGS.supports_conditional_load_store,
+                "{name}"
+            );
+        }
+    }
+
+    /// Command predication answers Metal's on every device: command buffer jumps, and
+    /// predicates nested to `u32::MAX`.
+    #[test]
+    fn predication_answers_metal_s_on_every_device() {
+        for facts in [roomy(), tight()] {
+            let caps = caps(&facts);
+            let name = &facts.name;
+            assert!(caps.flags.supports_command_buffer_jump, "{name}");
+            assert_eq!(
+                caps.limits.max_predicated_nesting_depth,
+                u64::from(u32::MAX),
+                "{name}"
+            );
+        }
+    }
+
+    /// Ordered atomics, bicubic filtering of half-float textures and gamma RGB10A2 answer yes on
+    /// every device: ordered atomics follow the Vulkan memory model at device scope, which rt's
+    /// floor requires of every device it makes (`vulkanMemoryModel` and
+    /// `vulkanMemoryModelDeviceScope`).
+    #[test]
+    fn atomics_bicubic_filtering_and_gamma_answer_yes_on_every_device() {
+        for facts in [roomy(), tight()] {
+            let f = caps(&facts).flags;
+            let name = &facts.name;
+            assert!(f.supports_memory_order_atomics, "{name}");
+            assert!(f.supports_float16_bcubic_filtering, "{name}");
+            assert!(f.is_rgb10a2_gamma_supported, "{name}");
+        }
+    }
+
     /// `maxThreadgroupMemoryLength` is rt's answer, not Metal's held to the device's shared
     /// memory: on a device of 32,768 bytes, where rt answers 32,752, the guest is told 32,752,
     /// where a Mac and Metal's 32 KiB held to the limit answer 32,768; on one of 16,384 bytes,
