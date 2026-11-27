@@ -423,14 +423,21 @@ and QEMU's `usb-tablet`, which has no sideways wheel, gets none of it:
   `test: reims-vgpu-graphics::device::tests::motion::scrolling_goes_to_the_devices_the_guest_names`,
   `manual` (an x86-64 guest on a Linux host: a sideways scroll in Finder and
   Safari)
-- A touchpad scrolls one notch per 10 points of movement, a line as SDL
-  reports it, sideways too, the rest carried on to the next event and counted
-  afresh where the scrolling turns back. On Windows this is read from the code
-  and tested with the window's own events: the lab's Windows host has no
-  touchpad.
-  `test: reims-vgpu-graphics::device::tests::motion::a_mouse_alone_gets_a_notch_per_10_points`,
+- A touchpad, and a Mac's precise scrolling with its coasting, scroll the
+  kext's precise scroller beside the mouse: continuous, precise scrolling in
+  points, as far as the host reports and unaccelerated, sideways too, in steps
+  of 10 points (a line as SDL reports it), the rest carried on to the next
+  event and started afresh where the scrolling turns back. The guest gets the
+  distance only, no gesture phases (docs/known-issues.md). On Windows this is
+  read from the code and tested with the window's own events: the lab's
+  Windows host has no touchpad.
+  `test: reims-vgpu-graphics::device::tests::motion::scrolling_goes_to_the_devices_the_guest_names`,
   `test: native::sdl_thread::input::the_guest_s_own_devices_take_the_wheel_where_they_scroll`,
+  `test: native::macos::input::the_guest_s_own_devices_take_scrolling_where_they_scroll`,
   `manual` (a touchpad on a Linux host)
+- Where the scroller is not up, a touchpad turns the mouse's wheel one notch
+  per 10 points instead, counted the same way.
+  `test: reims-vgpu-graphics::device::tests::motion::a_mouse_alone_gets_a_notch_per_10_points`
 
 ## Cursor
 
