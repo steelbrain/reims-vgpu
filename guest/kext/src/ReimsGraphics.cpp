@@ -1257,7 +1257,11 @@ void ReimsGraphics::startPointerDevice()
 {
 	if (!pointerMotionTaken || __atomic_load_n(&pointerDevice, __ATOMIC_ACQUIRE))
 		return;
+#if defined(__x86_64__)
+	RgfxPointerDevice *made = RgfxPointerDevice::withProvider(this, false);
+#else
 	RgfxPointerDevice *made = RgfxPointerDevice::withProvider(this);
+#endif
 	if (!made) {
 		IOLog("ReimsGraphics: the guest's mouse for POINTER_MOTION did not start\n");
 		return;
@@ -1265,9 +1269,15 @@ void ReimsGraphics::startPointerDevice()
 	__atomic_store_n(&pointerDevice, made, __ATOMIC_RELEASE);
 	IOLog("ReimsGraphics: the guest's mouse for POINTER_MOTION is up\n");
 #if defined(__x86_64__)
-	// The host's scrolling goes to it from here, sideways included, until the next reset.
+	// The host's scrolling goes to it from here, sideways included, until the next reset: a
+	// wheel's notches to the mouse, and a touchpad's distance to the scroller where it is up, as
+	// the mouse's notches where it is not.
+	RgfxPointerDevice *scroller = RgfxPointerDevice::withProvider(this, true);
+	if (!scroller)
+		IOLog("ReimsGraphics: the guest's scroller did not start: the mouse takes its scrolling\n");
+	__atomic_store_n(&scrollerDevice, scroller, __ATOMIC_RELEASE);
 	RgfxScrollDevices devices = {};
-	devices.devices = RGFX_SCROLL_DEVICE_WHEEL;
+	devices.devices = RGFX_SCROLL_DEVICE_WHEEL | (scroller ? RGFX_SCROLL_DEVICE_PRECISE : 0);
 	if (post(RGFX_CMD_SCROLL_DEVICES, &devices, sizeof(devices), nullptr) != kIOReturnSuccess)
 		IOLog("ReimsGraphics: SCROLL_DEVICES was not sent: the tablet keeps the scrolling\n");
 #endif
@@ -1276,6 +1286,13 @@ void ReimsGraphics::startPointerDevice()
 // Display 0's stop, once the work loop hands the device nothing more: the device stops and goes.
 void ReimsGraphics::stopPointerDevice()
 {
+#if defined(__x86_64__)
+	if (RgfxPointerDevice *scroller =
+	        __atomic_exchange_n(&scrollerDevice, nullptr, __ATOMIC_ACQ_REL)) {
+		scroller->terminate();
+		scroller->release();
+	}
+#endif
 	RgfxPointerDevice *mouse = __atomic_exchange_n(&pointerDevice, nullptr, __ATOMIC_ACQ_REL);
 	if (!mouse)
 		return;
@@ -1299,7 +1316,8 @@ void ReimsGraphics::pointerMotion(const volatile UInt8 *payload, UInt32 size)
 }
 
 #if defined(__x86_64__)
-// handleEvent's SCROLL, on the device's work loop: its notches to the guest's mouse.
+// handleEvent's SCROLL, on the device's work loop: its notches to the guest's mouse, and its
+// distance to the scroller.
 void ReimsGraphics::pointerScroll(const volatile UInt8 *payload, UInt32 size)
 {
 	RgfxScrolled scrolled = {};
@@ -1311,7 +1329,11 @@ void ReimsGraphics::pointerScroll(const volatile UInt8 *payload, UInt32 size)
 			      mouse ? "" : " (no mouse is up)");
 		return;
 	}
-	mouse->scroll(scrolled);
+	if (scrolled.notchesUp || scrolled.notchesRight)
+		mouse->scroll(scrolled);
+	RgfxPointerDevice *scroller = __atomic_load_n(&scrollerDevice, __ATOMIC_ACQUIRE);
+	if (scroller && (scrolled.fineUp || scrolled.fineRight))
+		scroller->scrollFine(scrolled);
 }
 #endif
 

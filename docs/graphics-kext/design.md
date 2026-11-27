@@ -4455,6 +4455,28 @@ instead:
   127 notches each way, with the buttons its last `POINTER_MOTION` left
   held. The arm64e kext sends none: vmapple's tablet scrolls smoothly and
   sideways.
+- **The guest's precise scroller.** Beside the mouse the x86-64 kext starts
+  "Reims vGPU Scroller" (product 0x5248): the mouse's descriptor and
+  reports, with a physical range of -1 to 1 on its wheel and pan against
+  their logical -127 to 127, which `IOHIDEventService::determineResolution`
+  reads as 127 counts a unit. macOS marks its events continuous and precise,
+  in points, as a touchpad's. Its acceleration is off
+  (`HIDSupportsScrollAcceleration` false on the device, which IOHIDInterface
+  and the event service copy down and the scroll filter reads), and then a
+  count scrolls 10 points however fast counts come: 120 counts made 1200
+  points slow (100 ms apart), fast (8 ms) and in lumps (4 every 16 ms), on
+  both axes, at 127 and at 90 counts a unit, on 26.7.2 and 11.7.11
+  (measured, potluck jobs m3-max-75987 and m3-max-75994). Apple's driver
+  passes each count whole (`getValue() << 16`) and reads no resolution
+  multiplier, so no descriptor makes a count worth less: precise scrolling
+  moves in steps of 10 points. With the acceleration on, neither a flat
+  `HIDScrollAccelerationTable` nor one linear `HIDScrollAccelCurves` curve
+  scrolled as far a count at every speed: the table up to 6.3 times as far
+  fast as slow, the curve 25% further in lumps (job m3-max-76084). With the
+  scroller up, `SCROLL_DEVICES` names it too (`RGFX_SCROLL_DEVICE_PRECISE`),
+  and each `SCROLL`'s distance goes to it as counts, one per 10 points
+  (`kRgfxScrollerFinePerCount`), the rest carried on and started afresh
+  where the scrolling turns back, at most 8 x 127 a `SCROLL`.
 - **The device.** From a guest's `SCROLL_DEVICES` to its next reset, a
   window's scroll (`PointerLink::scroll`) is owed as a `SCROLL` and posted
   after the owed motion, joined into the owed one while the ring is held or

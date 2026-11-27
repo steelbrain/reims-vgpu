@@ -6,7 +6,9 @@
 //
 // Its name and numbers are ours: "Reims vGPU Mouse" of "Reims vGPU", vendor 0x1234 and product
 // 0x5247, the PCI IDs of the device it belongs to. It is a child of display 0's framebuffer,
-// started by it once the guest took the feature and stopped with it.
+// started by it once the guest took the feature and stopped with it. The x86-64 kext's
+// framebuffer starts a second beside it, the precise scroller, "Reims vGPU Scroller", product
+// 0x5248, which takes a SCROLL's distance (RgfxPointerMotion.hpp) with its acceleration off.
 //
 // It imports only what every release of both sets defines (x86-64 11 to 26, arm64 14 to 27).
 // The SDK's IOHIDDevice.h is the newest release's, and a class inheriting a method imports it by
@@ -34,8 +36,14 @@ class RgfxPointerDevice final : public IOHIDDevice
 	OSDeclareFinalStructors(RgfxPointerDevice);
 
 public:
+#if !RGFX_GUEST_ARM64
+	// The device, the mouse or (`scroller`) the precise scroller, attached to `provider` and
+	// started: nullptr where it does not start.
+	static RgfxPointerDevice *withProvider(IOService *provider, bool scroller);
+#else
 	// The device, attached to `provider` and started: nullptr where it does not start.
 	static RgfxPointerDevice *withProvider(IOService *provider);
+#endif
 
 	// Hands the HID stack the reports of one POINTER_MOTION, in order. On the framebuffer's work
 	// loop, one call at a time.
@@ -44,6 +52,9 @@ public:
 	// Hands it a SCROLL's notches as reports, with the buttons the last POINTER_MOTION left held,
 	// as post does.
 	void scroll(const RgfxScrolled &scrolled);
+	// Hands the scroller a SCROLL's distance as counts of 10 points, keeping the rest for the
+	// next (rgfxScrollerCounts); nothing where it makes no count.
+	void scrollFine(const RgfxScrolled &scrolled);
 #endif
 
 	IOReturn newReportDescriptor(IOMemoryDescriptor **descriptor) const override;
@@ -103,6 +114,10 @@ private:
 #if !RGFX_GUEST_ARM64
 	// The buttons the last report held.
 	uint32_t buttons;
+	// The scroller (withProvider), and the distance its counts have left, up and right, in 1/256
+	// point.
+	bool scroller;
+	int64_t rest[2];
 #endif
 };
 

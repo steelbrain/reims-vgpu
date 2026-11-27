@@ -795,8 +795,11 @@ private:
 	void stopPointerDevice();
 	void pointerMotion(const volatile UInt8 *payload, UInt32 size);
 #if defined(__x86_64__)
-	// handleEvent's SCROLL, which hands the mouse the event's notches on the work loop: the host
-	// sends it once the start has named the mouse (SCROLL_DEVICES, design.md "Scrolling").
+	// The x86-64 kext's precise scroller beside the mouse (RgfxPointerDevice.hpp), made and
+	// stopped with it and stored as it is; and handleEvent's SCROLL, which hands the mouse the
+	// event's notches and the scroller its distance on the work loop: the host sends it once the
+	// start has named them (SCROLL_DEVICES, design.md "Scrolling").
+	RgfxPointerDevice *scrollerDevice;
 	void pointerScroll(const volatile UInt8 *payload, UInt32 size);
 #endif
 #if defined(__arm64e__)

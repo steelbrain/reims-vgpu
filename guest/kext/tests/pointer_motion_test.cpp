@@ -2,8 +2,9 @@
 // reports that carry it (one for a press alone, several for motion past one report's range, each
 // with its buttons), and the report descriptor's shape: a mouse of five buttons, relative 16-bit
 // X and Y and an 8-bit wheel, six bytes a report, and as the x86-64 kext builds it an 8-bit AC
-// Pan after the wheel, seven bytes, which a SCROLL's notches turn (pointer_motion_arm64_test
-// builds it as the arm64e kext does).
+// Pan after the wheel, seven bytes, which a SCROLL's notches turn, and the precise scroller's
+// descriptor and counts, which a SCROLL's distance turns (pointer_motion_arm64_test builds it as
+// the arm64e kext does, which has neither).
 #include "RgfxPointerMotion.hpp"
 
 #include <cstdio>
@@ -169,6 +170,61 @@ int main()
 		check(sizeof(kRgfxMouseReportDescriptor) == (RGFX_GUEST_ARM64 ? 64u : 79u),
 		      "the arm64e descriptor's bytes as before");
 	}
+#if !RGFX_GUEST_ARM64
+	// The scroller's descriptor is the mouse's with a physical range of -1 to 1 from the wheel on,
+	// set after the wheel's logical range and cleared before the collections end.
+	{
+		uint8_t want[sizeof(kRgfxMouseReportDescriptor) + 8];
+		size_t n = 0;
+		const uint8_t wheel[] = {0x09, 0x38, 0x15, 0x81, 0x25, 0x7f};
+		for (size_t i = 0; i < sizeof(kRgfxMouseReportDescriptor); i++) {
+			if (i == sizeof(kRgfxMouseReportDescriptor) - 2) {
+				const uint8_t clear[] = {0x35, 0x00, 0x45, 0x00};
+				std::memcpy(want + n, clear, sizeof(clear));
+				n += sizeof(clear);
+			}
+			want[n++] = kRgfxMouseReportDescriptor[i];
+			if (i >= sizeof(wheel) - 1 &&
+			    !std::memcmp(kRgfxMouseReportDescriptor + i + 1 - sizeof(wheel), wheel, sizeof(wheel))) {
+				const uint8_t set[] = {0x35, 0xff, 0x45, 0x01};
+				std::memcpy(want + n, set, sizeof(set));
+				n += sizeof(set);
+			}
+		}
+		check(n == sizeof(kRgfxScrollerReportDescriptor) &&
+		          !std::memcmp(want, kRgfxScrollerReportDescriptor, n),
+		      "the scroller's descriptor is the mouse's at 127 counts a unit");
+	}
+	// The scroller's counts: one for each whole 10 points, toward zero, the rest carried on and
+	// started afresh where the scrolling turns back.
+	{
+		int64_t rest = 0;
+		check(rgfxScrollerCounts(&rest, 2560) == 1 && rest == 0, "10 points are a count");
+		check(rgfxScrollerCounts(&rest, 1280) == 0 && rest == 1280, "5 points wait");
+		check(rgfxScrollerCounts(&rest, 1280) == 1 && rest == 0, "and make one with 5 more");
+		check(rgfxScrollerCounts(&rest, -3520) == -1 && rest == -960, "down, toward zero");
+		check(rgfxScrollerCounts(&rest, 2000) == 0 && rest == 2000, "a turn starts afresh");
+		check(rgfxScrollerCounts(&rest, 0) == 0 && rest == 2000, "nothing keeps the rest");
+	}
+	// The extremes: i32's range either way makes at most what one SCROLL's reports carry, 8 x 127,
+	// the rest past whole counts kept, and a rest beside it overflows nothing.
+	{
+		int64_t rest = 2559;
+		check(rgfxScrollerCounts(&rest, INT32_MAX) == 1016 &&
+		          rest == (int64_t(INT32_MAX) + 2559) % 2560,
+		      "up, at most 1016 counts");
+		rest = -2559;
+		check(rgfxScrollerCounts(&rest, INT32_MIN) == -1016 &&
+		          rest == (int64_t(INT32_MIN) - 2559) % 2560,
+		      "down, at most 1016 counts");
+		RgfxMotion m = {};
+		m.wheel = 1016;
+		m.pan = -1016;
+		check(rgfxMouseReports(m, r) == kRgfxMouseReportsMax &&
+		          static_cast<int8_t>(r[7][5]) == 127 && static_cast<int8_t>(r[7][6]) == -127,
+		      "which every report carries");
+	}
+#endif
 	std::printf("pointer_motion_test: %d checks passed\n", checks);
 	return 0;
 }

@@ -17,8 +17,9 @@
 //
 // The x86-64 kext's mouse scrolls sideways too: an 8-bit AC Pan (consumer page 0x0C, usage
 // 0x238) in byte 6, above 0 right, so 7 bytes a report, which IOHIDEventDriver makes the scroll
-// event's sideways axis. Its SCROLL's notches go to it (design.md, "Scrolling"). The arm64e
-// kext's mouse has no pan: its guest's tablet scrolls sideways.
+// event's sideways axis. Its SCROLL's notches go to it (design.md, "Scrolling"), and a SCROLL's
+// distance to the precise scroller below. The arm64e kext's mouse has no pan and it has no
+// scroller: its guest's tablet scrolls.
 //
 // Header-only and free of the kernel's headers, so its native test (tests/pointer_motion_test.cpp)
 // builds it as the kext does.
@@ -93,6 +94,55 @@ constexpr int32_t kRgfxMouseReportWheelMax = 127;
 // 65538 of 32767, more than any host sends; the device sends at most this many, the motion past
 // them dropped, as are notches past 8 x 127 either way.
 constexpr uint32_t kRgfxMouseReportsMax = 8;
+
+#if !RGFX_GUEST_ARM64
+// The x86-64 kext's precise scroller (RgfxPointerDevice.hpp), which takes a SCROLL's distance, a
+// touchpad's: the mouse's descriptor and reports, its buttons and motion always 0, with a physical
+// range of -1 to 1 on its wheel and pan against their logical -127 to 127. Apple's
+// IOHIDEventService::determineResolution reads that as 127 counts a unit (IOHIDEventService.cpp:701
+// and :998, IOHIDFamily-2238.100.59) and publishes it as HIDScrollResolution, and at that macOS
+// marks the scroller's events continuous and precise, in points, as a touchpad's (measured on
+// x86-64 26.7.2 and 11.7.11, potluck jobs m3-max-75987 and m3-max-75994).
+constexpr uint8_t kRgfxScrollerReportDescriptor[] = {
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, // the mouse's collections,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, // buttons,
+    0x95, 0x05, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x03, 0x81, 0x01,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x16, 0x01, 0x80, 0x26, 0xff, 0x7f, // X and Y
+    0x75, 0x10, 0x95, 0x02, 0x81, 0x06,
+    0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, // Wheel, logical -127 to 127
+    0x35, 0xff,                         // Physical Minimum (-1)
+    0x45, 0x01,                         // Physical Maximum (1)
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+    0x05, 0x0c, 0x0a, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7f, // AC Pan, logical -127 to 127
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+    0x35, 0x00, // Physical Minimum (0)
+    0x45, 0x00, // Physical Maximum (0)
+    0xc0, 0xc0,
+};
+
+// The 1/256 points of a SCROLL's distance one of the scroller's counts stands for. With its
+// acceleration off (RgfxPointerDevice.cpp), a count scrolls 10 points, however fast the counts
+// come: 120 counts made 1200 points slow, fast and in lumps, on each axis, at 127 and at 90 counts
+// a unit (the jobs above). No descriptor makes a count worth less: Apple's driver passes each
+// count whole, getValue() << 16 (IOHIDEventDriver.cpp:4300 and :4312), and reads no resolution
+// multiplier.
+constexpr int64_t kRgfxScrollerFinePerCount = 10 * 256;
+
+// The scroller's counts on one axis for `fine` more of a SCROLL's distance, the rest kept in
+// `*rest`: the distance joins the rest, which starts afresh where the scrolling turns back, and
+// a count goes for each whole 10 points, toward zero. Counts past what one SCROLL's reports carry
+// (8 x 127 either way) are dropped, as a mouse's notches are.
+inline int32_t rgfxScrollerCounts(int64_t *rest, int32_t fine)
+{
+	if ((*rest > 0 && fine < 0) || (*rest < 0 && fine > 0))
+		*rest = 0;
+	const int64_t total = *rest + fine;
+	const int64_t counts = total / kRgfxScrollerFinePerCount;
+	*rest = total - counts * kRgfxScrollerFinePerCount;
+	const int64_t most = int64_t(kRgfxMouseReportsMax) * kRgfxMouseReportWheelMax;
+	return static_cast<int32_t>(counts > most ? most : (counts < -most ? -most : counts));
+}
+#endif
 
 // POINTER_MOTION's motion, wheel and buttons (RgfxPointerMotion past its header), and on x86-64 a
 // SCROLL's sideways notches, above 0 right.

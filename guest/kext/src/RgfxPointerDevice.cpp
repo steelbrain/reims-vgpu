@@ -10,7 +10,11 @@
 
 OSDefineMetaClassAndFinalStructors(RgfxPointerDevice, IOHIDDevice);
 
+#if !RGFX_GUEST_ARM64
+RgfxPointerDevice *RgfxPointerDevice::withProvider(IOService *provider, bool scroller)
+#else
 RgfxPointerDevice *RgfxPointerDevice::withProvider(IOService *provider)
+#endif
 {
 	RgfxPointerDevice *device = OSTypeAlloc(RgfxPointerDevice);
 	if (!device)
@@ -18,11 +22,23 @@ RgfxPointerDevice *RgfxPointerDevice::withProvider(IOService *provider)
 	device->reportBuffer = nullptr;
 #if !RGFX_GUEST_ARM64
 	device->buttons = 0;
+	device->scroller = scroller;
+	device->rest[0] = device->rest[1] = 0;
 #endif
 	if (!device->init(nullptr)) {
 		device->release();
 		return nullptr;
 	}
+#if !RGFX_GUEST_ARM64
+	// The scroller's acceleration off, so each count scrolls 10 points at any speed
+	// (RgfxPointerMotion.hpp): IOHIDInterface copies HIDSupportsScrollAcceleration from its device
+	// (IOHIDInterface.cpp:961), the event service from its interface (IOHIDEventService.cpp:2876),
+	// and the scroll filter accelerates no event of a service where it reads false
+	// (IOHIDPointerScrollFilter.cpp:917-922, IOHIDFamily-2238.100.59). Copied on 26.7.2 and
+	// 11.7.11 alike (measured, potluck jobs m3-max-75987 and m3-max-75994).
+	if (scroller)
+		device->setProperty("HIDSupportsScrollAcceleration", false);
+#endif
 	device->reportBuffer =
 	    IOBufferMemoryDescriptor::withCapacity(kRgfxMouseReportBytes, kIODirectionOutIn);
 	if (!device->reportBuffer || !device->attach(provider)) {
@@ -60,12 +76,31 @@ void RgfxPointerDevice::scroll(const RgfxScrolled &scrolled)
 	motion.buttons = buttons;
 	post(motion);
 }
+
+void RgfxPointerDevice::scrollFine(const RgfxScrolled &scrolled)
+{
+	RgfxMotion motion = {};
+	motion.wheel = rgfxScrollerCounts(&rest[0], scrolled.fineUp);
+	motion.pan = rgfxScrollerCounts(&rest[1], scrolled.fineRight);
+	if (motion.wheel || motion.pan)
+		post(motion);
+}
 #endif
 
 IOReturn RgfxPointerDevice::newReportDescriptor(IOMemoryDescriptor **descriptor) const
 {
+#if !RGFX_GUEST_ARM64
+	IOBufferMemoryDescriptor *buffer =
+	    scroller ? IOBufferMemoryDescriptor::withBytes(kRgfxScrollerReportDescriptor,
+	                                                   sizeof(kRgfxScrollerReportDescriptor),
+	                                                   kIODirectionOutIn)
+	             : IOBufferMemoryDescriptor::withBytes(kRgfxMouseReportDescriptor,
+	                                                   sizeof(kRgfxMouseReportDescriptor),
+	                                                   kIODirectionOutIn);
+#else
 	IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::withBytes(
 	    kRgfxMouseReportDescriptor, sizeof(kRgfxMouseReportDescriptor), kIODirectionOutIn);
+#endif
 	if (!buffer)
 		return kIOReturnNoResources;
 	*descriptor = buffer;
@@ -79,6 +114,10 @@ OSString *RgfxPointerDevice::newManufacturerString() const
 
 OSString *RgfxPointerDevice::newProductString() const
 {
+#if !RGFX_GUEST_ARM64
+	if (scroller)
+		return OSString::withCString("Reims vGPU Scroller");
+#endif
 	return OSString::withCString("Reims vGPU Mouse");
 }
 
@@ -89,6 +128,10 @@ OSNumber *RgfxPointerDevice::newVendorIDNumber() const
 
 OSNumber *RgfxPointerDevice::newProductIDNumber() const
 {
+#if !RGFX_GUEST_ARM64
+	if (scroller)
+		return OSNumber::withNumber(0x5248ULL, 32);
+#endif
 	return OSNumber::withNumber(0x5247ULL, 32);
 }
 

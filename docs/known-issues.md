@@ -122,6 +122,15 @@ to another of the VM's displays. To get the normal pointer back, press the relea
 same). The pointer then stays normal until macOS shows its cursor again, which it does when the
 recording or share stops, even if you click back into the guest's picture meanwhile.
 
+## Touchpad scrolling moves in steps of 10 points on Intel Mac guests
+
+In an x86-64 macOS guest, a touchpad on your host scrolls the way a touchpad does, by as far as
+your fingers move, but in steps of 10 points: movement shorter than that waits until more of it
+adds up. macOS's own driver counts scrolling in whole steps, and nothing a device can tell it makes
+a step smaller. The guest also gets the distance only, not the gesture: macOS doesn't see a swipe
+begin or end. arm64 guests scroll through their own virtual tablet instead, which gets the
+gesture too.
+
 ## On a Mac
 
 ### You need macOS 26 or later to run VMs
