@@ -2969,6 +2969,151 @@ mod tests {
         assert_eq!((counts.plane_fills, counts.plane_fills_taken), (2, 0));
     }
 
+    /// Texture `obj_id` over buffer 10 that shows the top left quarter of [`nv12_planes`]' luma
+    /// plane, as `R8Unorm`: no plane's whole extent, so a plain shape of its own. The image of its
+    /// shape.
+    #[cfg(unix)]
+    fn quarter_luma_texture(r: &mut Rig, obj_id: u64) -> u64 {
+        use reims_vgpu_graphics::wire::RgfxTextureFromIOSurface;
+        use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
+        use zerocopy::{FromBytes as _, IntoBytes as _};
+        let info = PixelFormatInfo {
+            name: Some("MTLPixelFormatR8Unorm".into()),
+            block_bytes: 1,
+            block_width: 1,
+            block_height: 1,
+            block_depth: 1,
+            ..PixelFormatInfo::default()
+        };
+        r.p.script().clear();
+        (r.p.script()).always("MTLPixelFormatGetInfoForDevice()", Step::value(info));
+        let luma = nv12_planes()[0];
+        let size = ((luma.row_bytes / 2) as u32, (luma.rows / 2) as u32);
+        let bytes = surface_texture_as(obj_id, 10, 10, size, (1, 0));
+        let mut m = RgfxTextureFromIOSurface::read_from_bytes(&bytes).unwrap();
+        m.offset = luma.offset;
+        m.bytes_per_row = luma.bytes_per_row;
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, m.as_bytes()).unwrap(), Ok(()));
+        views(&r.p.call_log().since(mark))[0].0
+    }
+
+    /// A plain shape made over a video cache while a decode into its planes, counted behind a
+    /// deferred copy of the cache, waits there with its picture (`surface_cache`'s `Since`) takes
+    /// no zeros as its fill: its reader, counted after the decode, is filled once that copy is
+    /// made, from the buffer after the planes holding the picture were written back into it, and
+    /// never takes the platform's cleared image as filled (`SurfaceCaches::take_zeros`)
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_shape_made_behind_a_decode_waiting_on_a_deferred_copy_takes_its_picture() {
+        use super::super::surface_cache::Reach;
+        let mut r = video_shaped();
+        let cache = cache_id(&r);
+        let luma = plane_texture(&mut r, 21, 0);
+        let chroma = plane_texture(&mut r, 22, 1);
+        let writes = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        // A writer holds the cache, and a download of it waits for it.
+        let writer_queue = r.device.new_command_queue().unwrap();
+        let writer = writer_queue.command_buffer(ON).unwrap().unwrap();
+        let (_, writer_uses) = (r.dec.surface_caches)
+            .before(&r.device, &writer, &writes, &NO_REACH)
+            .unwrap();
+        let downloaded = download(&r, BLOCK);
+        assert!(!downloaded.load(Ordering::SeqCst), "behind the writer");
+        // A decode into the planes, counted behind the download: what it wrote waits there.
+        let decode_queue = r.device.new_command_queue().unwrap();
+        let decode_cb = decode_queue.command_buffer(ON).unwrap().unwrap();
+        let decode = Reach {
+            video: true,
+            decoded: vec![(BLOCK, nv12_planes())],
+            ..Reach::default()
+        };
+        let (_, decode_uses) = (r.dec.surface_caches)
+            .before(&r.device, &decode_cb, &writes, &decode)
+            .unwrap();
+        assert!(
+            r.dec.surface_caches.surface_targets(BLOCK).is_some(),
+            "the picture lands in the planes"
+        );
+        (r.dec.surface_caches)
+            .decoded(Some(&r.device), BLOCK, true)
+            .unwrap();
+        (r.dec.surface_caches)
+            .finish(&r.device, 2, None, &decode_cb, decode_uses.unwrap(), || {
+                decode_cb.commit(ON)
+            })
+            .unwrap();
+        // A reader's plain shape over the luma plane, made now, and the reader, counted after the
+        // decode.
+        let plain = quarter_luma_texture(&mut r, 30);
+        assert!(![luma, chroma].contains(&plain), "a plain shape's image");
+        let reader_queue = r.device.new_command_queue().unwrap();
+        let reader = reader_queue.command_buffer(ON).unwrap().unwrap();
+        let (_, reader_uses) = (r.dec.surface_caches)
+            .before(&r.device, &reader, &reading(BLOCK, 0), &NO_REACH)
+            .unwrap();
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (
+                counts.zero_taken,
+                counts.planes_landed,
+                counts.fills_deferred
+            ),
+            (0, 0, 1),
+            "the decode's write waits in the download's record, and the reader's fill behind it"
+        );
+        // The writer ends: the download is made, the decode's write becomes the cache's, and the
+        // reader's fill follows.
+        let mark = r.p.call_log().mark();
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &writer, writer_uses.unwrap(), || {
+                writer.commit(ON)
+            })
+            .unwrap();
+        let calls = r.p.call_log().since(mark);
+        let counts = r.dec.caches().counts().shapes;
+        assert_eq!(
+            (
+                counts.zero_taken,
+                counts.zero_taken_bytes,
+                counts.planes_landed
+            ),
+            (0, 0, 1),
+            "no shape took the platform's cleared image as its fill"
+        );
+        let filled = fills(&calls);
+        let into_plain: Vec<_> = (filled.iter())
+            .filter(|&&(_, _, image)| image == plain)
+            .collect();
+        assert_eq!(
+            into_plain.len(),
+            1,
+            "the plain shape filled once: {filled:?}"
+        );
+        assert_eq!(into_plain[0].0, cache, "from the cache's buffer");
+        let back = written_back(&calls);
+        assert!(
+            back.iter()
+                .any(|&(image, into, _)| image == luma && into == cache),
+            "the luma plane, holding the picture, written back: {back:?}"
+        );
+        assert!(
+            first(&calls, TO_BUFFER) < first(&calls, FILL),
+            "written back before the fill"
+        );
+        (r.dec.surface_caches)
+            .finish(&r.device, 3, None, &reader, reader_uses.unwrap(), || {
+                reader.commit(ON)
+            })
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst), "the download answered");
+        assert_eq!(r.dec.caches().counts().shapes.zero_taken, 0);
+    }
+
     /// A decode whose textures show a video cache's planes whole, where the cache has its
     /// surface, is given the surface's planes, which its picture lands in, and makes no memory of
     /// the cache's buffer, which the picture does not touch ("Deferred memory"). A decode whose
