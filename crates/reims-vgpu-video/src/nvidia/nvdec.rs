@@ -4,6 +4,7 @@
 //! and the DPB kept, by our own codec code; NVDEC gets each picture's
 //! parameters as `CUVIDPICPARAMS`, as VA-API gets its buffers.
 
+pub(crate) mod av1;
 pub(crate) mod decoder;
 pub(crate) mod ffi;
 pub(crate) mod h264;
@@ -48,16 +49,19 @@ pub enum NvdecCodec {
     H264,
     /// HEVC.
     Hevc,
+    /// AV1.
+    Av1,
 }
 
 impl NvdecCodec {
     /// Every codec, in `cudaVideoCodec`'s order.
-    pub const ALL: [Self; 2] = [Self::H264, Self::Hevc];
+    pub const ALL: [Self; 3] = [Self::H264, Self::Hevc, Self::Av1];
 
     pub(crate) fn raw(self) -> ffi::cudaVideoCodec {
         match self {
             Self::H264 => ffi::cudaVideoCodec_H264,
             Self::Hevc => ffi::cudaVideoCodec_HEVC,
+            Self::Av1 => ffi::cudaVideoCodec_AV1,
         }
     }
 }

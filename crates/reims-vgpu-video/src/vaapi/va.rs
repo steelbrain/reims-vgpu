@@ -12,6 +12,7 @@
 // descriptors, and what is left of it, unused there, is let be.
 #![cfg_attr(windows, allow(dead_code, unused_imports))]
 
+mod av1;
 mod buffer;
 mod calls;
 mod caps;
@@ -56,6 +57,9 @@ mod vpp_ffi;
 mod wait;
 mod zero_copy;
 
+pub use av1::{
+    AV1_PROFILE0, Av1Decoder, decodes_ten_bit as av1_decodes_ten_bit, limits as av1_limits,
+};
 pub use caps::{
     Capabilities, ConfigCapabilities, Entrypoint, Fourcc, Profile, SurfaceCapabilities,
     proc_filter_name, rt_format_names,

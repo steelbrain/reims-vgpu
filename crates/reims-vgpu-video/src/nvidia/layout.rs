@@ -348,6 +348,7 @@ fn nvdec_checks(checks: &mut Checks) {
         "__typeof__(((CUVIDPICPARAMS *)0)->CodecSpecific)",
         size_of::<dec::CuvidCodecSpecific>(),
     );
+    av1_checks(checks);
     layout!(checks, dec::CUVIDPROCPARAMS, "CUVIDPROCPARAMS" {
         progressive_frame, second_field, top_field_first, unpaired_field, reserved_flags,
         reserved_zero, raw_input_dptr, raw_input_pitch, raw_input_format, raw_output_dptr,
@@ -417,6 +418,83 @@ fn nvdec_checks(checks: &mut Checks) {
     for signature in dec::NvdecFunctions::SIGNATURES {
         checks.signature(&format!("t{}", signature.symbol), signature, false);
     }
+}
+
+/// `CUVIDAV1PICPARAMS`: its fields, its words' bit-fields, and its anonymous structs.
+fn av1_checks(checks: &mut Checks) {
+    use dec::av1::{self as av1, CUVIDAV1PICPARAMS as P, CuvidAv1GlobalMotion, CuvidAv1RefFrame};
+    layout!(checks, P, "CUVIDAV1PICPARAMS" {
+        width, height, frame_offset, decodePicIdx, tile_widths, tile_heights, cdef_y_strength,
+        cdef_uv_strength, base_qindex, qp_y_dc_delta_q, qp_u_dc_delta_q, qp_v_dc_delta_q,
+        qp_u_ac_delta_q, qp_v_ac_delta_q, qm_y, qm_u, qm_v, segmentation_feature_data,
+        segmentation_feature_mask, loop_filter_level, loop_filter_level_u, loop_filter_level_v,
+        loop_filter_sharpness, loop_filter_ref_deltas, loop_filter_mode_deltas, lr_unit_size,
+        lr_type, primary_ref_frame, ref_frame_map, reserved5_32bits, ref_frame, global_motion,
+        num_y_points, scaling_points_y, num_cb_points, scaling_points_cb, num_cr_points,
+        scaling_points_cr, reserved7_8bits, random_seed, ar_coeffs_y, ar_coeffs_cb,
+        ar_coeffs_cr, cb_mult, cb_luma_mult, cb_offset, cr_mult, cr_luma_mult, cr_offset,
+        reserved,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", sequence_word: u32, av1::bits::sequence {
+        profile, use_128x128_superblock, subsampling_x, subsampling_y, mono_chrome,
+        bit_depth_minus8, enable_filter_intra, enable_intra_edge_filter,
+        enable_interintra_compound, enable_masked_compound, enable_dual_filter,
+        enable_order_hint, order_hint_bits_minus1, enable_jnt_comp, enable_superres, enable_cdef,
+        enable_restoration, enable_fgs,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", frame_word: u32, av1::bits::frame {
+        frame_type, show_frame, disable_cdf_update, allow_screen_content_tools, force_integer_mv,
+        coded_denom, allow_intrabc, allow_high_precision_mv, interp_filter,
+        switchable_motion_mode, use_ref_frame_mvs, disable_frame_end_update_cdf, delta_q_present,
+        delta_q_res, using_qmatrix, coded_lossless, use_superres, tx_mode, reference_mode,
+        allow_warped_motion, reduced_tx_set, skip_mode,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", tiling_word: u32, av1::bits::tiling {
+        num_tile_cols, num_tile_rows, context_update_tile_id,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", cdef_word: u8, av1::bits::cdef {
+        cdef_damping_minus_3, cdef_bits,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", skip_mode_word: u8, av1::bits::skip_mode {
+        SkipModeFrame0, SkipModeFrame1,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", segmentation_word: u8, av1::bits::segmentation {
+        segmentation_enabled, segmentation_update_map, segmentation_update_data,
+        segmentation_temporal_update,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", loop_filter_word: u8, av1::bits::loop_filter {
+        loop_filter_delta_enabled, loop_filter_delta_update, delta_lf_present, delta_lf_res,
+        delta_lf_multi,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", layer_word: u8, av1::bits::layer {
+        temporal_layer_id, spatial_layer_id,
+    });
+    bit_fields!(checks, P, "CUVIDAV1PICPARAMS", film_grain_word: u16, av1::bits::film_grain {
+        apply_grain, overlap_flag, scaling_shift_minus8, chroma_scaling_from_luma, ar_coeff_lag,
+        ar_coeff_shift_minus6, grain_scale_shift, clip_to_restricted_range,
+    });
+    const REF_FRAME: &str = "__typeof__(((CUVIDAV1PICPARAMS *)0)->ref_frame[0])";
+    checks.size(REF_FRAME, size_of::<CuvidAv1RefFrame>());
+    checks.offset(REF_FRAME, "width", offset_of!(CuvidAv1RefFrame, width));
+    checks.offset(REF_FRAME, "height", offset_of!(CuvidAv1RefFrame, height));
+    checks.offset(REF_FRAME, "index", offset_of!(CuvidAv1RefFrame, index));
+    checks.offset(
+        REF_FRAME,
+        "reserved24Bits",
+        offset_of!(CuvidAv1RefFrame, reserved24Bits),
+    );
+    const MOTION: &str = "__typeof__(((CUVIDAV1PICPARAMS *)0)->global_motion[0])";
+    checks.size(MOTION, size_of::<CuvidAv1GlobalMotion>());
+    checks.offset(
+        MOTION,
+        "reserved24Bits",
+        offset_of!(CuvidAv1GlobalMotion, reserved24Bits),
+    );
+    checks.offset(MOTION, "wmmat", offset_of!(CuvidAv1GlobalMotion, wmmat));
+    bit_fields!(checks, CuvidAv1GlobalMotion, MOTION, motion_word: u8, av1::bits::motion {
+        invalid, wmtype,
+    });
+    checks.constant("cudaVideoCodec_AV1", dec::cudaVideoCodec_AV1.into());
 }
 
 fn nvenc_checks(checks: &mut Checks) {

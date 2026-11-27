@@ -16,6 +16,7 @@
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 
+pub(crate) mod av1;
 pub(crate) mod encode;
 
 pub(crate) type VADisplay = *mut c_void;

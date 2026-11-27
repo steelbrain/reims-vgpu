@@ -19,6 +19,7 @@ Intel runs were made on the Iris Xe of an i9-13900H on iHD. Paths are
 |---|---|
 | H.264 syntax and the decoding process above the slice data: NAL units, `avcC`, SPS/PPS/scaling lists, slice headers, order counts, the DPB's marking, lists and bumping. Plain Rust on every host, behind an `Accelerator` trait | `src/codec/h264.rs`, `src/codec/h264/`; the bumping process HEVC shares, `src/codec/dpb.rs` |
 | HEVC syntax and the decoding process above the slice data: NAL units, `hvcC`, VPS/SPS/PPS, scaling lists, short- and long-term sets, slice segment headers, order counts, the DPB, lists and bumping. Plain Rust, behind its own `Accelerator` trait | `src/codec/hevc.rs`, `src/codec/hevc/` |
+| AV1 syntax and the decoding process above the tile data: OBUs, `av1C`, the sequence and frame headers, tile groups, the eight reference slots and the frames each temporal unit shows. Plain Rust, behind its own `Accelerator` trait | `src/codec/av1.rs`, `src/codec/av1/` |
 | The encoders' portable half: settings, GOP, parameter sets, slice headers, configuration records and rate control | `src/codec/encode.rs`, `src/codec/encode/` ("The encoders") |
 | libva's binding, written by hand for the subset used | `src/vaapi/va/ffi.rs`, checked by `src/vaapi/va/ffi_layout.c`; video processing's `src/vaapi/va/vpp_ffi.rs`, checked by `src/vaapi/va/vpp_ffi_layout.c` |
 | libva and libva-drm, loaded at run time, and a wrapper of each function the binding calls | `src/vaapi/va/libva.rs` |
@@ -27,6 +28,7 @@ Intel runs were made on the Iris Xe of an i9-13900H on iHD. Paths are
 | VA buffers and a picture's begin, render and end | `src/vaapi/va/buffer.rs` |
 | The H.264 accelerator and `H264Decoder` | `src/vaapi/va/h264.rs` |
 | The HEVC accelerator and `HevcDecoder` | `src/vaapi/va/hevc.rs` |
+| The AV1 accelerator and `Av1Decoder`, for VideoToolbox's decoders alone ([devices.md](devices.md), "AV1 on arm64 guests") | `src/vaapi/va/av1.rs`, its binding `src/vaapi/va/ffi/av1.rs`, checked by `src/vaapi/va/ffi/av1_layout.c` |
 | NV12 and P010 surface pools, a frame on one, and the ways back into caller planes | `src/vaapi/va/surface.rs`, `src/vaapi/va/frame.rs`, `src/vaapi/va/readback.rs`, `src/vaapi/va/host_memory.rs` |
 | What the driver's video processing writes into an imported surface, tried at each display's open ("The import check") | `src/vaapi/va/import_check.rs` |
 | A frame written in place into a caller's pages ("Zero copy"), and the wait for a run's writes outside the driver's lock | `src/vaapi/va/zero_copy.rs`, `src/vaapi/va/fence.rs` |
@@ -142,6 +144,11 @@ Both report the same for the codecs the crate drives:
 
 - Not offered: H.264 High10, 4:2:2 or 4:4:4; HEVC 4:2:2, 4:4:4, 12-bit or
   SCC.
+- AV1, for an arm64 guest's VideoToolbox alone ([devices.md](devices.md), "AV1 on arm64
+  guests"): the RX 7900 XTX decodes `AV1Profile0` up to 8192x4352 at 8 and 10 bits, its
+  surfaces from 16x16 (HEVC Main's from 64x64), and lists `AV1Profile2` (Professional) as
+  well, which is not offered (m3-max-77318 and m3-max-77432, 2026-11-27). The smallest
+  surface is the smallest frame offered (`graphics/vaapi.rs`). The Iris Xe's iHD decodes `AV1Profile0` up to 16384x16384 (m3-max-77363).
 - Encode attributes, the same for both encoders: rate control 0x416 (CBR,
   VBR, CQP, QVBR), 128 slices at most. H.264 takes packed headers 0x1f and
   references 0x10002 (two in list 0, one in list 1). HEVC takes references

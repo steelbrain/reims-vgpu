@@ -18,7 +18,7 @@ driver 13.4, on CachyOS) unless they say otherwise.
 | The CUDA driver API: a GPU, its primary context, copies | `src/nvidia/cuda.rs`, `src/nvidia/cuda/ffi.rs` |
 | NVDEC's binding: caps, decoder, pictures, mapping, status, reconfiguration | `src/nvidia/nvdec.rs`, `src/nvidia/nvdec/ffi.rs` |
 | An NVDEC decoder and its pictures: surfaces, stand-ins, the copy out | `src/nvidia/nvdec/decoder.rs` |
-| The codec module's accelerators on NVDEC, one a codec | `src/nvidia/nvdec/h264.rs`, `hevc.rs` |
+| The codec module's accelerators on NVDEC, one a codec | `src/nvidia/nvdec/h264.rs`, `hevc.rs`, and AV1's, for VideoToolbox's decoders alone ([devices.md](devices.md), "AV1 on arm64 guests"), `av1.rs` with its binding `src/nvidia/nvdec/ffi/av1.rs` |
 | The decoder of whole Annex B access units, which the reims-graphics device's video drives | `src/nvidia/annex_b.rs` |
 | The failures NVDEC reports, which fail the pictures after them | `src/nvidia/decode.rs` |
 | Zero copy: guest memory registered with CUDA ("Zero copy") | `src/nvidia/zero_copy.rs` |
@@ -239,6 +239,29 @@ the model.
   scaling lists in coding (diagonal) order, as dynlink_cuviddec.h says
   ("scaling lists (diag order)"), 32x32's from `matrixId` 0 and 3;
   `NumDeltaPocsOfRefRpsIdx` from the slice header's own predicted set.
+
+- **AV1**, for VideoToolbox's paravirtual decoders alone ([devices.md](devices.md), "AV1 on
+  arm64 guests"): `CUVIDAV1PICPARAMS` from the codec module's sequence and frame headers
+  (`src/nvidia/nvdec/av1.rs`), ffmpeg's `nvdec_av1.c` the model. A frame's tile data goes in
+  one call, each tile's start and end in `pSliceDataOffsets`. The references go by surface:
+  `ref_frame_map` and each `ref_frame[i].index` name the surface of the slot they name, 0xff
+  for an empty one, for every frame, as ffmpeg fills them; `primary_ref_frame` names the
+  surface of the primary reference's slot, not the slot's number. With the slot's number there,
+  and `ref_frame[]` left zero on key frames, libnvcuvid faulted (SIGSEGV, and SIGBUS under gdb)
+  inside `cuvidDecodePicture` at the first frame (**measured** on the RTX 3090, driver
+  620.70.06, 2026-11-27, m3-max-77319 and m3-max-77356). A frame naming a slot that holds no
+  frame is refused before NVDEC sees it (`picture_parameters`). After the fix, every
+  `CUVIDPICPARAMS` of our superres stream equalled ffmpeg's byte for byte but for its two
+  pointers, call by call under gdb (m3-max-77392). NVDEC decodes into `decodePicIdx`, which
+  later frames predict from, and writes the frame with film grain into `CurrPicIdx`, which the
+  guest gets: its grain is the specification's, each frame of our grain stream equal to
+  libdav1d's (m3-max-77377). On the RTX 3090 (Ampere, driver 620.70.06), the caps answer AV1 at
+  4:2:0 from 128x128 up to 8192x8192, at 8 and 10 bits (m3-max-77421), and NVDEC decodes a superres stream's
+  inter frames wrongly: of our `aom-superres`, the key frame matched libdav1d's and each of the
+  5 inter frames differed, each with status 9 (`cuvidDecodeStatus_Error_Concealed`), and
+  ffmpeg's own NVDEC decode gave the same 5 wrong frames (**measured**, 2026-11-27,
+  m3-max-77377 and m3-max-77392; [bugs.md](bugs.md), U36). VideoToolbox's decoders copy no
+  failed picture, so each such frame fails to the guest as a decode error.
 
 ### Concealment
 

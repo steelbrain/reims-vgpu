@@ -8,6 +8,8 @@
 
 mod va;
 
+pub use va::{AV1_PROFILE0, Av1Decoder, av1_decodes_ten_bit, av1_limits};
+
 pub use va::{
     Capabilities, ConfigCapabilities, Display, Entrypoint, Error, ExportedPlane, Fourcc, Frame,
     FrameHold, GuestWrites, H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrite,

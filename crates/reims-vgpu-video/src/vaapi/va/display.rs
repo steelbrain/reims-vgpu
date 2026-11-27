@@ -50,6 +50,8 @@ pub enum Error {
     Bitstream(crate::codec::h264::Error),
     /// The HEVC stream is malformed, or uses what the decoder refuses.
     HevcBitstream(crate::codec::hevc::Error),
+    /// The AV1 stream is malformed, or uses what the decoder refuses.
+    Av1Bitstream(crate::codec::av1::Error),
     /// The driver cannot decode this stream: what is missing, in words.
     Unsupported(String),
     /// The caller holds every surface the decoder may make.
@@ -78,6 +80,7 @@ impl std::fmt::Display for Error {
             } => write!(f, "{call} failed: {message} ({status:#x})"),
             Self::Bitstream(e) => write!(f, "{e}"),
             Self::HevcBitstream(e) => write!(f, "{e}"),
+            Self::Av1Bitstream(e) => write!(f, "{e}"),
             Self::Unsupported(what) => write!(f, "the driver cannot: {what}"),
             Self::OutOfSurfaces => write!(f, "every decode surface is held"),
             Self::PlaneTooSmall(plane) => write!(f, "the {plane} plane is too small"),
@@ -88,12 +91,13 @@ impl std::fmt::Display for Error {
 
 impl Error {
     /// Whether the error is one picture's of the stream, after which the decoder goes on (the
-    /// codec crate's `is_picture_error`, H.264's and HEVC's): the rest are the decoder's own or
+    /// codec crate's `is_picture_error`, H.264's, HEVC's and AV1's): the rest are the decoder's own or
     /// the driver's.
     pub fn is_picture_error(&self) -> bool {
         match self {
             Self::Bitstream(e) => e.is_picture_error(),
             Self::HevcBitstream(e) => e.is_picture_error(),
+            Self::Av1Bitstream(e) => e.is_picture_error(),
             _ => false,
         }
     }
@@ -110,6 +114,12 @@ impl From<crate::codec::h264::Error> for Error {
 impl From<crate::codec::hevc::Error> for Error {
     fn from(e: crate::codec::hevc::Error) -> Self {
         Self::HevcBitstream(e)
+    }
+}
+
+impl From<crate::codec::av1::Error> for Error {
+    fn from(e: crate::codec::av1::Error) -> Self {
+        Self::Av1Bitstream(e)
     }
 }
 

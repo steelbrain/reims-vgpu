@@ -109,6 +109,8 @@ pub(crate) fn surface_count(pictures: usize) -> u32 {
 pub(crate) enum Slices<'a> {
     /// Each slice's start: H.264's slices, HEVC's slice segments.
     Starts(&'a [u32]),
+    /// Each tile's start and end, two offsets a tile: AV1's tiles.
+    Tiles(&'a [u32]),
 }
 
 impl Slices<'_> {
@@ -122,6 +124,15 @@ impl Slices<'_> {
                 starts.as_ptr(),
                 starts.iter().all(|&start| start <= len),
             ),
+            Slices::Tiles(bounds) => {
+                let (tiles, rest) = bounds.as_chunks::<2>();
+                (
+                    tiles.len(),
+                    bounds.as_ptr(),
+                    rest.is_empty()
+                        && (tiles.iter()).all(|&[start, end]| start <= end && end <= len),
+                )
+            }
         };
         if !within {
             return Err(Error::Bitstream(format!(

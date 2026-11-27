@@ -30,6 +30,10 @@
 //!   them, [`AnnexBDecoder::lands_range_extensions`]): 4:2:0 ones as Main 10's,
 //!   and 4:4:4 ones into three planes, luma, Cb and Cr, each as large, which
 //!   it reads back; its writes, of two planes, refuse those.
+//! - **An AV1 stream** is handed over as temporal units of OBUs, in the
+//!   low-overhead format, after its record's `configOBUs` as its
+//!   parameter sets (`nvdec::av1`); a picture NVDEC fails is followed by
+//!   the next decodes, as an H.264 stream's is.
 //! - **A picture holds its decode surface** until it drops: the decoder has
 //!   [`AnnexBDecoder::SPARE_PICTURES`] surfaces beyond its references and
 //!   the picture being decoded, and a decode with none free is
@@ -39,6 +43,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::codec::PictureStart;
+use crate::codec::av1::{Decoder as Av1Decoder, Limits as Av1Limits};
 use crate::codec::h264::{Decoder as H264Decoder, nal::NalFormat};
 use crate::codec::hevc::Decoder as HevcDecoder;
 use crate::core::device_memory::DeviceMemory;
@@ -49,6 +54,7 @@ use crate::nvidia::cuda::Gpu;
 use crate::nvidia::decode::Failures;
 use crate::nvidia::error::Error;
 use crate::nvidia::external::ImportedBuffer;
+use crate::nvidia::nvdec::av1::NvdecAv1;
 use crate::nvidia::nvdec::decoder::{
     Crop, Destination, InPlace, Memory, OnFailed, Picture, PictureReadBack, SPARE_SURFACES,
 };
@@ -65,6 +71,10 @@ pub enum AnnexBCodec {
     /// 8, 10 and 12 bits where the caller lands them
     /// ([`AnnexBDecoder::lands_range_extensions`]).
     Hevc,
+    /// AV1's Main profile, 4:2:0 at 8 and 10 bits, of frames within the
+    /// limits (NVDEC's largest and smallest, as its capability query lists
+    /// them).
+    Av1(Av1Limits),
 }
 
 /// One stream's decoder of whole Annex B access units on NVDEC (module
@@ -83,6 +93,8 @@ pub struct AnnexBDecoder {
 enum Codec {
     H264(H264Decoder<NvdecH264>),
     Hevc(HevcDecoder<NvdecHevc>),
+    /// Boxed: its eight slots' state is far larger than the other decoders.
+    Av1(Box<Av1Decoder<NvdecAv1>>),
 }
 
 /// How an [`AnnexBDecoder`]'s pictures reached NVDEC: as a run of their
@@ -117,6 +129,10 @@ impl AnnexBDecoder {
                 NvdecHevc::new(Arc::clone(gpu)),
                 NalFormat::AnnexB,
             )),
+            AnnexBCodec::Av1(limits) => Codec::Av1(Box::new(Av1Decoder::new(
+                NvdecAv1::new(Arc::clone(gpu)),
+                limits,
+            ))),
         };
         Self {
             codec,
@@ -161,7 +177,8 @@ impl AnnexBDecoder {
     }
 
     /// Takes parameter sets (H.264's SPS and PPS, HEVC's VPS, SPS and PPS),
-    /// units in Annex B form; units that make a picture are an error.
+    /// units in Annex B form; AV1's sequence header OBUs, a record's
+    /// `configOBUs`; units that make a picture are an error.
     pub fn parameter_sets(&mut self, sets: &[u8]) -> Result<(), Error> {
         match self.decode_sample(sets, false)? {
             None => Ok(()),
@@ -190,6 +207,7 @@ impl AnnexBDecoder {
         match &self.codec {
             Codec::H264(decoder) => decoder.last_picture(),
             Codec::Hevc(decoder) => decoder.last_picture(),
+            Codec::Av1(_) => None,
         }
     }
 
@@ -198,6 +216,7 @@ impl AnnexBDecoder {
         let in_place = match &self.codec {
             Codec::H264(decoder) => &decoder.accelerator().in_place,
             Codec::Hevc(decoder) => &decoder.accelerator().in_place,
+            Codec::Av1(decoder) => &decoder.accelerator().in_place,
         };
         Bitstreams {
             in_place: in_place.in_place,
@@ -244,6 +263,17 @@ impl AnnexBDecoder {
                 )?;
                 (decoded.into_iter())
                     .map(|out| (out.picture, out.crop))
+                    .collect::<Vec<_>>()
+            }
+            // An AV1 decoder decodes on after a frame NVDEC failed, from what NVDEC left: its
+            // tile groups are sent in place, each frame's own.
+            Codec::Av1(decoder) => {
+                let decoded = decoder.decode(sample, id)?;
+                (decoded.into_iter())
+                    .map(|out| {
+                        let (width, height) = out.size;
+                        (Arc::clone(out.picture.output()), (0, 0, width, height))
+                    })
                     .collect::<Vec<_>>()
             }
         };
@@ -659,5 +689,7 @@ impl AnnexBPicture {
     }
 }
 
+#[cfg(test)]
+mod av1_tests;
 #[cfg(test)]
 mod tests;
