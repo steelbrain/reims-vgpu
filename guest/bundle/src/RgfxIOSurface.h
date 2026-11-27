@@ -51,16 +51,16 @@
  * block (RgfxRegion::acquireSurface), found by the pages of plane 0 the process maps, holding
  * every plane. Where the kext gives no shared block, the process keeps a block of its own for the
  * surface. The kext gives a surface's blocks in one mode, so every holder of a surface copied
- * copies it. Each view made, in place or a copy and why, and each copy's block, shared or the
- * process's own, is counted in the "surface copies" line the process logs (os_log, info) once a
- * minute at most while views are made or copied; the kext logs why it first refused a shared
- * block. The line also says whether the kext answers the surfaces' unlock seeds ("unlock seeds
- * on", off, or unknown before a device says), and counts the uploads made while a CPU held the
- * surface locked for writing ("mid-write"), those made again once such a CPU let go ("synced
- * again at the unlock"), and the kext's answers they took ("asks for it"); and, for cached
- * surfaces, the uses named while the lock that moved their generation was held ("named
- * mid-write"), the refills asked once it let go ("filled again at the unlock"), and the kext's
- * answers they took.
+ * copies it. Each view made, in place or a copy and why (RgfxSurfaceCopyReason, each reason by its
+ * name), and each copy's block, shared or the process's own, is counted in the "surface copies"
+ * line the process logs (os_log, info) once a minute at most while views are made or copied; the
+ * kext logs why it first refused a shared block. The line also says whether the kext answers the
+ * surfaces' unlock seeds ("unlock seeds on", off, or unknown before a device says), and counts the
+ * uploads made while a CPU held the surface locked for writing ("mid-write"), those made again
+ * once such a CPU let go ("synced again at the unlock"), and the kext's answers they took ("asks
+ * for it"); and, for cached surfaces, the uses named while the lock that moved their generation
+ * was held ("named mid-write"), the refills asked once it let go ("filled again at the unlock"),
+ * and the kext's answers they took.
  *
  * The copy holds the planes in plane order, each from a kShadowRowAlign multiple, its rows
  * kShadowRowAlign apart, as the surface's own memory holds them one after another; a header past
@@ -311,11 +311,22 @@ void rgfxIOSurfaceSetRefill(bool on);
 /// Why a GPU view of a surface is a copy of its planes in a block, not its pages in place.
 enum RgfxSurfaceCopyReason : uint32_t {
 	kRgfxSurfaceCopiedAlignment,   // a plane where no host texture lies over it in place
-	kRgfxSurfaceCopiedUnsupported, // no view in place on the device, or of the surface's pages
+	kRgfxSurfaceCopiedUnsupported, // the device uses no surface in place (no SURFACE_PAGES)
 	kRgfxSurfaceCopiedRefused,     // the kext gave no block in place
 	kRgfxSurfaceCopiedNoRoom,      // the kext had no room for its block in place
+	kRgfxSurfaceCopiedUncached,    // asked no device cache where the device caches every surface,
+	                               // which the kext refuses (`uncacheable`)
+	kRgfxSurfaceCopiedHost,        // the device refused the surface's pages
 	kRgfxSurfaceCopyReasons
 };
+
+/// Whether the device uses surfaces in place: where the device's feature word holds
+/// RGFX_FEATURE_SURFACE_PAGES, as the device is made. The kext answers an ask in place it does
+/// not carry out kIOReturnUnsupported (RgfxRegion::kPagesUnsupported) for three reasons, which
+/// the copies' counts name apart by this and the ask (RgfxSurfaceCopyReason): the device uses no
+/// surface in place, an ask with no device cache where the device caches every surface, and the
+/// device's refusal of the surface's pages.
+void rgfxIOSurfaceSetPagesTaken(bool on);
 
 /// Whether the device caches every surface the kext gives in place: where the device's feature
 /// word holds RGFX_FEATURE_SURFACE_CACHE_EVERY, as the device is made. A view that is a copy is

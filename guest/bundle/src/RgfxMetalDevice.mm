@@ -1171,6 +1171,9 @@ RGFX_LOG_UNRECOGNIZED
 	// Where the device caches every surface the kext gives in place, a view that is a copy is a
 	// fallback, logged by its reason.
 	rgfxIOSurfaceSetCacheEvery((_caps.features() & RGFX_FEATURE_SURFACE_CACHE_EVERY) != 0);
+	// A refusal of a block in place is counted by its reason, which the kext's answer and this
+	// tell apart (RgfxSurfaceCopyReason).
+	rgfxIOSurfaceSetPagesTaken((_caps.features() & RGFX_FEATURE_SURFACE_PAGES) != 0);
 	// No-copy buffers over the process's own pages, where the kext makes pages blocks and the
 	// host took the feature that maps them.
 	if ((_caps.kextFeatures() & kRgfxKextFeaturePagesBlock) != 0 &&

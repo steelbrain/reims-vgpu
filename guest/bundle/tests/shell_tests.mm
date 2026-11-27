@@ -21434,8 +21434,8 @@ void test_iosurface_keep()
 }
 
 // A surface whose ask in place the device or the kext refuses gets a copy in its shared block,
-// counted by why; where the device caches every surface in place (SURFACE_CACHE_EVERY) the copy
-// is the fallback, still made and counted.
+// counted by why, each reason by its name; where the device caches every surface in place
+// (SURFACE_CACHE_EVERY) the copy is the fallback, still made and counted.
 void test_iosurface_in_place_fallback()
 {
 	Fixture fx;
@@ -21487,22 +21487,32 @@ void test_iosurface_in_place_fallback()
 	};
 	int asked = 0, copies = 0;
 	// Where the device caches every surface the kext gives in place, a refused ask is still a
-	// copy, counted by its reason: never nil.
+	// copy, counted by its reason: never nil. The kext answers unsupported for three: where the
+	// device uses no surface in place (no SURFACE_PAGES), where an ask with no device cache meets a
+	// device that caches every surface (`uncacheable`), and where the device refused the
+	// surface's pages; each is counted by its name.
 	struct Case {
 		bool cacheEvery;
+		bool pagesTaken;
+		bool uncached; // made under RgfxAskUncachedScope
 		RgfxRegion::PagesAnswer answer;
 		RgfxSurfaceCopyReason reason;
 	};
 	for (const Case &c : {
-	         Case{false, RgfxRegion::kPagesUnsupported, kRgfxSurfaceCopiedUnsupported},
-	         Case{false, RgfxRegion::kPagesRefused, kRgfxSurfaceCopiedRefused},
-	         Case{true, RgfxRegion::kPagesUnsupported, kRgfxSurfaceCopiedUnsupported},
-	         Case{true, RgfxRegion::kPagesRefused, kRgfxSurfaceCopiedRefused},
-	         Case{true, RgfxRegion::kPagesNoRoom, kRgfxSurfaceCopiedNoRoom},
+	         Case{false, false, false, RgfxRegion::kPagesUnsupported,
+	              kRgfxSurfaceCopiedUnsupported},
+	         Case{false, true, false, RgfxRegion::kPagesUnsupported, kRgfxSurfaceCopiedHost},
+	         Case{false, true, true, RgfxRegion::kPagesUnsupported, kRgfxSurfaceCopiedHost},
+	         Case{false, true, false, RgfxRegion::kPagesRefused, kRgfxSurfaceCopiedRefused},
+	         Case{true, true, false, RgfxRegion::kPagesUnsupported, kRgfxSurfaceCopiedHost},
+	         Case{true, true, true, RgfxRegion::kPagesUnsupported, kRgfxSurfaceCopiedUncached},
+	         Case{true, true, false, RgfxRegion::kPagesRefused, kRgfxSurfaceCopiedRefused},
+	         Case{true, true, false, RgfxRegion::kPagesNoRoom, kRgfxSurfaceCopiedNoRoom},
 	     }) {
 		const RgfxRegion::PagesAnswer answer = c.answer;
 		src.answer = answer;
 		rgfxIOSurfaceSetCacheEvery(c.cacheEvery);
+		rgfxIOSurfaceSetPagesTaken(c.pagesTaken);
 		uint64_t before[kRgfxSurfaceCopyReasons];
 		for (uint32_t k = 0; k < kRgfxSurfaceCopyReasons; k++)
 			before[k] = rgfxIOSurfaceCopiedViews(static_cast<RgfxSurfaceCopyReason>(k));
@@ -21527,12 +21537,21 @@ void test_iosurface_in_place_fallback()
 			                                                       width:16
 			                                                      height:16
 			                                                   mipmapped:NO];
-			RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
-			                                                            iosurface:s
-			                                                                plane:0
-			                                                               region:&region
-			                                                               device:nil
-			                                                           serializer:&fx.ser];
+			auto make = [&] {
+				return [RgfxIOSurfaceTexture textureWithDescriptor:td
+				                                         iosurface:s
+				                                             plane:0
+				                                            region:&region
+				                                            device:nil
+				                                        serializer:&fx.ser];
+			};
+			RgfxIOSurfaceTexture *t = nil;
+			if (c.uncached) {
+				RgfxAskUncachedScope ask;
+				t = make();
+			} else {
+				t = make();
+			}
 			CHECK(t != nil && src.asked == ++asked && src.copies == ++copies &&
 			      blocks.allocated.empty());
 			auto create =
@@ -21556,6 +21575,7 @@ void test_iosurface_in_place_fallback()
 		CFRelease(s);
 	}
 	rgfxIOSurfaceSetCacheEvery(false);
+	rgfxIOSurfaceSetPagesTaken(false);
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
 }
 
@@ -22461,7 +22481,7 @@ void test_iosurface_nil_is_logged()
 	CHECK(has(line, "IOSurface " + std::to_string(IOSurfaceGetID(s)) + " 'RGhA' 6094x1566") &&
 	      has(line, "0 planes; plane 0: 1566 rows of " +
 	                    std::to_string(IOSurfaceGetBytesPerRow(s)) + " bytes") &&
-	      has(line, "not in place (the device uses no surface in place, or refused its pages)") &&
+	      has(line, "not in place (the device uses no surface in place)") &&
 	      has(line, "no shared copy block of " + std::to_string(size) + " bytes") &&
 	      has(line, "(1048576 bytes free)"));
 	@autoreleasepool {

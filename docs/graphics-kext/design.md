@@ -5526,8 +5526,13 @@ guest keeps it only as the fallback, counted by why.
   of each, with all of them and the growths on a line beside the dormancy
   line ("every surface cached").
 - **The bundle.** A view not in place is still a copy, made as before, never
-  nil: counted by why (alignment, unsupported, refused by the kext, no room in
-  the kext) in the minute's surface copies line, which is logged at the
+  nil: counted by why (`RgfxSurfaceCopyReason`) in the minute's surface copies
+  line. The reasons are alignment; unsupported, where the device uses no
+  surface in place; refused by the kext; no room in the kext; asked uncached
+  where every surface is cached, the kext's `uncacheable`; and refused by the
+  device, which refused the surface's pages. The kext answers the last three
+  alike, and the bundle tells them apart by the ask and by the device's
+  `SURFACE_PAGES` and `SURFACE_CACHE_EVERY`. The line is logged at the
   default level where a copy was made in that minute, and the first of each
   reason logged at the default level with the surface's format and shape
   (`rgfxIOSurfaceSetCacheEvery`). A plane goes in place where its offset and
