@@ -54,8 +54,10 @@ P010, and handed to the driver as its resource
 (`src/vaapi/va/d3d11.rs`), which wrap the same resource, read what decodes
 into it (`Frame::texture`). Direct3D 12 makes one device a process and
 adapter, so the driver's, the draws' and the pools' are one. No pool texture
-is shared by an NT handle: an open of one on the device that made it stays
-charged to the process for good ([bugs.md](bugs.md), U34). A display whose
+is shared by an NT handle: an open of one on the device that made it adds a
+charge to the process's GPU memory counters that never comes down, though
+available memory, the commit charge and DXGI's usage did not move with it
+([bugs.md](bugs.md), U34). A display whose
 driver lists no such memory type for its H.264 or HEVC decodes' surfaces is
 refused at its open, as one is where libva does not load. `vaon12`'s own
 surfaces cannot be read so, and their export fails (UHD 630, Mesa 26.2.7).

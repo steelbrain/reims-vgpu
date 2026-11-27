@@ -51,6 +51,11 @@
 //! - Available MBytes went from 46443 to 48237, Committed Bytes from 19.5 to 17.9 GiB, and the
 //!   process's handles from 1117 to 971.
 //! - No import was refused, and every check matched all 240 of its pictures.
+//!
+//! Measured on another open, `ID3D12Device::OpenSharedHandle` of a texture's NT handle on its
+//! own device, the counter's charge stays past the device's last release, and DXGI's
+//! `QueryVideoMemoryInfo` does not count it (Intel UHD 630 and WARP, 2026-11-26, potluck job
+//! m3-max-75692; reims-vgpu-video's `vaapi::va::d3d12`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

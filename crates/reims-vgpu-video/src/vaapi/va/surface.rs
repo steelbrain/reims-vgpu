@@ -531,8 +531,8 @@ pub(super) fn takes_resources(display: &Display) -> Result<(), Error> {
 
 /// A surface of `format`, `width` by `height`, that the driver makes over
 /// `texture`'s resource (`VA_SURFACE_ATTRIB_MEM_TYPE_D3D12_RESOURCE`), never
-/// by an NT handle, whose import keeps the texture's memory charged for good
-/// (`super::d3d12`).
+/// by an NT handle, whose import adds a charge to the process's GPU memory
+/// counters that never comes down (`super::d3d12`).
 #[cfg(windows)]
 fn import_texture(
     display: &Display,

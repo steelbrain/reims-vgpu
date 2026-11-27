@@ -14,15 +14,18 @@
 //! fence.
 //!
 //! No pool texture is shared by an NT handle. An open of a texture's NT handle on the device that
-//! made it (`ID3D12Device::OpenSharedHandle`) charged the process's GPU memory with the texture's
-//! size for good: past the open's release, the texture's and its handle's, and the display's
-//! `vaTerminate`, while the device lived; and vaon12's import of an NT handle
+//! made it (`ID3D12Device::OpenSharedHandle`) adds the texture's size to the process's Shared
+//! Usage in the "GPU Process Memory" counters (what Task Manager shows): a charge in those
+//! counters that never comes down, even past the device's last release; available physical
+//! memory, the commit charge and DXGI's usage (`QueryVideoMemoryInfo`) did not move with it
+//! (over 1440 MiB of charge, measured on the lab's UHD 630 and on the software adapter, WARP,
+//! potluck job m3-max-75692). It stays past the open's release, the texture's and its handle's,
+//! and the display's `vaTerminate`. vaon12's import of an NT handle
 //! (`VA_SURFACE_ATTRIB_MEM_TYPE_NTHANDLE`) is such an open, charged again at each import of the
 //! same texture. A pool of six 3840x2160 NV12 textures was charged 72 MiB at each import and at
-//! each of the draws' opens, with no VA call for the opens alone, in the "GPU Process Memory"
-//! counters' Shared Usage, which DXGI's `QueryVideoMemoryInfo` does not count; handed over and
-//! wrapped as resources, none (measured on an Intel UHD Graphics 630, driver 31.0.101.2145, Mesa
-//! 26.2.7, 2026-11-26, with a program of our own on D3D12 and libva alone).
+//! each of the draws' opens, with no VA call for the opens alone; handed over and wrapped as
+//! resources, none (measured on an Intel UHD Graphics 630, driver 31.0.101.2145, Mesa 26.2.7,
+//! 2026-11-26, with programs of our own on D3D12 and libva alone).
 //!
 //! The binding is written by hand: the functions are loaded from `d3d12.dll` and `dxgi.dll` with
 //! `LoadLibraryW` and `GetProcAddress`, as libva is (`super::libva`), and each COM method is
