@@ -77,8 +77,9 @@ or has no player for them at all:
 - **HEVC at 4:2:2, 4:4:4 or 12 bits on arm64 guests.** These decode on your GPU where its own
   driver offers them, and in the guest's software where it doesn't. The AMD GPUs we test on, a
   Radeon 780M and an RX 7900 XTX, offer none of them. NVIDIA GPUs decode 4:2:0 and 4:4:4 up to
-  12 bits but not 4:2:2, even on a card whose decoder handles it, such as the RTX 5080 Laptop GPU
-  we test on: we haven't built that part yet. An Intel Iris Xe decodes all of them, except 4:2:0
+  12 bits, and 4:2:2 where the card's decoder handles it, such as the RTX 5080 Laptop GPU's; an
+  RTX 3090's doesn't. We've checked the 5080's 4:2:2 pictures on the host, not yet from an arm64
+  guest on that card. An Intel Iris Xe decodes all of them, except 4:2:0
   video at 8 or 10 bits that uses HEVC's range extensions profiles, which we don't take from
   Intel's driver yet.
 - **JPEG decoding on arm64 guests.** macOS 14.6.1 and 26.6.2 look for Apple's own JPEG and scaler

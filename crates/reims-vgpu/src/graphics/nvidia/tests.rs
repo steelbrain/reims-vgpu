@@ -8,6 +8,7 @@ use std::alloc::Layout;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use reims_vgpu_video::core::backend::{Chroma, PixelFormat};
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryLife};
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::runtime::{ExitStep, MonoTime, Rings, TimedOut};
@@ -659,6 +660,246 @@ fn a_videotoolbox_picture_lands_in_the_lent_surfaces_pages_as_it_reads_back() {
     });
 }
 
+/// The card test's streams ([`an_hevc_picture_lands_in_its_guest_format_as_the_software_decode_has_it`]):
+/// each one's name in `RVG_NV_STREAMS`, its chroma format, depth and size. x265 wrote them from
+/// ffmpeg's `testsrc2` with no reordering (`--bframes 0`), so that decode order is display order.
+const CARD_STREAMS: [(&str, Chroma, u8, (u32, u32)); 13] = [
+    ("main-360p", Chroma::Yuv420, 8, (640, 360)),
+    ("main10-360p", Chroma::Yuv420, 10, (640, 360)),
+    ("main12-360p", Chroma::Yuv420, 12, (640, 360)),
+    ("main422-8-360p", Chroma::Yuv422, 8, (640, 360)),
+    ("main422-10-360p", Chroma::Yuv422, 10, (640, 360)),
+    ("main422-12-360p", Chroma::Yuv422, 12, (640, 360)),
+    ("main422-10-1366x766", Chroma::Yuv422, 10, (1366, 766)),
+    ("main422-8-1080p", Chroma::Yuv422, 8, (1920, 1080)),
+    ("main422-10-1080p", Chroma::Yuv422, 10, (1920, 1080)),
+    ("main422-12-1080p", Chroma::Yuv422, 12, (1920, 1080)),
+    ("main444-360p", Chroma::Yuv444, 8, (640, 360)),
+    ("main444-10-360p", Chroma::Yuv444, 10, (640, 360)),
+    ("main444-12-360p", Chroma::Yuv444, 12, (640, 360)),
+];
+
+/// A `width` by `height` surface of `format` as CoreVideo lays out a pool's IOSurface: the luma at
+/// `luma_at`, the chroma on the next 4 KiB after it, each plane's rows 64 bytes aligned.
+fn pool_layout(format: PixelFormat, (width, height): (u32, u32), luma_at: usize) -> SurfaceLayout {
+    let sample = format.bytes_per_sample();
+    let columns = usize::try_from(width).expect("columns");
+    let (pairs, chroma_rows) = format.chroma().plane_size(columns, height);
+    let (luma_pitch, chroma_pitch) = (
+        (columns * sample).next_multiple_of(64),
+        (pairs * 2 * sample).next_multiple_of(64),
+    );
+    let rows = usize::try_from(height).expect("rows");
+    let chroma_at = (luma_at + luma_pitch * rows).next_multiple_of(0x1000);
+    SurfaceLayout {
+        pixel_format: format.fourcc(),
+        width,
+        height,
+        planes: vec![
+            PlaneLayout {
+                offset: luma_at,
+                bytes_per_row: luma_pitch,
+                width,
+                height,
+            },
+            PlaneLayout {
+                offset: chroma_at,
+                bytes_per_row: chroma_pitch,
+                width: u32::try_from(pairs).expect("pairs"),
+                height: chroma_rows,
+            },
+        ],
+        bytes_per_row: 0,
+    }
+}
+
+/// The pictures the CPU converted into a surface's layout, process-wide, so far.
+fn converted() -> u64 {
+    (reims_vgpu_vulkan::answer::counted_kinds().into_iter())
+        .find(|(code, _)| *code == CONVERTED_CODE)
+        .map_or(0, |(_, n)| n)
+}
+
+/// HEVC's pictures of 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits ([`CARD_STREAMS`], in
+/// `RVG_NV_STREAMS`) land through a VideoToolbox decoder of the arm, its session taken where
+/// NVDEC's caps decode the stream ([`declines`]), in the surface format a guest's pool has for
+/// their chroma format and depth (`PixelFormat::of`, video range), laid out as CoreVideo lays out
+/// a pool's IOSurface ([`pool_layout`]), as the software decode has them: the SHA-256 of each
+/// frame's two planes, each row's samples alone, is its line of `NAME.sha256` (ffmpeg's decode
+/// into the planes' layout), and the bytes before the planes, past each row and past the chroma
+/// are as they were. A stream whose session the caps refuse is named with why, and not decoded.
+/// Prints a row a stream (`CARD`): the frames compared, the reasons pictures were copied by the
+/// CPU, and the CPU's conversions counted (`video-pictures-cpu-converted`), none at 4:2:2; and the
+/// rate of each 1080p stream's pictures, each decoded and landed before the next is sent, as a
+/// guest's session sends them.
+#[test]
+#[ignore = "needs an NVIDIA GPU and the card test's streams in RVG_NV_STREAMS: run on the NVIDIA host"]
+fn an_hevc_picture_lands_in_its_guest_format_as_the_software_decode_has_it() {
+    use reims_vgpu_video::codec::hevc;
+    use reims_vgpu_video::paravirt::Codec as StreamCodec;
+    use sha2::{Digest, Sha256};
+
+    let dir = std::env::var_os("RVG_NV_STREAMS").expect("RVG_NV_STREAMS, the streams' directory");
+    let dir = std::path::PathBuf::from(dir);
+    let platform = crate::rt_test_end::platform();
+    crate::entry::run(|_| {
+        let device = platform.system_default_device().expect("an rt device");
+        crate::graphics::video_choice::tested_gpu::check_rt(&device, Arm::Nvidia);
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let gpu = super::super::video_choice::rt_nvidia_gpu(&device);
+        let video = NvidiaVideo::<RtPlatform>::new(&device, gpu, &runtime);
+        let video = Arc::new(video.expect("NVDEC on the device's GPU"));
+        let shared = Shared(Arc::clone(&video));
+        let (mut wrong, mut decoded, mut refused) = (Vec::new(), 0, 0);
+        for (name, chroma, bits, (width, height)) in CARD_STREAMS {
+            let read = |kind: &str| std::fs::read(dir.join(format!("{name}.{kind}")));
+            let file = read("265").expect("a stream");
+            let want = String::from_utf8(read("sha256").expect("its hashes")).expect("text");
+            let want: Vec<&str> = want.lines().collect();
+            let range_extensions = chroma != Chroma::Yuv420 || bits > 10;
+            let stream = Stream {
+                codec: StreamCodec::Hevc,
+                profile: if range_extensions {
+                    4
+                } else if bits > 8 {
+                    2
+                } else {
+                    1
+                },
+                chroma_format_idc: chroma.chroma_format_idc(),
+                luma_bits: bits,
+                chroma_bits: bits,
+                // x265's coded size: whole 8-sample blocks.
+                width: width.next_multiple_of(8),
+                height: height.next_multiple_of(8),
+                range_extensions,
+            };
+            if let Some(why) = shared.guest_declines(RGFX_VIDEO_CODEC_HEVC, &stream) {
+                println!("CARD {name}: refused at its start: {why}");
+                refused += 1;
+                continue;
+            }
+            let format = PixelFormat::of(chroma, bits, false).expect("a guest format");
+            let luma_at = 0x400;
+            let layout = pool_layout(format, (width, height), luma_at);
+            let [luma, chroma_plane] = [layout.planes[0], layout.planes[1]];
+            let sample = format.bytes_per_sample();
+            let columns = usize::try_from(width).expect("columns");
+            let (pairs, chroma_rows) = chroma.plane_size(columns, height);
+            let planes = [
+                (
+                    luma,
+                    columns * sample,
+                    usize::try_from(height).expect("rows"),
+                ),
+                (
+                    chroma_plane,
+                    pairs * 2 * sample,
+                    usize::try_from(chroma_rows).expect("rows"),
+                ),
+            ];
+            let chroma_end = chroma_plane.offset + chroma_plane.bytes_per_row * planes[1].2;
+            let len = (chroma_end + 1).next_multiple_of(PAGE);
+            let memory = PagesMemory {
+                life: MemoryLife::new(),
+                pages: Pages::new(len),
+            };
+            let output = GuestOutput {
+                layout: layout.clone(),
+                memory: &memory,
+                buffer: None,
+            };
+            let mut decoder = AnnexBDecoder::new(&video.gpu, AnnexBCodec::Hevc, &runtime);
+            decoder.lands_range_extensions();
+            let mut guest = NvGuestDecoder::<RtPlatform> {
+                decoder,
+                said: Vec::new(),
+                gathers: Err("the card test's".to_owned()),
+                gathered: 0,
+            };
+            let before = converted();
+            let (mut got, mut busy) = (Vec::new(), std::time::Duration::ZERO);
+            for (n, unit) in hevc::nal::access_units(&file).into_iter().enumerate() {
+                memory.pages.fill(UNTOUCHED);
+                let start = runtime.now();
+                let landed = guest.decode(&[], unit, &output);
+                busy += runtime.now().saturating_duration_since(start);
+                match landed {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => panic!("{name}: access unit {n}: {error:?}"),
+                }
+                let bytes = memory.pages.bytes();
+                assert!(
+                    bytes[..luma_at].iter().all(|&b| b == UNTOUCHED),
+                    "{name}: picture {n}: the bytes before the planes"
+                );
+                assert!(
+                    bytes[chroma_end..].iter().all(|&b| b == UNTOUCHED),
+                    "{name}: picture {n}: the bytes past the chroma"
+                );
+                let mut hash = Sha256::new();
+                for (plane, row_bytes, rows) in planes {
+                    for row in 0..rows {
+                        let first = plane.offset + row * plane.bytes_per_row;
+                        hash.update(&bytes[first..][..row_bytes]);
+                        assert!(
+                            (bytes[first + row_bytes..first + plane.bytes_per_row].iter())
+                                .all(|&b| b == UNTOUCHED),
+                            "{name}: picture {n}: bytes past row {row} of the plane at {}",
+                            plane.offset
+                        );
+                    }
+                }
+                got.push(format!("{:x}", hash.finalize()));
+            }
+            let conversions = converted() - before;
+            let equal = got.len() == want.len() && got.iter().zip(&want).all(|(g, w)| g == w);
+            let first_wrong = (got.iter().zip(&want)).position(|(g, w)| g != w);
+            let rate = if height >= 1080 {
+                let pictures = u32::try_from(got.len()).expect("pictures");
+                format!(
+                    ", {:.1} pictures a second",
+                    f64::from(pictures) / busy.as_secs_f64()
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "CARD {name}: '{}' {} of {} frames, {}, CPU copies {:?}, CPU conversions {conversions}{rate}",
+                format.fourcc(),
+                got.len(),
+                want.len(),
+                if equal { "equal" } else { "NOT EQUAL" },
+                guest.said,
+            );
+            if !equal {
+                wrong.push(format!(
+                    "{name}: {} frames of {}, first differing {first_wrong:?}",
+                    got.len(),
+                    want.len()
+                ));
+            }
+            if chroma == Chroma::Yuv422 {
+                assert_eq!(
+                    conversions, 0,
+                    "{name}: a 4:2:2 picture converted by the CPU"
+                );
+            }
+            decoded += 1;
+        }
+        println!(
+            "CARD_DONE decoded {decoded} refused {refused} wrong {}",
+            wrong.len()
+        );
+        assert_eq!(
+            wrong,
+            Vec::<String>::new(),
+            "frames unlike the software decode's"
+        );
+    });
+}
+
 /// The CPU's copy of a picture read back lands each plane's rows at the surface's offset and
 /// pitch, as many of each row's bytes as the plane's rows hold, and as many rows as both have,
 /// leaving the bytes past each row as they were; a plane whose rows lie past the surface is
@@ -766,6 +1007,106 @@ fn a_4_4_4_pictures_cb_and_cr_are_interleaved_into_the_surfaces_chroma_plane() {
     assert_eq!(
         interleave_planes(&read[..2], &planes, &mut surface, 1),
         Err("2 planes read back for 3".to_owned())
+    );
+}
+
+/// An HEVC 4:2:2 stream's session is taken where NVDEC's caps decode HEVC 4:2:2 at its depth
+/// into NV16 (8 bits) or P216 (past), at its size, and refused otherwise, naming why. The caps are
+/// the cards' own answers (`nvidia-probe`): the RTX 5080 Laptop GPU's (615.71.09, 2026-11-27,
+/// job m3-max-77563), HEVC 4:2:2 at 8 bits into NV16 and at 10 and 12 into P216, each from
+/// 144x144 up to 8192x8192 and 262,144 macroblocks; and the RTX 3090's (620.70.06, 2026-11-22),
+/// which lists no HEVC 4:2:2 (`cuvidGetDecoderCaps`'s `bIsSupported` 0).
+#[test]
+fn an_hevc_4_2_2_stream_is_taken_on_the_caps_that_decode_it_and_refused_on_the_rest() {
+    use reims_vgpu_video::paravirt::Codec as StreamCodec;
+    type Answer = Result<DecodeCapabilities, String>;
+    let stream = |chroma_format_idc: u8, bits: u8, width: u32, height: u32| Stream {
+        codec: StreamCodec::Hevc,
+        profile: 4,
+        chroma_format_idc,
+        luma_bits: bits,
+        chroma_bits: bits,
+        width,
+        height,
+        range_extensions: true,
+    };
+    let rtx_5080 = |codec: NvdecCodec, chroma: ChromaFormat, bits: u32| -> Answer {
+        let output = match (chroma, bits) {
+            (ChromaFormat::Yuv422, 8) => SurfaceFormat::Nv16,
+            (ChromaFormat::Yuv422, _) => SurfaceFormat::P216,
+            (ChromaFormat::Yuv444, 8) => SurfaceFormat::Yuv444,
+            (ChromaFormat::Yuv444, _) => SurfaceFormat::Yuv444_16Bit,
+            _ => SurfaceFormat::P016,
+        };
+        Ok(DecodeCapabilities {
+            output_formats: vec![output],
+            ..nvdec_answer(codec, chroma, bits, (144, 144), (8192, 8192))
+        })
+    };
+    let rtx_3090 = |codec: NvdecCodec, chroma: ChromaFormat, bits: u32| -> Answer {
+        Ok(DecodeCapabilities {
+            supported: chroma != ChromaFormat::Yuv422,
+            ..rtx_5080(codec, chroma, bits)?
+        })
+    };
+    for bits in [8, 10, 12] {
+        for (width, height) in [(144, 144), (1920, 1080), (8192, 8192)] {
+            let taken = stream(2, bits, width, height);
+            assert_eq!(
+                declines(&rtx_5080, RGFX_VIDEO_CODEC_HEVC, &taken),
+                None,
+                "{taken:?}"
+            );
+        }
+        assert_eq!(
+            declines(
+                &rtx_3090,
+                RGFX_VIDEO_CODEC_HEVC,
+                &stream(2, bits, 1920, 1080)
+            )
+            .as_deref(),
+            Some(format!("NVDEC does not decode HEVC 4:2:2 at {bits} bits").as_str())
+        );
+        // 4:4:4 is taken on both, as it was.
+        assert_eq!(
+            declines(
+                &rtx_3090,
+                RGFX_VIDEO_CODEC_HEVC,
+                &stream(3, bits, 1920, 1080)
+            ),
+            None
+        );
+    }
+    for (declined, why) in [
+        (
+            stream(2, 10, 128, 128),
+            "NVDEC decodes HEVC 4:2:2 from 144x144, not 128x128",
+        ),
+        (
+            stream(2, 12, 8200, 144),
+            "NVDEC decodes HEVC 4:2:2 up to 8192x8192 (262144 macroblocks), not 8200x144",
+        ),
+    ] {
+        assert_eq!(
+            declines(&rtx_5080, RGFX_VIDEO_CODEC_HEVC, &declined).as_deref(),
+            Some(why)
+        );
+    }
+    // Caps that write 4:2:2 at 10 bits only as NV16, which the decoder does not make of it.
+    let nv16_alone = |codec: NvdecCodec, chroma: ChromaFormat, bits: u32| -> Answer {
+        Ok(DecodeCapabilities {
+            output_formats: vec![SurfaceFormat::Nv16],
+            ..rtx_5080(codec, chroma, bits)?
+        })
+    };
+    assert_eq!(
+        declines(
+            &nv16_alone,
+            RGFX_VIDEO_CODEC_HEVC,
+            &stream(2, 10, 1920, 1080)
+        )
+        .as_deref(),
+        Some("NVDEC writes HEVC 4:2:2 at 10 bits as [Nv16], not P216")
     );
 }
 

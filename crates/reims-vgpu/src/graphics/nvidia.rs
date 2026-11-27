@@ -63,14 +63,16 @@
 //!     where it does at 10 ([`vp9_caps`]), each sample a frame or a superframe whole, and lands as
 //!     H.264's and HEVC's 4:2:0 pictures do. Its caps entry, codec 3, is skipped by an x86
 //!     guest's kexts, and no device session takes it.
-//!   - **HEVC's range extensions**, the codec crate's 4:2:0 and 4:4:4 at 8, 10 and 12 bits, have a
-//!     paravirtual session where NVDEC's caps say it decodes HEVC at the stream's chroma format
-//!     and depth into the output the decoder makes (NV12 or P016; 4:4:4's three planes, 8-bit or
-//!     16-bit), at the stream's size; elsewhere, and for every 4:2:2 stream (no decode into
-//!     NVDEC's 4:2:2 outputs is built), the session is refused at its start, the reason named
-//!     (`GraphicsVideo::guest_declines`), and the guest decodes in software. A 4:2:0 picture
-//!     lands as Main 10's does, P016 copied into `tv20`/`tf20` at 12 bits, the two laid out
-//!     alike. A 4:4:4 picture lands in the surface's 4:4:4 format of its depth (`444v`, `x444`,
+//!   - **HEVC's range extensions**, the codec crate's 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12
+//!     bits, have a paravirtual session where NVDEC's caps say it decodes HEVC at the stream's
+//!     chroma format and depth into the output the decoder makes (NV12 or P016; NV16 or P216;
+//!     4:4:4's three planes, 8-bit or 16-bit), at the stream's size; elsewhere the session is
+//!     refused at its start, the reason named (`GraphicsVideo::guest_declines`), and the guest
+//!     decodes in software. A 4:2:0 picture lands as Main 10's does, P016 copied into
+//!     `tv20`/`tf20` at 12 bits, the two laid out alike. A 4:2:2 picture lands the same way in
+//!     the surface's 4:2:2 format of its depth (`422v`, `x422`, `tv22` and their full-range
+//!     twins), NV16 and P216 laid out as those are, the chroma as tall as the luma. A 4:4:4
+//!     picture lands in the surface's 4:4:4 format of its depth (`444v`, `x444`,
 //!     `tv44` and their full-range twins), its luma as it lies and its Cb and Cr interleaved into
 //!     the surface's second plane; at 8 bits by the GPU where CUDA imports the device's
 //!     exportable buffers: one `cuMemcpy2D` a plane within the GPU into the decoder's scratch,
@@ -100,7 +102,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_VP9_PROFILE_0, RGFX_VIDEO_VP9_PROFILE_2, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_video::codec::{PictureStart, vp9};
-use reims_vgpu_video::core::backend::{BackendError as VideoError, Chroma};
+use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::device_memory::{
     DeviceImports, GuestTarget, MemoryIdentity, TargetPlane,
 };
@@ -519,18 +521,13 @@ fn declines(caps: CapsOf<'_>, codec: u32, stream: &Stream) -> Option<String> {
 
 /// Why NVDEC's decoders take none of `stream`'s pictures, an HEVC stream of the range
 /// extensions: `caps` of HEVC at the stream's chroma format and depth, which are to say it
-/// decodes it ([`declines_by`]); `None` where they do. A 4:2:2 stream is declined whatever they
-/// say: no decode of it into NVDEC's 4:2:2 outputs is built here.
+/// decodes it ([`declines_by`]); `None` where they do.
 fn declines_range_extensions(caps: CapsOf<'_>, stream: &Stream) -> Option<String> {
     let bits = u32::from(stream.luma_bits);
     let (chroma, what) = match stream.chroma_format_idc {
         1 => (ChromaFormat::Yuv420, "HEVC 4:2:0"),
+        2 => (ChromaFormat::Yuv422, "HEVC 4:2:2"),
         3 => (ChromaFormat::Yuv444, "HEVC 4:4:4"),
-        2 => {
-            return Some(format!(
-                "{NAME}'s decoders here land no HEVC 4:2:2 pictures"
-            ));
-        }
         other => {
             return Some(format!(
                 "{NAME} decodes HEVC of chroma_format_idc 1 to 3, not {other}"
@@ -548,10 +545,10 @@ fn declines_range_extensions(caps: CapsOf<'_>, stream: &Stream) -> Option<String
 
 /// Why NVDEC's decoder of `answer`, the caps of `what` at `chroma` and `bits`, decodes none of
 /// `stream`'s pictures: where they do not say it decodes it, into the output the decoder makes
-/// of it (4:2:0 into `SurfaceFormat::Nv12` at 8 bits and `P016` past; 4:4:4 into its three
-/// planes, `Yuv444` at 8 bits and `Yuv444_16Bit` past), at the stream's size (`nMinWidth` and
-/// `nMinHeight` up to `nMaxWidth`, `nMaxHeight` and `nMaxMBCount`), as the decoder's make checks
-/// them; `None` where they do.
+/// of it (4:2:0 into `SurfaceFormat::Nv12` at 8 bits and `P016` past; 4:2:2 into `Nv16` and
+/// `P216`; 4:4:4 into its three planes, `Yuv444` at 8 bits and `Yuv444_16Bit` past), at the
+/// stream's size (`nMinWidth` and `nMinHeight` up to `nMaxWidth`, `nMaxHeight` and
+/// `nMaxMBCount`), as the decoder's make checks them; `None` where they do.
 fn declines_by(
     answer: Result<DecodeCapabilities, String>,
     what: &str,
@@ -566,6 +563,8 @@ fn declines_by(
     let output = match (chroma, bits > 8) {
         (ChromaFormat::Yuv444, false) => SurfaceFormat::Yuv444,
         (ChromaFormat::Yuv444, true) => SurfaceFormat::Yuv444_16Bit,
+        (ChromaFormat::Yuv422, false) => SurfaceFormat::Nv16,
+        (ChromaFormat::Yuv422, true) => SurfaceFormat::P216,
         (_, true) => SurfaceFormat::P016,
         (_, false) => SurfaceFormat::Nv12,
     };
@@ -1247,11 +1246,7 @@ impl<P: Platform> NvGuestDecoder<P> {
             )));
         }
         let four_four_four = picture.four_four_four();
-        let chroma = if four_four_four {
-            Chroma::Yuv444
-        } else {
-            Chroma::Yuv420
-        };
+        let chroma = picture.chroma();
         if target.pixel_format().chroma() != chroma {
             let chroma = chroma.name();
             return Err(VideoError::Unsupported(format!(

@@ -512,7 +512,10 @@ host's surface has another layout, each picture it converts on the CPU counted
 | RTX 3090, 620.70.06 | 4:2:0, 8, 10 and 12 bits | NV12, P016 | `420v`, `x420`, `tv20` | a copy, as Main and Main 10's |
 | | 4:4:4, 8 bits | three planes | `444v` | the GPU's interleave where CUDA imports the device's buffers, else the CPU's |
 | | 4:4:4, 10 and 12 bits | three planes of 16-bit samples | `x444`, `tv44` | the CPU's interleave |
-| | 4:2:2 | none built | | refused |
+| | 4:2:2 | none: NVDEC lists no HEVC 4:2:2 | | refused |
+| RTX 5080 Laptop GPU, 615.71.09 | 4:2:2, 8 bits | NV16 | `422v` | a copy, as Main's |
+| | 4:2:2, 10 and 12 bits | P216 | `x422`, `tv22` | a copy, as Main 10's |
+| | 4:2:0 and 4:4:4 | as the RTX 3090's | | |
 | Radeon 780M, radeonsi | any | none: no decoder listed | | refused |
 
 The full-range forms land as the video-range ones. Our streams of the 4:2:0 range extensions
@@ -534,6 +537,16 @@ one that allows none (2026-11-27):
   pictures converted by the CPU and 50 interleaved by the GPU. Its session of a 4:2:2 stream was
   refused at its start, as `NVDEC's decoders here land no HEVC 4:2:2 pictures (HEVC
   general_profile_idc 4, chroma_format_idc 2, luma 10 bits, chroma 10 bits, 640x360)`.
+- On the RTX 5080 Laptop GPU (615.71.09), no arm64 guest has run; its 4:2:2 is checked on the
+  host alone. The arm's VideoToolbox decoder, its sessions taken on the card's own caps (the card
+  test `an_hevc_picture_lands_in_its_guest_format_as_the_software_decode_has_it` in
+  `graphics/nvidia/tests.rs`, potluck job m3-max-77563), decoded our x265 streams of 4:2:2 at 8,
+  10 and 12 bits, at 640x360 and 1920x1080 and at 10 bits at 1366x766, into `422v`, `x422` and
+  `tv22` surfaces laid out as a pool's IOSurface, every picture byte for byte as ffmpeg's software
+  decode of the stream, with none copied or converted by the CPU; and 4:2:0 and 4:4:4 at 8, 10
+  and 12 bits, every picture the same too. It decoded and landed the 1920x1080 4:2:2 pictures at
+  344 to 384 a second, each landed before the next was sent (a debug build). How fast a guest
+  decodes them there is not measured.
 - On the Radeon 780M (m3-max-77300), each hardware session of a range extensions stream was
   refused at its start, the warning naming the decoder radeonsi lacks, as `VA-API: the driver
   has no HEVCMain422_10 decoder (HEVC general_profile_idc 4, chroma_format_idc 2, luma 10

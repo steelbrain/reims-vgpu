@@ -1885,14 +1885,15 @@ Stages:
       decoder's sizes"), and NVDEC and VA-API also HEVC's
       range extensions, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits,
       where the arm's own query lists a decoder of the stream: NVDEC's caps
-      for its chroma format, depth and size, 4:2:2 aside, or the VA
+      for its chroma format, depth and size, or the VA
       driver's decoder of the stream's range extensions profile with the
       render targets and surfaces it needs at that size (iHD's). Each
       picture lands in the format the guest's own software decoder gives
       the stream, which `TDrs` names (`PixelFormat::of`: '420v', 'x420' and
       'tv20' at 8, 10 and 12 bits of 4:2:0, '422v', 'x422' and 'tv22' of
       4:2:2, '444v', 'x444' and 'tv44' of 4:4:4, and their full-range
-      forms): NVDEC's 4:2:0 and VA-API's P012 by a copy, as Main 10's;
+      forms): NVDEC's 4:2:0 and 4:2:2 (NV16, P216) and VA-API's P012 by a
+      copy, as Main 10's;
       NVDEC's three 4:4:4 planes interleaved by the runtime device's GPU at
       8 bits where CUDA imports the device's exportable buffers, else by
       the CPU; VA-API's XYUV split by the runtime device's GPU where the
@@ -1909,7 +1910,8 @@ Stages:
       (a stream of a coded size outside its decoder's, as HEVC under
       NVDEC's 144x144; a range extensions stream on a VA driver without
       its decoder, radeonsi's, or on an NVIDIA GPU whose caps lack it,
-      and HEVC 4:2:2 on NVDEC: the arm's `guest_declines`), is then
+      as the RTX 3090's lack HEVC 4:2:2: the arm's `guest_declines`), is
+      then
       refused at
       the session's start, not at
       each tile or frame, and every tile a session takes lands in the
