@@ -1113,6 +1113,9 @@ mod tests {
             shares_ids: false,
             driver_id: 0,
             past_manifest: false,
+            driver_version: 0,
+            driver_name: String::new(),
+            driver_info: String::new(),
         }
     }
 

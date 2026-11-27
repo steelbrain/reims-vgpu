@@ -3,6 +3,7 @@
 //! report. A running VM's library is asked first for its degradation counts as they are then
 //! ([`ask_counts`]), so its QEMU log in the zip ends with them.
 
+use crate::gpu::GpuInfo;
 use crate::host::{Host, Os};
 use crate::runtime;
 use crate::vm::Vm;
@@ -21,6 +22,17 @@ const LOG_CAP: u64 = 64 << 20;
 /// How long one run of vulkaninfo may take: a GPU driver that hangs can hold it forever, and
 /// the report goes on without the rest of its output.
 pub const VULKANINFO_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long the ask for a Windows host's display adapters may take: WMI, which answers it, can
+/// be slow or hang, and the report goes on without it.
+const ADAPTERS_LIMIT: Duration = Duration::from_secs(30);
+
+/// What Windows PowerShell runs for system.txt's display adapters ([`display_adapters`]): a line
+/// an adapter, its name, PnP device ID and driver version as Windows' `Win32_VideoController`
+/// gives them. Progress records are off, so none reaches stderr as CLIXML.
+const ADAPTERS_QUERY: &str = "$ProgressPreference = 'SilentlyContinue'; \
+    Get-CimInstance Win32_VideoController | ForEach-Object { \
+    '{0}  [{1}]  driver {2}' -f $_.Name, $_.PNPDeviceID, $_.DriverVersion }";
 
 /// How long the ask for a running VM's counts waits for QMP's greeting and its answer: QMP takes
 /// one client at a time, so the ask waits while another holds it (reims-ctl's viewer).
@@ -284,7 +296,12 @@ fn vulkan_summary(whole: &End) -> String {
     }
     let mut cmd = Command::new("vulkaninfo");
     cmd.arg("--summary");
-    let run = run_limited(cmd, VULKANINFO_LIMIT);
+    first_lines(run_limited(cmd, VULKANINFO_LIMIT), "vulkaninfo --summary")
+}
+
+/// A tool's run as a section of system.txt: the first 80 lines it wrote, stdout then stderr,
+/// and how it ended where it did not exit with success.
+fn first_lines(run: Limited, tool: &str) -> String {
     let out = [run.stdout, run.stderr].concat();
     let mut s = String::from_utf8_lossy(&out)
         .lines()
@@ -292,10 +309,55 @@ fn vulkan_summary(whole: &End) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     if !matches!(run.end, End::Exited(status) if status.success()) {
-        s.push('\n');
-        s.push_str(&run.end.says("vulkaninfo --summary"));
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&run.end.says(tool));
     }
     s
+}
+
+/// system.txt's display adapters on a Windows host: each one Windows has, its name, its PnP
+/// device ID (`PCI\VEN_10DE&DEV_2204&...`, its vendor and device IDs among it) and its driver
+/// package's version, from Windows PowerShell, which every Windows has, under
+/// [`ADAPTERS_LIMIT`]. It names a GPU whose Vulkan driver is broken or absent, which the
+/// section of Vulkan GPUs cannot: a manifest's probe finds only what its driver answers.
+fn display_adapters() -> String {
+    let root =
+        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let mut cmd = Command::new(root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", ADAPTERS_QUERY]);
+    first_lines(run_limited(cmd, ADAPTERS_LIMIT), "powershell")
+}
+
+/// system.txt's Vulkan GPUs, those of `gpus` ([`crate::gpu::list`]): each on a line, its label,
+/// IDs and driver manifest, and below it its driver's version as Vulkan gives it, raw
+/// (`driverVersion`, which each vendor encodes its own way), with the driver's own name and
+/// version text where the driver says them (Vulkan 1.2); `none` where no probe found one.
+fn vulkan_gpus(gpus: &[GpuInfo]) -> String {
+    if gpus.is_empty() {
+        return "none".into();
+    }
+    gpus.iter()
+        .map(|g| {
+            let mut s = format!(
+                "{}  [{:04x}:{:04x}] {}\n    driverVersion {:#010x}",
+                g.label(),
+                g.vendor_id,
+                g.device_id,
+                g.driver_file.display(),
+                g.driver_version
+            );
+            if !g.driver_name.is_empty() || !g.driver_info.is_empty() {
+                s.push_str(&format!(
+                    ", driverName {:?}, driverInfo {:?}",
+                    g.driver_name, g.driver_info
+                ));
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What the host is: the parts a report about a guest's graphics needs.
@@ -375,19 +437,7 @@ fn system_info(host: Host, warnings: &[String], vulkaninfo: &End) -> String {
                     ],
                 ),
             );
-            let gpus = crate::gpu::list()
-                .iter()
-                .map(|g| {
-                    format!(
-                        "{}  [{:04x}:{:04x}] {}",
-                        g.label(),
-                        g.vendor_id,
-                        g.device_id,
-                        g.driver_file.display()
-                    )
-                })
-                .collect::<Vec<_>>();
-            section("vulkan gpus", gpus.join("\n"));
+            section("vulkan gpus", vulkan_gpus(&crate::gpu::list()));
             section("vulkaninfo --summary", vulkan_summary(vulkaninfo));
             section(
                 "nvidia",
@@ -420,7 +470,11 @@ fn system_info(host: Host, warnings: &[String], vulkaninfo: &End) -> String {
                 ),
             );
         }
-        Os::Windows | Os::Other => {}
+        Os::Windows => {
+            section("display adapters", display_adapters());
+            section("vulkan gpus", vulkan_gpus(&crate::gpu::list()));
+        }
+        Os::Other => {}
     }
     s
 }
@@ -617,6 +671,54 @@ mod tests {
             none.starts_with("degradation counts: not written for this report: connect to "),
             "{none}"
         );
+    }
+
+    /// system.txt's Vulkan GPUs: each GPU's label, IDs and manifest on a line, and below it its
+    /// driver's version raw, with the driver's own name and text where it says them, as a
+    /// Vulkan 1.2 driver does; `none` where no probe found a GPU.
+    #[test]
+    fn vulkan_gpus_name_each_gpu_and_its_driver() {
+        let gpu = |name: &str, ids: (u32, u32), file: &str, version: u32| GpuInfo {
+            name: name.into(),
+            vendor_id: ids.0,
+            device_id: ids.1,
+            kind: "integrated".into(),
+            driver_file: file.into(),
+            shares_driver: false,
+            shares_ids: false,
+            driver_id: 0,
+            past_manifest: false,
+            driver_version: version,
+            driver_name: String::new(),
+            driver_info: String::new(),
+        };
+        let uhd = GpuInfo {
+            driver_id: 5,
+            driver_name: "Intel Corporation".into(),
+            driver_info: "Intel driver".into(),
+            ..gpu(
+                "Intel(R) UHD Graphics 630",
+                (0x8086, 0x3e9b),
+                "C:/Windows/System32/DriverStore/FileRepository/iigd_dch.inf_amd64/igvk64.json",
+                0x0019_484f,
+            )
+        };
+        let older = gpu(
+            "A Vulkan 1.1 GPU",
+            (0x1af4, 0x50),
+            "/icd/old.json",
+            0x0040_2000,
+        );
+        assert_eq!(
+            vulkan_gpus(&[uhd, older]),
+            "Intel(R) UHD Graphics 630 (integrated, igvk64.json)  [8086:3e9b] \
+             C:/Windows/System32/DriverStore/FileRepository/iigd_dch.inf_amd64/igvk64.json\n    \
+             driverVersion 0x0019484f, driverName \"Intel Corporation\", \
+             driverInfo \"Intel driver\"\n\
+             A Vulkan 1.1 GPU (integrated, old.json)  [1af4:0050] /icd/old.json\n    \
+             driverVersion 0x00402000"
+        );
+        assert_eq!(vulkan_gpus(&[]), "none");
     }
 
     #[test]

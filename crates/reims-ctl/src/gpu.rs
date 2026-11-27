@@ -67,6 +67,16 @@ pub struct GpuInfo {
     /// manifest is not known to be this GPU's (the module doc): only its IDs name it.
     #[serde(default)]
     pub past_manifest: bool,
+    /// The driver's version as Vulkan gives it (`VkPhysicalDeviceProperties::driverVersion`),
+    /// raw: how it encodes a version is each vendor's own.
+    #[serde(default)]
+    pub driver_version: u32,
+    /// The driver's own name and version text (`VkPhysicalDeviceDriverProperties`'
+    /// `driverName` and `driverInfo`), where it says (Vulkan 1.2): empty where it does not.
+    #[serde(default)]
+    pub driver_name: String,
+    #[serde(default)]
+    pub driver_info: String,
 }
 
 impl GpuInfo {
@@ -319,13 +329,19 @@ pub fn probe_main() -> i32 {
                 };
                 // VkPhysicalDeviceDriverProperties is Vulkan 1.2's.
                 let v = p.api_version;
-                let driver_id = if vk::api_version_major(v) > 1 || vk::api_version_minor(v) >= 2 {
+                let text = |c: &std::ffi::CStr| c.to_string_lossy().into_owned();
+                let says_driver = vk::api_version_major(v) > 1 || vk::api_version_minor(v) >= 2;
+                let (driver_id, driver_name, driver_info) = if says_driver {
                     let mut driver = vk::PhysicalDeviceDriverProperties::default();
                     let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
                     instance.get_physical_device_properties2(pd, &mut p2);
-                    driver.driver_id.as_raw() as u32
+                    (
+                        driver.driver_id.as_raw() as u32,
+                        driver.driver_name_as_c_str().map(text).unwrap_or_default(),
+                        driver.driver_info_as_c_str().map(text).unwrap_or_default(),
+                    )
                 } else {
-                    0
+                    (0, String::new(), String::new())
                 };
                 let info = GpuInfo {
                     name,
@@ -337,6 +353,9 @@ pub fn probe_main() -> i32 {
                     shares_ids: false,
                     driver_id,
                     past_manifest: false,
+                    driver_version: p.driver_version,
+                    driver_name,
+                    driver_info,
                 };
                 println!("{}", serde_json::to_string(&info).unwrap());
             }
@@ -366,6 +385,9 @@ mod tests {
             shares_ids: false,
             driver_id: 0,
             past_manifest: false,
+            driver_version: 0,
+            driver_name: String::new(),
+            driver_info: String::new(),
         }
     }
 
