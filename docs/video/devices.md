@@ -3,9 +3,10 @@
 The reims-graphics device (PCI 1234:5247) decodes and encodes the guest's H.264 and HEVC on the
 host's hardware. The guest's video driver, in our Metal bundle, is AppleGVA's vendor driver
 ([docs/graphics-kext/design.md](../graphics-kext/design.md), "Decided", 16); it decodes, and
-encodes H.264 (`ENCODE_H264`), sending no `ENCODE_H265` yet. This file is the host's side: what
-it answers the guest, and what a decode and an encode do. The wire's records and their
-fields are documented where they are defined: `crates/reims-vgpu-graphics/src/wire.rs` (the caps and
+encodes H.264 (`ENCODE_H264`) and HEVC Main and Main 10 (`ENCODE_H265`, through the HEVC encoder
+plug-in's Intel route: design.md, "HEVC encode takes the plug-in's Intel route"). This file is the
+host's side: what it answers the guest, and what a decode and an encode do. The wire's records and
+their fields are documented where they are defined: `crates/reims-vgpu-graphics/src/wire.rs` (the caps and
 the session) and `crates/reims-vgpu-graphics/src/ops/video.rs` (the ops).
 
 ## Which hardware
@@ -237,8 +238,18 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   `guest/bundle/src/RgfxVideoDriver.cpp`, `PixelRequirement`).
 - **What an encode entry takes**: an `RgfxVideoEncodeCaps` per entry (`encode`): the rate
   controls (a bit each of CQP, CBR and VBR, as the arm's API lists them for the codec's
-  profiles) and the most consecutive B pictures, 0 on both arms, whose encoders keep frames in
-  display order.
+  profiles), the most consecutive B pictures, 0 on both arms, whose encoders keep frames in
+  display order, and in `flags`, `RGFX_VIDEO_ENCODE_CAP_IN_PLACE` where the arm codes a frame in
+  place of the last one ("An encode", below): always on VA-API; on NVENC where NVENC says it
+  codes a frame without advancing its state (`NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`) for every
+  profile of the codec, and a session of the codec with a state buffer coded a frame, the frame
+  again in its place and a frame after it at the device's start (`checked_in_place`,
+  `graphics/nvidia/encode.rs`). NVENC's interface (13.0) lists no capability for restoring a
+  state (`nvEncRestoreEncoderState`), only for coding without advancing it, so that session is
+  the query: it adds a median of 56.9 ms to the device's start on an RTX 3090 and 61.9 ms on an
+  RTX 2080 (**measured**, five checks each, m3-max-77618, m3-max-77597). A driver that lacks
+  the capability or refuses that session leaves the flag off, which the guest's kext reads as no
+  HEVC encoder.
 - **What a decode entry bounds**: an `RgfxVideoDecodeCaps` per entry (`decode`): the narrowest
   HEVC tile column the arm decodes, in luma samples, 128 on both arms
   (`reims_vgpu_video::codec::hevc::MIN_TILE_COLUMN_WIDTH`); zero, no bound, in every other
@@ -411,6 +422,23 @@ buffer of an encode session's process (reims-vgpu's `graphics/video_host/encode.
   declines that copy (said once a session), the planes are read as host bytes, in the surface's
   pages, or, for a plane in a device cache, in a staging buffer the GPU copies it into first, and
   the encoder's upload copies them. The encoder codes the same bytes either way.
+- **A frame coded in place** (`RGFX_VIDEO_ENCODE_IN_PLACE`, from a guest that read the caps
+  flag) replaces the last frame, whose access unit the guest drops: it is coded from the
+  references the last one was coded from, with its order count, at the QP the settings give
+  now, so no later picture predicts from the dropped one. The x86-64 guest's HEVC driver sends
+  one where macOS's encoder plug-in codes a frame again over its data rate limit
+  ([design.md](../graphics-kext/design.md), "HEVC encode takes the plug-in's Intel route"). The
+  VA crate's encoder holds its last picture back from its stream (`Accelerator::keep`) until the
+  next frame, and codes the frame again in its place (`Encoder::encode_in_place`,
+  `crates/reims-vgpu-video/src/codec/encode/encoder.rs`). NVENC codes each frame of such a
+  session without advancing its state, which a state buffer keeps as it is after the frame, and
+  takes that state (`nvEncRestoreEncoderState`) as the next frame comes
+  (`NvencEncoder::new_in_place`). A frame that cannot be coded in place fails
+  (`RGFX_VIDEO_ENCODE_FAILED`): with none to replace, with B pictures, with a hard limit the VA
+  crate's own rate control holds, of another `frame_index` than the last one's, or asking a
+  keyframe in place of a frame that is not one. The frame after it then does not predict from
+  the dropped one: on VA-API it is an IDR picture, and on NVENC it is coded from the state
+  before the dropped one.
 - **The access unit is written** in Annex-B form into the bitstream buffer, a keyframe's with
   its parameter sets first, and the frame's `RgfxVideoEncodeResult` after it. One past the
   capacity is not written (`RGFX_VIDEO_ENCODE_OVERFLOW`, with the bytes it needed), and the

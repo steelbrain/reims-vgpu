@@ -6,7 +6,8 @@
 #
 #   make BUNDLE_DIR=<signed reims-graphics.bundle dir>   build/RgfxGate.kext
 #   make test                                            native tests of the matching and preference logic,
-#                                                        the tree removal, the pass's decisions, the AVX-512
+#                                                        the tree removal, the HEVC driver link, the pass's
+#                                                        decisions, the AVX-512
 #                                                        state copy, and when the payload is made again
 #   make sigproof                                        build/xstate_sigproof-x86_64, the guest's own proof
 #                                                        of what a thread keeps across signals and thread
@@ -131,6 +132,8 @@ test: sigproof
 	$(BUILD)/obj/gva_pref_test
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/tree_test.cpp -o $(BUILD)/obj/tree_test
 	$(BUILD)/obj/tree_test
+	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/alias_test.cpp -o $(BUILD)/obj/alias_test
+	$(BUILD)/obj/alias_test
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/pass_test.cpp -o $(BUILD)/obj/pass_test
 	$(BUILD)/obj/pass_test
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/xstate_test.cpp -o $(BUILD)/obj/xstate_test

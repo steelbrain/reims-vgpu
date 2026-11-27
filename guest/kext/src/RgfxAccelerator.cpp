@@ -225,6 +225,7 @@ void registerAccelerator(RgfxAccelerator *accelerator, const char *when)
 {
 	IOLog("RgfxAccelerator: the bundle is at %s%s: registered\n", bundle.paths.executable, when);
 	accelerator->registerService(kIOServiceSynchronous);
+	accelerator->publishHevcEncoder();
 	IOLockLock(bundle.lock);
 	bundle.state = kBundleRegistered;
 	IOLockUnlock(bundle.lock);
@@ -1007,6 +1008,9 @@ void RgfxAccelerator::publishVideoCodecs()
 		OSSafeReleaseNULL(rating);
 		OSSafeReleaseNULL(h264);
 	}
+	RgfxHevcEncode hevcEncode;
+	if (rgfxHevcEncode(caps, &hevcEncode))
+		hevcEncodeLevel = hevcEncode.maxLevel;
 	RgfxHevcDecode hevc;
 	if (!rgfxHevcDecode(caps, &hevc))
 		return;
@@ -1035,6 +1039,69 @@ void RgfxAccelerator::publishVideoCodecs()
 	OSSafeReleaseNULL(capabilities);
 	OSSafeReleaseNULL(details);
 	OSSafeReleaseNULL(profiles);
+}
+
+// The guest's HEVC encoder plug-in (AppleGVAHEVCEncoder) finds a GPU encoder on an x86-64 Mac by
+// name alone: the last service named IntelAccelerator whose IOGVACodec names an Intel generation
+// ("Gen9" picks the driver at AppleIntelSKLGraphicsVADriver.bundle, which RgfxGate links to the
+// bundle), with IOGVAHEVCEncode and IOVARendererID on it, and VideoToolbox lists that encoder
+// with the capabilities IOGVAHEVCEncodeCapabilities carries. The nub is a plain IOService, a
+// child of the accelerator, with no IODVDBundleName, which AppleGVA's own loader skips: no Metal
+// device, no framebuffer, and none of AppleGVA's other routes moves to it (their Intel route
+// looks only under IGPU@2 or GFX0@2). Main and Main 10, up to the host encoder's level: the two
+// profiles the plug-in names, both of which the host encodes where the nub is published
+// (rgfxHevcEncode).
+void RgfxAccelerator::publishHevcEncoder()
+{
+	const uint32_t level = hevcEncodeLevel;
+	if (level == 0)
+		return;
+	IOService *nub = OSTypeAlloc(IOService);
+	if (!nub || !nub->init()) {
+		OSSafeReleaseNULL(nub);
+		IOLog("RgfxAccelerator: no HEVC encoder: no memory\n");
+		return;
+	}
+	nub->setName("IntelAccelerator");
+	nub->setProperty("IOGVACodec", "Gen9");
+	nub->setProperty("IOGVAHEVCEncode", "2");
+	nub->setProperty("IOVARendererID", kVideoRendererID, kDriverKeyNumberBits);
+	OSArray *profiles = OSArray::withCapacity(2);
+	OSDictionary *details = OSDictionary::withCapacity(2);
+	OSDictionary *capabilities = OSDictionary::withCapacity(4);
+	OSNumber *maxLevel = OSNumber::withNumber(level, 32);
+	OSNumber *rating = OSNumber::withNumber(kRgfxHevcEncodeRating, 32);
+	OSNumber *quality = OSNumber::withNumber(kRgfxHevcEncodeQualityRating, 32);
+	OSNumber *mainProfile = OSNumber::withNumber(1, 32);
+	OSNumber *main10Profile = OSNumber::withNumber(2, 32);
+	OSDictionary *profileDetail = OSDictionary::withCapacity(1);
+	const bool made = profiles && details && capabilities && maxLevel && rating && quality &&
+	                  mainProfile && main10Profile && profileDetail &&
+	                  profileDetail->setObject("VTMaxEncodeLevel", maxLevel) &&
+	                  profiles->setObject(mainProfile) && profiles->setObject(main10Profile) &&
+	                  details->setObject("1", profileDetail) &&
+	                  details->setObject("2", profileDetail) &&
+	                  capabilities->setObject("VTSupportedProfileArray", profiles) &&
+	                  capabilities->setObject("VTPerProfileDetails", details) &&
+	                  capabilities->setObject("VTRating", rating) &&
+	                  capabilities->setObject("VTQualityRating", quality) &&
+	                  nub->setProperty("IOGVAHEVCEncodeCapabilities", capabilities);
+	OSSafeReleaseNULL(profileDetail);
+	OSSafeReleaseNULL(main10Profile);
+	OSSafeReleaseNULL(mainProfile);
+	OSSafeReleaseNULL(quality);
+	OSSafeReleaseNULL(rating);
+	OSSafeReleaseNULL(maxLevel);
+	OSSafeReleaseNULL(capabilities);
+	OSSafeReleaseNULL(details);
+	OSSafeReleaseNULL(profiles);
+	if (made && nub->attach(this)) {
+		nub->registerService();
+		IOLog("RgfxAccelerator: HEVC encode, Main and Main 10, level %u\n", level);
+	} else {
+		IOLog("RgfxAccelerator: no HEVC encoder: its nub not made\n");
+	}
+	nub->release();
 }
 
 // A queue's doorbell exits to the host, which may offer the ring's next command buffer to its

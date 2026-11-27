@@ -68,9 +68,12 @@ or has no player for them at all:
   common form: 4:2:0 colour at 8 or 10 bits. Other AV1 videos have no player in the guest. Your
   GPU's AV1 decoder doesn't decode 4:4:4 or 4:2:2, its 12-bit pictures would lose two bits on
   the way to the guest, and macOS in a virtual machine has no AV1 decoder of its own.
-- **HEVC encoding on Intel Mac guests.** macOS 26.7.2 sends hardware HEVC encoding to an Intel
-  GPU, even when an app asks for ours, so apps encode HEVC in software. On Linux hosts, H.264
-  encoding uses your GPU.
+- **HEVC encoding on Intel Mac guests, on some GPUs.** On a Linux host, an Intel Mac guest
+  encodes HEVC on your GPU if your GPU encodes HEVC at both 8 and 10 bits, at the sizes your GPU
+  encodes, and can encode a frame over again in its place. GPUs that encode through VA-API can;
+  NVIDIA GPUs can where their driver allows it. With any other GPU, the guest encodes HEVC in
+  software. Encoding doesn't use your GPU on Windows yet, whichever GPU you have, so the guest
+  encodes video in software there.
 - **HEVC at 4:2:2, 4:4:4 or 12 bits on Intel Mac guests.** macOS 26.7.2 would only take these
   from a GPU as 4:2:0 at 10 bits, which loses colour detail, so the guest keeps decoding them in
   software at full quality.
@@ -102,6 +105,32 @@ On the NVIDIA GPU we tested, the GPU's decoder fails each frame of such a video 
 from earlier frames, which is most of them. An arm64 guest gets a decode error for each of
 those frames rather than a wrong picture. Other AV1 videos play. We haven't seen this on AMD or
 Intel GPUs.
+
+## HEVC from Intel Mac guests can come out over the bitrate asked
+
+When an app in an Intel Mac guest encodes HEVC on your GPU, it asks for a bitrate, and macOS's
+encoder picks each frame's quality to land on it. It also looks for a measure of how detailed
+each picture is, which the GPUs we support don't report, so it judges from the sizes of the
+frames before. In our tests it lands within 6% of the ask at 1080p and 4K, with three
+exceptions:
+
+- On an NVIDIA GeForce RTX 3090, 10-bit HEVC at 1080p came out at 106% of the bitrate asked:
+  8.49 Mbit/s for 8 Mbit/s. NVIDIA's own encoder, given the same frames on the same card, came
+  out at 105%.
+- At 8K (8192×4320) on an Intel Iris Xe, a one-second clip came out at 118% of the bitrate asked,
+  and further from the original picture than the guest's own software encoder got with fewer
+  bits (44.9 dB of PSNR against 48.1 dB). The GPU encodes 8K at about 10 frames a second, 20 times
+  as fast as the software encoder but short of real time.
+- When an app asks for every frame to be a keyframe, the video came out at 4.1 to 5.0 times the
+  bitrate asked on the GPUs we tested, each frame bigger and sharper than the one before. That's
+  macOS's own encoder: with every frame a keyframe, it keeps raising each frame's quality the
+  same way on a real Intel Mac, which came out at 5.7 times the bitrate asked in the same test.
+  The video still plays back correctly.
+
+An app can also set a hard limit on the bytes in any one second. In our tests at 1080p with
+such a limit, the busiest second came out 1.7% to 3.0% over it, and every frame still played
+back. A real Intel Mac stayed under the same limit, but we ran it with a keyframe every 30
+frames and ours with macOS's default spacing, so the two runs don't compare directly.
 
 ## Sound comes after video on Windows
 

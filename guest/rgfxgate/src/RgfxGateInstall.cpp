@@ -46,6 +46,7 @@
 #include "RgfxGateVnop.hpp"
 #include "rgfx_match.h"
 #include "rgfx_pass.h"
+#include "rgfx_alias.h"
 #include "rgfx_tree.h"
 
 namespace rgfxgate {
@@ -571,6 +572,77 @@ static bool installBundle(vfs_context_t ctx) {
 	return ok;
 }
 
+#if !defined(__arm64e__)
+// The HEVC encoder plug-in's driver path, which RgfxGate links to the bundle's
+// executable (rgfx_alias.h): AppleGVAHEVCEncoder loads the driver its Intel
+// nub's IOGVACodec names ("Gen9", the accelerator's publishHevcEncoder) from
+// /Library/GPUBundles before /System/Library/Extensions, and macOS ships no
+// driver in /Library/GPUBundles. x86-64 only: an arm64 guest takes no GPU video
+// driver.
+extern "C" int VNOP_LINK(vnode_t, vnode_t, struct componentname *, vfs_context_t);
+static const char kHevcDriverBundle[] = "/Library/GPUBundles/AppleIntelSKLGraphicsVADriver.bundle";
+static const char kHevcDriverContents[] =
+    "/Library/GPUBundles/AppleIntelSKLGraphicsVADriver.bundle/Contents";
+static const char kHevcDriverMacOS[] =
+    "/Library/GPUBundles/AppleIntelSKLGraphicsVADriver.bundle/Contents/MacOS";
+static const char kHevcDriverExec[] =
+    "/Library/GPUBundles/AppleIntelSKLGraphicsVADriver.bundle/Contents/MacOS/"
+    "AppleIntelSKLGraphicsVADriver";
+
+// The file system rgfx_alias_update works on: lookups that do not follow a
+// final symbolic link, and each write below the MAC layer, as the install's.
+struct KernelAlias {
+	vfs_context_t ctx;
+
+	bool file_id(const char *path, uint64_t *id) {
+		vnode_t vp = nullptr;
+		if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
+			return false;
+		struct vnode_attr va;
+		VATTR_INIT(&va);
+		VATTR_WANTED(&va, va_fileid);
+		const bool ok = vnode_getattr(vp, &va, ctx) == 0 && VATTR_IS_SUPPORTED(&va, va_fileid);
+		if (ok)
+			*id = va.va_fileid;
+		vnode_put(vp);
+		return ok;
+	}
+	void remove(const char *path) {
+		clearRootless(path, ctx);
+		removeFile(path, ctx);
+	}
+	bool ensure_dir(const char *path) { return ensureDir(path, ctx); }
+	bool link(const char *target, const char *path) {
+		vnode_t vp = nullptr;
+		if (vnode_lookup(target, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
+			return false;
+		char leaf[256];
+		struct componentname cn;
+		int err = -1;
+		vnode_t dvp = parentAndLeaf(path, CREATE, &cn, leaf, sizeof(leaf), ctx);
+		if (dvp != nullptr) {
+			err = VNOP_LINK(vp, dvp, &cn, ctx);
+			vnode_put(dvp);
+		}
+		vnode_put(vp);
+		return err == 0;
+	}
+	void tag(const char *path) { tagRootless(path, ctx); }
+};
+
+// Keeps the HEVC encoder plug-in's driver path a hard link to the installed
+// executable (rgfx_alias.h), logging what it did.
+static void linkHevcDriver(vfs_context_t ctx) {
+	char exec[1024];
+	joinPath(exec, sizeof(exec), kBundlePath, kExecRel);
+	static const char *const dirs[] = {kHevcDriverBundle, kHevcDriverContents, kHevcDriverMacOS};
+	KernelAlias fs{ctx};
+	const RgfxAliasResult r = rgfx_alias_update(fs, exec, dirs, 3, kHevcDriverExec);
+	static const char *const said[] = {"current", "linked", "no executable", "FAILED"};
+	graft_client_log(kClientID, "HEVC driver link %s: %s", kHevcDriverExec, said[r]);
+}
+#endif
+
 // Records the install's outcome as RgfxGate's Graft client state
 // (GraftClient.ai.aneesiqbal.RgfxGate, "<state>: <reason>"), so a refusal is
 // visible there and never hidden behind the install-done flag, which only says
@@ -670,6 +742,13 @@ static void doInstall() {
 	bool needWrite = installNeeded(ctx);
 	bool tagged = bundleTagged(ctx);
 	if (!needWrite && tagged) {
+#if !defined(__arm64e__)
+		gInstallThread = current_thread();
+		gInstalling = true;
+		linkHevcDriver(ctx);
+		gInstalling = false;
+		gInstallThread = nullptr;
+#endif
 		graft_client_log(kClientID, "bundle current and tagged; no install");
 		recordInstallState("present", "bundle already installed and tagged");
 		vfs_context_rele(ctx);
@@ -693,6 +772,10 @@ static void doInstall() {
 		tagRootless(kContainerPath, ctx);
 		ok = true;
 	}
+#if !defined(__arm64e__)
+	if (ok)
+		linkHevcDriver(ctx);
+#endif
 
 	gInstalling = false;
 	gInstallThread = nullptr;

@@ -255,6 +255,12 @@ std::vector<FakeSession *> g_sentOn;
 // the host lists without one, which the driver reads as none).
 bool g_hostEncodes = true;
 uint32_t g_encodeRates = 1u << RGFX_VIDEO_RATE_CQP | 1u << RGFX_VIDEO_RATE_VBR;
+// The profiles the stand-in host's HEVC encoder takes, each from its format (Main from NV12, Main
+// 10 from P010): both, as the hosts' arms have them, where a check does not change them.
+uint32_t g_hevcEncodeProfiles = RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10;
+// The stand-in host's encoders' flags (RgfxVideoEncodeCaps::flags): frames coded in place, as the
+// hosts' arms code them, where a check does not change them.
+uint32_t g_encodeFlags = RGFX_VIDEO_ENCODE_CAP_IN_PLACE;
 // Each encode the driver sends, as it sent it.
 struct SentEncode {
 	FakeSession *session;
@@ -263,6 +269,7 @@ struct SentEncode {
 	uint64_t frameIndex;
 	bool forceKeyframe;
 	uint64_t capacity;
+	bool inPlace;
 };
 std::vector<SentEncode> g_encodes;
 // Each encode's work, done at once: what the host answers of it, the status and access unit the
@@ -300,14 +307,14 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 	h264.formats = RGFX_VIDEO_FORMAT_NV12;
 	hevc.formats = RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010;
 	hevc.max_references = g_hevcMaxReferences;
-	// And, where a check has them, H.264 encode of every profile and HEVC encode of Main, of
-	// 144x144 to 4096x4096.
+	// And, where a check has them, H.264 encode of every profile and HEVC encode of the profiles
+	// g_hevcEncodeProfiles names, of 144x144 to 4096x4096.
 	static RgfxVideoCodecCaps h264Encode = {}, hevcEncode = {};
 	h264Encode.codec = RGFX_VIDEO_CODEC_H264;
 	h264Encode.profiles = RGFX_VIDEO_H264_BASELINE | RGFX_VIDEO_H264_MAIN | RGFX_VIDEO_H264_HIGH;
 	h264Encode.max_level = 52;
 	hevcEncode.codec = RGFX_VIDEO_CODEC_HEVC;
-	hevcEncode.profiles = RGFX_VIDEO_HEVC_MAIN;
+	hevcEncode.profiles = g_hevcEncodeProfiles;
 	hevcEncode.max_level = 186;
 	for (RgfxVideoCodecCaps *c : {&h264Encode, &hevcEncode}) {
 		c->direction = RGFX_VIDEO_ENCODE;
@@ -315,6 +322,8 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 		c->min_size[0] = c->min_size[1] = 144;
 		c->max_size[0] = c->max_size[1] = 4096;
 	}
+	hevcEncode.formats = (g_hevcEncodeProfiles & RGFX_VIDEO_HEVC_MAIN ? RGFX_VIDEO_FORMAT_NV12 : 0) |
+	                     (g_hevcEncodeProfiles & RGFX_VIDEO_HEVC_MAIN_10 ? RGFX_VIDEO_FORMAT_P010 : 0);
 	if (direction == RGFX_VIDEO_ENCODE)
 		return !g_hostEncodes                 ? nullptr
 		       : codec == RGFX_VIDEO_CODEC_H264 ? &h264Encode
@@ -333,8 +342,10 @@ RgfxVideoDecodeCaps decodeCaps(uint32_t codec)
 RgfxVideoEncodeCaps encodeCaps(uint32_t codec)
 {
 	RgfxVideoEncodeCaps c = {};
-	if (g_hostEncodes && (codec == RGFX_VIDEO_CODEC_H264 || codec == RGFX_VIDEO_CODEC_HEVC))
+	if (g_hostEncodes && (codec == RGFX_VIDEO_CODEC_H264 || codec == RGFX_VIDEO_CODEC_HEVC)) {
 		c.rate_controls = g_encodeRates;
+		c.flags = g_encodeFlags;
+	}
 	return c;
 }
 
@@ -396,7 +407,7 @@ void *decode(Session *session, const Decode &d)
 void *encode(Session *session, const Encode &e)
 {
 	g_encodes.push_back({session, e.source ? IOSurfaceGetID(e.source) : 0, e.settings, e.frameIndex,
-	                     e.forceKeyframe, e.capacity});
+	                     e.forceKeyframe, e.capacity, e.inPlace});
 	EncodeWork &work = g_encodeWork.emplace_back();
 	work.result.status = g_encodeStatus;
 	work.result.bitstream_size = g_accessUnit.size();
@@ -807,14 +818,16 @@ std::vector<uint8_t> setsOf(const rgfx::video::h265::Sps &sps, const rgfx::video
 	return sets;
 }
 
-// A surface of `width` by `height` samples of a byte each.
-IOSurfaceRef canvas(uint32_t width, uint32_t height)
+// A surface of `width` by `height` samples of a byte each, of pixel format `format` where it is
+// not 0.
+IOSurfaceRef canvas(uint32_t width, uint32_t height, OSType format = 0)
 {
 	CFMutableDictionaryRef props = CFDictionaryCreateMutable(
 	    nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	const int32_t values[3] = {(int32_t)width, (int32_t)height, 1};
-	const CFStringRef keys[3] = {kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement};
-	for (int i = 0; i < 3; i++) {
+	const int32_t values[4] = {(int32_t)width, (int32_t)height, 1, (int32_t)format};
+	const CFStringRef keys[4] = {kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement,
+	                             kIOSurfacePixelFormat};
+	for (int i = 0; i < (format ? 4 : 3); i++) {
 		CFNumberRef n = CFNumberCreate(nullptr, kCFNumberSInt32Type, &values[i]);
 		CFDictionarySetValue(props, keys[i], n);
 		CFRelease(n);
@@ -1590,6 +1603,8 @@ void checkH264SpsLayouts()
 
 constexpr uint32_t kFunctionEncode = 0x20;
 constexpr uint64_t kEncodeH264 = 0x800, kEncodeHevc = 0x1000;
+constexpr uint32_t kFunctionProcess = 2;
+constexpr uint64_t kProcessFrameStatistics = 0x1000;
 constexpr uint64_t kBadArgument = 5;
 enum { kAllocatePixelBufferPool = 8, kQueryCommandStatus = 11 };
 constexpr uint32_t kQueryDone = 1;
@@ -1635,16 +1650,23 @@ int listed(uint32_t id, uint64_t sub)
 const char *g_self;
 
 // In a process of its own, as the driver fills its capability block once a process (the test
-// binary run again, `listed ENCODES RATES`, which exits 0 where the block lists H.264 encode
-// `want` times): a host that `encodes` H.264 with rate controls `rates`.
-void checkListedOn(bool encodes, uint32_t rates, int want, const char *what)
+// binary run again, `listed ENCODES RATES WANT WANT_HEVC HEVC_PROFILES`, which exits 0 where the
+// block lists H.264 encode `want` times and HEVC encode, with the frame statistics beside it,
+// `wantHevc` times): a host that `encodes` H.264 and HEVC with rate controls `rates`, its HEVC
+// encoder of `hevcProfiles`.
+void checkListedOn(bool encodes, uint32_t rates, int want, int wantHevc, const char *what,
+                   uint32_t hevcProfiles = RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10,
+                   uint32_t flags = RGFX_VIDEO_ENCODE_CAP_IN_PLACE)
 {
-	char encodesArg[4], ratesArg[16], wantArg[4];
+	char encodesArg[4], ratesArg[16], wantArg[4], wantHevcArg[4], profilesArg[16], flagsArg[16];
 	std::snprintf(encodesArg, sizeof encodesArg, "%d", encodes ? 1 : 0);
 	std::snprintf(ratesArg, sizeof ratesArg, "%u", rates);
 	std::snprintf(wantArg, sizeof wantArg, "%d", want);
+	std::snprintf(wantHevcArg, sizeof wantHevcArg, "%d", wantHevc);
+	std::snprintf(profilesArg, sizeof profilesArg, "%u", hevcProfiles);
+	std::snprintf(flagsArg, sizeof flagsArg, "%u", flags);
 	char *const argv[] = {const_cast<char *>(g_self), const_cast<char *>("listed"), encodesArg,
-	                      ratesArg, wantArg, nullptr};
+	                      ratesArg, wantArg, wantHevcArg, profilesArg, flagsArg, nullptr};
 	pid_t pid = 0;
 	CHECK(posix_spawn(&pid, g_self, nullptr, nullptr, argv, environ) == 0, "%s: no child", what);
 	int status = 0;
@@ -1653,40 +1675,58 @@ void checkListedOn(bool encodes, uint32_t rates, int want, const char *what)
 }
 
 // The child of checkListedOn: whether the block of its host lists H.264 encode `want` times, and
-// HEVC encode never.
+// HEVC encode and the frame statistics `wantHevc` times each.
 int listedChild(char **argv)
 {
 	g_hostEncodes = std::atoi(argv[2]) != 0;
 	g_encodeRates = (uint32_t)std::strtoul(argv[3], nullptr, 10);
+	g_hevcEncodeProfiles = (uint32_t)std::strtoul(argv[6], nullptr, 10);
+	g_encodeFlags = (uint32_t)std::strtoul(argv[7], nullptr, 10);
 	void *table = nullptr;
 	uint8_t params[64] = {}, identity[64] = {};
 	if (AVD_CreateAVDAccelerator(&table, params, identity) != 0 || !table)
 		return 2;
 	g_table = (DriverTable *)table;
 	g_driver = createDriver();
-	if (listed(kFunctionEncode, kEncodeHevc) != 0)
+	const int wantHevc = std::atoi(argv[5]);
+	if (listed(kFunctionEncode, kEncodeHevc) != wantHevc ||
+	    listed(kFunctionProcess, kProcessFrameStatistics) != wantHevc)
 		return 3;
 	return listed(kFunctionEncode, kEncodeH264) == std::atoi(argv[4]) ? 0 : 1;
 }
 
 // The capability block lists H.264 encode (function 0x20, sub-ID 0x800, NV12 in and a bitstream
-// out) where the host has an H.264 encoder with a rate control, and no HEVC encode, though the host
-// has an HEVC encoder: the driver encodes no HEVC, so it answers as a Mac without an HEVC encoder
-// does (VideoToolbox lists no hevc.gva, and a create that requires hardware fails -12908, measured
-// on macOS 26.7.2); a host with no encoder, or one it lists with no rate control, lists none. The rest of the checks run on a host
-// that encodes, so every answer of the block with the encoder listed is one AppleGVA may divide by
-// (checkNoZeroAnswers).
+// out) where the host has an H.264 encoder with a rate control, and HEVC encode (sub-ID 0x1000),
+// with the frame statistics the HEVC encoder plug-in looks up beside it (function 2, sub-ID
+// 0x1000), where the host has an HEVC encoder of Main from NV12 and Main 10 from P010 with a
+// constant QP, at which the driver codes the plug-in's frames, that codes a frame in place of the
+// last; a host with no encoder, or one it lists with no rate control, lists neither, and one with
+// no constant QP, of one of the two profiles alone, or that codes no frame in place, lists no HEVC
+// encode, and H.264 encode as before. The rest of the checks run on a host
+// that encodes, so every answer of the block with the encoders listed is one AppleGVA may divide
+// by (checkNoZeroAnswers).
 void checkEncodeListedApart()
 {
-	checkListedOn(false, 1u << RGFX_VIDEO_RATE_CQP, 0, "H.264 encode listed with no host encoder");
-	checkListedOn(true, 0, 0, "H.264 encode listed with no rate control");
-	checkListedOn(true, 1u << RGFX_VIDEO_RATE_CQP, 1, "H.264 encode not listed once");
+	checkListedOn(false, 1u << RGFX_VIDEO_RATE_CQP, 0, 0, "encode listed with no host encoder");
+	checkListedOn(true, 0, 0, 0, "encode listed with no rate control");
+	checkListedOn(true, 1u << RGFX_VIDEO_RATE_VBR, 1, 0,
+	              "H.264 encode not listed once, or HEVC encode listed, with no constant QP");
+	checkListedOn(true, 1u << RGFX_VIDEO_RATE_CQP, 1, 1, "H.264 or HEVC encode not listed once");
+	checkListedOn(true, 1u << RGFX_VIDEO_RATE_CQP, 1, 0, "HEVC encode listed of Main alone",
+	              RGFX_VIDEO_HEVC_MAIN);
+	checkListedOn(true, 1u << RGFX_VIDEO_RATE_CQP, 1, 0, "HEVC encode listed of Main 10 alone",
+	              RGFX_VIDEO_HEVC_MAIN_10);
+	checkListedOn(true, 1u << RGFX_VIDEO_RATE_CQP, 1, 0,
+	              "HEVC encode listed, or H.264 encode not, on a host that codes no frame in place",
+	              RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10, 0);
 }
 
 void checkEncodeListed()
 {
 	CHECK(listed(kFunctionEncode, kEncodeH264) == 1, "H.264 encode not listed once");
-	CHECK(listed(kFunctionEncode, kEncodeHevc) == 0, "HEVC encode listed");
+	CHECK(listed(kFunctionEncode, kEncodeHevc) == 1, "HEVC encode not listed once");
+	CHECK(listed(kFunctionProcess, kProcessFrameStatistics) == 1,
+	      "the frame statistics not listed once");
 	const CapabilityBlock *b = capabilities();
 	for (uint32_t f = 0; f < b->function_count; f++) {
 		const Function &fn = *b->functions[f];
@@ -1697,6 +1737,9 @@ void checkEncodeListed()
 		      "the encode's formats");
 	}
 }
+
+// The stand-in host's rate controls where a check does not change them.
+constexpr uint32_t kCqpVbr = 1u << RGFX_VIDEO_RATE_CQP | 1u << RGFX_VIDEO_RATE_VBR;
 
 // Makes one encode context of `sub` of `width` x `height`: CreateContexts' answer, the context in
 // `context`.
@@ -1716,9 +1759,11 @@ uint64_t makeEncode(void **context, uint32_t width, uint32_t height, uint64_t su
 	return call(kCreateContexts, &init);
 }
 
-// An H.264 encode context opens an encode session on the host where the host encodes its size;
-// one of a size past the host's, one on a host with no encoder, and an HEVC encode on a host that
-// encodes HEVC are refused at their create, with no session left open.
+// An H.264 or HEVC encode context opens an encode session on the host where the host encodes its
+// size; one of a size past the host's, one on a host with no encoder, and an HEVC encode on a host
+// whose encoder has no constant QP, encodes Main alone, or codes no frame in place, are refused at
+// their create, with no session left open, so VideoToolbox takes its software encoder where the
+// app allows it; an H.264 encode on that last host opens as before.
 void checkEncodeCreate()
 {
 	g_hostEncodes = true;
@@ -1726,14 +1771,23 @@ void checkEncodeCreate()
 		uint32_t width, height;
 		uint64_t sub;
 		bool encodes;
+		uint32_t rates;
 		uint64_t want;
 	} cases[] = {
-	    {640, 480, kEncodeH264, true, kOk},           {4096, 4096, kEncodeH264, true, kOk},
-	    {4097, 480, kEncodeH264, true, kUnsupported}, {128, 480, kEncodeH264, true, kUnsupported},
-	    {640, 480, kEncodeH264, false, kUnsupported}, {640, 480, kEncodeHevc, true, kUnsupported},
+	    {640, 480, kEncodeH264, true, kCqpVbr, kOk},
+	    {4096, 4096, kEncodeH264, true, kCqpVbr, kOk},
+	    {4097, 480, kEncodeH264, true, kCqpVbr, kUnsupported},
+	    {128, 480, kEncodeH264, true, kCqpVbr, kUnsupported},
+	    {640, 480, kEncodeH264, false, kCqpVbr, kUnsupported},
+	    {640, 480, kEncodeHevc, true, kCqpVbr, kOk},
+	    {1920, 1088, kEncodeHevc, true, kCqpVbr, kOk},
+	    {4097, 480, kEncodeHevc, true, kCqpVbr, kUnsupported},
+	    {640, 480, kEncodeHevc, false, kCqpVbr, kUnsupported},
+	    {640, 480, kEncodeHevc, true, 1u << RGFX_VIDEO_RATE_VBR, kUnsupported},
 	};
 	for (const auto &c : cases) {
 		g_hostEncodes = c.encodes;
+		g_encodeRates = c.rates;
 		g_opened.clear();
 		void *context = nullptr;
 		CHECK(makeEncode(&context, c.width, c.height, c.sub) == c.want,
@@ -1748,6 +1802,25 @@ void checkEncodeCreate()
 		}
 	}
 	g_hostEncodes = true;
+	g_encodeRates = kCqpVbr;
+	g_hevcEncodeProfiles = RGFX_VIDEO_HEVC_MAIN;
+	g_opened.clear();
+	void *mainOnly = nullptr;
+	CHECK(makeEncode(&mainOnly, 640, 480, kEncodeHevc) == kUnsupported && !mainOnly &&
+	          g_opened.empty(),
+	      "an HEVC encode on a host of Main alone not refused");
+	g_hevcEncodeProfiles = RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10;
+	g_encodeFlags = 0;
+	void *notInPlace = nullptr;
+	CHECK(makeEncode(&notInPlace, 640, 480, kEncodeHevc) == kUnsupported && !notInPlace &&
+	          g_opened.empty(),
+	      "an HEVC encode on a host that codes no frame in place not refused");
+	void *h264 = nullptr;
+	CHECK(makeEncode(&h264, 640, 480, kEncodeH264) == kOk && h264 && g_opened.size() == 1,
+	      "an H.264 encode on a host that codes no frame in place refused");
+	ContextDelete del = {1, 0, &h264};
+	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	g_encodeFlags = RGFX_VIDEO_ENCODE_CAP_IN_PLACE;
 }
 
 // AllocatePixelBufferPool gives an encoder's pools of kinds 0xe and 0x1b: a buffer of the product
@@ -2003,6 +2076,284 @@ void checkEncodeFrames()
 	g_encodeRates = 1u << RGFX_VIDEO_RATE_CQP | 1u << RGFX_VIDEO_RATE_VBR;
 }
 
+// An HEVC encode command's parameters as the HEVC encoder plug-in's Intel driver class fills
+// them, as far as the driver reads and writes them: the source surface (P+0x10), the NAL unit type
+// the plug-in chose (P+0x33c), its slice QP (P+0x3d8), and the words the access unit's length is
+// published as (P+0x3a0, P+0x3a8), which the plug-in zeroes before each encode.
+struct HevcEncode {
+	uint8_t parameters[0x800] = {};
+
+	HevcEncode(IOSurfaceRef source, uint32_t nalType, uint32_t qp, uint32_t poc)
+	{
+		std::memcpy(parameters + 0x4, &poc, 4);
+		std::memcpy(parameters + 0x10, &source, 8);
+		std::memcpy(parameters + 0x33c, &nalType, 4);
+		std::memcpy(parameters + 0x3d8, &qp, 4);
+	}
+	uint64_t begin() const { return u64(parameters + 0x3a0); }
+	uint64_t size() const { return u64(parameters + 0x3a8) - begin(); }
+	static uint64_t u64(const uint8_t *at)
+	{
+		uint64_t v;
+		std::memcpy(&v, at, 8);
+		return v;
+	}
+};
+
+// Schedules `e` on `context`: Schedule's answer, its token in `token`.
+uint64_t scheduleHevcEncode(void *context, const HevcEncode &e, void **token)
+{
+	Command c = {};
+	c.function_id = kFunctionEncode;
+	c.sub_id = kEncodeHevc;
+	c.context = context;
+	c.parameters = e.parameters;
+	const Command *list[1] = {&c};
+	void *tokens[1] = {};
+	CommandList cl = {1, 0, list};
+	TokenList tl = {1, 0, tokens};
+	const uint64_t answer = call(kSchedule, &cl, &tl);
+	*token = tokens[0];
+	return answer;
+}
+
+// An HEVC encode is sent with the settings the source and the plug-in's choices give, and
+// published where the plug-in reads it as it is queried done:
+// - the settings: the source's size, Main of NV12 for a '420v' or '420f' source, its range, the
+//   plug-in's slice QP as a constant QP, no keyframes of the host's own; an IRAP NAL unit type
+//   (BLA, IDR, CRA) forces a keyframe, another does not; the frames count up; the access unit
+//   takes at most half the bitstream pool's buffer;
+// - the access unit lands at the start of the buffer, each NAL unit after a 4-byte start code: a
+//   3-byte start code made 4, trailing zero bytes left out, and the NAL units the plug-in drops
+//   (an access unit delimiter, SEI) left out; its length is published as the words at +0x3a0 (0)
+//   and +0x3a8;
+// - a frame the host failed, an access unit of no slice segment, or one past the buffer, publishes
+//   a length of 0 and fails the context's next schedule, sending nothing; the schedule after it
+//   goes on;
+// - an 'x420' source is sent as Main 10 of P010 and an 'xf20' one as Main 10 at full range; a
+//   source of another format (BGRA) is not sent.
+void checkHevcEncodeFrames()
+{
+	g_hostEncodes = true;
+	g_encodeRates = 1u << RGFX_VIDEO_RATE_CQP;
+	g_encodes.clear();
+	g_encodeWork.clear();
+	constexpr uint32_t kBuffer = 0x1000;
+	const uint64_t bufferAt = allocate(g_driver, 0, kBuffer);
+	CHECK(bufferAt != 0, "the bitstream buffer refused");
+	const uint8_t *buffer = (const uint8_t *)bufferAt;
+	IOSurfaceRef source = canvas(640, 480, '420v');
+	void *context = nullptr;
+	CHECK(makeEncode(&context, 640, 480, kEncodeHevc) == kOk, "a create of one HEVC encode");
+	// An IDR access unit as a host writes one: an access unit delimiter, then VPS, SPS and PPS,
+	// an SEI and the IDR slice; the SPS after a 3-byte start code, trailing zero bytes at the end.
+	const std::vector<uint8_t> aud = {0x46, 0x01, 0x10}, vps = {0x40, 0x01, 0x0c, 0x01, 0xff},
+	                           sps = {0x42, 0x01, 0x01, 0x01, 0x60, 0x03},
+	                           pps = {0x44, 0x01, 0xc1, 0x72}, sei = {0x4e, 0x01, 0x05, 0x02, 0x80},
+	                           idr = {0x28, 0x01, 0xaf, 0x13, 0x77, 0x03, 0x11},
+	                           trail = {0x02, 0x01, 0xd0, 0x2a, 0x05};
+	auto unit = [](std::vector<uint8_t> &au, const std::vector<uint8_t> &nal, bool four) {
+		const uint8_t code[4] = {0, 0, 0, 1};
+		au.insert(au.end(), four ? code : code + 1, code + 4);
+		au.insert(au.end(), nal.begin(), nal.end());
+	};
+	g_accessUnit.clear();
+	unit(g_accessUnit, aud, true);
+	unit(g_accessUnit, vps, true);
+	unit(g_accessUnit, sps, false);
+	unit(g_accessUnit, pps, true);
+	unit(g_accessUnit, sei, true);
+	unit(g_accessUnit, idr, true);
+	g_accessUnit.insert(g_accessUnit.end(), {0, 0});
+	std::vector<uint8_t> want;
+	for (const auto *nal : {&vps, &sps, &pps, &idr})
+		unit(want, *nal, true);
+	void *token = nullptr;
+	HevcEncode first(source, 20, 24, 0);
+	CHECK(scheduleHevcEncode(context, first, &token) == kOk && token, "an IDR frame not scheduled");
+	CHECK(g_encodes.size() == 1, "%zu encodes sent", g_encodes.size());
+	const SentEncode &sent = g_encodes[0];
+	const RgfxVideoEncodeSettings &st = sent.settings;
+	CHECK(sent.surface == IOSurfaceGetID(source) && sent.frameIndex == 0 && sent.forceKeyframe &&
+	          sent.capacity == kBuffer / 2,
+	      "the IDR frame's encode: surface %u, frame %llu, keyframe %d, capacity %llu", sent.surface,
+	      (unsigned long long)sent.frameIndex, sent.forceKeyframe,
+	      (unsigned long long)sent.capacity);
+	CHECK(st.width == 640 && st.height == 480 && st.format == RGFX_VIDEO_FORMAT_NV12 &&
+	          st.profile == RGFX_VIDEO_HEVC_MAIN && st.level == 0 &&
+	          st.rate_control == RGFX_VIDEO_RATE_CQP && st.qp_i == 24 && st.qp_p == 24 &&
+	          st.qp_b == 24 && st.key_frame_interval == UINT32_MAX && st.full_range == 0,
+	      "the IDR frame's settings: profile %#x level %u rate %u qp %u keys %u range %u",
+	      st.profile, st.level, st.rate_control, st.qp_i, st.key_frame_interval, st.full_range);
+	CHECK(queryEncode(token) == kQueryDone, "the IDR frame not done");
+	CHECK(first.begin() == 0 && first.size() == want.size() &&
+	          std::memcmp(buffer, want.data(), want.size()) == 0,
+	      "the IDR frame's access unit: %llu bytes from %llu", (unsigned long long)first.size(),
+	      (unsigned long long)first.begin());
+	// A TRAIL_R frame of another QP, after a 3-byte start code.
+	g_accessUnit.clear();
+	unit(g_accessUnit, trail, false);
+	HevcEncode p(source, 1, 31, 1);
+	CHECK(scheduleHevcEncode(context, p, &token) == kOk, "a P frame not scheduled");
+	CHECK(g_encodes.size() == 2 && g_encodes[1].frameIndex == 1 && !g_encodes[1].forceKeyframe &&
+	          g_encodes[1].settings.qp_p == 31,
+	      "the P frame's encode");
+	CHECK(queryEncode(token) == kQueryDone && p.size() == trail.size() + 4 && buffer[3] == 1 &&
+	          std::memcmp(buffer + 4, trail.data(), trail.size()) == 0,
+	      "the P frame's access unit: %llu bytes", (unsigned long long)p.size());
+	// A CRA picture is a keyframe; a QP past 51 is sent as 51.
+	HevcEncode cra(source, 21, 60, 2);
+	CHECK(scheduleHevcEncode(context, cra, &token) == kOk && g_encodes.back().forceKeyframe &&
+	          g_encodes.back().settings.qp_i == 51,
+	      "a CRA frame's encode");
+	CHECK(queryEncode(token) == kQueryDone, "the CRA frame not done");
+	// A frame the host failed publishes no access unit, and fails the next schedule.
+	g_encodeStatus = RGFX_VIDEO_ENCODE_FAILED;
+	HevcEncode failed(source, 1, 31, 3);
+	CHECK(scheduleHevcEncode(context, failed, &token) == kOk, "the failing frame not scheduled");
+	g_encodeStatus = RGFX_VIDEO_ENCODE_OK;
+	CHECK(queryEncode(token) == kQueryDone && failed.size() == 0, "the failed frame published");
+	const size_t before = g_encodes.size();
+	HevcEncode after(source, 1, 31, 4);
+	CHECK(scheduleHevcEncode(context, after, &token) == kNotSent && g_encodes.size() == before,
+	      "the frame after a failed one sent");
+	CHECK(scheduleHevcEncode(context, after, &token) == kOk, "the next frame not scheduled");
+	CHECK(queryEncode(token) == kQueryDone && after.size() == trail.size() + 4,
+	      "the next frame not published");
+	// An access unit of no slice segment, and one past the buffer, publish none.
+	g_accessUnit.clear();
+	unit(g_accessUnit, sei, true);
+	HevcEncode noSlice(source, 1, 31, 5);
+	CHECK(scheduleHevcEncode(context, noSlice, &token) == kOk, "the frame of no slice not scheduled");
+	CHECK(queryEncode(token) == kQueryDone && noSlice.size() == 0,
+	      "an access unit of no slice published");
+	CHECK(scheduleHevcEncode(context, after, &token) == kNotSent,
+	      "the frame after one of no slice sent");
+	g_accessUnit.clear();
+	unit(g_accessUnit, std::vector<uint8_t>(kBuffer, 0x26), true);
+	HevcEncode past(source, 1, 31, 6);
+	CHECK(scheduleHevcEncode(context, past, &token) == kOk, "the frame past the buffer not scheduled");
+	CHECK(queryEncode(token) == kQueryDone && past.size() == 0,
+	      "an access unit past the buffer published");
+	CHECK(scheduleHevcEncode(context, after, &token) == kNotSent,
+	      "the frame after one past the buffer sent");
+	// A full-range source is sent of its range, a 10-bit one as Main 10 of P010; a BGRA one is
+	// not sent.
+	g_accessUnit.clear();
+	unit(g_accessUnit, trail, true);
+	IOSurfaceRef full = canvas(640, 480, '420f'), deep = canvas(640, 480, 'x420'),
+	             deepFull = canvas(640, 480, 'xf20'), bgra = canvas(640, 480, 'BGRA');
+	const struct {
+		IOSurfaceRef source;
+		uint32_t profile, format, fullRange;
+	} sources[] = {
+	    {full, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_FORMAT_NV12, 1},
+	    {deep, RGFX_VIDEO_HEVC_MAIN_10, RGFX_VIDEO_FORMAT_P010, 0},
+	    {deepFull, RGFX_VIDEO_HEVC_MAIN_10, RGFX_VIDEO_FORMAT_P010, 1},
+	};
+	for (const auto &c : sources) {
+		HevcEncode frame(c.source, 1, 31, 7);
+		CHECK(scheduleHevcEncode(context, frame, &token) == kOk, "a frame of format %#x not sent",
+		      (unsigned)IOSurfaceGetPixelFormat(c.source));
+		const RgfxVideoEncodeSettings &fs = g_encodes.back().settings;
+		CHECK(fs.profile == c.profile && fs.format == c.format && fs.full_range == c.fullRange &&
+		          fs.qp_p == 31,
+		      "a frame of format %#x: profile %#x format %u range %u",
+		      (unsigned)IOSurfaceGetPixelFormat(c.source), fs.profile, fs.format, fs.full_range);
+		CHECK(queryEncode(token) == kQueryDone, "a frame of format %#x not done",
+		      (unsigned)IOSurfaceGetPixelFormat(c.source));
+	}
+	const size_t sentBefore = g_encodes.size();
+	HevcEncode refused(bgra, 1, 31, 8);
+	CHECK(scheduleHevcEncode(context, refused, &token) == kNotSent &&
+	          g_encodes.size() == sentBefore,
+	      "a BGRA frame sent");
+	ContextDelete del = {1, 0, &context};
+	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	CHECK(callOn(g_driver, kFreeBitstreamBufferPool, (const void *)0) == kOk,
+	      "FreeBitstreamBufferPool");
+	for (IOSurfaceRef s : {source, full, deep, deepFull, bgra})
+		CFRelease(s);
+	g_accessUnit.clear();
+	g_encodeRates = kCqpVbr;
+}
+
+// The plug-in's frame coded again (hevcCodesAgain): a command of the last frame's order count and
+// source, of a P picture, is sent in place of it (RGFX_VIDEO_ENCODE_IN_PLACE), with its frame
+// index, at its own QP. Not in place: a new order count from the same surface, the same order
+// count from another surface, and a keyframe, which is sent as a new frame: an IDR picture coded
+// again right after itself, and each of keyframes from one reused surface, of order count 0 each.
+// Both of two retries in a row are in place, and so is the retry of the P picture right after an
+// IDR picture. After a frame the host failed, the next frame sent is a new one, whatever its order
+// count and surface.
+void checkHevcCodesAgain()
+{
+	g_hostEncodes = true;
+	g_encodeRates = 1u << RGFX_VIDEO_RATE_CQP;
+	g_encodes.clear();
+	g_encodeWork.clear();
+	CHECK(allocate(g_driver, 0, 0x1000) != 0, "the bitstream buffer refused");
+	IOSurfaceRef a = canvas(640, 480, '420v'), b = canvas(640, 480, '420v');
+	void *context = nullptr;
+	CHECK(makeEncode(&context, 640, 480, kEncodeHevc) == kOk, "a create of one HEVC encode");
+	const uint8_t trail[] = {0, 0, 0, 1, 0x02, 0x01, 0xd0, 0x2a, 0x05};
+	g_accessUnit.assign(trail, trail + sizeof trail);
+	constexpr uint32_t kIdr = 19, kTrail = 1;
+	// Sends a frame and has it done: the encode sent for it.
+	auto send = [&](IOSurfaceRef source, uint32_t nal, uint32_t qp, uint32_t poc) {
+		HevcEncode e(source, nal, qp, poc);
+		void *token = nullptr;
+		CHECK(scheduleHevcEncode(context, e, &token) == kOk && token,
+		      "a frame of order count %u not scheduled", poc);
+		CHECK(queryEncode(token) == kQueryDone && e.size() == sizeof trail,
+		      "a frame of order count %u not published", poc);
+		return g_encodes.back();
+	};
+	auto is = [&](const SentEncode &e, bool inPlace, uint64_t index, bool key, uint32_t qp,
+	              const char *what) {
+		CHECK(e.inPlace == inPlace && e.frameIndex == index && e.forceKeyframe == key &&
+		          e.settings.qp_i == qp,
+		      "%s: in place %d, frame %llu, keyframe %d, QP %u", what, e.inPlace,
+		      (unsigned long long)e.frameIndex, e.forceKeyframe, e.settings.qp_i);
+	};
+	// An IDR picture, and the same again at a higher QP right after it: a new IDR picture.
+	is(send(a, kIdr, 30, 0), false, 0, true, 30, "the IDR picture");
+	is(send(a, kIdr, 33, 0), false, 1, true, 33, "the IDR picture again");
+	// The P picture after it, and that again: in place, of its index.
+	is(send(a, kTrail, 30, 1), false, 2, false, 30, "the P picture after the IDR picture");
+	is(send(a, kTrail, 33, 1), true, 2, false, 33, "the P picture after the IDR picture again");
+	// A new order count from the same surface: a new frame.
+	is(send(a, kTrail, 30, 2), false, 3, false, 30, "a new order count from the same surface");
+	// That frame again twice: in place both times, of its index.
+	is(send(a, kTrail, 33, 2), true, 3, false, 33, "a P picture again");
+	is(send(a, kTrail, 36, 2), true, 3, false, 36, "a P picture again, twice");
+	// The same order count from another surface: a new frame.
+	is(send(b, kTrail, 30, 2), false, 4, false, 30, "the same order count from another surface");
+	is(send(b, kTrail, 30, 3), false, 5, false, 30, "the next P picture");
+	// Keyframes from one reused surface, each of order count 0: each a new frame.
+	for (uint64_t n = 6; n < 9; n++)
+		is(send(a, kIdr, 30, 0), false, n, true, 30, "a keyframe from one surface");
+	// A frame the host fails, then the same frame: its schedule fails, and the one after it is a
+	// new frame.
+	g_encodeStatus = RGFX_VIDEO_ENCODE_FAILED;
+	HevcEncode failed(a, kTrail, 30, 1);
+	void *token = nullptr;
+	CHECK(scheduleHevcEncode(context, failed, &token) == kOk, "the failing frame not scheduled");
+	g_encodeStatus = RGFX_VIDEO_ENCODE_OK;
+	CHECK(queryEncode(token) == kQueryDone && failed.size() == 0, "the failed frame published");
+	HevcEncode again(a, kTrail, 33, 1);
+	CHECK(scheduleHevcEncode(context, again, &token) == kNotSent, "the frame after a failed one sent");
+	is(send(a, kTrail, 33, 1), false, 10, false, 33, "the frame after a failed one's refusal");
+	ContextDelete del = {1, 0, &context};
+	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	CHECK(callOn(g_driver, kFreeBitstreamBufferPool, (const void *)0) == kOk,
+	      "FreeBitstreamBufferPool");
+	CFRelease(a);
+	CFRelease(b);
+	g_accessUnit.clear();
+	g_encodeRates = kCqpVbr;
+}
+
 // Runs a check, naming it first where VIDEO_TESTS_TRACE is set, so a crash names its check.
 #define RUN(check)                                       \
 	do {                                             \
@@ -2013,7 +2364,7 @@ void checkEncodeFrames()
 
 int main(int argc, char **argv)
 {
-	if (argc == 5 && std::strcmp(argv[1], "listed") == 0)
+	if (argc == 8 && std::strcmp(argv[1], "listed") == 0)
 		return listedChild(argv);
 	g_self = argv[0];
 	RUN(checkEncodeListedApart);
@@ -2042,6 +2393,8 @@ int main(int argc, char **argv)
 	RUN(checkEncodeCreate);
 	RUN(checkPixelPools);
 	RUN(checkEncodeFrames);
+	RUN(checkHevcEncodeFrames);
+	RUN(checkHevcCodesAgain);
 	std::printf("video_driver_tests: %d checks passed\n", g_checks);
 	return 0;
 }

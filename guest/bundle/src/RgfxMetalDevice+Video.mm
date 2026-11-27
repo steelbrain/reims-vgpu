@@ -465,15 +465,21 @@ void *rgfx::video::decode(Session *session, const Decode &decode)
 
 namespace {
 
-// The textures over `source`'s two planes an encode of `session`'s reads, made once per surface;
-// false where the surface is of no format the host reads or a texture is not made. Over the
-// surface's pages where its block is made here: the host reads a source's bytes on the CPU, so a
-// device cache would only be one more copy. The caller holds the session's lock.
-bool sourceTextures(rgfx::video::Session *session, IOSurfaceRef source, id<MTLTexture> *luma,
+// The textures over `source`'s two planes an encode of `session`'s reads at `settings`' format,
+// made once per surface: a '420v' or '420f' surface's bytes for NV12, an 'x420' or 'xf20'
+// surface's 16-bit samples, the 10 bits high in each as P010 has them, for P010. False where the
+// surface is of another format or a texture is not made. Over the surface's pages where its block
+// is made here: the host reads a source's bytes on the CPU, so a device cache would only be one
+// more copy. The caller holds the session's lock.
+bool sourceTextures(rgfx::video::Session *session, IOSurfaceRef source,
+                    const RgfxVideoEncodeSettings &settings, id<MTLTexture> *luma,
                     id<MTLTexture> *chroma)
 {
 	const OSType format = IOSurfaceGetPixelFormat(source);
-	if ((format != '420v' && format != '420f') || IOSurfaceGetPlaneCount(source) != 2)
+	const bool deep = settings.format == RGFX_VIDEO_FORMAT_P010;
+	const bool taken = deep ? format == 'x420' || format == 'xf20'
+	                        : format == '420v' || format == '420f';
+	if (!taken || IOSurfaceGetPlaneCount(source) != 2)
 		return false;
 	const uint64_t key = IOSurfaceGetID(source);
 	auto it = session->sources.find(key);
@@ -490,7 +496,8 @@ bool sourceTextures(rgfx::video::Session *session, IOSurfaceRef source, id<MTLTe
 			RgfxAskUncachedScope ask;
 			for (size_t plane = 0; plane < 2; plane++) {
 				const MTLPixelFormat format =
-				    plane == 0 ? MTLPixelFormatR8Unorm : MTLPixelFormatRG8Unorm;
+				    deep ? (plane == 0 ? MTLPixelFormatR16Unorm : MTLPixelFormatRG16Unorm)
+				         : (plane == 0 ? MTLPixelFormatR8Unorm : MTLPixelFormatRG8Unorm);
 				MTLTextureDescriptor *desc = [MTLTextureDescriptor
 				    texture2DDescriptorWithPixelFormat:format
 				                                 width:IOSurfaceGetWidthOfPlane(source, plane)
@@ -544,7 +551,7 @@ void *rgfx::video::encode(Session *session, const Encode &encode)
 	bool send;
 	{
 		std::lock_guard<std::mutex> hold(session->lock);
-		if (!sourceTextures(session, encode.source, &luma, &chroma))
+		if (!sourceTextures(session, encode.source, encode.settings, &luma, &chroma))
 			return nullptr;
 		send = !session->settingsSent ||
 		       memcmp(&session->sentSettings, &encode.settings, sizeof encode.settings) != 0;
@@ -563,7 +570,8 @@ void *rgfx::video::encode(Session *session, const Encode &encode)
 	body.bitstream_capacity = encode.capacity;
 	body.result_offset = resultOffset;
 	body.frame_index = encode.frameIndex;
-	body.flags = encode.forceKeyframe ? RGFX_VIDEO_ENCODE_FORCE_KEYFRAME : 0;
+	body.flags = (encode.forceKeyframe ? RGFX_VIDEO_ENCODE_FORCE_KEYFRAME : 0) |
+	             (encode.inPlace ? RGFX_VIDEO_ENCODE_IN_PLACE : 0);
 	[(RgfxCmdBuffer *)cb rgfxEncodeVideoSession:session->objId
 	                                      codec:session->codec
 	                                     encode:body

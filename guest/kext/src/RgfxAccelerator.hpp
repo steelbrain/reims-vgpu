@@ -455,6 +455,11 @@ public:
 	// Whether that framebuffer has started (ReimsGraphics::hasStarted): before, and once its stop
 	// has begun, the device holds nothing of any context, and no message of one reaches it.
 	bool framebufferStarted();
+	// Publishes the nub the guest's HEVC encoder plug-in finds a GPU encoder by
+	// (RgfxAccelerator.cpp, publishHevcEncoder), where publishVideoCodecs found the host encodes
+	// HEVC; once the accelerator has registered, so the plug-in finds it only with the bundle,
+	// and RgfxGate's link to it, in place.
+	void publishHevcEncoder();
 
 	// The bundle (RgfxAccelerator.cpp, "The bundle"): the accelerator registers only once the
 	// bundle MetalPluginName names is on disk and the framebuffer has started, and opens no user
@@ -758,7 +763,8 @@ private:
 	void nameProviderForVideo();
 	// Publishes the host's hardware video that AppleGVA reads from the accelerator, from the
 	// video caps the host wrote (RgfxVideoCodecs.hpp): its video driver, H.264 encode and HEVC
-	// decode, each where the host has it.
+	// decode, each where the host has it, and the level of its HEVC encode, which
+	// publishHevcEncoder publishes.
 	void publishVideoCodecs();
 	// Has IOSurface align the bytes per row it works out for a surface as the host's GPU takes
 	// such rows in place (RgfxSurfaceRows.hpp; IOSurface's own where the host asks no more), and
@@ -826,6 +832,9 @@ private:
 	bool reviveSurfaceBlock(RgfxSurfaceEntry &e, OSObject *surface, uint32_t surfaceId);
 
 	IOPCIDevice *pci;
+	// The level of the host's HEVC encoder, which publishVideoCodecs read from its caps, and 0
+	// where it encodes no HEVC the guest's plug-in can drive (RgfxVideoCodecs.hpp).
+	uint32_t hevcEncodeLevel = 0;
 	IOMemoryMap *registerMap;
 	volatile UInt8 *registers;
 	IODeviceMemory *region;

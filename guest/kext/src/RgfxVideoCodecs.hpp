@@ -134,4 +134,44 @@ static inline bool rgfxH264Encode(const RgfxVideoCaps &caps)
 	return false;
 }
 
+// The ratings the accelerator's HEVC encoder publishes (IOGVAHEVCEncodeCapabilities): as for
+// H.264 encode, an AMD Mac's.
+constexpr uint32_t kRgfxHevcEncodeRating = 350;
+constexpr uint32_t kRgfxHevcEncodeQualityRating = 50;
+
+// What the host's HEVC encoder offers the guest: Main and Main 10, up to its level.
+struct RgfxHevcEncode {
+	uint32_t maxLevel;
+};
+
+// Whether `caps` lists an HEVC encoder the guest's HEVC encoder plug-in can drive, and its level
+// in `out`: an encode entry of Main from NV12 and Main 10 from P010, with a constant QP among its
+// rate controls, since the plug-in's rate control picks each frame's QP and the driver codes at
+// it (guest/bundle/src/RgfxVideoDriver.cpp), and that codes a frame in place of the last one
+// (RGFX_VIDEO_ENCODE_CAP_IN_PLACE), since the plug-in codes a frame again at a higher QP where it
+// came out over its data rate limit. Both profiles, as the plug-in's session may be of either
+// and the driver learns which only from its first frame's source, past its create. False for an
+// older host's caps, for a host with no video arm or no such encoder, and on an arm64 guest.
+static inline bool rgfxHevcEncode(const RgfxVideoCaps &caps, RgfxHevcEncode *out)
+{
+	if (!kRgfxGuestVideoDriver || caps.version < RGFX_VIDEO_CAPS_VERSION)
+		return false;
+	const uint32_t n = caps.codec_count < RGFX_VIDEO_CAPS_CODECS ? caps.codec_count
+	                                                             : RGFX_VIDEO_CAPS_CODECS;
+	for (uint32_t i = 0; i < n; i++) {
+		const RgfxVideoCodecCaps &c = caps.codecs[i];
+		if (c.codec != RGFX_VIDEO_CODEC_HEVC || c.direction != RGFX_VIDEO_ENCODE)
+			continue;
+		const uint32_t profiles = RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10;
+		const uint32_t formats = RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010;
+		if ((c.profiles & profiles) != profiles || (c.formats & formats) != formats ||
+		    !(caps.encode[i].rate_controls & (1u << RGFX_VIDEO_RATE_CQP)) ||
+		    !(caps.encode[i].flags & RGFX_VIDEO_ENCODE_CAP_IN_PLACE))
+			return false;
+		out->maxLevel = c.max_level;
+		return true;
+	}
+	return false;
+}
+
 #endif

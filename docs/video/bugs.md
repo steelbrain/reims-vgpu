@@ -102,6 +102,34 @@ Everything known to be wrong, untested or put off in the reims-graphics device's
 - **Why it waits:** none of our streams resizes, and no run has shown one.
 - **Fix:** one decoder at the largest size the stream may reach, each frame decoded at its own size, checked with a stream that resizes on each arm.
 
+### B97. An Intel Mac guest's 10-bit HEVC on an RTX 3090 comes to 106% of the asked bit rate
+
+- **What:** a macOS 26.7.2 guest's Main 10 session on its hardware HEVC encoder (`hevc.gva`, docs/graphics-kext/design.md, "HEVC encode takes the plug-in's Intel route"), 1080p, 300 frames at 8 Mbit/s, came to 8.49 Mbit/s on an RTX 3090: 106.1% of the asked, 0.1 point past the 6% every other row lands in (Main on the 3090 100.7%; Main 10 on an RX 7900 XTX 104.8%, on an Iris Xe 98.1%).
+- **Evidence:** **measured**, driver 620.70.06, 2026-11-27, m3-max-77477. NVENC's own Main 10 encode of the same frames (ffmpeg, P4, VBR at 8 Mbit/s) came to 104.6%.
+- **Why it waits:** the bit rate is the macOS plug-in's: the host codes each frame at the QP the plug-in's rate control chose, and that rate control reads a measure of each picture's complexity which no host encoder reports (the frame statistics the driver does not supply), so it chooses from the bits the frames before came to. 1.5 points over NVENC's own rate at the same ask.
+- **Fix, if one is wanted:** a complexity on the plug-in's scale, which neither VA-API nor NVENC gives.
+
+### B98. An Intel Mac guest's 8K HEVC encodes at about 10 frames a second on an Iris Xe
+
+- **What:** 8192x4320 sessions on the guest's hardware HEVC encoder made 10.3 and 10.8 frames a second on an Iris Xe (RPL-P), where the guest's software encoder made 0.5; at 1080p the hardware made 94 to 118.
+- **Evidence:** **measured**, iHD 26.3.5, 2026-11-27, m3-max-77497 (the host's whole machine, hardware and software alternated, 30 frames each). Per frame, of 93 to 97 ms, the host's GPU wrote the encoder's input in 12.4 to 12.7 ms and the app's own copy into its buffers took 8.5 to 10.9 ms; the other 70 to 75 ms are the host's encode and the guest's round trip, which no log line separates.
+- **Why it waits:** the hardware is 20 times the software's speed at that size, so it is offered.
+- **Fix:** first split those 70 ms between the host's VA-API encode and the round trip.
+
+### B99. An Intel Mac guest's short 8K HEVC sessions come to 118% of the asked rate, under software's quality
+
+- **What:** in the sessions of B98, 30 frames at 60 Mbit/s, the hardware's stream came to 71.0 Mbit/s (118%) and 44.87 dB of luma against its source, its last frame 39.17 dB; the guest's software encoder's came to 54.7 Mbit/s (91%) and 48.12 dB.
+- **Evidence:** **measured**, m3-max-77497, as B98.
+- **Why it waits:** above 1080p the rate is reported, not held to a band; the bit rate and the QPs are the plug-in's rate control's (B97). A longer session has not been measured at that size.
+- **Fix:** a longer 8K session's row first, to see whether the plug-in's rate control settles.
+
+### B100. An Intel Mac guest's HEVC under a hard data rate limit goes up to 3% over it in a second
+
+- **What:** with `kVTCompressionPropertyKey_DataRateLimits` at 1,000,000 bytes in one second, 1080p, 300 frames at 8 Mbit/s and the plug-in's default keyframe interval (6 keyframes in 300 frames, 60 frames apart or closer), the most bytes in one second of the guest's stream came to 1.7% to 3.0% over the limit: Main 1,021,534 and Main 10 1,027,996 on an RX 7900 XTX, 1,017,335 and 1,021,809 on an RTX 3090, 1,029,488 and 1,029,273 on an Iris Xe. The plug-in coded 2 to 30 frames of each session again at a higher QP, each in place of the last, and every frame decodes back.
+- **Evidence:** **measured**, 2026-11-27, m3-max-77611, m3-max-77609, m3-max-77627. A real Intel Mac's `hevc.gva` (a 2019 MacBook Pro, macOS 26.7.1) under the same limit kept it at a keyframe interval of 30: none of 271 one-second windows over, the most 957,229 bytes, 86.6% of the asked rate (**measured**, m3-max-77635). The two ran at different keyframe intervals, so they do not compare as equal.
+- **Why it waits:** the retries and their QPs are the plug-in's, and no run has yet put the guest and a real Mac at one keyframe interval. It is to be read when a user reports an HEVC stream breaking its hard data rate limit.
+- **Fix:** first the guest's and a real Mac's rows at one keyframe interval; then whatever separates them.
+
 ## Upstream bugs
 
 Bugs in drivers, libraries and tools that our code or our checks work around.

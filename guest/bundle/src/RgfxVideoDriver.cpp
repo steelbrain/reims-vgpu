@@ -145,6 +145,11 @@ constexpr uint64_t kCodecHevc = 0x800;
 // the encode function, 0x800 is H.264 (an HEVC encode is 0x1000), where under the decode function
 // it is HEVC.
 constexpr uint64_t kEncodeH264 = 0x800;
+// An encode's sub-ID for HEVC, which the guest's HEVC encoder plug-in (AppleGVAHEVCEncoder) looks
+// up through the accelerator's Intel nub, and the sub-ID of the frame statistics (the process
+// function) it looks up beside it, which it makes no context of.
+constexpr uint64_t kEncodeHevc = 0x1000;
+constexpr uint64_t kProcessFrameStatistics = 0x1000;
 
 Function &addFunction(CapabilityBlock &b, uint32_t function_id, uint64_t sub_id, uint32_t in,
 		      std::initializer_list<uint32_t> outs, uint32_t engine = kVideoEngine)
@@ -172,6 +177,28 @@ void addDecoder(CapabilityBlock &b, uint64_t codec, std::initializer_list<uint32
 	Function &transfer = addFunction(b, kFunctionTransfer, 1, 'NV12', {'NV12'});
 	head.next = &decode;
 	decode.next = &transfer;
+}
+
+// The host's HEVC encoder where the guest's HEVC encoder plug-in can drive it, as the kext
+// publishes it (RgfxVideoCodecs.hpp's rgfxHevcEncode): Main from NV12 and Main 10 from P010, with a
+// constant QP among its rate controls, since the plug-in's rate control picks each frame's QP, and
+// one that codes a frame in place of the last (RGFX_VIDEO_ENCODE_CAP_IN_PLACE), since the plug-in
+// codes a frame again where it came out over its data rate limit (encodeHevcFrame). Both
+// profiles: a session may be of either, and the driver learns which only from its first frame's
+// source, past its create. Null otherwise.
+const RgfxVideoCodecCaps *hevcEncoder()
+{
+	const RgfxVideoCodecCaps *caps =
+	    rgfx::video::hostCodec(RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_ENCODE);
+	const uint32_t profiles = RGFX_VIDEO_HEVC_MAIN | RGFX_VIDEO_HEVC_MAIN_10;
+	const uint32_t formats = RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010;
+	const RgfxVideoEncodeCaps encode = rgfx::video::encodeCaps(RGFX_VIDEO_CODEC_HEVC);
+	const bool cqp = (encode.rate_controls & (1u << RGFX_VIDEO_RATE_CQP)) != 0;
+	const bool inPlace = (encode.flags & RGFX_VIDEO_ENCODE_CAP_IN_PLACE) != 0;
+	return caps && (caps->profiles & profiles) == profiles &&
+	               (caps->formats & formats) == formats && cqp && inPlace
+	           ? caps
+	           : nullptr;
 }
 
 void fillCapabilities(CapabilityBlock &b)
@@ -209,6 +236,12 @@ void fillCapabilities(CapabilityBlock &b)
 	if (rgfx::video::hostCodec(RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_ENCODE) &&
 	    rgfx::video::encodeCaps(RGFX_VIDEO_CODEC_H264).rate_controls != 0)
 		addFunction(b, kFunctionEncode, kEncodeH264, 'NV12', {'rawb'});
+	// HEVC encode, where the plug-in can drive the host's encoder (hevcEncoder), and the frame
+	// statistics the plug-in looks up beside it.
+	if (hevcEncoder()) {
+		addFunction(b, kFunctionEncode, kEncodeHevc, 'NV12', {'rawb'});
+		addFunction(b, kFunctionProcess, kProcessFrameStatistics, 'NV12', {'NV12', 'rawb'});
+	}
 	// Frame processing on the graphics engine.
 	addFunction(b, kFunctionProcess, 0x10, 'NV12', {'NV12'}, kGraphicsEngine);
 	b.functions = b.function_list;
@@ -516,6 +549,26 @@ uint64_t u64At(const uint8_t *base, size_t off)
 // host and the parameter sets it last sent there.
 struct Driver;
 
+// An HEVC encode context's last frame sent (Context::hevc_last): whether there is one, its
+// picture's order count and its source's IOSurface ID.
+struct HevcLast {
+	bool sent;
+	uint32_t poc;
+	uint32_t source;
+};
+
+// Whether the plug-in's HEVC encode of a picture of order count `poc` from the IOSurface of ID
+// `source`, a keyframe where `keyframe`, is sent in place of `last`: the same picture from the same
+// source, which the plug-in codes again where a frame's access unit came out over its data rate
+// limit, at a higher QP, dropping the first; each new frame has an order count of its own. Never a
+// keyframe: the host codes each as an IDR picture, whose order count, 0, a new frame from the
+// surface of the last may share, and a keyframe coded again is sent as a new IDR picture, which
+// the stream decodes as well, its rate control counting one picture more.
+bool hevcCodesAgain(const HevcLast &last, uint32_t poc, uint32_t source, bool keyframe)
+{
+	return !keyframe && last.sent && last.poc == poc && last.source == source;
+}
+
 struct Context {
 	// The driver AppleGVA made the context on, whose bitstream buffers its pictures name.
 	Driver *driver;
@@ -538,6 +591,9 @@ struct Context {
 	// since its last schedule, which fails its next (RgfxVideoStatus.hpp).
 	uint64_t frames = 0;
 	std::atomic<bool> encode_failed{false};
+	// An HEVC encode context's last frame sent, which the plug-in may code again in its place
+	// (hevcCodesAgain); none before its first, and after a frame the host failed.
+	HevcLast hevc_last{};
 	// Whether its first output surface's layout was logged (outputSaid).
 	std::atomic<bool> output_said{false};
 };
@@ -1318,6 +1374,172 @@ bool encodeSettings(Context *context, const uint8_t *P, IOSurfaceRef source,
 	return true;
 }
 
+// An HEVC encode command's parameters (Command::parameters, P), as AppleGVAHEVCEncoder's driver
+// class for an Intel GPU fills them for the encode function's sub-ID 0x1000 (macOS 26.7.1's
+// plug-in, booted on 26.7.2): the picture's order count (its PicOrderCntVal) at +0x4; the source
+// frame, an IOSurface, at +0x10; the NAL unit type the plug-in chose for the picture, which its
+// sample's sync attachments follow, at +0x33c; and the slice QP its rate control chose, at
+// +0x3d8. The order count is the whole PicOrderCntVal, its most significant part kept by the
+// plug-in, not the slice header's least significant bits. Where a frame's access unit comes out
+// over the session's data rate limit, the plug-in codes the same frame again at a higher QP, twice
+// at most, with the same order count, NAL unit type and source, and drops the first
+// (hevcCodesAgain). The plug-in reads the access unit
+// from the start of its bitstream pool's one buffer (pool 0), as many bytes as the word at +0x3a8
+// less the one at +0x3a0, both of which it zeroes before each encode. It takes the access unit as
+// Annex-B with 4-byte start codes: its VPS, SPS and PPS make the session's format description,
+// and its slice segments, each start code rewritten to a 4-byte length in place, the sample; it
+// drops NAL units of other types. Its own parameter sets and slice headers in the command are
+// for a driver that codes under them; the host codes under its own, which the format description
+// then carries.
+constexpr size_t kHevcPoc = 0x004, kHevcSource = 0x010, kHevcNalType = 0x33c, kHevcBegin = 0x3a0,
+                 kHevcEnd = 0x3a8, kHevcQp = 0x3d8;
+constexpr uint32_t kHevcBitstreamPool = 0;
+
+// The settings the host encodes the HEVC frame of command parameters `P` with, from its source
+// `source`, into `out`: the source's size, format and range, Main from a '420v' or '420f' source
+// and Main 10 from an 'x420' or 'xf20' one, and a constant QP, the one the plug-in chose for the
+// picture; the plug-in's NAL types make every keyframe. False, logged once a reason, where the
+// host does not encode it so.
+bool encodeHevcSettings(const uint8_t *P, IOSurfaceRef source, RgfxVideoEncodeSettings *out)
+{
+	const RgfxVideoCodecCaps *caps = hevcEncoder();
+	const OSType format = IOSurfaceGetPixelFormat(source);
+	const bool deep = format == 'x420' || format == 'xf20';
+	const uint32_t profile = deep ? RGFX_VIDEO_HEVC_MAIN_10 : RGFX_VIDEO_HEVC_MAIN;
+	const uint32_t layout = deep ? RGFX_VIDEO_FORMAT_P010 : RGFX_VIDEO_FORMAT_NV12;
+	const uint32_t width = (uint32_t)IOSurfaceGetWidth(source),
+	               height = (uint32_t)IOSurfaceGetHeight(source);
+	if (!caps || !(deep || format == '420v' || format == '420f') || !(caps->profiles & profile) ||
+	    !(caps->formats & layout) || width % 2 || height % 2 ||
+	    !rgfx::video::sizeTaken(caps, width, height)) {
+		static std::atomic<bool> said;
+		notSent(said, "its HEVC encode asks a format, profile or size the host does not encode");
+		return false;
+	}
+	RgfxVideoEncodeSettings s = {};
+	s.width = width;
+	s.height = height;
+	s.format = layout;
+	s.profile = profile;
+	s.full_range = format == '420f' || format == 'xf20';
+	s.key_frame_interval = UINT32_MAX;
+	s.quality = 50;
+	s.rate_control = RGFX_VIDEO_RATE_CQP;
+	s.qp_i = s.qp_p = s.qp_b = std::min<uint32_t>(u32At(P, kHevcQp), 51);
+	*out = s;
+	return true;
+}
+
+// Commits the HEVC encode of parameters `P` on `context`'s session: its work on the host, or null
+// where it could not be sent.
+void *encodeHevcFrame(Context *context, const uint8_t *P)
+{
+	IOSurfaceRef source = (IOSurfaceRef)u64At(P, kHevcSource);
+	const uint8_t *buffer;
+	size_t bytes;
+	if (!source || CFGetTypeID(source) != IOSurfaceGetTypeID() ||
+	    !bitstreamBuffer(context->driver, kHevcBitstreamPool, 0, &buffer, &bytes) || bytes < 8) {
+		static std::atomic<bool> said;
+		notSent(said, "its HEVC encode names no source surface (+0x10), or the driver has no "
+		              "bitstream pool 0");
+		return nullptr;
+	}
+	rgfx::video::Encode e = {};
+	e.source = source;
+	if (!encodeHevcSettings(P, source, &e.settings))
+		return nullptr;
+	// An IRAP picture (BLA, IDR or CRA) the plug-in asks for is a keyframe; the host makes no other.
+	const uint32_t nal = u32At(P, kHevcNalType);
+	e.forceKeyframe = nal >= 16 && nal <= 21;
+	// The plug-in's frame again, at a higher QP, is coded in place of the last one sent, of its
+	// place in display order, unless it is a keyframe (hevcCodesAgain).
+	const uint32_t poc = u32At(P, kHevcPoc), id = IOSurfaceGetID(source);
+	e.inPlace = hevcCodesAgain(context->hevc_last, poc, id, e.forceKeyframe);
+	e.frameIndex = e.inPlace ? context->frames - 1 : context->frames;
+	// The host's access unit is never longer than the wire's bound for its size; the start codes
+	// made 4 bytes long add one a NAL unit at most, which the pool's buffer has room for.
+	const uint64_t bound = (uint64_t)e.settings.width * e.settings.height *
+	                           (e.settings.format == RGFX_VIDEO_FORMAT_P010 ? 2 : 1) * 3 / 2 +
+	                       (1u << 20);
+	e.capacity = std::min<uint64_t>(bound, bytes / 2);
+	void *work = rgfx::video::encode(context->session, e);
+	if (!work) {
+		static std::atomic<bool> said;
+		notSent(said, "a source of no format the host reads, or no command buffer");
+		return nullptr;
+	}
+	if (!e.inPlace)
+		context->frames++;
+	context->hevc_last = {true, poc, id};
+	return work;
+}
+
+// Writes the Annex-B access unit `in` (`size` bytes, start codes of 3 or 4 bytes) into `out` (of
+// `room` bytes) as the HEVC plug-in reads it: each VCL NAL unit, VPS, SPS and PPS after a 4-byte
+// start code, its trailing zero bytes left out, and the NAL units of other types (access unit
+// delimiters, SEI, filler), which the plug-in drops, left out. The bytes written; 0 where none
+// fit or there is no slice segment.
+uint64_t hevcAccessUnit(const uint8_t *in, uint64_t size, uint8_t *out, uint64_t room)
+{
+	auto startCode = [&](uint64_t i) {
+		return i + 3 <= size && in[i] == 0 && in[i + 1] == 0 && in[i + 2] == 1;
+	};
+	uint64_t i = 0, written = 0;
+	bool slices = false;
+	while (i < size && !startCode(i))
+		i++;
+	while (i < size) {
+		const uint64_t begin = i + 3;
+		uint64_t end = begin;
+		while (end < size && !startCode(end))
+			end++;
+		i = end;
+		while (end > begin && in[end - 1] == 0)
+			end--;
+		if (end - begin < 2)
+			continue;
+		const uint32_t type = (in[begin] >> 1) & 0x3f;
+		if (type > 34 || (type > 21 && type < 32))
+			continue;
+		if (written + 4 + (end - begin) > room)
+			return 0;
+		static const uint8_t code[4] = {0, 0, 0, 1};
+		memcpy(out + written, code, 4);
+		memcpy(out + written + 4, in + begin, end - begin);
+		written += 4 + (end - begin);
+		slices = slices || type <= 21;
+	}
+	return slices ? written : 0;
+}
+
+// Publishes the done HEVC encode of token `t` to the plug-in: its access unit at the start of the
+// bitstream pool's buffer (hevcAccessUnit), and its length as the words at +0x3a0 (0) and +0x3a8.
+// A frame the host did not encode, or whose access unit does not fit, publishes a length of 0,
+// which the plug-in takes as no sample, and fails the context's next schedule.
+void publishHevcEncoded(Token *t)
+{
+	uint8_t *P = t->parameters;
+	RgfxVideoEncodeResult result = {};
+	const uint8_t *bytes = nullptr;
+	const uint8_t *buffer = nullptr;
+	size_t room = 0;
+	const bool done = rgfx::video::encodeResult(t->work, &result, &bytes) &&
+	                  result.status == RGFX_VIDEO_ENCODE_OK && result.bitstream_size > 0 &&
+	                  bitstreamBuffer(t->encode->driver, kHevcBitstreamPool, 0, &buffer, &room);
+	const uint64_t size =
+	    done ? hevcAccessUnit(bytes, result.bitstream_size, const_cast<uint8_t *>(buffer), room) : 0;
+	if (size == 0) {
+		t->encode->encode_failed = true;
+		static std::atomic<bool> said;
+		if (!said.exchange(true))
+			os_log_error(rgfxLog(), "RGFX: video: an HEVC encode not delivered: host status %u, %llu bytes",
+			             result.status, (unsigned long long)result.bitstream_size);
+	}
+	const uint64_t begin = 0;
+	memcpy(P + kHevcBegin, &begin, sizeof begin);
+	memcpy(P + kHevcEnd, &size, sizeof size);
+}
+
 // Commits the encode command `c`'s frame on its context's session: its work on the host, or null
 // where it could not be sent.
 void *encodeFrame(const Command *c)
@@ -1329,6 +1551,8 @@ void *encodeFrame(const Command *c)
 		notSent(said, "its encode command names no encode session or no parameters");
 		return nullptr;
 	}
+	if (context->sub_id == kEncodeHevc)
+		return encodeHevcFrame(context, P);
 	IOSurfaceRef source = (IOSurfaceRef)u64At(P, kEncodeSource);
 	const uint8_t *nal = (const uint8_t *)u64At(P, kEncodeNal);
 	const uint32_t capacity = u32At(P, kEncodeCapacity);
@@ -1372,6 +1596,10 @@ void publishEncoded(Token *t)
 	if (t->published)
 		return;
 	t->published = true;
+	if (t->encode->sub_id == kEncodeHevc) {
+		publishHevcEncoded(t);
+		return;
+	}
 	uint8_t *P = t->parameters;
 	uint8_t *length = (uint8_t *)u64At(P, kEncodeLength);
 	const uint32_t capacity = u32At(P, kEncodeCapacity), start = u32At(P, kEncodeStart);
@@ -1428,7 +1656,9 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 							    fi->width, fi->height, nullptr, {}}
 					      : nullptr;
 			const bool encode = context && fi->function_id == kFunctionEncode;
-			const uint32_t codec = encode ? (fi->sub_id == kEncodeH264 ? RGFX_VIDEO_CODEC_H264 : 0)
+			const uint32_t codec = encode ? (fi->sub_id == kEncodeH264   ? RGFX_VIDEO_CODEC_H264
+			                                 : fi->sub_id == kEncodeHevc ? RGFX_VIDEO_CODEC_HEVC
+			                                                             : 0)
 			                       : !context || fi->function_id != kFunctionDecode ? 0
 			                       : fi->sub_id == kCodecH264                       ? RGFX_VIDEO_CODEC_H264
 			                       : fi->sub_id == kCodecHevc                       ? RGFX_VIDEO_CODEC_HEVC
@@ -1436,10 +1666,25 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			if (encode) {
 				// An encode of a coded size the host does not encode is refused here, where
 				// VideoToolbox hears of it at its session's create.
-				const RgfxVideoCodecCaps *caps = codec ? hostEncoder(codec) : nullptr;
-				if (caps && rgfx::video::sizeTaken(caps, fi->width, fi->height))
+				// An HEVC encode takes the host's encoder only where the plug-in can drive it
+				// (hevcEncoder).
+				const RgfxVideoCodecCaps *caps = codec == RGFX_VIDEO_CODEC_HEVC ? hevcEncoder()
+				                                 : codec                       ? hostEncoder(codec)
+				                                                               : nullptr;
+				const bool sized = caps && rgfx::video::sizeTaken(caps, fi->width, fi->height);
+				if (sized)
 					context->session = rgfx::video::openSession(codec, RGFX_VIDEO_ENCODE);
 				if (!context->session) {
+					static std::atomic<bool> said;
+					if (!said.exchange(true))
+						os_log_error(rgfxLog(),
+						             "RGFX: video: an %{public}s encode of %ux%u refused at its "
+						             "create: %{public}s",
+						             codec == RGFX_VIDEO_CODEC_HEVC ? "HEVC" : "H.264", fi->width,
+						             fi->height,
+						             !caps    ? "the host has no encoder the driver drives"
+						             : !sized ? "the host encodes no picture of its size"
+						                      : "no session opened");
 					for (uint32_t j = 0; j < i; j++) {
 						deleteContext((Context *)ci->info->contexts[j]);
 						ci->info->contexts[j] = nullptr;
@@ -1662,6 +1907,9 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 				// (publishEncoded).
 				const bool failed = encode && context && context->encode_failed.exchange(false);
 				hostFailed = hostFailed || failed;
+				// The host holds no frame of this context's to code again in place.
+				if (failed)
+					context->hevc_last = {};
 				void *work = !decode || failed ? nullptr
 				             : encode          ? encodeFrame(decode)
 				                               : decodePicture(decode);

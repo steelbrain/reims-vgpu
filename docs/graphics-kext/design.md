@@ -1566,10 +1566,10 @@ Stages:
       VideoToolbox ranks the encoder by, as an AMD Mac's (`VTRating` 350,
       `VTQualityRating` 50 on a Radeon Pro 5300M's, macOS 26.7.1): AppleGVA's
       `h264.gva` is listed as hardware, and a session requiring hardware is
-      made and encodes on the host's encoder. It lists no HEVC encode, on a
-      host that encodes HEVC too, so VideoToolbox lists no `hevc.gva` and a
-      session requiring hardware fails −12908, as on a Mac without an HEVC
-      encoder (**measured**, macOS 26.7.2 guest, Iris Xe host, 2026-11-16).
+      made and encodes on the host's encoder. It encodes HEVC Main and Main
+      10 where the caps list an HEVC encoder of both with a constant QP,
+      through the HEVC encoder plug-in's Intel route ("HEVC encode takes the
+      plug-in's Intel route", below).
     - **Routing:** AppleGVA hands a session to the AMD driver only on the
       Macs without an Intel GPU, or where `com.apple.AppleGVA`'s
       `gvaForceAMDKE` is set; elsewhere, an iMac20,1 among them, it looks for
@@ -1669,6 +1669,166 @@ Stages:
       frame toward the session's average bitrate (**measured**, macOS 26.7.2
       guest, Iris Xe host, 2026-11-16). AppleGVA schedules a frame
       only once it has the last one's status, so one frame is in flight.
+    - **HEVC encode takes the plug-in's Intel route.** AppleGVA's HEVC
+      encoder plug-in (`hevc.gva`) drives no AMD driver. On an x86-64 Mac it
+      finds its GPU encoder by name: the last service named
+      `IntelAccelerator` whose `IOGVACodec` names an Intel generation, with
+      `IOGVAHEVCEncode` and `IOVARendererID` on it; VideoToolbox lists that
+      encoder with the capabilities its `IOGVAHEVCEncodeCapabilities`
+      carries. With no such service, a session requiring hardware failed
+      −12903, one naming our GPU too (**measured**, macOS 26.7.2 guest, RX
+      7900 XTX host, m3-max-77226). So where the caps list an HEVC encoder
+      of Main from NV12 and Main 10 from P010 with a constant QP among its
+      rate controls, which codes a frame in place of the last
+      (`RGFX_VIDEO_ENCODE_CAP_IN_PLACE`, below; `rgfxHevcEncode`), the
+      accelerator, once registered,
+      attaches a plain `IOService` named `IntelAccelerator` as its child
+      (`publishHevcEncoder`, `guest/kext/src/RgfxAccelerator.cpp`):
+      `IOGVACodec` "Gen9", `IOGVAHEVCEncode` "2", our `IOVARendererID`, and
+      Main and Main 10, up to the encoder's level, rated as the H.264
+      encoder. It carries no `IODVDBundleName`, which AppleGVA's own loader
+      looks for, and no Metal device or framebuffer hangs off it.
+      - **Both profiles, or no nub.** The plug-in names two profiles, Main
+        and Main 10, and reads four source formats, `420v`, `420f`, `x420`
+        and `xf20` (macOS 26.7.1's plug-in). VideoToolbox
+        hands it a session of a profile the nub does not list: a Main 10
+        session on a nub of Main alone was made on `hevc.gva`, and its first
+        frame came to the driver with a 10-bit source (Iris Xe and Radeon
+        780M hosts, m3-max-77365 and m3-max-77368). The driver's create sees
+        only the session's size, so it cannot refuse such a session, and the
+        nub stands only where the host encodes both profiles. A host of Main
+        alone gets none, and VideoToolbox encodes HEVC in software, as
+        before.
+      - **The driver path is a link to the bundle.** The plug-in loads the
+        driver the generation names, `AppleIntelSKLGraphicsVADriver.bundle`,
+        from `/Library/GPUBundles` before `/System/Library/Extensions`, and
+        macOS ships none in `/Library/GPUBundles`. RgfxGate's install pass
+        keeps the driver's executable path there a hard link to the
+        bundle's executable at every boot, made again whenever the
+        executable is a new file, as each install writes it
+        (`guest/rgfxgate/src/rgfx_alias.h`, tested on real files by
+        `tests/alias_test.cpp`; x86-64 only). One inode, so the link
+        carries the executable's signature and rootless tag, and dyld maps
+        one image whichever path a process loads it by.
+      - **The commands.** The plug-in calls the bundle's entry points as its
+        Intel driver: one encode command a frame (function 0x20, sub-ID
+        0x1000) whose parameters name the source IOSurface (`+0x10`), the
+        NAL unit type the plug-in chose for the picture (`+0x33c`) and the
+        slice QP its rate control chose (`+0x3d8`), beside its own VPS,
+        SPS, PPS and slice headers, which are for a driver that codes under
+        them. The driver sends `RGFX_OP_VIDEO_ENCODE_H265` at that QP as a
+        constant QP, an IRAP type (BLA, IDR, CRA) forcing a keyframe, Main
+        from a `420v` or `420f` source and Main 10 of P010 from an `x420` or
+        `xf20` one; the host codes under its own parameter sets. Once the command is done,
+        the driver writes the access unit at the start of the plug-in's
+        bitstream buffer (pool 0), each VCL NAL unit, VPS, SPS and PPS after
+        a 4-byte start code and the other NAL units left out, and its length
+        as the words at `+0x3a0` (0) and `+0x3a8`; the plug-in makes the
+        session's format description from that VPS, SPS and PPS, and each
+        sample from the slice segments. A failed frame publishes a length of
+        0 and fails the context's next schedule, as H.264's does.
+      - **A frame coded again is coded in place.** Where a frame's access
+        unit comes out over the session's data rate limit
+        (`kVTCompressionPropertyKey_DataRateLimits`), the plug-in codes the
+        same frame again at a QP 3 higher, twice at most, and drops the
+        first; nothing of the limit reaches the driver. Sent as a new frame,
+        the retry was coded on the host after the dropped one and predicted
+        from it: at a limit of 1 Mbit a second at 1080p, each session's 5
+        retries, all of P pictures, left gaps in the stream's order counts,
+        and VideoToolbox decoded 134 and 149 of 300 frames back, failing the
+        rest −17694 (**measured**, Main and Main 10, RX 7900 XTX host,
+        m3-max-77530; H.264's encoder made no retry there, and its 300
+        frames decoded). The command carries no frame counter, so the driver
+        takes a command of a P picture whose order count (the whole
+        PicOrderCntVal, `+0x4`, not the slice header's least significant
+        bits) and source surface are the last frame's as the retry
+        (`hevcCodesAgain`), and sends it with `RGFX_VIDEO_ENCODE_IN_PLACE`
+        and the last frame's index; the host codes it from the references
+        the last one was coded from, with its order count
+        ([video/devices.md](../video/devices.md), "An encode"). A keyframe
+        is never sent in place: the host codes each as an IDR picture, whose
+        order count, 0, a new keyframe from the last one's surface shares,
+        and a keyframe coded again is sent as a new IDR picture, which the
+        stream decodes as well, the host's rate control counting one
+        picture more. A frame after one the host failed is never coded in
+        place. The host's sessions for the plug-in have no
+        B pictures (the driver sends none), and a host refuses a frame in
+        place in a session of B pictures, failing it. The nub stands only
+        where the host codes in place: an NVENC host whose driver refuses
+        it gets none (`checked_in_place`). Sent in place, at the same limit
+        the plug-in coded 2 to 30 frames of a session again: no gap in the
+        order counts, all 300 frames decoded back, and the most bytes in a
+        second 1.7% to 3.0% over the limit (**measured**, Main and Main 10,
+        m3-max-77611 RX 7900 XTX, m3-max-77609 RTX 3090, m3-max-77627 Iris
+        Xe; [video/bugs.md](../video/bugs.md) B100).
+      - **What the driver does not take.** The plug-in writes a QP for each
+        32×32 CTU before each frame (pool 27, one 32-bit value a CTU, within
+        a few steps of the frame's QP); the host codes the frame's QP
+        alone. The frame statistics record the plug-in hands the driver
+        (`+0x3b8`) is not supplied: it stays as the plug-in zeroes it. Of
+        its values, the plug-in's rate control reads one, a measure of the
+        picture's complexity per 16×16 block, which neither VA-API nor NVENC
+        reports; with none, it chooses each QP from the bits the frames
+        before came to, and lands a session's average bit rate within 6% of
+        the one asked on two of the three GPUs below. The record's per-CTU
+        statistics steer only the QP map, which the host does not take.
+      - The route is macOS 26.7.1's plug-in's, booted on 26.7.2. On an Iris
+        Xe host (m3-max-77329), a session requiring hardware was made on
+        `hevc.gva`, and its 10 frames at 1080p were coded on iHD, with the
+        keyframes where the session asked for them.
+      - **What a session gets** (**measured**, macOS 26.7.2 guest, 1080p,
+        300 frames at 8 Mbit/s, each decoded back by VideoToolbox and
+        compared with its source; the host's own encoder, ffmpeg's NVENC at
+        P4 or its VA-API encoder as it comes, on the same frames at the
+        guest's bit rate):
+
+        | GPU | Main: bit rate, luma | Main 10: bit rate, luma | host's own luma, Main / Main 10 |
+        |---|---|---|---|
+        | RX 7900 XTX (m3-max-77475) | 105.1%, 45.02 dB | 104.8%, 45.17 dB | 45.19 / 45.63 dB |
+        | Iris Xe (m3-max-77476) | 103.5%, 48.04 dB | 98.1%, 48.86 dB | 47.92 / 49.35 dB |
+        | RTX 3090 (m3-max-77477) | 100.7%, 44.81 dB | 106.1%, 45.06 dB | 45.76 / 46.60 dB |
+
+        NVENC's own Main 10 encode of the same frames at 8 Mbit/s came to
+        104.6% (the 3090's 106.1% is [video/bugs.md](../video/bugs.md)
+        B97). Main 10 sessions whose frames came from the session's pool
+        taken once and kept, or from the app's own 8-bit buffers, decoded
+        back as the pool's did (30 frames, as ffmpeg decodes them: 45.09 dB
+        of luma on the XTX, 48.97 on the Iris Xe, 45.03 on the 3090). A
+        session of a size the host does not encode, 64×64 or 128×96, was
+        made on the guest's software encoder (`hevc.vcp`), as before. With
+        frames coded in place (m3-max-77615, m3-max-77613, m3-max-77614),
+        the same sessions' streams came out byte for byte the same on the
+        XTX and the 3090, and on the Iris Xe but for 205 bytes of one.
+      - **A keyframe every frame comes to 4 to 5 times the asked rate, as
+        on a real Intel Mac** (**measured**, `MaxKeyFrameInterval` 1, 1080p,
+        30 distinct frames from one reused source buffer at 8 Mbit/s). The
+        plug-in lowers its QP frame after frame, its slices' QPs falling
+        from 20 to 13, so each frame comes out larger than the one before:
+        411.5% of the asked on the Iris Xe (m3-max-77627), 427.8% on the RTX
+        3090 (m3-max-77609) and 496.8% on the RX 7900 XTX (m3-max-77611),
+        every frame decoding back. A real Intel Mac's `hevc.gva` (a 2019
+        MacBook Pro, macOS 26.7.1) came to 571.8% in the same test, with the
+        same QPs frame for frame (m3-max-77635). The host's own encoders,
+        given the same frames with a keyframe every frame, came to 99.6% to
+        122.3%.
+      - **VideoToolbox replaces a session's pixel buffer pool.** On
+        `hevc.gva`, the pool `VTCompressionSessionGetPixelBufferPool`
+        answered before the encoder started is replaced when it starts: at
+        the third frame of a Main 10 session, by another pool of `420v`, on
+        a real Intel Mac (macOS 26.7.1, m3-max-77481) as on ours
+        (m3-max-77475), and at the first frame of a Main session on ours.
+        An app that keeps the first pool without retaining it reads freed
+        memory from then on; one that takes the pool again for each frame,
+        or retains it, does not.
+      - **Speed** (**measured**, Iris Xe, m3-max-77497, the host's whole
+        machine): at 1080p, 94 to 118 frames a second, where the guest's
+        software encoder made 3.2 to 3.3; at 8192×4320, 10.3 and 10.8, where
+        software made 0.5 (B98). Per 8K frame, of 93 to 97 ms, the host's GPU
+        wrote the encoder's input in 12.4 to 12.7 ms and the app copied into
+        its buffers in 8.5 to 10.9 ms; the rest is the host's encode and the
+        guest's round trip. Those 30 8K frames at 60 Mbit/s came to 118% of
+        the rate asked and 44.87 dB of luma, where software's came to 91%
+        and 48.12 dB (B99).
     - **The HEVC output surface is named in the parameters, not on the
       command.** An H.264 decode arrives as a pipeline whose transfer command
       carries the output surface; an HEVC decode is a bare decode command with

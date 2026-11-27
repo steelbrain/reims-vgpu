@@ -103,14 +103,17 @@ void *decode(Session *session, const Decode &decode);
 /// One frame to encode on its session, of its codec: the two-plane surface `source`, NV12's
 /// ('420v', '420f'), its whole planes, the settings' size; the `settings` in force from it on,
 /// which the call sends the host where they differ from the last it sent the session (the
-/// first's always); its place in display order, `frameIndex`; and whether it must be a keyframe.
-/// The access unit takes at most `capacity` bytes.
+/// first's always); its place in display order, `frameIndex`; whether it must be a keyframe; and
+/// whether it is coded in place of the session's last frame, whose access unit the guest drops
+/// (`RGFX_VIDEO_ENCODE_IN_PLACE`, `frameIndex` the last one's). The access unit takes at most
+/// `capacity` bytes.
 struct Encode {
 	IOSurfaceRef source;
 	RgfxVideoEncodeSettings settings;
 	uint64_t frameIndex;
 	bool forceKeyframe;
 	uint64_t capacity;
+	bool inPlace;
 };
 
 /// Commits the encode on `session`'s queue: a token for its completion, null where it was not
