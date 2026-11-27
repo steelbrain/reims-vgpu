@@ -461,13 +461,11 @@ fn pool_host(config: &GraphicsConfig) -> Result<Option<(PoolConfig, PoolHost)>, 
 
 /// The range the device's pool takes of `room`, the addresses the host can give it, on a GPU
 /// whose memory heaps hold `heaps` bytes, every heap summed ([`PoolConfig::sized`]), logged once
-/// a device, with the room's size: with a warning where the GPU answers no heap, and so no pool,
-/// or where the room holds less than the heaps, and the range stops at the room's end.
+/// a device, with the room's size: with a warning where the room holds less than the heaps, and
+/// the range stops at the room's end. `None`, and no pool, where the GPU answers no heap, which
+/// the device's line of no pool says ([`no_pool`]).
 fn pool_range(room: PoolConfig, heaps: u64) -> Option<PoolConfig> {
-    let Some(range) = room.sized(heaps) else {
-        log::warn!("pool: the GPU answers no memory heap: the guest has no Shared pool");
-        return None;
-    };
+    let range = room.sized(heaps)?;
     if range.physical_length < heaps {
         log::warn!(
             "pool: the guest's {} MiB of addresses at {:#x} hold less than the GPU's {} MiB of \
@@ -486,6 +484,26 @@ fn pool_range(room: PoolConfig, heaps: u64) -> Option<PoolConfig> {
         heaps >> 20
     );
     Some(range)
+}
+
+/// Why the device offers the guest no Shared pool, of a device whose host gave it addresses for
+/// one (`given`, [`GraphicsConfig::pool`]), whose GPU's memory heaps took a range of them
+/// (`ranged`, [`pool_range`]) and which offers it (`offered`, `POOL`); `None` where it offers one.
+/// The device writes it once, at its start, at warn: without the pool it offers no `POOL`, and
+/// so no `SURFACE_CACHE_EVERY` ([`cache_every`]) and no `MANAGED_AT_COPY` ([`managed_at_copy`]).
+/// QEMU gives no addresses on a machine that is neither a PC machine (an x86 target whose PCI
+/// host answers `pci-hole64-end`) nor vmapple, on a vmapple machine whose room is 0, and on a PC
+/// machine where no whole GiB of addresses lies from the end of the PCI host's 64-bit window to
+/// the top quarter of the guest's physical addresses (under KVM and WHPX, to the host's at most)
+/// (`reims_graphics_pool_room` and `reims_graphics_pool_room_machine` in
+/// `hw/display/reims-graphics-pci.c`); a Windows host offers the pool to an x86-64 guest alone.
+fn no_pool(given: bool, ranged: bool, offered: bool) -> Option<&'static str> {
+    match (given, ranged, offered) {
+        (_, _, true) => None,
+        (false, _, false) => Some("the host gave the device no guest addresses for one"),
+        (true, false, false) => Some("the GPU answers no memory heap"),
+        (true, true, false) => Some("a Windows host offers one to an x86-64 guest alone"),
+    }
 }
 
 /// The reims-graphics device.
@@ -596,6 +614,17 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let pool_ledger = (shared_pool.as_ref())
                 .filter(|_| !cfg!(windows) || config.guest_arch == GuestArch::X86_64)
                 .map(Pool::ledger);
+            // The one line of a device with no pool, whatever kept it from one.
+            if let Some(why) = no_pool(
+                config.pool.is_some(),
+                shared_pool.is_some(),
+                pool_ledger.is_some(),
+            ) {
+                log::warn!(
+                    "pool: the guest has no Shared pool: {why}; the device offers no POOL, \
+                     SURFACE_CACHE_EVERY or MANAGED_AT_COPY"
+                );
+            }
             // `Managed` resources are one copy where the platform answers that the GPU shares the
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
             // answers `hasUnifiedMemory` alike, from the blob.

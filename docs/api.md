@@ -251,8 +251,10 @@ runtime takes Shared blocks until the driver refuses one. The bound is the heaps
 `VK_EXT_memory_budget`'s budgets: the range is address space the guest keeps for the VM's life, a
 budget moves with what other processes hold, and RAM is bounded at each block's take. Where the
 heaps hold more than the addresses given, the range stops at their end and the device logs a warning
-once; where the GPU answers no heap, the guest has no pool, and the device logs that too. The device
-logs the range it took, the addresses it was given and the heaps' total once, at its creation.
+once; where the GPU answers no heap, the guest has no pool. The device logs the range it took, the
+addresses it was given and the heaps' total once, at its creation; a device with no pool, whether
+it was given no addresses, its GPU answers no heap or a Windows host has an arm64 guest, logs one
+warning there instead, which says why (`pool: the guest has no Shared pool: ...`).
 `rvg_graphics_device_pool_range` answers the range it took, 0 and 0 for none, and the host reserves
 that before the guest's firmware runs. The host then maps
 the device's blocks there as the pool grows

@@ -252,7 +252,10 @@ is its transport:
   device offers the library the room the machine answers instead
   (`x-pool-room-base`, `x-pool-room-size`): from the end of RAM rounded up
   to 1 GiB to the end of the guest's physical addresses, in whole GiB
-  ("arm64 guests"), and reserves nothing. The
+  ("arm64 guests"), and reserves nothing. A device left with no pool (no
+  room, a GPU with no memory heap, or a Windows host's arm64 guest) writes
+  one warning at its start that says why (`pool: the guest has no Shared
+  pool: ...`). The
   library maps its blocks of host memory into the range as the guest's pool
   grows (`pool_add`, docs/api.md) and takes them out as it shrinks
   (`pool_remove`). Each block is a RAM region of its own, unmergeable, owned

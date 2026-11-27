@@ -13621,6 +13621,66 @@ fn the_pool_s_range_is_the_gpu_s_memory_heaps_at_most_the_addresses_given() {
     assert_eq!(headless(&raised).pool_range(), None);
 }
 
+/// A device with no Shared pool writes one warning at its start that says why, whatever kept it
+/// from one; a device with a pool writes none
+#[test]
+fn a_device_with_no_pool_warns_once_at_its_start_with_why() {
+    let no_pool_lines = |lines: Vec<reims_vgpu_vulkan::core::testkit::logs::Line>| {
+        (lines.into_iter())
+            .filter(|(level, _, line)| {
+                *level == log::Level::Warn && line.starts_with("pool: the guest has no Shared pool")
+            })
+            .map(|(_, target, line)| (target, line))
+            .collect::<Vec<_>>()
+    };
+    let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+    let raised = Arc::new(AtomicU32::new(0));
+    let device = headless(&raised);
+    assert_eq!(device.pool_range(), None);
+    assert_eq!(
+        no_pool_lines(logs.take()),
+        [(
+            "reims_vgpu::graphics".to_owned(),
+            "pool: the guest has no Shared pool: the host gave the device no guest addresses for \
+             one; the device offers no POOL, SURFACE_CACHE_EVERY or MANAGED_AT_COPY"
+                .to_owned()
+        )]
+    );
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            pool_add: Some(Arc::new(|_, _, _| {})),
+            pool_remove: Some(Arc::new(|_, _| {})),
+            ..GraphicsCallbacks::default()
+        },
+        pool: Some(PoolConfig {
+            physical_address: 52 << 30,
+            physical_length: 16 << 30,
+        }),
+        ..GraphicsConfig::default()
+    };
+    let pooled = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    assert!(pooled.pool_range().is_some());
+    assert_eq!(no_pool_lines(logs.take()), []);
+}
+
+/// The no-pool line names each reason a device offers no pool for, and none where it offers one
+#[test]
+fn the_no_pool_line_names_why_the_device_offers_no_pool() {
+    assert_eq!(no_pool(true, true, true), None);
+    assert_eq!(
+        no_pool(false, false, false),
+        Some("the host gave the device no guest addresses for one")
+    );
+    assert_eq!(
+        no_pool(true, false, false),
+        Some("the GPU answers no memory heap")
+    );
+    assert_eq!(
+        no_pool(true, true, false),
+        Some("a Windows host offers one to an x86-64 guest alone")
+    );
+}
+
 /// A `POOL_TAKE` by context `context` of `length` bytes, as the kext posts it.
 fn pool_take(context: u32, length: u64) -> Vec<u8> {
     RgfxPoolTake {
