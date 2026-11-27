@@ -51,6 +51,17 @@ impl SliceType {
     pub fn is_inter(self) -> bool {
         matches!(self, Self::P | Self::Sp | Self::B)
     }
+
+    /// Its name in the standard: `P`, `B`, `I`, `SP` or `SI`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::P => "P",
+            Self::B => "B",
+            Self::I => "I",
+            Self::Sp => "SP",
+            Self::Si => "SI",
+        }
+    }
 }
 
 /// One `modification_of_pic_nums_idc` operation (7.4.3.1).

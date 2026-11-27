@@ -37,6 +37,15 @@ impl SliceType {
     pub fn is_inter(self) -> bool {
         self != Self::I
     }
+
+    /// Its name in the standard: `B`, `P` or `I`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::B => "B",
+            Self::P => "P",
+            Self::I => "I",
+        }
+    }
 }
 
 /// A long-term picture of the slice's reference picture set: an entry of

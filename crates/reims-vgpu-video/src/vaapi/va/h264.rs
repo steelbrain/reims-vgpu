@@ -10,11 +10,11 @@ use super::frame::Frame;
 use super::surface::{Rect, Surface, SurfaceFormat, SurfacePool, end_context};
 use super::target::TargetFor;
 use super::wait::{self, Deadline};
-use crate::codec::PictureRole;
 use crate::codec::h264::{
     self, Accelerator, Decoder, NalFormat, Output, OutputOrder, PictureParams, ReferenceFrame,
     SliceParams, slice::SliceType, sps::Sps,
 };
+use crate::codec::{PictureRole, PictureStart};
 
 /// The most macroblocks of an H.264 picture the decoder takes: iHD and
 /// radeonsi answer 4096x4096 as their largest H.264 decode, yet decode
@@ -94,6 +94,12 @@ impl H264Decoder {
             .into_iter()
             .map(|output| frame_from_output(output, &deadline))
             .collect())
+    }
+
+    /// The picture the last access unit started, whether it decoded or not
+    /// (see [`crate::codec::h264::Decoder::last_picture`]).
+    pub fn last_picture(&self) -> Option<PictureStart> {
+        self.inner.last_picture()
     }
 
     /// Emits the frames still waiting for display order. References are

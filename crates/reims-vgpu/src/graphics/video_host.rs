@@ -83,11 +83,14 @@
 //!   for the last value: the thread lands every picture it was given first. A picture keeps
 //!   alive what it lands from, so a decoder may go before its last pictures land.
 //!
-//! The session logs the first picture of each way it lands at `info` ("hardware video: ..."),
-//! and its counts at its end: its pictures by the way each landed, the decodes that answered none
-//! and how many of them were pictures of the stream that do not decode, the outputs they landed in
-//! ([`Outputs`]: how many surfaces' memory, and the most of it live at once), and the time the
-//! CPU's copies of them took.
+//! The session logs at `info` ("hardware video: ...") its start, with its codec; its first
+//! decode, with its output's size, the picture its access unit started
+//! ([`HostDecoder::last_picture`]: the first slice's type, `frame_num` and order count) and
+//! whether it decoded; the first picture of each way it lands; and its counts at its end: its
+//! pictures by the way each landed, the decodes that answered none and how many of them were
+//! pictures of the stream that do not decode, the outputs they landed in ([`Outputs`]: how many
+//! surfaces' memory, and the most of it live at once), and the time the CPU's copies of them
+//! took.
 
 #![allow(dead_code, reason = "each of the host's video arms uses a part of it")]
 
@@ -95,6 +98,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use reims_vgpu_graphics::wire::{RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC};
+use reims_vgpu_video::codec::PictureStart;
 use reims_vgpu_video::core::device_memory::MemoryIdentity;
 #[cfg(unix)]
 use reims_vgpu_video::core::device_wait::{KeptMark, Lingering, poll_until};
@@ -189,6 +194,13 @@ pub(crate) trait HostDecoder<P: Platform>: Send + 'static {
     /// that would hold one more waits, once its picture is decoded, for the oldest to land. One
     /// at the least.
     fn most_unlanded(&self) -> usize;
+
+    /// The picture the access unit last handed to [`Self::decode`] started, whether it decoded
+    /// or not, which the session logs of its first decode; `None` where it started none (no
+    /// slice, or a first slice header that did not parse), or the decoder reads no headers.
+    fn last_picture(&self) -> Option<PictureStart> {
+        None
+    }
 }
 
 /// A decoded picture, which the session's landing thread lands in its decode's output.
@@ -1155,6 +1167,15 @@ impl Way {
     }
 }
 
+/// `codec`, an `RGFX_VIDEO_CODEC_*`, as the log lines name it.
+fn codec_says(codec: u32) -> String {
+    match codec {
+        RGFX_VIDEO_CODEC_H264 => "H.264".to_owned(),
+        RGFX_VIDEO_CODEC_HEVC => "HEVC".to_owned(),
+        other => format!("codec {other}"),
+    }
+}
+
 /// A session's counts of its pictures, logged at its end.
 #[derive(Debug, Default)]
 struct Counts {
@@ -1231,6 +1252,8 @@ struct State<P: Platform> {
     value: u64,
     /// The outputs its decodes landed in, logged at its end.
     outputs: Outputs,
+    /// Whether its first decode was logged.
+    first_said: bool,
 }
 
 impl<P: Platform> HostVideoSession<P> {
@@ -1269,6 +1292,10 @@ impl<P: Platform> HostVideoSession<P> {
                 return None;
             }
         };
+        log::info!(
+            "hardware video: {name}: a session started, of {}",
+            codec_says(codec)
+        );
         Some(Self {
             codec,
             name,
@@ -1277,6 +1304,7 @@ impl<P: Platform> HostVideoSession<P> {
                 jobs: Some(jobs),
                 value: 0,
                 outputs: Outputs::default(),
+                first_said: false,
             }),
             event,
             counts,
@@ -1324,7 +1352,28 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
             (state.decoder.parameter_sets(decode.parameter_sets))
                 .map_err(|error| decode_fault(format_args!("its parameter sets: {error}")))?;
         }
-        let picture = match state.decoder.decode(au, &output) {
+        let answer = state.decoder.decode(au, &output);
+        if !state.first_said {
+            state.first_said = true;
+            let decoded = match &answer {
+                Ok(Some(_)) => "decoded",
+                Ok(None) => "no picture to land",
+                Err(error) if error.is::<NotDecoded>() => {
+                    "a picture of the stream that does not decode"
+                }
+                Err(_) => "an error, which faults its command buffer",
+            };
+            let picture = (state.decoder.last_picture())
+                .map_or_else(|| "no picture started".to_owned(), |p| p.to_string());
+            log::info!(
+                "hardware video: {}: a session's first decode, into a {}x{} output: {picture}; \
+                 {decoded}",
+                self.name,
+                output.luma.width,
+                output.luma.height
+            );
+        }
+        let picture = match answer {
             Ok(picture) => picture,
             Err(error) => match error.downcast::<NotDecoded>() {
                 Ok(not) => {

@@ -87,6 +87,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
     RgfxVideoEncodeCaps,
 };
+use reims_vgpu_video::codec::PictureStart;
 use reims_vgpu_video::core::backend::BackendError as VideoError;
 use reims_vgpu_video::core::device_memory::{
     DeviceImports, GuestTarget, MemoryIdentity, TargetPlane,
@@ -644,6 +645,10 @@ impl<P: Platform> HostDecoder<P> for NvdecDecoder<P> {
 
     fn most_unlanded(&self) -> usize {
         AnnexBDecoder::SPARE_PICTURES
+    }
+
+    fn last_picture(&self) -> Option<PictureStart> {
+        self.decoder.last_picture()
     }
 }
 

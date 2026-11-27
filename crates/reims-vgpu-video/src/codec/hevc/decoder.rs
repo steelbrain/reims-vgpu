@@ -18,9 +18,9 @@ use super::scaling::ScalingLists;
 use super::slice::{SliceHeader, SliceType};
 use super::sps::Sps;
 use super::{Error, NalFormat, OutputOrder};
-use crate::codec::PictureRole;
 use crate::codec::h264::ParameterSets;
 use crate::codec::h264::nal::sample_units;
+use crate::codec::{PictureRole, PictureStart};
 
 pub use super::dpb::RpsMembership;
 
@@ -167,6 +167,8 @@ pub struct Decoder<A: Accelerator> {
     /// Whether the sample being decoded held a RASL picture that was
     /// skipped.
     skipped_leading: bool,
+    /// The picture the last sample started ([`Self::last_picture`]).
+    started: Option<PictureStart>,
 }
 
 impl<A: Accelerator> Decoder<A> {
@@ -188,6 +190,7 @@ impl<A: Accelerator> Decoder<A> {
             next_key: 0,
             damaged: false,
             skipped_leading: false,
+            started: None,
         }
     }
 
@@ -230,6 +233,7 @@ impl<A: Accelerator> Decoder<A> {
     /// [`Error::SkippedLeadingPicture`], which is no failure.
     pub fn decode(&mut self, sample: &[u8], id: u64) -> Result<Vec<Output<A::Picture>>, A::Error> {
         self.skipped_leading = false;
+        self.started = None;
         match self.decode_sample(sample, id) {
             Err(error) => {
                 self.damaged = true;
@@ -323,6 +327,15 @@ impl<A: Accelerator> Decoder<A> {
         self.damaged = true;
     }
 
+    /// The picture the last sample decoded started, whether it decoded or
+    /// not: its first slice segment's type, whether it is an IDR picture,
+    /// and its `PicOrderCntVal` where its decode derived one. `None` where
+    /// the sample started no picture: one with no slice segment, or whose
+    /// first slice segment header did not parse.
+    pub fn last_picture(&self) -> Option<PictureStart> {
+        self.started
+    }
+
     /// Emits every picture still waiting for output, in display order.
     /// References are kept, so decoding can go on. In decode order nothing
     /// waits, and nothing comes out.
@@ -411,6 +424,12 @@ impl<A: Accelerator> Decoder<A> {
             return Err(Error::NoFirstSliceSegment.into());
         }
         let unit_type = first.nal_unit_type;
+        self.started = Some(PictureStart {
+            slice_type: first.slice_type.name(),
+            idr: is_idr(unit_type),
+            frame_num: None,
+            poc: None,
+        });
         let irap = is_irap(unit_type);
         if self.damaged && !irap {
             // Apple's HEVC decoder gives no picture after one that failed
@@ -454,6 +473,9 @@ impl<A: Accelerator> Decoder<A> {
             first.slice_pic_order_cnt_lsb,
             sps.max_pic_order_cnt_lsb(),
         )?;
+        if let Some(started) = &mut self.started {
+            started.poc = Some(poc);
+        }
 
         // 8.3.2: the reference picture set, found before anything changes.
         let found = if starts_sequence || is_idr(unit_type) {

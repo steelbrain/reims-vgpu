@@ -108,6 +108,7 @@ use reims_vgpu_graphics::wire::{
 };
 #[cfg(unix)]
 use reims_vgpu_video::codec::PictureRole;
+use reims_vgpu_video::codec::PictureStart;
 use reims_vgpu_video::core::backend::{BackendError as VideoError, DeviceWrite, PixelFormat};
 #[cfg(unix)]
 use reims_vgpu_video::core::device_memory::{
@@ -1325,6 +1326,13 @@ impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
         match self.codec {
             Codec::H264(_) => H264Decoder::SPARE_FRAMES,
             Codec::Hevc(_) => HevcDecoder::SPARE_FRAMES,
+        }
+    }
+
+    fn last_picture(&self) -> Option<PictureStart> {
+        match &self.codec {
+            Codec::H264(decoder) => decoder.last_picture(),
+            Codec::Hevc(decoder) => decoder.last_picture(),
         }
     }
 }

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::codec::PictureRole;
+use crate::codec::{PictureRole, PictureStart};
 
 /// Writes syntax elements, then an escaped NAL unit.
 #[derive(Default)]
@@ -661,6 +661,43 @@ fn a_p_picture_with_nothing_to_predict_from_is_refused() {
         Some(Error::MissingReference)
     );
     assert!(d.accelerator().submitted.is_empty());
+}
+
+#[test]
+fn last_picture_says_what_a_sample_started_decoded_or_not() -> Result<(), Error> {
+    let spec = SpsSpec::default();
+    let mut d = decoder(OutputOrder::Decode);
+    assert_eq!(d.last_picture(), None);
+    // A stream started at a P picture is refused, its numbers read.
+    let units = [sps(&spec), pps(false), slice(&p(5, 10), &spec)];
+    assert_eq!(
+        d.decode(&sample(&units), 0).err(),
+        Some(Error::MissingReference)
+    );
+    let refused = PictureStart {
+        slice_type: "P",
+        idr: false,
+        frame_num: Some(5),
+        poc: Some(10),
+    };
+    assert_eq!(d.last_picture(), Some(refused));
+    assert_eq!(refused.to_string(), "slice type P, frame_num 5, POC 10");
+    d.decode(&sample(&[slice(&idr(), &spec)]), 1)?;
+    let decoded = PictureStart {
+        slice_type: "I",
+        idr: true,
+        frame_num: Some(0),
+        poc: Some(0),
+    };
+    assert_eq!(d.last_picture(), Some(decoded));
+    assert_eq!(
+        decoded.to_string(),
+        "slice type I (IDR), frame_num 0, POC 0"
+    );
+    // Parameter sets alone start no picture.
+    d.decode(&sample(&[sps(&spec), pps(false)]), 2)?;
+    assert_eq!(d.last_picture(), None);
+    Ok(())
 }
 
 #[test]

@@ -10,7 +10,7 @@ use super::bits::BitReader;
 use super::nal::nal_type;
 use super::slice::SliceHeader;
 use super::*;
-use crate::codec::PictureRole;
+use crate::codec::{PictureRole, PictureStart};
 
 /// Writes syntax elements, then raw bytes or an escaped NAL unit.
 #[derive(Default)]
@@ -1053,6 +1053,44 @@ fn after_a_sample_that_fails_pictures_are_refused_until_an_irap_picture_decodes(
     d.reset();
     assert_eq!(d.decode(&p(4), 12).err(), Some(Error::MissingReference));
     assert_eq!(d.decode(&p(8), 13).err(), Some(Error::Unrecovered));
+    Ok(())
+}
+
+#[test]
+fn last_picture_says_what_a_sample_started_decoded_or_not() -> Result<(), Error> {
+    let spec = SpsSpec {
+        sets: gop_sets(),
+        ..SpsSpec::default()
+    };
+    let mut units = vec![sps(&spec), pps(&PpsSpec::default())];
+    units.push(picture(&spec, nal_type::IDR_W_RADL, 2, 0, 0));
+    let idr = sample(&units);
+    let p = |lsb| sample(&[picture(&spec, nal_type::TRAIL_R, 1, lsb, 0)]);
+    let started = |slice_type, idr, poc| {
+        Some(PictureStart {
+            slice_type,
+            idr,
+            frame_num: None,
+            poc,
+        })
+    };
+    let mut d = decoder();
+    assert_eq!(d.last_picture(), None);
+    d.decode(&idr, 0)?;
+    assert_eq!(d.last_picture(), started("I", true, Some(0)));
+    d.decode(&p(4), 1)?;
+    assert_eq!(d.last_picture(), started("P", false, Some(4)));
+    // A sample that does not parse starts no picture; the picture after it
+    // is refused before its order count is derived.
+    assert!(d.decode(&forbidden(), 2).is_err());
+    assert_eq!(d.last_picture(), None);
+    assert_eq!(d.decode(&p(8), 3).err(), Some(Error::Unrecovered));
+    let refused = d.last_picture();
+    assert_eq!(refused, started("P", false, None));
+    assert_eq!(
+        refused.map(|r| r.to_string()).as_deref(),
+        Some("slice type P, POC not derived")
+    );
     Ok(())
 }
 

@@ -70,6 +70,38 @@ pub enum PictureRole {
     NonReference,
 }
 
+/// The picture a decoder's last sample started, as its first slice says, and the order count
+/// its decode derived: what a host's video session logs of its first decode
+/// (`h264::Decoder::last_picture`, `hevc::Decoder::last_picture`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PictureStart {
+    /// Its first slice's `slice_type`: `I`, `P` or `B`, and H.264's `SP` and `SI`.
+    pub slice_type: &'static str,
+    /// Whether it is an IDR picture.
+    pub idr: bool,
+    /// Its `frame_num`: H.264's alone.
+    pub frame_num: Option<u32>,
+    /// Its order count: H.264's `PicOrderCnt()` of the frame, HEVC's `PicOrderCntVal`; `None`
+    /// where its decode stopped before deriving it.
+    pub poc: Option<i32>,
+}
+
+impl std::fmt::Display for PictureStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "slice type {}", self.slice_type)?;
+        if self.idr {
+            f.write_str(" (IDR)")?;
+        }
+        if let Some(frame_num) = self.frame_num {
+            write!(f, ", frame_num {frame_num}")?;
+        }
+        match self.poc {
+            Some(poc) => write!(f, ", POC {poc}"),
+            None => f.write_str(", POC not derived"),
+        }
+    }
+}
+
 /// The fuzzers' harness: each codec's tests have a `fuzz` module of their
 /// own.
 #[cfg(test)]

@@ -38,6 +38,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::codec::PictureStart;
 use crate::codec::h264::{Decoder as H264Decoder, nal::NalFormat};
 use crate::codec::hevc::Decoder as HevcDecoder;
 use crate::core::device_memory::DeviceMemory;
@@ -177,6 +178,16 @@ impl AnnexBDecoder {
         match self.decode_sample(au, true) {
             Err(Error::SkippedLeadingPicture(_)) => Ok(None),
             decoded => decoded,
+        }
+    }
+
+    /// The picture the last access unit started, whether it decoded or not
+    /// (see [`crate::codec::h264::Decoder::last_picture`] and
+    /// [`crate::codec::hevc::Decoder::last_picture`]).
+    pub fn last_picture(&self) -> Option<PictureStart> {
+        match &self.codec {
+            Codec::H264(decoder) => decoder.last_picture(),
+            Codec::Hevc(decoder) => decoder.last_picture(),
         }
     }
 

@@ -15,7 +15,6 @@ use super::frame::Frame;
 use super::surface::{Rect, Surface, SurfaceFormat, SurfacePool, end_context};
 use super::target::TargetFor;
 use super::wait::{self, Deadline};
-use crate::codec::PictureRole;
 use crate::codec::hevc::{
     self, Accelerator, Decoder, NalFormat, Output, OutputOrder, PictureParams, RpsMembership,
     SliceParams,
@@ -25,6 +24,7 @@ use crate::codec::hevc::{
     slice::SliceType,
     sps::Sps,
 };
+use crate::codec::{PictureRole, PictureStart};
 
 /// An entry of `RefPicList[][]` that names no picture (va_dec_hevc.h).
 const NO_REFERENCE: u8 = 0xff;
@@ -124,6 +124,12 @@ impl HevcDecoder {
             .into_iter()
             .map(|output| frame_from_output(output, &deadline))
             .collect())
+    }
+
+    /// The picture the last access unit started, whether it decoded or not
+    /// (see [`crate::codec::hevc::Decoder::last_picture`]).
+    pub fn last_picture(&self) -> Option<PictureStart> {
+        self.inner.last_picture()
     }
 
     /// Emits the frames still waiting for display order. References are

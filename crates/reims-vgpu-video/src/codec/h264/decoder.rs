@@ -15,7 +15,7 @@ use super::pps::Pps;
 use super::scaling::ScalingLists;
 use super::slice::{SliceHeader, SliceType};
 use super::sps::Sps;
-use crate::codec::PictureRole;
+use crate::codec::{PictureRole, PictureStart};
 
 /// The order frames come out in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +166,8 @@ pub struct Decoder<A: Accelerator> {
     /// `PrevRefFrameNum` (7.4.3), and whether a reference has been
     /// decoded since the start or a reset.
     prev_ref_frame_num: Option<u32>,
+    /// The picture the last sample started ([`Self::last_picture`]).
+    started: Option<PictureStart>,
 }
 
 impl<A: Accelerator> Decoder<A> {
@@ -183,6 +185,7 @@ impl<A: Accelerator> Decoder<A> {
             poc: PocState::default(),
             dpb: Dpb::new(),
             prev_ref_frame_num: None,
+            started: None,
         }
     }
 
@@ -231,7 +234,17 @@ impl<A: Accelerator> Decoder<A> {
     /// the parameter sets in it before the error are kept. The pictures
     /// after it decode and come out as any (the type's doc).
     pub fn decode(&mut self, sample: &[u8], id: u64) -> Result<Vec<Output<A::Picture>>, A::Error> {
+        self.started = None;
         self.decode_sample(sample, id)
+    }
+
+    /// The picture the last sample decoded started, whether it decoded or
+    /// not: its first slice's type, whether it is an IDR picture, its
+    /// `frame_num`, and its order count where its decode derived one.
+    /// `None` where the sample started no picture: one with no slice, or
+    /// whose first slice header did not parse.
+    pub fn last_picture(&self) -> Option<PictureStart> {
+        self.started
     }
 
     fn decode_sample(
@@ -389,6 +402,12 @@ impl<A: Accelerator> Decoder<A> {
         let Some((first, _)) = slices.first() else {
             return Ok(());
         };
+        self.started = Some(PictureStart {
+            slice_type: first.slice_type.name(),
+            idr: first.idr,
+            frame_num: Some(first.frame_num),
+            poc: None,
+        });
         let sps = first.sps.clone();
         let pps = first.pps.clone();
         // An active SPS has frame_mbs_only_flag 1 (check_supported), so no
@@ -412,6 +431,9 @@ impl<A: Accelerator> Decoder<A> {
             self.fill_frame_num_gap(&sps, prev, frame_num)?;
         }
         let order = self.poc.compute(&sps, first)?;
+        if let Some(started) = &mut self.started {
+            started.poc = Some(order.frame());
+        }
         self.dpb.update_frame_num_wrap(frame_num, max_frame_num)?;
 
         // Every slice's lists, before anything reaches the accelerator.
