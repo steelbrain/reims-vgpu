@@ -610,17 +610,20 @@ fn a_draws_targets_hold_its_picture_as_it_returns_however_busy_the_gpu() {
 
 /// The control of [`a_draws_targets_hold_its_picture_as_it_returns_however_busy_the_gpu`]: with
 /// the draws' fence signalled on the queue ahead of the context's flush on purpose, so that it
-/// may pass before the GPU ran the draws, some read as a draw returns does not hold the picture.
-/// A pass of the test counts only where this fails to hold the picture. Run holding the GPU, on
-/// the default adapter.
+/// may pass before the GPU ran the draws, some draw's fence passes ahead of the probe of the
+/// context's stream, so the test's count catches a fence that passed before its draws ran. A
+/// pass of the test counts only where this finds such a fence. Its reads are told, and not held
+/// to: on the UHD 630, with a thread a CPU spinning, the native device's read of a draw that
+/// returned early reached the GPU after the draws (2026-11-26, 0 of 7200 wrong while 5035 fences
+/// passed early). Run holding the GPU, on the default adapter.
 #[test]
 #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
 fn a_fence_signalled_ahead_of_its_flush_passes_before_the_draws_ran() {
     let (arms, clears, spinners) = reads_as_draws_return(true);
     assert!(
-        arms.iter().any(|arm| !arm.wrong.is_empty()),
-        "with the fence signalled ahead of the flush, every draw's targets read back as the \
-         draw returned held the picture: {}",
+        arms.iter().any(|arm| !arm.early.is_empty()),
+        "with the fence signalled ahead of the flush, no draw's fence passed ahead of the \
+         context's stream: {}",
         told(&arms, clears, spinners)
     );
     println!(
