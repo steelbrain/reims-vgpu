@@ -1291,8 +1291,10 @@ RGFX_LOG_UNRECOGNIZED
 		memory.context = connContext;
 		memory.take = addressed ? &rgfxKextPoolTakeAddressed : &rgfxKextPoolTake;
 		memory.give = &rgfxKextPoolGive;
-		_poolSource = std::make_unique<RgfxPoolSlabSource>(*_region, *_serializer, memory,
-		                                                   managedAtOffset, managedOverCopy);
+		// Its cache of slabs is sized by the guest's RAM, as the process's own pages' is.
+		_poolSource = std::make_unique<RgfxPoolSlabSource>(
+		    *_region, *_serializer, memory, [NSProcessInfo processInfo].physicalMemory,
+		    managedAtOffset, managedOverCopy);
 		_slabs = std::make_unique<RgfxSlabs>(*_poolSource);
 	} else if (_region->hasPagesBlocks() &&
 	           (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {

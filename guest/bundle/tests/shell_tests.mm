@@ -731,7 +731,7 @@ void test_upload_chunks_of_the_pool_alone()
 	RgfxRegion region(mem.data(), mem.size());
 	TestPoolKext kext;
 	kext.refuse = true;
-	RgfxPoolSlabSource pool(region, fx.ser, kext.calls(), false, true);
+	RgfxPoolSlabSource pool(region, fx.ser, kext.calls(), 1ull << 30, false, true);
 	RgfxSlabs slabs(pool);
 	CHECK(!slabs.inRegion());
 	auto nothingPosted = [&]() {
@@ -756,8 +756,8 @@ void test_upload_chunks_of_the_pool_alone()
 		CHECK(placed.heap_obj_id == heap.obj_id && placed.length == chunk.size);
 		CHECK(placed.obj_id == ((RgfxBuffer *)chunk.buffer).rgfxObjId && nothingPosted());
 		chunk = {};
-	} // the chunk's buffer goes, and its block with it
-	CHECK(kext.blocks.empty());
+	} // the chunk's buffer goes; its slab, kept once empty, goes with the slabs' reclaim
+	CHECK(kext.blocks.size() == 1 && slabs.reclaim() && kext.blocks.empty());
 
 	// Over the region's slabs: the region's.
 	RgfxRegionSlabSource source(region, fx.ser);
@@ -4058,7 +4058,7 @@ void test_shared_heaps_of_the_pool_on_an_apple_gpu()
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x20000, 0xee);
 	RgfxRegion region(mem.data(), mem.size());
 	TestPoolKext kext;
-	RgfxPoolSlabSource pool(region, ser, kext.calls(), false, true);
+	RgfxPoolSlabSource pool(region, ser, kext.calls(), 1ull << 30, false, true);
 	auto make = [&](uint64_t size, id device) {
 		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
 		d.size = size;

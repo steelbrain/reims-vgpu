@@ -63,14 +63,15 @@
  * it, the copy starts with zeros its GPU writes there rather than with the bytes copied over its
  * link, as a Mac's GPU copy of a buffer made with no bytes holds.
  *
- * LETTING GO. A class keeps up to two empty slabs, each for kCacheIdleMs at most; a third empty
- * one goes at once, and one left empty that long goes too, as does a cached slab past the cap or
- * idle, so a process at rest holds only the slabs its buffers lie in. A source may have none of
- * its slabs kept (keepsFreed): each goes as its last buffer does, as the Shared pool's slabs do.
- * A slab goes by its source (its heap's OBJECT_DESTROY, then its block's release, whose
- * BLOCK_RELEASE the kext waits for, or a pool block's give), on the background thread, so a
- * buffer's free never waits for the host; without the thread, at once. Every buffer in a slab had
- * its destroy posted before its range came back, so the heap's destroy follows theirs.
+ * LETTING GO. A class keeps up to two empty slabs, each for kCacheIdleMs at most; a third empty one
+ * goes at once, and one left empty that long goes too, as does a cached slab past the cap or idle,
+ * so a process at rest holds only the slabs its buffers lie in. Every source's slabs are kept so,
+ * the Shared pool's among them: a process that makes a buffer and frees it again and again in an
+ * otherwise empty class takes one slab, not one a buffer. A slab goes by its source (its heap's
+ * OBJECT_DESTROY, then its block's release, whose BLOCK_RELEASE the kext waits for, or a pool
+ * block's give), on the background thread, so a buffer's free never waits for the host; without the
+ * thread, at once. Every buffer in a slab had its destroy posted before its range came back, so the
+ * heap's destroy follows theirs.
  *
  * CHURN. The allocator counts what keeping slabs saved its sources (Churn): slabs made, slabs of
  * small buffers emptied, the empty ones a class kept that a buffer took from again, those let go,
@@ -178,11 +179,6 @@ public:
 	/// largest slab of a class it makes.
 	virtual uint64_t smallMax() const { return kSmallMax; }
 	virtual uint64_t slabMax() const { return kSlabMax; }
-
-	/// Whether the allocator keeps this source's slabs once no buffer lies in them, for a later
-	/// buffer: a class's empty ones (LETTING GO) and dedicated ones (the cache). Where it answers
-	/// false, each goes as its last buffer does.
-	virtual bool keepsFreed() const { return true; }
 
 	/// Whether this source's slabs are blocks of the device region, which every process
 	/// shares: the region's are; the Shared pool's and the process's own pages' are not.
@@ -397,12 +393,19 @@ struct RgfxPoolMemory {
 /// kext's chunks do. The device makes it the slabs' one source where Managed buffers lie over
 /// copies (THE SOURCES): a buffer it has no block for is nil.
 ///
-/// The allocator keeps none of these slabs once empty (keepsFreed): a slab goes with its last
-/// buffer, its heap's destroy and then its block's give, and a later buffer takes a new block.
-/// Measured on the Radeon 780M host (an x86-64 macOS guest's boot to its desktop, a window
-/// dragged 31 s, and a GPU benchmark's run, the slab churn lines): the empty slabs a class kept
-/// were taken from again 5 times before the desktop and never in the drag or the benchmark, and
-/// no large buffer took a cached slab, so the kept slabs would save no take there.
+/// The allocator keeps these slabs once empty as it keeps the region's (LETTING GO): two empty
+/// slabs a class and the cached slabs of large buffers, up to a sixteenth of `capacity` (the
+/// device's: the guest's RAM, as for the process's own pages, since the kext tells the bundle
+/// nothing of the pool's length), each for kCacheIdleMs at most; then its heap's destroy goes, and
+/// its block's give. A kept block is this process's alone meanwhile: a take that finds none lets go
+/// of this process's kept slabs (THE FALLBACKS), never another's. Without them, a process that
+/// makes a buffer and frees it again and again in an otherwise empty class takes a block of the
+/// pool, a heap over it and a give a buffer, and as each new slab doubles its class's next one, a
+/// block of kSlabMax for each buffer of a page: the slab churn lines of an x86-64 guest on a
+/// Windows host counted 17 such slabs of 16 MiB a second in one process, none taken from again. On
+/// the Radeon 780M host (an x86-64 macOS guest's boot to its desktop, a window dragged 31 s, and a
+/// GPU benchmark's run) the kept slabs were taken from again 5 times before the desktop and never
+/// in the drag or the benchmark.
 ///
 /// The take waits for the host on the thread whose buffer found no room, as Metal's newBuffer
 /// waits for the kernel's pages: takes() counts them and the time they took.
@@ -414,18 +417,17 @@ struct RgfxPoolMemory {
 class RgfxPoolSlabSource : public RgfxRegionSlabSource {
 public:
 	RgfxPoolSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
-	                   const RgfxPoolMemory &memory, bool managedAtOffset = false,
-	                   bool managedOverCopy = false);
+	                   const RgfxPoolMemory &memory, uint64_t capacity,
+	                   bool managedAtOffset = false, bool managedOverCopy = false);
 
 	uint64_t unit() const override { return kUnit; }
 	bool serves(uint32_t options, uint64_t size, bool dedicated) const override;
 	uint64_t smallMax() const override { return kSmallMax; }
 	uint64_t slabMax() const override { return kSlabMax; }
-	bool keepsFreed() const override { return false; }
 	bool inRegion() const override { return false; }
-	/// Whatever the pool holds: the host's. Sizes no cache, as the allocator keeps none of this
-	/// source's slabs.
-	uint64_t capacity() const override { return UINT64_MAX; }
+	/// What sizes the cache of this source's slabs: the constructor's `capacity`. The pool itself
+	/// holds whatever the host gives it.
+	uint64_t capacity() const override { return m_capacity; }
 	bool heapedSlab(uint64_t size, uint32_t options, bool dedicated) const override;
 	bool take(uint64_t size, bool heap, Memory *out) override;
 	void give(const Memory &memory) override;
@@ -454,6 +456,7 @@ public:
 
 private:
 	RgfxPoolMemory m_memory;
+	uint64_t m_capacity;
 	std::atomic<uint64_t> m_taken{0};
 	std::atomic<uint64_t> m_takenBytes{0};
 	std::atomic<uint64_t> m_refused{0};

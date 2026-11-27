@@ -4952,9 +4952,11 @@ the host's import, and the kext's block table holds one entry per slab:
   made one Shared Placement `HEAP_OVER_POOL`, its buffers placed in it as in
   a region slab's heap. A class's slabs grow to 16 MiB and hold buffers of up
   to 4 MiB, as chunked slabs do, and a larger buffer takes a block of its own
-  of its length rounded up to 64 KiB, with its heap, up to 4 GiB. No slab of
-  the pool is kept once empty, a class's or a large buffer's: it goes with
-  its last buffer, its heap's destroy and then its block's give. No slab
+  of its length rounded up to 64 KiB, with its heap, up to 4 GiB. The pool's
+  slabs are kept once empty as the region's are: two empty slabs a class, and
+  large buffers' own slabs cached up to a sixteenth of the guest's RAM, each
+  for 2 s at most; a slab let go goes with its heap's destroy and then its
+  block's give. No slab
   falls back to the region: where the kext refuses a take (the pool full, or
   no GPU address left) for the slab and for slabs half as large down to the
   buffer's size, the buffer is nil, as Metal's `newBufferWithLength:` is
@@ -5150,8 +5152,9 @@ reads it once.
   finds no address left there is refused, as one that finds no room. A guest
   that did not take the bit reads 0 there and picks its heaps' addresses
   itself, as before.
-- **A give.** When the slab's last buffer goes, the bundle destroys its heap
-  and gives the block back (selector 17, `PoolGive`); every call into the
+- **A give.** When a slab goes (2 s after its last buffer at most, "Empty
+  slabs kept", below), the bundle destroys its heap and gives the block back
+  (selector 17, `PoolGive`); every call into the
   kext first posts the destroys the control ring holds, so the heap's
   destroy goes first. The kext takes the block's mapping out of the process,
   then posts `POOL_GIVE`, after every message the process posted before. The
@@ -5172,14 +5175,29 @@ reads it once.
   none, which fails its command buffer as out of memory. The rings, command buffers' bodies,
   surface copy blocks, the scanout and the cursor stay in the region, and
   the ICB slots where they were (the kext's chunks, else the region).
-- **No empty slab kept.** On the Radeon 780M host (an x86-64 macOS guest's
-  boot to its desktop, a window dragged for 31 s, and a GPU benchmark's run,
-  counted by the bundle's slab churn lines), the empty slabs a class kept
-  were taken from again 5 times before the desktop and never in the drag or
-  the benchmark, and no large buffer took a cached slab: keeping them would
-  have saved no take there. The bundle's churn line carries the pool's takes
-  too: blocks taken and given back, takes refused, and how long the takes
-  waited for the host.
+- **Empty slabs kept.** A class keeps two empty slabs of the pool, and
+  large buffers' own slabs are cached, as the region's are ("Shared and
+  Managed buffers lie in slabs", above), each for 2 s at most, the cache up
+  to a sixteenth of the guest's RAM (the kext reads the pool's length,
+  `POOL_LENGTH`, and tells the bundle nothing of it). A kept or cached block
+  is its process's alone for those 2 s: a take that finds no block lets go of
+  its own process's kept and cached slabs and asks again (above, "Where no
+  source has memory for a new slab"),
+  never another's, so where the pool is full (its range holds as many bytes
+  as the host GPU's memory heaps, docs/qemu.md "The guest's Shared pool", and
+  the host's memory backs it) another process's take may be refused for up
+  to 2 s where it would have found a block. Without them, a process that makes a
+  buffer and frees it again and again in an otherwise empty class takes a
+  block, makes a heap over it and gives the block back for each buffer, and
+  as each new slab doubles its class's next one, the block is 16 MiB for a
+  buffer of a page, which the host zeroes as it gives it: the slab churn
+  lines of an x86-64 guest on a Windows host counted one process making and
+  letting go about 17 such slabs a second, none taken from again. On the
+  Radeon 780M host (an x86-64 macOS guest's boot to its desktop, a window
+  dragged for 31 s, and a GPU benchmark's run) the kept slabs were taken from
+  again 5 times before the desktop and never in the drag or the benchmark.
+  The bundle's churn line carries the pool's takes too: blocks taken and
+  given back, takes refused, and how long the takes waited for the host.
 
 **Private blocks.** Where the guest took `PRIVATE_BLOCKS` (feature bit 60),
 a context's Private objects lie in blocks of GPU addresses the host gives the

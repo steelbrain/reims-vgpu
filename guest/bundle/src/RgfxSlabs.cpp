@@ -300,9 +300,10 @@ static_assert(RgfxPoolSlabSource::kUnit == RGFX_POOL_BLOCK_ALIGN, "a pool slab i
 static_assert(RgfxPoolSlabSource::kTakeMax == RGFX_POOL_TAKE_MAX, "the longest take");
 
 RgfxPoolSlabSource::RgfxPoolSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
-                                       const RgfxPoolMemory &memory, bool managedAtOffset,
-                                       bool managedOverCopy)
-    : RgfxRegionSlabSource(region, serializer, managedAtOffset, managedOverCopy), m_memory(memory)
+                                       const RgfxPoolMemory &memory, uint64_t capacity,
+                                       bool managedAtOffset, bool managedOverCopy)
+    : RgfxRegionSlabSource(region, serializer, managedAtOffset, managedOverCopy), m_memory(memory),
+      m_capacity(capacity)
 {
 }
 
@@ -824,10 +825,7 @@ void RgfxSlabs::giveBack(const Range &range)
 		slab->dirty.add(range.offset, range.size);
 		slab->used -= range.size;
 		m_dirtySlabs.insert(slab);
-		if (slab->dedicated && !slab->source->keepsFreed()) {
-			// Its source's slabs are not kept: it goes with its buffer.
-			doom(slab);
-		} else if (slab->dedicated) {
+		if (slab->dedicated) {
 			// Cached for a later buffer, the oldest of its source's let go past a sixteenth of the
 			// source.
 			slab->idleSince = nowMs();
@@ -846,7 +844,7 @@ void RgfxSlabs::giveBack(const Range &range)
 				churned();
 			}
 			// Counted empty first: doom() counts it out again.
-			if (slab->used == 0 && (++cls.empty > kEmptyKept || !slab->source->keepsFreed())) {
+			if (slab->used == 0 && ++cls.empty > kEmptyKept) {
 				doom(slab);
 			} else if (slab->used == 0) {
 				// Kept for kCacheIdleMs, then let go where nothing took from it meanwhile.
