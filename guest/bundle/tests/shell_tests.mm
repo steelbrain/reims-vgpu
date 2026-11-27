@@ -22653,6 +22653,8 @@ int rgfxProtocolFairShareCase(const char *name);
 void rgfxArchiveTests();
 void rgfxResourceTests();
 void rgfxQueueTests(const char *self);
+void rgfxQueueLockTests(const char *self);
+int rgfxQueueLockCase(const char *name);
 int rgfxQueueDiesCase(const char *name);
 void rgfxResidencyTests(const char *self);
 int rgfxResidencyDiesCase(const char *name);
@@ -22721,6 +22723,14 @@ int main(int argc, char **argv)
 		return dies_case(argv[2]);
 	if (argc == 3 && std::strcmp(argv[1], "--queue-dies") == 0)
 		return rgfxQueueDiesCase(argv[2]);
+	if (argc == 3 && std::strcmp(argv[1], "--queue-lock") == 0)
+		return rgfxQueueLockCase(argv[2]);
+	// The app-lock tests alone (tests/queue_tests.mm), which `make test` runs among the rest.
+	if (argc == 2 && std::strcmp(argv[1], "--app-locks") == 0) {
+		rgfxQueueLockTests(argv[0]);
+		std::printf("shell_tests --app-locks: OK (%d checks)\n", g_checks.load());
+		return 0;
+	}
 	if (argc == 3 && std::strcmp(argv[1], "--residency-dies") == 0)
 		return rgfxResidencyDiesCase(argv[2]);
 	if (argc == 3 && std::strcmp(argv[1], "--protocol-fair-share") == 0)

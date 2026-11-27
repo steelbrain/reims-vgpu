@@ -89,6 +89,18 @@ int rgfxQueueTimings(int rounds);
 RGFX_RESOURCE_SPI
 @end
 
+// A device for that queue alone: it answers newCommandQueue with the queue it is given.
+@interface QueueTestCopyDevice : NSObject
+@property(nonatomic, strong) id<MTLCommandQueue> queue;
+@end
+
+@implementation QueueTestCopyDevice
+- (id<MTLCommandQueue>)newCommandQueue
+{
+	return self.queue;
+}
+@end
+
 // The command-buffer SPI the guest's frameworks send (MTLCommandBufferSPI), as the AMD 5300M's and
 // the Intel 630's buffers answer it.
 @protocol QueueTestCommandBufferSPI
@@ -2793,11 +2805,171 @@ void test_a_scheduled_signal_takes_only_a_shared_event()
 }
 #endif
 
+// AN APP'S LOCKS. An app may take @synchronized on an object Metal hands it and hold it while
+// it waits for Metal's work on that object: a 2D game on a common engine holds its command
+// buffer's across the buffer's commit and waitUntilCompleted. The bundle takes no lock on an
+// object an app can reach, so each wait below returns, its work done on another thread: the
+// buffer's completion, a buffer of the queue made, encoded, committed and completed, the
+// function's bitcode hash, and the device's queue for the CPU's texture copies. Each case
+// (rgfxQueueLockCase) runs in a process of its own, which must end within 10 s: a case that
+// deadlocks is that case's timeout, not a stuck run.
+constexpr int kLockCaseSeconds = 10;
+
+bool lockCaseFinishes(const char *name)
+{
+	char *args[] = {const_cast<char *>(g_self), const_cast<char *>("--queue-lock"),
+	                const_cast<char *>(name), nullptr};
+	pid_t pid = 0;
+	CHECK(posix_spawn(&pid, g_self, nullptr, nullptr, args, *_NSGetEnviron()) == 0);
+	const auto start = std::chrono::steady_clock::now();
+	int status = 0;
+	pid_t ended = 0;
+	while (ended == 0 &&
+	       std::chrono::steady_clock::now() - start < std::chrono::seconds(kLockCaseSeconds)) {
+		ended = waitpid(pid, &status, WNOHANG);
+		if (ended == 0)
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	const long ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                      std::chrono::steady_clock::now() - start)
+	                                      .count());
+	if (ended == 0) {
+		kill(pid, SIGKILL);
+		waitpid(pid, &status, 0);
+		std::fprintf(stderr, "queue-lock %s: TIMEOUT, no end within %d s (killed)\n", name,
+		             kLockCaseSeconds);
+		return false;
+	}
+	const bool ok = ended == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+	std::fprintf(stderr, "queue-lock %s: %s in %ld ms (status %d)\n", name,
+	             ok ? "finished" : "FAILED", ms, status);
+	return ok;
+}
+
+void test_an_apps_locks_hold_nothing_of_the_bundle()
+{
+	bool ok = true;
+	for (const char *name : {"buffer", "buffer-handler", "queue", "function", "device"})
+		ok = lockCaseFinishes(name) && ok;
+	CHECK(ok);
+}
+
 } // namespace
+
+void rgfxQueueLockTests(const char *self)
+{
+	g_self = self;
+	test_an_apps_locks_hold_nothing_of_the_bundle();
+}
+
+// The cases of test_an_apps_locks_hold_nothing_of_the_bundle: the calling thread holds the
+// object's lock and waits for work another thread does, which is started inside the lock.
+int rgfxQueueLockCase(const char *name)
+{
+	@autoreleasepool {
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		std::thread other;
+		const bool handler = std::strcmp(name, "buffer-handler") == 0;
+		if (handler || std::strcmp(name, "buffer") == 0) {
+			// The buffer's commit and wait under its lock, the host completing it meanwhile;
+			// with a completed handler, its completion runs on the queue's completion queue.
+			Queue q(true);
+			Driven driven({&q});
+			id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+			std::atomic<bool> ran{false};
+			std::atomic<bool> *ranp = &ran;
+			if (handler) {
+				[cb addCompletedHandler:^(id<MTLCommandBuffer> x) {
+					(void)x;
+					ranp->store(true);
+				}];
+			}
+			@synchronized(cb) {
+				other = std::thread([&] {
+					const uint64_t seqno = nextSeqno(q);
+					hostScheduled(q, *driven.kext, seqno, cb);
+					hostComplete(q, *driven.kext, seqno, cb);
+				});
+				[cb commit];
+				[cb waitUntilCompleted];
+			}
+			other.join();
+			CHECK(cb.status == MTLCommandBufferStatusCompleted);
+			CHECK(ran.load() == handler);
+			return 0;
+		}
+		if (std::strcmp(name, "queue") == 0) {
+			// A buffer of the queue, made, encoded, committed and completed on another thread.
+			Queue q(true);
+			Driven driven({&q});
+			id<MTLCommandQueue> queue = q.queue;
+			MTLCommandBufferStatus status = MTLCommandBufferStatusNotEnqueued;
+			@synchronized(queue) {
+				other = std::thread([&] {
+					@autoreleasepool {
+						id<MTLCommandBuffer> cb = [queue commandBuffer];
+						[[cb blitCommandEncoder] endEncoding];
+						[cb commit];
+						hostComplete(q, *driven.kext, nextSeqno(q), cb);
+						[cb waitUntilCompleted];
+						status = cb.status;
+					}
+					dispatch_semaphore_signal(done);
+				});
+				dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+			}
+			other.join();
+			CHECK(status == MTLCommandBufferStatusCompleted);
+			return 0;
+		}
+		if (std::strcmp(name, "function") == 0) {
+			// The function's bitcode hash, which a binary archive's key reads.
+			RgfxFunction *fn = [RgfxFunction functionWithLibrary:nil
+			                                                name:@"f"
+			                                           constants:nullptr
+			                                               count:0
+			                                              device:nil
+			                                          serializer:nullptr];
+			const RgfxBitCodeHash *hash = nullptr;
+			@synchronized(fn) {
+				other = std::thread([&] {
+					hash = [fn bitCodeHash];
+					dispatch_semaphore_signal(done);
+				});
+				dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+			}
+			other.join();
+			CHECK(hash != nullptr && hash == [fn bitCodeHash]);
+			return 0;
+		}
+		if (std::strcmp(name, "device") == 0) {
+			// The device's copy queue, which a CPU copy into or out of a texture takes first.
+			Queue q(true);
+			QueueTestCopyDevice *device = [QueueTestCopyDevice new];
+			device.queue = q.queue;
+			id<MTLDevice> asDevice = (id<MTLDevice>)device;
+			id<MTLCommandQueue> got = nil;
+			@synchronized(device) {
+				other = std::thread([&] {
+					got = rgfxCopyQueue(asDevice);
+					dispatch_semaphore_signal(done);
+				});
+				dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+			}
+			other.join();
+			CHECK(got == q.queue);
+			CHECK(rgfxCopyQueue(asDevice) == q.queue); // kept with the device
+			return 0;
+		}
+	}
+	std::fprintf(stderr, "queue-lock: no case %s\n", name);
+	return 1;
+}
 
 void rgfxQueueTests(const char *self)
 {
 	g_self = self;
+	test_an_apps_locks_hold_nothing_of_the_bundle();
 	test_encoder_keeps_its_buffer_until_it_ends();
 	test_encoder_spi_members();
 	test_handlers_after_commit_end_the_process();

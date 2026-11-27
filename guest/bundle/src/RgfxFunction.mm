@@ -115,6 +115,10 @@ bool isRendererPluginData(NSData *data)
 	BOOL _haveType;
 	RgfxBitCodeHash _hash;                        // the bitcode hash, from the library's table
 	BOOL _haveHash;
+	// The lock of the stand-in hash bitCodeHash makes. The function's own, never the object's: an
+	// app may hold @synchronized(function) while another thread reads the hash (AN APP'S LOCKS,
+	// tests/queue_tests.mm). A plain mutex: it is held over the hash's arithmetic alone.
+	std::mutex _hashLock;
 	MTLPatchType _patchType;                      // the [[patch]] type and control point
 	NSInteger _patchControlPointCount;            //   count, from the library's table
 	MTLFunctionOptions _options;                  // the descriptor's, where made from one
@@ -228,17 +232,16 @@ bool isRendererPluginData(NSData *data)
 // their pipelines by it: the SHA-256 of "rgfx-function-v1", its library's id and its name.
 - (const RgfxBitCodeHash *)bitCodeHash
 {
-	@synchronized(self) {
-		if (!_haveHash) {
-			static const char kPrefix[] = "rgfx-function-v1";
-			CC_SHA256_CTX ctx;
-			CC_SHA256_Init(&ctx);
-			CC_SHA256_Update(&ctx, kPrefix, sizeof(kPrefix) - 1);
-			CC_SHA256_Update(&ctx, &_libraryObjId, sizeof(_libraryObjId));
-			CC_SHA256_Update(&ctx, _name.data(), static_cast<CC_LONG>(_name.size()));
-			CC_SHA256_Final(_hash.bytes, &ctx);
-			_haveHash = YES;
-		}
+	std::lock_guard<std::mutex> hold(_hashLock);
+	if (!_haveHash) {
+		static const char kPrefix[] = "rgfx-function-v1";
+		CC_SHA256_CTX ctx;
+		CC_SHA256_Init(&ctx);
+		CC_SHA256_Update(&ctx, kPrefix, sizeof(kPrefix) - 1);
+		CC_SHA256_Update(&ctx, &_libraryObjId, sizeof(_libraryObjId));
+		CC_SHA256_Update(&ctx, _name.data(), static_cast<CC_LONG>(_name.size()));
+		CC_SHA256_Final(_hash.bytes, &ctx);
+		_haveHash = YES;
 	}
 	return &_hash;
 }

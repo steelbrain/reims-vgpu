@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 /// Maps an MTLTextureDescriptor into the wire's RgfxTextureDescriptor. Each Metal
@@ -258,25 +259,34 @@ void rgfxNoteCopyRefused(std::atomic<bool> &logged, NSString *what, RgfxTexture 
 	}
 }
 
-// The device's queue for the CPU's copies into and out of its textures, made at the first one
-// and kept with the device.
+} // namespace
+
+// The device's queue for the CPU's copies into and out of its textures (RgfxTexture.h). Under a
+// lock of the bundle's own, never the device object's: an app may hold @synchronized(device)
+// while it waits for a CPU copy another thread makes (AN APP'S LOCKS, tests/queue_tests.mm). A
+// plain mutex, as nothing done under it takes it again. The device's newCommandQueue runs under it,
+// so one queue is made a device: a queue made outside it and dropped would be a queue made and
+// destroyed that the host sees. The device's newCommandQueue takes no lock an app can hold, and
+// runs no block, handler or call into the app.
 id<MTLCommandQueue> rgfxCopyQueue(id<MTLDevice> device)
 {
 	static char key;
+	static std::mutex lock;
 	if (device == nil) {
 		return nil;
 	}
-	@synchronized(device) {
-		id<MTLCommandQueue> queue = objc_getAssociatedObject(device, &key);
-		if (queue == nil) {
-			queue = [device newCommandQueue];
-			if (queue != nil) {
-				objc_setAssociatedObject(device, &key, queue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-			}
+	std::lock_guard<std::mutex> hold(lock);
+	id<MTLCommandQueue> queue = objc_getAssociatedObject(device, &key);
+	if (queue == nil) {
+		queue = [device newCommandQueue];
+		if (queue != nil) {
+			objc_setAssociatedObject(device, &key, queue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 		}
-		return queue;
 	}
+	return queue;
 }
+
+namespace {
 
 // --- views ---------------------------------------------------------------------
 

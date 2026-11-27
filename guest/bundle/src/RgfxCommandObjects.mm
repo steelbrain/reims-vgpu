@@ -726,6 +726,22 @@ struct RgfxBarrierSlot {
 - (nullable NSArray *)rgfxResidencySets;
 @end
 
+#if RgfxMakesResidencySets
+// The counted set's NSInvalidArgumentException at a nil residency set, which Metal's queue and
+// buffer raise (addObject:'s "attempt to insert nil", removeObject:'s "attempt to remove nil"),
+// raised by a counted set of its own, so no lock of the queue's or the buffer's is held while the
+// app's handler of it runs.
+static void rgfxRaiseAtNilSet(BOOL adding)
+{
+	NSCountedSet *scratch = [NSCountedSet set];
+	id none = nil;
+	if (adding)
+		[scratch addObject:none];
+	else
+		[scratch removeObject:none];
+}
+#endif
+
 @implementation RgfxCommandQueue {
 	RgfxRingWriter *_submitRing;   // borrowed: the queue's submission ring
 	RgfxIdSpace *_ids;             // borrowed: the device id space, for cb ids
@@ -764,9 +780,10 @@ struct RgfxBarrierSlot {
 	// The blocks of its command buffers too large for its ring (RgfxUploads.h), made with the
 	// first such buffer, over the queue's region.
 	std::shared_ptr<RgfxBodyPool> _bodyPool;
-	// The barrier fences (QUEUE BARRIERS), made with the queue, and the encoders made.
+	// The barrier fences (QUEUE BARRIERS), made with the queue and never changed, and the encoders
+	// made, counted by any thread.
 	NSArray<RgfxFence *> *_barrierFences;
-	uint64_t _encodersMade;
+	std::atomic<uint64_t> _encodersMade;
 	uint64_t _traceId; // globalTraceObjectID
 	// rgfxMessageReserve's bytes. Command buffers commit on any thread; a lost update only
 	// sizes one message's first allocation.
@@ -813,8 +830,14 @@ struct RgfxBarrierSlot {
 	// completed (RgfxCmdBuffer's commit and rgfxDeliverCompletion:).
 	dispatch_group_t _committedGroup;
 	// The residency sets it is given, each as many times as it was added (RESIDENCY SETS, below),
-	// under @synchronized(self): made with the queue on the arm64 device, none on the x86 one.
+	// under `_stateLock`: made with the queue on the arm64 device, none on the x86 one.
 	NSCountedSet *_residencySets;
+	// The lock of `_bodyPool`, `_uploadPool` and `_residencySets`. The queue's own, never the
+	// object's: an app may hold @synchronized(queue) while it waits for work another thread does
+	// with the queue (AN APP'S LOCKS, tests/queue_tests.mm). A plain mutex, as nothing done under
+	// it takes it again: it is held over no block, handler, release or raise, and over no message
+	// but the counted set's.
+	std::mutex _stateLock;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -1034,40 +1057,39 @@ struct RgfxBarrierSlot {
 // The queue's pool of message blocks, made over its region on first use.
 - (std::shared_ptr<RgfxBodyPool>)rgfxBodyPool
 {
-	@synchronized(self) {
-		if (_bodyPool == nullptr && self.region != nullptr) {
-			_bodyPool = std::make_shared<RgfxBodyPool>(self.region);
-		}
-		return _bodyPool;
-	}
+	RgfxRegion *region = self.region;
+	std::lock_guard<std::mutex> hold(_stateLock);
+	if (_bodyPool == nullptr && region != nullptr)
+		_bodyPool = std::make_shared<RgfxBodyPool>(region);
+	return _bodyPool;
 }
 
 // The queue's upload pool, made over its region on first use.
 - (std::shared_ptr<RgfxUploadPool>)rgfxUploadPool
 {
-	@synchronized(self) {
-		if (_uploadPool == nullptr) {
-			_uploadPool = std::make_shared<RgfxUploadPool>(self.region, [self serializer],
-			                                               self.device, self.slabs,
-			                                               self.uploadsManaged);
-		}
-		return _uploadPool;
-	}
+	RgfxRegion *region = self.region;
+	RgfxSerializer *serializer = [self serializer];
+	id<MTLDevice> device = self.device;
+	RgfxSlabs *slabs = self.slabs;
+	const bool managed = self.uploadsManaged;
+	std::lock_guard<std::mutex> hold(_stateLock);
+	if (_uploadPool == nullptr)
+		_uploadPool = std::make_shared<RgfxUploadPool>(region, serializer, device, slabs, managed);
+	return _uploadPool;
 }
 
+// No lock: the fences never change after the queue is made, and the count is atomic.
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot
 {
 	RgfxBarrierSlot b;
-	@synchronized(self) {
-		if (_barrierFences.count != kRgfxBarrierFences)
-			return b;
-		for (uint32_t i = 0; i < kRgfxBarrierFences; i++)
-			b.fences[i] = [_barrierFences[i] rgfxObjId];
-		const uint64_t n = _encodersMade++;
-		b.slot = static_cast<uint32_t>(n % kRgfxBarrierFences);
-		b.earlier = static_cast<uint32_t>(n < kRgfxBarrierFences ? n : kRgfxBarrierFences);
-		b.waitOwn = n >= kRgfxBarrierFences;
-	}
+	if (_barrierFences.count != kRgfxBarrierFences)
+		return b;
+	for (uint32_t i = 0; i < kRgfxBarrierFences; i++)
+		b.fences[i] = [_barrierFences[i] rgfxObjId];
+	const uint64_t n = _encodersMade.fetch_add(1);
+	b.slot = static_cast<uint32_t>(n % kRgfxBarrierFences);
+	b.earlier = static_cast<uint32_t>(n < kRgfxBarrierFences ? n : kRgfxBarrierFences);
+	b.waitOwn = n >= kRgfxBarrierFences;
 	return b;
 }
 
@@ -1235,9 +1257,12 @@ struct RgfxBarrierSlot {
 - (void)addResidencySet:(id<MTLResidencySet>)residencySet
 {
 #if RgfxMakesResidencySets
-	@synchronized(self) {
-		[_residencySets addObject:residencySet];
+	if (residencySet == nil) {
+		rgfxRaiseAtNilSet(YES);
+		return;
 	}
+	std::lock_guard<std::mutex> hold(_stateLock);
+	[_residencySets addObject:residencySet];
 #else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
@@ -1247,10 +1272,14 @@ struct RgfxBarrierSlot {
                    count:(NSUInteger)count
 {
 #if RgfxMakesResidencySets
-	@synchronized(self) {
-		for (NSUInteger i = 0; i < count; i++)
+	NSUInteger i = 0;
+	{
+		std::lock_guard<std::mutex> hold(_stateLock);
+		for (; i < count && residencySets[i] != nil; i++)
 			[_residencySets addObject:residencySets[i]];
 	}
+	if (i < count)
+		rgfxRaiseAtNilSet(YES); // the sets before the nil one are added, as before it
 #else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
@@ -1259,7 +1288,14 @@ struct RgfxBarrierSlot {
 - (void)removeResidencySet:(id<MTLResidencySet>)residencySet
 {
 #if RgfxMakesResidencySets
-	@synchronized(self) {
+	if (residencySet == nil) {
+		rgfxRaiseAtNilSet(NO);
+		return;
+	}
+	// Kept past the lock: a set the queue held last goes after it.
+	NS_VALID_UNTIL_END_OF_SCOPE id<MTLResidencySet> kept = residencySet;
+	{
+		std::lock_guard<std::mutex> hold(_stateLock);
 		[_residencySets removeObject:residencySet];
 	}
 #else
@@ -1271,10 +1307,16 @@ struct RgfxBarrierSlot {
                       count:(NSUInteger)count
 {
 #if RgfxMakesResidencySets
-	@synchronized(self) {
-		for (NSUInteger i = 0; i < count; i++)
+	// Kept past the lock: the sets the queue held last go after it.
+	std::vector<id> kept(residencySets, residencySets + count);
+	NSUInteger i = 0;
+	{
+		std::lock_guard<std::mutex> hold(_stateLock);
+		for (; i < count && residencySets[i] != nil; i++)
 			[_residencySets removeObject:residencySets[i]];
 	}
+	if (i < count)
+		rgfxRaiseAtNilSet(NO); // the sets before the nil one are removed, as before it
 #else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
@@ -1284,9 +1326,8 @@ struct RgfxBarrierSlot {
 - (NSArray *)rgfxResidencySets
 {
 #if RgfxMakesResidencySets
-	@synchronized(self) {
-		return _residencySets.count != 0 ? _residencySets.allObjects : nil;
-	}
+	std::lock_guard<std::mutex> hold(_stateLock);
+	return _residencySets.count != 0 ? _residencySets.allObjects : nil;
 #else
 	return nil;
 #endif
@@ -1798,9 +1839,15 @@ enum RgfxStage : unsigned {
 	std::atomic<MTLCommandBufferStatus> _status;
 	NSString *_cbLabel;
 	NSMutableDictionary *_userDictionary; // userDictionary, made when first asked
-	// The residency sets it uses, each as many times as it was used, under @synchronized(self):
-	// made at the first use, let go once it completes (useResidencySet:).
+	// The residency sets it uses, each as many times as it was used, under `_stateLock`: made at
+	// the first use, let go once it completes (useResidencySet:).
 	NSCountedSet *_residencySets;
+	// The lock of `_residencySets` and `_userDictionary`. The buffer's own, never the object's: an
+	// app may hold @synchronized(buffer) across its commit and waitUntilCompleted while the
+	// completion thread delivers the buffer's completion (AN APP'S LOCKS, tests/queue_tests.mm). A
+	// plain mutex, as nothing done under it takes it again: it is held over no block, handler or
+	// release, and no message but to the counted set and the dictionary's class.
+	std::mutex _stateLock;
 	// What the client asked of the buffer's content protection (setProtectionOptions:).
 	uint64_t _protectionOptions;
 	// The error options its descriptor asked for (commandBufferWithDescriptor:).
@@ -3344,11 +3391,14 @@ static NSError *rgfxInvalidInputError()
 - (void)useResidencySet:(id<MTLResidencySet>)residencySet
 {
 #if RgfxMakesResidencySets
-	@synchronized(self) {
-		if (_residencySets == nil)
-			_residencySets = [NSCountedSet set];
-		[_residencySets addObject:residencySet];
+	if (residencySet == nil) {
+		rgfxRaiseAtNilSet(YES);
+		return;
 	}
+	std::lock_guard<std::mutex> hold(_stateLock);
+	if (_residencySets == nil)
+		_residencySets = [NSCountedSet set];
+	[_residencySets addObject:residencySet];
 #else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
@@ -3358,12 +3408,16 @@ static NSError *rgfxInvalidInputError()
                    count:(NSUInteger)count
 {
 #if RgfxMakesResidencySets
-	@synchronized(self) {
+	NSUInteger i = 0;
+	{
+		std::lock_guard<std::mutex> hold(_stateLock);
 		if (_residencySets == nil)
 			_residencySets = [NSCountedSet set];
-		for (NSUInteger i = 0; i < count; i++)
+		for (; i < count && residencySets[i] != nil; i++)
 			[_residencySets addObject:residencySets[i]];
 	}
+	if (i < count)
+		rgfxRaiseAtNilSet(YES); // the sets before the nil one are used, as before it
 #else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
@@ -3388,7 +3442,8 @@ static NSError *rgfxInvalidInputError()
 	};
 	note([_queue rgfxResidencySets]);
 	NSArray *own = nil;
-	@synchronized(self) {
+	{
+		std::lock_guard<std::mutex> hold(_stateLock);
 		if (_residencySets.count != 0)
 			own = _residencySets.allObjects;
 	}
@@ -3400,7 +3455,8 @@ static NSError *rgfxInvalidInputError()
 - (void)rgfxLetResidencySetsGo
 {
 	NS_VALID_UNTIL_END_OF_SCOPE NSCountedSet *used = nil;
-	@synchronized(self) {
+	{
+		std::lock_guard<std::mutex> hold(_stateLock);
 		used = _residencySets;
 		_residencySets = nil;
 	}
@@ -3412,11 +3468,10 @@ static NSError *rgfxInvalidInputError()
 // A mutable dictionary of the caller's, the same one each time.
 - (NSMutableDictionary *)userDictionary
 {
-	@synchronized(self) {
-		if (_userDictionary == nil)
-			_userDictionary = [NSMutableDictionary dictionary];
-		return _userDictionary;
-	}
+	std::lock_guard<std::mutex> hold(_stateLock);
+	if (_userDictionary == nil)
+		_userDictionary = [NSMutableDictionary dictionary];
+	return _userDictionary;
 }
 
 // Metal signals the event for every agent mask tried (0, 1, 2, all ones): as

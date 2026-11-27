@@ -240,6 +240,10 @@ void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMo
 /// and at every other value as Invalid (rgfxLinearAlignmentAnswer).
 void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format, id<MTLDevice> _Nullable device = nil);
 
+/// The device's queue for the CPU's copies into and out of its textures, made at the first one
+/// and kept with the device; nil for a nil device.
+id<MTLCommandQueue> _Nullable rgfxCopyQueue(id<MTLDevice> _Nullable device);
+
 /// What minimumLinearTextureAlignmentForPixelFormat: does at `format` on `device`
 /// (rgfxEndAtUnalignableLinearFormat): answers it, or ends the process as at a compressed format,
 /// a depth or stencil one, or one the device lacks (Invalid).
