@@ -483,7 +483,7 @@ fn reads_as_draws_return(signal_ahead: bool) -> ([Arm; 3], u32, usize) {
     let stop = Arc::new(AtomicBool::new(false));
     let busy = {
         let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
+        StdRuntime::thread("busy plane draw", move || {
             let other = PlaneDraw::new(None).expect("a second plane draw");
             let targets = (other.targets(SIZE, false))
                 .unwrap_or_else(|why| failed(&other, "its targets", &why));
@@ -496,16 +496,18 @@ fn reads_as_draws_return(signal_ahead: bool) -> ([Arm; 3], u32, usize) {
             }
             clears
         })
+        .expect("the busy draws' thread")
     };
     let spinners = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let spinning: Vec<_> = (0..spinners)
         .map(|_| {
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
+            StdRuntime::thread("spinner", move || {
                 while !stop.load(Ordering::Relaxed) {
                     std::hint::spin_loop();
                 }
             })
+            .expect("a spinning thread")
         })
         .collect();
     let mut arms: [Arm; 3] = Default::default();
