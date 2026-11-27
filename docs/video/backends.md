@@ -11,7 +11,7 @@ crate, the traits between them, and how each is tested.
 | module | what it is |
 |---|---|
 | `core` (`src/core.rs`) | What the arms share: the threads and clock the host gives them, their locks, a guest surface's memory as a device reaches it, and their bounded waits ([core.md](core.md)) |
-| `codec` (`src/codec.rs`) | The codecs above the hardware, in plain Rust: H.264's and HEVC's syntax, order counts and DPB over an `Accelerator` that decodes the slice data, and the encoders' portable half: settings, GOP, parameter sets, slice headers and configuration records |
+| `codec` (`src/codec.rs`) | The codecs above the hardware, in plain Rust: H.264's and HEVC's syntax, order counts and DPB over an `Accelerator` that decodes the slice data, AV1's OBUs, headers, tile groups and reference slots over one that decodes the tile data, and the encoders' portable half: settings, GOP, parameter sets, slice headers and configuration records |
 | `vaapi` (`src/vaapi.rs`, Linux and Windows) | VA-API through libva, loaded at run time: the decoders and encoders on the codec module, the import check and zero copy ([vaapi.md](vaapi.md)) |
 | `nvidia` (`src/nvidia.rs`, Linux) | NVDEC and NVENC over the CUDA driver API, loaded at run time: the decoder of whole access units and the encoder ([nvidia.md](nvidia.md)) |
 | `paravirt` (`src/paravirt.rs`) | VideoToolbox's paravirtual protocol, the host's side: the `vtpv` messages an arm64 guest's VideoToolbox sends through the device's `VT_MESSAGE`, the decoder list and capabilities answered from the arm's decoders, the decoder sessions, each on a thread of its own over a backend that lands its pictures in the buffers the guest lends, and the encoder sessions, over a backend that encodes the source frames the guest lends (on VA-API, written by the GPU from a buffer over their pages into an input of the encoder's, memory of the runtime device's that the encoder's display imports, on NVENC into memory CUDA imported, which NVENC registers as input, else read through the host's view of the pages and uploaded), whose samples the session emits ([design.md](../graphics-kext/design.md), "Decided", 17) |
@@ -65,6 +65,31 @@ and Windows.
   hardware's own answers. The probes, which print what they measure over inputs a checkout
   does not hold and check nothing else, are ignored tests outside both sets (`src/probes.rs`),
   run by hand.
+- **AV1's streams are committed.** `src/codec/av1/tests/streams` holds eleven small streams of
+  ours (128 KiB with their references: aomenc 3.15.3, SVT-AV1 4.2.0 and rav1e 0.8.1 from ffmpeg's synthetic sources;
+  tiles in several tile groups, film grain, superres, screen content, an odd size with frame ids,
+  10 bits, an AVIF still's item with its reduced still picture header, and the 4:4:4 and 12-bit
+  profiles the decoder refuses) and each shown frame's MD5,
+  ffmpeg's `framemd5` of libdav1d's decode (NV12, P010), made once on a node and committed, so
+  that no test needs those tools. The CPU tests read them through the codec module, and truncate
+  and fuzz them (`codec::av1::tests`); the ignored `vaapi::va::av1::` and
+  `nvidia::annex_b::av1_tests::` tests decode them on the hardware, each frame's MD5 against its
+  reference, or reported failed by the hardware (NVDEC's status), which the decoder delivers as
+  no frame: a wrong frame delivered as decoded fails the test, on any card. A stream with film
+  grain is decoded twice (`codec::av1::tests::judge`): with the grain off, each frame against its
+  reference without grain, which every card must match; and as the arm outputs it, each frame
+  with the grain the driver applies. That frame is the specification's, its reference with
+  grain, or the driver's own synthesis, whose residual (the frame less the frame before grain,
+  in each of Y, U and V) has the statistics of the specification's own residual, which
+  `tests/streams/aom-grain.grain` holds from libdav1d's decode with and without grain: its mean
+  within `GRAIN_MEAN` code values, its standard deviation within `GRAIN_STD` of the
+  specification's, and its 32x32 blocks' variances correlated with the specification's by
+  `GRAIN_CORRELATION` at least, bounds set from what the cards measured, each with its jobs
+  (`codec::av1::tests::card`). The check is shown to fail on grain of other parameters: the
+  stream decoded with its grain half as strong, on luma alone, or strong where it is weak, each
+  frame refused (`grain_of_other_parameters_is_refused_by_the_grain_check`). radeonsi's and
+  NVDEC's grain is the specification's; iHD's is its own ([devices.md](devices.md), "AV1 on
+  arm64 guests").
 - **The arms' tests** are reims-vgpu's `graphics::` tests, on any host: the host sessions' on
   the fake platform (`video_host`'s tests), and the VA-API arm's on driver answers the tests
   make up (`graphics/vaapi/tests.rs`).

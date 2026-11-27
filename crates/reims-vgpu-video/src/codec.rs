@@ -2,6 +2,9 @@
 //! and the part of its decoding process a stateless accelerator is not
 //! given, in plain Rust with no FFI.
 //!
+//! - [`av1`] is AV1's: OBUs, `av1C`, the sequence header, frame headers with
+//!   the processes that set what the hardware is given, tile groups and the
+//!   reference slots, over an `Accelerator` that decodes the tiles.
 //! - [`encode`] is the H.264 and HEVC encoders' portable half: their
 //!   settings, the GOP and decode times, the parameter sets, slice headers
 //!   and configuration records the VA-API backend packs, and the rate
@@ -51,6 +54,7 @@
     )
 )]
 
+pub mod av1;
 mod bits;
 mod dpb;
 pub mod encode;
