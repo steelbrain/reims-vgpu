@@ -217,18 +217,24 @@ Unset or unparsable values give the defaults below.
   `test: reims-vgpu-graphics::device::tests::displays::the_image_over_the_edge_leaves_the_cursor_on_the_display_of_its_hot_spot`,
   `manual` (a VM with two displays)
 - In a game: captured, once the guest has hidden its cursor on every display
-  for 50 ms (a hide while the guest has yet to show the cursor on the display
-  a crossing moves it to counts from a second after the crossing began), as
-  a game does that turns its camera by the mouse's motion, the
+  and kept it hidden for 50 ms past the hide's first move, which the absolute
+  pointer takes (a hide while the guest has yet to show the cursor on the
+  display a crossing moves it to counts from a second after the crossing
+  began), as a game does that turns its camera by the mouse's motion, the
   pointer drives the guest's own mouse (`POINTER_MOTION`,
   docs/graphics-kext/design.md, "A pointer for games"), so the camera turns
-  however far the mouse moves, past the image's edge. The window holds the
+  however far the mouse moves, past the image's edge. A game's camera turns
+  by the absolute pointer for its first moves: measured, the pointer drove
+  the guest's mouse 57 ms after a move's first report, at its 8th report,
+  with reports 8 ms apart (Linux, an x86-64 macOS 26.7.2 guest). A cursor
+  hidden until the mouse moves, as macOS hides it while text is typed, shows
+  at that first move, so the pointer never drives the guest's mouse for it
+  and no move is lost. The window holds the
   host's pointer still (`CGAssociateMouseAndMouseCursorPosition`) and hands
   the guest's mouse its unaccelerated motion, the buttons pressed meanwhile
   and a mouse wheel's notches; the guest accelerates the motion once, as its
   own mouse settings say. Once the guest shows its cursor again (the game's
-  menu, or the next move after typing hid it), the pointer is the absolute
-  one again, the host's pointer let go over the guest's cursor where it shows
+  menu), the pointer is the absolute one again, the host's pointer let go over the guest's cursor where it shows
   on the window's display, else where it was held. A button comes up by the
   route it went down by, so one held across either switch is never left
   down. Releasing capture, losing the keyboard and closing let the pointer go
@@ -236,6 +242,8 @@ Unset or unparsable values give the defaults below.
   take `POINTER_MOTION` (one built before it, the option ROM, Ambrosia's
   module), the pointer is the absolute one only.
   `test: game::the_guest_s_mouse_is_driven_once_its_cursor_stays_hidden`,
+  `test: game::a_hide_a_move_ends_drives_nothing`,
+  `test: game::a_new_hide_starts_the_count_over`,
   `test: game::moves_go_to_the_guest_s_mouse_until_it_shows_its_cursor`,
   `test: game::a_button_comes_up_by_the_route_it_went_down_by`,
   `test: game::the_wheel_goes_to_the_driven_mouse`,
@@ -244,6 +252,7 @@ Unset or unparsable values give the defaults below.
   `test: native::macos::input::a_hidden_cursor_s_motion_drives_the_guest_s_mouse_until_it_shows`,
   `test: native::macos::input::a_button_held_across_the_switch_comes_up_by_its_own_route`,
   `test: native::macos::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
+  `test: native::macos::input::a_cursor_hidden_until_the_mouse_moves_drives_nothing`,
   `test: reims-vgpu::graphics::tests::displays::a_window_s_device_offers_pointer_motion_and_drives_the_guest_s_mouse`,
   `test: reims-vgpu-graphics::device::tests::motion::a_crossing_s_hide_is_not_a_game_s`,
   `test: reims-vgpu-graphics::device::tests::motion::a_guest_that_did_not_take_pointer_motion_gets_none`,
@@ -252,7 +261,7 @@ Unset or unparsable values give the defaults below.
   `manual` (a game, or a probe that hides the cursor and reads its deltas:
   the camera turns past the image's edge; a drag on the desktop lands where
   the pointer is; typing in TextEdit hides the cursor, and the next move
-  shows it where the guest moved it, the host's pointer over it)
+  shows it under the host's pointer, the guest's mouse never driven)
 
 ## Keyboard
 
@@ -613,6 +622,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: native::sdl_thread::input::a_hidden_cursor_s_motion_drives_the_guest_s_mouse_until_it_shows`,
   `test: native::sdl_thread::input::a_button_held_across_the_switch_comes_up_by_its_own_route`,
   `test: native::sdl_thread::input::letting_go_of_a_game_gives_the_pointer_back_where_it_was_held`,
+  `test: native::sdl_thread::input::a_cursor_hidden_until_the_mouse_moves_drives_nothing`,
   `test: reims-vgpu-graphics::device::tests::motion::motion_reaches_a_guest_that_took_it`,
   `test: reims-vgpu-graphics::device::tests::motion::a_crossing_s_hide_is_not_a_game_s`,
   `manual` (as on macOS, on a Linux host's guest boot)
