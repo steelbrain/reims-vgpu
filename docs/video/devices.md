@@ -534,9 +534,13 @@ one that allows none (2026-11-27):
 - On the RTX 3090 (m3-max-77315), the hardware sessions decoded Main 10, Main 12, and 4:4:4 at
   8, 10 and 12 bits, and the full-range forms of the 12-bit and the 4:4:4 ones past 8 bits, each
   into the software session's format, every picture byte for byte the same; the run counted 40
-  pictures converted by the CPU and 50 interleaved by the GPU. Its session of a 4:2:2 stream was
-  refused at its start, as `NVDEC's decoders here land no HEVC 4:2:2 pictures (HEVC
-  general_profile_idc 4, chroma_format_idc 2, luma 10 bits, chroma 10 bits, 640x360)`.
+  pictures converted by the CPU and 50 interleaved by the GPU. Its sessions of 4:2:2 streams
+  were refused at their start. Once the arm took 4:2:2 where NVDEC's caps list it, a boot there
+  (m3-max-77572) decoded Main 10, Main 12 and 4:4:4 at 8, 10 and 12 bits in hardware again, every
+  picture byte for byte the same, and refused each 4:2:2 session, at 8, 10 and 12 bits, naming
+  the caps, as `NVDEC does not decode HEVC 4:2:2 at 10 bits (HEVC general_profile_idc 4,
+  chroma_format_idc 2, luma 10 bits, chroma 10 bits, 640x360)`; the guest decoded those in
+  software.
 - On the RTX 5080 Laptop GPU (615.71.09), no arm64 guest has run; its 4:2:2 is checked on the
   host alone. The arm's VideoToolbox decoder, its sessions taken on the card's own caps (the card
   test `an_hevc_picture_lands_in_its_guest_format_as_the_software_decode_has_it` in
