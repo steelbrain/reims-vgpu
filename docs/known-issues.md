@@ -108,6 +108,21 @@ display refresh shows about 30% of its frames a refresh late, because under the 
 power policy its CPU runs the guest's and the host's graphics work at about 1.3 GHz, too slow to
 finish each frame within one refresh.
 
+## The pointer moves differently while the guest shares its screen
+
+While an app in the guest records or shares the screen, such as a video call's screen share or
+macOS's own screen recording, macOS hides the mouse cursor and draws it into the picture itself.
+To the window, that looks like a game hiding the cursor to steer by the mouse. So while the window
+has captured input, the pointer switches to the way it works for games 50 ms after you first move
+the mouse, and stays that way until the recording or share stops. The guest then moves the cursor
+by your mouse's own movement and the guest's mouse settings rather than your host's pointer speed,
+so it can feel slower. Your host's pointer also stays hidden inside the window, and can't move on
+to another of the VM's displays. Releasing capture (Ctrl+Alt+Super, Ctrl+Alt+Win on Windows, or
+⌃⌥⌘ on a Mac) gives you the normal pointer back, but only until you click into the guest's picture
+again: once you're captured and move the mouse, it switches again. To avoid the switch for the whole
+share, turn off **Capture input** in the VM's settings (`reims-ctl set <vm> --capture false`), which
+applies at the VM's next start.
+
 ## On a Mac
 
 ### You need macOS 26 or later to run VMs
