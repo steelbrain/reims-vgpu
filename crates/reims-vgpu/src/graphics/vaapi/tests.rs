@@ -287,6 +287,130 @@ fn an_hevc_range_extensions_stream_decodes_on_its_profiles_decoder_of_its_surfac
     );
 }
 
+/// A 4:2:0 stream of H.264, or of HEVC's Main or Main 10, is declined at its session's start
+/// where the driver's decoder of it, the first of its profiles the driver lists with its render
+/// targets, leaves its size out (from the least its surfaces list, none where they list none, up
+/// to the least of the largest its config and its surfaces list, and H.264's 65,535 blocks), or
+/// where the driver lists none, naming why; and taken within them
+#[test]
+fn a_4_2_0_stream_outside_the_drivers_sizes_is_declined_at_its_start() {
+    use reims_vgpu_video::paravirt::Codec as StreamCodec;
+    let (h264, hevc) = (RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC);
+    // The device's codec and a 4:2:0 stream of it, of H.264's `profile_idc` or at HEVC's depth.
+    let stream = |codec: u32, profile_or_bits: u8, width: u32, height: u32| {
+        let (of, profile, bits) = if codec == h264 {
+            (StreamCodec::H264, profile_or_bits, 8)
+        } else {
+            (
+                StreamCodec::Hevc,
+                1 + u8::from(profile_or_bits == 10),
+                profile_or_bits,
+            )
+        };
+        let stream = Stream {
+            codec: of,
+            profile,
+            chroma_format_idc: 1,
+            luma_bits: bits,
+            chroma_bits: bits,
+            width,
+            height,
+            range_extensions: false,
+        };
+        (codec, stream)
+    };
+    let configs = [
+        config(Profile::H264_MAIN, RT_YUV420, (4096, 4096), Some((64, 64))),
+        config(Profile::H264_HIGH, RT_YUV420, (4096, 2304), None),
+        config(
+            Profile::HEVC_MAIN,
+            RT_YUV420,
+            (8192, 8192),
+            Some((128, 128)),
+        ),
+        config(
+            Profile::HEVC_MAIN10,
+            RT_YUV420 | RT_YUV420_10,
+            (8192, 4352),
+            None,
+        ),
+    ];
+    for (codec, taken) in [
+        stream(h264, 77, 64, 64),
+        stream(h264, 77, 4096, 4080),
+        stream(h264, 66, 64, 64),
+        stream(h264, 100, 16, 16),
+        stream(h264, 100, 3840, 2160),
+        stream(hevc, 8, 128, 128),
+        stream(hevc, 8, 8192, 8192),
+        stream(hevc, 10, 8, 8),
+        stream(hevc, 10, 8192, 4352),
+    ] {
+        assert_eq!(declines(&configs, codec, &taken), None, "{taken:?}");
+    }
+    for ((codec, declined), why) in [
+        (
+            stream(h264, 77, 48, 64),
+            "VA-API decodes H264Main from 64x64, not 48x64",
+        ),
+        (
+            stream(h264, 66, 64, 48),
+            "VA-API decodes H264Main from 64x64, not 64x48",
+        ),
+        (
+            stream(h264, 77, 4096, 4096),
+            "VA-API decodes H264Main up to 4096x4096 (65535 macroblocks), not 4096x4096",
+        ),
+        (
+            stream(h264, 100, 4096, 2320),
+            "VA-API decodes H264High up to 4096x2304 (65535 macroblocks), not 4096x2320",
+        ),
+        (
+            stream(hevc, 8, 120, 128),
+            "VA-API decodes HEVCMain from 128x128, not 120x128",
+        ),
+        (
+            stream(hevc, 8, 8200, 128),
+            "VA-API decodes HEVCMain up to 8192x8192, not 8200x128",
+        ),
+        (
+            stream(hevc, 10, 1920, 4360),
+            "VA-API decodes HEVCMain10 up to 8192x4352, not 1920x4360",
+        ),
+    ] {
+        assert_eq!(declines(&configs, codec, &declined).as_deref(), Some(why));
+    }
+    let eight_bits_alone = [
+        config(Profile::H264_HIGH, RT_YUV420, (4096, 2304), None),
+        config(Profile::HEVC_MAIN10, RT_YUV420, (8192, 4352), None),
+    ];
+    let (codec, ten_bits) = stream(hevc, 10, 1920, 1080);
+    assert_eq!(
+        declines(&eight_bits_alone, codec, &ten_bits).as_deref(),
+        Some("VA-API: the driver has no HEVCMain10 decoder of YUV420_10 render targets")
+    );
+    // iHD's H.264 config lists 8192x8192, and its surfaces 4096x4096.
+    let mut ihd = config(Profile::H264_HIGH, RT_YUV420, (8192, 8192), Some((16, 16)));
+    if let Ok(surfaces) = ihd.surfaces.as_mut() {
+        (surfaces.max_width, surfaces.max_height) = (Some(4096), Some(4096));
+    }
+    let (codec, wide) = stream(h264, 100, 4112, 2160);
+    assert_eq!(
+        declines(std::slice::from_ref(&ihd), codec, &wide).as_deref(),
+        Some("VA-API decodes H264High up to 4096x4096 (65535 macroblocks), not 4112x2160")
+    );
+    let (codec, uhd) = stream(h264, 100, 4096, 2160);
+    assert_eq!(declines(std::slice::from_ref(&ihd), codec, &uhd), None);
+    let (codec, baseline) = stream(h264, 66, 1920, 1088);
+    assert_eq!(declines(&eight_bits_alone, codec, &baseline), None);
+    let (codec, main) = stream(h264, 77, 1920, 1088);
+    assert_eq!(declines(&eight_bits_alone, codec, &main), None);
+    assert_eq!(
+        declines(&[], codec, &main).as_deref(),
+        Some("VA-API: the driver has no H264Main or H264High decoder of YUV420 render targets")
+    );
+}
+
 /// The layout is granularity [2, 2] at the largest alignment the import check found for the
 /// codec's formats, and zero where it found none
 #[test]

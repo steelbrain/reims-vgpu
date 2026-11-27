@@ -216,11 +216,12 @@ impl VaH264 {
     }
 }
 
-/// The VA profiles that decode `sps`'s stream, most constrained first:
-/// Baseline streams (with FMO refused and redundant slices dropped) are
-/// Constrained Baseline's subset of Main.
-fn profile_candidates(sps: &Sps) -> &'static [Profile] {
-    match sps.profile_idc {
+/// The VA profiles that decode a stream of `profile_idc`, most constrained
+/// first, of which the decoder decodes on the first the driver lists with
+/// 4:2:0 render targets: Baseline streams (with FMO refused and redundant
+/// slices dropped) are Constrained Baseline's subset of Main.
+pub fn decoder_profiles(profile_idc: u8) -> &'static [Profile] {
+    match profile_idc {
         66 => &[
             Profile::H264_CONSTRAINED_BASELINE,
             Profile::H264_MAIN,
@@ -243,7 +244,7 @@ fn select_profile(display: &Display, sps: &Sps) -> Result<Profile, Error> {
              {H264_MAX_MACROBLOCKS} the drivers decode"
         )));
     }
-    for &profile in profile_candidates(sps) {
+    for &profile in decoder_profiles(sps.profile_idc) {
         if !display.supports(profile, Entrypoint::VLD) {
             continue;
         }
@@ -271,7 +272,7 @@ fn select_profile(display: &Display, sps: &Sps) -> Result<Profile, Error> {
     Err(Error::Unsupported(format!(
         "H.264 profile_idc {} (no VA profile of {:?})",
         sps.profile_idc,
-        profile_candidates(sps)
+        decoder_profiles(sps.profile_idc)
             .iter()
             .filter_map(|p| p.name())
             .collect::<Vec<_>>()

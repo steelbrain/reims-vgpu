@@ -19,10 +19,11 @@
 //!   AV1's Main profile at 8 and 10 bits, whose samples go to the backend whole, temporal units
 //!   of OBUs, after the record's `configOBUs` (`av1`), in the profiles and tools the codec's
 //!   `check_supported` takes, which every arm's decode of a picture checks: a stream of
-//!   monochrome pictures (a HEIC image's alpha), of deeper samples, or of a chroma format and
-//!   depth the arm declines ([`Backend::declines`], from its own query of the host's decoder; a
-//!   HEIC image's 4:4:4 thumbnail where the arm decodes no 4:4:4) is refused at its start, not
-//!   at each frame, with a warning that names why, and the stream's
+//!   monochrome pictures (a HEIC image's alpha), of deeper samples, or of a chroma format, depth
+//!   or coded size the arm declines ([`Backend::declines`], from its own query of the host's
+//!   decoder; a HEIC image's 4:4:4 thumbnail where the arm decodes no 4:4:4, a stream smaller
+//!   than the decoder's least size) is refused at its start, not at each frame, with a warning
+//!   that names why, and the stream's
 //!   profile, chroma format, bit depths and size ([`Undecoded`]). A started session sends `Dpba`,
 //!   the attributes the guest's output buffers are to have: the two-plane CoreVideo format of its
 //!   chroma, depth and range that the guest's own software decoder lands the stream in

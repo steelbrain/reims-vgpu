@@ -76,8 +76,8 @@ pub use encoder::{
 };
 pub use export::{ExportedPlane, SurfaceExport};
 pub use frame::{Frame, FrameHold, GuestWrites, PlaneRows, ReadBack};
-pub use h264::{H264_MAX_MACROBLOCKS, H264Decoder};
-pub use hevc::{HevcDecoder, range_extensions_decoder};
+pub use h264::{H264_MAX_MACROBLOCKS, H264Decoder, decoder_profiles as h264_decoder_profiles};
+pub use hevc::{HevcDecoder, main_decoder as hevc_main_decoder, range_extensions_decoder};
 pub use import_check::{ImportWrite, ImportWrites};
 pub use libva::LoadError;
 pub use readback::{ReadbackTimes, ReadbackWay, read_back_by};

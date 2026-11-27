@@ -93,7 +93,11 @@ NVIDIA parser is used: the codec module parses every stream, as for VA-API.
 Each has 2 decode engines. NVDEC also lists H.264 at 10 bits and 4:2:2,
 and HEVC 4:2:2 and 4:4:4, which the device's caps do not offer; HEVC's
 range extensions at 4:2:0 and 4:4:4 are decoded for VideoToolbox's
-paravirtual decoders ([devices.md](devices.md)), and its 4:2:2 is not.
+paravirtual decoders ([devices.md](devices.md)), and its 4:2:2 is not. A
+paravirtual session of a stream outside the sizes of its codec, chroma
+format and depth is refused at its start, and the guest decodes it in
+software ([devices.md](devices.md), "A stream outside the host decoder's
+sizes").
 
 The RTX 3090 (620.70.06, `nvidia-probe`, 2026-11-22) answers HEVC 4:4:4 at
 8 bits from 144x144 to 8192x8192, 262,144 macroblocks, into `Yuv444`

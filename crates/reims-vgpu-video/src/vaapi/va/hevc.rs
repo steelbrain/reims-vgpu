@@ -249,13 +249,13 @@ impl VaHevc {
 /// formats.
 fn profile_for(sps: &Sps, range_extensions: bool) -> Result<(Profile, SurfaceFormat), Error> {
     if !hevc::is_range_extensions(sps) {
-        return match (sps.chroma_format_idc, sps.bit_depth_luma_minus8) {
-            (1, 0) => Ok((Profile::HEVC_MAIN, SurfaceFormat::Nv12)),
-            (1, 2) => Ok((Profile::HEVC_MAIN10, SurfaceFormat::P010)),
-            _ => Err(Error::Unsupported(
-                "HEVC Main: VA-API decodes 4:2:0 at 8 and 10 bits".into(),
-            )),
-        };
+        let bits = sps.bit_depth_luma_minus8.saturating_add(8);
+        return (sps.chroma_format_idc == 1)
+            .then(|| main_format(bits))
+            .flatten()
+            .ok_or_else(|| {
+                Error::Unsupported("HEVC Main: VA-API decodes 4:2:0 at 8 and 10 bits".into())
+            });
     }
     if !range_extensions {
         return Err(Error::Unsupported(
@@ -292,6 +292,24 @@ fn range_extensions_format(chroma_format_idc: u8, bits: u8) -> Option<(Profile, 
         (3, 12) => (Profile::HEVC_MAIN444_12, SurfaceFormat::Y412),
         _ => return None,
     })
+}
+
+/// The profile and surface format of a 4:2:0 stream of Main or Main 10 at
+/// `bits`: Main at 8 bits into NV12, Main 10 at 10 into P010.
+fn main_format(bits: u8) -> Option<(Profile, SurfaceFormat)> {
+    match bits {
+        8 => Some((Profile::HEVC_MAIN, SurfaceFormat::Nv12)),
+        10 => Some((Profile::HEVC_MAIN10, SurfaceFormat::P010)),
+        _ => None,
+    }
+}
+
+/// What a 4:2:0 stream of Main or Main 10 at `bits` decodes on, for a caller that checks the
+/// driver's answers for it: the profile and the render-target format (a `VA_RT_FORMAT_*` bit)
+/// its config is made with; `None` for a depth the decoder takes none of.
+pub fn main_decoder(bits: u8) -> Option<(Profile, u32)> {
+    let (profile, format) = main_format(bits)?;
+    Some((profile, format.rt_format()))
 }
 
 /// What a range extensions stream of `chroma_format_idc` at `bits` decodes on, for a caller that

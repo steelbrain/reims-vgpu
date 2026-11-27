@@ -50,8 +50,8 @@ profile of (`guest_encoders` in `graphics/vaapi.rs` and `graphics/nvidia.rs`). S
 an arm64 guest decodes H.264, HEVC and VP9 and encodes H.264 and HEVC Main and Main 10 in
 hardware; on a Windows host it decodes alone, as the Windows arm answers no encoder. Its decoders
 land 4:2:0 pictures, and HEVC's range extensions, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits,
-where the arm's own query lists a decoder of the stream (`guest_declines`; "HEVC's range
-extensions on arm64 guests", below).
+where the arm's own query lists a decoder of the stream at its size (`guest_declines`; "A stream
+outside the host decoder's sizes" and "HEVC's range extensions on arm64 guests", below).
 
 VP9 reaches the host by this route alone. Its caps entry (codec 3, `RGFX_VIDEO_CODEC_VP9`) lists
 profile 0, into NV12, where the arm decodes VP9 at 8 bits, and profile 2, into P010, where it
@@ -431,6 +431,41 @@ Both run in reims-vgpu's host video session (`graphics/video_host.rs`, [backends
 in host bytes, and the session copies it into the cache on a runtime queue. Each session counts
 how its pictures landed, and logs the counts at its end ([vaapi.md](vaapi.md), "The
 reims-graphics device").
+
+## A stream outside the host decoder's sizes
+
+A host decoder takes pictures from its least size up to its largest, as the arm's own query of it
+lists them:
+
+- **NVDEC**: its caps of the stream's codec at its chroma format and depth (`cuvidGetDecoderCaps`),
+  from `nMinWidth` by `nMinHeight` up to `nMaxWidth` by `nMaxHeight` and `nMaxMBCount` blocks of
+  16x16, which the decoder's make checks too: on the RTX 5080 Laptop GPU, H.264 from 48x64 and
+  HEVC from 144x144 ([bugs.md](bugs.md), D14).
+- **VA-API**: the driver's decoder the VA crate's decoder picks for the stream, of the first
+  profile that decodes it the driver lists with its render targets (for H.264, of Constrained
+  Baseline, Main and High; for HEVC, Main, Main 10 or the range extensions' profile of the
+  stream's chroma format and depth), from the least size its surfaces list (none, where they list
+  none) up to the least of the largest its config and its surfaces list (iHD's H.264 config lists
+  8192x8192, its surfaces 4096x4096), and for H.264 at most the 65,535 blocks the VA crate's
+  decoder takes.
+
+An x86-64 guest's caps carry the decoder's sizes, and the guest's video driver refuses a session
+of a coded size outside them at its create, so VideoToolbox decodes such a stream in software
+(`guest/bundle/src/RgfxVideoDriver.cpp`). On an arm64 guest, a VideoToolbox session of an H.264
+or HEVC stream whose coded size lies outside them is refused at its `dsta`, its warning naming the
+stream and the sizes (`guest_declines` in `graphics/nvidia.rs` and `graphics/vaapi.rs`, through
+`graphics/decode_sizes.rs`, as `NVDEC decodes HEVC 4:2:0 from 144x144, not 128x128`), and the
+guest's VideoToolbox decodes the stream in software where its client allows it. Before, the
+session was made and its pictures failed in the host's decoder. AV1's sessions are checked
+against the arm's AV1 decoder the same way ("AV1 on arm64 guests", above).
+
+Measured on an arm64 macOS 26.6.2 guest under TCG on an RTX 3090 host (potluck job m3-max-77509,
+2026-11-27), each stream decoded by a session that allows a hardware decoder and requires none:
+H.264 at 32x32, HEVC Main at 128x128 and Main 10 at 128x96, each under the 3090's least size (H.264
+48x16, HEVC 144x144), were refused at their `dsta` with `NVDEC decodes H.264 from 48x16, not 32x32`
+and `NVDEC decodes HEVC 4:2:0 from 144x144, not ...`, and the guest decoded each stream's 30
+pictures in software, every one the same as a decode that allows no hardware decoder; H.264 and
+HEVC Main at 640x360 decoded in hardware, every picture the same.
 
 ## HEVC's range extensions on arm64 guests
 

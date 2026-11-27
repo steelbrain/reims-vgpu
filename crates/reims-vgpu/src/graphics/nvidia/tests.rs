@@ -873,3 +873,138 @@ fn nvidia_errors_reach_videotoolbox_as_their_kind() {
         VideoError::Malfunction("every decode surface is held".to_owned())
     );
 }
+
+/// What NVDEC answers of `codec` at `chroma` and `bits`: decoded into NV12 and P016, from `min`
+/// up to `max` and the blocks `max` holds.
+fn nvdec_answer(
+    codec: NvdecCodec,
+    chroma: ChromaFormat,
+    bits: u32,
+    min: (u32, u32),
+    max: (u32, u32),
+) -> DecodeCapabilities {
+    DecodeCapabilities {
+        codec,
+        chroma,
+        bit_depth: bits,
+        supported: true,
+        engines: 1,
+        output_formats: vec![SurfaceFormat::Nv12, SurfaceFormat::P016],
+        max_width: max.0,
+        max_height: max.1,
+        max_macroblocks: (max.0 / 16) * (max.1 / 16),
+        min_width: min.0,
+        min_height: min.1,
+    }
+}
+
+/// A 4:2:0 stream of H.264, or of HEVC's Main or Main 10, is declined at its session's start
+/// where NVDEC's caps of its codec at its depth leave its size out (each side from the least up
+/// to the largest, and the blocks), or say NVDEC does not decode it, naming why; and taken within
+/// them. The caps are the RTX 5080 Laptop GPU's least sizes, H.264 from 48x64 and HEVC from
+/// 144x144 (`docs/video/bugs.md`, D14)
+#[test]
+fn a_4_2_0_stream_outside_nvdecs_caps_is_declined_at_its_start() {
+    use reims_vgpu_video::paravirt::Codec as StreamCodec;
+    type Answer = Result<DecodeCapabilities, String>;
+    let (h264, hevc) = (RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC);
+    // The device's codec and a 4:2:0 stream of it.
+    let stream = |codec: u32, luma_bits: u8, width: u32, height: u32| {
+        let (of, profile) = if codec == h264 {
+            (StreamCodec::H264, 100)
+        } else {
+            (StreamCodec::Hevc, 1)
+        };
+        let stream = Stream {
+            codec: of,
+            profile,
+            chroma_format_idc: 1,
+            luma_bits,
+            chroma_bits: luma_bits,
+            width,
+            height,
+            range_extensions: false,
+        };
+        (codec, stream)
+    };
+    let caps = |codec: NvdecCodec, chroma: ChromaFormat, bits: u32| -> Answer {
+        Ok(match codec {
+            NvdecCodec::H264 => nvdec_answer(codec, chroma, bits, (48, 64), (4096, 4096)),
+            _ => nvdec_answer(codec, chroma, bits, (144, 144), (8192, 8192)),
+        })
+    };
+    for (codec, taken) in [
+        stream(h264, 8, 48, 64),
+        stream(h264, 8, 1920, 1088),
+        stream(h264, 8, 4096, 4096),
+        stream(hevc, 8, 144, 144),
+        stream(hevc, 8, 8192, 8192),
+        stream(hevc, 10, 144, 144),
+        stream(hevc, 10, 3840, 2160),
+    ] {
+        assert_eq!(declines(&caps, codec, &taken), None, "{taken:?}");
+    }
+    for ((codec, declined), why) in [
+        (
+            stream(h264, 8, 32, 64),
+            "NVDEC decodes H.264 from 48x64, not 32x64",
+        ),
+        (
+            stream(h264, 8, 48, 48),
+            "NVDEC decodes H.264 from 48x64, not 48x48",
+        ),
+        (
+            stream(h264, 8, 4112, 64),
+            "NVDEC decodes H.264 up to 4096x4096 (65536 macroblocks), not 4112x64",
+        ),
+        (
+            stream(hevc, 8, 128, 128),
+            "NVDEC decodes HEVC 4:2:0 from 144x144, not 128x128",
+        ),
+        (
+            stream(hevc, 10, 144, 136),
+            "NVDEC decodes HEVC 4:2:0 from 144x144, not 144x136",
+        ),
+        (
+            stream(hevc, 8, 8200, 144),
+            "NVDEC decodes HEVC 4:2:0 up to 8192x8192 (262144 macroblocks), not 8200x144",
+        ),
+        (
+            stream(hevc, 10, 144, 8200),
+            "NVDEC decodes HEVC 4:2:0 up to 8192x8192 (262144 macroblocks), not 144x8200",
+        ),
+    ] {
+        assert_eq!(declines(&caps, codec, &declined).as_deref(), Some(why));
+    }
+    let blocks = |codec: NvdecCodec, chroma: ChromaFormat, bits: u32| -> Answer {
+        Ok(DecodeCapabilities {
+            max_macroblocks: 8160,
+            ..nvdec_answer(codec, chroma, bits, (144, 144), (4096, 4096))
+        })
+    };
+    let (codec, fits) = stream(hevc, 8, 1920, 1080);
+    assert_eq!(declines(&blocks, codec, &fits), None);
+    let (codec, wider) = stream(hevc, 8, 2048, 1080);
+    assert_eq!(
+        declines(&blocks, codec, &wider).as_deref(),
+        Some("NVDEC decodes HEVC 4:2:0 up to 4096x4096 (8160 macroblocks), not 2048x1080")
+    );
+    let eight_bits_alone = |codec: NvdecCodec, chroma: ChromaFormat, bits: u32| -> Answer {
+        Ok(DecodeCapabilities {
+            supported: bits == 8,
+            ..nvdec_answer(codec, chroma, bits, (144, 144), (8192, 8192))
+        })
+    };
+    let (codec, ten_bits) = stream(hevc, 10, 1920, 1080);
+    assert_eq!(
+        declines(&eight_bits_alone, codec, &ten_bits).as_deref(),
+        Some("NVDEC does not decode HEVC 4:2:0 at 10 bits")
+    );
+    let refused =
+        |_: NvdecCodec, _: ChromaFormat, _: u32| -> Answer { Err("no CUDA device".to_owned()) };
+    let (codec, any) = stream(h264, 8, 1920, 1088);
+    assert_eq!(
+        declines(&refused, codec, &any).as_deref(),
+        Some("NVDEC's caps of H.264 at 8 bits: no CUDA device")
+    );
+}

@@ -79,7 +79,11 @@
 //! - **VideoToolbox's paravirtual decoders** (`VaGuestDecoder`, `super::vt`): an arm64 guest's
 //!   decode lands in the IOSurface its kext lent, written there by the driver's video processing
 //!   (`Frame::write_to_guest`, the first way above) where the import check takes the surface's
-//!   layout and memory, else read back and copied by the CPU into the surface's pages. An HEVC
+//!   layout and memory, else read back and copied by the CPU into the surface's pages. A 4:2:0
+//!   stream of H.264, or of HEVC's Main or Main 10, decodes where the driver's decoder the VA
+//!   crate's decoder picks for it takes its coded size (`declines_4_2_0`, from the driver's own
+//!   answers: the least size its surfaces list, the largest its config and its surfaces list);
+//!   elsewhere its session is refused at its start, and the guest decodes it in software. An HEVC
 //!   stream of the range extensions decodes where the driver's decoder of its chroma format and
 //!   depth takes it (`declines_range_extensions`, from the driver's own answers: the profile, its
 //!   render-target format, its surfaces' FOURCC and sizes; the VA crate's
@@ -140,6 +144,7 @@ use reims_vgpu_video::vaapi::{
 use reims_vgpu_video::vaapi::{SurfaceCapabilities, range_extensions_decoder, rt_format_names};
 #[cfg(unix)]
 use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, TargetChecks, TargetPlane, TargetShape};
+use reims_vgpu_video::vaapi::{h264_decoder_profiles, hevc_main_decoder};
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::num::ToUsize as _;
@@ -670,35 +675,92 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
 
 /// Why the driver's decoders among `configs` take none of `stream`'s pictures, a stream of
 /// `codec` the codec module takes: an HEVC stream of the range extensions as
-/// [`declines_range_extensions`] says; any other but 4:2:0's; `None` where they decode it.
+/// [`declines_range_extensions`] says; a 4:2:0 stream of H.264, or of HEVC's Main or Main 10,
+/// as [`declines_4_2_0`] says; any other; `None` where they decode it.
 fn declines(configs: &[ConfigCapabilities], codec: u32, stream: &Stream) -> Option<String> {
     if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
         return declines_range_extensions(configs, stream);
     }
-    (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
-        format!(
+    if stream.chroma_format_idc != 1 || stream.range_extensions {
+        return Some(format!(
             "{NAME}'s decoders land 4:2:0 pictures, and HEVC's range extensions where the \
              driver decodes them, alone"
-        )
-    })
+        ));
+    }
+    declines_4_2_0(configs, codec, stream)
+}
+
+/// Why the driver decodes none of a 4:2:0 `stream`'s pictures, of H.264 or of HEVC's Main or
+/// Main 10, `None` where it decodes them: on the decoder among `configs` the VA crate's decoder
+/// picks for it, the first of its profiles (`h264_decoder_profiles`, `hevc_main_decoder`) the
+/// driver lists with its render targets, within its sizes ([`sizes_of`]; and H.264's at most
+/// `H264_MAX_MACROBLOCKS`, past which the VA crate's decoder refuses it).
+fn declines_4_2_0(configs: &[ConfigCapabilities], codec: u32, stream: &Stream) -> Option<String> {
+    let hevc = hevc_main_decoder(stream.luma_bits);
+    let (profiles, rt_format, max_macroblocks) = match (codec, &hevc) {
+        (RGFX_VIDEO_CODEC_H264, _) => (
+            h264_decoder_profiles(stream.profile),
+            RT_YUV420,
+            Some(H264_MAX_MACROBLOCKS),
+        ),
+        (RGFX_VIDEO_CODEC_HEVC, Some((profile, rt_format))) => {
+            (std::slice::from_ref(profile), *rt_format, None)
+        }
+        (RGFX_VIDEO_CODEC_HEVC, None) => {
+            return Some(format!(
+                "{NAME} decodes HEVC Main and Main 10 at 8 and 10 bits, not {}",
+                stream.luma_bits
+            ));
+        }
+        (other, _) => return Some(format!("{NAME} decodes no codec {other} here")),
+    };
+    let decoder = profiles.iter().find_map(|&profile| {
+        configs.iter().find(|config| {
+            config.profile == profile
+                && (config.rt_formats).is_none_or(|formats| formats & rt_format != 0)
+        })
+    });
+    let Some(config) = decoder else {
+        let names: Vec<&str> = profiles
+            .iter()
+            .filter_map(|profile| profile.name())
+            .collect();
+        return Some(format!(
+            "{NAME}: the driver has no {} decoder of {} render targets",
+            names.join(" or "),
+            rt_format_names(rt_format).join(", ")
+        ));
+    };
+    let name = config.profile.name().unwrap_or("its");
+    let sizes = DecodeSizes {
+        max_macroblocks,
+        ..sizes_of(config, config.surfaces.as_ref().ok())
+    };
+    sizes.declines(
+        &format!("{NAME} decodes {name}"),
+        stream.width,
+        stream.height,
+    )
 }
 
 /// The sizes `config`'s decoder takes, of `surfaces`: from the least its surfaces list (0 where
-/// they list none) up to the largest the config lists, else its surfaces.
+/// they list none) up to the least of the largest the config and its surfaces list, either of
+/// which refuses a picture past it (iHD's H.264 config lists 8192x8192, and its surfaces 4096x4096:
+/// `docs/video/vaapi.md`, "The H.264 decoder").
 fn sizes_of(config: &ConfigCapabilities, surfaces: Option<&SurfaceCapabilities>) -> DecodeSizes {
     let listed = |of: fn(&SurfaceCapabilities) -> Option<u32>| surfaces.and_then(of);
+    let least = |a: Option<u32>, b: Option<u32>| match (a, b) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b).unwrap_or(u32::MAX),
+    };
     DecodeSizes {
         min: (
             listed(|s| s.min_width).unwrap_or(0),
             listed(|s| s.min_height).unwrap_or(0),
         ),
         max: (
-            (config.max_width)
-                .or(listed(|s| s.max_width))
-                .unwrap_or(u32::MAX),
-            (config.max_height)
-                .or(listed(|s| s.max_height))
-                .unwrap_or(u32::MAX),
+            least(config.max_width, listed(|s| s.max_width)),
+            least(config.max_height, listed(|s| s.max_height)),
         ),
         max_macroblocks: None,
     }

@@ -18,6 +18,10 @@ pub use va::{
     read_back_by, rt_format_names,
 };
 
+/// What the paravirtual route checks a stream's start against: the profiles a decoder of it
+/// decodes on.
+pub use va::{h264_decoder_profiles, hevc_main_decoder};
+
 /// A pool's surface on Windows, a shared Direct3D 12 texture, which a frame names
 /// (`Frame::texture`).
 #[cfg(windows)]

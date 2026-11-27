@@ -1876,7 +1876,13 @@ Stages:
       session's `dsta` on one is refused with
       `kVTVideoDecoderUnsupportedDataFormatErr`: the arms decode 4:2:0
       pictures, of 8 bits, or 10 in HEVC, in the profiles and tools the
-      codec's `check_supported` takes, and NVDEC and VA-API also HEVC's
+      codec's `check_supported` takes, at the coded sizes the arm's own
+      query of its decoder lists (NVDEC's caps of the codec at the
+      stream's chroma format and depth; the VA driver's decoder of the
+      stream's profile, from its surfaces' least size up to the least of
+      its config's and its surfaces' largest;
+      [devices.md](../video/devices.md), "A stream outside the host
+      decoder's sizes"), and NVDEC and VA-API also HEVC's
       range extensions, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits,
       where the arm's own query lists a decoder of the stream: NVDEC's caps
       for its chroma format, depth and size, 4:2:2 aside, or the VA
@@ -1900,9 +1906,11 @@ Stages:
       guests"). A
       stream the codec refuses (monochrome, a HEIC image's alpha item, a
       depth past 12 bits, screen content coding), or one the arm declines
-      (a range extensions stream on a VA driver without its decoder,
-      radeonsi's, or on an NVIDIA GPU whose caps lack it, and HEVC 4:2:2
-      on NVDEC: the arm's `guest_declines`), is then refused at
+      (a stream of a coded size outside its decoder's, as HEVC under
+      NVDEC's 144x144; a range extensions stream on a VA driver without
+      its decoder, radeonsi's, or on an NVIDIA GPU whose caps lack it,
+      and HEVC 4:2:2 on NVDEC: the arm's `guest_declines`), is then
+      refused at
       the session's start, not at
       each tile or frame, and every tile a session takes lands in the
       format its `TDrs` names. The refusal's warning names the stream and

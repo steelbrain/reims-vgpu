@@ -55,7 +55,10 @@
 //!   GPU, one `cuMemcpy2D` a plane into the view of its pages registered with CUDA, as into an
 //!   output's pages above, else read back and copied by the CPU, each reason logged once a
 //!   decoder. So every decode codec of the caps has one, and the device offers `VT_MESSAGES`
-//!   where NVDEC decodes H.264 or HEVC.
+//!   where NVDEC decodes H.264 or HEVC. A session of a stream whose coded size lies outside
+//!   NVDEC's caps of its codec at its chroma format and depth (`nMinWidth` by `nMinHeight` up to
+//!   `nMaxWidth` by `nMaxHeight` and `nMaxMBCount`, as the decoder's make checks them) is refused
+//!   at its start ([`declines`]), and the guest decodes the stream in software.
 //!   - **VP9** decodes there alone, profile 0 where NVDEC decodes VP9 at 8 bits and profile 2
 //!     where it does at 10 ([`vp9_caps`]), each sample a frame or a superframe whole, and lands as
 //!     H.264's and HEVC's 4:2:0 pictures do. Its caps entry, codec 3, is skipped by an x86
@@ -492,17 +495,26 @@ type CapsOf<'a> = &'a dyn Fn(NvdecCodec, ChromaFormat, u32) -> Result<DecodeCapa
 
 /// Why NVDEC's decoders take none of `stream`'s pictures, a stream of `codec` the codec module
 /// takes, by what `caps` answers: an HEVC stream of the range extensions as
-/// [`declines_range_extensions`] says; any other but 4:2:0's; `None` where they decode it.
+/// [`declines_range_extensions`] says; a 4:2:0 stream of H.264, or of HEVC's Main or Main 10,
+/// where the caps of its codec at 4:2:0 and its depth do not say NVDEC decodes it, at its size
+/// among them ([`declines_by`]); any other; `None` where they decode it.
 fn declines(caps: CapsOf<'_>, codec: u32, stream: &Stream) -> Option<String> {
     if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
         return declines_range_extensions(caps, stream);
     }
-    (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
-        format!(
+    if stream.chroma_format_idc != 1 || stream.range_extensions {
+        return Some(format!(
             "{NAME}'s decoders land 4:2:0 pictures, and HEVC's range extensions where NVDEC \
              decodes them, alone"
-        )
-    })
+        ));
+    }
+    let (nvdec, what) = match codec {
+        RGFX_VIDEO_CODEC_H264 => (NvdecCodec::H264, "H.264"),
+        RGFX_VIDEO_CODEC_HEVC => (NvdecCodec::Hevc, "HEVC 4:2:0"),
+        other => return Some(format!("{NAME} decodes no codec {other} here")),
+    };
+    let (chroma, bits) = (ChromaFormat::Yuv420, u32::from(stream.luma_bits));
+    declines_by(caps(nvdec, chroma, bits), what, chroma, bits, stream)
 }
 
 /// Why NVDEC's decoders take none of `stream`'s pictures, an HEVC stream of the range
