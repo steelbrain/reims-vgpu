@@ -12,10 +12,12 @@
 //! dynlink_cuviddec.h names ("scaling lists (diag order)") and the codec
 //! crate keeps them in.
 //!
-//! The range extensions' streams the codec crate decodes, 4:4:4 at 8 bits,
-//! decode into NVDEC's three planes ([`NvdecHevc::four_four_four`]), their
-//! tools and chroma QP offset lists in the picture parameters' range
-//! extension fields.
+//! The range extensions' streams the codec crate decodes, where the caller
+//! lands them ([`NvdecHevc::range_extensions`]): 4:2:0 at 8, 10 and 12 bits
+//! into NV12 and P016, and 4:4:4 at 8, 10 and 12 bits into NVDEC's three
+//! planes, their tools and chroma QP offset lists in the picture parameters'
+//! range extension fields. Their 4:2:2 streams decode into no format built
+//! here, and are refused.
 
 use std::ffi::{c_int, c_ushort};
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use crate::codec::PictureRole;
 use crate::codec::hevc::nal::{is_idr, is_irap};
 use crate::codec::hevc::pps::Pps;
 use crate::codec::hevc::sps::Sps;
-use crate::codec::hevc::{Accelerator, PictureParams, SliceParams};
+use crate::codec::hevc::{self, Accelerator, PictureParams, SliceParams};
 
 use super::decoder::{
     Decoder, DecoderSpec, InPlace, Picture, SPARE_SURFACES, active, surface_count,
@@ -40,9 +42,10 @@ pub(crate) struct NvdecHevc {
     decoder: Option<Decoder>,
     /// The sample being decoded, for its slices to go to NVDEC in place.
     pub(crate) in_place: InPlace,
-    /// Whether its caller lands 4:4:4 pictures, three planes each: a 4:4:4
-    /// stream's configure is refused without it.
-    pub(crate) four_four_four: bool,
+    /// Whether its caller lands the range extensions' pictures, 4:4:4 ones
+    /// in three planes each: a range extensions stream's configure is
+    /// refused without it.
+    pub(crate) range_extensions: bool,
 }
 
 impl NvdecHevc {
@@ -51,7 +54,7 @@ impl NvdecHevc {
             gpu,
             decoder: None,
             in_place: InPlace::default(),
-            four_four_four: false,
+            range_extensions: false,
         }
     }
 
@@ -61,8 +64,8 @@ impl NvdecHevc {
 }
 
 /// The decoder `sps`'s pictures need, with a DPB of `dpb_size` pictures: 4:4:4
-/// where the SPS's `chroma_format_idc` is 3, else 4:2:0, the one other the codec
-/// crate decodes.
+/// where the SPS's `chroma_format_idc` is 3, else 4:2:0, the one other the
+/// configure takes (it refuses 4:2:2).
 pub(crate) fn spec(sps: &Sps, dpb_size: usize) -> DecoderSpec {
     DecoderSpec {
         codec: NvdecCodec::Hevc,
@@ -85,9 +88,15 @@ impl Accelerator for NvdecHevc {
     fn configure(&mut self, sps: &Sps, dpb_size: usize) -> Result<(), Error> {
         self.decoder = None;
         let spec = spec(sps, dpb_size);
-        if spec.chroma == ChromaFormat::Yuv444 && !self.four_four_four {
+        if hevc::is_range_extensions(sps) && !self.range_extensions {
             return Err(Error::Unsupported(
-                "HEVC 4:4:4: its caller lands 4:2:0 pictures alone".to_owned(),
+                "HEVC range extensions: its caller lands Main and Main 10 pictures alone"
+                    .to_owned(),
+            ));
+        }
+        if sps.chroma_format_idc == 2 {
+            return Err(Error::Unsupported(
+                "HEVC 4:2:2: no NVDEC output of it is built here".to_owned(),
             ));
         }
         self.decoder = Some(Decoder::new(Arc::clone(&self.gpu), &spec)?);

@@ -1,14 +1,18 @@
 //! HEVC decoding on VA-API: [`crate::codec::hevc::Decoder`] over an accelerator
 //! that fills libva's HEVC buffers (va_dec_hevc.h) and decodes into a pool
 //! of NV12 surfaces for Main, P010 ones for Main 10, and, for a caller that
-//! lands 4:4:4 pictures ([`HevcDecoder::lands_4_4_4`]), XYUV ones for the
-//! range extensions' 4:4:4 at 8 bits, on the driver's `HEVCMain444`. Those
-//! pictures' parameters go as va_dec_hevc.h's `…Extension` structures, the
-//! base one with the range extensions' after it, in the picture's and each
-//! slice's parameter buffer, as ffmpeg sends them for that profile.
+//! lands the range extensions' pictures
+//! ([`HevcDecoder::lands_range_extensions`]), the surfaces of the driver's
+//! range extensions profile of the stream's chroma format and depth
+//! ([`range_extensions_decoder`]): `HEVCMain12`'s P012 (NV12 and P010 at 8
+//! and 10 bits), `HEVCMain422_10`'s YUY2 and Y210, `HEVCMain422_12`'s Y212,
+//! `HEVCMain444`'s XYUV, `HEVCMain444_10`'s Y410 and `HEVCMain444_12`'s Y412.
+//! Those pictures' parameters go as va_dec_hevc.h's `…Extension` structures,
+//! the base one with the range extensions' after it, in the picture's and
+//! each slice's parameter buffer, as ffmpeg sends them for those profiles.
 
 use super::buffer::{Buffer, render_decode};
-use super::caps::{Context, Entrypoint, Profile};
+use super::caps::{Context, Entrypoint, Fourcc, Profile};
 use super::display::{Display, Error};
 use super::ffi;
 use super::frame::Frame;
@@ -42,8 +46,9 @@ const MAX_CURRENT_REFERENCES: usize = 8;
 /// record's length size, as VideoToolbox's samples are, or Annex B for
 /// [`HevcDecoder::new_annex_b`]. Frames come out in decode order unless
 /// [`HevcDecoder::set_output_order`] asks for display order. Main streams
-/// decode into NV12 frames, Main 10 ones into P010, and 4:4:4 ones at 8 bits
-/// into XYUV where the caller lands them ([`HevcDecoder::lands_4_4_4`]).
+/// decode into NV12 frames, Main 10 ones into P010, and the range extensions'
+/// into their profile's surfaces where the caller lands them
+/// ([`HevcDecoder::lands_range_extensions`]).
 pub struct HevcDecoder {
     inner: Decoder<VaHevc>,
 }
@@ -58,9 +63,10 @@ impl HevcDecoder {
     /// A decoder for samples described by an `hvcC` record (ISO/IEC
     /// 14496-15, 8.3.3.1), whose parameter sets it takes. The record's
     /// first SPS is checked against what the decoder and the driver take,
-    /// so that a stream they cannot decode is refused here. A 4:4:4 stream
-    /// the driver decodes is taken here, and refused at its first picture
-    /// unless [`Self::lands_4_4_4`] was called before it.
+    /// so that a stream they cannot decode is refused here. A range
+    /// extensions stream the driver decodes is taken here, and refused at its
+    /// first picture unless [`Self::lands_range_extensions`] was called before
+    /// it.
     pub fn new(display: &Display, hvcc: &[u8]) -> Result<Self, Error> {
         let inner = Decoder::from_hvcc(VaHevc::new(display), hvcc)?;
         let config = DecoderConfiguration::parse(hvcc)?;
@@ -83,12 +89,13 @@ impl HevcDecoder {
         }
     }
 
-    /// Has a 4:4:4 stream at 8 bits decoded, into XYUV surfaces, whose
-    /// frames the caller reads back with [`super::ReadBack::copy_4_4_4_into`]
-    /// ([`Frame::is_4_4_4`]); without it, a 4:4:4 stream is refused when its
-    /// SPS is taken.
-    pub fn lands_4_4_4(&mut self) {
-        self.inner.accelerator_mut().four_four_four = true;
+    /// Has a range extensions stream decoded ([`range_extensions_decoder`]),
+    /// whose packed frames the caller reads back with
+    /// [`super::ReadBack::copy_packed_into`] ([`Frame::is_packed`]), and the
+    /// rest with [`super::ReadBack::copy_into`]; without it, a range
+    /// extensions stream is refused when its SPS is taken.
+    pub fn lands_range_extensions(&mut self) {
+        self.inner.accelerator_mut().range_extensions = true;
     }
 
     /// Chooses decode order (the default) or display order.
@@ -196,8 +203,9 @@ struct VaHevc {
     session: Option<Session>,
     /// What gives the decode in hand its picture's target, taken as the picture is made.
     target_for: Option<TargetFor>,
-    /// Whether the caller lands 4:4:4 pictures ([`HevcDecoder::lands_4_4_4`]).
-    four_four_four: bool,
+    /// Whether the caller lands the range extensions' pictures
+    /// ([`HevcDecoder::lands_range_extensions`]).
+    range_extensions: bool,
 }
 
 /// What one SPS's pictures are decoded with.
@@ -223,7 +231,7 @@ impl VaHevc {
             display: display.clone_ref(),
             session: None,
             target_for: None,
-            four_four_four: false,
+            range_extensions: false,
         }
     }
 
@@ -235,26 +243,83 @@ impl VaHevc {
 }
 
 /// The VA profile and surface format for `sps`'s stream: Main at 8 bits,
-/// Main 10 at 10, of 4:2:0, and Main 4:4:4 of the range extensions' 4:4:4
-/// at 8 bits where the caller lands its pictures (`four_four_four`).
-/// `check_supported` has refused other depths and formats.
-fn profile_for(sps: &Sps, four_four_four: bool) -> Result<(Profile, SurfaceFormat), Error> {
-    match (sps.chroma_format_idc, sps.bit_depth_luma_minus8) {
-        (1, 0) => Ok((Profile::HEVC_MAIN, SurfaceFormat::Nv12)),
-        (1, _) => Ok((Profile::HEVC_MAIN10, SurfaceFormat::P010)),
-        (3, 0) if four_four_four => Ok((Profile::HEVC_MAIN444, SurfaceFormat::Xyuv)),
-        (3, 0) => Err(Error::Unsupported(
-            "HEVC 4:4:4: its caller lands 4:2:0 pictures alone".into(),
-        )),
-        _ => Err(Error::Unsupported(
-            "HEVC: VA-API decodes 4:2:0 here, and 4:4:4 at 8 bits".into(),
-        )),
+/// Main 10 at 10, of 4:2:0, and a range extensions stream's
+/// ([`range_extensions_format`]) where the caller lands its pictures
+/// (`range_extensions`). `check_supported` has refused other depths and
+/// formats.
+fn profile_for(sps: &Sps, range_extensions: bool) -> Result<(Profile, SurfaceFormat), Error> {
+    if !hevc::is_range_extensions(sps) {
+        return match (sps.chroma_format_idc, sps.bit_depth_luma_minus8) {
+            (1, 0) => Ok((Profile::HEVC_MAIN, SurfaceFormat::Nv12)),
+            (1, 2) => Ok((Profile::HEVC_MAIN10, SurfaceFormat::P010)),
+            _ => Err(Error::Unsupported(
+                "HEVC Main: VA-API decodes 4:2:0 at 8 and 10 bits".into(),
+            )),
+        };
     }
+    if !range_extensions {
+        return Err(Error::Unsupported(
+            "HEVC range extensions: its caller lands Main and Main 10 pictures alone".into(),
+        ));
+    }
+    let bits = sps.bit_depth_luma_minus8.saturating_add(8);
+    range_extensions_format(sps.chroma_format_idc, bits).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "HEVC range extensions of chroma_format_idc {} at {bits} bits",
+            sps.chroma_format_idc
+        ))
+    })
+}
+
+/// The driver's range extensions profile that decodes a stream of
+/// `chroma_format_idc` at `bits`, and the surfaces it decodes into: Main 12
+/// for 4:2:0, into P012 at 12 bits, and NV12 and P010 below, which a driver
+/// whose Main 12 decoder makes none of those render targets declines; Main
+/// 4:2:2 10 for 4:2:2 at 8 and 10 bits, into YUY2 and Y210, and Main 4:2:2
+/// 12 at 12, into Y212; Main 4:4:4, Main 4:4:4 10 and Main 4:4:4 12 for
+/// 4:4:4, into XYUV, Y410 and Y412 (va.h's profiles; the surfaces as ffmpeg's
+/// VA-API decoder maps those formats).
+fn range_extensions_format(chroma_format_idc: u8, bits: u8) -> Option<(Profile, SurfaceFormat)> {
+    Some(match (chroma_format_idc, bits) {
+        (1, 8) => (Profile::HEVC_MAIN12, SurfaceFormat::Nv12),
+        (1, 10) => (Profile::HEVC_MAIN12, SurfaceFormat::P010),
+        (1, 12) => (Profile::HEVC_MAIN12, SurfaceFormat::P012),
+        (2, 8) => (Profile::HEVC_MAIN422_10, SurfaceFormat::Yuy2),
+        (2, 10) => (Profile::HEVC_MAIN422_10, SurfaceFormat::Y210),
+        (2, 12) => (Profile::HEVC_MAIN422_12, SurfaceFormat::Y212),
+        (3, 8) => (Profile::HEVC_MAIN444, SurfaceFormat::Xyuv),
+        (3, 10) => (Profile::HEVC_MAIN444_10, SurfaceFormat::Y410),
+        (3, 12) => (Profile::HEVC_MAIN444_12, SurfaceFormat::Y412),
+        _ => return None,
+    })
+}
+
+/// What a range extensions stream of `chroma_format_idc` at `bits` decodes on, for a caller that
+/// checks the driver's answers for it: the profile, the render-target format (a `VA_RT_FORMAT_*`
+/// bit) its config is made with, and the surfaces' FOURCC; `None` for a chroma format or depth
+/// the decoder takes none of.
+pub fn range_extensions_decoder(chroma_format_idc: u8, bits: u8) -> Option<(Profile, u32, Fourcc)> {
+    let (profile, format) = range_extensions_format(chroma_format_idc, bits)?;
+    Some((profile, format.rt_format(), Fourcc(format.fourcc())))
+}
+
+/// Whether `profile` is one of the range extensions', whose pictures' parameters go as
+/// va_dec_hevc.h's `…Extension` structures.
+fn takes_extensions(profile: Profile) -> bool {
+    [
+        Profile::HEVC_MAIN12,
+        Profile::HEVC_MAIN422_10,
+        Profile::HEVC_MAIN422_12,
+        Profile::HEVC_MAIN444,
+        Profile::HEVC_MAIN444_10,
+        Profile::HEVC_MAIN444_12,
+    ]
+    .contains(&profile)
 }
 
 /// The VA profile, when the driver decodes `sps`'s stream at its size.
-fn select_profile(display: &Display, sps: &Sps, four_four_four: bool) -> Result<Profile, Error> {
-    let (profile, format) = profile_for(sps, four_four_four)?;
+fn select_profile(display: &Display, sps: &Sps, range_extensions: bool) -> Result<Profile, Error> {
+    let (profile, format) = profile_for(sps, range_extensions)?;
     let name = profile.name().unwrap_or("HEVC");
     if !display.supports(profile, Entrypoint::VLD) {
         return Err(Error::Unsupported(format!(
@@ -296,8 +361,8 @@ impl Accelerator for VaHevc {
 
     fn configure(&mut self, sps: &Sps, _dpb_size: usize) -> Result<(), Error> {
         self.session = None;
-        let profile = select_profile(&self.display, sps, self.four_four_four)?;
-        let (_, format) = profile_for(sps, self.four_four_four)?;
+        let profile = select_profile(&self.display, sps, self.range_extensions)?;
+        let (_, format) = profile_for(sps, self.range_extensions)?;
         let (width, height) = (
             sps.pic_width_in_luma_samples,
             sps.pic_height_in_luma_samples,
@@ -352,9 +417,9 @@ impl Accelerator for VaHevc {
             .ok_or_else(|| Error::Unsupported("decoding without a context".into()))?;
         let context = decoding.id;
         let display = &self.display;
-        // The range extensions' profile takes the extension structures
+        // The range extensions' profiles take the extension structures
         // whole (va_dec_hevc.h), as ffmpeg sends them.
-        let extensions = session.profile == Profile::HEVC_MAIN444;
+        let extensions = takes_extensions(session.profile);
         let base = picture_parameters(picture, params)?;
         let picture_buffer = if extensions {
             let parameters = ffi::VAPictureParameterBufferHEVCExtension {
@@ -824,29 +889,50 @@ mod tests {
     }
 
     #[test]
-    fn a_4_4_4_stream_takes_main_4_4_4_into_xyuv_where_its_caller_lands_it() -> Result<(), Error> {
-        use crate::codec::hevc::tests::{sps_4_4_4_with, sps_of};
-        let four = Sps::parse(&sps_4_4_4_with(0))?;
-        assert_eq!(
-            profile_for(&four, true)?,
-            (Profile::HEVC_MAIN444, SurfaceFormat::Xyuv)
-        );
-        assert!(matches!(
-            profile_for(&four, false),
-            Err(Error::Unsupported(why)) if why == "HEVC 4:4:4: its caller lands 4:2:0 pictures alone"
-        ));
+    fn a_range_extensions_stream_takes_its_profile_where_its_caller_lands_it() -> Result<(), Error>
+    {
+        use crate::codec::hevc::tests::sps_of;
+        use SurfaceFormat::{Nv12, P010, P012, Xyuv, Y210, Y212, Y410, Y412, Yuy2};
+        for (chroma, bits, profile, format) in [
+            (1, 12, Profile::HEVC_MAIN12, P012),
+            (1, 10, Profile::HEVC_MAIN12, P010),
+            (1, 8, Profile::HEVC_MAIN12, Nv12),
+            (2, 8, Profile::HEVC_MAIN422_10, Yuy2),
+            (2, 10, Profile::HEVC_MAIN422_10, Y210),
+            (2, 12, Profile::HEVC_MAIN422_12, Y212),
+            (3, 8, Profile::HEVC_MAIN444, Xyuv),
+            (3, 10, Profile::HEVC_MAIN444_10, Y410),
+            (3, 12, Profile::HEVC_MAIN444_12, Y412),
+        ] {
+            // Of the range extensions' profile, with their SPS syntax.
+            let sps = Sps::parse(&sps_of(4, chroma, u32::from(bits) - 8, true, None))?;
+            assert_eq!(profile_for(&sps, true)?, (profile, format));
+            assert!(takes_extensions(profile));
+            assert_eq!(
+                range_extensions_decoder(chroma as u8, bits),
+                Some((profile, format.rt_format(), Fourcc(format.fourcc())))
+            );
+            assert!(matches!(
+                profile_for(&sps, false),
+                Err(Error::Unsupported(why))
+                    if why == "HEVC range extensions: its caller lands Main and Main 10 pictures alone"
+            ));
+        }
+        assert_eq!(range_extensions_decoder(0, 8), None);
+        assert_eq!(range_extensions_decoder(3, 14), None);
         let main = Sps::parse(&sps_of(1, 1, 0, false, None))?;
         let ten = Sps::parse(&sps_of(2, 1, 2, false, None))?;
-        for four_four_four in [false, true] {
+        for range_extensions in [false, true] {
             assert_eq!(
-                profile_for(&main, four_four_four)?,
+                profile_for(&main, range_extensions)?,
                 (Profile::HEVC_MAIN, SurfaceFormat::Nv12)
             );
             assert_eq!(
-                profile_for(&ten, four_four_four)?,
+                profile_for(&ten, range_extensions)?,
                 (Profile::HEVC_MAIN10, SurfaceFormat::P010)
             );
         }
+        assert!(!takes_extensions(Profile::HEVC_MAIN10));
         Ok(())
     }
 

@@ -17,7 +17,7 @@
 //!   then `videoGather444` writes the crop's samples into the surface's two planes through the
 //!   Shared buffer over its pages that VideoToolbox's decoder hands for a 4:4:4 surface
 //!   (`super::super::vt`), and is waited for: the rows and bytes that the CPU's split of the read
-//!   back writes (`ReadBack::copy_4_4_4_into`), and nothing else of the surface.
+//!   back writes (`ReadBack::copy_packed_into`), and nothing else of the surface.
 //! - **Refusals** come before anything is written into the surface, and the picture is then read
 //!   back and split by the CPU, the reason logged once a decoder: no buffer over the surface, a
 //!   crop the kernel does not write (`gather::gathers`), the driver's decline of the scratch
@@ -163,8 +163,8 @@ impl<P: Platform> XyuvGathers<P> {
         let Some(surface) = surface else {
             return declined("no buffer of the device's over the surface");
         };
-        if !frame.is_4_4_4() {
-            return declined("a 4:2:0 picture");
+        if !frame.is_xyuv() {
+            return declined("a picture of no XYUV surface");
         }
         let crop = (frame.width(), frame.height());
         let even = (crop.0.next_multiple_of(2), crop.1.next_multiple_of(2));

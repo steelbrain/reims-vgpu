@@ -125,10 +125,15 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// Why a decoder of `codec` from [`Self::guest_decoder`] decodes none of `stream`'s pictures,
     /// a stream the codec crate's decoder takes, for VideoToolbox's session of it to be refused
     /// at its start (`reims_vgpu_video::paravirt::Backend::declines`); `None` where it decodes
-    /// them. The default takes 4:2:0 streams alone, which every arm's caps answer for.
+    /// them. The default takes 4:2:0 streams of Main and Main 10 alone, which every arm's caps
+    /// answer for.
     fn guest_declines(&self, _codec: u32, stream: &Stream) -> Option<String> {
-        (stream.chroma_format_idc != 1)
-            .then(|| "the host's video decodes 4:2:0 pictures alone".to_owned())
+        if stream.chroma_format_idc != 1 {
+            Some("the host's video decodes 4:2:0 pictures alone".to_owned())
+        } else {
+            (stream.range_extensions)
+                .then(|| "the host's video decodes no range extensions pictures".to_owned())
+        }
     }
     /// The encoders VideoToolbox's paravirtual encoder list names, whose source frames come in
     /// surfaces the guest lends ([`GuestEncoder`]): one for each codec the arm encodes so; none

@@ -22,6 +22,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+use crate::core::backend::Chroma;
 use crate::core::runtime::MonoTime;
 
 use super::caps::{Config, Context, Entrypoint, Profile};
@@ -110,27 +111,53 @@ pub(crate) fn asked() -> Option<ReadbackWay> {
 
 /// The bytes a row and the rows of `rect`'s two planes: luma, then the
 /// interleaved chroma, whose last pair and row an odd width or height
-/// shares with its last luma column or row; for XYUV, its one plane's
-/// pixels, four bytes each, and no second plane.
+/// shares with its last luma column or row; for a packed format, its one
+/// plane's pixels, whole pairs of them for 4:2:2 (`packed_row_bytes`), and no
+/// second plane.
 pub(crate) fn plane_extents(format: SurfaceFormat, rect: Rect) -> [(usize, usize); 2] {
     let sample = format.bytes_per_sample();
     let (width, height) = (to_usize(rect.width), to_usize(rect.height));
-    match format {
-        SurfaceFormat::Xyuv => [(width * 4, height), (0, 0)],
-        SurfaceFormat::Nv12 | SurfaceFormat::P010 => [
-            (width * sample, height),
-            (width.div_ceil(2) * 2 * sample, height.div_ceil(2)),
-        ],
+    if format.planes() == 1 {
+        return [(packed_row_bytes(format, width), height), (0, 0)];
+    }
+    [
+        (width * sample, height),
+        (width.div_ceil(2) * 2 * sample, height.div_ceil(2)),
+    ]
+}
+
+/// The bytes `width` pixels of a packed format take in a row: a 4:2:2 format's
+/// pixels in whole pairs, the last one's too where the width is odd.
+fn packed_row_bytes(format: SurfaceFormat, width: usize) -> usize {
+    let pixel = format.first_plane_bytes_per_pixel();
+    match format.chroma() {
+        Chroma::Yuv422 => width.div_ceil(2) * 2 * pixel,
+        Chroma::Yuv420 | Chroma::Yuv444 => width * pixel,
     }
 }
 
-/// Splits `rect` of an XYUV plane in `bytes`, at `plane`'s offset with its
-/// pitch, into two destinations, each with its stride: the luma, a byte a
-/// pixel, and the chroma, each pixel's Cb then Cr. Each source row is first
-/// read whole into a row of the caller's with `copy` (streaming loads where
-/// the bytes are a mapping of video memory), then split.
-pub(crate) fn split_xyuv(
+/// The Cb and Cr pairs one row of `width` pixels of a packed format gives:
+/// one for each two pixels of 4:2:2, the last one's too where the width is
+/// odd, and one a pixel of 4:4:4.
+pub(crate) fn packed_pairs(format: SurfaceFormat, width: usize) -> usize {
+    match format.chroma() {
+        Chroma::Yuv422 => width.div_ceil(2),
+        Chroma::Yuv420 | Chroma::Yuv444 => width,
+    }
+}
+
+/// Splits `rect` of a packed plane of `format` in `bytes`, at `plane`'s
+/// offset with its pitch, into two destinations, each with its stride: the
+/// luma, and the chroma, each pair's Cb then Cr, as CoreVideo's two-plane
+/// formats of the chroma format and depth lay them out: a byte a sample at 8
+/// bits; deeper, a little-endian 16-bit word, its bits at the top, as the
+/// sources' 16-bit words already hold them and Y410's 10-bit fields are moved
+/// to. Each source row is first read whole into a row of the caller's with
+/// `copy` (streaming loads where the bytes are a mapping of video memory),
+/// then split. A 4:2:2 `rect.x` is even, so its rows start on a pair.
+pub(crate) fn split_packed(
     bytes: &[u8],
+    format: SurfaceFormat,
     (offset, pitch): (usize, usize),
     rect: Rect,
     destinations: [(&mut [u8], usize); 2],
@@ -142,10 +169,23 @@ pub(crate) fn split_xyuv(
     }
     let short = || Error::Unsupported("an image smaller than its pitches".into());
     let too_small = || Error::PlaneTooSmall("destination");
+    if format.planes() != 1 || (format.chroma() == Chroma::Yuv422 && rect.x % 2 != 0) {
+        return Err(Error::Unsupported(format!(
+            "splitting {} pixels from column {}",
+            format.name(),
+            rect.x
+        )));
+    }
     let [(y, y_stride), (cbcr, cbcr_stride)] = destinations;
     let width = to_usize(rect.width);
-    let x = to_usize(rect.x).checked_mul(4).ok_or_else(short)?;
-    let mut row_bytes = vec![0u8; width.checked_mul(4).ok_or_else(short)?];
+    let sample = format.bytes_per_sample();
+    let luma_bytes = width.checked_mul(sample).ok_or_else(short)?;
+    let pairs = packed_pairs(format, width);
+    let chroma_bytes = pairs.checked_mul(2 * sample).ok_or_else(short)?;
+    let x = (to_usize(rect.x))
+        .checked_mul(format.first_plane_bytes_per_pixel())
+        .ok_or_else(short)?;
+    let mut row_bytes = vec![0u8; packed_row_bytes(format, width)];
     for row in 0..to_usize(rect.height) {
         let src = to_usize(rect.y)
             .checked_add(row)
@@ -154,17 +194,76 @@ pub(crate) fn split_xyuv(
             .and_then(|start| bytes.get(start..start.checked_add(row_bytes.len())?))
             .ok_or_else(short)?;
         copy(&mut row_bytes, src);
-        let (pixels, _) = row_bytes.as_chunks::<4>();
-        let luma = destination(y, row, y_stride, width).ok_or_else(too_small)?;
-        for (sample, pixel) in luma.iter_mut().zip(pixels) {
-            *sample = pixel[2];
-        }
-        let chroma = destination(cbcr, row, cbcr_stride, width * 2).ok_or_else(too_small)?;
-        for (pair, pixel) in chroma.as_chunks_mut::<2>().0.iter_mut().zip(pixels) {
-            *pair = [pixel[1], pixel[0]];
-        }
+        let luma = destination(y, row, y_stride, luma_bytes).ok_or_else(too_small)?;
+        let chroma = destination(cbcr, row, cbcr_stride, chroma_bytes).ok_or_else(too_small)?;
+        split_row(format, &row_bytes, luma, chroma);
     }
     Ok(())
+}
+
+/// One row of [`split_packed`]: `packed`'s pixels into `luma`'s samples and
+/// `chroma`'s pairs, as many as each holds.
+fn split_row(format: SurfaceFormat, packed: &[u8], luma: &mut [u8], chroma: &mut [u8]) {
+    match format {
+        SurfaceFormat::Xyuv => {
+            let (pixels, _) = packed.as_chunks::<4>();
+            for (sample, pixel) in luma.iter_mut().zip(pixels) {
+                *sample = pixel[2];
+            }
+            for (pair, pixel) in chroma.as_chunks_mut::<2>().0.iter_mut().zip(pixels) {
+                *pair = [pixel[1], pixel[0]];
+            }
+        }
+        // Y0, Cb, Y1, Cr.
+        SurfaceFormat::Yuy2 => {
+            let (groups, _) = packed.as_chunks::<4>();
+            for (samples, group) in luma.chunks_mut(2).zip(groups) {
+                for (sample, y) in samples.iter_mut().zip([group[0], group[2]]) {
+                    *sample = y;
+                }
+            }
+            for (pair, group) in chroma.as_chunks_mut::<2>().0.iter_mut().zip(groups) {
+                *pair = [group[1], group[3]];
+            }
+        }
+        // As YUY2, in 16-bit words.
+        SurfaceFormat::Y210 | SurfaceFormat::Y212 => {
+            let (groups, _) = packed.as_chunks::<8>();
+            for (samples, group) in luma.chunks_mut(4).zip(groups) {
+                let (y0, y1) = ([group[0], group[1]], [group[4], group[5]]);
+                for (sample, y) in samples.chunks_mut(2).zip([y0, y1]) {
+                    sample.copy_from_slice(&y[..sample.len()]);
+                }
+            }
+            for (pair, group) in chroma.as_chunks_mut::<4>().0.iter_mut().zip(groups) {
+                *pair = [group[2], group[3], group[6], group[7]];
+            }
+        }
+        // Cb, Y and Cr in 10-bit fields of a 32-bit word, moved to the top of 16 bits.
+        SurfaceFormat::Y410 => {
+            let (pixels, _) = packed.as_chunks::<4>();
+            let field = |w: u32, at: u32| ((((w >> at) & 0x3ff) as u16) << 6).to_le_bytes();
+            for (sample, pixel) in luma.as_chunks_mut::<2>().0.iter_mut().zip(pixels) {
+                *sample = field(u32::from_le_bytes(*pixel), 10);
+            }
+            for (pair, pixel) in chroma.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
+                let w = u32::from_le_bytes(*pixel);
+                let (cb, cr) = (field(w, 0), field(w, 20));
+                *pair = [cb[0], cb[1], cr[0], cr[1]];
+            }
+        }
+        // Cb, Y, Cr and alpha, in 16-bit words.
+        SurfaceFormat::Y412 => {
+            let (pixels, _) = packed.as_chunks::<8>();
+            for (sample, pixel) in luma.as_chunks_mut::<2>().0.iter_mut().zip(pixels) {
+                *sample = [pixel[2], pixel[3]];
+            }
+            for (pair, pixel) in chroma.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
+                *pair = [pixel[0], pixel[1], pixel[4], pixel[5]];
+            }
+        }
+        SurfaceFormat::Nv12 | SurfaceFormat::P010 | SurfaceFormat::P012 => {}
+    }
 }
 
 /// Copies `rect` out of `bytes`, whose planes are at `offsets` with
@@ -264,12 +363,12 @@ pub(crate) enum HostFormat {
 }
 
 impl HostFormat {
-    /// The decoders' format's; `None` for XYUV, which no host surface is of.
+    /// The decoders' format's; `None` for the others, which no host surface is of.
     pub(crate) fn of(format: SurfaceFormat) -> Option<Self> {
         match format {
             SurfaceFormat::Nv12 => Some(Self::Nv12),
             SurfaceFormat::P010 => Some(Self::P010),
-            SurfaceFormat::Xyuv => None,
+            _ => None,
         }
     }
 
@@ -854,7 +953,7 @@ pub(crate) struct MappedRead<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostFormat, Rect, SurfaceFormat, copy_rect, copy_row, split_xyuv};
+    use super::{HostFormat, Rect, SurfaceFormat, copy_rect, copy_row, split_packed};
     use crate::vaapi::va::display::Error;
 
     /// An NV12 frame of 4x4 in 8 bytes a row: luma 0 to 31, then chroma
@@ -900,8 +999,9 @@ mod tests {
             bytes[at..at + 4].copy_from_slice(&[40 + n, 20 + n, n, 0xff]);
         }
         let (mut y, mut cbcr) = (vec![0; 2 * 3], vec![0; 2 * 5]);
-        let split = split_xyuv(
+        let split = split_packed(
             &bytes,
+            SurfaceFormat::Xyuv,
             (4, 16),
             rect(1, 0, 2, 2),
             [(&mut y, 3), (&mut cbcr, 5)],
@@ -913,8 +1013,9 @@ mod tests {
         assert_eq!(cbcr, [21, 41, 22, 42, 0, 24, 44, 25, 45, 0]);
         // A crop past the plane, and destinations too small, are refused.
         let (mut y, mut cbcr) = (vec![0; 6], vec![0; 12]);
-        let past = split_xyuv(
+        let past = split_packed(
             &bytes,
+            SurfaceFormat::Xyuv,
             (4, 16),
             rect(0, 1, 3, 2),
             [(&mut y, 3), (&mut cbcr, 6)],
@@ -922,14 +1023,125 @@ mod tests {
         );
         assert!(matches!(past, Err(Error::Unsupported(_))));
         let (mut y, mut cbcr) = (vec![0; 6], vec![0; 7]);
-        let small = split_xyuv(
+        let small = split_packed(
             &bytes,
+            SurfaceFormat::Xyuv,
             (4, 16),
             rect(0, 0, 3, 2),
             [(&mut y, 3), (&mut cbcr, 6)],
             copy_row,
         );
         assert!(matches!(small, Err(Error::PlaneTooSmall(_))));
+    }
+
+    /// Splits a packed plane of `format`, `pixels` of its row's bytes from byte 2 at `pitch`,
+    /// two rows, from column `x`, `width` wide, into planes of exactly their rows' bytes.
+    fn split(
+        format: SurfaceFormat,
+        row: &[u8],
+        pitch: usize,
+        (x, width): (u32, u32),
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        let mut bytes = vec![0xee; 2 + 2 * pitch];
+        for r in 0..2 {
+            bytes[2 + r * pitch..2 + r * pitch + row.len()].copy_from_slice(row);
+        }
+        let sample = format.bytes_per_sample();
+        let pairs = super::packed_pairs(format, width as usize);
+        let (y_row, cbcr_row) = (width as usize * sample, pairs * 2 * sample);
+        let (mut y, mut cbcr) = (vec![0; 2 * y_row], vec![0; 2 * cbcr_row]);
+        split_packed(
+            &bytes,
+            format,
+            (2, pitch),
+            rect(x, 0, width, 2),
+            [(&mut y, y_row), (&mut cbcr, cbcr_row)],
+            copy_row,
+        )?;
+        assert_eq!(
+            (y[..y_row].to_vec(), cbcr[..cbcr_row].to_vec()),
+            (y[y_row..].to_vec(), cbcr[cbcr_row..].to_vec())
+        );
+        y.truncate(y_row);
+        cbcr.truncate(cbcr_row);
+        Ok((y, cbcr))
+    }
+
+    /// YUY2's Y0, Cb, Y1, Cr bytes, and Y210's and Y212's 16-bit words in that order, split into
+    /// luma and a Cb/Cr pair for each two pixels; an odd width takes its last pair's first
+    /// luma sample alone.
+    #[test]
+    fn a_4_2_2_rectangle_splits_into_luma_and_a_pair_for_two_pixels() -> Result<(), Error> {
+        let row = [10, 20, 11, 30, 12, 21, 13, 31];
+        let (y, cbcr) = split(SurfaceFormat::Yuy2, &row, 12, (0, 4))?;
+        assert_eq!((y, cbcr), (vec![10, 11, 12, 13], vec![20, 30, 21, 31]));
+        let (y, cbcr) = split(SurfaceFormat::Yuy2, &row, 12, (2, 1))?;
+        assert_eq!((y, cbcr), (vec![12], vec![21, 31]));
+        let words: Vec<u8> = [
+            0x1000u16, 0x2040, 0x1100, 0x3080, 0x1200, 0x20c0, 0x1300, 0x3100,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        for format in [SurfaceFormat::Y210, SurfaceFormat::Y212] {
+            let (y, cbcr) = split(format, &words, 20, (0, 3))?;
+            assert_eq!(y, [0x00, 0x10, 0x00, 0x11, 0x00, 0x12]);
+            assert_eq!(cbcr, [0x40, 0x20, 0x80, 0x30, 0xc0, 0x20, 0x00, 0x31]);
+        }
+        // A first column inside a pair is refused.
+        assert!(matches!(
+            split(SurfaceFormat::Yuy2, &row, 12, (1, 2)),
+            Err(Error::Unsupported(_))
+        ));
+        Ok(())
+    }
+
+    /// Y410's 10-bit fields, Cb in bits 0 to 9, Y in 10 to 19 and Cr in 20 to 29, land at the
+    /// top of 16-bit words, as P010's and CoreVideo's `x444`'s samples lie; Y412's 16-bit Cb, Y,
+    /// Cr and alpha words land as they are.
+    #[test]
+    fn a_4_4_4_rectangle_of_deep_samples_splits_into_16_bit_words() -> Result<(), Error> {
+        let pixel = |cb: u32, y: u32, cr: u32| (3 << 30 | cr << 20 | y << 10 | cb).to_le_bytes();
+        let row: Vec<u8> = [pixel(0x3ff, 64, 512), pixel(1, 940, 0)].concat();
+        let (y, cbcr) = split(SurfaceFormat::Y410, &row, 12, (0, 2))?;
+        let words = |w: &[u16]| -> Vec<u8> { w.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        assert_eq!(y, words(&[64 << 6, 940 << 6]));
+        assert_eq!(cbcr, words(&[0x3ff << 6, 512 << 6, 1 << 6, 0]));
+        let row = words(&[
+            0x1230, 0x4560, 0x7890, 0xfff0, 0xabc0, 0xdef0, 0x0120, 0xfff0,
+        ]);
+        let (y, cbcr) = split(SurfaceFormat::Y412, &row, 20, (0, 2))?;
+        assert_eq!(y, words(&[0x4560, 0xdef0]));
+        assert_eq!(cbcr, words(&[0x1230, 0x7890, 0xabc0, 0x0120]));
+        Ok(())
+    }
+
+    /// A two-plane format, given as packed, is refused, as is a pitch whose rows wrap: none
+    /// indexes out of its slices.
+    #[test]
+    fn a_packed_split_of_a_planar_format_or_a_wrapping_pitch_is_refused() {
+        let bytes = vec![0; 64];
+        let (mut y, mut cbcr) = (vec![0; 8], vec![0; 8]);
+        let planar = split_packed(
+            &bytes,
+            SurfaceFormat::P012,
+            (0, 16),
+            rect(0, 0, 2, 2),
+            [(&mut y, 4), (&mut cbcr, 4)],
+            copy_row,
+        );
+        assert!(matches!(planar, Err(Error::Unsupported(_))));
+        for (offset, pitch) in [(0, usize::MAX), (usize::MAX, 16)] {
+            let wraps = split_packed(
+                &bytes,
+                SurfaceFormat::Y410,
+                (offset, pitch),
+                rect(0, 0, 1, 2),
+                [(&mut y, 4), (&mut cbcr, 4)],
+                copy_row,
+            );
+            assert!(matches!(wraps, Err(Error::Unsupported(_))));
+        }
     }
 
     #[test]

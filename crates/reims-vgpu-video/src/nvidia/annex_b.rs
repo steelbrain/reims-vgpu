@@ -26,10 +26,10 @@
 //!   caller asks ([`AnnexBDecoder::copy_failed_pictures`]), it is written or
 //!   read back as NVDEC left it, telling its status, and the pictures after
 //!   it decode, as a Mac's hardware decoders hand them on.
-//! - **A 4:4:4 picture** (HEVC's range extensions, where the caller lands
-//!   them, [`AnnexBDecoder::lands_4_4_4`]) decodes into three planes, luma,
-//!   Cb and Cr, each as large, which it reads back; its writes, of two
-//!   planes, refuse it.
+//! - **The range extensions' pictures** (HEVC's, where the caller lands
+//!   them, [`AnnexBDecoder::lands_range_extensions`]): 4:2:0 ones as Main 10's,
+//!   and 4:4:4 ones into three planes, luma, Cb and Cr, each as large, which
+//!   it reads back; its writes, of two planes, refuse those.
 //! - **A picture holds its decode surface** until it drops: the decoder has
 //!   [`AnnexBDecoder::SPARE_PICTURES`] surfaces beyond its references and
 //!   the picture being decoded, and a decode with none free is
@@ -61,8 +61,9 @@ use crate::nvidia::wait::Deadline;
 pub enum AnnexBCodec {
     /// H.264, of the profiles the codec crate decodes.
     H264,
-    /// HEVC, Main and Main 10, and the range extensions' 4:4:4 at 8 bits
-    /// where the caller lands them ([`AnnexBDecoder::lands_4_4_4`]).
+    /// HEVC, Main and Main 10, and the range extensions' 4:2:0 and 4:4:4 at
+    /// 8, 10 and 12 bits where the caller lands them
+    /// ([`AnnexBDecoder::lands_range_extensions`]).
     Hevc,
 }
 
@@ -148,13 +149,14 @@ impl AnnexBDecoder {
         self.failed = OnFailed::Copy;
     }
 
-    /// Has an HEVC stream's 4:4:4 pictures decoded, each in three planes,
-    /// which the caller writes or reads back ([`AnnexBPicture::four_four_four`]);
-    /// without it, a 4:4:4 stream's decoder is refused when its SPS is
-    /// taken. An H.264 decoder is left as it is.
-    pub fn lands_4_4_4(&mut self) {
+    /// Has an HEVC stream of the range extensions decoded: a 4:2:0 one's
+    /// pictures as Main 10's, a 4:4:4 one's each in three planes, which the
+    /// caller writes or reads back ([`AnnexBPicture::four_four_four`]);
+    /// without it, a range extensions stream's decoder is refused when its SPS
+    /// is taken. An H.264 decoder is left as it is.
+    pub fn lands_range_extensions(&mut self) {
         if let Codec::Hevc(decoder) = &mut self.codec {
-            decoder.accelerator_mut().four_four_four = true;
+            decoder.accelerator_mut().range_extensions = true;
         }
     }
 
@@ -393,7 +395,7 @@ impl AnnexBPicture {
     }
 
     /// Whether it is a 4:4:4 picture, in three planes, luma, Cb and Cr, each
-    /// as large ([`AnnexBDecoder::lands_4_4_4`]): its read back has the
+    /// as large ([`AnnexBDecoder::lands_range_extensions`]): its read back has the
     /// three, its writes of two planes refuse it, and
     /// [`Self::write_4_4_4_into_device`] takes the three.
     pub fn four_four_four(&self) -> bool {

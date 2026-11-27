@@ -30,7 +30,7 @@ use reims_vgpu_graphics::wire::{
     RgfxVtSurface,
 };
 use reims_vgpu_video::codec::encode::{Coded, FailedSample};
-use reims_vgpu_video::core::backend::{BackendError as VideoError, PixelFormat};
+use reims_vgpu_video::core::backend::{BackendError as VideoError, Chroma, PixelFormat};
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::paravirt::status::{self, OsStatus};
@@ -230,9 +230,9 @@ impl<P: Platform> VtDecoder<P> {
             Ok(view) => view,
             Err(why) => return Err(self.failed(status::VIDEO_DECODER_MALFUNCTION, why)),
         };
-        // A buffer over a 4:4:4 surface's pages, for a decoder whose GPU writes them.
-        let four_four_four =
-            PixelFormat::from_fourcc(layout.pixel_format).is_some_and(PixelFormat::is_4_4_4);
+        // A buffer over an 8-bit 4:4:4 surface's pages, for a decoder whose GPU writes them.
+        let four_four_four = PixelFormat::from_fourcc(layout.pixel_format)
+            .is_some_and(|format| format.is_4_4_4() && format.bit_depth() == 8);
         let buffer = match four_four_four && self.decoder.lands_4_4_4_by_gpu() {
             false => None,
             true => {
@@ -475,24 +475,24 @@ pub(super) fn layout_of(record: &RgfxVtSurface) -> Result<SurfaceLayout, String>
 }
 
 /// The part of a surface laid out as `layout` that a tile's `region` lands in: each plane from the
-/// region's first row and column, `region.width` by `region.height` luma samples (half, rounded
-/// up, of a 4:2:0 chroma plane's, of pairs; as many of a 4:4:4 one's), with the surface's rows.
-/// A region past the surface, or one from an odd column or row, is refused, as is a surface of a
-/// format other than the 4:2:0 and 4:4:4 ones a picture lands in: a tile session starts only on
-/// a stream of pictures the arm decodes (`reims_vgpu_video::paravirt`'s decoder refuses the rest
-/// at the session's `dsts`), and its `TDrs` names their format.
+/// region's first row and column, `region.width` by `region.height` luma samples (of pairs, half
+/// as many, rounded up, across a 4:2:0 or 4:2:2 chroma plane and down a 4:2:0 one; as many of a
+/// 4:4:4 one's), with the surface's rows. A region past the surface, or one from an odd column
+/// or row, is refused, as is a surface of a format other than the two-plane ones a picture lands
+/// in ([`PixelFormat`]): a tile session starts only on a stream of pictures the arm decodes
+/// (`reims_vgpu_video::paravirt`'s decoder refuses the rest at the session's `dsts`), and its
+/// `TDrs` names their format.
 fn region_layout(layout: &SurfaceLayout, region: TileRegion) -> Result<SurfaceLayout, String> {
     let format = layout.pixel_format;
-    let one_of = |formats: [&[u8; 4]; 2]| formats.map(|f| FourCc::new(*f)).contains(&format);
-    // Bytes a sample, and whether chroma has a pair for every two columns and rows.
-    let (sample, half) = if one_of([b"420v", b"420f"]) {
-        (1, true)
-    } else if one_of([b"x420", b"xf20"]) {
-        (2, true)
-    } else if one_of([b"444v", b"444f"]) {
-        (1, false)
-    } else {
+    let Some(pixels) = PixelFormat::from_fourcc(format) else {
         return Err(format!("tiles in '{format}'"));
+    };
+    let sample = pixels.bytes_per_sample();
+    // The luma columns and rows a chroma pair stands for.
+    let (across, down) = match pixels.chroma() {
+        Chroma::Yuv420 => (2, 2),
+        Chroma::Yuv422 => (2, 1),
+        Chroma::Yuv444 => (1, 1),
     };
     let fits = (region.x.checked_add(region.width)).is_some_and(|end| end <= layout.width)
         && (region.y.checked_add(region.height)).is_some_and(|end| end <= layout.height);
@@ -505,8 +505,6 @@ fn region_layout(layout: &SurfaceLayout, region: TileRegion) -> Result<SurfaceLa
     let [luma, chroma] = layout.planes[..] else {
         return Err(format!("a surface of {} planes", layout.planes.len()));
     };
-    // A 4:2:0 chroma row holds a Cb/Cr pair for every two columns, and stands for two rows; a
-    // 4:4:4 one a pair for every column, a row for a row.
     let moved = |plane: PlaneLayout, (columns, rows): (u32, u32), per_column: usize, size| {
         let down = plane.bytes_per_row.checked_mul(rows.to_usize())?;
         let across = columns.to_usize().checked_mul(per_column)?;
@@ -518,21 +516,21 @@ fn region_layout(layout: &SurfaceLayout, region: TileRegion) -> Result<SurfaceLa
             ..plane
         })
     };
-    let whole = (region.width, region.height);
-    let planes = if half {
-        let halves = (region.width.div_ceil(2), region.height.div_ceil(2));
-        let at = (region.x / 2, region.y / 2);
-        [
-            moved(luma, (region.x, region.y), sample, whole),
-            moved(chroma, at, 2 * sample, halves),
-        ]
-    } else {
-        let at = (region.x, region.y);
-        [
-            moved(luma, at, sample, whole),
-            moved(chroma, at, 2 * sample, whole),
-        ]
-    };
+    let pairs = (region.width.div_ceil(across), region.height.div_ceil(down));
+    let planes = [
+        moved(
+            luma,
+            (region.x, region.y),
+            sample,
+            (region.width, region.height),
+        ),
+        moved(
+            chroma,
+            (region.x / across, region.y / down),
+            2 * sample,
+            pairs,
+        ),
+    ];
     let [Some(luma), Some(chroma)] = planes else {
         return Err("a tile past 2^64 bytes".to_owned());
     };
@@ -709,6 +707,45 @@ mod tests {
                     offset: 0x1000 + 32 * 128 + 80,
                     bytes_per_row: 128,
                     width: 23,
+                    height: 15,
+                },
+            ]
+        );
+    }
+
+    /// A 4:2:2 surface's chroma has a pair for every two columns of every row, and a 12-bit
+    /// one's samples are two bytes each: its region is from the region's row and half its
+    /// column, four bytes a pair across, half as many columns, rounded up, and as many rows.
+    #[test]
+    fn a_tiles_region_of_a_4_2_2_surface_moves_its_chroma_a_row_a_row() {
+        let mut deep = nv12();
+        deep.pixel_format = u32::from_be_bytes(*b"tv22");
+        deep.planes[0].bytes_per_row = 128;
+        deep.planes[1].bytes_per_row = 128;
+        deep.planes[1].height = 48;
+        let layout = layout_of(&deep).unwrap();
+        let region = TileRegion {
+            source_x: 0,
+            source_y: 0,
+            width: 23,
+            height: 15,
+            x: 40,
+            y: 32,
+        };
+        let part = region_layout(&layout, region).unwrap();
+        assert_eq!(
+            part.planes,
+            vec![
+                PlaneLayout {
+                    offset: 0x400 + 32 * 128 + 80,
+                    bytes_per_row: 128,
+                    width: 23,
+                    height: 15,
+                },
+                PlaneLayout {
+                    offset: 0x1000 + 32 * 128 + 80,
+                    bytes_per_row: 128,
+                    width: 12,
                     height: 15,
                 },
             ]

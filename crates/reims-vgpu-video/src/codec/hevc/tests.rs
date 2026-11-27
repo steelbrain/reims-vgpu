@@ -143,6 +143,9 @@ fn write_set(w: &mut BitWriter, index: usize, count: usize, set: &Set) {
 #[derive(Clone)]
 struct SpsSpec {
     profile_idc: u8,
+    /// A profile whose `general_profile_compatibility_flag` is set beside
+    /// `profile_idc`'s.
+    also_compatible: Option<u8>,
     chroma_format_idc: u32,
     bit_depth_minus8: u32,
     /// `log2_max_pic_order_cnt_lsb_minus4`.
@@ -185,6 +188,7 @@ impl Default for SpsSpec {
     fn default() -> Self {
         Self {
             profile_idc: 1,
+            also_compatible: None,
             chroma_format_idc: 1,
             bit_depth_minus8: 0,
             lsb_minus4: 4,
@@ -212,7 +216,8 @@ fn sps(spec: &SpsSpec) -> Vec<u8> {
     w.u(4, 0).u(3, 0).bit(true);
     // profile_tier_level(1, 0)
     w.u(2, 0).bit(false).u(5, u32::from(spec.profile_idc));
-    w.u(32, 1 << (31 - u32::from(spec.profile_idc)));
+    let also = spec.also_compatible.map_or(0, |p| 1 << (31 - u32::from(p)));
+    w.u(32, 1 << (31 - u32::from(spec.profile_idc)) | also);
     w.bit(true)
         .bit(false)
         .bit(false)
@@ -1811,22 +1816,24 @@ fn what_the_codec_does_not_build_for_is_refused() {
             "unsupported: profiles outside Main, Main 10, Main Still Picture and the range \
              extensions",
         ),
+        (range_extensions(0, 0, 0), "unsupported: monochrome"),
         (
-            range_extensions(2, 0, 0),
-            "unsupported: range extensions streams other than 4:4:4 at 8 bits",
+            range_extensions(3, 6, 0),
+            "unsupported: range extensions streams of depths other than 8, 10 and 12 bits",
         ),
         (
-            range_extensions(3, 2, 0),
-            "unsupported: range extensions streams other than 4:4:4 at 8 bits",
-        ),
-        (
-            range_extensions(0, 0, 0),
-            "unsupported: range extensions streams other than 4:4:4 at 8 bits",
+            range_extensions(2, 8, 0),
+            "unsupported: range extensions streams of depths other than 8, 10 and 12 bits",
         ),
         (
             // extended_precision_processing_flag, the fifth.
             range_extensions(3, 0, 1 << 4),
             "unsupported: extended precision processing",
+        ),
+        (
+            // high_precision_offsets_enabled_flag, the seventh, past 8 bits.
+            range_extensions(2, 2, 1 << 2),
+            "unsupported: high precision weighted prediction offsets past 8 bits",
         ),
         (
             SpsSpec {
@@ -1931,6 +1938,147 @@ fn a_range_extensions_444_stream_at_8_bits_decodes() -> Result<(), Error> {
     );
     let header = &d.accelerator().decoded[0].headers[0];
     assert!(header.cu_chroma_qp_offset_enabled_flag);
+    Ok(())
+}
+
+#[test]
+fn range_extensions_streams_of_each_chroma_format_and_depth_decode() -> Result<(), Error> {
+    // Every tool of the SPS's range extensions but extended precision (the
+    // fifth of nine flags) and, past 8 bits, high precision offsets (the
+    // seventh).
+    for chroma_format_idc in 1..=3 {
+        for bit_depth_minus8 in [0, 2, 4] {
+            let range_tools = if bit_depth_minus8 == 0 {
+                0b1_1110_1111
+            } else {
+                0b1_1110_1011
+            };
+            let spec = SpsSpec {
+                profile_idc: 4,
+                chroma_format_idc,
+                bit_depth_minus8,
+                range_extension: true,
+                range_tools,
+                ..SpsSpec::default()
+            };
+            let pps_spec = PpsSpec {
+                transform_skip: true,
+                range_extension: Some(pps::PpsRangeExtension {
+                    log2_max_transform_skip_block_size_minus2: 1,
+                    cross_component_prediction_enabled_flag: chroma_format_idc == 3,
+                    ..pps::PpsRangeExtension::default()
+                }),
+                ..PpsSpec::default()
+            };
+            let parsed = sps::Sps::parse(&sps(&spec))?;
+            assert!(is_range_extensions(&parsed));
+            let idr = slice(
+                &spec,
+                &pps_spec,
+                &SliceSpec {
+                    unit_type: nal_type::IDR_W_RADL,
+                    ..SliceSpec::default()
+                },
+            );
+            let mut d = decoder();
+            let out = d.decode(&sample(&[sps(&spec), pps(&pps_spec), idr]), 3)?;
+            let depth = 8 + bit_depth_minus8 as u8;
+            assert_eq!(d.accelerator().configured, [(64, 48, depth, 5)]);
+            // The conformance window's one unit at the bottom: two rows of 4:2:0,
+            // one of 4:2:2 and 4:4:4 (SubHeightC).
+            let rows = if chroma_format_idc == 1 { 46 } else { 47 };
+            assert_eq!(
+                (out.len(), out[0].bit_depth, out[0].crop),
+                (1, depth, (0, 0, 64, rows)),
+                "chroma_format_idc {chroma_format_idc}, {depth} bits"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_range_extensions_sps_cut_short_or_with_a_bit_flipped_is_refused_or_decoded_whole() {
+    // Every prefix of a range extensions SPS of each chroma format and depth, and the SPS with
+    // each bit past its NAL header flipped, before a PPS and an IDR slice: the decoder answers
+    // each, an error or pictures of the size and depth the SPS it read gives, and panics on none.
+    let pps_spec = PpsSpec::default();
+    for chroma_format_idc in 1..=3 {
+        for bit_depth_minus8 in [0, 2, 4] {
+            let spec = SpsSpec {
+                profile_idc: 4,
+                chroma_format_idc,
+                bit_depth_minus8,
+                range_extension: true,
+                range_tools: 0b1_1110_1011,
+                ..SpsSpec::default()
+            };
+            let whole = sps(&spec);
+            let idr = slice(
+                &spec,
+                &pps_spec,
+                &SliceSpec {
+                    unit_type: nal_type::IDR_W_RADL,
+                    ..SliceSpec::default()
+                },
+            );
+            let mut units: Vec<Vec<u8>> = (2..whole.len()).map(|n| whole[..n].to_vec()).collect();
+            for bit in 16..whole.len() * 8 {
+                let mut flipped = whole.clone();
+                flipped[bit / 8] ^= 0x80 >> (bit % 8);
+                units.push(flipped);
+            }
+            for unit in units {
+                let read = sps::Sps::parse(&unit).ok();
+                let mut d = decoder();
+                let result = d.decode(&sample(&[unit, pps(&pps_spec), idr.clone()]), 0);
+                if let Ok(out) = result {
+                    for picture in out {
+                        let read = read
+                            .as_ref()
+                            .expect("a picture decoded from an SPS that reads");
+                        assert_eq!(picture.bit_depth, read.bit_depth_luma_minus8 + 8);
+                        assert!(picture.crop.2 <= read.pic_width_in_luma_samples);
+                        assert!(picture.crop.3 <= read.pic_height_in_luma_samples);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_main_family_stream_decodes_as_main_unless_it_turns_the_range_extensions_on()
+-> Result<(), Error> {
+    // A stream of profile 4 that says it is also Main 10's, 4:2:0, with no range extensions:
+    // Main 10's, as a decoder of Main 10 takes it.
+    let compatible = SpsSpec {
+        profile_idc: 4,
+        also_compatible: Some(2),
+        bit_depth_minus8: 2,
+        ..SpsSpec::default()
+    };
+    assert!(!is_range_extensions(&sps::Sps::parse(&sps(&compatible))?));
+    // With its range extensions' SPS syntax, or of 4:2:2, the range extensions'.
+    for spec in [
+        SpsSpec {
+            range_extension: true,
+            ..compatible.clone()
+        },
+        SpsSpec {
+            chroma_format_idc: 2,
+            ..compatible.clone()
+        },
+    ] {
+        assert!(is_range_extensions(&sps::Sps::parse(&sps(&spec))?));
+    }
+    // A Main 10 stream is no range extensions stream.
+    let main_10 = SpsSpec {
+        profile_idc: 2,
+        bit_depth_minus8: 2,
+        ..SpsSpec::default()
+    };
+    assert!(!is_range_extensions(&sps::Sps::parse(&sps(&main_10))?));
     Ok(())
 }
 

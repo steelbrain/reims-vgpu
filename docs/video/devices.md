@@ -48,8 +48,9 @@ and the decoder list beside it in `graphics.rs`), and an encoder for each codec 
 profile of (`guest_encoders` in `graphics/vaapi.rs` and `graphics/nvidia.rs`). So on a Linux host
 an arm64 guest decodes H.264 and HEVC and encodes H.264 and HEVC Main and Main 10 in hardware; on
 a Windows host it decodes alone, as the Windows arm answers no encoder. Its decoders land 4:2:0
-pictures, and HEVC's 4:4:4 where the arm's decoder decodes it (`guest_declines`): NVDEC's, and
-VA-API's Main 4:4:4 at 8 bits where the driver has one.
+pictures, and HEVC's range extensions, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits, where the
+arm's own query lists a decoder of the stream (`guest_declines`; "HEVC's range extensions on arm64
+guests", below).
 
 Where the host lists no decoder, the kext publishes no service, and the guest's VideoToolbox
 answers as above for decoders. Its encoders are then the OS's own: arm64 macOS 27.0.1 lists no
@@ -235,11 +236,16 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   image for each picture until the IRAP picture, and none of them reaches the device
   (**measured** in the guest on a Radeon 780M, 2026-11-20).
   A stream the decoder does not take, an `avcC` or `hvcC` record's error, and the hardware's or
-  the host API's errors still fault the command buffer. The range extensions' streams, HEVC's
-  4:4:4 at 8 bits among them, are streams this decoder does not take: the caps offer 4:2:0
-  alone, and its decoders land 4:2:0 pictures alone, where VideoToolbox's paravirtual decoders
-  on arm64 guests land HEVC 4:4:4 at 8 bits on hosts that decode it
-  ([design.md](../graphics-kext/design.md), "The answers are the host's arms'").
+  the host API's errors still fault the command buffer. The range extensions' streams are
+  streams this decoder does not take: the caps offer 4:2:0 alone, and its decoders land 4:2:0
+  pictures at 8 and 10 bits alone, where VideoToolbox's paravirtual decoders on arm64 guests
+  land them on hosts that decode them ([design.md](../graphics-kext/design.md), "The answers
+  are the host's arms'"). With a kext that published the range extensions' profiles too (a
+  scratch build, never landed), an x86-64 macOS 26.7.2 guest on the Iris Xe called the
+  device's decode for every one of them, but its decoders asked for 4:2:0 destinations alone,
+  `x420` for 10 and 12 bits and `420v` for 8, whatever the stream's chroma format, so no
+  picture could match the guest's software decode of a 4:2:2 or 4:4:4 stream, or of a 12-bit
+  one (**measured**, 2026-11-27, potluck jobs m3-max-77246 and m3-max-77257).
 - **A Mac's picture of an H.264 stream started at a P picture** is a decode against a
   reference of zeros, the picture's residuals added, which shows green. On VideoToolbox on a
   MacBook Pro of 2019 (macOS 26.7.1, its hardware decoder, 2026-11-25, potluck job
@@ -302,3 +308,93 @@ Both run in reims-vgpu's host video session (`graphics/video_host.rs`, [backends
 in host bytes, and the session copies it into the cache on a runtime queue. Each session counts
 how its pictures landed, and logs the counts at its end ([vaapi.md](vaapi.md), "The
 reims-graphics device").
+
+## HEVC's range extensions on arm64 guests
+
+VideoToolbox's paravirtual decoders, an arm64 guest's alone, take HEVC's range extensions where
+the arm's own query lists a decoder of the stream: VA-API's decoder of the stream's range
+extensions profile with the render targets and the surfaces it needs ([vaapi.md](vaapi.md),
+"Surfaces, formats and readback"), NVDEC's caps for its chroma format, depth and size
+([nvidia.md](nvidia.md)). Where the query lists none, the session's `dsta` is refused, its warning
+naming the stream and the arm's reason (`guest_declines` in `graphics/vaapi.rs` and
+`graphics/nvidia.rs`), and the guest decodes the stream in software. Monochrome, depths past 12
+bits and screen content coding are the codec's own refusals on every host.
+
+Each picture lands in the format the guest's own software decoder gives the stream, which `Dpba`
+names (`PixelFormat::of`): `420v`, `x420` and `tv20` for 4:2:0 at 8, 10 and 12 bits, `422v`,
+`x422` and `tv22` for 4:2:2, `444v`, `x444` and `tv44` for 4:4:4, and their full-range forms
+(`420f`, `xf20`, `tf20` and the rest). Measured on arm64 macOS 27.0.1 on an M3 Max (potluck jobs
+m3-max-77228 and m3-max-77231): the software decoder answers those formats, `tv20`, `tv22` and
+`tv44` being two planes of 16-bit samples with the 12 bits at the top, as `x420` holds 10; the
+M3's hardware decoder answers `422v` and `444v` at 8 bits and its own packed 10-bit formats,
+`p420`, `p422` and `p444` (three samples in 32 bits), at 10, and refuses 12-bit streams (−12911).
+CoreVideo's own descriptions of its packed formats give none the layout of VA-API's Y210, Y212,
+Y410 or Y412 (**measured** on macOS 27.0.1, potluck job m3-max-77310): `v216` orders a 4:2:2
+pair's 16-bit samples Cb, Y0, Cr, Y1, where Y210 and Y212 put Y0, Cb, Y1, Cr; `v410` holds a
+pixel's 10-bit Cb, Y and Cr from bit 2 of its 32-bit word, Y410 from bit 0; `y416` orders A, Y,
+Cb, Cr, where Y412 puts Cb, Y, Cr, A; and the M3's own 10-bit formats pack three samples in 32
+bits. `yuvs` has YUY2's layout, but neither of the Mac's decoders gives it: both answer `422v`
+for a 4:2:2 stream at 8 bits. So the device writes the guest's formats, and converts where the
+host's surface has another layout, each picture it converts on the CPU counted
+(`video-pictures-cpu-converted`):
+
+| host | stream | host surface | guest's format | written by |
+|---|---|---|---|---|
+| Iris Xe, iHD 26.3.5 | 4:2:0, 12 bits | P012 | `tv20` | a copy, as Main 10's |
+| | 4:2:2, 8 bits | YUY2 | `422v` | the CPU's split |
+| | 4:2:2, 10 bits | Y210 | `x422` | the CPU's split |
+| | 4:2:2, 12 bits | Y212 | `tv22` | the CPU's split |
+| | 4:4:4, 8 bits | XYUV | `444v` | the GPU's split where the import check passed XYUV, else the CPU's |
+| | 4:4:4, 10 bits | Y410 | `x444` | the CPU's split, each 10-bit field moved to the top of 16 bits |
+| | 4:4:4, 12 bits | Y412 | `tv44` | the CPU's split |
+| | 4:2:0, 8 and 10 bits | none: Main 12 lists P012 and P016 alone | | refused |
+| RTX 3090, 620.70.06 | 4:2:0, 8, 10 and 12 bits | NV12, P016 | `420v`, `x420`, `tv20` | a copy, as Main and Main 10's |
+| | 4:4:4, 8 bits | three planes | `444v` | the GPU's interleave where CUDA imports the device's buffers, else the CPU's |
+| | 4:4:4, 10 and 12 bits | three planes of 16-bit samples | `x444`, `tv44` | the CPU's interleave |
+| | 4:2:2 | none built | | refused |
+| Radeon 780M, radeonsi | any | none: no decoder listed | | refused |
+
+The full-range forms land as the video-range ones. Our streams of the 4:2:0 range extensions
+are 12-bit alone, so the 3090's 4:2:0 rows at 8 and 10 bits rest on its caps and the unit tests,
+not on a boot.
+
+Measured with VideoToolbox in arm64 macOS 26.6.2 guests under TCG, each stream one of our x265
+streams at 640x360 of 10 pictures, decoded once by a session that requires hardware and once by
+one that allows none (2026-11-27):
+- On the Iris Xe (potluck job m3-max-77302), the hardware sessions decoded Main 10 and the
+  range extensions at 4:2:0 12 bits and at 4:2:2 and 4:4:4 of 8, 10 and 12 bits, and the
+  full-range forms of the 12-bit and the 4:2:2 and 4:4:4 ones past 8 bits, each into the format
+  the software session gave, every picture byte for byte the same. The run counted 100
+  pictures converted by the CPU and 50 split by the GPU. An arm64 macOS 14.6.1 guest there
+  gave the same on the same streams: the same formats, every picture the same (m3-max-77338).
+- On the RTX 3090 (m3-max-77315), the hardware sessions decoded Main 10, Main 12, and 4:4:4 at
+  8, 10 and 12 bits, and the full-range forms of the 12-bit and the 4:4:4 ones past 8 bits, each
+  into the software session's format, every picture byte for byte the same; the run counted 40
+  pictures converted by the CPU and 50 interleaved by the GPU. Its session of a 4:2:2 stream was
+  refused at its start, as `NVDEC's decoders here land no HEVC 4:2:2 pictures (HEVC
+  general_profile_idc 4, chroma_format_idc 2, luma 10 bits, chroma 10 bits, 640x360)`.
+- On the Radeon 780M (m3-max-77300), each hardware session of a range extensions stream was
+  refused at its start, the warning naming the decoder radeonsi lacks, as `VA-API: the driver
+  has no HEVCMain422_10 decoder (HEVC general_profile_idc 4, chroma_format_idc 2, luma 10
+  bits, chroma 10 bits, 640x360)`, and the software sessions decoded them.
+
+The conversions cost less than the guest's own decode. On the Iris Xe, the one host here that
+lists the 4:2:2 decoders, and slower than the RTX 3090 at each stream both decode in the runs
+above, a hardware session and a software one took turns three times on each of
+our 1920x1080 streams of 30 pictures, in one arm64 macOS 26.6.2 guest under TCG (potluck job
+m3-max-77327, 2026-11-27; measured with the guest's CPU emulated, not on an arm64 host). The
+medians of the three, in seconds for the 30 pictures:
+
+| stream | host surface, written by | hardware | software |
+|---|---|---|---|
+| 4:2:0, 12 bits | P012, a copy | 0.413 | 2.218 |
+| 4:2:2, 8 bits | YUY2, the CPU's split | 0.379 | 3.306 |
+| 4:2:2, 10 bits | Y210, the CPU's split | 0.615 | 2.320 |
+| 4:2:2, 12 bits | Y212, the CPU's split | 0.587 | 2.313 |
+| 4:4:4, 8 bits | XYUV, the GPU's split | 0.375 | 1.950 |
+| 4:4:4, 10 bits | Y410, the CPU's split | 0.499 | 3.415 |
+| 4:4:4, 12 bits | Y412, the CPU's split | 0.593 | 3.585 |
+
+Every hardware run was faster than every software run of its stream (hardware 0.361 to 0.660 s,
+software 1.883 to 5.315 s), and the run counted 450 pictures converted by the CPU, the five CPU
+rows' 90 each.

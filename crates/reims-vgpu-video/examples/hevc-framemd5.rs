@@ -1,11 +1,15 @@
 //! Decodes an HEVC stream with [`reims_vgpu_video::vaapi::HevcDecoder`] and
 //! prints each frame's MD5 over its planes, packed, in the order the
-//! decoder emits them: NV12 for Main, P010 (little-endian 16-bit samples)
-//! for Main 10, and for 4:4:4 at 8 bits, which the decoder lands
-//! ([`HevcDecoder::lands_4_4_4`]), luma then interleaved Cb and Cr each as
-//! large, ffmpeg's NV24. With display order this is what `ffmpeg -f framemd5
-//! -pix_fmt nv12` (or `p010le`, or `nv24`) prints for the same stream, so a
-//! software decode is the reference (tools/hevc-check.sh).
+//! decoder emits them: luma, then interleaved Cb and Cr, in the two planes a
+//! VideoToolbox decoder's picture lands in: NV12 for Main, P010 (little-endian
+//! 16-bit samples) for Main 10, and for the range extensions, which the
+//! decoder lands ([`HevcDecoder::lands_range_extensions`]), P012 for 4:2:0 at
+//! 12 bits, NV16, P210 and P212 for 4:2:2 at 8, 10 and 12 bits (chroma as tall
+//! as luma), and NV24, P410 and P412 for 4:4:4 (chroma as wide and tall). With
+//! display order this is what `ffmpeg -f framemd5 -pix_fmt nv12` (or `p010le`,
+//! `p012le`, `nv16`, `p210le`, `p212le`, `nv24`, `p410le` or `p412le`) prints
+//! for the same stream, so a software decode is the reference
+//! (tools/hevc-check.sh).
 //!
 //! ```sh
 //! hevc-framemd5 /dev/dri/renderD128 stream.mp4 [options]
@@ -66,6 +70,7 @@ mod decode {
 
     use reims_vgpu_video::codec::h264::nal::LengthPrefixed;
     use reims_vgpu_video::codec::hevc::{self, OutputOrder, hvcc::DecoderConfiguration, nal};
+    use reims_vgpu_video::core::backend::Chroma;
     use reims_vgpu_video::vaapi::{Display, Error, Frame, HevcDecoder, PlaneRows};
 
     use super::md5::{Md5, self_test};
@@ -156,42 +161,38 @@ mod decode {
             let sample = if frame.bit_depth() > 8 { 2 } else { 1 };
             self.bit_depth = frame.bit_depth();
             let (w, h) = (frame.width() as usize * sample, frame.height() as usize);
-            // 4:4:4's chroma rows hold a Cb and a Cr a pixel, each as many rows as luma's.
-            let (uv_w, uv_h) = if frame.is_4_4_4() {
-                (2 * w, h)
-            } else {
-                (w, h / 2)
+            // 4:4:4's chroma rows hold a Cb and a Cr a pixel, each as many rows as luma's; 4:2:2's
+            // a pair for each two pixels, as many rows; 4:2:0's a pair for each two, half as many.
+            let pairs = (frame.width() as usize).div_ceil(2) * 2 * sample;
+            let (uv_w, uv_h) = match frame.chroma() {
+                Chroma::Yuv444 => (2 * w, h),
+                Chroma::Yuv422 => (pairs, h),
+                Chroma::Yuv420 => (w, h / 2),
             };
             let (stride, uv_stride) = (w + self.pad, uv_w + self.pad);
             self.y.resize(stride * h, 0);
             self.uv.resize(uv_stride * uv_h, 0);
             let start = StdRuntime.now();
-            if frame.is_4_4_4() {
-                let back = frame.read_back().map_err(|e| e.to_string())?;
-                back.copy_4_4_4_into(
-                    PlaneRows {
-                        bytes: &mut self.y,
-                        bytes_per_row: stride,
-                        rows: h,
-                        row_bytes: w,
-                    },
-                    PlaneRows {
-                        bytes: &mut self.uv,
-                        bytes_per_row: uv_stride,
-                        rows: uv_h,
-                        row_bytes: uv_w,
-                    },
-                )
-                .map_err(|e| e.to_string())?;
+            let back = frame.read_back().map_err(|e| e.to_string())?;
+            let y = PlaneRows {
+                bytes: &mut self.y,
+                bytes_per_row: stride,
+                rows: h,
+                row_bytes: w,
+            };
+            let uv = PlaneRows {
+                bytes: &mut self.uv,
+                bytes_per_row: uv_stride,
+                rows: uv_h,
+                row_bytes: uv_w,
+            };
+            if frame.is_packed() {
+                back.copy_packed_into(y, uv)
             } else {
-                let copy = if sample == 2 {
-                    Frame::copy_p010_to
-                } else {
-                    Frame::copy_nv12_to
-                };
-                copy(frame, &mut self.y, stride, &mut self.uv, uv_stride)
-                    .map_err(|e| e.to_string())?;
+                back.copy_into(y, uv)
             }
+            .map_err(|e| e.to_string())?;
+            drop(back);
             self.readback += StdRuntime.elapsed_since(start);
             self.stages = frame.readback_times();
             let mut md5 = Md5::new();
@@ -255,7 +256,7 @@ mod decode {
                 units.into_iter().map(<[u8]>::to_vec).collect(),
             )
         };
-        decoder.lands_4_4_4();
+        decoder.lands_range_extensions();
         decoder.set_output_order(options.order);
         let mut reader = Reader {
             y: Vec::new(),

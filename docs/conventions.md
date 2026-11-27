@@ -192,7 +192,12 @@ repeats the ones code cites.
     video's on Linux (`video-pictures-gpu-gathered`, a VideoToolbox
     decoder's 4:4:4 picture the GPU wrote into its surface's two planes
     from the decoder's scratch: one GPU pass a picture that a Mac does not
-    make) and its
+    make), its video's on Linux (`video-pictures-cpu-converted`, a
+    VideoToolbox decoder's picture the CPU wrote into its surface's two
+    planes from a host surface of another layout: VA-API's packed 4:2:2 and
+    4:4:4 samples of HEVC's range extensions, and NVDEC's three 4:4:4
+    planes where the GPU's gather does not take them; one CPU pass a
+    picture that a Mac does not make) and its
     decodes' (`video-landing-failure-carried`, a picture whose copy or
     draw into its output's caches failed after its command buffer
     completed at its decode, the session's next decode failing in its

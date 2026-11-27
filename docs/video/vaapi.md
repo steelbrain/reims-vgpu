@@ -196,7 +196,9 @@ whether it writes whole rows alone. Where none passes, the driver is lent
 no import of that format, and its frames come back through `vaGetImage`
 ("The copy back"). The graphics arm logs the three answers as its display
 opens, as `in place: NV12 Ok(ImportWrite { alignment: 256, whole_rows:
-false }), P010 ..., XYUV ...`.
+false }), P010 ..., XYUV ...`. The range extensions' other surfaces, P012,
+YUY2, Y210, Y212, Y410 and Y412, have no trial: no import of them is lent,
+and their frames come back through `vaGetImage` alone (`ImportWrites::of`).
 
 What the drivers answered (**measured**, libva 2.24.1, 2026-11-07):
 
@@ -1131,12 +1133,34 @@ said:
   `Frame::bit_depth` says which, and `copy_p010_to` copies two bytes a
   sample. The conformance window crops in chroma units, so a 4:2:0 frame
   is always of even size.
-- Main 4:4:4 at 8 bits, for a caller that lands it, decodes into XYUV
-  surfaces (`VAProfileHEVCMain444`, `VA_RT_FORMAT_YUV444`): one plane of
-  four bytes a pixel, Cr, Cb, Y and a byte unused, in memory order, as DRM's
-  `XYUV8888` and ffmpeg's VUYX. iHD lists AYUV and XYUV for the profile
-  (2026-11-22); XYUV is the one without alpha. `Frame::is_4_4_4` says so.
-  A frame lands two ways. `Frame::write_4_4_4_to` has the driver's video
+- The range extensions' streams, for a caller that lands them
+  (`HevcDecoder::lands_range_extensions`), decode on the driver's profile
+  of the stream's chroma format and depth, into its surfaces
+  (`range_extensions_decoder`, as ffmpeg's VA-API decoder maps those
+  formats):
+
+  | stream | profile | render targets | surfaces |
+  |---|---|---|---|
+  | 4:2:0 at 8, 10, 12 bits | `HEVCMain12` | YUV420, YUV420_10, YUV420_12 | NV12, P010, P012 |
+  | 4:2:2 at 8, 10 bits | `HEVCMain422_10` | YUV422, YUV422_10 | YUY2, Y210 |
+  | 4:2:2 at 12 bits | `HEVCMain422_12` | YUV422_12 | Y212 |
+  | 4:4:4 at 8, 10, 12 bits | `HEVCMain444`, `HEVCMain444_10`, `HEVCMain444_12` | YUV444, YUV444_10, YUV444_12 | XYUV, Y410, Y412 |
+
+  P012 is P010's two planes with 12 bits at the top of each sample. The
+  rest are one plane of packed pixels (va.h's FOURCCs): YUY2 bytes Y0, Cb,
+  Y1 and Cr for each two pixels, Y210 and Y212 the same in little-endian
+  16-bit words with the bits at the top, Y410 one little-endian 32-bit word
+  a pixel with Cb in bits 0 to 9, Y in 10 to 19 and Cr in 20 to 29, Y412
+  four 16-bit words a pixel, Cb, Y, Cr and alpha, and XYUV four bytes a
+  pixel, Cr, Cb, Y and a byte unused, in memory order, as DRM's `XYUV8888`
+  and ffmpeg's VUYX. What iHD 26.3.5 on the Iris Xe lists (`vaapi-probe`,
+  2026-11-27): `HEVCMain12` with P012 and P016 surfaces, so its 4:2:0
+  streams at 8 and 10 bits have no surface of theirs and are refused;
+  `HEVCMain422_10` with YUY2 and Y210; `HEVCMain422_12` with Y212, Y216 and
+  P012; `HEVCMain444` with AYUV and XYUV (XYUV is the one without alpha);
+  `HEVCMain444_10` with Y410; and `HEVCMain444_12` with Y412, Y212, Y416
+  and P012. `Frame::is_packed` says a frame is of a packed surface, and
+  `Frame::is_xyuv` that it is XYUV. An XYUV frame lands two ways. `Frame::write_4_4_4_to` has the driver's video
   processing write its crop's even width and height, from the crop's first
   pixel, into a `PackedTarget`: one plane of XYUV pixels in a caller's
   memory, imported as zero copy imports a caller's pages, where the import
@@ -1151,12 +1175,20 @@ said:
   thread's CPU time a picture, from the driver's write to the pass's end,
   0.57 ms median and 0.87 ms mean, against 12.1 ms and 10.0 ms for the read
   back and the CPU's split; its wall time 2.1 ms median against 13.2 ms.
-  Else `ReadBack::copy_4_4_4_into` reads it back through `vaGetImage` (an
-  XYUV image: there is no staged copy back of XYUV, which has no host
-  surface) and splits it on the CPU into two planes, luma and each pixel's
-  Cb then Cr, as CoreVideo's `444v` and `444f` and ffmpeg's NV24 lay them
-  out. A decode's target (`super::target`) and the two-plane in-place write
-  into a guest's surface (`Frame::write_to_guest`) take no XYUV.
+  Else, as every other packed frame, `ReadBack::copy_packed_into` reads it
+  back through `vaGetImage` (an image of the surface's own format: there is
+  no staged copy back of a packed surface, which has no host surface) and
+  splits it on the CPU into two planes (`split_packed`): the luma, and
+  each pair's Cb then Cr, a pair for each two pixels at 4:2:2 and for each
+  pixel at 4:4:4; a byte a sample at 8 bits, and a little-endian 16-bit
+  word deeper, its bits at the top, as the packed words already hold them
+  and Y410's 10-bit fields are moved to. These are CoreVideo's two-plane
+  formats of the chroma format and depth (`422v`, `x422`, `tv22`, `444v`,
+  `x444`, `tv44`, and their full-range forms) and ffmpeg's NV16, P210,
+  P212, NV24, P410 and P412. A P012 frame copies as P010's, two bytes a
+  sample, into `tv20` or `tf20`. A decode's target (`super::target`) and the
+  two-plane in-place write into a guest's surface (`Frame::write_to_guest`)
+  take NV12 and P010 alone.
 
 ### What it refuses
 
@@ -1167,29 +1199,35 @@ anything reaches the GPU:
   name one of them;
 - in the Main profiles, chroma other than 4:2:0, bit depths above 10, and
   the range extensions (`sps_range_extension_flag` and the PPS's);
-- in the range extensions, every stream but 4:4:4 at 8 bits (Main 4:4:4's,
-  Main 4:4:4 Intra's and Main 4:4:4 Still Picture's), and of those, separate
-  colour planes, extended precision processing, which A.3.5 allows only in
-  its 16-bit profiles, and an SPS whose VUI does not read, which hides its
-  extensions (`check_range_extensions`);
+- in the range extensions (`check_range_extensions`), monochrome, depths
+  other than 8, 10 and 12 bits, separate colour planes, an SPS whose VUI
+  does not read, which hides its extensions, extended precision processing,
+  which A.3.5 allows only in its 16-bit profiles, and high precision
+  weighted prediction offsets past 8 bits, whose offsets the slice header's
+  parse holds to 8 bits' range;
 - luma and chroma of different depths, and the screen content extensions
   (`sps_scc_extension_flag` and the PPS's).
 
-The codec module decodes the 4:4:4 streams it takes with their tools: the
+The codec module decodes the range extensions' streams it takes with their tools: the
 SPS's nine range extension flags and the PPS's transform skip size,
 cross-component prediction, chroma QP offset lists and SAO offset scales,
 each held to 7.4.3.3.2's ranges, and a slice's
 `cu_chroma_qp_offset_enabled_flag`. This module's accelerator decodes them
-for a caller that lands them (`HevcDecoder::lands_4_4_4`, which
-VideoToolbox's paravirtual decoders call), on the driver's `HEVCMain444`
-into XYUV surfaces (`profile_for`, and "Surfaces, formats and readback"),
-and refuses them for any other caller, before anything reaches the driver,
-with `Error::Unsupported("HEVC 4:4:4: its caller lands 4:2:0 pictures
-alone")`. A driver with no such decoder refuses them with its own answer,
-`HEVCMain444: the driver has no decoder`. iHD 26.3.5 on an Iris Xe lists
-`HEVCMain444` VLD with 4:4:4 render targets and AYUV and XYUV surfaces up
-to 16384x16384 (`vaapi-probe`, 2026-11-22); radeonsi on the Radeon 780M
-lists none. The picture's parameters go as va_dec_hevc.h's
+for a caller that lands them (`HevcDecoder::lands_range_extensions`,
+which VideoToolbox's paravirtual decoders call), on the driver's profile of
+the stream's chroma format and depth into its surfaces (`profile_for`, and
+"Surfaces, formats and readback"), and refuses them for any other caller,
+before anything reaches the driver, with `Error::Unsupported("HEVC range
+extensions: its caller lands Main and Main 10 pictures alone")`. A stream
+of a range extensions profile that is 4:2:0 and turns none of their tools
+on, as a Main or Main 10 stream also is, decodes as Main's
+(`is_range_extensions`). A driver with no decoder of the stream refuses it
+with its own answer, as `HEVCMain444_12: the driver has no decoder`, or
+`HEVCMain12: no YUV420_12 render targets`. iHD 26.3.5 on an Iris Xe lists
+the six range extensions profiles' VLD decoders up to 16384x16384
+(`vaapi-probe`, 2026-11-27; their surfaces in "Surfaces, formats and
+readback"); radeonsi on the Radeon 780M lists none. The picture's
+parameters go as va_dec_hevc.h's
 `VAPictureParameterBufferHEVCExtension`, the base structure and the range
 extensions' (`VAPictureParameterBufferHEVCRext`: the SPS's and the PPS's
 flags, the chroma QP offset lists, the SAO offset scales and the transform
@@ -1197,7 +1235,7 @@ skip size) with screen content's zeroed, and each slice's as
 `VASliceParameterBufferHEVCExtension`, whose range extension part holds the
 prediction weights' offsets at 16 bits and
 `cu_chroma_qp_offset_enabled_flag`: the whole structures in the usual
-buffer types, as ffmpeg sends them for that profile. NVDEC decodes them too
+buffer types, as ffmpeg sends them for those profiles. NVDEC decodes them too
 ([nvidia.md](nvidia.md), "What it refuses").
 
 Parameter sets, slice headers and pictures past the standard's ranges
@@ -1222,9 +1260,9 @@ as ffmpeg's own VA-API decode did (kvz-720p-ref15 from its tenth picture
 on, on the Radeon 780M, 2026-10-24; "Testing HEVC"). Each picture after
 it is refused until an IRAP picture.
 
-x265's streams of Main 4:2:2 10 and Main 12 are refused so; its Main 4:4:4
-streams decode where the driver lists `HEVCMain444` into XYUV, and are
-refused with the driver's answer elsewhere. `HevcDecoder::new` checks the `hvcC` record's first SPS, the driver's
+x265's streams of the range extensions decode where the driver lists the
+decoder of their profile, render targets and surfaces, and are refused with
+the driver's answer elsewhere. `HevcDecoder::new` checks the `hvcC` record's first SPS, the driver's
 profile and its largest size, so that a session the driver cannot serve
 fails when it is made.
 
@@ -1741,12 +1779,18 @@ set, and every frame's MD5 over packed NV12 or P010 must match. Then:
 - 2- and 3-byte NAL lengths, strides padded 192 bytes, a caller holding
   24 frames;
 - a switch from Main 720p to Main 10 1080p at an IDR picture, mid-stream;
-- Main 4:2:2 10 and Main 12, which must be refused;
-- x265's Main 4:4:4 streams at 8 bits (main444-360p; main444-720p-fade,
-  with weighted prediction; main444-1366x766-ctu16, with CTBs of 16 and
-  transform skip), whose MD5s over NV24 must match where `vaapi-probe`
-  lists `HEVCMain444`'s decoder of 4:4:4 render targets and XYUV surfaces,
-  and which must be refused, naming `HEVCMain444`, where it does not;
+- x265's streams of the range extensions (`rext_streams`): Main 4:4:4 at
+  8 bits (main444-360p; main444-720p-fade, with weighted prediction;
+  main444-1366x766-ctu16, with CTBs of 16 and transform skip), Main 12
+  (main12-360p; main12-720p-fade), Main 4:2:2 10 at 8 and 10 bits
+  (main422-8-360p; main422-10-720p; main422-10-1366x766-ctu16), Main 4:2:2
+  12 (main422-12-720p-fade), Main 4:4:4 10 (main444-10-720p) and Main 4:4:4
+  12 (main444-12-720p-fade; main444-12-1366x766-ctu16), whose MD5s over
+  ffmpeg's two-plane format of their chroma format and depth (P012, NV16,
+  P210, P212, NV24, P410, P412: `rext_decoder`) must match where
+  `vaapi-probe` lists the decoder of their profile, render targets and
+  surfaces, and which must be refused, naming the profile, where it does
+  not;
 - kvazaar's kvz-720p-tiles-narrow and kvz-720p-tiles-short, whose tile
   column of 192 samples and row of 16 Main does not allow (H.265 A.3.2 and
   A.3.3: 256 and 64 at least), which must match on every frame;

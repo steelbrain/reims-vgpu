@@ -13,16 +13,19 @@
 //!   a stream whose pictures the host decodes none of, are refused with
 //!   `kVTVideoDecoderUnsupportedDataFormatErr`, an H.264 SPS that lets pictures be fields with
 //!   `kVTVideoDecoderMalfunctionErr`, and the backend refuses what it does not decode, each with
-//!   no `Dpba`. The host decodes 4:2:0 pictures at 8 bits, HEVC's at 10 too, and HEVC's 4:4:4
-//!   pictures at 8 where the arm does, in the profiles and tools the codec's `check_supported`
-//!   takes, which every arm's decode of a picture checks: a stream of 4:2:2 or monochrome
-//!   pictures (a HEIC image's alpha), of deeper samples, or of 4:4:4 ones the arm declines
-//!   ([`Backend::declines`]; a HEIC image's 4:4:4 thumbnail where the arm decodes no 4:4:4) is
-//!   refused at its start, not at each frame, with a warning that names why, and the stream's
+//!   no `Dpba`. The host decodes 4:2:0 pictures at 8 bits, HEVC's at 10 too, and HEVC's range
+//!   extensions pictures (4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits) where the arm does, in
+//!   the profiles and tools the codec's `check_supported` takes, which every arm's decode of a
+//!   picture checks: a stream of monochrome pictures (a HEIC image's alpha), of deeper samples,
+//!   or of a chroma format and depth the arm declines ([`Backend::declines`], from its own
+//!   query of the host's decoder; a HEIC image's 4:4:4 thumbnail where the arm decodes no 4:4:4)
+//!   is refused at its start, not at each frame, with a warning that names why, and the stream's
 //!   profile, chroma format, bit depths and size ([`Undecoded`]). A started session sends `Dpba`,
-//!   the attributes the guest's output buffers are to have (the two-plane format of its chroma,
-//!   depth and range: `420v`, `420f`, `x420`, `xf20`, `444v` or `444f`), before its reply. A second
-//!   `dsta` is answered `kVTVideoDecoderBadDataErr`, and the session goes on as the first left it.
+//!   the attributes the guest's output buffers are to have: the two-plane CoreVideo format of its
+//!   chroma, depth and range that the guest's own software decoder lands the stream in
+//!   ([`PixelFormat::of`]: `420v`, `x420`, `tv20`, `422v`, `x422`, `tv22`, `444v`, `x444`, `tv44`
+//!   and their full-range twins), before its reply. A second `dsta` is answered
+//!   `kVTVideoDecoderBadDataErr`, and the session goes on as the first left it.
 //! - **`dfrm`** decodes one sample: the host asks the guest for an output buffer (`Dbuf`, waiting
 //!   [`BUFFER_REPLY_WAIT`]), which lends the buffer's surface; the backend decodes the sample's
 //!   access unit into it and returns once the picture is there; the host emits the frame
@@ -67,6 +70,7 @@ use crate::codec::h264::{self, avcc};
 use crate::codec::hevc::nal::nal_type;
 use crate::codec::hevc::sps::Sps as HevcSps;
 use crate::codec::hevc::{self, hvcc};
+use crate::core::backend::{Chroma, PixelFormat};
 use crate::core::fourcc::FourCc;
 use crate::core::runtime::Runtime;
 use crate::paravirt::WireError;
@@ -186,9 +190,15 @@ pub trait Backend: Send + Sync {
 
     /// Why the arm decodes none of the pictures of a stream of `stream`, one the codec takes, so
     /// that its session is refused at its start as one the codec refuses is, not at each picture
-    /// or tile; `None` where it decodes them. The default takes 4:2:0 streams alone.
+    /// or tile; `None` where it decodes them. The default takes 4:2:0 streams of Main and Main 10
+    /// alone.
     fn declines(&self, stream: &Stream) -> Option<String> {
-        (stream.chroma_format_idc != 1).then(|| "the arm decodes 4:2:0 pictures alone".to_owned())
+        if stream.chroma_format_idc != 1 {
+            Some("the arm decodes 4:2:0 pictures alone".to_owned())
+        } else {
+            (stream.range_extensions)
+                .then(|| "the arm decodes no range extensions pictures".to_owned())
+        }
     }
 }
 
@@ -209,6 +219,9 @@ pub struct Stream {
     pub width: u32,
     /// The coded picture's height, in luma samples.
     pub height: u32,
+    /// Whether HEVC's stream decodes as the range extensions' (`codec::hevc::is_range_extensions`),
+    /// on their profiles; false for H.264's.
+    pub range_extensions: bool,
 }
 
 /// One open decoder, called on its session's thread, one call at a time.
@@ -418,8 +431,11 @@ impl Worker {
             );
             return Err(status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT);
         }
+        let format = record
+            .format
+            .ok_or(status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT)?;
         let decoder = self.backend.open(config)?;
-        self.send_buffer_attributes(config, &record);
+        self.send_buffer_attributes(config, format);
         self.decoder = Some(decoder);
         self.config = Some(config.clone());
         self.length_size = record.length_size;
@@ -430,12 +446,11 @@ impl Worker {
     /// `Dpba`: the attributes the guest's output buffers are to have: the format the picture
     /// lands in, the description's size, IOSurface backing, which the host needs to reach them,
     /// and the row and plane alignments and cache mode a hardware decoder's buffers have.
-    fn send_buffer_attributes(&self, config: &DecoderConfig, record: &Record) {
-        let format = pixel_format(record);
+    fn send_buffer_attributes(&self, config: &DecoderConfig, format: PixelFormat) {
         let attributes = Value::dictionary([
             (
                 "PixelFormatType",
-                Value::Array(vec![Value::Integer(i64::from(u32::from_be_bytes(format)))]),
+                Value::Array(vec![Value::Integer(i64::from(format.fourcc().0))]),
             ),
             ("Width", Value::Integer(i64::from(config.width))),
             ("Height", Value::Integer(i64::from(config.height))),
@@ -554,9 +569,10 @@ impl Worker {
             );
             return Err(status::UNIMPLEMENTED);
         }
+        let format = record.format.ok_or(status::UNIMPLEMENTED)?;
         let decoder = self.backend.open(config)?;
         let limits = decoder.tile_limits().ok_or(status::UNIMPLEMENTED)?;
-        self.send_tile_requirements(&record, limits);
+        self.send_tile_requirements(format, limits);
         self.tiles = Some(TileSession {
             decoder,
             length_size: record.length_size,
@@ -569,13 +585,11 @@ impl Worker {
     /// in, IOSurface backing, and a hardware decoder's row and plane alignments), and the tiles
     /// the session decodes: the backend's largest and smallest picture, [`TILE_PIXEL_ALIGNMENT`],
     /// [`TILE_BYTE_ALIGNMENT`], and rows of an output buffer up to the widest tile's.
-    fn send_tile_requirements(&self, record: &Record, limits: TileLimits) {
+    fn send_tile_requirements(&self, format: PixelFormat, limits: TileLimits) {
         let attributes = Value::dictionary([
             (
                 "PixelFormatType",
-                Value::Array(vec![Value::Integer(i64::from(u32::from_be_bytes(
-                    pixel_format(record),
-                )))]),
+                Value::Array(vec![Value::Integer(i64::from(format.fourcc().0))]),
             ),
             ("IOSurfaceProperties", Value::Dictionary(Vec::new())),
             ("BytesPerRowAlignment", Value::Integer(64)),
@@ -1014,18 +1028,14 @@ fn config_from_format(format: &SerializedFormatDescription) -> Option<DecoderCon
     })
 }
 
-/// The CoreVideo format a configuration's pictures land in: 4:2:0 at 8 or 10 bits, or 4:4:4 at 8,
-/// video or full range, two planes each.
-fn pixel_format(record: &Record) -> [u8; 4] {
-    let four_four_four = record.stream.chroma_format_idc == 3;
-    match (four_four_four, record.ten_bit, record.full_range) {
-        (true, _, false) => *b"444v",
-        (true, _, true) => *b"444f",
-        (false, false, false) => *b"420v",
-        (false, false, true) => *b"420f",
-        (false, true, false) => *b"x420",
-        (false, true, true) => *b"xf20",
-    }
+/// The CoreVideo format a stream's pictures land in: the two-plane format of its chroma format,
+/// depth and range ([`PixelFormat::of`]); `None` for one of none (monochrome, or past 12 bits).
+fn pixel_format(stream: &Stream, full_range: bool) -> Option<PixelFormat> {
+    PixelFormat::of(
+        Chroma::of_idc(stream.chroma_format_idc)?,
+        stream.luma_bits,
+        full_range,
+    )
 }
 
 /// A `dtil`'s region from its `,tco`, `,tcd` and `,obp`: `None` for a negative or empty one, one
@@ -1051,10 +1061,8 @@ struct Record {
     length_size: u8,
     /// Its parameter sets, Annex B.
     parameter_sets: Vec<u8>,
-    /// Whether the luma samples have more than 8 bits: 10, in a stream the host decodes.
-    ten_bit: bool,
-    /// Whether the samples use the full range.
-    full_range: bool,
+    /// The CoreVideo format its pictures land in ([`pixel_format`]), where it has one.
+    format: Option<PixelFormat>,
     /// The stream its SPS describes.
     stream: Stream,
     /// Why the codec takes none of the stream's pictures, where it takes none.
@@ -1063,9 +1071,9 @@ struct Record {
 
 /// A stream whose pictures the host's decoders take none of: what the codec's `check_supported`
 /// refuses of its SPS (a profile, chroma format, bit depths or tools outside 4:2:0 at 8 bits,
-/// HEVC's at 8 or 10, and HEVC's 4:4:4 at 8), which every arm's decode of each picture checks, or
-/// what the arm declines of it ([`Backend::declines`]), and what the SPS says the stream is,
-/// which the refusal's line names.
+/// HEVC's at 8 or 10, and HEVC's range extensions at 8, 10 and 12), which every arm's decode of
+/// each picture checks, or what the arm declines of it ([`Backend::declines`]), and what the SPS
+/// says the stream is, which the refusal's line names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Undecoded {
     /// What `check_supported` refuses, or the arm declines.
@@ -1084,6 +1092,7 @@ impl Stream {
             chroma_bits: sps.bit_depth_chroma_minus8.saturating_add(8),
             width: sps.pic_width_in_luma_samples,
             height: sps.pic_height_in_luma_samples,
+            range_extensions: hevc::is_range_extensions(sps),
         }
     }
 
@@ -1097,6 +1106,7 @@ impl Stream {
             chroma_bits: sps.bit_depth_chroma_minus8.saturating_add(8),
             width: sps.coded_width(),
             height: sps.coded_height(),
+            range_extensions: false,
         }
     }
 }
@@ -1174,7 +1184,7 @@ fn undecoded(backend: &dyn Backend, record: &Record) -> Option<Undecoded> {
 /// ([`Record::undecoded`]).
 fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
     let unsupported = status::VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT;
-    let (length_size, units, ten_bit, full_range, stream, undecoded) = match config.codec {
+    let (length_size, units, full_range, stream, undecoded) = match config.codec {
         Codec::H264 => {
             let record =
                 avcc::DecoderConfiguration::parse(&config.record).map_err(|_| unsupported)?;
@@ -1197,16 +1207,8 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
                 why: error.to_string(),
                 stream,
             });
-            let ten_bit = sps.bit_depth_luma_minus8 > 0;
             let full_range = sps.is_full_range();
-            (
-                record.length_size,
-                units,
-                ten_bit,
-                full_range,
-                stream,
-                undecoded,
-            )
+            (record.length_size, units, full_range, stream, undecoded)
         }
         Codec::Hevc => {
             let record =
@@ -1232,7 +1234,6 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
             (
                 record.length_size,
                 record.nal_units,
-                sps.bit_depth_luma_minus8 > 0,
                 full,
                 stream,
                 undecoded,
@@ -1250,8 +1251,7 @@ fn read_record(config: &DecoderConfig) -> Result<Record, OsStatus> {
     Ok(Record {
         length_size,
         parameter_sets,
-        ten_bit,
-        full_range,
+        format: pixel_format(&stream, full_range),
         stream,
         undecoded,
     })

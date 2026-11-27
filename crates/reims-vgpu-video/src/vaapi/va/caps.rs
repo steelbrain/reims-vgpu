@@ -38,8 +38,18 @@ impl Profile {
     pub const HEVC_MAIN: Self = Self(ffi::VAProfileHEVCMain);
     /// `VAProfileHEVCMain10`.
     pub const HEVC_MAIN10: Self = Self(ffi::VAProfileHEVCMain10);
+    /// `VAProfileHEVCMain12`: the range extensions' 4:2:0 to 12 bits.
+    pub const HEVC_MAIN12: Self = Self(ffi::VAProfileHEVCMain12);
+    /// `VAProfileHEVCMain422_10`: the range extensions' 4:2:2 at 8 and 10 bits.
+    pub const HEVC_MAIN422_10: Self = Self(ffi::VAProfileHEVCMain422_10);
+    /// `VAProfileHEVCMain422_12`: the range extensions' 4:2:2 at 12 bits.
+    pub const HEVC_MAIN422_12: Self = Self(ffi::VAProfileHEVCMain422_12);
     /// `VAProfileHEVCMain444`: the range extensions' 4:4:4 at 8 bits.
     pub const HEVC_MAIN444: Self = Self(ffi::VAProfileHEVCMain444);
+    /// `VAProfileHEVCMain444_10`: the range extensions' 4:4:4 at 10 bits.
+    pub const HEVC_MAIN444_10: Self = Self(ffi::VAProfileHEVCMain444_10);
+    /// `VAProfileHEVCMain444_12`: the range extensions' 4:4:4 at 12 bits.
+    pub const HEVC_MAIN444_12: Self = Self(ffi::VAProfileHEVCMain444_12);
 
     /// va.h's name for the profile, without its `VAProfile` prefix.
     pub fn name(self) -> Option<&'static str> {
@@ -139,6 +149,18 @@ impl Fourcc {
     pub const NV12: Self = Self(ffi::VA_FOURCC_NV12);
     /// `VA_FOURCC_XYUV`.
     pub const XYUV: Self = Self(ffi::VA_FOURCC_XYUV);
+    /// `VA_FOURCC_P012`.
+    pub const P012: Self = Self(ffi::VA_FOURCC_P012);
+    /// `VA_FOURCC_YUY2`.
+    pub const YUY2: Self = Self(ffi::VA_FOURCC_YUY2);
+    /// `VA_FOURCC_Y210`.
+    pub const Y210: Self = Self(ffi::VA_FOURCC_Y210);
+    /// `VA_FOURCC_Y212`.
+    pub const Y212: Self = Self(ffi::VA_FOURCC_Y212);
+    /// `VA_FOURCC_Y410`.
+    pub const Y410: Self = Self(ffi::VA_FOURCC_Y410);
+    /// `VA_FOURCC_Y412`.
+    pub const Y412: Self = Self(ffi::VA_FOURCC_Y412);
 }
 
 impl std::fmt::Display for Fourcc {

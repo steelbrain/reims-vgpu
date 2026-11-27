@@ -134,9 +134,9 @@ pub trait Accelerator {
 /// decoded: 4:2:0 at 8 or 10 bits, with tiles, wavefront parallel
 /// processing, dependent slice segments, scaling lists, weighted
 /// prediction and long-term references; and the range extensions' streams
-/// at 4:4:4 and 8 bits, with their tools but extended precision. Other
-/// chroma formats and bit depths, and the screen content extensions, are
-/// refused with [`Error::Unsupported`] ([`check_supported`]).
+/// at 4:2:0, 4:2:2 and 4:4:4 and 8, 10 and 12 bits, with their tools but
+/// extended precision. Monochrome, other bit depths, and the screen content
+/// extensions, are refused with [`Error::Unsupported`] ([`check_supported`]).
 ///
 /// Errors follow Apple's HEVC decoder: after a sample that does not
 /// decode, each picture is refused with [`Error::Unrecovered`] until an
@@ -786,9 +786,11 @@ fn same_but_vui(a: &Sps, b: &Sps) -> bool {
 /// (Main, Main 10, Main Still Picture, or a stream compatible with one),
 /// 4:2:0 at 8 or 10 bits alike for luma and chroma, without the range or
 /// screen content extensions; or a stream of the range extensions' profiles
-/// (A.3.5) at 4:4:4 and 8 bits, with their tools but extended precision.
-/// Whether the host's decoder takes it is the accelerator's to say, from its
-/// driver's answers: this is what the codec builds for.
+/// (A.3.5) at 4:2:0, 4:2:2 or 4:4:4 and 8, 10 or 12 bits alike for luma and
+/// chroma, with their tools but extended precision, and high precision
+/// weighted prediction offsets at 8 bits alone. Whether the host's decoder
+/// takes it is the accelerator's to say, from its driver's answers: this is
+/// what the codec builds for.
 pub fn check_supported(sps: &Sps) -> Result<(), Error> {
     let ptl = &sps.profile_tier_level;
     let main = matches!(ptl.general_profile_idc, 1..=3) || (1..=3).any(|p| ptl.compatible_with(p));
@@ -811,13 +813,8 @@ pub fn check_supported(sps: &Sps) -> Result<(), Error> {
     if sps.sps_scc_extension_flag {
         return Err(Error::Unsupported("screen content coding"));
     }
-    if range_extensions && sps.chroma_format_idc == 3 {
+    if is_range_extensions(sps) {
         return check_range_extensions(sps);
-    }
-    if !main {
-        return Err(Error::Unsupported(
-            "range extensions streams other than 4:4:4 at 8 bits",
-        ));
     }
     if sps.chroma_format_idc != 1 {
         return Err(Error::Unsupported("chroma formats other than 4:2:0"));
@@ -831,14 +828,31 @@ pub fn check_supported(sps: &Sps) -> Result<(), Error> {
     Ok(())
 }
 
-/// [`check_supported`] for a 4:4:4 stream of the range extensions' profiles:
-/// 8 bits, its three planes coded together, its SPS read to its range
-/// extensions, and every tool of theirs but extended precision processing,
-/// which A.3.5 allows only in its 16-bit profiles.
+/// Whether `sps`'s stream is decoded as the range extensions' ([`check_supported`]): one of
+/// their profiles, but a stream also of the Main family that is 4:2:0 and turns on none of their
+/// tools, which decodes as Main's. A decoder of a range extensions stream takes the range
+/// extensions' parameters (VA-API's range extensions profiles and their structures).
+pub fn is_range_extensions(sps: &Sps) -> bool {
+    let ptl = &sps.profile_tier_level;
+    let main = matches!(ptl.general_profile_idc, 1..=3) || (1..=3).any(|p| ptl.compatible_with(p));
+    let range_extensions = ptl.general_profile_idc == 4 || ptl.compatible_with(4);
+    range_extensions && !(main && sps.chroma_format_idc == 1 && !sps.sps_range_extension_flag)
+}
+
+/// [`check_supported`] for a stream of the range extensions' profiles: 4:2:0,
+/// 4:2:2 or 4:4:4 at 8, 10 or 12 bits, its planes coded together, its SPS
+/// read to its range extensions, and every tool of theirs but extended
+/// precision processing, which A.3.5 allows only in its 16-bit profiles, and
+/// high precision weighted prediction offsets past 8 bits, whose offsets
+/// the slice header's parse holds to 8 bits' range (`slice`'s
+/// `pred_weight_table`).
 fn check_range_extensions(sps: &Sps) -> Result<(), Error> {
-    if sps.bit_depth_luma_minus8 != 0 {
+    if sps.chroma_format_idc == 0 {
+        return Err(Error::Unsupported("monochrome"));
+    }
+    if !matches!(sps.bit_depth_luma_minus8, 0 | 2 | 4) {
         return Err(Error::Unsupported(
-            "range extensions streams other than 4:4:4 at 8 bits",
+            "range extensions streams of depths other than 8, 10 and 12 bits",
         ));
     }
     if sps.separate_colour_plane_flag {
@@ -847,8 +861,14 @@ fn check_range_extensions(sps: &Sps) -> Result<(), Error> {
     if sps.extensions_unread {
         return Err(Error::Unsupported("range extensions an SPS's VUI hides"));
     }
-    if sps.range_extension.extended_precision_processing_flag {
+    let tools = &sps.range_extension;
+    if tools.extended_precision_processing_flag {
         return Err(Error::Unsupported("extended precision processing"));
+    }
+    if tools.high_precision_offsets_enabled_flag && sps.bit_depth_luma_minus8 > 0 {
+        return Err(Error::Unsupported(
+            "high precision weighted prediction offsets past 8 bits",
+        ));
     }
     Ok(())
 }
@@ -859,8 +879,8 @@ fn check_range_extensions(sps: &Sps) -> Result<(), Error> {
 /// the SPS within them.
 fn check_pps_supported(pps: &Pps, sps: &Sps) -> Result<(), Error> {
     if pps.pps_range_extension_flag {
-        // 4:2:0: a Main family SPS, the one of 4:2:0 `check_supported` takes.
-        if sps.chroma_format_idc == 1 {
+        // A Main family SPS, which `check_supported` takes without the range extensions.
+        if !is_range_extensions(sps) {
             return Err(Error::Unsupported("the range extensions"));
         }
         check_pps_range_extension(&pps.range_extension, sps)?;

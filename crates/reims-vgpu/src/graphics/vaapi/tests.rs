@@ -1,6 +1,6 @@
 use super::*;
 use crate::graphics::video_choice::tested_gpu::Arm;
-use reims_vgpu_video::vaapi::{ImportWrite, SurfaceCapabilities, TargetFormat};
+use reims_vgpu_video::vaapi::{Fourcc, ImportWrite, SurfaceCapabilities, TargetFormat};
 
 /// A VLD config of `profile`, decoding `rt_formats`, up to `max` with surfaces from `min`.
 fn config(
@@ -141,71 +141,106 @@ fn a_profile_whose_config_decodes_none_of_its_formats_is_left_out() {
     assert!(caps_of(&driver(Vec::new())).is_empty());
 }
 
-/// An HEVC 4:4:4 stream decodes where the driver's Main 4:4:4 decoder writes XYUV surfaces of
-/// 4:4:4 render targets at its size and the stream is of 8 bits, as iHD's answers on an Iris Xe
-/// (AYUV and XYUV up to 16384x16384), and is declined, naming why, everywhere else
+/// An HEVC range extensions stream decodes where the driver's decoder of its chroma format and
+/// depth writes that decoder's surfaces of the stream's render targets at its size, as iHD's
+/// answers on an Iris Xe (Main 4:4:4's AYUV and XYUV, Main 12's P012 and P016, Main 4:2:2 10's
+/// YUY2 and Y210 of 4:2:2 and 4:2:2 10-bit render targets, Main 4:4:4 12's Y412, each up to
+/// 16384x16384; potluck job m3-max-77223), and is declined, naming why, everywhere else
 #[test]
-fn an_hevc_4_4_4_stream_decodes_on_a_main_4_4_4_decoder_of_xyuv_surfaces_alone() {
+fn an_hevc_range_extensions_stream_decodes_on_its_profiles_decoder_of_its_surfaces_alone() {
     use reims_vgpu_video::paravirt::Codec as StreamCodec;
-    let stream = |luma_bits: u8, width: u32, height: u32| Stream {
+    let stream = |chroma_format_idc: u8, luma_bits: u8, width: u32, height: u32| Stream {
         codec: StreamCodec::Hevc,
         profile: 4,
-        chroma_format_idc: 3,
+        chroma_format_idc,
         luma_bits,
         chroma_bits: luma_bits,
         width,
         height,
+        range_extensions: true,
     };
-    let ayuv = Fourcc(u32::from_le_bytes(*b"AYUV"));
-    let iris = |pixel_formats: Vec<Fourcc>, rt_formats: u32| {
-        let mut config = config(
-            Profile::HEVC_MAIN444,
-            rt_formats,
-            (16384, 16384),
-            Some((16, 16)),
-        );
+    let named = |name: &[u8; 4]| Fourcc(u32::from_le_bytes(*name));
+    let iris = |profile, pixel_formats: Vec<Fourcc>, rt_formats: u32| {
+        let mut config = config(profile, rt_formats, (16384, 16384), Some((16, 16)));
         if let Ok(surfaces) = config.surfaces.as_mut() {
             surfaces.pixel_formats = pixel_formats;
         }
         config
     };
-    let taken = iris(vec![ayuv, Fourcc::XYUV], 0x0000_000f);
-    assert_eq!(declines_4_4_4(Some(&taken), &stream(8, 1920, 1080)), None);
-    assert_eq!(declines_4_4_4(Some(&taken), &stream(8, 16384, 16)), None);
+    let configs = [
+        iris(
+            Profile::HEVC_MAIN444,
+            vec![named(b"AYUV"), Fourcc::XYUV],
+            0x0000_000f,
+        ),
+        iris(
+            Profile::HEVC_MAIN12,
+            vec![Fourcc::P012, named(b"P016")],
+            0x0000_1000,
+        ),
+        iris(
+            Profile::HEVC_MAIN422_10,
+            vec![Fourcc::YUY2, Fourcc::Y210],
+            0x0000_0202,
+        ),
+        iris(Profile::HEVC_MAIN444_12, vec![Fourcc::Y412], 0x0000_4000),
+    ];
+    for taken in [
+        stream(3, 8, 1920, 1080),
+        stream(3, 8, 16384, 16),
+        stream(1, 12, 1920, 1080),
+        stream(2, 8, 1920, 1080),
+        stream(2, 10, 1920, 1080),
+        stream(3, 12, 1920, 1080),
+    ] {
+        assert_eq!(
+            declines_range_extensions(&configs, &taken),
+            None,
+            "{taken:?}"
+        );
+    }
     let declined = [
         (
-            None,
-            stream(8, 1920, 1080),
-            "VA-API: the driver has no HEVC Main 4:4:4 decoder",
+            stream(3, 10, 1920, 1080),
+            "VA-API: the driver has no HEVCMain444_10 decoder",
         ),
         (
-            Some(&taken),
-            stream(10, 1920, 1080),
-            "VA-API decodes HEVC 4:4:4 at 8 bits here, not 10",
+            stream(1, 10, 1920, 1080),
+            "VA-API: the driver's HEVCMain12 decoder has no YUV420_10 render targets",
         ),
         (
-            Some(&taken),
-            stream(8, 16400, 1080),
-            "VA-API decodes HEVC 4:4:4 up to 16384x16384, not 16400x1080",
+            stream(3, 14, 1920, 1080),
+            "VA-API decodes HEVC's range extensions of 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 \
+             bits, not chroma_format_idc 3 at 14",
         ),
         (
-            Some(&taken),
-            stream(8, 8, 8),
-            "VA-API decodes HEVC 4:4:4 from 16x16, not 8x8",
+            stream(3, 8, 16400, 1080),
+            "VA-API decodes HEVCMain444 up to 16384x16384, not 16400x1080",
+        ),
+        (
+            stream(2, 8, 8, 8),
+            "VA-API decodes HEVCMain422_10 from 16x16, not 8x8",
         ),
     ];
-    for (config, stream, why) in declined {
-        assert_eq!(declines_4_4_4(config, &stream).as_deref(), Some(why));
+    for (stream, why) in declined {
+        assert_eq!(
+            declines_range_extensions(&configs, &stream).as_deref(),
+            Some(why)
+        );
     }
-    let packed_alone = iris(vec![ayuv], 0x0000_000f);
+    let packed_alone = [iris(
+        Profile::HEVC_MAIN444,
+        vec![named(b"AYUV")],
+        0x0000_000f,
+    )];
     assert_eq!(
-        declines_4_4_4(Some(&packed_alone), &stream(8, 1920, 1080)).as_deref(),
-        Some("VA-API writes HEVC 4:4:4 as [AYUV], not XYUV")
+        declines_range_extensions(&packed_alone, &stream(3, 8, 1920, 1080)).as_deref(),
+        Some("VA-API's HEVCMain444 decoder writes [AYUV], not XYUV")
     );
-    let no_4_4_4 = iris(vec![Fourcc::XYUV], RT_YUV420);
+    let no_4_4_4 = [iris(Profile::HEVC_MAIN444, vec![Fourcc::XYUV], RT_YUV420)];
     assert_eq!(
-        declines_4_4_4(Some(&no_4_4_4), &stream(8, 1920, 1080)).as_deref(),
-        Some("VA-API: the driver's HEVC Main 4:4:4 decoder has no 4:4:4 render targets")
+        declines_range_extensions(&no_4_4_4, &stream(3, 8, 1920, 1080)).as_deref(),
+        Some("VA-API: the driver's HEVCMain444 decoder has no YUV444 render targets")
     );
 }
 
@@ -853,8 +888,9 @@ pub(super) fn va_streams() -> Vec<std::path::PathBuf> {
 
 /// Decodes each of `streams` on `display`, in decode order, and hands each frame to `each` with
 /// its stream and its access unit's id, until `each` answered `true` (written) for `most` of the
-/// stream's frames or the stream ends. With `four_four_four`, an HEVC decoder decodes 4:4:4
-/// streams too (`HevcDecoder::lands_4_4_4`). A stream the decoder refuses is left at its refusal,
+/// stream's frames or the stream ends. With `four_four_four`, an HEVC decoder decodes the range
+/// extensions' streams too (`HevcDecoder::lands_range_extensions`), 4:4:4 among them. A stream the
+/// decoder refuses is left at its refusal,
 /// which is answered.
 pub(super) fn each_picture(
     display: &Display,
@@ -871,7 +907,7 @@ pub(super) fn each_picture(
         let (units, mut decoder) = if stream.to_string_lossy().ends_with(".265") {
             let mut decoder = HevcDecoder::new_annex_b(display);
             if four_four_four {
-                decoder.lands_4_4_4();
+                decoder.lands_range_extensions();
             }
             (hevc::nal::access_units(&file), Codec::Hevc(decoder))
         } else {

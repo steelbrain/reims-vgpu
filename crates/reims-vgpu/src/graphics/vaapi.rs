@@ -80,11 +80,18 @@
 //!   decode lands in the IOSurface its kext lent, written there by the driver's video processing
 //!   (`Frame::write_to_guest`, the first way above) where the import check takes the surface's
 //!   layout and memory, else read back and copied by the CPU into the surface's pages. An HEVC
-//!   4:4:4 stream at 8 bits decodes where the driver's Main 4:4:4 decoder takes it
-//!   (`declines_4_4_4`) into XYUV surfaces, split into the surface's two planes, luma and
-//!   interleaved Cb and Cr (`444v` and `444f`): on Linux by the runtime device's GPU where the
-//!   import check passed XYUV (`xyuv`), else read back and split by the CPU; every other stream
-//!   that is not 4:2:0 is refused at its session's start.
+//!   stream of the range extensions decodes where the driver's decoder of its chroma format and
+//!   depth takes it (`declines_range_extensions`, from the driver's own answers: the profile, its
+//!   render-target format, its surfaces' FOURCC and sizes; the VA crate's
+//!   `range_extensions_decoder`), into the guest's two-plane format of the stream
+//!   (`PixelFormat::of`). Per host surface: P012 (4:2:0 at 12 bits) is read back and copied into
+//!   `tv20`/`tf20` as it is, the two laid out alike; the packed ones are split into the surface's
+//!   two planes, luma and interleaved Cb and Cr: YUY2 into `422v`/`422f`, Y210 into `x422`/`xf22`,
+//!   Y212 into `tv22`/`tf22`, Y410 into `x444`/`xf44` (its 10-bit fields moved to the top of 16
+//!   bits), Y412 into `tv44`/`tf44`, and XYUV into `444v`/`444f`, on Linux by the runtime device's
+//!   GPU where the import check passed XYUV (`xyuv`). The rest are read back and split by the
+//!   CPU, each picture counted (`video-pictures-cpu-converted`). Every other stream that is not
+//!   4:2:0 Main or Main 10 is refused at its session's start, naming why.
 //! - **VideoToolbox's paravirtual encoders** (`encode::VaGuestEncoder`, `super::vt`): an arm64
 //!   guest's encoder reads each source frame from the IOSurface its kext lent: written by the
 //!   runtime device's GPU from a buffer over its pages into an input of the encoder's, as an x86
@@ -121,12 +128,13 @@ use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::vaapi::{
-    Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Fourcc, Frame,
-    GuestWrites, H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile,
-    Target, TargetCodec, TargetFor, VideoEncoder, encoder_support,
+    Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
+    H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, Target,
+    TargetCodec, TargetFor, VideoEncoder, encoder_support,
 };
 #[cfg(unix)]
 use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, TargetChecks, TargetPlane, TargetShape};
+use reims_vgpu_video::vaapi::{range_extensions_decoder, rt_format_names};
 #[cfg(unix)]
 use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::core::num::ToUsize as _;
@@ -150,8 +158,8 @@ use super::gather::GatherPipeline;
 #[cfg(unix)]
 use super::video_host::Failed;
 use super::video_host::{
-    BackendError, DecodeOutput, Extent, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
-    HostVideoSession, Landing, OutputPlane, picture_error,
+    BackendError, CONVERTED_CODE, DecodeOutput, Extent, HostDecoder, HostEncodeSession,
+    HostPicture, HostPlane, HostVideoSession, Landing, OutputPlane, picture_error,
 };
 
 mod encode;
@@ -170,8 +178,6 @@ const NAME: &str = "VA-API";
 /// `VA_RT_FORMAT_YUV420` and `VA_RT_FORMAT_YUV420_10` (va.h): 8-bit and 10-bit 4:2:0.
 const RT_YUV420: u32 = 0x0000_0001;
 const RT_YUV420_10: u32 = 0x0000_0100;
-/// `VA_RT_FORMAT_YUV444`.
-const RT_YUV444: u32 = 0x0000_0004;
 
 /// The smallest picture a decode answers where its configs' surfaces give no minimum.
 const MIN_SIZE: u32 = 16;
@@ -372,9 +378,9 @@ struct VaapiVideo<P: Platform> {
     /// What writes pictures into device caches through their memory, where the platform makes
     /// caches of dma-bufs and the driver's checks passed anything (`cache_writes`, on Unix).
     targets: Option<Arc<CacheTargets<P>>>,
-    /// The driver's HEVC Main 4:4:4 decoder, where it lists one: what VideoToolbox's sessions of
-    /// 4:4:4 streams decode on ([`declines_4_4_4`]).
-    hevc_4_4_4: Option<ConfigCapabilities>,
+    /// The driver's HEVC range extensions decoders it lists: what VideoToolbox's sessions of
+    /// those streams decode on ([`declines_range_extensions`]).
+    hevc_range_extensions: Vec<ConfigCapabilities>,
     /// The kernel that writes VideoToolbox's 4:4:4 pictures into their surfaces (`xyuv`), made at
     /// its first use and kept for the device's decoders.
     #[cfg(unix)]
@@ -404,7 +410,17 @@ impl<P: Platform> VaapiVideo<P> {
         };
         let mut caps = caps_of(&capabilities);
         caps.extend(encode::encode_caps_of(&encoders, &capabilities));
-        let hevc_4_4_4 = (capabilities.find(Profile::HEVC_MAIN444, Entrypoint::VLD)).cloned();
+        let hevc_range_extensions = [
+            Profile::HEVC_MAIN12,
+            Profile::HEVC_MAIN422_10,
+            Profile::HEVC_MAIN422_12,
+            Profile::HEVC_MAIN444,
+            Profile::HEVC_MAIN444_10,
+            Profile::HEVC_MAIN444_12,
+        ]
+        .into_iter()
+        .filter_map(|profile| capabilities.find(profile, Entrypoint::VLD).cloned())
+        .collect();
         if caps.is_empty() {
             return Err("the driver decodes and encodes neither H.264 nor HEVC".to_owned());
         }
@@ -438,7 +454,7 @@ impl<P: Platform> VaapiVideo<P> {
             imports,
             copies,
             targets,
-            hevc_4_4_4,
+            hevc_range_extensions,
             #[cfg(unix)]
             gathers: Arc::new(GatherPipeline::new(device)),
         })
@@ -531,16 +547,18 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         true
     }
 
-    /// 4:2:0 streams, and HEVC's 4:4:4 at 8 bits where the driver's Main 4:4:4 decoder decodes
-    /// them ([`declines_4_4_4`]).
+    /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where the driver's
+    /// decoder of their chroma format and depth decodes them ([`declines_range_extensions`]).
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
-        match stream.chroma_format_idc {
-            1 => None,
-            3 if codec == RGFX_VIDEO_CODEC_HEVC => declines_4_4_4(self.hevc_4_4_4.as_ref(), stream),
-            _ => Some(format!(
-                "{NAME}'s decoders land 4:2:0 pictures, and HEVC's 4:4:4 at 8 bits, alone"
-            )),
+        if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
+            return declines_range_extensions(&self.hevc_range_extensions, stream);
         }
+        (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
+            format!(
+                "{NAME}'s decoders land 4:2:0 pictures, and HEVC's range extensions where the \
+                 driver decodes them, alone"
+            )
+        })
     }
 
     /// One for each codec the driver encodes a profile of (`encode::guest_encoders`).
@@ -560,15 +578,15 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         Ok(Box::new(encoder))
     }
 
-    /// An HEVC decoder lands 4:4:4 pictures too, which [`Self::guest_declines`] lets through
-    /// where the driver decodes them.
+    /// An HEVC decoder lands the range extensions' pictures too, which [`Self::guest_declines`]
+    /// lets through where the driver decodes them.
     fn guest_decoder(&self, codec: u32) -> Option<Box<dyn GuestDecoder<P>>> {
         (self.caps.iter()).find(|c| c.codec == codec && c.direction == RGFX_VIDEO_DECODE)?;
         let codec = match codec {
             RGFX_VIDEO_CODEC_H264 => Codec::H264(H264Decoder::new_annex_b(&self.display)),
             RGFX_VIDEO_CODEC_HEVC => {
                 let mut decoder = HevcDecoder::new_annex_b(&self.display);
-                decoder.lands_4_4_4();
+                decoder.lands_range_extensions();
                 Codec::Hevc(decoder)
             }
             _ => return None,
@@ -586,41 +604,43 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
     }
 }
 
-/// Why the driver decodes none of an HEVC 4:4:4 `stream`'s pictures into the XYUV surfaces the
-/// VA crate's decoder lands them from, `None` where it decodes them: on its Main 4:4:4 decoder,
-/// `config`, of 4:4:4 render targets and XYUV surfaces, at 8 bits, within its sizes.
-fn declines_4_4_4(config: Option<&ConfigCapabilities>, stream: &Stream) -> Option<String> {
-    let bits = stream.luma_bits;
-    if bits != 8 {
+/// Why the driver decodes none of an HEVC range extensions `stream`'s pictures into the surfaces
+/// the VA crate's decoder lands them from, `None` where it decodes them: on the decoder among
+/// `configs` of the profile of the stream's chroma format and depth (`range_extensions_decoder`),
+/// of its render targets and its surfaces' FOURCC, within its sizes.
+fn declines_range_extensions(configs: &[ConfigCapabilities], stream: &Stream) -> Option<String> {
+    let (chroma, bits) = (stream.chroma_format_idc, stream.luma_bits);
+    let Some((profile, rt_format, fourcc)) = range_extensions_decoder(chroma, bits) else {
         return Some(format!(
-            "{NAME} decodes HEVC 4:4:4 at 8 bits here, not {bits}"
+            "{NAME} decodes HEVC's range extensions of 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 \
+             bits, not chroma_format_idc {chroma} at {bits}"
         ));
-    }
-    let Some(config) = config else {
-        return Some(format!("{NAME}: the driver has no HEVC Main 4:4:4 decoder"));
+    };
+    let name = profile.name().unwrap_or("HEVC");
+    let Some(config) = configs.iter().find(|config| config.profile == profile) else {
+        return Some(format!("{NAME}: the driver has no {name} decoder"));
     };
     if config
         .rt_formats
-        .is_some_and(|formats| formats & RT_YUV444 == 0)
+        .is_some_and(|formats| formats & rt_format == 0)
     {
         return Some(format!(
-            "{NAME}: the driver's HEVC Main 4:4:4 decoder has no 4:4:4 render targets"
+            "{NAME}: the driver's {name} decoder has no {} render targets",
+            rt_format_names(rt_format).join(", ")
         ));
     }
     let surfaces = match &config.surfaces {
         Ok(surfaces) => surfaces,
         Err(error) => {
-            return Some(format!(
-                "{NAME}: the HEVC Main 4:4:4 decoder's surfaces: {error}"
-            ));
+            return Some(format!("{NAME}: the {name} decoder's surfaces: {error}"));
         }
     };
-    if !surfaces.pixel_formats.contains(&Fourcc::XYUV) {
+    if !surfaces.pixel_formats.contains(&fourcc) {
         let formats: Vec<String> = (surfaces.pixel_formats.iter())
             .map(ToString::to_string)
             .collect();
         return Some(format!(
-            "{NAME} writes HEVC 4:4:4 as [{}], not XYUV",
+            "{NAME}'s {name} decoder writes [{}], not {fourcc}",
             formats.join(", ")
         ));
     }
@@ -638,11 +658,11 @@ fn declines_4_4_4(config: Option<&ConfigCapabilities>, stream: &Stream) -> Optio
     );
     if width < min_width || height < min_height {
         Some(format!(
-            "{NAME} decodes HEVC 4:4:4 from {min_width}x{min_height}, not {width}x{height}"
+            "{NAME} decodes {name} from {min_width}x{min_height}, not {width}x{height}"
         ))
     } else if width > max_width || height > max_height {
         Some(format!(
-            "{NAME} decodes HEVC 4:4:4 up to {max_width}x{max_height}, not {width}x{height}"
+            "{NAME} decodes {name} up to {max_width}x{max_height}, not {width}x{height}"
         ))
     } else {
         None
@@ -1448,21 +1468,30 @@ impl<P: Platform> VaGuestDecoder<P> {
                 .crop_within(x, y, width, height)
                 .map_err(video_error)?;
         }
-        // A 4:4:4 stream's pictures are XYUV, which the GPU or the CPU splits into the surface's
-        // two planes; a 4:2:0 one's are NV12 or P010, which land as they are.
-        let four_four_four = frame.is_4_4_4();
+        // The range extensions' 4:2:2 and 4:4:4 pictures are packed in one plane, which the CPU
+        // splits into the surface's two planes, as the GPU does XYUV's where it takes them; a
+        // 4:2:0 one's are NV12, P010 or P012, which land as they are. The surface is of the
+        // picture's chroma format and depth (`paravirt`'s `Dpba` named it).
         let format = output.layout.pixel_format;
-        if PixelFormat::from_fourcc(format).is_some_and(PixelFormat::is_4_4_4) != four_four_four {
-            let chroma = if four_four_four { "4:4:4" } else { "4:2:0" };
+        let fits = PixelFormat::from_fourcc(format).is_some_and(|guest| {
+            guest.chroma() == frame.chroma() && u32::from(guest.bit_depth()) == frame.bit_depth()
+        });
+        if !fits {
             return Err(VideoError::Unsupported(format!(
-                "a {chroma} picture for a '{format}' surface"
+                "a {} picture for a '{format}' surface",
+                frame.surface_format_name()
             )));
         }
-        let declined = if four_four_four {
+        let declined = if frame.is_xyuv() {
             match self.gather(&frame, output)? {
                 Ok(()) => return Ok(true),
                 Err(why) => format!("a 4:4:4 picture's XYUV samples into two planes: {why}"),
             }
+        } else if frame.is_packed() {
+            format!(
+                "a picture's packed {} samples into two planes",
+                frame.surface_format_name()
+            )
         } else {
             match GuestTarget::new(&output.layout, output.memory) {
                 Ok(target) => match frame.write_to_guest(&target, &self.imports) {
@@ -1528,12 +1557,12 @@ impl<P: Platform> VaGuestDecoder<P> {
             rows: chroma.height.to_usize(),
             row_bytes: uv_row,
         };
-        if four_four_four {
-            back.copy_4_4_4_into(y, uv)
+        if frame.is_packed() {
+            back.copy_packed_into(y, uv).map_err(video_error)?;
+            reims_vgpu_vulkan::answer::count_kind(CONVERTED_CODE);
         } else {
-            back.copy_into(y, uv)
+            back.copy_into(y, uv).map_err(video_error)?;
         }
-        .map_err(video_error)?;
         drop(view);
         Ok(true)
     }

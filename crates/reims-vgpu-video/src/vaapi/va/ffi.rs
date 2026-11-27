@@ -51,10 +51,22 @@ pub(crate) const VA_PROGRESSIVE: c_int = 0x1;
 pub(crate) const VA_RT_FORMAT_YUV420: c_uint = 0x0000_0001;
 pub(crate) const VA_RT_FORMAT_YUV420_10: c_uint = 0x0000_0100;
 pub(crate) const VA_RT_FORMAT_YUV444: c_uint = 0x0000_0004;
+pub(crate) const VA_RT_FORMAT_YUV422: c_uint = 0x0000_0002;
+pub(crate) const VA_RT_FORMAT_YUV422_10: c_uint = 0x0000_0200;
+pub(crate) const VA_RT_FORMAT_YUV444_10: c_uint = 0x0000_0400;
+pub(crate) const VA_RT_FORMAT_YUV420_12: c_uint = 0x0000_1000;
+pub(crate) const VA_RT_FORMAT_YUV422_12: c_uint = 0x0000_2000;
+pub(crate) const VA_RT_FORMAT_YUV444_12: c_uint = 0x0000_4000;
 
 pub(crate) const VA_FOURCC_NV12: u32 = 0x3231_564e;
 pub(crate) const VA_FOURCC_P010: u32 = 0x3031_3050;
 pub(crate) const VA_FOURCC_XYUV: u32 = 0x5655_5958;
+pub(crate) const VA_FOURCC_P012: u32 = 0x3231_3050;
+pub(crate) const VA_FOURCC_YUY2: u32 = 0x3259_5559;
+pub(crate) const VA_FOURCC_Y210: u32 = 0x3031_3259;
+pub(crate) const VA_FOURCC_Y212: u32 = 0x3231_3259;
+pub(crate) const VA_FOURCC_Y410: u32 = 0x3031_3459;
+pub(crate) const VA_FOURCC_Y412: u32 = 0x3231_3459;
 
 pub(crate) const VA_SLICE_DATA_FLAG_ALL: u32 = 0x00;
 
@@ -75,7 +87,12 @@ pub(crate) const VAProfileH264High: VAProfile = 7;
 pub(crate) const VAProfileH264ConstrainedBaseline: VAProfile = 13;
 pub(crate) const VAProfileHEVCMain: VAProfile = 17;
 pub(crate) const VAProfileHEVCMain10: VAProfile = 18;
+pub(crate) const VAProfileHEVCMain12: VAProfile = 23;
+pub(crate) const VAProfileHEVCMain422_10: VAProfile = 24;
+pub(crate) const VAProfileHEVCMain422_12: VAProfile = 25;
 pub(crate) const VAProfileHEVCMain444: VAProfile = 26;
+pub(crate) const VAProfileHEVCMain444_10: VAProfile = 27;
+pub(crate) const VAProfileHEVCMain444_12: VAProfile = 28;
 
 // VAEntrypoint.
 pub(crate) const VAEntrypointVLD: VAEntrypoint = 1;
@@ -1202,9 +1219,21 @@ mod tests {
             VA_RT_FORMAT_YUV420,
             VA_RT_FORMAT_YUV420_10,
             VA_RT_FORMAT_YUV444,
+            VA_RT_FORMAT_YUV422,
+            VA_RT_FORMAT_YUV422_10,
+            VA_RT_FORMAT_YUV444_10,
+            VA_RT_FORMAT_YUV420_12,
+            VA_RT_FORMAT_YUV422_12,
+            VA_RT_FORMAT_YUV444_12,
             VA_FOURCC_NV12,
             VA_FOURCC_P010,
             VA_FOURCC_XYUV,
+            VA_FOURCC_P012,
+            VA_FOURCC_YUY2,
+            VA_FOURCC_Y210,
+            VA_FOURCC_Y212,
+            VA_FOURCC_Y410,
+            VA_FOURCC_Y412,
             VA_SLICE_DATA_FLAG_ALL,
             VA_PICTURE_H264_INVALID,
             VA_PICTURE_H264_SHORT_TERM_REFERENCE,
@@ -1220,7 +1249,12 @@ mod tests {
             VAProfileH264ConstrainedBaseline,
             VAProfileHEVCMain,
             VAProfileHEVCMain10,
+            VAProfileHEVCMain12,
+            VAProfileHEVCMain422_10,
+            VAProfileHEVCMain422_12,
             VAProfileHEVCMain444,
+            VAProfileHEVCMain444_10,
+            VAProfileHEVCMain444_12,
             VAEntrypointVLD,
             VAEntrypointVideoProc,
             VAConfigAttribRTFormat,

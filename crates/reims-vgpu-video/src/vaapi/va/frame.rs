@@ -1,10 +1,11 @@
 //! A decoded frame, for every codec: its surface, held until the frame is
 //! dropped, what the decoder knows of it, and its readback into caller
-//! planes, NV12 for 8-bit frames and P010 for 10-bit ones.
+//! planes, NV12 for 8-bit frames and P010 for 10-bit ones, and two planes of
+//! the range extensions' packed frames.
 
 use std::sync::Arc;
 
-use crate::core::backend::DeviceWrite;
+use crate::core::backend::{Chroma, DeviceWrite};
 use crate::core::device_memory::GuestTarget;
 use crate::core::surfaces::crop_within;
 
@@ -132,18 +133,37 @@ impl Frame {
         self.full_range
     }
 
-    /// The bits a sample holds: 8 for an NV12 or a 4:4:4 frame, 10 for a P010 one.
+    /// The bits a sample holds: 8 for an NV12, YUY2 or XYUV frame, 10 for a P010, Y210 or Y410
+    /// one, 12 for a P012, Y212 or Y412 one.
     pub fn bit_depth(&self) -> u32 {
-        match self.surface.format() {
-            SurfaceFormat::Nv12 | SurfaceFormat::Xyuv => 8,
-            SurfaceFormat::P010 => 10,
-        }
+        u32::from(self.surface.format().bit_depth())
     }
 
-    /// Whether the frame is 4:4:4 (HEVC Main 4:4:4's, [`super::HevcDecoder::lands_4_4_4`]),
-    /// which [`ReadBack::copy_4_4_4_into`] reads back, and else 4:2:0.
+    /// How the frame's chroma is sampled: 4:2:0, or the range extensions' 4:2:2 or 4:4:4
+    /// ([`super::HevcDecoder::lands_range_extensions`]).
+    pub fn chroma(&self) -> Chroma {
+        self.surface.format().chroma()
+    }
+
+    /// Whether the frame is 4:4:4 ([`Self::chroma`]).
     pub fn is_4_4_4(&self) -> bool {
+        self.chroma() == Chroma::Yuv444
+    }
+
+    /// Whether the frame's pixels are packed in one plane, which [`ReadBack::copy_packed_into`]
+    /// reads back, rather than in two, which [`ReadBack::copy_into`] reads back.
+    pub fn is_packed(&self) -> bool {
+        self.surface.format().planes() == 1
+    }
+
+    /// Whether the frame is 8-bit 4:4:4 in XYUV, which [`Frame::write_4_4_4_to`] writes.
+    pub fn is_xyuv(&self) -> bool {
         self.surface.format() == SurfaceFormat::Xyuv
+    }
+
+    /// The name of its surface's VA format (`NV12`, `P010`, `Y410` and the like).
+    pub fn surface_format_name(&self) -> &'static str {
+        self.surface.format().name()
     }
 
     /// What the frames of this frame's surface pool came back through so
@@ -314,21 +334,33 @@ impl ReadBack<'_> {
         )
     }
 
-    /// Copies an 8-bit 4:4:4 frame ([`Frame::is_4_4_4`]), cropped, into two planes as CoreVideo's
-    /// `444v` and `444f` and ffmpeg's `nv24` lay them out: `y`, and `cbcr`, each pixel's Cb
-    /// then Cr, as many rows as `y`, whose rows hold `row_bytes` of the picture each. Planes of
+    /// Copies a packed frame ([`Frame::is_packed`]: the range extensions' 4:2:2 and 4:4:4),
+    /// cropped, into two planes as CoreVideo's two-plane formats of its chroma format and depth
+    /// (`422v`, `x422`, `tv22`, `444v`, `x444`, `tv44` and their full-range twins) and ffmpeg's
+    /// `nv16`, `p210`, `p212`, `nv24`, `p410` and `p412` lay them out: `y`, and `cbcr`, each pair's
+    /// Cb then Cr, as many rows as `y`, whose rows hold `row_bytes` of the picture each; a
+    /// sample a byte at 8 bits, else a little-endian 16-bit word, its bits at the top. Planes of
     /// fewer rows or columns than the frame take its top left, as [`ReadBack::copy_into`]'s do.
-    pub fn copy_4_4_4_into(&self, y: PlaneRows<'_>, cbcr: PlaneRows<'_>) -> Result<(), Error> {
+    pub fn copy_packed_into(&self, y: PlaneRows<'_>, cbcr: PlaneRows<'_>) -> Result<(), Error> {
         let frame = self.frame;
-        let fit = |rows: usize| u32::try_from(rows).unwrap_or(u32::MAX);
+        let format = frame.surface.format();
+        let sample = format.bytes_per_sample();
+        let fit = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let chroma_bytes = cbcr.row_bytes.min(cbcr.bytes_per_row) / (2 * sample);
+        // A 4:2:2 row holds a pair for every two columns, the last one too where the width is
+        // odd, so an even width fits where its pairs do.
+        let chroma_columns = match format.chroma() {
+            Chroma::Yuv422 => fit(chroma_bytes).saturating_mul(2),
+            Chroma::Yuv420 | Chroma::Yuv444 => fit(chroma_bytes),
+        };
         let rect = Rect {
             width: (frame.rect.width)
-                .min(fit(y.row_bytes.min(y.bytes_per_row)))
-                .min(fit(cbcr.row_bytes.min(cbcr.bytes_per_row) / 2)),
+                .min(fit(y.row_bytes.min(y.bytes_per_row) / sample))
+                .min(chroma_columns),
             height: (frame.rect.height).min(fit(y.rows)).min(fit(cbcr.rows)),
             ..frame.rect
         };
-        self.surface.copy_4_4_4_to(
+        self.surface.copy_packed_to(
             rect,
             (y.bytes, y.bytes_per_row),
             (cbcr.bytes, cbcr.bytes_per_row),
@@ -418,7 +450,7 @@ impl Frame {
         })
     }
 
-    /// Writes the frame, a 4:4:4 one ([`Frame::is_4_4_4`]), into `target` as its XYUV surface
+    /// Writes the frame, an XYUV one ([`Frame::is_xyuv`]), into `target` as its XYUV surface
     /// holds it, by video-processing runs from its surface as [`Frame::write_to_guest`] writes a
     /// 4:2:0 frame (`super::zero_copy`), once its decode is done: `target`'s whole width and
     /// height from the crop's first sample, which the decoded (coded) picture holds.

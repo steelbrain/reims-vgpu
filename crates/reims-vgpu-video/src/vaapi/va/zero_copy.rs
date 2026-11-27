@@ -83,7 +83,7 @@
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Weak};
 
-use crate::core::backend::DeviceWrite;
+use crate::core::backend::{Chroma, DeviceWrite};
 use crate::core::device_memory::{DeviceImports, DeviceMemory, GuestTarget, TargetPlane};
 #[cfg(unix)]
 use crate::core::device_memory::{DmaBufError, SurfaceDmaBuf};
@@ -395,10 +395,11 @@ pub(crate) fn write(
 ) -> Result<DeviceWrite, Error> {
     let format = frame.surface.format();
     // The driver's 4:2:0 frames, NV12 and P010, into two planes; a 4:4:4 one, XYUV, is
-    // written whole into a packed buffer alone (`write_packed`).
-    if format == SurfaceFormat::Xyuv
+    // written whole into a packed buffer alone (`write_packed`), and the range extensions'
+    // others are read back.
+    if !matches!(format, SurfaceFormat::Nv12 | SurfaceFormat::P010)
         || target.pixel_format().bytes_per_sample() != format.bytes_per_sample()
-        || target.pixel_format().is_4_4_4()
+        || target.pixel_format().chroma() != Chroma::Yuv420
     {
         return Ok(declined(format!(
             "a {} buffer for {} frames",

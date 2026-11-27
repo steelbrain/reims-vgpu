@@ -56,20 +56,25 @@
 //!   output's pages above, else read back and copied by the CPU, each reason logged once a
 //!   decoder. So every decode codec of the caps has one, and the device offers `VT_MESSAGES`
 //!   where NVDEC decodes H.264 or HEVC.
-//!   - **HEVC's 4:4:4 at 8 bits**, the range extensions' streams the codec crate decodes, has a
-//!     paravirtual session where NVDEC decodes HEVC at 4:4:4 and that depth into its three
-//!     planes, at the stream's size; elsewhere the session is refused at its start, the reason
-//!     named (`GraphicsVideo::guest_declines`), and the guest decodes in software. The picture
-//!     lands in the surface's 4:4:4 formats ('444v', '444f'), its luma as it lies and its Cb and
-//!     Cr interleaved into the surface's second plane, by the GPU where CUDA imports the device's
+//!   - **HEVC's range extensions**, the codec crate's 4:2:0 and 4:4:4 at 8, 10 and 12 bits, have a
+//!     paravirtual session where NVDEC's caps say it decodes HEVC at the stream's chroma format
+//!     and depth into the output the decoder makes (NV12 or P016; 4:4:4's three planes, 8-bit or
+//!     16-bit), at the stream's size; elsewhere, and for every 4:2:2 stream (no decode into
+//!     NVDEC's 4:2:2 outputs is built), the session is refused at its start, the reason named
+//!     (`GraphicsVideo::guest_declines`), and the guest decodes in software. A 4:2:0 picture
+//!     lands as Main 10's does, P016 copied into `tv20`/`tf20` at 12 bits, the two laid out
+//!     alike. A 4:4:4 picture lands in the surface's 4:4:4 format of its depth (`444v`, `x444`,
+//!     `tv44` and their full-range twins), its luma as it lies and its Cb and Cr interleaved into
+//!     the surface's second plane; at 8 bits by the GPU where CUDA imports the device's
 //!     exportable buffers: one `cuMemcpy2D` a plane within the GPU into the decoder's scratch,
 //!     an exportable buffer of the device's that CUDA imported, made at the decoder's first
 //!     4:4:4 picture (and again for a larger one) as zeros, its three planes one after another
 //!     at one pitch, the width rounded up to 256 bytes; then the scratch said written
 //!     (`Buffer::external_write_done`), and the platform library's `videoGather444` kernel writes
 //!     the surface's two planes from it, through a Shared buffer over the surface's pages
-//!     (`super::gather`, counted as `video-pictures-gpu-gathered`). Where that is refused, the
-//!     picture is read back and interleaved by the CPU, the reason logged once a decoder: a
+//!     (`super::gather`, counted as `video-pictures-gpu-gathered`). Where that is refused, and
+//!     past 8 bits, which the kernel does not take, the picture is read back and interleaved by
+//!     the CPU (counted as `video-pictures-cpu-converted`), the reason logged once a decoder: a
 //!     scratch the device or CUDA does not make, which the decoder does not ask again, no buffer
 //!     over the surface, a plane off a 32-bit word, the kernel's pipeline refused.
 //! - **VideoToolbox's paravirtual encoders** (`encode`'s `guest`): an arm64 guest's encode, of
@@ -88,7 +93,7 @@ use reims_vgpu_graphics::wire::{
     RgfxVideoEncodeCaps,
 };
 use reims_vgpu_video::codec::PictureStart;
-use reims_vgpu_video::core::backend::BackendError as VideoError;
+use reims_vgpu_video::core::backend::{BackendError as VideoError, Chroma};
 use reims_vgpu_video::core::device_memory::{
     DeviceImports, GuestTarget, MemoryIdentity, TargetPlane,
 };
@@ -112,8 +117,8 @@ use super::decode::{
 };
 use super::gather::{GatherPipeline, Gatherer, Planar, gathers};
 use super::video_host::{
-    BackendError, DecodeOutput, Extent, Failed, HostDecoder, HostEncodeSession, HostPicture,
-    HostVideoSession, Landing, OutputPlane, SourcePlane, picture_error,
+    BackendError, CONVERTED_CODE, DecodeOutput, Extent, Failed, HostDecoder, HostEncodeSession,
+    HostPicture, HostVideoSession, Landing, OutputPlane, SourcePlane, picture_error,
 };
 
 mod encode;
@@ -434,36 +439,53 @@ fn supported(gpu: &Gpu, codec: NvdecCodec, bit_depth: u32) -> Option<DecodeCapab
     }
 }
 
-/// Why NVDEC's decoders take none of `stream`'s pictures, an HEVC stream at 4:4:4: NVDEC's caps
-/// of HEVC at 4:4:4 and the stream's depth, which are to say it decodes it, into its three
-/// planes (`SurfaceFormat::Yuv444` at 8 bits, `Yuv444_16Bit` past), at the stream's size; `None`
-/// where they do.
-fn declines_4_4_4(gpu: &Gpu, stream: &Stream) -> Option<String> {
+/// Why NVDEC's decoders take none of `stream`'s pictures, an HEVC stream of the range
+/// extensions: NVDEC's caps of HEVC at the stream's chroma format and depth, which are to say it
+/// decodes it, into the output the decoder makes of them (4:2:0 into `SurfaceFormat::Nv12` at 8
+/// bits and `P016` past; 4:4:4 into its three planes, `Yuv444` at 8 bits and `Yuv444_16Bit`
+/// past), at the stream's size; `None` where they do. A 4:2:2 stream is declined whatever they
+/// say: no decode of it into NVDEC's 4:2:2 outputs is built here.
+fn declines_range_extensions(gpu: &Gpu, stream: &Stream) -> Option<String> {
     let bits = u32::from(stream.luma_bits);
-    let caps = match decode_capabilities(gpu, NvdecCodec::Hevc, ChromaFormat::Yuv444, bits) {
-        Ok(caps) => caps,
-        Err(error) => {
+    let (chroma, name) = match stream.chroma_format_idc {
+        1 => (ChromaFormat::Yuv420, "4:2:0"),
+        3 => (ChromaFormat::Yuv444, "4:4:4"),
+        2 => {
             return Some(format!(
-                "{NAME}'s caps of HEVC 4:4:4 at {bits} bits: {error}"
+                "{NAME}'s decoders here land no HEVC 4:2:2 pictures"
+            ));
+        }
+        other => {
+            return Some(format!(
+                "{NAME} decodes HEVC of chroma_format_idc 1 to 3, not {other}"
             ));
         }
     };
-    let output = if bits > 8 {
-        SurfaceFormat::Yuv444_16Bit
-    } else {
-        SurfaceFormat::Yuv444
+    let caps = match decode_capabilities(gpu, NvdecCodec::Hevc, chroma, bits) {
+        Ok(caps) => caps,
+        Err(error) => {
+            return Some(format!(
+                "{NAME}'s caps of HEVC {name} at {bits} bits: {error}"
+            ));
+        }
+    };
+    let output = match (chroma, bits > 8) {
+        (ChromaFormat::Yuv444, false) => SurfaceFormat::Yuv444,
+        (ChromaFormat::Yuv444, true) => SurfaceFormat::Yuv444_16Bit,
+        (_, true) => SurfaceFormat::P016,
+        (_, false) => SurfaceFormat::Nv12,
     };
     let (width, height) = (stream.width, stream.height);
     if !caps.supported {
-        Some(format!("{NAME} does not decode HEVC 4:4:4 at {bits} bits"))
+        Some(format!("{NAME} does not decode HEVC {name} at {bits} bits"))
     } else if !caps.output_formats.contains(&output) {
         Some(format!(
-            "{NAME} writes HEVC 4:4:4 at {bits} bits as {:?}, not {output:?}",
+            "{NAME} writes HEVC {name} at {bits} bits as {:?}, not {output:?}",
             caps.output_formats
         ))
     } else if width < caps.min_width || height < caps.min_height {
         Some(format!(
-            "{NAME} decodes HEVC 4:4:4 from {}x{}, not {width}x{height}",
+            "{NAME} decodes HEVC {name} from {}x{}, not {width}x{height}",
             caps.min_width, caps.min_height
         ))
     } else if width > caps.max_width
@@ -472,7 +494,7 @@ fn declines_4_4_4(gpu: &Gpu, stream: &Stream) -> Option<String> {
             > u64::from(caps.max_macroblocks)
     {
         Some(format!(
-            "{NAME} decodes HEVC 4:4:4 up to {}x{} ({} macroblocks), not {width}x{height}",
+            "{NAME} decodes HEVC {name} up to {}x{} ({} macroblocks), not {width}x{height}",
             caps.max_width, caps.max_height, caps.max_macroblocks
         ))
     } else {
@@ -580,7 +602,7 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
             _ => return None,
         };
         let mut decoder = AnnexBDecoder::new(&video.gpu, annex_b, &video.runtime);
-        decoder.lands_4_4_4();
+        decoder.lands_range_extensions();
         let gathers = match &video.imports {
             Some(_) => Ok(Gathers {
                 gpu: Arc::clone(&video.gpu),
@@ -597,15 +619,18 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
         }))
     }
 
-    /// 4:2:0 streams, and HEVC's at 4:4:4 where NVDEC decodes them ([`declines_4_4_4`]).
+    /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where NVDEC decodes them
+    /// ([`declines_range_extensions`]).
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
-        match stream.chroma_format_idc {
-            1 => None,
-            3 if codec == RGFX_VIDEO_CODEC_HEVC => declines_4_4_4(&self.0.gpu, stream),
-            _ => Some(format!(
-                "{NAME}'s decoders land 4:2:0 pictures, and HEVC's 4:4:4, alone"
-            )),
+        if codec == RGFX_VIDEO_CODEC_HEVC && stream.range_extensions {
+            return declines_range_extensions(&self.0.gpu, stream);
         }
+        (stream.chroma_format_idc != 1 || stream.range_extensions).then(|| {
+            format!(
+                "{NAME}'s decoders land 4:2:0 pictures, and HEVC's range extensions where NVDEC \
+                 decodes them, alone"
+            )
+        })
     }
 }
 
@@ -1058,8 +1083,13 @@ impl<P: Platform> NvGuestDecoder<P> {
             )));
         }
         let four_four_four = picture.four_four_four();
-        if target.pixel_format().is_4_4_4() != four_four_four {
-            let chroma = if four_four_four { "4:4:4" } else { "4:2:0" };
+        let chroma = if four_four_four {
+            Chroma::Yuv444
+        } else {
+            Chroma::Yuv420
+        };
+        if target.pixel_format().chroma() != chroma {
+            let chroma = chroma.name();
             return Err(VideoError::Unsupported(format!(
                 "a {chroma} picture for a '{}' surface",
                 output.layout.pixel_format
@@ -1104,11 +1134,11 @@ impl<P: Platform> NvGuestDecoder<P> {
             unsafe { std::slice::from_raw_parts_mut(view.first.as_ptr().add(view.offset), length) };
         let read = read.planes();
         if four_four_four {
-            interleave_planes(&read, &planes, surface, sample)
+            interleave_planes(&read, &planes, surface, sample).map_err(VideoError::Malfunction)?;
+            reims_vgpu_vulkan::answer::count_kind(CONVERTED_CODE);
         } else {
-            copy_planes(&read, &planes, surface)
+            copy_planes(&read, &planes, surface).map_err(VideoError::Malfunction)?;
         }
-        .map_err(VideoError::Malfunction)?;
         drop(view);
         Ok(true)
     }

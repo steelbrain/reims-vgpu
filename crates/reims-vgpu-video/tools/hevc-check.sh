@@ -15,12 +15,14 @@
 # record and length-prefixed samples, as VideoToolbox hands them over) and
 # from its Annex B form, in display order; every frame's MD5, over NV12
 # for Main and P010 for Main 10, must equal ffmpeg's. Decode order must
-# give the same frames. Streams the decoder must refuse (4:2:2 and 12-bit,
-# which the codec crate refuses) must fail with their refusal. The range
-# extensions' 4:4:4 at 8 bits decodes, its MD5s over NV24, where the
-# driver lists a Main 4:4:4 decoder of 4:4:4 render targets and XYUV
-# surfaces (examples/vaapi-probe), and is refused, naming the driver's
-# Main 4:4:4, where it does not.
+# give the same frames. The range extensions' streams, 4:2:0 at 12 bits and
+# 4:2:2 and 4:4:4 at 8, 10 and 12, each decode, their MD5s over the two
+# planes a VideoToolbox decoder's picture lands in (P012; NV16, P210, P212;
+# NV24, P410, P412), where the driver lists the decoder of their chroma
+# format and depth (Main 12, Main 4:2:2 10, Main 4:2:2 12, Main 4:4:4,
+# Main 4:4:4 10 and Main 4:4:4 12) with their render targets and the
+# surfaces the VA crate decodes them into (examples/vaapi-probe), and are
+# refused, naming the driver's profile, where it does not.
 #
 # x265's own reconstruction (--recon) is a second reference. ffmpeg n9.0.2's
 # software decode differs from it on some CTB-16 streams with SAO and
@@ -53,13 +55,29 @@ info=$CARGO_TARGET_DIR/release/examples/hevc-info
 cut=$CARGO_TARGET_DIR/release/examples/hevc-cut
 craft=$CARGO_TARGET_DIR/release/examples/hevc-craft
 
-# Whether the driver lists HEVC Main 4:4:4's decoder of 4:4:4 render
-# targets and XYUV surfaces, the 4:4:4 streams' decode.
-four_four_four=0
+# The range extensions' decoder of a chroma format and depth: the VA
+# profile, its render-target format, the surfaces the VA crate decodes into
+# (its range_extensions_decoder) and the two planes ffmpeg's reference is
+# in, for CHROMA (420, 422, 444) and BITS.
+rext_decoder() {
+  case $1/$2 in
+    420/12) echo "HEVCMain12 YUV420_12 P012 p012le" ;;
+    422/8) echo "HEVCMain422_10 YUV422 YUY2 nv16" ;;
+    422/10) echo "HEVCMain422_10 YUV422_10 Y210 p210le" ;;
+    422/12) echo "HEVCMain422_12 YUV422_12 Y212 p212le" ;;
+    444/8) echo "HEVCMain444 YUV444 XYUV nv24" ;;
+    444/10) echo "HEVCMain444_10 YUV444_10 Y410 p410le" ;;
+    444/12) echo "HEVCMain444_12 YUV444_12 Y412 p412le" ;;
+  esac
+}
 probe=$("$CARGO_TARGET_DIR/release/examples/vaapi-probe" "$node" 2>&1 || true)
-if grep -Eq '^HEVCMain444 +VLD +rt=([^ ]*,)?YUV444[, ].* surfaces=([^ ]*,)?XYUV[, ]' <<<"$probe"; then
-  four_four_four=1
-fi
+# Whether the driver lists the decoder of CHROMA at BITS, of its render
+# targets and surfaces.
+rext_listed() {
+  local profile rt fourcc _
+  read -r profile rt fourcc _ <<<"$(rext_decoder "$1" "$2")"
+  grep -Eq "^$profile +VLD +rt=([^ ]*,)?$rt[, ].* surfaces=([^ ]*,)?$fourcc[, ]" <<<"$probe"
+}
 
 # Asymmetric scaling lists in HM's format, so that a list in the wrong
 # scan order, transposed, in the wrong slot or with the wrong DC changes
@@ -127,14 +145,23 @@ streams=(
   "main-720p-ref1|1280x720|60|8|testsrc2|--preset fast --bframes 0 --ref 1 --no-temporal-mvp --keyint 300"
 )
 
-# The range extensions' 4:4:4 at 8 bits, x265's: name|size|frames|source
-# filter|x265 options. Each frame's MD5 is over NV24, luma then each
-# pixel's Cb and Cr, the two planes the decoder lands it in; the fade's
+# The range extensions' streams, x265's: name|size|frames|bits|chroma|source
+# filter|x265 options. Each frame's MD5 is over the two planes the decoder
+# lands it in, luma then the Cb and Cr pairs (rext_decoder); the fades'
 # weighted prediction sends the slices' range extension parameters.
 rext_streams=(
-  "main444-360p|640x360|10|testsrc2|--preset fast --profile main444-8"
-  "main444-720p-fade|1280x720|60|fade|--preset fast --profile main444-8 --weightp --weightb --bframes 3 --ref 3"
-  "main444-1366x766-ctu16|1366x766|30|testsrc2|--preset fast --profile main444-8 --ctu 16 --bframes 2 --tskip"
+  "main444-360p|640x360|10|8|444|testsrc2|--preset fast --profile main444-8"
+  "main444-720p-fade|1280x720|60|8|444|fade|--preset fast --profile main444-8 --weightp --weightb --bframes 3 --ref 3"
+  "main444-1366x766-ctu16|1366x766|30|8|444|testsrc2|--preset fast --profile main444-8 --ctu 16 --bframes 2 --tskip"
+  "main12-360p|640x360|10|12|420|testsrc2|--preset fast --profile main12"
+  "main12-720p-fade|1280x720|30|12|420|fade|--preset fast --profile main12 --weightp --weightb --bframes 3 --ref 3"
+  "main422-8-360p|640x360|10|8|422|testsrc2|--preset fast --profile main422-10 --bframes 3"
+  "main422-10-720p|1280x720|30|10|422|testsrc2|--preset fast --profile main422-10 --bframes 3 --ref 3"
+  "main422-10-1366x766-ctu16|1366x766|20|10|422|testsrc2|--preset fast --profile main422-10 --ctu 16 --bframes 2 --tskip"
+  "main422-12-720p-fade|1280x720|30|12|422|fade|--preset fast --profile main422-12 --weightp --weightb --bframes 3"
+  "main444-10-720p|1280x720|30|10|444|testsrc2|--preset fast --profile main444-10 --bframes 3 --ref 3"
+  "main444-12-720p-fade|1280x720|30|12|444|fade|--preset fast --profile main444-12 --weightp --weightb --bframes 3"
+  "main444-12-1366x766-ctu16|1366x766|20|12|444|testsrc2|--preset fast --profile main444-12 --ctu 16 --tskip"
 )
 
 # kvazaar 2.3.2's streams, 8 bits only as CachyOS builds it, for what x265
@@ -220,10 +247,10 @@ encode() {
     return 1
   fi
   local pix_out=nv12
-  if (( bits > 8 )); then
+  if [[ $csp != 420 || $bits == 12 ]]; then
+    read -r _ _ _ pix_out <<<"$(rext_decoder "$csp" "$bits")"
+  elif (( bits > 8 )); then
     pix_out=p010le
-  elif [[ $csp == 444 ]]; then
-    pix_out=nv24
   fi
   hashes "$out/$name.recon" -i "$out/$name.recon.y4m" -pix_fmt "$pix_out" || return 1
   rm -f "$out/$name.recon.y4m"
@@ -333,17 +360,12 @@ bits_of() {
 }
 
 # What the decoder refuses, cleanly, before any slice reaches the GPU:
-# x265's name|size|frames|bits|chroma|options|what the refusal says, and kvazaar's
-# name|size|frames|source filter|options|what the refusal says. kvazaar
-# takes tile columns of 64 samples, one CTB, which radeonsi decodes wrongly
-# with no error, and the codec crate refuses columns under 128.
-rext='^hevc-framemd5: unsupported: range extensions streams other than 4:4:4 at 8 bits'
-refusals=(
-  "main422-10|640x360|10|10|422|--preset fast --profile main422-10|$rext"
-  "main12|640x360|10|12|420|--preset fast --profile main12|$rext"
-)
-# The 4:4:4 streams' refusal where the driver decodes none of them.
-rext_refused='^hevc-framemd5: (sample [0-9]+: )?the driver cannot: HEVCMain444: '
+# kvazaar's name|size|frames|source filter|options|what the refusal says.
+# kvazaar takes tile columns of 64 samples, one CTB, which radeonsi decodes
+# wrongly with no error, and the codec crate refuses columns under 128.
+# Every stream x265 writes the codec crate now takes; a range extensions
+# stream is refused, naming its profile, where the driver lists no decoder
+# of it (rext_listed).
 kvazaar_refusals=(
   "kvz-720p-tiles-col64|1280x720|10|testsrc2|--preset fast --gop 8 --level 5.1 --tiles-width-split 64,128,1216|ColumnWidthInLumaSamples is out of range"
 )
@@ -357,11 +379,14 @@ kvazaar_partial=(
 )
 
 echo "hevc-check on $node, $(date -Is), $(hostname), $(x265 --version 2>&1 | grep -m1 -o 'version [^ ]*'), $(kvazaar --version 2>&1 | head -n1)"
-if (( four_four_four )); then
-  echo "     4:4:4 at 8 bits: the driver lists HEVC Main 4:4:4's decoder into XYUV: decoded"
-else
-  echo "     4:4:4 at 8 bits: the driver lists no HEVC Main 4:4:4 decoder into XYUV: refused"
-fi
+for csp_bits in 420/12 422/8 422/10 422/12 444/8 444/10 444/12; do
+  read -r profile rt fourcc _ <<<"$(rext_decoder "${csp_bits%/*}" "${csp_bits#*/}")"
+  if rext_listed "${csp_bits%/*}" "${csp_bits#*/}"; then
+    echo "     ${csp_bits%/*} at ${csp_bits#*/} bits: the driver lists $profile's decoder of $rt into $fourcc: decoded"
+  else
+    echo "     ${csp_bits%/*} at ${csp_bits#*/} bits: the driver lists no $profile decoder of $rt into $fourcc: refused"
+  fi
+done
 
 # Every stream and its reference first, then the GPU. Each checked stream
 # goes into `made` as name|bits.
@@ -383,13 +408,14 @@ for entry in "${streams[@]}"; do
   made+=("$name|$bits")
 done
 for entry in "${rext_streams[@]}"; do
-  IFS='|' read -r name size frames kind opts <<<"$entry"
-  if ! encode "$name" "$size" "$frames" 8 "$kind" "$opts" 444; then
+  IFS='|' read -r name size frames bits csp kind opts <<<"$entry"
+  if ! encode "$name" "$size" "$frames" "$bits" "$kind" "$opts" "$csp"; then
     failed=1
     continue
   fi
-  (( four_four_four )) || continue
-  reference "$name" 8 nv24
+  rext_listed "$csp" "$bits" || continue
+  read -r _ _ _ pix <<<"$(rext_decoder "$csp" "$bits")"
+  reference "$name" "$bits" "$pix"
   cp "$out/$name.ref" "$out/$name.expect"
   if ! cmp -s "$out/$name.ref" "$out/$name.recon"; then
     echo "NOTE $name: ffmpeg's decode differs from x265's reconstruction from frame" \
@@ -476,10 +502,6 @@ for entry in "${crafted[@]}"; do
   cp "$out/$source.expect" "$out/$name.expect"
   made+=("$name|$bits")
 done
-for entry in "${refusals[@]}"; do
-  IFS='|' read -r name size frames bits csp opts _ <<<"$entry"
-  encode "$name" "$size" "$frames" "$bits" testsrc2 "$opts" "$csp" || failed=1
-done
 for entry in "${kvazaar_refusals[@]}" "${kvazaar_partial[@]}"; do
   IFS='|' read -r name size frames kind opts _ _ <<<"$entry"
   if encode_kvazaar "$name" "$size" "$frames" "$kind" "$opts"; then
@@ -562,21 +584,18 @@ if run "$out/$name.265" "$name.annexb"; then
   check "$name (Annex B, display order)" "$out/$name.expect" "$out/$name.annexb.md5"
 fi
 
-# A stream to refuse that was not made has failed already.
-for entry in "${refusals[@]}"; do
-  IFS='|' read -r name _ _ _ _ _ why <<<"$entry"
+# A stream to refuse that was not made has failed already. A range
+# extensions stream the driver lists no decoder of is refused naming its
+# profile.
+for entry in "${rext_streams[@]}"; do
+  IFS='|' read -r name _ _ bits csp _ <<<"$entry"
+  rext_listed "$csp" "$bits" && continue
   [[ -s $out/$name.mp4 ]] || continue
-  refused "$name" "$out/$name.mp4" "$why"
-done
-if (( ! four_four_four )); then
-  for entry in "${rext_streams[@]}"; do
-    IFS='|' read -r name _ <<<"$entry"
-    [[ -s $out/$name.mp4 ]] || continue
-    for input in "$out/$name.mp4" "$out/$name.265"; do
-      refused "$name (${input##*.})" "$input" "$rext_refused"
-    done
+  read -r profile _ <<<"$(rext_decoder "$csp" "$bits")"
+  for input in "$out/$name.mp4" "$out/$name.265"; do
+    refused "$name (${input##*.})" "$input" "^hevc-framemd5: (sample [0-9]+: )?the driver cannot: $profile: "
   done
-fi
+done
 for entry in "${kvazaar_refusals[@]}"; do
   IFS='|' read -r name _ _ _ _ why <<<"$entry"
   [[ -s $out/$name.mp4 ]] || continue

@@ -203,7 +203,7 @@ fn a_4_4_4_picture_written_by_the_gpu_is_the_cpus_split() {
         // Each written picture's CPU and wall times, the GPU's way then the CPU's.
         let mut times: Vec<[Duration; 4]> = Vec::new();
         let mut each = |stream: &std::path::Path, id: u64, frame: &Frame| -> bool {
-            if !frame.is_4_4_4() {
+            if !frame.is_xyuv() {
                 return false;
             }
             let (width, height) = (u64::from(frame.width()), u64::from(frame.height()));
@@ -247,7 +247,7 @@ fn a_4_4_4_picture_written_by_the_gpu_is_the_cpus_split() {
             let (y, uv) = cpu.split_at_mut(usize_of(chroma_at));
             let (cpu_at, wall_at) = (thread_cpu(), std::time::Instant::now());
             (frame.read_back().expect("the read back"))
-                .copy_4_4_4_into(
+                .copy_packed_into(
                     plane_rows(&mut y[usize_of(luma_at)..], luma_pitch, height, width),
                     plane_rows(uv, chroma_pitch, height, 2 * width),
                 )

@@ -157,6 +157,15 @@ const FAILURES_LOGGED: u64 = 8;
 /// logged once per boot, then counted").
 pub(crate) const CARRIED_CODE: &str = "video-landing-failure-carried";
 
+/// The code of a VideoToolbox decoder's picture the CPU wrote into its surface's two planes from
+/// a host surface of another layout: the range extensions' packed 4:2:2 and 4:4:4 samples a
+/// VA-API driver decodes into (YUY2, Y210, Y212, Y410, Y412, and XYUV where the GPU's gather does
+/// not take it) split into luma and Cb/Cr pairs, and NVDEC's three 4:4:4 planes interleaved into
+/// two where the GPU's gather does not take them: one CPU pass a picture that a Mac, whose
+/// decoder writes the guest's format, does not make (docs/conventions.md, "Each degradation is
+/// logged once per boot, then counted").
+pub(crate) const CONVERTED_CODE: &str = "video-pictures-cpu-converted";
+
 /// A backend's error: what it could not do, which the session logs or faults the command buffer
 /// with.
 pub(crate) type BackendError = Box<dyn std::error::Error + Send + Sync>;

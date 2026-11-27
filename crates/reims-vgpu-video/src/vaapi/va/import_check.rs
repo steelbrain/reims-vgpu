@@ -161,6 +161,12 @@ impl ImportWrites {
             SurfaceFormat::Nv12 => self.nv12.clone(),
             SurfaceFormat::P010 => self.p010.clone(),
             SurfaceFormat::Xyuv => self.xyuv.clone(),
+            SurfaceFormat::P012
+            | SurfaceFormat::Yuy2
+            | SurfaceFormat::Y210
+            | SurfaceFormat::Y212
+            | SurfaceFormat::Y410
+            | SurfaceFormat::Y412 => Err(format!("no import of {} is checked", format.name())),
         }
     }
 
@@ -427,14 +433,14 @@ fn fill(picture: Picture, bytes: &mut [u8], planes: [(usize, usize); 2]) -> Resu
 
 /// The trial picture's sample at `column` (in samples: a chroma row's Cb and Cr alternate, and an
 /// XYUV pixel's Cr, Cb, Y and fourth byte) of `row` of `plane`, as its bytes hold it: 8-bit
-/// values for NV12 and XYUV, 10-bit ones in a sample's high bits for P010. Across the opening's
-/// trial picture every value of the format turns up.
+/// values for NV12 and XYUV, deeper ones in a sample's high bits for P010 and the rest. Across
+/// the opening's trial picture every value of the format turns up.
 fn sample(format: SurfaceFormat, plane: usize, column: usize, row: usize) -> u16 {
     let (a, b, c) = if plane == 0 { (3, 5, 7) } else { (7, 11, 101) };
     let value = column * a + row * b + c;
-    match format {
-        SurfaceFormat::Nv12 | SurfaceFormat::Xyuv => (value % 256) as u16,
-        SurfaceFormat::P010 => ((value * 13 % 1024) as u16) << 6,
+    match format.bit_depth() {
+        8 => (value % 256) as u16,
+        bits => ((value * 13 % (1 << bits)) as u16) << (16 - bits),
     }
 }
 
@@ -584,6 +590,14 @@ fn trial_in(
             super::zero_copy::trial(display, &source.surface, target, write, strips)?;
             let held = memory.memory.lock();
             return Ok(wrong(picture, held.bytes(), planes));
+        }
+        SurfaceFormat::P012
+        | SurfaceFormat::Yuy2
+        | SurfaceFormat::Y210
+        | SurfaceFormat::Y212
+        | SurfaceFormat::Y410
+        | SurfaceFormat::Y412 => {
+            return Err(format!("no trial of {} is built", picture.format.name()));
         }
     };
     let plane = |n: usize| PlaneLayout {
@@ -1178,7 +1192,7 @@ mod tests {
                         pixel_format: match format {
                             SurfaceFormat::Nv12 => FourCc::new(*b"420v"),
                             SurfaceFormat::P010 => FourCc::new(*b"x420"),
-                            SurfaceFormat::Xyuv => unreachable!("FORMATS has no XYUV"),
+                            _ => unreachable!("FORMATS has NV12 and P010 alone"),
                         },
                         width: picture.width,
                         height: picture.height,

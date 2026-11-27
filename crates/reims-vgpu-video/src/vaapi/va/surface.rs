@@ -1,8 +1,10 @@
 //! Decode surfaces: a pool of surfaces of one format and size, lent out
 //! one at a time, and their readback into caller-provided planes. 8-bit
-//! 4:2:0 is NV12, 10-bit 4:2:0 is P010, and 8-bit 4:4:4 is XYUV, whose
-//! frames are split into two planes as they are read back
-//! ([`SurfaceReadBack::copy_4_4_4_to`]).
+//! 4:2:0 is NV12, 10-bit 4:2:0 is P010 and 12-bit P012, each of two planes
+//! read back as they are; the range extensions' 4:2:2 and 4:4:4 are packed
+//! in one plane (YUY2, Y210, Y212; XYUV, Y410, Y412), whose frames are split
+//! into two planes as they are read back
+//! ([`SurfaceReadBack::copy_packed_to`]).
 //!
 //! A pool makes a surface only when one is asked of it and none is free
 //! ([`SurfacePool::get`]), so it holds no more surfaces than were lent at
@@ -27,6 +29,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use crate::core::backend::Chroma;
 use crate::core::runtime::MonoTime;
 use crate::core::sync::{Mutex, MutexGuard};
 
@@ -55,7 +58,7 @@ mod shared;
 const MAX_SURFACES: usize = 48;
 
 /// What a pool's surfaces hold: 4:2:0 in two planes, luma then
-/// interleaved Cb/Cr, or 4:4:4 packed in one.
+/// interleaved Cb/Cr, or 4:2:2 or 4:4:4 packed in one (va_fourcc.h's layouts).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SurfaceFormat {
     /// 8-bit samples (`VA_FOURCC_NV12`).
@@ -63,10 +66,30 @@ pub(crate) enum SurfaceFormat {
     /// 10-bit samples in the top bits of little-endian 16-bit words
     /// (`VA_FOURCC_P010`).
     P010,
+    /// 12-bit samples in the top bits of little-endian 16-bit words, as P010
+    /// (`VA_FOURCC_P012`). HEVC Main 12's.
+    P012,
+    /// 8-bit 4:2:2 in one plane, four bytes for two pixels: Y0, Cb, Y1, Cr,
+    /// in that order in memory (`VA_FOURCC_YUY2`). HEVC Main 4:2:2 10's at 8
+    /// bits.
+    Yuy2,
+    /// 10-bit 4:2:2 as YUY2, each sample in the top bits of a little-endian
+    /// 16-bit word (`VA_FOURCC_Y210`). HEVC Main 4:2:2 10's.
+    Y210,
+    /// 12-bit 4:2:2 as Y210 (`VA_FOURCC_Y212`). HEVC Main 4:2:2 12's.
+    Y212,
     /// 8-bit 4:4:4 in one plane, four bytes a pixel: Cr, Cb, Y and one
     /// unused, in that order in memory (`VA_FOURCC_XYUV`, ffmpeg's `VUYX`).
     /// HEVC Main 4:4:4's.
     Xyuv,
+    /// 10-bit 4:4:4 in one plane, a little-endian 32-bit word a pixel: Cb in
+    /// its bits 0 to 9, Y in 10 to 19, Cr in 20 to 29, and 2 of alpha
+    /// (`VA_FOURCC_Y410`). HEVC Main 4:4:4 10's.
+    Y410,
+    /// 12-bit 4:4:4 in one plane, four little-endian 16-bit words a pixel,
+    /// each sample in their top bits: Cb, Y, Cr and alpha, in that order in
+    /// memory (`VA_FOURCC_Y412`). HEVC Main 4:4:4 12's.
+    Y412,
 }
 
 impl SurfaceFormat {
@@ -75,7 +98,13 @@ impl SurfaceFormat {
         match self {
             Self::Nv12 => ffi::VA_RT_FORMAT_YUV420,
             Self::P010 => ffi::VA_RT_FORMAT_YUV420_10,
+            Self::P012 => ffi::VA_RT_FORMAT_YUV420_12,
+            Self::Yuy2 => ffi::VA_RT_FORMAT_YUV422,
+            Self::Y210 => ffi::VA_RT_FORMAT_YUV422_10,
+            Self::Y212 => ffi::VA_RT_FORMAT_YUV422_12,
             Self::Xyuv => ffi::VA_RT_FORMAT_YUV444,
+            Self::Y410 => ffi::VA_RT_FORMAT_YUV444_10,
+            Self::Y412 => ffi::VA_RT_FORMAT_YUV444_12,
         }
     }
 
@@ -83,7 +112,13 @@ impl SurfaceFormat {
         match self {
             Self::Nv12 => ffi::VA_FOURCC_NV12,
             Self::P010 => ffi::VA_FOURCC_P010,
+            Self::P012 => ffi::VA_FOURCC_P012,
+            Self::Yuy2 => ffi::VA_FOURCC_YUY2,
+            Self::Y210 => ffi::VA_FOURCC_Y210,
+            Self::Y212 => ffi::VA_FOURCC_Y212,
             Self::Xyuv => ffi::VA_FOURCC_XYUV,
+            Self::Y410 => ffi::VA_FOURCC_Y410,
+            Self::Y412 => ffi::VA_FOURCC_Y412,
         }
     }
 
@@ -91,33 +126,52 @@ impl SurfaceFormat {
     pub(crate) fn bits_per_pixel(self) -> u32 {
         match self {
             Self::Nv12 => 12,
-            Self::P010 => 24,
-            Self::Xyuv => 32,
+            Self::P010 | Self::P012 => 24,
+            Self::Yuy2 => 16,
+            Self::Y210 | Self::Y212 | Self::Xyuv | Self::Y410 => 32,
+            Self::Y412 => 64,
         }
     }
 
-    /// The bytes one sample takes.
+    /// The bytes one sample takes as it is read back into two planes: one at 8 bits, two
+    /// deeper.
     pub(crate) fn bytes_per_sample(self) -> usize {
-        match self {
-            Self::Nv12 | Self::Xyuv => 1,
-            Self::P010 => 2,
-        }
+        if self.bit_depth() == 8 { 1 } else { 2 }
     }
 
-    /// The bytes a pixel takes in its first plane: a luma sample, or a packed pixel's four.
+    /// The bytes a pixel takes in its first plane: a luma sample, or a packed pixel's.
     pub(crate) fn first_plane_bytes_per_pixel(self) -> usize {
         match self {
             Self::Nv12 => 1,
-            Self::P010 => 2,
-            Self::Xyuv => 4,
+            Self::P010 | Self::P012 | Self::Yuy2 => 2,
+            Self::Y210 | Self::Y212 | Self::Xyuv | Self::Y410 => 4,
+            Self::Y412 => 8,
         }
     }
 
     /// Its planes: luma and chroma, or one of packed pixels.
     pub(crate) fn planes(self) -> u32 {
         match self {
-            Self::Nv12 | Self::P010 => 2,
-            Self::Xyuv => 1,
+            Self::Nv12 | Self::P010 | Self::P012 => 2,
+            Self::Yuy2 | Self::Y210 | Self::Y212 | Self::Xyuv | Self::Y410 | Self::Y412 => 1,
+        }
+    }
+
+    /// How its chroma is sampled.
+    pub(crate) fn chroma(self) -> Chroma {
+        match self {
+            Self::Nv12 | Self::P010 | Self::P012 => Chroma::Yuv420,
+            Self::Yuy2 | Self::Y210 | Self::Y212 => Chroma::Yuv422,
+            Self::Xyuv | Self::Y410 | Self::Y412 => Chroma::Yuv444,
+        }
+    }
+
+    /// The bits a sample holds.
+    pub(crate) fn bit_depth(self) -> u8 {
+        match self {
+            Self::Nv12 | Self::Yuy2 | Self::Xyuv => 8,
+            Self::P010 | Self::Y210 | Self::Y410 => 10,
+            Self::P012 | Self::Y212 | Self::Y412 => 12,
         }
     }
 
@@ -126,7 +180,13 @@ impl SurfaceFormat {
         match self {
             Self::Nv12 => "NV12",
             Self::P010 => "P010",
+            Self::P012 => "P012",
+            Self::Yuy2 => "YUY2",
+            Self::Y210 => "Y210",
+            Self::Y212 => "Y212",
             Self::Xyuv => "XYUV",
+            Self::Y410 => "Y410",
+            Self::Y412 => "Y412",
         }
     }
 }
@@ -706,33 +766,41 @@ impl SurfaceReadBack<'_> {
         Ok(())
     }
 
-    /// Copies `rect` of an XYUV surface into two planes of 8-bit 4:4:4, as
-    /// CoreVideo's `444v` and ffmpeg's `nv24` lay them out: `y` with
-    /// `y_stride` bytes a row, and `cbcr`, each pixel's Cb then Cr, with
-    /// `cbcr_stride`; `rect.height` rows each. The CPU's copy alone: each
-    /// row is read whole with the way back's row copy, then split.
-    pub(crate) fn copy_4_4_4_to(
+    /// Copies `rect` of a packed surface into two planes, as CoreVideo's two-plane formats of
+    /// its chroma format and depth lay them out (`readback::split_packed`): `y` with `y_stride`
+    /// bytes a row, and `cbcr`, each pair's Cb then Cr, with `cbcr_stride`; `rect.height` rows
+    /// each. The CPU's copy alone: each row is read whole with the way back's row copy, then
+    /// split.
+    pub(crate) fn copy_packed_to(
         &self,
         rect: Rect,
         (y, y_stride): (&mut [u8], usize),
         (cbcr, cbcr_stride): (&mut [u8], usize),
     ) -> Result<(), Error> {
         let pool = &self.surface.pool;
-        if pool.format != SurfaceFormat::Xyuv {
+        if pool.format.planes() != 1 {
             return Err(Error::Unsupported(format!(
-                "reading a {} frame back as 4:4:4",
+                "reading a {} frame back as packed pixels",
                 pool.format.name()
             )));
         }
         let (width, rows) = (to_usize(rect.width), to_usize(rect.height));
+        let sample = pool.format.bytes_per_sample();
+        let pairs = readback::packed_pairs(pool.format, width);
         self.check_planes(
             rect,
-            (y.len(), y_stride, rows, width),
-            (cbcr.len(), cbcr_stride, rows, width.saturating_mul(2)),
+            (y.len(), y_stride, rows, width.saturating_mul(sample)),
+            (
+                cbcr.len(),
+                cbcr_stride,
+                rows,
+                pairs.saturating_mul(2 * sample),
+            ),
         )?;
         let started = pool.display.runtime().now();
-        readback::split_xyuv(
+        readback::split_packed(
             self.bytes(),
+            pool.format,
             self.read.planes[0],
             rect,
             [(y, y_stride), (cbcr, cbcr_stride)],

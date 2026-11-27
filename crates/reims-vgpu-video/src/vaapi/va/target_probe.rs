@@ -61,8 +61,11 @@ fn import(
     let drm_format = match format {
         SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
         SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
-        SurfaceFormat::Xyuv => {
-            return Err(Error::Unsupported("a probe surface of XYUV".into()));
+        other => {
+            return Err(Error::Unsupported(format!(
+                "a probe surface of {}",
+                other.name()
+            )));
         }
     };
     let (w, h) = (width as usize, height as usize);

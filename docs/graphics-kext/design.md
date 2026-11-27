@@ -1870,21 +1870,32 @@ Stages:
       `kVTVideoDecoderUnsupportedDataFormatErr`: the arms decode 4:2:0
       pictures, of 8 bits, or 10 in HEVC, in the profiles and tools the
       codec's `check_supported` takes, and NVDEC and VA-API also HEVC's
-      4:4:4 at 8 bits (the range extensions' Main 4:4:4 streams) where
-      NVDEC's caps answer HEVC 4:4:4 at that depth and the stream's size,
-      or the VA driver lists a Main 4:4:4 decoder of 4:4:4 render targets
-      and XYUV surfaces at that size (iHD's), each picture landing in the
-      4:4:4 format its `TDrs` names ('444v', '444f'), its Cb and Cr
-      interleaved from NVDEC's three planes by the runtime device's GPU
-      where CUDA imports the device's exportable buffers, else by the CPU,
-      and from VA-API's XYUV samples by the runtime device's GPU where the
-      display's import check passed XYUV, else by the CPU
-      (`graphics::nvidia`'s, `graphics::gather`'s, `graphics::vaapi`'s and
-      `graphics::vaapi::xyuv`'s module docs). A
-      stream the codec refuses (4:2:2, monochrome, a HEIC image's alpha
-      item, a 4:4:4 stream past 8 bits), or one the arm declines (4:4:4 on
-      a VA driver without that decoder, radeonsi's, and on an NVIDIA GPU
-      whose caps lack it: the arm's `guest_declines`), is then refused at
+      range extensions, 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bits,
+      where the arm's own query lists a decoder of the stream: NVDEC's caps
+      for its chroma format, depth and size, 4:2:2 aside, or the VA
+      driver's decoder of the stream's range extensions profile with the
+      render targets and surfaces it needs at that size (iHD's). Each
+      picture lands in the format the guest's own software decoder gives
+      the stream, which `TDrs` names (`PixelFormat::of`: '420v', 'x420' and
+      'tv20' at 8, 10 and 12 bits of 4:2:0, '422v', 'x422' and 'tv22' of
+      4:2:2, '444v', 'x444' and 'tv44' of 4:4:4, and their full-range
+      forms): NVDEC's 4:2:0 and VA-API's P012 by a copy, as Main 10's;
+      NVDEC's three 4:4:4 planes interleaved by the runtime device's GPU at
+      8 bits where CUDA imports the device's exportable buffers, else by
+      the CPU; VA-API's XYUV split by the runtime device's GPU where the
+      display's import check passed XYUV, else by the CPU, and its other
+      packed surfaces (YUY2, Y210, Y212, Y410, Y412) split by the CPU,
+      each picture the CPU converts counted
+      (`video-pictures-cpu-converted`; `graphics::nvidia`'s,
+      `graphics::gather`'s, `graphics::vaapi`'s and
+      `graphics::vaapi::xyuv`'s module docs, and
+      [devices.md](../video/devices.md), "HEVC's range extensions on arm64
+      guests"). A
+      stream the codec refuses (monochrome, a HEIC image's alpha item, a
+      depth past 12 bits, screen content coding), or one the arm declines
+      (a range extensions stream on a VA driver without its decoder,
+      radeonsi's, or on an NVIDIA GPU whose caps lack it, and HEVC 4:2:2
+      on NVDEC: the arm's `guest_declines`), is then refused at
       the session's start, not at
       each tile or frame, and every tile a session takes lands in the
       format its `TDrs` names. The refusal's warning names the stream and

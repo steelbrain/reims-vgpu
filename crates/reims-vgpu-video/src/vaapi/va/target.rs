@@ -73,12 +73,12 @@ impl TargetFormat {
         }
     }
 
-    /// A decode's of `format`; `None` for XYUV, which no target is of.
+    /// A decode's of `format`; `None` for the range extensions' formats, which no target is of.
     pub(crate) fn of(format: SurfaceFormat) -> Option<TargetFormat> {
         match format {
             SurfaceFormat::Nv12 => Some(TargetFormat::Nv12),
             SurfaceFormat::P010 => Some(TargetFormat::P010),
-            SurfaceFormat::Xyuv => None,
+            _ => None,
         }
     }
 

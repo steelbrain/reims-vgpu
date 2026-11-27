@@ -91,9 +91,9 @@ NVIDIA parser is used: the codec module parses every stream, as for VA-API.
 | HEVC | 4:2:0 8, 10, 12-bit | 144x144 to 8192x8192 | NV12; P016 above 8 |
 
 Each has 2 decode engines. NVDEC also lists H.264 at 10 bits and 4:2:2,
-and HEVC 4:2:2 and 4:4:4, which the device's caps do not offer; HEVC
-4:4:4 at 8 bits is decoded for VideoToolbox's paravirtual decoders
-([devices.md](devices.md)).
+and HEVC 4:2:2 and 4:4:4, which the device's caps do not offer; HEVC's
+range extensions at 4:2:0 and 4:4:4 are decoded for VideoToolbox's
+paravirtual decoders ([devices.md](devices.md)), and its 4:2:2 is not.
 
 The RTX 3090 (620.70.06, `nvidia-probe`, 2026-11-22) answers HEVC 4:4:4 at
 8 bits from 144x144 to 8192x8192, 262,144 macroblocks, into `Yuv444`
@@ -215,12 +215,15 @@ the model.
 - **H.264.** Slices as Annex B, each after a three-byte start code, with
   `pSliceDataOffsets`; the scaling lists in raster order; the DPB by
   surface index with `FrameIdx` and both fields' order counts.
-- **HEVC 4:4:4** (the range extensions' 4:4:4 at 8 bits, the codec module's
-  one stream of theirs) decodes at `cudaVideoChromaFormat_444` into
-  `cudaVideoSurfaceFormat_YUV444`, three planes, luma, Cb and Cr, each the
-  picture's size, the second after the luma's rows rounded up to even, as
-  the 4:2:0 chroma lies, and the third as far after the second
-  (`Mapped::of`). The range extensions' fields of `CUVIDHEVCPICPARAMS` take
+- **HEVC's range extensions** (the codec module's streams of theirs at
+  4:2:0 and 4:4:4, 8, 10 and 12 bits) decode at their chroma format and
+  depth: 4:2:0 into NV12 at 8 bits and P016 deeper, as Main 10's, the 12
+  bits at the top of each sample; 4:4:4 at `cudaVideoChromaFormat_444` into
+  `cudaVideoSurfaceFormat_YUV444` at 8 bits and `YUV444_16Bit` deeper,
+  three planes, luma, Cb and Cr, each the picture's size, the second after
+  the luma's rows rounded up to even, as the 4:2:0 chroma lies, and the
+  third as far after the second (`Mapped::of`). Their 4:2:2 streams are
+  refused ("What it refuses"). The range extensions' fields of `CUVIDHEVCPICPARAMS` take
   the SPS's and PPS's range extensions, the chroma QP offset lists'
   entries among them. A picture of three planes reads back with three
   copies (`AnnexBPicture::read_back`), and is written within the GPU into
@@ -270,13 +273,19 @@ DPB names it follows NVIDIA's parser, measured on 2026-10-24:
 
 ### What it refuses
 
-- What the codec module refuses (interlaced H.264, HEVC's range
-  extensions but 4:4:4 at 8 bits: [vaapi.md](vaapi.md), "What it
-  refuses"), as unsupported.
-- An HEVC 4:4:4 stream, as unsupported, where the decoder's caller lands
-  4:2:0 pictures alone ("HEVC 4:4:4: its caller lands 4:2:0 pictures
-  alone"), as a host video session's decoders do; VideoToolbox's
-  paravirtual decoders land them (`AnnexBDecoder::lands_4_4_4`, below).
+- What the codec module refuses (interlaced H.264, and in HEVC's range
+  extensions monochrome, depths past 12 bits and the rest of
+  [vaapi.md](vaapi.md), "What it refuses"), as unsupported.
+- An HEVC range extensions stream, as unsupported, where the decoder's
+  caller lands Main and Main 10 pictures alone ("HEVC range extensions: its
+  caller lands Main and Main 10 pictures alone"), as a host video session's
+  decoders do; VideoToolbox's paravirtual decoders land them
+  (`AnnexBDecoder::lands_range_extensions`).
+- An HEVC 4:2:2 stream, as unsupported ("HEVC 4:2:2: no NVDEC output of it
+  is built here"): NVDEC's 4:2:2 outputs are not mapped. The RTX 3090
+  lists no HEVC 4:2:2 decode (`nvidia-probe`, 2026-11-22); the RTX 5080
+  Laptop GPU lists one (above), and the guest's 4:2:2 streams decode in its
+  own software there.
 - A stream past NVDEC's sizes, as unsupported, or under them, as too small
   (`Error::TooSmall`). The device's caps give the guest NVDEC's own sizes
   ([bugs.md](bugs.md), D14).

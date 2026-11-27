@@ -525,7 +525,7 @@ impl Device {
         let dxgi_format = match format {
             SurfaceFormat::Nv12 => DXGI_FORMAT_NV12,
             SurfaceFormat::P010 => DXGI_FORMAT_P010,
-            SurfaceFormat::Xyuv => return Err("no shared texture of XYUV".to_owned()),
+            format => return Err(format!("no shared texture of {}", format.name())),
         };
         let heap = HeapProperties {
             type_: D3D12_HEAP_TYPE_DEFAULT,
@@ -805,7 +805,7 @@ impl Device {
         let format = match to.format {
             SurfaceFormat::Nv12 => DXGI_FORMAT_NV12,
             SurfaceFormat::P010 => DXGI_FORMAT_P010,
-            SurfaceFormat::Xyuv => return Err("no shared texture of XYUV".to_owned()),
+            format => return Err(format!("no shared texture of {}", format.name())),
         };
         let desc = ResourceDesc {
             dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
