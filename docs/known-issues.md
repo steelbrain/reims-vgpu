@@ -47,6 +47,14 @@ Intel UHD 630.
 
 We're working on all three. We don't know of a workaround yet.
 
+Task Manager's shared GPU memory for QEMU also climbs while a guest decodes video, and it stays up
+until QEMU exits. How far it climbs follows how many decoded pictures an app holds at once. One of
+our tests keeps every picture of a 4K HEVC clip, and each play added 5.5 to 8.2 GiB, to 37 GiB
+after six plays. An H.264 export in our tests added about 97 MiB a round. On our Intel UHD 630, no
+memory is used behind that figure: over two of those 4K plays it grew by 11.5 GiB, while the host's
+available memory didn't drop and its committed memory didn't rise. We haven't measured this on an
+NVIDIA or AMD card on a Windows host.
+
 ## Sound comes after video on Windows
 
 On a Windows host, a VM's sound reaches your speakers about 0.1 s after the guest sends it, and
