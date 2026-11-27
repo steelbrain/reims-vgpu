@@ -438,6 +438,7 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AI
 	arch -$(ARCH) $(VIDEO_H265_TESTBIN)
 	arch -$(ARCH) $(VIDEO_DRIVER_TESTBIN)
 	bash tests/bundle_files_check.sh $(BUNDLEBIN)
+	bash tests/bundle_sync_check.sh $(BUNDLEBIN) src $(WRAP_OBJ_NAT) $(CORE_OBJ_NAT)
 	bash tests/bundle_log_check.sh $(BUNDLEBIN) Info.plist src/RgfxLog.hpp
 
 # --- the wire round trip against the host's library (native arch, this Mac's GPU) ----------
