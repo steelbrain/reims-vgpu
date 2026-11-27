@@ -384,12 +384,15 @@ fn zero_owed_clears_only_targets_that_owe_zeros() {
 }
 
 /// How many draws each arm of [`reads_as_draws_return`] makes. A draws' fence signalled on the
-/// Direct3D 12 queue after the context's flush passed ahead of the context's stream at 12.0 to
-/// 19.7% of a macOS guest's drawn pictures in each of 16 passes of an adaptive stream's playback
-/// on the UHD 630 (2676 of 17663 in all, 2026-11-26), so that at the lowest pass's rate 37 draws
-/// miss it less than once in 100 runs (0.88^37 < 0.01). The three arms' 7200 draws miss a rate
-/// of 0.064% a draw (ln 100 / 7200) less than once in 100 runs.
-const DRAWS_READ_AS_THEY_RETURN: usize = 2400;
+/// Direct3D 12 queue after the context's flush passed ahead of the context's stream at 15.2% of
+/// a macOS guest's drawn pictures in 16 passes of an adaptive stream's playback on the UHD 630
+/// (2676 of 17663, 12.0% at the lowest pass, 2026-11-26): at 15% an arm's 100 draws miss it
+/// about once in 11 million runs (0.85^100), and at 12% about once in 360 thousand (0.88^100).
+/// In these tests' own runs on that order (2026-11-26, 2400 draws an arm) it passed ahead at
+/// 63 to 71% of an arm's draws, and with the fence signalled ahead of the flush, the control's
+/// order, at 66 to 72%: at 66% the control's 100 draws an arm miss it less than once in 10^46
+/// runs (0.34^100).
+const DRAWS_READ_AS_THEY_RETURN: usize = 100;
 
 /// What an arm of [`reads_as_draws_return`] saw.
 #[derive(Debug, Default)]
@@ -588,34 +591,41 @@ fn failed(draw: &PlaneDraw, what: &str, why: &str) -> ! {
     panic!("{what}: {why}; {}", draw.removed_reasons())
 }
 
-/// A draw's targets hold its picture whole once `draw` returns, however busy the GPU and the
-/// CPUs are, at a target's or a pool texture's first use too: the fence the draw waits for
-/// passes only after its draws ran, and so after the probe of the context's stream that the
-/// context signals after them, so a device that reads the targets at once, as the platform's
-/// copies out of a cache's planes do, reads the picture and not what the targets held before it,
-/// and a new target's read holds no zero ([`reads_as_draws_return`]). Run holding the GPU, on the
-/// default adapter.
+/// No draw returns before the GPU ran it, however busy the GPU and the CPUs are, at a target's or
+/// a pool texture's first use too: the fence a draw waits for passes only after the probe of the
+/// context's stream, which the context signals after the draws, passed ([`reads_as_draws_return`]).
+/// That is what this test catches: a landing released ahead of its draws. On the order before
+/// the context's own signal, the queue's signal after the flush, it failed at 63 to 71% of each
+/// arm's draws (2026-11-26).
+///
+/// Its reads of the targets as each draw returns are held to the picture too, but were never
+/// shown to fail: with the fence signalled ahead of the flush on purpose, the control's order,
+/// none of 7200 such reads missed the picture while 5035 of those draws returned ahead of their
+/// stream (2026-11-26). The check of the pictures a guest reads is the Windows playback probe's,
+/// which compares each picture's GPU read with its CPU read in a macOS guest. Run holding the
+/// GPU, on the default adapter.
 #[test]
 #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
-fn a_draws_targets_hold_its_picture_as_it_returns_however_busy_the_gpu() {
+fn no_draw_returns_before_its_context_stream_ran_however_busy_the_gpu() {
     let (arms, clears, spinners) = reads_as_draws_return(false);
     assert!(
         arms.iter()
             .all(|arm| arm.wrong.is_empty() && arm.early.is_empty()),
-        "read back as each draw returned, the targets did not hold the picture, or the draws' \
-         fence passed ahead of the context's stream: {}",
+        "a draw returned with its fence passed ahead of the context's stream, or its targets read \
+         back as it returned did not hold the picture: {}",
         told(&arms, clears, spinners)
     );
 }
 
-/// The control of [`a_draws_targets_hold_its_picture_as_it_returns_however_busy_the_gpu`]: with
+/// The control of [`no_draw_returns_before_its_context_stream_ran_however_busy_the_gpu`]: with
 /// the draws' fence signalled on the queue ahead of the context's flush on purpose, so that it
 /// may pass before the GPU ran the draws, some draw's fence passes ahead of the probe of the
 /// context's stream, so the test's count catches a fence that passed before its draws ran. A
-/// pass of the test counts only where this finds such a fence. Its reads are told, and not held
-/// to: on the UHD 630, with a thread a CPU spinning, the native device's read of a draw that
-/// returned early reached the GPU after the draws (2026-11-26, 0 of 7200 wrong while 5035 fences
-/// passed early). Run holding the GPU, on the default adapter.
+/// pass of the test counts only where this finds such a fence ([`DRAWS_READ_AS_THEY_RETURN`]
+/// gives its chance to miss one). Its reads are told, and not held to: on the UHD 630, with a
+/// thread a CPU spinning, the native device's read of a draw that returned early reached the GPU
+/// after the draws (2026-11-26, 0 of 7200 wrong while 5035 fences passed early). Run holding the
+/// GPU, on the default adapter.
 #[test]
 #[ignore = "needs Direct3D 11 on the default adapter: run on the Windows host"]
 fn a_fence_signalled_ahead_of_its_flush_passes_before_the_draws_ran() {
