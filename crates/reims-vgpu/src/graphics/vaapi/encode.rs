@@ -7,7 +7,11 @@
 //!   it encodes a profile (the VA crate's `encoder_support`), with those profiles, the sizes their
 //!   configs and surfaces give, NV12 sources (and P010 for HEVC Main 10), and the references
 //!   their configs take. Its rate controls ([`encode_caps`]) are those `VAConfigAttribRateControl`
-//!   lists of CQP, CBR and VBR, and no B-frames: the encoder keeps frames in display order.
+//!   lists of CQP, CBR and VBR, and no B-frames: the encoder keeps frames in display order. It
+//!   codes a frame in place of the last one (`RGFX_VIDEO_ENCODE_CAP_IN_PLACE`): the VA crate's
+//!   encoder holds its last picture back from its stream until the next frame, and codes the
+//!   frame again in its place (`VideoEncoder::encode_in_place`). A frame coded in place that
+//!   fails, or is refused, starts the stream again: the next frame is an IDR picture.
 //! - **The settings** ([`settings_of`]) map onto the VA crate's: the profile, size and colour; a
 //!   VBR with no peak peaks at 1.05 times its average; `quality` 0 to 100 onto `VAConfigAttribEncQualityRange`'s levels, the fastest to
 //!   1, the best. A change of what makes a new sequence makes a new encoder, whose first access
@@ -49,9 +53,10 @@ use reims_vgpu_graphics::ops::video::{
     RGFX_VIDEO_RATE_CQP, RGFX_VIDEO_RATE_VBR, RgfxVideoEncodeSettings,
 };
 use reims_vgpu_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_ENCODE, RGFX_VIDEO_FORMAT_NV12,
-    RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN,
-    RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_ENCODE,
+    RGFX_VIDEO_ENCODE_CAP_IN_PLACE, RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010,
+    RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN,
+    RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_video::codec::encode::{
     Coded, ColourDescription, EncoderSettings, Entropy, FailedSample, FrameRate, FrameType,
@@ -173,8 +178,8 @@ pub(super) fn encode_caps_of(
 }
 
 /// What an encode of `codec`, an entry [`encode_caps_of`] made, takes beyond it: the rate
-/// controls the configs of its profiles list, and no B-frames (module doc); all zero for a decode
-/// entry.
+/// controls the configs of its profiles list, no B-frames, and frames coded in place (module
+/// doc); all zero for a decode entry.
 pub(super) fn encode_caps(
     codec: &RgfxVideoCodecCaps,
     supports: &[EncoderSupport],
@@ -198,7 +203,7 @@ pub(super) fn encode_caps(
     RgfxVideoEncodeCaps {
         rate_controls,
         max_b_frames: 0,
-        flags: 0,
+        flags: RGFX_VIDEO_ENCODE_CAP_IN_PLACE,
         reserved_0c: 0,
     }
 }
@@ -548,20 +553,43 @@ impl<P: Platform> HostEncodedFrame<P> for VaFrame<P> {
         out: &mut [u8],
     ) -> Result<Encoded, BackendError> {
         let mut state = self.state.lock();
-        if let Some(settings) = &self.frame.settings {
-            state.apply(settings)?;
-        }
-        let input = self.times(&state)?;
-        if let Some(encoded) = self.filled(&mut state, &input, source, out)? {
-            return Ok(encoded);
-        }
-        self.fills.lock().uploaded += 1;
-        let host = source.host()?;
-        encode_host(&mut state, &input, &host, out)
+        let encoded = self.encode_into(&mut state, source, out);
+        self.failed_in_place(&mut state, &encoded);
+        encoded
     }
 }
 
 impl<P: Platform> VaFrame<P> {
+    /// [`HostEncodedFrame::finish`] on the locked `state`.
+    fn encode_into(
+        &self,
+        state: &mut State,
+        source: &mut FrameSource<'_, P>,
+        out: &mut [u8],
+    ) -> Result<Encoded, BackendError> {
+        if let Some(settings) = &self.frame.settings {
+            state.apply(settings)?;
+        }
+        let input = self.times(state)?;
+        if let Some(encoded) = self.filled(state, &input, source, out)? {
+            return Ok(encoded);
+        }
+        self.fills.lock().uploaded += 1;
+        let host = source.host()?;
+        encode_host(state, &input, &host, out, self.frame.in_place)
+    }
+
+    /// Where the frame was to be coded in place and was not (`encoded`), the guest has dropped
+    /// the frame it replaces: the stream starts again, its next frame an IDR picture.
+    fn failed_in_place(&self, state: &mut State, encoded: &Result<Encoded, BackendError>) {
+        if self.frame.in_place
+            && encoded.is_err()
+            && let Some(encoder) = state.encoder.as_mut()
+        {
+            encoder.start_again();
+        }
+    }
+
     /// The frame encoded from `source`'s planes where they lie, written by the GPU into an input
     /// of the encoder's (module doc), into `out`; `None` where the write was declined, nothing
     /// written, which is said once a session. `Err` where the encode failed, or the write
@@ -578,7 +606,11 @@ impl<P: Platform> VaFrame<P> {
         let Some(target) = self.fills.lock().fill(encoder, luma, chroma)? else {
             return Ok(None);
         };
-        let coded = encoder.encode_target(&target, input)?;
+        let coded = if self.frame.in_place {
+            encoder.encode_target_in_place(&target, input)?
+        } else {
+            encoder.encode_target(&target, input)?
+        };
         finish_coded(state, coded, out).map(Some)
     }
 
@@ -591,14 +623,19 @@ impl<P: Platform> VaFrame<P> {
         out: &mut [u8],
     ) -> Result<Encoded, BackendError> {
         let mut state = self.state.lock();
-        if let Some(settings) = &self.frame.settings {
-            state.apply(settings)?;
-        }
-        let input = self.times(&state)?;
-        encode_host(&mut state, &input, source, out)
+        let encoded = (|| {
+            if let Some(settings) = &self.frame.settings {
+                state.apply(settings)?;
+            }
+            let input = self.times(&state)?;
+            encode_host(&mut state, &input, source, out, self.frame.in_place)
+        })();
+        self.failed_in_place(&mut state, &encoded);
+        encoded
     }
 
-    /// The frame's times, key-frame demand and tag as the encoder takes them, with no planes.
+    /// The frame's times, key-frame demand and tag as the encoder takes them, with no planes. A
+    /// frame coded in place replaces the last one, which may be one that did not fit.
     fn times(&self, state: &State) -> Result<InputFrame<'static>, BackendError> {
         let encoder = state.encoder.as_ref().ok_or("an encode with no settings")?;
         let duration = i64::from(encoder.settings().frame_rate.denominator);
@@ -611,26 +648,31 @@ impl<P: Platform> VaFrame<P> {
             planes: [none, none],
             pts: index.saturating_mul(duration),
             duration,
-            force_key_frame: self.frame.force_keyframe || state.key_next,
+            force_key_frame: self.frame.force_keyframe || (state.key_next && !self.frame.in_place),
             id: self.frame.frame_index,
         })
     }
 }
 
 /// Encodes the frame of `input`'s times from `source`'s host bytes, which the encoder uploads,
-/// into `out`.
+/// into `out`: in place of the last one where `in_place`.
 fn encode_host(
     state: &mut State,
     input: &InputFrame<'_>,
     source: &EncodeSource,
     out: &mut [u8],
+    in_place: bool,
 ) -> Result<Encoded, BackendError> {
     let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
     let input = InputFrame {
         planes: [plane(&source.luma)?, plane(&source.chroma)?],
         ..*input
     };
-    let coded = encoder.encode(&input)?;
+    let coded = if in_place {
+        encoder.encode_in_place(&input)?
+    } else {
+        encoder.encode(&input)?
+    };
     finish_coded(state, coded, out)
 }
 

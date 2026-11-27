@@ -321,7 +321,7 @@ impl<P: Platform> NvidiaVideo<P> {
         });
         let vp9 = vp9_caps(asked(NvdecCodec::Vp9, 8), asked(NvdecCodec::Vp9, 10));
         let encoders = match encode_profiles(Arc::clone(&gpu)) {
-            Ok(encoders) => encoders,
+            Ok(encoders) => encode::checked_in_place(&gpu, encoders),
             Err(error) => {
                 log::info!("hardware video: no {ENCODE_NAME} at {address}: {error}");
                 Vec::new()

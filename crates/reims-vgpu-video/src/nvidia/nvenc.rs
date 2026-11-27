@@ -224,7 +224,9 @@ pub(crate) enum Submission {
     /// until the picture's output is locked, into a bitstream buffer:
     /// `index` numbers it (`frameIdx`), `timestamp` comes back with its
     /// packet, and `idr` makes it an IDR picture with its parameter sets
-    /// before it.
+    /// before it. `unadvanced` codes it without advancing the encoder's
+    /// state, which state buffer 0 then holds as it would be after it
+    /// ([`Session::restore_state`]).
     Frame {
         input: Buffer,
         output: Buffer,
@@ -232,6 +234,7 @@ pub(crate) enum Submission {
         index: u32,
         timestamp: u64,
         idr: bool,
+        unadvanced: bool,
     },
     /// The end of the stream: every frame NVENC holds comes out.
     End,
@@ -349,6 +352,25 @@ impl Session {
             Err(_) => **kept = previous,
         }
         result
+    }
+
+    /// Advances the encoder's state to the one state buffer 0 holds: as it is after the last
+    /// frame coded without advancing it (`nvEncRestoreEncoderState`, the whole state). NVENC is
+    /// done with every frame submitted before.
+    pub(crate) fn restore_state(&self) -> Result<(), Error> {
+        let call = entry!(self.nvenc, nvEncRestoreEncoderState)?;
+        self.check_not_stalled()?;
+        let mut params = ffi::NV_ENC_RESTORE_ENCODER_STATE_PARAMS::zeroed();
+        params.version = ffi::NV_ENC_RESTORE_ENCODER_STATE_PARAMS_VER;
+        params.bufferIdx = 0;
+        params.state = ffi::NV_ENC_STATE_RESTORE_FULL;
+        let encoder = self.encoder;
+        self.gpu.push().and_then(|_current| {
+            // SAFETY: a live, initialised session; the parameters are live and versioned, and
+            // name no buffer.
+            let status = unsafe { call(encoder, &raw mut params) };
+            check_status("nvEncRestoreEncoderState", status, Some(encoder))
+        })
     }
 
     /// Makes an input buffer of `width` by `height` frames in `format`.
@@ -757,6 +779,7 @@ impl Session {
                 index,
                 timestamp,
                 idr,
+                unadvanced,
             } => {
                 let output = self.output(output, &[BufferKind::Bitstream])?;
                 self.submitted.borrow().check_free(output)?;
@@ -777,6 +800,10 @@ impl Session {
                 if idr {
                     picture.encodePicFlags =
                         ffi::NV_ENC_PIC_FLAG_FORCEIDR | ffi::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+                }
+                if unadvanced {
+                    picture.encodePicFlags |= ffi::NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE;
+                    picture.stateBufferIdx = 0;
                 }
             }
             Submission::End => picture.encodePicFlags = ffi::NV_ENC_PIC_FLAG_EOS,

@@ -45,8 +45,9 @@ use std::sync::Arc;
 
 use reims_vgpu_graphics::ops::video::{
     RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RGFX_OP_VIDEO_ENCODE_H264,
-    RGFX_OP_VIDEO_ENCODE_H265, RGFX_VIDEO_ENCODE_FORCE_KEYFRAME, RgfxVideoEncodeResult,
-    RgfxVideoEncodeSettings, RgfxVideoOpDecodeH264, RgfxVideoOpDecodeH265, RgfxVideoOpEncode,
+    RGFX_OP_VIDEO_ENCODE_H265, RGFX_VIDEO_ENCODE_FORCE_KEYFRAME, RGFX_VIDEO_ENCODE_IN_PLACE,
+    RgfxVideoEncodeResult, RgfxVideoEncodeSettings, RgfxVideoOpDecodeH264, RgfxVideoOpDecodeH265,
+    RgfxVideoOpEncode,
 };
 use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxSurfaceFacts,
@@ -741,6 +742,9 @@ pub struct VideoEncode<'a, P: Platform> {
     pub frame_index: u64,
     /// Whether the frame must be a keyframe.
     pub force_keyframe: bool,
+    /// Whether the frame is coded in place of the session's last one
+    /// (`RGFX_VIDEO_ENCODE_IN_PLACE`).
+    pub in_place: bool,
     /// The settings from this frame on, where they changed since the session's last encode.
     pub settings: Option<RgfxVideoEncodeSettings>,
 }
@@ -1089,6 +1093,7 @@ fn encode_op<P: Platform>(
         result_offset: m.result_offset,
         frame_index: m.frame_index,
         force_keyframe: m.flags & RGFX_VIDEO_ENCODE_FORCE_KEYFRAME != 0,
+        in_place: m.flags & RGFX_VIDEO_ENCODE_IN_PLACE != 0,
         settings,
     };
     // After the buffers of other queues its command buffer runs after: the writes of the

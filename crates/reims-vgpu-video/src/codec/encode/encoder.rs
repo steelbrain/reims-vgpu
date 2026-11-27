@@ -5,6 +5,13 @@
 //! the accelerator encodes into [`EncodedSample`]s in decode order. The
 //! accelerator ([`Accelerator`]) uploads frames and runs the hardware;
 //! VA-API's is the VA-API backend's.
+//!
+//! A stream without B pictures or a hard limit holds its last picture back
+//! from the accelerator's stream ([`Accelerator::keep`]) until the next
+//! frame or a flush, so that the caller can have it coded again in its
+//! place ([`Encoder::encode_in_place`]): from the references it was coded
+//! from, with the same order count and decode time, at the QP the settings
+//! give then.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -283,6 +290,51 @@ pub struct Encoder<A: Accelerator> {
     limit_rate: Option<LimitRate>,
     /// Pictures kept since the last IDR picture, counting it.
     since_key: u32,
+    /// The last picture coded, held back from the accelerator's stream
+    /// (module doc).
+    held: Option<Held>,
+}
+
+/// The last picture coded, not yet the accelerator's (module doc): where
+/// it was planned, the encoder's state before it, and the picture as the
+/// accelerator last coded it.
+struct Held {
+    frame_type: FrameType,
+    order: u32,
+    reference: Option<u64>,
+    forward: Option<u64>,
+    backward: Option<u64>,
+    pts: i64,
+    before: Before,
+    picture: Unkept,
+}
+
+/// The encoder's state before a picture: what coding it again starts from.
+struct Before {
+    dpb: VecDeque<ReferencePicture>,
+    frame_num: u32,
+    idr_pic_id: u32,
+    since_key: u32,
+    rate_control_changed: bool,
+    record: Record,
+}
+
+/// A picture's [`PictureParams`] as the accelerator last coded it, without
+/// the encoder's settings, headers and parameter sets, which
+/// [`Accelerator::keep`] is given as they are then.
+struct Unkept {
+    frame_type: FrameType,
+    poc: i32,
+    frame_num: u32,
+    reference: Option<u64>,
+    list0: Option<ReferencePicture>,
+    list1: Option<ReferencePicture>,
+    dpb: Vec<ReferencePicture>,
+    retained: Vec<u64>,
+    slice_header: PackedUnit,
+    h264_slice: Option<h264::SliceHeader>,
+    hevc_slice: Option<hevc::SliceHeader>,
+    rate_control_changed: bool,
 }
 
 /// `value` rounded up to a multiple of `to`, a power of two; none past a
@@ -611,6 +663,7 @@ impl<A: Accelerator> Encoder<A> {
             restart: false,
             limit_rate,
             since_key: 0,
+            held: None,
         })
     }
 
@@ -675,6 +728,148 @@ impl<A: Accelerator> Encoder<A> {
         Ok(self.push(input, frame))
     }
 
+    /// [`Self::encode`] of `frame` in place of the last picture coded, whose
+    /// sample the caller drops (module doc): the same frame again, with its
+    /// time stamp, coded with the same picture type, references, order count
+    /// and decode time stamp, at the QP the settings give now. Its one sample
+    /// comes out at once. `Err` is a frame not taken: where there is no last
+    /// picture held to code again (none was coded since the stream began or
+    /// a picture failed, or the stream has B pictures or a hard limit), its
+    /// time stamp is not the last one's, it demands a key frame and the last
+    /// picture is not one, or it does not upload. Then the last picture is
+    /// gone with it, and the next frame is coded as an IDR picture.
+    pub fn encode_in_place(
+        &mut self,
+        frame: &InputFrame<'_>,
+    ) -> Result<Vec<Coded<A::Error>>, A::Error> {
+        let held = self.held_for(frame)?;
+        match self.accelerator.upload(frame) {
+            Ok(input) => Ok(self.code_again(held, input, frame)),
+            Err(error) => {
+                self.start_again();
+                Err(error)
+            }
+        }
+    }
+
+    /// [`Self::encode_in_place`] of a frame another device already wrote into
+    /// `input`, an input of the accelerator's ([`Self::encode_input`]).
+    pub fn encode_input_in_place(
+        &mut self,
+        input: A::Input,
+        frame: &InputFrame<'_>,
+    ) -> Result<Vec<Coded<A::Error>>, A::Error> {
+        let held = self.held_for(frame)?;
+        Ok(self.code_again(held, input, frame))
+    }
+
+    /// The held picture `frame` is coded in place of; `Err` where it cannot
+    /// be ([`Self::encode_in_place`]), and the stream starts again.
+    fn held_for(&mut self, frame: &InputFrame<'_>) -> Result<Held, A::Error> {
+        let why = match self.held.take() {
+            Some(held) if held.pts != frame.pts => format!(
+                "a frame of PTS {} coded in place of PTS {}",
+                frame.pts, held.pts
+            ),
+            Some(held) if frame.force_key_frame && held.frame_type != FrameType::Idr => {
+                "a key frame coded in place of a picture that is not one".to_owned()
+            }
+            Some(held) => return Ok(held),
+            None if self.b_frames > 0 => {
+                "a frame coded in place in a stream with B pictures".into()
+            }
+            None if self.limit_rate.is_some() => {
+                "a frame coded in place in a stream held to a hard limit".into()
+            }
+            None => "a frame coded in place of none".into(),
+        };
+        self.start_again();
+        Err(Unsupported(why).into())
+    }
+
+    /// Starts the stream again where the caller dropped the last picture's
+    /// sample: no picture is held to code in place, and the next frame is
+    /// coded as an IDR picture.
+    pub fn start_again(&mut self) {
+        self.held = None;
+        self.dpb.clear();
+        self.restart = true;
+    }
+
+    /// Codes `frame`, in `input`, in place of `held` (module doc).
+    fn code_again(
+        &mut self,
+        held: Held,
+        input: A::Input,
+        frame: &InputFrame<'_>,
+    ) -> Vec<Coded<A::Error>> {
+        let Held {
+            frame_type,
+            order,
+            reference,
+            forward,
+            backward,
+            pts,
+            before,
+            picture: _,
+        } = held;
+        self.dpb = before.dpb;
+        self.frame_num = before.frame_num;
+        self.idr_pic_id = before.idr_pic_id;
+        self.since_key = before.since_key;
+        self.record = before.record;
+        // Rate control goes with it again where it went with the last try,
+        // and where it changed since.
+        self.rate_control_changed |= before.rate_control_changed;
+        // Without B pictures a sample's DTS is its PTS, which the last try's
+        // took.
+        self.times.push(pts);
+        let planned = Planned {
+            frame: Pending {
+                input,
+                pts,
+                duration: frame.duration,
+                id: frame.id,
+            },
+            frame_type,
+            order,
+            reference,
+            forward,
+            backward,
+        };
+        self.encode_all(vec![planned])
+    }
+
+    /// Gives the accelerator the held picture as the stream's.
+    fn keep_held(&mut self) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        let p = held.picture;
+        let parameter_sets: &[PackedUnit] = if p.frame_type == FrameType::Idr {
+            &self.parameter_sets
+        } else {
+            &[]
+        };
+        self.accelerator.keep(&PictureParams {
+            settings: &self.settings,
+            headers: &self.headers,
+            frame_type: p.frame_type,
+            poc: p.poc,
+            frame_num: p.frame_num,
+            reference: p.reference,
+            list0: p.list0,
+            list1: p.list1,
+            dpb: &p.dpb,
+            retained: &p.retained,
+            parameter_sets,
+            slice_header: &p.slice_header,
+            h264_slice: p.h264_slice.as_ref(),
+            hevc_slice: p.hevc_slice.as_ref(),
+            rate_control_changed: p.rate_control_changed,
+        });
+    }
+
     /// `Err` where `pts` does not follow the last frame's.
     fn follows(&self, pts: i64) -> Result<(), A::Error> {
         if let Some(last) = self.last_pts {
@@ -685,6 +880,7 @@ impl<A: Accelerator> Encoder<A> {
 
     /// Takes `frame`, in `input`, and encodes what its plan gives.
     fn push(&mut self, input: A::Input, frame: &InputFrame<'_>) -> Vec<Coded<A::Error>> {
+        self.keep_held();
         self.last_pts = Some(frame.pts);
         self.times.push(frame.pts);
         let pending = Pending {
@@ -701,8 +897,10 @@ impl<A: Accelerator> Encoder<A> {
     }
 
     /// Encodes the frames still waiting and returns each with its own
-    /// result. Frames may follow: the next starts a new run.
+    /// result, and gives the accelerator the last picture held (module doc).
+    /// Frames may follow: the next starts a new run.
     pub fn flush(&mut self) -> Vec<Coded<A::Error>> {
+        self.keep_held();
         let planned = self.planner.flush();
         self.encode_all(planned)
     }
@@ -729,8 +927,8 @@ impl<A: Accelerator> Encoder<A> {
                 Ok(sample) => coded.push(Ok(sample)),
                 Err(error) => {
                     self.times.next_dts();
-                    self.dpb.clear();
-                    self.restart = true;
+                    // A picture held before it failed is not the stream's.
+                    self.start_again();
                     failed = true;
                     coded.push(Err(FailedSample {
                         id,
@@ -940,6 +1138,16 @@ impl<A: Accelerator> Encoder<A> {
             forward,
             backward,
         } = planned;
+        // Held back from the accelerator's stream (module doc).
+        let hold = self.b_frames == 0 && self.limit_rate.is_none();
+        let before = hold.then(|| Before {
+            dpb: self.dpb.clone(),
+            frame_num: self.frame_num,
+            idr_pic_id: self.idr_pic_id,
+            since_key: self.since_key,
+            rate_control_changed: self.rate_control_changed,
+            record: self.record.clone(),
+        });
         if frame_type == FrameType::Idr {
             self.dpb.clear();
             self.frame_num = 0;
@@ -952,6 +1160,7 @@ impl<A: Accelerator> Encoder<A> {
             Some(rate) => rate.plan(frame_type, self.remaining(), dts),
             None => self.qp(frame_type),
         };
+        let planned_order = order;
         // At most gop::MAX_ORDER, so within an i32.
         let order =
             i32::try_from(order).map_err(|_| Unsupported::overflow("a picture's order count"))?;
@@ -988,7 +1197,7 @@ impl<A: Accelerator> Encoder<A> {
         };
         // The tries after the first.
         let mut retries = 1..LIMIT_TRIES;
-        let coded = loop {
+        let (coded, unkept) = loop {
             let (_, h264_slice, hevc_slice, slice_header) = self.slice_header(&slice(qp))?;
             let picture = PictureParams {
                 settings: &self.settings,
@@ -1021,9 +1230,37 @@ impl<A: Accelerator> Encoder<A> {
                 }
                 rate.coded(frame_type, qp, bits, dts);
             }
+            if hold {
+                break (coded, Some((slice_header, h264_slice, hevc_slice)));
+            }
             self.accelerator.keep(&picture);
-            break coded;
+            break (coded, None);
         };
+        if let (Some(before), Some((slice_header, h264_slice, hevc_slice))) = (before, unkept) {
+            self.held = Some(Held {
+                frame_type,
+                order: planned_order,
+                reference,
+                forward,
+                backward,
+                pts: frame.pts,
+                before,
+                picture: Unkept {
+                    frame_type,
+                    poc,
+                    frame_num,
+                    reference,
+                    list0,
+                    list1,
+                    dpb,
+                    retained,
+                    slice_header,
+                    h264_slice,
+                    hevc_slice,
+                    rate_control_changed: self.rate_control_changed,
+                },
+            });
+        }
         self.rate_control_changed = false;
         self.since_key = self.since_key.saturating_add(1);
         self.dpb = after;
@@ -1521,6 +1758,8 @@ pub mod tests {
         for n in 1..5 {
             coded.extend(encoder.encode(&frame(n, false))?);
         }
+        // The last picture is the accelerator's once the stream is flushed.
+        coded.extend(encoder.flush());
         let samples = samples(coded)?;
         let Encoder { accelerator, .. } = encoder;
         let types: Vec<FrameType> = samples.iter().map(|s| s.frame_type).collect();
@@ -1696,6 +1935,229 @@ pub mod tests {
             assert_eq!(fake.calls, 30);
             assert!(fake.qps.iter().all(|&qp| qp == PPS_QP));
         }
+        Ok(())
+    }
+
+    /// HEVC or H.264 at constant QPs with no B pictures, as the guest's
+    /// paravirtual encoders ask (each picture's QP its own).
+    fn in_place_settings(profile: Profile) -> EncoderSettings {
+        let mut settings = EncoderSettings::new(profile, 640, 360);
+        settings.rate_control = at_qp(30);
+        settings.key_frame_interval = Some(30);
+        settings.allow_frame_reordering = false;
+        settings
+    }
+
+    fn at_qp(qp: u8) -> RateControl {
+        RateControl::ConstantQp {
+            intra: qp,
+            predicted: qp,
+            bidirectional: qp,
+        }
+    }
+
+    /// What `frames` frames, each `(n, key, again)`, come out as through an
+    /// encoder of `settings`: frame `n` (a key frame where `key`), coded at
+    /// QP 30, then coded in place of itself at QP 33, 36 and so on as many
+    /// times as `again` says, each QP set as it changes. Each result, with
+    /// the fake once flushed.
+    fn coded_again(
+        settings: EncoderSettings,
+        frames: &[(u32, bool, u8)],
+    ) -> Result<(Vec<Coded<Unsupported>>, Fake), Unsupported> {
+        let mut encoder = Encoder::new(Fake::default(), settings, &limits())?;
+        let mut coded = Vec::new();
+        let mut qp = 30;
+        let mut set = |encoder: &mut Encoder<Fake>, to: u8| {
+            let changed = qp != to;
+            qp = to;
+            if changed {
+                encoder.set_rate_control(at_qp(to))
+            } else {
+                Ok(())
+            }
+        };
+        for &(n, key, again) in frames {
+            set(&mut encoder, 30)?;
+            coded.extend(encoder.encode(&frame(n, key))?);
+            for retry in 1..=again {
+                set(&mut encoder, 30 + 3 * retry)?;
+                coded.extend(encoder.encode_in_place(&frame(n, key))?);
+            }
+        }
+        coded.extend(encoder.flush());
+        let Encoder { accelerator, .. } = encoder;
+        Ok((coded, accelerator))
+    }
+
+    /// A picture as the fake saw it (`Seen`), without whether rate control
+    /// went with it.
+    type Placed = (FrameType, i32, Option<i32>, Option<i32>, Vec<u64>);
+
+    /// Each picture the fake kept, without whether rate control went with it.
+    fn placed(fake: &Fake) -> Vec<Placed> {
+        (fake.pictures.iter())
+            .map(|p| (p.0, p.1, p.2, p.3, p.4.clone()))
+            .collect()
+    }
+
+    /// The frames' samples, last try of each, and the fake.
+    fn last_tries(
+        settings: EncoderSettings,
+        frames: &[(u32, bool, u8)],
+    ) -> Result<(Vec<EncodedSample>, Vec<EncodedSample>, Fake), Unsupported> {
+        let (coded, fake) = coded_again(settings, frames)?;
+        let all = samples(coded)?;
+        let mut last: Vec<EncodedSample> = Vec::new();
+        for sample in &all {
+            match last.last_mut() {
+                Some(previous) if previous.id == sample.id => *previous = sample.clone(),
+                _ => last.push(sample.clone()),
+            }
+        }
+        Ok((all, last, fake))
+    }
+
+    #[test]
+    fn a_picture_coded_in_place_is_the_one_it_replaces_at_another_qp() -> Result<(), Unsupported> {
+        use FrameType::{Idr, P};
+        for profile in [Profile::HevcMain, Profile::HevcMain10, Profile::H264Main] {
+            let settings = in_place_settings(profile);
+            let plain: Vec<_> = (0..5).map(|n| (n, false, 0)).collect();
+            let (_, once, plain_fake) = last_tries(settings.clone(), &plain)?;
+            // Frame 2 coded again once in its place, at QP 33.
+            let again: Vec<_> = (0..5).map(|n| (n, false, u8::from(n == 2))).collect();
+            let (all, last, fake) = last_tries(settings, &again)?;
+            assert_eq!(all.len(), 6, "{profile:?}");
+            assert_eq!(fake.calls, 6, "{profile:?}");
+            // The stream is the one without it but for the QP of picture 2,
+            // and the rate control sent with the QPs that changed: the same
+            // types, order counts, references and frame numbers, and the
+            // picture after it predicts from it.
+            assert_eq!(placed(&fake), placed(&plain_fake), "{profile:?}");
+            assert_eq!(fake.lsbs, plain_fake.lsbs, "{profile:?}");
+            assert_eq!(fake.qps, [30, 30, 33, 30, 30], "{profile:?}");
+            let sent: Vec<bool> = fake.pictures.iter().map(|p| p.5).collect();
+            assert_eq!(sent, [true, false, true, true, false], "{profile:?}");
+            assert_eq!(fake.pictures[3].2, Some(fake.pictures[2].1), "{profile:?}");
+            let types: Vec<FrameType> = last.iter().map(|s| s.frame_type).collect();
+            assert_eq!(types, [Idr, P, P, P, P], "{profile:?}");
+            // Each try of frame 2 has its time stamps.
+            let tries: Vec<(u64, i64, i64)> = (all.iter())
+                .filter(|s| s.id == 2)
+                .map(|s| (s.id, s.pts, s.dts))
+                .collect();
+            assert_eq!(tries, [(2, 6000, 6000), (2, 6000, 6000)], "{profile:?}");
+            let times = |samples: &[EncodedSample]| -> Vec<(i64, i64)> {
+                samples.iter().map(|s| (s.pts, s.dts)).collect()
+            };
+            assert_eq!(times(&last), times(&once), "{profile:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_picture_coded_in_place_twice_in_a_row_keeps_its_place() -> Result<(), Unsupported> {
+        let settings = in_place_settings(Profile::HevcMain);
+        let plain: Vec<_> = (0..4).map(|n| (n, false, 0)).collect();
+        let (_, _, plain_fake) = last_tries(settings.clone(), &plain)?;
+        let again: Vec<_> = (0..4)
+            .map(|n| (n, false, if n == 1 { 2 } else { 0 }))
+            .collect();
+        let (all, last, fake) = last_tries(settings, &again)?;
+        let ids: Vec<u64> = all.iter().map(|s| s.id).collect();
+        assert_eq!(ids, [0, 1, 1, 1, 2, 3]);
+        assert_eq!(fake.calls, 6);
+        assert_eq!(placed(&fake), placed(&plain_fake));
+        assert_eq!(fake.qps, [30, 36, 30, 30]);
+        assert_eq!(last.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_picture_after_an_idr_picture_or_one_coded_in_place_of_it() -> Result<(), Unsupported> {
+        use FrameType::{Idr, P};
+        let settings = in_place_settings(Profile::HevcMain);
+        // The IDR picture coded again in its place: an IDR picture, which
+        // carries the configuration record again, and the P picture after
+        // it predicts from it.
+        let (all, _, fake) = last_tries(settings.clone(), &[(0, true, 1), (1, false, 0)])?;
+        let types: Vec<FrameType> = all.iter().map(|s| s.frame_type).collect();
+        assert_eq!(types, [Idr, Idr, P]);
+        assert!(all[0].configuration.is_some() && all[1].configuration.is_some());
+        assert_eq!(all[1].configuration, all[0].configuration);
+        assert!(all[2].configuration.is_none());
+        assert_eq!(fake.qps, [33, 30]);
+        assert_eq!(fake.pictures[1].2, Some(0));
+        // The P picture right after the IDR picture coded again: it still
+        // predicts from the IDR picture.
+        let (all, _, fake) = last_tries(settings, &[(0, true, 0), (1, false, 1), (2, false, 0)])?;
+        let types: Vec<FrameType> = all.iter().map(|s| s.frame_type).collect();
+        assert_eq!(types, [Idr, P, P, P]);
+        assert_eq!(fake.qps, [30, 33, 30]);
+        assert_eq!(fake.pictures[1].1, 1);
+        assert_eq!(fake.pictures[1].2, Some(0));
+        assert_eq!(fake.pictures[2].2, Some(1));
+        // All key frames: each coded again in its place is an IDR picture
+        // again, at its own place.
+        let keys: Vec<_> = (0..4).map(|n| (n, true, 1)).collect();
+        let (all, last, fake) = last_tries(in_place_settings(Profile::HevcMain), &keys)?;
+        assert_eq!(all.len(), 8);
+        assert!(last.iter().all(|s| s.frame_type == Idr));
+        assert_eq!(fake.pictures.len(), 4);
+        assert_eq!(fake.qps, [33, 33, 33, 33]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_frame_not_coded_in_place_starts_the_stream_again() -> Result<(), Unsupported> {
+        use FrameType::{Idr, P};
+        let refused = |encoder: &mut Encoder<Fake>, frame: &InputFrame<'_>| {
+            encoder.encode_in_place(frame).is_err()
+        };
+        // None coded yet; another PTS than the last frame's; a key frame in
+        // place of a P picture. Each is refused, and the frame after it is
+        // coded as an IDR picture.
+        let mut encoder = Encoder::new(
+            Fake::default(),
+            in_place_settings(Profile::HevcMain),
+            &limits(),
+        )?;
+        assert!(refused(&mut encoder, &frame(0, false)));
+        let mut coded = encoder.encode(&frame(0, false))?;
+        coded.extend(encoder.encode(&frame(1, false))?);
+        assert!(refused(&mut encoder, &frame(2, false)));
+        coded.extend(encoder.encode(&frame(2, false))?);
+        coded.extend(encoder.encode(&frame(3, false))?);
+        assert!(refused(&mut encoder, &frame(3, true)));
+        coded.extend(encoder.encode(&frame(4, false))?);
+        // Refused twice in a row: nothing is held after the first.
+        assert!(refused(&mut encoder, &frame(5, false)));
+        assert!(refused(&mut encoder, &frame(4, false)));
+        coded.extend(encoder.encode(&frame(5, false))?);
+        let types: Vec<FrameType> = samples(coded)?.iter().map(|s| s.frame_type).collect();
+        assert_eq!(types, [Idr, P, Idr, P, Idr, Idr]);
+        // After a picture that failed.
+        let fake = Fake {
+            fail_call: Some(1),
+            ..Fake::default()
+        };
+        let mut encoder = Encoder::new(fake, in_place_settings(Profile::HevcMain), &limits())?;
+        drop(encoder.encode(&frame(0, false))?);
+        assert!(encoder.encode(&frame(1, false))?[0].is_err());
+        assert!(refused(&mut encoder, &frame(1, false)));
+        // With B pictures, and held to a hard limit: never.
+        let mut settings = in_place_settings(Profile::H264High);
+        settings.allow_frame_reordering = true;
+        let mut encoder = Encoder::new(Fake::default(), settings, &limits())?;
+        assert_eq!(encoder.b_frames(), 1);
+        for n in 0..4 {
+            drop(encoder.encode(&frame(n, false))?);
+        }
+        assert!(refused(&mut encoder, &frame(3, false)));
+        let mut encoder = Encoder::new(Fake::default(), limited(), &limits())?;
+        drop(encoder.encode(&frame(0, false))?);
+        assert!(refused(&mut encoder, &frame(0, false)));
         Ok(())
     }
 }

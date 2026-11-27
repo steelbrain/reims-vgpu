@@ -144,6 +144,19 @@ pub const RGFX_OP_VIDEO_ENCODE_H265: u16 = 0x4003;
 
 /// [`RgfxVideoOpEncode::flags`]: the frame is a keyframe (an IDR picture, or HEVC's IRAP).
 pub const RGFX_VIDEO_ENCODE_FORCE_KEYFRAME: u32 = 1 << 0;
+/// [`RgfxVideoOpEncode::flags`]: the frame is coded in place of the session's last one, which the
+/// guest drops: from the references the last one was coded from, at the same place in the
+/// stream, so that the stream holds this frame where the last one was and no picture predicts
+/// from the dropped one. Its `frame_index` is the last one's. Taken from a host whose
+/// [`RgfxVideoEncodeCaps::flags`](crate::wire::RgfxVideoEncodeCaps) has
+/// [`RGFX_VIDEO_ENCODE_CAP_IN_PLACE`](crate::wire::RGFX_VIDEO_ENCODE_CAP_IN_PLACE) for the
+/// codec. Where the host cannot, the encode fails ([`RGFX_VIDEO_ENCODE_FAILED`]), writes
+/// nothing, and no later frame predicts from the dropped one: the session holds no last frame
+/// to replace (none was coded since its settings made a new stream, or the last one failed),
+/// codes B pictures, or holds a hard limit ([`RGFX_VIDEO_ENCODE_HARD_LIMIT`]) by coding frames
+/// again itself; the `frame_index` is not the last one's; or the frame asks a keyframe in place
+/// of one that is not.
+pub const RGFX_VIDEO_ENCODE_IN_PLACE: u32 = 1 << 1;
 
 /// The body of [`RGFX_OP_VIDEO_ENCODE_H264`] and [`RGFX_OP_VIDEO_ENCODE_H265`], followed by
 /// `settings_size` bytes of [`RgfxVideoEncodeSettings`] where the settings changed since the
@@ -171,7 +184,7 @@ pub struct RgfxVideoOpEncode {
     /// The frame's place in display order, from 0; the result says which frame its access unit
     /// holds.
     pub frame_index: u64,
-    /// `RGFX_VIDEO_ENCODE_*`: [`RGFX_VIDEO_ENCODE_FORCE_KEYFRAME`].
+    /// `RGFX_VIDEO_ENCODE_*`: [`RGFX_VIDEO_ENCODE_FORCE_KEYFRAME`], [`RGFX_VIDEO_ENCODE_IN_PLACE`].
     pub flags: u32,
     /// The bytes of [`RgfxVideoEncodeSettings`] after this body; 0 where they are unchanged.
     pub settings_size: u32,

@@ -1002,6 +1002,20 @@
 // [`RgfxVideoOpEncode::flags`]: the frame is a keyframe (an IDR picture, or HEVC's IRAP).
 #define RGFX_VIDEO_ENCODE_FORCE_KEYFRAME (1 << 0)
 
+// [`RgfxVideoOpEncode::flags`]: the frame is coded in place of the session's last one, which the
+// guest drops: from the references the last one was coded from, at the same place in the
+// stream, so that the stream holds this frame where the last one was and no picture predicts
+// from the dropped one. Its `frame_index` is the last one's. Taken from a host whose
+// [`RgfxVideoEncodeCaps::flags`](crate::wire::RgfxVideoEncodeCaps) has
+// [`RGFX_VIDEO_ENCODE_CAP_IN_PLACE`](crate::wire::RGFX_VIDEO_ENCODE_CAP_IN_PLACE) for the
+// codec. Where the host cannot, the encode fails ([`RGFX_VIDEO_ENCODE_FAILED`]), writes
+// nothing, and no later frame predicts from the dropped one: the session holds no last frame
+// to replace (none was coded since its settings made a new stream, or the last one failed),
+// codes B pictures, or holds a hard limit ([`RGFX_VIDEO_ENCODE_HARD_LIMIT`]) by coding frames
+// again itself; the `frame_index` is not the last one's; or the frame asks a keyframe in place
+// of one that is not.
+#define RGFX_VIDEO_ENCODE_IN_PLACE (1 << 1)
+
 // [`RgfxVideoEncodeSettings::rate_control`]: a constant QP a picture type (`qp_i`, `qp_p`,
 // `qp_b`).
 #define RGFX_VIDEO_RATE_CQP 1
@@ -3426,6 +3440,11 @@
 // reaches the pages only at a CPU lock of the surface, and the GPU's other uses of it read it
 // where it landed. Without it, a picture lands in the surface's pages.
 #define RGFX_VIDEO_CAPS_OUTPUT_CACHED (1 << 0)
+
+// [`RgfxVideoEncodeCaps::flags`]: the host codes a frame in place of a session's last one
+// ([`RGFX_VIDEO_ENCODE_IN_PLACE`](crate::ops::video::RGFX_VIDEO_ENCODE_IN_PLACE)), a session of
+// no B pictures.
+#define RGFX_VIDEO_ENCODE_CAP_IN_PLACE (1 << 0)
 
 // A pipeline reflection reply's status: the pipeline was created.
 #define RGFX_PIPELINE_OK 0
@@ -8603,7 +8622,8 @@ typedef struct {
   // The most consecutive B pictures an encode takes
   // ([`RgfxVideoEncodeSettings::b_frames`](crate::ops::video::RgfxVideoEncodeSettings)).
   uint32_t max_b_frames;
-  // Zero: reserved for intra refresh and the like.
+  // `RGFX_VIDEO_ENCODE_CAP_*`: [`RGFX_VIDEO_ENCODE_CAP_IN_PLACE`]. Zero from a host older
+  // than these.
   uint32_t flags;
   // Zero.
   uint32_t reserved_0c;
@@ -8796,7 +8816,7 @@ typedef struct {
   // The frame's place in display order, from 0; the result says which frame its access unit
   // holds.
   uint64_t frame_index;
-  // `RGFX_VIDEO_ENCODE_*`: [`RGFX_VIDEO_ENCODE_FORCE_KEYFRAME`].
+  // `RGFX_VIDEO_ENCODE_*`: [`RGFX_VIDEO_ENCODE_FORCE_KEYFRAME`], [`RGFX_VIDEO_ENCODE_IN_PLACE`].
   uint32_t flags;
   // The bytes of [`RgfxVideoEncodeSettings`] after this body; 0 where they are unchanged.
   uint32_t settings_size;

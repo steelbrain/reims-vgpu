@@ -22,7 +22,9 @@ threads-required = "num-test-threads"
 # `graphics::nvidia::`, `video_host::` and `surface_cache::`, which take surface_cache's download
 # costs, failed 3 of 4 runs, and `graphics::nvidia::` beside the download costs alone 1 of 4, each
 # failure an NVDEC decode whose status was 8 (cuvidDecodeStatus_Error); the same filters without
-# the download costs failed none of 8 (m3-max-53602, m3-max-53622, 2026-11-19).
+# the download costs failed none of 8 (m3-max-53602, m3-max-53622, 2026-11-19). The NVENC
+# in-place check's test counts its GPU's encoder sessions, which the tests beside it hold too:
+# run with the NVIDIA tests, it counted 3 (m3-max-77594, 2026-11-27).
 [[profile.default.overrides]]
 filter = '''
     (binary_id(reims-vgpu) & (
@@ -34,7 +36,8 @@ filter = '''
       | test(=graphics::decode::close_cost::on_vulkan_close_cost)
       | test(=graphics::decode::composite_cost::on_rt_composite_cost)
       | test(=graphics::decode::dispatch_cost::on_rt_dispatch_cost)
-      | test(=graphics::decode::draw_cost::on_rt_draw_cost)))
+      | test(=graphics::decode::draw_cost::on_rt_draw_cost)
+      | test(=graphics::nvidia::encode::tests::the_in_place_check_leaves_no_nvenc_session)))
 '''
 threads-required = "num-test-threads"
 
@@ -68,7 +71,8 @@ filter = '''
       | test(=graphics::decode::close_cost::on_vulkan_close_cost)
       | test(=graphics::decode::composite_cost::on_rt_composite_cost)
       | test(=graphics::decode::dispatch_cost::on_rt_dispatch_cost)
-      | test(=graphics::decode::draw_cost::on_rt_draw_cost)))
+      | test(=graphics::decode::draw_cost::on_rt_draw_cost)
+      | test(=graphics::nvidia::encode::tests::the_in_place_check_leaves_no_nvenc_session)))
 '''
 test-group = "@global"
 

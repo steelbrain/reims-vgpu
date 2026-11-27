@@ -296,7 +296,8 @@ fn the_va_settings_of_the_wire_s() {
 }
 
 /// The rate controls an encode entry lists: the wire's bit of each `VA_RC_*` its profiles'
-/// configs list; a decode entry lists none.
+/// configs list; and it codes frames in place, H.264's and HEVC's alike. A decode entry lists
+/// none of it.
 #[test]
 fn an_encode_entry_lists_its_configs_rate_controls() {
     let entry = RgfxVideoCodecCaps {
@@ -304,7 +305,16 @@ fn an_encode_entry_lists_its_configs_rate_controls() {
         direction: RGFX_VIDEO_ENCODE,
         ..RgfxVideoCodecCaps::default()
     };
-    assert_eq!(encode_caps(&entry, &[]), RgfxVideoEncodeCaps::default());
+    let in_place = RgfxVideoEncodeCaps {
+        flags: RGFX_VIDEO_ENCODE_CAP_IN_PLACE,
+        ..RgfxVideoEncodeCaps::default()
+    };
+    assert_eq!(encode_caps(&entry, &[]), in_place);
+    let hevc = RgfxVideoCodecCaps {
+        codec: RGFX_VIDEO_CODEC_HEVC,
+        ..entry
+    };
+    assert_eq!(encode_caps(&hevc, &[]), in_place);
     let decode = RgfxVideoCodecCaps {
         direction: RGFX_VIDEO_DECODE,
         ..entry
@@ -418,6 +428,7 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
                     settings: (index == 0).then_some(s),
                     frame_index: index,
                     force_keyframe: false,
+                    in_place: false,
                 };
                 let frame = encoder.frame(frame);
                 let (luma, chroma) = picture(&s, index);
@@ -491,6 +502,177 @@ fn each_profile_encodes_on_the_driver_and_decodes_back() {
                 "codec {} profile {bit:#x}",
                 entry.codec
             );
+        }
+    }
+}
+
+/// Each frame of `frames`, `(index, in_place, qp)`, through an encoder of `codec`'s `entry`
+/// on the driver, from the host bytes of [`picture`] `index`, at constant QP `qp` (settings
+/// sent where it changes): each one's [`Encoded`], and its access unit where it was written.
+fn encode_frames(
+    display: &Display,
+    supports: &Arc<[EncoderSupport]>,
+    entry: &RgfxVideoCodecCaps,
+    s: &RgfxVideoEncodeSettings,
+    frames: &[(u64, bool, u32)],
+) -> Vec<Result<(Encoded, Vec<u8>), BackendError>> {
+    let rates = encode_caps(entry, supports);
+    let encoder = VaEncoder::<RtPlatform>::new(
+        display,
+        entry.codec,
+        Arc::clone(supports),
+        entry,
+        &rates,
+        Err("the test copies none by the GPU".to_owned()),
+    );
+    let mut qp = None;
+    let mut out = Vec::new();
+    for &(index, in_place, at) in frames {
+        let settings = RgfxVideoEncodeSettings {
+            qp_i: at,
+            qp_p: at,
+            qp_b: at,
+            ..*s
+        };
+        let changed = qp != Some(at);
+        qp = Some(at);
+        let frame = EncodeFrame {
+            settings: changed.then_some(settings),
+            frame_index: index,
+            force_keyframe: false,
+            in_place,
+        };
+        let frame = encoder.frame(frame);
+        let (luma, chroma) = picture(s, index);
+        let row = luma.len() / s.height as usize;
+        let source = EncodeSource {
+            luma: SourcePlane {
+                at: luma.as_ptr(),
+                bytes_per_row: row,
+                row_bytes: row,
+                rows: s.height as usize,
+            },
+            chroma: SourcePlane {
+                at: chroma.as_ptr(),
+                bytes_per_row: row,
+                row_bytes: row,
+                rows: s.height as usize / 2,
+            },
+            width: s.width,
+            height: s.height,
+        };
+        let mut bytes = vec![0u8; 1 << 20];
+        let encoded = frame.finish_from_host(&source, &mut bytes);
+        out.push(encoded.map(|e| {
+            bytes.truncate(e.size as usize);
+            (e, bytes)
+        }));
+    }
+    out
+}
+
+/// On the driver, each codec and profile it encodes, frames coded again in place of the last
+/// (as AppleGVA's limiter codes a frame again at a higher QP): the key frame twice, frame 2
+/// three times and frame 4 once more, then frames to 7. Each try is its frame's, of its picture
+/// type; the last try of each frame makes the stream, which the driver's own decoder decodes
+/// whole, every frame of it. A frame coded in place with none held is refused, and the frame
+/// after it is a keyframe.
+#[test]
+#[ignore = "needs a VA-API GPU: run on the VA-API host"]
+fn frames_coded_in_place_decode_back_in_their_places() {
+    let display = display();
+    let supports: Arc<[EncoderSupport]> = encoder_support(&display).into();
+    let caps = display.capabilities().unwrap();
+    let entries = encode_caps_of(&supports, &caps);
+    assert!(
+        !entries.is_empty(),
+        "the driver encodes neither H.264 nor HEVC"
+    );
+    let frames = [
+        (0, false, 26),
+        (0, true, 29),
+        (1, false, 26),
+        (2, false, 26),
+        (2, true, 29),
+        (2, true, 32),
+        (3, false, 26),
+        (4, false, 26),
+        (4, true, 29),
+        (5, false, 26),
+        (6, false, 26),
+        (7, false, 26),
+    ];
+    for entry in &entries {
+        assert_ne!(
+            encode_caps(entry, &supports).flags & RGFX_VIDEO_ENCODE_CAP_IN_PLACE,
+            0
+        );
+        for bit in (0..32)
+            .map(|b| 1u32 << b)
+            .filter(|b| entry.profiles & b != 0)
+        {
+            let s = settings(entry.codec, bit);
+            let what = format!("codec {} profile {bit:#x}", entry.codec);
+            let coded = encode_frames(&display, &supports, entry, &s, &frames);
+            let mut units: Vec<Vec<u8>> = Vec::new();
+            let mut last = None;
+            for (n, (try_, &(index, in_place, _))) in coded.iter().zip(&frames).enumerate() {
+                let (encoded, au) = try_
+                    .as_ref()
+                    .unwrap_or_else(|e| panic!("{what} try {n}: {e}"));
+                assert_eq!(encoded.frame_index, index, "{what} try {n}");
+                assert!(!encoded.overflow, "{what} try {n}");
+                let key = index == 0;
+                assert_eq!(encoded.keyframe, key, "{what} try {n}");
+                assert_eq!(
+                    encoded.picture_type,
+                    if key {
+                        RGFX_VIDEO_PICTURE_I
+                    } else {
+                        RGFX_VIDEO_PICTURE_P
+                    },
+                    "{what} try {n}"
+                );
+                if in_place {
+                    assert_eq!(last, Some(index), "{what} try {n}");
+                    *units.last_mut().unwrap() = au.clone();
+                } else {
+                    units.push(au.clone());
+                }
+                last = Some(index);
+            }
+            assert_eq!(units.len(), 8, "{what}");
+            let mut decoded = 0;
+            if entry.codec == RGFX_VIDEO_CODEC_H264 {
+                let mut decoder = H264Decoder::new_annex_b(&display);
+                for (id, au) in units.iter().enumerate() {
+                    decoded += decoder.decode(au, id as u64).unwrap().len();
+                }
+                decoded += decoder.flush().unwrap().len();
+            } else {
+                let mut decoder = HevcDecoder::new_annex_b(&display);
+                for (id, au) in units.iter().enumerate() {
+                    decoded += decoder.decode(au, id as u64).unwrap().len();
+                }
+                decoded += decoder.flush().unwrap().len();
+            }
+            assert_eq!(decoded, 8, "{what}");
+            // Refused: in place of none, then a new frame is a keyframe.
+            let refused = encode_frames(
+                &display,
+                &supports,
+                entry,
+                &s,
+                &[
+                    (0, false, 26),
+                    (1, false, 26),
+                    (5, true, 26),
+                    (2, false, 26),
+                ],
+            );
+            assert!(refused[2].is_err(), "{what}");
+            let (encoded, _) = refused[3].as_ref().unwrap();
+            assert!(encoded.keyframe, "{what}");
         }
     }
 }

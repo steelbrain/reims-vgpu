@@ -67,6 +67,10 @@ pub(crate) struct EncodeFrame {
     pub(crate) frame_index: u64,
     /// Whether it must be a keyframe.
     pub(crate) force_keyframe: bool,
+    /// Whether it is coded in place of the last frame taken, which the guest drops
+    /// (`RGFX_VIDEO_ENCODE_IN_PLACE`): from the references that frame was coded from. A backend
+    /// that cannot (no frame held, B pictures) fails the frame's encode.
+    pub(crate) in_place: bool,
 }
 
 /// A backend's encoder of one codec, whose session is a [`HostEncodeSession`]. Its calls run on
@@ -501,6 +505,7 @@ impl<P: Platform> GraphicsVideoSession<P> for HostEncodeSession<P> {
             settings: encode.settings,
             frame_index: encode.frame_index,
             force_keyframe: encode.force_keyframe,
+            in_place: encode.in_place,
         };
         let frame = state.encoder.encode(frame).map_err(encode_fault)?;
         let value = state.value + 1;

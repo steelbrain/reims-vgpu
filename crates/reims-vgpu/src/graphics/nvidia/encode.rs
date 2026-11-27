@@ -7,7 +7,15 @@
 //!   (and P010 for HEVC Main 10), the least of their sizes, the codec's top level, and the
 //!   references NVENC takes. Its rate controls ([`encode_caps`]) are CQP, and CBR and VBR where
 //!   NVENC lists them, and no B-frames: the encoder keeps frames in display order, a frame in and
-//!   its access unit out.
+//!   its access unit out. It codes a frame in place of the last one
+//!   (`RGFX_VIDEO_ENCODE_CAP_IN_PLACE`) where NVENC says it codes a frame without advancing its
+//!   state for every profile of the codec, and a session of the codec with a state buffer did
+//!   so at the device's start ([`checked_in_place`]); a driver that refuses either leaves the
+//!   flag off. A session then codes each frame without advancing NVENC's state, and advances it
+//!   (`nvEncRestoreEncoderState`) as the next frame comes: a frame coded in place is coded from
+//!   the state before the last one (the NVIDIA crate's `NvencEncoder::new_in_place`). A frame
+//!   coded in place that fails, or is refused, drops the last one: the next frame is coded from
+//!   the state before it.
 //! - **The settings** ([`params_of`]) map onto the NVIDIA crate's: the profile, size, level,
 //!   entropy coder and colour; a VBR with no peak peaks at 1.05 times its average, as the VA-API
 //!   arm's does; `quality` 0 to 100 onto NVENC's presets ([`preset_of`]): P1 (the fastest) up
@@ -41,13 +49,14 @@ use reims_vgpu_graphics::ops::video::{
     RgfxVideoEncodeSettings,
 };
 use reims_vgpu_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_ENCODE, RGFX_VIDEO_FORMAT_NV12,
-    RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN,
-    RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_ENCODE,
+    RGFX_VIDEO_ENCODE_CAP_IN_PLACE, RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010,
+    RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN,
+    RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_video::nvidia::{
     Bitstream, DeviceFrame, EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl,
-    Gpu, NvencEncoder, PictureType, RawFrame, Tuning,
+    Gpu, NvencEncoder, PictureType, RawFrame, Tuning, codes_in_place,
 };
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::sync::Mutex;
@@ -144,9 +153,45 @@ pub(super) fn encode_caps_of(supports: &[EncodeProfileSupport]) -> Vec<RgfxVideo
     entries
 }
 
+/// `supports` with each codec's `in_place` as a session on `gpu` shows it (module doc): where
+/// NVENC says so for every profile of a codec, a session of its first profile codes a frame in
+/// place ([`codes_in_place`]), at its smallest size from 256x256; where it does not, no profile
+/// of the codec is, which is said at info.
+pub(super) fn checked_in_place(
+    gpu: &Arc<Gpu>,
+    mut supports: Vec<EncodeProfileSupport>,
+) -> Vec<EncodeProfileSupport> {
+    for codec in [RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC] {
+        let of_codec = |s: &EncodeProfileSupport| wire_profile(s.profile).0 == codec;
+        let Some(first) = supports.iter().find(|s| of_codec(s)).copied() else {
+            continue;
+        };
+        let size = |min: u32, max: u32| min.max(256).min(max) & !1;
+        let checked = if supports.iter().filter(|s| of_codec(s)).all(|s| s.in_place) {
+            let (width, height) = (
+                size(first.min_width, first.max_width),
+                size(first.min_height, first.max_height),
+            );
+            codes_in_place(Arc::clone(gpu), first.profile, width, height).map_err(|e| e.to_string())
+        } else {
+            Err("NVENC does not say it codes a frame without advancing its state".to_owned())
+        };
+        if let Err(why) = checked {
+            log::info!(
+                "hardware video: {ENCODE_NAME} codes no frame of {codec:#x} in place: {why}"
+            );
+            for support in supports.iter_mut().filter(|s| of_codec(s)) {
+                support.in_place = false;
+            }
+        }
+    }
+    supports
+}
+
 /// What an encode of `codec`, an entry [`encode_caps_of`] made, takes beyond it: CQP, and CBR
-/// and VBR where NVENC lists them for each of its profiles, and no B-frames (module doc); all
-/// zero for a decode entry.
+/// and VBR where NVENC lists them for each of its profiles, no B-frames, and frames coded in
+/// place where every profile codes them ([`checked_in_place`]; module doc); all zero for a
+/// decode entry.
 pub(super) fn encode_caps(
     codec: &RgfxVideoCodecCaps,
     supports: &[EncodeProfileSupport],
@@ -162,10 +207,15 @@ pub(super) fn encode_caps(
     if profiles().all(|s| s.variable_bit_rate) {
         rate_controls |= 1 << RGFX_VIDEO_RATE_VBR;
     }
+    let in_place = profiles().next().is_some() && profiles().all(|s| s.in_place);
     RgfxVideoEncodeCaps {
         rate_controls,
         max_b_frames: 0,
-        flags: 0,
+        flags: if in_place {
+            RGFX_VIDEO_ENCODE_CAP_IN_PLACE
+        } else {
+            0
+        },
         reserved_0c: 0,
     }
 }
@@ -302,6 +352,8 @@ struct State {
     settings: Option<RgfxVideoEncodeSettings>,
     /// Whether the next frame is made an IDR picture: the last one did not fit.
     key_next: bool,
+    /// Whether its encoders code frames in place (module doc).
+    in_place: bool,
 }
 
 impl State {
@@ -317,7 +369,12 @@ impl State {
             _ => {
                 let params = params_of(self.codec, settings)?;
                 self.encoder = None;
-                self.encoder = Some(NvencEncoder::new(Arc::clone(&self.gpu), &params)?);
+                let gpu = Arc::clone(&self.gpu);
+                self.encoder = Some(if self.in_place {
+                    NvencEncoder::new_in_place(gpu, &params)?
+                } else {
+                    NvencEncoder::new(gpu, &params)?
+                });
             }
         }
         self.settings = Some(*settings);
@@ -355,8 +412,7 @@ impl<P: Platform> Fills<P> {
         encoder: &mut NvencEncoder,
         [luma, chroma]: [&OutputPlane<P>; 2],
         size: (u32, u32),
-        index: u64,
-        force_idr: bool,
+        (index, force_idr, in_place): (u64, bool, bool),
     ) -> Result<Option<Vec<Bitstream>>, BackendError> {
         let declined = match &mut self.filler {
             Ok(filler) => {
@@ -373,7 +429,12 @@ impl<P: Platform> Fills<P> {
                             index,
                             force_idr,
                         };
-                        match encoder.encode_device(&frame) {
+                        let encoded = if in_place {
+                            encoder.encode_device_in_place(&frame)
+                        } else {
+                            encoder.encode_device(&frame)
+                        };
+                        match encoded {
                             Ok(packets) => return Ok(Some(packets)),
                             // NVENC took nothing of the frame: it is uploaded, and so are the
                             // session's frames from here on.
@@ -406,6 +467,7 @@ pub(super) struct NvencHostEncoder<P: Platform> {
     /// What writes its frames into memory NVENC reads, on the GPU (module doc).
     fills: Arc<Mutex<Fills<P>>>,
     /// The profiles NVENC encodes of the codec, which [`HostEncoder::check`] holds settings to.
+    /// They code frames in place where `encode` says so.
     profiles: Vec<EncodeProfile>,
     /// The sizes the codec's entry gives.
     min_size: [u32; 2],
@@ -433,6 +495,7 @@ impl<P: Platform> NvencHostEncoder<P> {
                 encoder: None,
                 settings: None,
                 key_next: false,
+                in_place: encode.flags & RGFX_VIDEO_ENCODE_CAP_IN_PLACE != 0,
             })),
             fills: Arc::new(Mutex::new(Fills {
                 filler,
@@ -506,12 +569,46 @@ impl<P: Platform> HostEncodedFrame<P> for NvencFrame<P> {
         out: &mut [u8],
     ) -> Result<Encoded, BackendError> {
         let mut state = self.state.lock();
+        let encoded = self.encode_into(&mut state, source, out);
+        // The guest dropped the frame this one was to replace: the next frame is coded from
+        // NVENC's state before it.
+        if self.frame.in_place
+            && encoded.is_err()
+            && let Some(encoder) = state.encoder.as_mut()
+        {
+            encoder.drop_last();
+        }
+        encoded
+    }
+}
+
+impl<P: Platform> NvencFrame<P> {
+    /// [`HostEncodedFrame::finish`] on the locked `state`. A new frame first takes the last one
+    /// as the stream's, before its settings change NVENC's (module doc); a frame coded in place
+    /// replaces the last one, which may be one that did not fit.
+    fn encode_into(
+        &self,
+        state: &mut State,
+        source: &mut FrameSource<'_, P>,
+        out: &mut [u8],
+    ) -> Result<Encoded, BackendError> {
+        let in_place = self.frame.in_place;
+        if !in_place
+            && let Some(encoder) = state.encoder.as_mut()
+            && let Err(e) = encoder.keep()
+        {
+            log::warn!(
+                kind:% = e;
+                "hardware video: {ENCODE_NAME}: NVENC's state after a frame: {e}; the next frame \
+                 is an IDR picture"
+            );
+        }
         if let Some(settings) = &self.frame.settings {
             state.apply(settings)?;
         }
-        let force_idr = self.frame.force_keyframe || state.key_next;
-        if let Some(packets) = self.filled(&mut state, source, force_idr)? {
-            return finish_packets(&mut state, packets, out);
+        let force_idr = self.frame.force_keyframe || (state.key_next && !in_place);
+        if let Some(packets) = self.filled(state, source, force_idr)? {
+            return finish_packets(state, packets, out);
         }
         let source = source.host()?;
         let encoder = state.encoder.as_mut().ok_or("an encode with no settings")?;
@@ -521,12 +618,14 @@ impl<P: Platform> HostEncodedFrame<P> for NvencFrame<P> {
             index: self.frame.frame_index,
             force_idr,
         };
-        let packets = encoder.encode(&raw)?;
-        finish_packets(&mut state, packets, out)
+        let packets = if in_place {
+            encoder.encode_in_place(&raw)?
+        } else {
+            encoder.encode(&raw)?
+        };
+        finish_packets(state, packets, out)
     }
-}
 
-impl<P: Platform> NvencFrame<P> {
     /// The frame's packets, encoded from `source`'s planes where they lie, copied by the GPU into
     /// memory NVENC reads (module doc); `None` where the copy or NVENC's read of it was declined,
     /// nothing encoded, which is said once a session. `Err` where the copy failed once on the
@@ -542,8 +641,7 @@ impl<P: Platform> NvencFrame<P> {
             encoder,
             source.planes(),
             source.size(),
-            self.frame.frame_index,
-            force_idr,
+            (self.frame.frame_index, force_idr, self.frame.in_place),
         )
     }
 }

@@ -277,6 +277,22 @@ impl VideoEncoder {
         wait::by(&Deadline::default(), || self.inner.encode(frame))
     }
 
+    /// [`Self::encode`] of `frame` in place of the last frame encoded, whose
+    /// sample the caller drops: the same frame again, coded as the last one
+    /// was, from the references it was coded from, at the QP the settings give
+    /// now ([`Encoder::encode_in_place`]). `Err` is a frame not taken, after
+    /// which the next frame is coded as an IDR picture.
+    pub fn encode_in_place(&mut self, frame: &InputFrame<'_>) -> Result<Vec<Coded<Error>>, Error> {
+        wait::by(&Deadline::default(), || self.inner.encode_in_place(frame))
+    }
+
+    /// Starts the stream again where the caller dropped the last frame's
+    /// sample ([`Encoder::start_again`]): the next frame is coded as an IDR
+    /// picture.
+    pub fn start_again(&mut self) {
+        self.inner.start_again();
+    }
+
     /// Encodes the frames still waiting, and returns each with its own
     /// result. More frames may follow.
     pub fn flush(&mut self) -> Vec<Coded<Error>> {
@@ -433,6 +449,33 @@ impl VideoEncoder {
         input: &Target,
         frame: &InputFrame<'_>,
     ) -> Result<Vec<Coded<Error>>, Error> {
+        let input = self.input_of(input)?;
+        wait::by(&Deadline::default(), || {
+            self.inner.encode_input(input, frame)
+        })
+    }
+
+    /// [`Self::encode_in_place`] of the frame written into `input`, as
+    /// [`Self::encode_target`] takes it.
+    pub fn encode_target_in_place(
+        &mut self,
+        input: &Target,
+        frame: &InputFrame<'_>,
+    ) -> Result<Vec<Coded<Error>>, Error> {
+        let input = match self.input_of(input) {
+            Ok(input) => input,
+            Err(error) => {
+                self.inner.start_again();
+                return Err(error);
+            }
+        };
+        wait::by(&Deadline::default(), || {
+            self.inner.encode_input_in_place(input, frame)
+        })
+    }
+
+    /// `input` as the encoder takes it ([`Self::encode_target`]).
+    fn input_of(&self, input: &Target) -> Result<Input, Error> {
         let shape = self.input_shape();
         if !input.is_on(self.inner.accelerator().display()) || input.shape() != shape {
             return Err(Error::Unsupported(format!(
@@ -445,10 +488,7 @@ impl VideoEncoder {
                 }
             )));
         }
-        let input = Input::Imported(input.clone());
-        wait::by(&Deadline::default(), || {
-            self.inner.encode_input(input, frame)
-        })
+        Ok(Input::Imported(input.clone()))
     }
 }
 

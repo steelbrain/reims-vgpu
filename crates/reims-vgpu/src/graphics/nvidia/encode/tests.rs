@@ -39,8 +39,8 @@ fn settings(codec: u32, profile: u32, width: u32, height: u32) -> RgfxVideoEncod
     }
 }
 
-/// NVENC's answer for `profile`: `min` to `max` pictures, CBR and VBR as given, and several
-/// references.
+/// NVENC's answer for `profile`: `min` to `max` pictures, CBR and VBR as given, several
+/// references, and frames coded without advancing its state.
 fn support(profile: EncodeProfile, min: u32, max: u32, cbr: bool) -> EncodeProfileSupport {
     EncodeProfileSupport {
         profile,
@@ -52,7 +52,49 @@ fn support(profile: EncodeProfile, min: u32, max: u32, cbr: bool) -> EncodeProfi
         constant_bit_rate: cbr,
         variable_bit_rate: true,
         max_references: 7,
+        in_place: true,
     }
+}
+
+/// An encode entry codes frames in place where every profile of its codec does: where NVENC
+/// refuses it for one (its caps, or the session `checked_in_place` makes), the codec's flag is
+/// off, and the device answers no frame coded in place for it.
+#[test]
+fn frames_are_coded_in_place_where_every_profile_of_the_codec_is() {
+    let mut main10 = support(EncodeProfile::HevcMain10, 129, 8192, true);
+    main10.in_place = false;
+    let supports = [
+        support(EncodeProfile::H264Main, 145, 4096, true),
+        support(EncodeProfile::H264High, 145, 4096, true),
+        support(EncodeProfile::HevcMain, 129, 8192, true),
+        main10,
+    ];
+    let entries = encode_caps_of(&supports);
+    let flags = |supports: &[EncodeProfileSupport]| -> Vec<u32> {
+        (entries.iter())
+            .map(|e| encode_caps(e, supports).flags)
+            .collect()
+    };
+    assert_eq!(flags(&supports), [RGFX_VIDEO_ENCODE_CAP_IN_PLACE, 0]);
+    let mut all = supports;
+    all[3].in_place = true;
+    assert_eq!(
+        flags(&all),
+        [
+            RGFX_VIDEO_ENCODE_CAP_IN_PLACE,
+            RGFX_VIDEO_ENCODE_CAP_IN_PLACE
+        ]
+    );
+    let none = all.map(|s| EncodeProfileSupport {
+        in_place: false,
+        ..s
+    });
+    assert_eq!(flags(&none), [0, 0]);
+    let decode = RgfxVideoCodecCaps {
+        direction: RGFX_VIDEO_DECODE,
+        ..entries[0]
+    };
+    assert_eq!(encode_caps(&decode, &all).flags, 0);
 }
 
 /// An entry for each codec: its profiles, its formats, the least of their sizes and
@@ -505,6 +547,7 @@ fn each_profile_encodes_through_a_session_and_decodes_back_on_nvdec() {
                     result_offset: 0,
                     frame_index: n,
                     force_keyframe: n == 10,
+                    in_place: false,
                     settings: frame_settings,
                 };
                 let value = session
@@ -584,6 +627,272 @@ fn each_profile_encodes_through_a_session_and_decodes_back_on_nvdec() {
             }
             eprintln!("{what}: the least PSNR of a plane {least:.1} dB");
             drop(session);
+        }
+    }
+}
+
+/// On the NVIDIA host, the device-start check of frames coded in place (`checked_in_place`) leaves
+/// no NVENC session open on its GPU once it is done (where `nvidia-smi` answers the GPU's encoder
+/// sessions), and says, five times over, how long it took. The count is the GPU's, every
+/// process's sessions on it, so the test runs alone (`.config/nextest.toml`).
+#[test]
+#[ignore = "needs an NVIDIA GPU, and a measurement: run it alone on the NVIDIA host"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+fn the_in_place_check_leaves_no_nvenc_session() {
+    let gpu = Arc::new(Gpu::open(&GpuSelector::First).expect("an NVIDIA GPU"));
+    let supports = encode_profiles(Arc::clone(&gpu)).expect("NVENC's profiles");
+    let mut took = Vec::new();
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        let checked = checked_in_place(&gpu, supports.clone());
+        took.push(start.elapsed().as_secs_f64() * 1000.0);
+        assert!(checked.iter().all(|s| s.in_place), "{checked:?}");
+    }
+    took.sort_by(f64::total_cmp);
+    eprintln!(
+        "the in-place check took {took:.1?} ms, median {:.1} ms",
+        took[2]
+    );
+    let sessions = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=pci.bus_id,encoder.stats.sessionCount",
+            "--format=csv,noheader",
+        ])
+        .output();
+    match sessions {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            eprintln!("NVENC sessions after it, by GPU: {}", text.trim());
+            // CUDA's bus ID has a 4-digit domain and nvidia-smi's an 8-digit one: the bus,
+            // device and function after it name the GPU.
+            let ours = |id: &str| {
+                id.split_once(':')
+                    .map(|(_, rest)| rest.trim().to_ascii_lowercase())
+            };
+            let bus = ours(&gpu.info().pci_bus_id);
+            let line = text
+                .lines()
+                .find(|line| ours(line.split(',').next().unwrap_or_default()) == bus)
+                .expect("nvidia-smi lists the GPU opened");
+            let count = line.rsplit(',').next().map(str::trim);
+            assert_eq!(count, Some("0"), "{line}");
+        }
+        Err(e) => eprintln!("no nvidia-smi to count NVENC sessions: {e}"),
+    }
+}
+
+/// On the NVIDIA host, each codec and profile NVENC encodes, which codes frames in place there
+/// (`checked_in_place`; the test fails where it does not), through an encode session of the
+/// arm's, 1280x720 at a constant QP: frames coded again in place of the last at a higher QP, as
+/// AppleGVA's limiter codes them (the IDR picture once more, frame 5 twice and frame 9 once),
+/// each try its frame's, of its picture type. The last try of each frame makes the stream,
+/// which decodes back on NVDEC, every frame to a picture whose planes reach [`LEAST_PSNR`]
+/// against it. A frame coded in place of another frame is refused, the guest drops the frame it
+/// was to replace, and the next frame is coded from NVENC's state before that one.
+#[test]
+#[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+fn frames_coded_in_place_decode_back_on_nvdec() {
+    let gpu = Arc::new(Gpu::open(&GpuSelector::First).expect("an NVIDIA GPU"));
+    let runtime: Arc<dyn Runtime> = StdRuntime::shared();
+    let supports = checked_in_place(
+        &gpu,
+        encode_profiles(Arc::clone(&gpu)).expect("NVENC's profiles"),
+    );
+    let entries = encode_caps_of(&supports);
+    let p = FakePlatform::new();
+    let (width, height) = (1280u32, 720u32);
+    // (frame, in place, QP) of each try, and the frame refused in place of frame 11.
+    let tries: Vec<(u64, bool, u32)> = vec![
+        (0, false, 22),
+        (0, true, 24),
+        (1, false, 22),
+        (2, false, 22),
+        (3, false, 22),
+        (4, false, 22),
+        (5, false, 22),
+        (5, true, 24),
+        (5, true, 26),
+        (6, false, 22),
+        (7, false, 22),
+        (8, false, 22),
+        (9, false, 22),
+        (9, true, 24),
+        (10, false, 22),
+        (11, false, 22),
+        (12, true, 22),
+        (12, false, 22),
+        (13, false, 22),
+    ];
+    for entry in &entries {
+        let caps = encode_caps(entry, &supports);
+        assert_ne!(caps.flags & RGFX_VIDEO_ENCODE_CAP_IN_PLACE, 0, "{entry:?}");
+        for bit in (0..32)
+            .map(|b| 1u32 << b)
+            .filter(|b| entry.profiles & b != 0)
+        {
+            let what = format!("codec {} profile {bit:#x}", entry.codec);
+            let s = settings(entry.codec, bit, width, height);
+            let encoder = NvencHostEncoder::<FakePlatform>::new(
+                &gpu,
+                entry.codec,
+                &supports,
+                entry,
+                &caps,
+                Err("the fake's buffers export nothing".to_owned()),
+            );
+            let session = HostEncodeSession::<FakePlatform>::new(
+                &p.device(),
+                entry.codec,
+                "NVENC",
+                Box::new(encoder),
+            )
+            .expect("a session");
+            let event = match session.event() {
+                EventRef::Shared(event) => event,
+                EventRef::Event(_) => panic!("a plain event"),
+            };
+            let wide = s.format == RGFX_VIDEO_FORMAT_P010;
+            let row = width as usize * if wide { 2 } else { 1 };
+            let pitch = row.next_multiple_of(256);
+            let chroma_at = pitch * height as usize;
+            let len = (chroma_at + pitch * height as usize / 2) as u64;
+            let buffer = |len| {
+                (p.device()
+                    .new_buffer_of_length(OnFault::Return, len, SHARED))
+                .expect("no raise")
+                .expect("a buffer")
+            };
+            let source = buffer(len);
+            let (bitstream, result) = (buffer(4 << 20), buffer(64));
+            let plane = |offset, rows| VideoPlane {
+                buffer: &source,
+                offset,
+                bytes_per_row: pitch as u64,
+                row_bytes: row as u64,
+                width: u64::from(width),
+                height: rows,
+                cached: false,
+                pages: None,
+                cache: None,
+                rows_room: None,
+                #[cfg(unix)]
+                surface: None,
+            };
+            let mut qp = None;
+            // The last try of each frame: its access unit.
+            let mut stream: Vec<(u64, Vec<u8>)> = Vec::new();
+            for (n, &(index, in_place, at)) in tries.iter().enumerate() {
+                write_frame(&source, &s, pitch, chroma_at, index as usize);
+                let changed = qp != Some(at);
+                qp = Some(at);
+                let encode = VideoEncode {
+                    luma: plane(0, u64::from(height)),
+                    chroma: plane(chroma_at as u64, u64::from(height / 2)),
+                    bitstream: &bitstream,
+                    bitstream_offset: 0,
+                    bitstream_capacity: 4 << 20,
+                    result: &result,
+                    result_offset: 0,
+                    frame_index: index,
+                    force_keyframe: false,
+                    in_place,
+                    settings: changed.then_some(RgfxVideoEncodeSettings {
+                        qp_i: at,
+                        qp_p: at,
+                        ..s
+                    }),
+                };
+                let value = session
+                    .encode(&encode)
+                    .expect("an encode the session takes");
+                assert!(
+                    event.wait_until_signaled_value(value, 10_000),
+                    "{what} try {n}"
+                );
+                // SAFETY: the fake's Shared buffers hold their bytes, which the session wrote
+                // before its signal and writes no more until the next encode.
+                let (result_bytes, au) = unsafe {
+                    (
+                        std::slice::from_raw_parts(result.contents().as_ptr::<u8>(), 32),
+                        std::slice::from_raw_parts(bitstream.contents().as_ptr::<u8>(), 4 << 20),
+                    )
+                };
+                let r = RgfxVideoEncodeResult::read_from_bytes(result_bytes).expect("a result");
+                let what = format!("{what} try {n}: {r:?}");
+                if index == 12 && in_place {
+                    // Refused: the guest has dropped frame 11, which it asked to replace, and
+                    // frame 12 is coded from NVENC's state before it.
+                    assert_ne!(r.status, RGFX_VIDEO_ENCODE_OK, "{what}");
+                    assert_eq!(stream.pop().map(|(index, _)| index), Some(11), "{what}");
+                    continue;
+                }
+                assert_eq!(r.status, RGFX_VIDEO_ENCODE_OK, "{what}");
+                assert_eq!(r.frame_index, index, "{what}");
+                let key = index == 0;
+                assert_eq!(
+                    r.picture_type,
+                    if key {
+                        RGFX_VIDEO_PICTURE_I
+                    } else {
+                        RGFX_VIDEO_PICTURE_P
+                    },
+                    "{what}"
+                );
+                let au = au[..r.bitstream_size as usize].to_vec();
+                if in_place {
+                    let last = stream.last_mut().expect("a frame before");
+                    assert_eq!(last.0, index, "{what}");
+                    last.1 = au;
+                } else {
+                    stream.push((index, au));
+                }
+            }
+            drop(session);
+            assert_eq!(stream.len(), 13, "{what}");
+            let mut decoder = AnnexBDecoder::new(
+                &gpu,
+                if entry.codec == RGFX_VIDEO_CODEC_H264 {
+                    AnnexBCodec::H264
+                } else {
+                    AnnexBCodec::Hevc
+                },
+                &runtime,
+            );
+            let sets = parameter_set_types(entry.codec);
+            let mut parameter_sets = Vec::new();
+            for (_, unit) in nal_units(entry.codec, &stream[0].1)
+                .iter()
+                .filter(|(t, _)| sets.contains(t))
+            {
+                parameter_sets.extend_from_slice(&START_CODE);
+                parameter_sets.extend_from_slice(unit);
+            }
+            decoder
+                .parameter_sets(&parameter_sets)
+                .expect("the parameter sets");
+            let mut least = f64::INFINITY;
+            for (index, au) in &stream {
+                let picture = (decoder.decode(au)).expect("a decode").expect("a picture");
+                let read = picture.read_back((width, height)).expect("a read back");
+                for (plane, read) in read.planes().iter().enumerate() {
+                    let rows = read.rows as usize;
+                    let db = psnr(
+                        read.bytes,
+                        read.bytes_per_row,
+                        plane,
+                        *index as usize,
+                        width as usize,
+                        rows,
+                        wide,
+                    );
+                    least = least.min(db);
+                    assert!(
+                        db >= LEAST_PSNR,
+                        "{what} frame {index}: plane {plane} at {db:.1} dB"
+                    );
+                }
+            }
+            eprintln!("{what}: the least PSNR of a plane {least:.1} dB");
         }
     }
 }
@@ -735,6 +1044,7 @@ fn frames_filled_by_the_gpu_encode_as_uploaded<P: Platform>(
                         result_offset: 0,
                         frame_index: n,
                         force_keyframe: n == 6,
+                        in_place: false,
                         settings: (n == 0).then_some(s),
                     };
                     let value = session

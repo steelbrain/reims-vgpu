@@ -27,6 +27,7 @@ fn support(profile: EncodeProfile, max_width: u32, max_height: u32) -> EncodePro
         constant_bit_rate: true,
         variable_bit_rate: true,
         max_references: 7,
+        in_place: false,
     }
 }
 

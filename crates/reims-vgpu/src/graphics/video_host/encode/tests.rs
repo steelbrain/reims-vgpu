@@ -57,9 +57,9 @@ fn settings() -> RgfxVideoEncodeSettings {
 /// What the encoder and its frames saw, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Seen {
-    /// A frame taken: its index, whether it carried settings, and whether it was forced a
-    /// keyframe.
-    Took(u64, bool, bool),
+    /// A frame taken: its index, whether it carried settings, whether it was forced a keyframe,
+    /// and whether it is coded in place of the last.
+    Took(u64, bool, bool, bool),
     /// A frame finished: its index, its source's first luma byte and chroma byte, and the
     /// capacity it had.
     Finished(u64, u8, u8, usize),
@@ -96,6 +96,7 @@ impl HostEncoder<P> for Encoder {
             frame.frame_index,
             frame.settings.is_some(),
             frame.force_keyframe,
+            frame.in_place,
         ));
         let answer = self.answers.pop_front().unwrap_or(Answer::Unit(10));
         Ok(Box::new(Frame {
@@ -199,6 +200,7 @@ fn encode<'a>(
         result_offset: 1024,
         frame_index: index,
         force_keyframe: false,
+        in_place: false,
         settings,
     }
 }
@@ -241,7 +243,14 @@ fn an_encode_writes_its_access_unit_then_its_result_then_signals() {
         1
     );
     assert_eq!(s.encode(&encode(&src, &second, 1, None)).unwrap(), 2);
-    assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
+    // Frame 1 again, in place of the last: the backend is told so.
+    let again = buffer(&p, 4096, SHARED);
+    let in_place = VideoEncode {
+        in_place: true,
+        ..encode(&src, &again, 1, None)
+    };
+    assert_eq!(s.encode(&in_place).unwrap(), 3);
+    assert!(event_of(&s).wait_until_signaled_value(3, 10_000));
     let b = bytes(&first);
     assert!(b[..256].iter().all(|&x| x == UNTOUCHED));
     assert!(b[256..276].iter().all(|&x| x == 0));
@@ -270,12 +279,17 @@ fn an_encode_writes_its_access_unit_then_its_result_then_signals() {
         (log.lock().iter().cloned()).partition(|seen| matches!(seen, Seen::Took(..)));
     assert_eq!(
         took,
-        [Seen::Took(0, true, false), Seen::Took(1, false, false)]
+        [
+            Seen::Took(0, true, false, false),
+            Seen::Took(1, false, false, false),
+            Seen::Took(1, false, false, true),
+        ]
     );
     assert_eq!(
         finished,
         [
             Seen::Finished(0, 0x11, 0x22, 512),
+            Seen::Finished(1, 0x11, 0x22, 512),
             Seen::Finished(1, 0x11, 0x22, 512),
         ]
     );

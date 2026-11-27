@@ -51,7 +51,7 @@ pub use external::ImportedBuffer;
 pub use nvdec::{ChromaFormat, DecodeCapabilities, NvdecCodec, SurfaceFormat, decode_capabilities};
 pub use nvenc::encoder::{
     Bitstream, DeviceFrame, EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl,
-    NvencEncoder, Packet, PictureType, RawFrame, Tuning, encode_profiles,
+    NvencEncoder, Packet, PictureType, RawFrame, Tuning, codes_in_place, encode_profiles,
 };
 pub use nvenc::max_api_version;
 pub use probe::{EncodeCodecReport, EncoderReport, encoder_report};

@@ -10,6 +10,14 @@
 //! forced where the caller asks for one; NVENC places the rest by its GOP
 //! length. B pictures are never references here, so a reference is encoded
 //! at most one frame ahead of its display order.
+//!
+//! A session made to code frames in place ([`NvencEncoder::new_in_place`])
+//! codes each frame without advancing NVENC's state, which a state buffer
+//! keeps as it is after the frame, and advances it to that state
+//! (`nvEncRestoreEncoderState`) only as the next frame comes, or the stream
+//! ends ([`NvencEncoder::keep`]). Until then the frame can be coded again in
+//! its place ([`NvencEncoder::encode_in_place`]), from NVENC's state before
+//! it: the same place in the stream, at the rate control's settings then.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -276,11 +284,33 @@ pub struct NvencEncoder {
     /// The registered input each slot's pending frame reads, if it is
     /// device memory.
     slot_inputs: Vec<Option<Buffer>>,
+    /// Whether each frame is coded without advancing NVENC's state (module
+    /// doc).
+    holds: bool,
+    /// The last frame coded so, while NVENC's state is the one before it.
+    unkept: Option<Unkept>,
+    /// The next frame is coded as an IDR picture: NVENC's state is not the
+    /// one after the last frame the caller has.
+    restart: bool,
     session: Session,
     /// The device memory registered as input. After the session, which
     /// unregisters it as it drops, so that the imports outlive their
     /// registrations.
     device_inputs: Vec<DeviceInput>,
+}
+
+/// The last frame a session that codes frames in place coded (module doc):
+/// what coding it again takes.
+#[derive(Clone, Copy, Debug)]
+struct Unkept {
+    /// The caller's index for it.
+    index: u64,
+    /// Its `frameIdx`.
+    frame_idx: u32,
+    /// Whether it was asked to be an IDR picture.
+    idr: bool,
+    /// What NVENC coded it as.
+    picture_type: PictureType,
 }
 
 /// Ours: input and bitstream buffers beyond what NVENC holds, so that a
@@ -290,6 +320,22 @@ const EXTRA_SLOTS: usize = 3;
 impl NvencEncoder {
     /// Opens a session on `gpu` and configures it for `params`.
     pub fn new(gpu: Arc<Gpu>, params: &EncodeParams) -> Result<Self, Error> {
+        Self::open(gpu, params, false)
+    }
+
+    /// [`Self::new`] of a session that codes frames in place (module doc),
+    /// with a state buffer: one without B pictures. `Err` where NVENC
+    /// refuses the state buffer.
+    pub fn new_in_place(gpu: Arc<Gpu>, params: &EncodeParams) -> Result<Self, Error> {
+        if params.b_frames > 0 {
+            return Err(Error::Unsupported(
+                "frames coded in place in a stream with B pictures".to_owned(),
+            ));
+        }
+        Self::open(gpu, params, true)
+    }
+
+    fn open(gpu: Arc<Gpu>, params: &EncodeParams, holds: bool) -> Result<Self, Error> {
         let mut session = Session::open(gpu)?;
         let codec = params.profile.codec_guid();
         check_params(&session, params, codec)?;
@@ -318,6 +364,7 @@ impl NvencEncoder {
         init.maxEncodeWidth = params.width;
         init.maxEncodeHeight = params.height;
         init.tuningInfo = tuning;
+        init.numStateBuffers = u32::from(holds);
         session.initialize(init, config)?;
         let mut encoder = Self {
             params: params.clone(),
@@ -328,6 +375,9 @@ impl NvencEncoder {
             submitted: 0,
             sequence_parameters: Vec::new(),
             slot_inputs: Vec::new(),
+            holds,
+            unkept: None,
+            restart: false,
             session,
             device_inputs: Vec::new(),
         };
@@ -384,6 +434,105 @@ impl NvencEncoder {
         self.submit(slot_index, input, pitch, frame.index, frame.force_idr)
     }
 
+    /// [`Self::encode`] of `frame` in place of the last frame coded, whose
+    /// packet the caller drops (module doc): the same frame again, its index
+    /// the last one's, coded from NVENC's state before the last one, at the
+    /// rate control's settings now. Its one packet comes out at once. `Err`
+    /// is a frame not taken: where the session codes no frame in place or
+    /// holds none to code again, the index is not the last frame's, or it
+    /// asks an IDR picture in place of a frame that is not one, the last
+    /// frame is gone with it, and the next frame is coded from NVENC's state
+    /// before it; where the frame does not reach NVENC, or NVENC does not
+    /// take it, the last frame stays, to code again in place.
+    pub fn encode_in_place(&mut self, frame: &RawFrame<'_>) -> Result<Vec<Bitstream>, Error> {
+        let unkept = self.unkept_for(frame.index, frame.force_idr)?;
+        let slot_index = self.free_slot()?;
+        let input = self.slots[slot_index].input;
+        let pitch = self.session.upload(
+            input,
+            frame.luma,
+            frame.chroma,
+            self.row_bytes(),
+            self.rows(),
+        )?;
+        self.code(
+            slot_index,
+            input,
+            pitch,
+            frame.index,
+            unkept.idr || frame.force_idr,
+            unkept.frame_idx,
+        )
+    }
+
+    /// [`Self::encode_in_place`] of a frame NVENC reads where another API's
+    /// GPU wrote it, as [`Self::encode_device`] takes it.
+    pub fn encode_device_in_place(
+        &mut self,
+        frame: &DeviceFrame<'_>,
+    ) -> Result<Vec<Bitstream>, Error> {
+        let unkept = self.unkept_for(frame.index, frame.force_idr)?;
+        let (slot_index, registered) = self.device_slot(frame)?;
+        self.code(
+            slot_index,
+            registered,
+            frame.pitch,
+            frame.index,
+            unkept.idr || frame.force_idr,
+            unkept.frame_idx,
+        )
+    }
+
+    /// The last frame coded, which a frame of `index` is coded in place of,
+    /// asking an IDR picture where `force_idr` ([`Self::encode_in_place`]).
+    fn unkept_for(&mut self, index: u64, force_idr: bool) -> Result<Unkept, Error> {
+        let why = match self.unkept {
+            Some(unkept) if unkept.index != index => {
+                format!("frame {index} coded in place of frame {}", unkept.index)
+            }
+            Some(unkept) if force_idr && unkept.picture_type != PictureType::Idr => {
+                "an IDR picture coded in place of a frame that is not one".to_owned()
+            }
+            Some(unkept) => return Ok(unkept),
+            None if !self.holds => {
+                "a frame coded in place in a session without a state buffer".into()
+            }
+            None => "a frame coded in place of none".into(),
+        };
+        self.unkept = None;
+        Err(Error::Unsupported(why))
+    }
+
+    /// Takes the last frame coded as the stream's (module doc): NVENC's state
+    /// advances to the one after it. `Err` where NVENC refuses: then the
+    /// next frame is coded as an IDR picture.
+    pub fn keep(&mut self) -> Result<(), Error> {
+        if self.unkept.take().is_none() {
+            return Ok(());
+        }
+        self.submitted = self.submitted.wrapping_add(1);
+        self.session
+            .restore_state()
+            .inspect_err(|_| self.restart = true)
+    }
+
+    /// [`Self::keep`] as a frame or the end comes, which go on where NVENC
+    /// refuses, with a warning.
+    fn keep_going(&mut self) {
+        if let Err(e) = self.keep() {
+            log::warn!(
+                kind:% = e;
+                "NVENC's state after a frame: {e}; the next frame is an IDR picture"
+            );
+        }
+    }
+
+    /// Drops the last frame coded, whose packet the caller dropped: the next
+    /// frame is coded from NVENC's state before it.
+    pub fn drop_last(&mut self) {
+        self.unkept = None;
+    }
+
     /// Encodes one frame NVENC reads where another API's GPU wrote it
     /// ([`DeviceFrame`]), as [`Self::encode`] encodes one it copies: the
     /// memory is registered with the session on its first frame at its
@@ -393,6 +542,19 @@ impl NvencEncoder {
     /// not take: memory of another GPU, too short or at a pitch NVENC does
     /// not take, or still read for a frame not out yet.
     pub fn encode_device(&mut self, frame: &DeviceFrame<'_>) -> Result<Vec<Bitstream>, Error> {
+        let (slot_index, registered) = self.device_slot(frame)?;
+        self.submit(
+            slot_index,
+            registered,
+            frame.pitch,
+            frame.index,
+            frame.force_idr,
+        )
+    }
+
+    /// The slot `frame` goes in, and its memory's registration
+    /// ([`Self::encode_device`]).
+    fn device_slot(&mut self, frame: &DeviceFrame<'_>) -> Result<(usize, Buffer), Error> {
         let registered = self.device_input(frame.input, frame.pitch)?;
         let in_flight =
             (self.pending.iter()).any(|&slot| self.slot_inputs[slot] == Some(registered));
@@ -403,13 +565,7 @@ impl NvencEncoder {
         }
         let slot_index = self.free_slot()?;
         self.slot_inputs[slot_index] = Some(registered);
-        self.submit(
-            slot_index,
-            registered,
-            frame.pitch,
-            frame.index,
-            frame.force_idr,
-        )
+        Ok((slot_index, registered))
     }
 
     /// The bytes of a frame's row: its width in samples of its bit depth.
@@ -485,7 +641,8 @@ impl NvencEncoder {
     }
 
     /// Submits the frame in `input` at `pitch` into `slot_index`'s
-    /// bitstream buffer, and reads what comes out ([`Self::encode`]).
+    /// bitstream buffer, after the last frame, and reads what comes out
+    /// ([`Self::encode`]).
     fn submit(
         &mut self,
         slot_index: usize,
@@ -494,13 +651,38 @@ impl NvencEncoder {
         index: u64,
         force_idr: bool,
     ) -> Result<Vec<Bitstream>, Error> {
+        self.keep_going();
+        let frame_idx = self.submitted;
+        self.code(
+            slot_index,
+            input,
+            pitch,
+            index,
+            force_idr || self.restart,
+            frame_idx,
+        )
+    }
+
+    /// Codes the frame in `input` at `pitch` into `slot_index`'s bitstream
+    /// buffer as `frame_idx`, and reads what comes out; in a session that
+    /// codes frames in place, without advancing NVENC's state (module doc).
+    fn code(
+        &mut self,
+        slot_index: usize,
+        input: Buffer,
+        pitch: u32,
+        index: u64,
+        idr: bool,
+        frame_idx: u32,
+    ) -> Result<Vec<Bitstream>, Error> {
         let status = self.session.encode_picture(Submission::Frame {
             input,
             output: self.slots[slot_index].output,
             pitch,
-            index: self.submitted,
+            index: frame_idx,
             timestamp: index,
-            idr: force_idr,
+            idr,
+            unadvanced: self.holds,
         });
         let status = match status {
             Ok(status) => status,
@@ -509,18 +691,34 @@ impl NvencEncoder {
                 return Err(e);
             }
         };
-        self.submitted = self.submitted.wrapping_add(1);
+        if !self.holds {
+            self.submitted = self.submitted.wrapping_add(1);
+        }
+        self.restart = false;
         self.next = (slot_index + 1) % self.slots.len();
         self.pending.push_back(slot_index);
         if status == ffi::NV_ENC_ERR_NEED_MORE_INPUT {
             return Ok(Vec::new());
         }
-        Ok(self.drain())
+        let bitstreams = self.drain();
+        if self.holds
+            && let [Ok(packet)] = bitstreams.as_slice()
+        {
+            self.unkept = Some(Unkept {
+                index,
+                frame_idx,
+                idr,
+                picture_type: packet.picture_type,
+            });
+        }
+        Ok(bitstreams)
     }
 
-    /// Ends the stream: every frame NVENC still holds comes out, each with
-    /// its own result. `Err` is an end NVENC did not take.
+    /// Ends the stream: the last frame coded is the stream's
+    /// ([`Self::keep`]), and every frame NVENC still holds comes out, each
+    /// with its own result. `Err` is an end NVENC did not take.
     pub fn flush(&mut self) -> Result<Vec<Bitstream>, Error> {
+        self.keep_going();
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
@@ -621,6 +819,11 @@ pub struct EncodeProfileSupport {
     /// (`NV_ENC_NUM_REF_FRAMES_7`), where NVENC takes several
     /// (`NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES`); 1 where it does not.
     pub max_references: u32,
+    /// Whether NVENC says it codes a frame without advancing its state
+    /// (`NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE`), which a session that codes
+    /// frames in place takes ([`NvencEncoder::new_in_place`],
+    /// [`codes_in_place`]); false where it does not answer.
+    pub in_place: bool,
 }
 
 /// The most reference frames `numRefL0` names (`NV_ENC_NUM_REF_FRAMES_7`).
@@ -674,9 +877,74 @@ pub fn encode_profiles(gpu: Arc<Gpu>) -> Result<Vec<EncodeProfileSupport>, Error
             } else {
                 1
             },
+            in_place: cap(ffi::caps::DISABLE_ENC_STATE_ADVANCE).is_ok_and(|v| v != 0),
         });
     }
     Ok(supported)
+}
+
+/// Whether NVENC on `gpu` codes frames of `profile` in place: a session of
+/// it at `width` by `height` at a constant QP, with a state buffer
+/// ([`NvencEncoder::new_in_place`]), codes a frame, the frame again in its
+/// place at another QP, and a frame after it, each one access unit. `Err`,
+/// with why, where it does not.
+pub fn codes_in_place(
+    gpu: Arc<Gpu>,
+    profile: EncodeProfile,
+    width: u32,
+    height: u32,
+) -> Result<(), Error> {
+    let at_qp = |qp| EncodeRateControl::ConstantQp {
+        intra: qp,
+        predicted: qp,
+        bidirectional: qp,
+    };
+    let params = EncodeParams {
+        profile,
+        width,
+        height,
+        frame_rate: (30, 1),
+        rate_control: at_qp(30),
+        buffer_milliseconds: 1000,
+        gop_length: None,
+        b_frames: 0,
+        level: None,
+        cabac: None,
+        full_range: false,
+        colour: None,
+        display_aspect: None,
+        preset: 1,
+        tuning: Tuning::LowLatency,
+    };
+    let mut encoder = NvencEncoder::new_in_place(gpu, &params)?;
+    let sample = if profile.bit_depth() > 8 { 2 } else { 1 };
+    let row = usize::try_from(width).unwrap_or(0) * sample;
+    let rows = usize::try_from(height).unwrap_or(0);
+    let luma = vec![0u8; row * rows];
+    let chroma = vec![0u8; row * rows.div_ceil(2)];
+    let frame = |index, force_idr| RawFrame {
+        luma: (&luma, row),
+        chroma: (&chroma, row),
+        index,
+        force_idr,
+    };
+    let one = |bitstreams: Vec<Bitstream>, index: u64| -> Result<(), Error> {
+        match bitstreams.as_slice() {
+            [Ok(packet)] if packet.index == index => Ok(()),
+            [Err(e)] => Err(e.clone()),
+            other => Err(Error::Unsupported(format!(
+                "{} access units for frame {index}",
+                other.len()
+            ))),
+        }
+    };
+    one(encoder.encode(&frame(0, true))?, 0)?;
+    encoder.reconfigure(at_qp(33), params.frame_rate)?;
+    one(encoder.encode_in_place(&frame(0, true))?, 0)?;
+    encoder.keep()?;
+    encoder.reconfigure(at_qp(30), params.frame_rate)?;
+    one(encoder.encode(&frame(1, false))?, 1)?;
+    encoder.keep()
 }
 
 impl Drop for NvencEncoder {
@@ -1023,6 +1291,7 @@ pub(crate) mod tests {
                 index: n,
                 timestamp: u64::from(n),
                 idr: (n / 3) % 2 == 0,
+                unadvanced: false,
             })?;
             let submit = StdRuntime.elapsed_since(submitting).as_micros();
             let handle = session.output(output, &[BufferKind::Bitstream])?;

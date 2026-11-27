@@ -73,6 +73,7 @@ pub(crate) const NV_ENC_MAP_INPUT_RESOURCE_VER: u32 = struct_version(4);
 pub(crate) const NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER: u32 = struct_version(1);
 pub(crate) const NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER: u32 = struct_version(1);
 pub(crate) const NV_ENCODE_API_FUNCTION_LIST_VER: u32 = struct_version(2);
+pub(crate) const NV_ENC_RESTORE_ENCODER_STATE_PARAMS_VER: u32 = struct_version(2);
 
 /// `NVENC_INFINITE_GOPLENGTH`.
 pub(crate) const NVENC_INFINITE_GOPLENGTH: u32 = 0xffff_ffff;
@@ -142,6 +143,11 @@ pub(crate) const NV_ENC_PIC_TYPE_NONREF_P: NV_ENC_PIC_TYPE = 0x7;
 pub(crate) const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x2;
 pub(crate) const NV_ENC_PIC_FLAG_OUTPUT_SPSPPS: u32 = 0x4;
 pub(crate) const NV_ENC_PIC_FLAG_EOS: u32 = 0x8;
+pub(crate) const NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE: u32 = 0x10;
+
+/// `NV_ENC_STATE_RESTORE_TYPE`.
+pub(crate) type NV_ENC_STATE_RESTORE_TYPE = c_int;
+pub(crate) const NV_ENC_STATE_RESTORE_FULL: NV_ENC_STATE_RESTORE_TYPE = 0x01;
 
 pub(crate) const NV_ENC_H264_ENTROPY_CODING_MODE_CABAC: NvEncEnum = 0x1;
 pub(crate) const NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC: NvEncEnum = 0x2;
@@ -165,6 +171,7 @@ pub(crate) mod caps {
     pub(crate) const WIDTH_MIN: NV_ENC_CAPS = 45;
     pub(crate) const HEIGHT_MIN: NV_ENC_CAPS = 46;
     pub(crate) const SUPPORT_MULTIPLE_REF_FRAMES: NV_ENC_CAPS = 47;
+    pub(crate) const DISABLE_ENC_STATE_ADVANCE: NV_ENC_CAPS = 51;
 }
 
 /// `NV_ENC_CAPS`' names without their `NV_ENC_CAPS_` prefix, by value,
@@ -719,6 +726,20 @@ pub(crate) struct NV_ENC_PIC_PARAMS {
     pub(crate) reserved6: [*mut c_void; 57],
 }
 
+/// `NV_ENC_RESTORE_ENCODER_STATE_PARAMS`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NV_ENC_RESTORE_ENCODER_STATE_PARAMS {
+    pub(crate) version: u32,
+    pub(crate) bufferIdx: u32,
+    pub(crate) state: NV_ENC_STATE_RESTORE_TYPE,
+    pub(crate) reserved: u32,
+    pub(crate) outputBitstream: *mut c_void,
+    pub(crate) completionEvent: *mut c_void,
+    pub(crate) reserved1: [u32; 64],
+    pub(crate) reserved2: [*mut c_void; 64],
+}
+
 /// `NV_ENC_LOCK_BITSTREAM`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -974,7 +995,8 @@ function_list! {
             *mut NV_ENC_INITIALIZE_PARAMS,
             *mut NV_ENC_SEQUENCE_PARAM_PAYLOAD,
         ) -> NVENCSTATUS;
-        nvEncRestoreEncoderState: fn(Encoder, *mut c_void) -> NVENCSTATUS;
+        nvEncRestoreEncoderState: fn(Encoder, *mut NV_ENC_RESTORE_ENCODER_STATE_PARAMS)
+            -> NVENCSTATUS;
         nvEncLookaheadPicture: fn(Encoder, *mut c_void) -> NVENCSTATUS;
     }
     reserved2: 275
@@ -998,6 +1020,8 @@ unsafe impl Zeroed for NV_ENC_CAPS_PARAM {}
 unsafe impl Zeroed for NV_ENC_CREATE_INPUT_BUFFER {}
 // SAFETY: as above.
 unsafe impl Zeroed for NV_ENC_CREATE_BITSTREAM_BUFFER {}
+// SAFETY: as above.
+unsafe impl Zeroed for NV_ENC_RESTORE_ENCODER_STATE_PARAMS {}
 // SAFETY: as above.
 unsafe impl Zeroed for NV_ENC_CONFIG {}
 // SAFETY: as above.

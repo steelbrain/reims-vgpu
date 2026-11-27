@@ -294,7 +294,12 @@ impl<P: Platform> NvGuestEncoder<P> {
             let sample = u32::try_from(sample).unwrap_or(0);
             let [luma, chroma] = buffer_planes(buffer, &planes, size, sample);
             let filled = (self.fills)
-                .encode_filled(&mut self.encoder, [&luma, &chroma], size, index, force_idr)
+                .encode_filled(
+                    &mut self.encoder,
+                    [&luma, &chroma],
+                    size,
+                    (index, force_idr, false),
+                )
                 .map_err(|error| VideoError::Malfunction(error.to_string()))?;
             if let Some(bitstreams) = filled {
                 return Ok(bitstreams);

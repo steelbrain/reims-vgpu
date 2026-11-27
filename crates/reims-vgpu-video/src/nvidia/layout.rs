@@ -603,6 +603,11 @@ fn nvenc_checks(checks: &mut Checks) {
         diffPicNumHint, alphaBuffer, meExternalSbHints, meSbHintsCount, stateBufferIdx,
         outputReconBuffer, reserved3, reserved6,
     });
+    layout!(checks, enc::NV_ENC_RESTORE_ENCODER_STATE_PARAMS,
+        "NV_ENC_RESTORE_ENCODER_STATE_PARAMS" {
+        version, bufferIdx, state, reserved, outputBitstream, completionEvent, reserved1,
+        reserved2,
+    });
     layout!(checks, enc::NV_ENC_LOCK_BITSTREAM, "NV_ENC_LOCK_BITSTREAM" {
         version, outputBitstream, sliceOffsets, frameIdx, hwEncodeStatus, numSlices,
         bitstreamSizeInBytes, outputTimeStamp, outputDuration, bitstreamBufferPtr, pictureType,
@@ -700,6 +705,10 @@ fn nvenc_checks(checks: &mut Checks) {
             "NV_ENCODE_API_FUNCTION_LIST_VER",
             enc::NV_ENCODE_API_FUNCTION_LIST_VER,
         ),
+        (
+            "NV_ENC_RESTORE_ENCODER_STATE_PARAMS_VER",
+            enc::NV_ENC_RESTORE_ENCODER_STATE_PARAMS_VER,
+        ),
         ("NVENC_INFINITE_GOPLENGTH", enc::NVENC_INFINITE_GOPLENGTH),
         ("NV_ENC_PIC_FLAG_FORCEIDR", enc::NV_ENC_PIC_FLAG_FORCEIDR),
         (
@@ -707,6 +716,10 @@ fn nvenc_checks(checks: &mut Checks) {
             enc::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS,
         ),
         ("NV_ENC_PIC_FLAG_EOS", enc::NV_ENC_PIC_FLAG_EOS),
+        (
+            "NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE",
+            enc::NV_ENC_PIC_FLAG_DISABLE_ENC_STATE_ADVANCE,
+        ),
         ("NV_ENC_LEVEL_AUTOSELECT", enc::NV_ENC_LEVEL_AUTOSELECT),
     ] {
         checks.constant(name, value.into());
@@ -785,6 +798,11 @@ fn nvenc_checks(checks: &mut Checks) {
             "NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES",
             enc::caps::SUPPORT_MULTIPLE_REF_FRAMES,
         ),
+        (
+            "NV_ENC_CAPS_DISABLE_ENC_STATE_ADVANCE",
+            enc::caps::DISABLE_ENC_STATE_ADVANCE,
+        ),
+        ("NV_ENC_STATE_RESTORE_FULL", enc::NV_ENC_STATE_RESTORE_FULL),
     ] {
         checks.constant(name, value.into());
     }

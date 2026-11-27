@@ -5130,11 +5130,17 @@ pub struct RgfxVideoEncodeCaps {
     /// The most consecutive B pictures an encode takes
     /// ([`RgfxVideoEncodeSettings::b_frames`](crate::ops::video::RgfxVideoEncodeSettings)).
     pub max_b_frames: u32,
-    /// Zero: reserved for intra refresh and the like.
+    /// `RGFX_VIDEO_ENCODE_CAP_*`: [`RGFX_VIDEO_ENCODE_CAP_IN_PLACE`]. Zero from a host older
+    /// than these.
     pub flags: u32,
     /// Zero.
     pub reserved_0c: u32,
 }
+
+/// [`RgfxVideoEncodeCaps::flags`]: the host codes a frame in place of a session's last one
+/// ([`RGFX_VIDEO_ENCODE_IN_PLACE`](crate::ops::video::RGFX_VIDEO_ENCODE_IN_PLACE)), a session of
+/// no B pictures.
+pub const RGFX_VIDEO_ENCODE_CAP_IN_PLACE: u32 = 1 << 0;
 
 /// What the host's hardware takes of one decode codec beside its [`RgfxVideoCodecCaps`], by the
 /// same index ([`RgfxVideoCaps::decode`]): the bounds of a picture the host refuses, which the
