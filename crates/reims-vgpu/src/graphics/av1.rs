@@ -10,7 +10,10 @@
 //! the guest's output formats (two planes, 10 bits at most) would cut, and High (profile 1) is
 //! 4:4:4, which no arm's AV1 decoder lands; either is refused at its session's start.
 
-use reims_vgpu_video::paravirt::{self, Stream};
+use reims_vgpu_video::paravirt;
+// What the arms decline, where an arm builds: VA-API's on Linux and Windows, NVDEC's on Linux.
+#[cfg(any(target_os = "linux", windows))]
+use reims_vgpu_video::paravirt::Stream;
 
 /// AV1 among the arm's codec numbers (`RGFX_VIDEO_CODEC_*`), as the host's own code numbers it:
 /// far from the device's own numbers, and never written to the guest.
@@ -38,6 +41,7 @@ pub struct GuestAv1 {
 
 impl GuestAv1 {
     /// The codec module's limits of the arm's AV1 decoder.
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn limits(self) -> reims_vgpu_video::codec::av1::Limits {
         reims_vgpu_video::codec::av1::Limits {
             max_width: self.max_width,
@@ -61,6 +65,7 @@ pub(crate) fn vt_decoder() -> paravirt::Decoder {
 /// takes (Main, 4:2:0) of a depth or a size past the arm's; `None` where it decodes them. A
 /// frame the hardware fails, such as NVDEC's of a superres sequence, fails to the guest where
 /// it fails (`graphics::nvidia`).
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn declines(name: &str, av1: Option<GuestAv1>, stream: &Stream) -> Option<String> {
     let Some(av1) = av1 else {
         return Some(format!("{name} decodes no AV1"));
@@ -99,6 +104,7 @@ pub(crate) fn declines(name: &str, av1: Option<GuestAv1>, stream: &Stream) -> Op
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", windows))]
     fn stream(bits: u8, chroma: u8, width: u32, height: u32) -> Stream {
         Stream {
             codec: paravirt::Codec::Av1,
@@ -112,6 +118,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", windows))]
     const ARM: GuestAv1 = GuestAv1 {
         max_width: 8192,
         max_height: 4352,
@@ -128,6 +135,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", windows))]
     fn a_stream_past_the_arms_depth_size_or_subsampling_is_declined() {
         assert_eq!(declines("A", Some(ARM), &stream(8, 1, 1920, 1080)), None);
         assert_eq!(declines("A", Some(ARM), &stream(10, 1, 8192, 4352)), None);

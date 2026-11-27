@@ -39,7 +39,7 @@ impl Av1Decoder {
 
     /// Has the driver apply grain of the parameters `alter` makes of each frame's (the codec
     /// decoder's `alter_film_grain`), for the card tests.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn alter_film_grain(
         &mut self,
         alter: fn(&mut crate::codec::av1::frame::FilmGrainParams),

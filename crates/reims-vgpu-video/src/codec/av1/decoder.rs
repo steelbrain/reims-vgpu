@@ -206,7 +206,7 @@ impl<A: Accelerator> Decoder<A> {
     /// the accelerator is handed them, the slots keeping what the stream coded: the card tests'
     /// decodes of a stream without its grain, so that what is output is the decoded frame
     /// alone, and with grain of other parameters, which their grain check must refuse.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn alter_film_grain(&mut self, alter: fn(&mut frame::FilmGrainParams)) {
         self.film_grain = Some(alter);
     }

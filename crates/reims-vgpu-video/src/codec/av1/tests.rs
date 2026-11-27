@@ -10,11 +10,12 @@
 //! header and one key frame, as ffmpeg's libaom encoder made it (`-still-picture 1`) and its
 //! demux copied it out of the AVIF, byte for byte; its MD5 is libdav1d's decode of the AVIF.
 
-#[cfg(unix)]
+// The card tests' helpers, for the VA-API and NVIDIA modules' card tests, which build on Linux.
+#[cfg(target_os = "linux")]
 mod card;
 mod fuzz;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) use card::{
     CardFrame, NO_GRAIN, ReadFrame, WRONG_GRAIN, card_streams, grain_refused, judge,
 };
@@ -35,7 +36,7 @@ pub(crate) struct Stream {
     pub(crate) md5_without_grain: Option<&'static str>,
     /// Its film grain residual's statistics, where it applies grain: its `.grain` file, from
     /// libdav1d's decode with grain and without (`ReadFrame`, `Residual`).
-    #[cfg_attr(not(unix), expect(dead_code, reason = "read by the card tests alone"))]
+    #[cfg(target_os = "linux")]
     pub(crate) grain: Option<&'static str>,
     /// `UpscaledWidth` and `FrameHeight` of its frames.
     pub(crate) size: (u32, u32),
@@ -51,6 +52,7 @@ macro_rules! stream {
             ivf: include_bytes!(concat!("tests/streams/", $name, ".ivf")),
             md5: include_str!(concat!("tests/streams/", $name, ".md5")),
             md5_without_grain: None,
+            #[cfg(target_os = "linux")]
             grain: None,
             size: $size,
             bit_depth: $depth,
@@ -65,6 +67,7 @@ pub(crate) const STREAMS: &[Stream] = &[
     stream!("aom-tiles", (640, 360), 8, true),
     Stream {
         md5_without_grain: Some(include_str!("tests/streams/aom-grain.nograin.md5")),
+        #[cfg(target_os = "linux")]
         grain: Some(include_str!("tests/streams/aom-grain.grain")),
         ..stream!("aom-grain", (352, 288), 8, true)
     },
