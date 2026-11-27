@@ -149,8 +149,8 @@ impl Slices<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DecoderSpec {
     pub(crate) codec: NvdecCodec,
-    /// 4:2:0, monochrome, which NVDEC writes as 4:2:0, or 4:4:4, which it writes in three
-    /// planes.
+    /// 4:2:0, monochrome, which NVDEC writes as 4:2:0, 4:2:2, which it writes as 4:2:0's
+    /// planes with the chroma as tall as the luma, or 4:4:4, which it writes in three planes.
     pub(crate) chroma: ChromaFormat,
     /// Bits a sample: 8, 10 or 12.
     pub(crate) bit_depth: u32,
@@ -352,15 +352,16 @@ pub(crate) const KEPT_BYTES: u64 = 512 << 20;
 #[cfg(test)]
 pub(crate) static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The bytes of `spec`'s decode surfaces: 4:2:0's, or 4:4:4's three planes, at one byte a
-/// sample, two past 8 bits.
+/// The bytes of `spec`'s decode surfaces: 4:2:0's, 4:2:2's or 4:4:4's samples, at one byte
+/// a sample, two past 8 bits.
 fn surface_bytes(spec: &DecoderSpec) -> u64 {
-    let planes = if spec.chroma == ChromaFormat::Yuv444 {
-        6
-    } else {
-        3
+    // Halves of the luma's samples a picture holds.
+    let halves = match spec.chroma {
+        ChromaFormat::Yuv444 => 6,
+        ChromaFormat::Yuv422 => 4,
+        ChromaFormat::Yuv420 | ChromaFormat::Monochrome => 3,
     };
-    let samples = u64::from(spec.width) * u64::from(spec.height) * planes / 2;
+    let samples = u64::from(spec.width) * u64::from(spec.height) * halves / 2;
     let bytes = if spec.bit_depth > 8 { 2 } else { 1 };
     u64::from(spec.surfaces) * samples * bytes
 }
@@ -478,11 +479,14 @@ impl Decoder {
             )));
         }
         // 8 bits decode into NV12; deeper into P016, whose samples are
-        // P010's for 10 bits: the value in the high bits. 4:4:4 into its
-        // three planes, of 8 bits or of 16 the same way.
+        // P010's for 10 bits: the value in the high bits. 4:2:2 into NV16
+        // and P216, laid out as NV12 and P016 with the chroma as tall as the
+        // luma; 4:4:4 into its three planes, of 8 bits or of 16 the same way.
         let output = match (spec.chroma, spec.bit_depth > 8) {
             (ChromaFormat::Yuv444, false) => SurfaceFormat::Yuv444,
             (ChromaFormat::Yuv444, true) => SurfaceFormat::Yuv444_16Bit,
+            (ChromaFormat::Yuv422, false) => SurfaceFormat::Nv16,
+            (ChromaFormat::Yuv422, true) => SurfaceFormat::P216,
             (_, true) => SurfaceFormat::P016,
             (_, false) => SurfaceFormat::Nv12,
         };
@@ -940,7 +944,8 @@ impl Picture {
         *self.size.lock()
     }
 
-    /// Bytes a sample of the output: 1 for NV12 and 4:4:4's 8 bits, 2 for P016 and 4:4:4's 16.
+    /// Bytes a sample of the output: 1 for NV12, NV16 and 4:4:4's 8 bits, 2 for P016, P216 and
+    /// 4:4:4's 16.
     pub(crate) fn bytes_per_sample(&self) -> usize {
         match self.inner.output {
             SurfaceFormat::P016 | SurfaceFormat::Yuv444_16Bit | SurfaceFormat::P216 => 2,
@@ -948,23 +953,29 @@ impl Picture {
         }
     }
 
-    /// The planes its output has: 2, luma then interleaved chroma (NV12, P016), or 3, luma,
-    /// Cb and Cr, each as large (4:4:4's).
+    /// The planes its output has: 2, luma then interleaved chroma (NV12, P016, NV16, P216),
+    /// or 3, luma, Cb and Cr, each as large (4:4:4's).
     pub(crate) fn plane_count(&self) -> usize {
-        if self.planar() { 3 } else { 2 }
+        if self.chroma() == ChromaFormat::Yuv444 {
+            3
+        } else {
+            2
+        }
     }
 
-    /// Whether its output is 4:4:4's three planes.
-    fn planar(&self) -> bool {
-        matches!(
-            self.inner.output,
-            SurfaceFormat::Yuv444 | SurfaceFormat::Yuv444_16Bit
-        )
+    /// Its output's chroma format: 4:2:0 (NV12, P016), 4:2:2 (NV16, P216) or 4:4:4.
+    pub(crate) fn chroma(&self) -> ChromaFormat {
+        match self.inner.output {
+            SurfaceFormat::Nv12 | SurfaceFormat::P016 => ChromaFormat::Yuv420,
+            SurfaceFormat::Nv16 | SurfaceFormat::P216 => ChromaFormat::Yuv422,
+            SurfaceFormat::Yuv444 | SurfaceFormat::Yuv444_16Bit => ChromaFormat::Yuv444,
+        }
     }
 
     /// Waits for the picture's decode, and copies `crop` of it into the
     /// decoder's staging memory: luma, then chroma (interleaved Cb and Cr,
-    /// half as tall, or 4:4:4's Cb and Cr planes, [`Self::plane_count`]),
+    /// half as tall, or 4:2:2's as tall, or 4:4:4's Cb and Cr planes,
+    /// [`Self::plane_count`]),
     /// each row packed. Every call into the driver a copy
     /// needs is made here: the map, the copies and the unmap, each wait
     /// bounded (module docs). What it returns holds the crop for the CPU's
@@ -1164,7 +1175,7 @@ impl Picture {
             size,
             crop,
             self.bytes_per_sample(),
-            self.planar(),
+            self.chroma(),
         )?;
         let (copies, planned) = plan(&mapped);
         let copied = match copies.pageable.then(|| inner.caller()).flatten() {
@@ -1477,17 +1488,17 @@ impl Mapped {
     /// bytes: the crop cut to the picture, and each plane's rows to the
     /// pitch. A plane follows the one before's rows, their count rounded up
     /// to even, as NVDEC lays a mapped frame out: the chroma after the luma,
-    /// half as tall, where an odd width's last chroma pair covers its last
-    /// column; or, where `planar`, Cb after the luma and Cr after Cb, each
-    /// as large. `Err` is a surface past the address space, which no map
-    /// gives.
+    /// half as tall at 4:2:0 and as tall at 4:2:2 (`chroma`), where an odd
+    /// width's last chroma pair covers its last column; or, at 4:4:4, Cb
+    /// after the luma and Cr after Cb, each as large. `Err` is a surface past
+    /// the address space, which no map gives.
     fn of(
         address: c_ulonglong,
         pitch: u32,
         (width, height): (u32, u32),
         crop: Crop,
         bytes: usize,
-        planar: bool,
+        chroma: ChromaFormat,
     ) -> Result<Self, Error> {
         let plane_at = |n: u64| {
             u64::from(height)
@@ -1511,7 +1522,7 @@ impl Mapped {
         let x_bytes = samples(crop.x);
         let within = |row_bytes: usize| row_bytes.min(pitch.saturating_sub(x_bytes));
         let y = usize::try_from(crop.y).unwrap_or(0);
-        if planar {
+        if chroma == ChromaFormat::Yuv444 {
             let row = within(samples(crop.width));
             return Ok(Self {
                 planes: vec![
@@ -1523,16 +1534,21 @@ impl Mapped {
                 rows: vec![crop.height; 3],
             });
         }
+        let (chroma_y, chroma_rows) = if chroma == ChromaFormat::Yuv422 {
+            (y, crop.height)
+        } else {
+            (y / 2, crop.height.div_ceil(2))
+        };
         Ok(Self {
             planes: vec![
                 (address, pitch, x_bytes, y),
-                (plane_at(1)?, pitch, x_bytes, y / 2),
+                (plane_at(1)?, pitch, x_bytes, chroma_y),
             ],
             row_bytes: vec![
                 within(samples(crop.width)),
                 within(samples(crop.width).next_multiple_of(2 * bytes.max(1))),
             ],
-            rows: vec![crop.height, crop.height.div_ceil(2)],
+            rows: vec![crop.height, chroma_rows],
         })
     }
 }
@@ -1783,13 +1799,27 @@ pub(crate) mod tests {
 
     #[test]
     fn a_mapped_pictures_chroma_follows_its_luma_rows_rounded_to_even() -> Result<(), Error> {
-        let mapped = Mapped::of(0x1000, 2048, (641, 361), crop(0, 0, 641, 361), 1, false)?;
+        let mapped = Mapped::of(
+            0x1000,
+            2048,
+            (641, 361),
+            crop(0, 0, 641, 361),
+            1,
+            ChromaFormat::Yuv420,
+        )?;
         assert_eq!(mapped.planes[0], (0x1000, 2048, 0, 0));
         assert_eq!(mapped.planes[1], (0x1000 + 2048 * 362, 2048, 0, 0));
         // An odd width's last chroma pair covers its last column.
         assert_eq!(mapped.row_bytes, [641, 642]);
         assert_eq!(mapped.rows, [361, 181]);
-        let deep = Mapped::of(0, 4096, (1920, 1080), crop(0, 0, 1920, 1080), 2, false)?;
+        let deep = Mapped::of(
+            0,
+            4096,
+            (1920, 1080),
+            crop(0, 0, 1920, 1080),
+            2,
+            ChromaFormat::Yuv420,
+        )?;
         assert_eq!(deep.planes[1].0, 4096 * 1080);
         assert_eq!(deep.row_bytes, [3840, 3840]);
         Ok(())
@@ -1797,7 +1827,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_mapped_4_4_4_pictures_cb_and_cr_follow_its_luma_each_as_large() -> Result<(), Error> {
-        let mapped = Mapped::of(0x1000, 1024, (513, 361), crop(2, 4, 500, 300), 1, true)?;
+        let mapped = Mapped::of(
+            0x1000,
+            1024,
+            (513, 361),
+            crop(2, 4, 500, 300),
+            1,
+            ChromaFormat::Yuv444,
+        )?;
         assert_eq!(
             mapped.planes,
             [
@@ -1812,18 +1849,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_mapped_4_2_2_pictures_chroma_follows_its_luma_as_tall() -> Result<(), Error> {
+        let mapped = Mapped::of(
+            0x1000,
+            2048,
+            (641, 361),
+            crop(0, 0, 641, 361),
+            1,
+            ChromaFormat::Yuv422,
+        )?;
+        assert_eq!(mapped.planes[0], (0x1000, 2048, 0, 0));
+        assert_eq!(mapped.planes[1], (0x1000 + 2048 * 362, 2048, 0, 0));
+        assert_eq!(mapped.row_bytes, [641, 642]);
+        assert_eq!(mapped.rows, [361, 361]);
+        // A crop from an odd row starts the chroma on that row too.
+        let deep = Mapped::of(
+            0,
+            4096,
+            (1920, 1088),
+            crop(2, 3, 1916, 1080),
+            2,
+            ChromaFormat::Yuv422,
+        )?;
+        assert_eq!(deep.planes[1], (4096 * 1088, 4096, 4, 3));
+        assert_eq!(deep.row_bytes, [3832, 3832]);
+        assert_eq!(deep.rows, [1080, 1080]);
+        Ok(())
+    }
+
+    #[test]
     fn a_crop_is_cut_to_the_picture_and_its_rows_to_the_pitch() -> Result<(), Error> {
         // H.264's 1920x1088 coded picture shown as 1920x1080 from (0, 4).
-        let mapped = Mapped::of(0, 2048, (1920, 1088), crop(0, 4, 1920, 1080), 1, false)?;
+        let mapped = Mapped::of(
+            0,
+            2048,
+            (1920, 1088),
+            crop(0, 4, 1920, 1080),
+            1,
+            ChromaFormat::Yuv420,
+        )?;
         assert_eq!((mapped.planes[0].3, mapped.planes[1].3), (4, 2));
         assert_eq!(mapped.rows, [1080, 540]);
         // A crop past the picture keeps what is in it.
-        let mapped = Mapped::of(0, 64, (64, 32), crop(8, 30, 100, 100), 1, false)?;
+        let mapped = Mapped::of(
+            0,
+            64,
+            (64, 32),
+            crop(8, 30, 100, 100),
+            1,
+            ChromaFormat::Yuv420,
+        )?;
         assert_eq!(mapped.planes[0].2, 8);
         assert_eq!(mapped.rows, [2, 1]);
         assert_eq!(mapped.row_bytes, [56, 56]);
         // A pitch shorter than the rows holds them to it.
-        let mapped = Mapped::of(0, 40, (64, 32), crop(16, 0, 64, 32), 1, false)?;
+        let mapped = Mapped::of(
+            0,
+            40,
+            (64, 32),
+            crop(16, 0, 64, 32),
+            1,
+            ChromaFormat::Yuv420,
+        )?;
         assert_eq!(mapped.row_bytes, [24, 24]);
         Ok(())
     }
@@ -1921,7 +2008,17 @@ pub(crate) mod tests {
 
     #[test]
     fn a_surface_past_the_address_space_is_an_error_not_a_wrap() {
-        assert!(Mapped::of(u64::MAX - 10, 4096, (64, 64), crop(0, 0, 64, 64), 1, false).is_err());
+        assert!(
+            Mapped::of(
+                u64::MAX - 10,
+                4096,
+                (64, 64),
+                crop(0, 0, 64, 64),
+                1,
+                ChromaFormat::Yuv420
+            )
+            .is_err()
+        );
         assert!(
             Mapped::of(
                 0,
@@ -1929,7 +2026,7 @@ pub(crate) mod tests {
                 (u32::MAX, u32::MAX),
                 crop(0, 0, 1, 1),
                 2,
-                false
+                ChromaFormat::Yuv420
             )
             .is_ok()
         );
@@ -2001,6 +2098,17 @@ pub(crate) mod tests {
         // Two 4K 10-bit decoders of 9 surfaces fit, a third does not.
         let ten = surface_bytes(&hevc_4k(10, 9));
         assert_eq!(ten, 9 * 3840 * 2160 * 3);
+        // 4:2:2's chroma is as large as its luma, 4:4:4's twice.
+        for (chroma, bytes) in [
+            (ChromaFormat::Yuv422, 9 * 3840 * 2160 * 4),
+            (ChromaFormat::Yuv444, 9 * 3840 * 2160 * 6),
+        ] {
+            let spec = DecoderSpec {
+                chroma,
+                ..hevc_4k(10, 9)
+            };
+            assert_eq!(surface_bytes(&spec), bytes, "{chroma:?}");
+        }
         assert_eq!(over_budget(&[ten, ten], KEPT_BYTES), 0);
         assert_eq!(over_budget(&[ten, ten, ten], KEPT_BYTES), 1);
     }

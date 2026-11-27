@@ -14,10 +14,9 @@
 //!
 //! The range extensions' streams the codec crate decodes, where the caller
 //! lands them ([`NvdecHevc::range_extensions`]): 4:2:0 at 8, 10 and 12 bits
-//! into NV12 and P016, and 4:4:4 at 8, 10 and 12 bits into NVDEC's three
-//! planes, their tools and chroma QP offset lists in the picture parameters'
-//! range extension fields. Their 4:2:2 streams decode into no format built
-//! here, and are refused.
+//! into NV12 and P016, 4:2:2 at 8, 10 and 12 bits into NV16 and P216, and
+//! 4:4:4 at 8, 10 and 12 bits into NVDEC's three planes, their tools and
+//! chroma QP offset lists in the picture parameters' range extension fields.
 
 use std::ffi::{c_int, c_ushort};
 use std::sync::Arc;
@@ -63,16 +62,15 @@ impl NvdecHevc {
     }
 }
 
-/// The decoder `sps`'s pictures need, with a DPB of `dpb_size` pictures: 4:4:4
-/// where the SPS's `chroma_format_idc` is 3, else 4:2:0, the one other the
-/// configure takes (it refuses 4:2:2).
+/// The decoder `sps`'s pictures need, with a DPB of `dpb_size` pictures: 4:2:2
+/// where the SPS's `chroma_format_idc` is 2, 4:4:4 where it is 3, else 4:2:0.
 pub(crate) fn spec(sps: &Sps, dpb_size: usize) -> DecoderSpec {
     DecoderSpec {
         codec: NvdecCodec::Hevc,
-        chroma: if sps.chroma_format_idc == 3 {
-            ChromaFormat::Yuv444
-        } else {
-            ChromaFormat::Yuv420
+        chroma: match sps.chroma_format_idc {
+            2 => ChromaFormat::Yuv422,
+            3 => ChromaFormat::Yuv444,
+            _ => ChromaFormat::Yuv420,
         },
         bit_depth: u32::from(sps.bit_depth_luma_minus8) + 8,
         width: sps.pic_width_in_luma_samples,
@@ -92,11 +90,6 @@ impl Accelerator for NvdecHevc {
             return Err(Error::Unsupported(
                 "HEVC range extensions: its caller lands Main and Main 10 pictures alone"
                     .to_owned(),
-            ));
-        }
-        if sps.chroma_format_idc == 2 {
-            return Err(Error::Unsupported(
-                "HEVC 4:2:2: no NVDEC output of it is built here".to_owned(),
             ));
         }
         self.decoder = Some(Decoder::new(Arc::clone(&self.gpu), &spec)?);

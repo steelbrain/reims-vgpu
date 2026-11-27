@@ -28,8 +28,10 @@
 //!   it decode, as a Mac's hardware decoders hand them on.
 //! - **The range extensions' pictures** (HEVC's, where the caller lands
 //!   them, [`AnnexBDecoder::lands_range_extensions`]): 4:2:0 ones as Main 10's,
-//!   and 4:4:4 ones into three planes, luma, Cb and Cr, each as large, which
-//!   it reads back; its writes, of two planes, refuse those.
+//!   4:2:2 ones in two planes as well, the chroma as tall as the luma
+//!   ([`AnnexBPicture::chroma`]), and 4:4:4 ones into three planes, luma, Cb
+//!   and Cr, each as large, which it reads back; its writes, of two planes,
+//!   refuse those.
 //! - **An AV1 stream** is handed over as temporal units of OBUs, in the
 //!   low-overhead format, after its record's `configOBUs` as its
 //!   parameter sets (`nvdec::av1`); a picture NVDEC fails is followed by
@@ -51,6 +53,7 @@ use crate::codec::av1::{Decoder as Av1Decoder, Limits as Av1Limits};
 use crate::codec::h264::{Decoder as H264Decoder, nal::NalFormat};
 use crate::codec::hevc::Decoder as HevcDecoder;
 use crate::codec::vp9::Decoder as Vp9Decoder;
+use crate::core::backend::Chroma;
 use crate::core::device_memory::DeviceMemory;
 use crate::core::runtime::Runtime;
 use crate::core::surfaces::crop_within;
@@ -59,6 +62,7 @@ use crate::nvidia::cuda::Gpu;
 use crate::nvidia::decode::Failures;
 use crate::nvidia::error::Error;
 use crate::nvidia::external::ImportedBuffer;
+use crate::nvidia::nvdec::ChromaFormat;
 use crate::nvidia::nvdec::av1::NvdecAv1;
 use crate::nvidia::nvdec::decoder::{
     Crop, Destination, InPlace, Memory, OnFailed, Picture, PictureReadBack, SPARE_SURFACES,
@@ -73,8 +77,8 @@ use crate::nvidia::wait::Deadline;
 pub enum AnnexBCodec {
     /// H.264, of the profiles the codec crate decodes.
     H264,
-    /// HEVC, Main and Main 10, and the range extensions' 4:2:0 and 4:4:4 at
-    /// 8, 10 and 12 bits where the caller lands them
+    /// HEVC, Main and Main 10, and the range extensions' 4:2:0, 4:2:2 and
+    /// 4:4:4 at 8, 10 and 12 bits where the caller lands them
     /// ([`AnnexBDecoder::lands_range_extensions`]).
     Hevc,
     /// AV1's Main profile, 4:2:0 at 8 and 10 bits, of frames within the
@@ -177,8 +181,9 @@ impl AnnexBDecoder {
     }
 
     /// Has an HEVC stream of the range extensions decoded: a 4:2:0 one's
-    /// pictures as Main 10's, a 4:4:4 one's each in three planes, which the
-    /// caller writes or reads back ([`AnnexBPicture::four_four_four`]);
+    /// pictures as Main 10's, a 4:2:2 one's in two planes, the chroma as tall
+    /// as the luma, a 4:4:4 one's each in three planes, which the caller
+    /// writes or reads back ([`AnnexBPicture::chroma`]);
     /// without it, a range extensions stream's decoder is refused when its SPS
     /// is taken. An H.264 decoder is left as it is.
     pub fn lands_range_extensions(&mut self) {
@@ -419,9 +424,9 @@ pub struct ReadPlane<'a> {
 pub struct ReadBack<'a>(PictureReadBack<'a>);
 
 impl ReadBack<'_> {
-    /// The luma and the chroma (interleaved Cb and Cr, half as tall), or a
-    /// 4:4:4 picture's luma, Cb and Cr, each as large
-    /// ([`AnnexBPicture::four_four_four`]).
+    /// The luma and the chroma (interleaved Cb and Cr, half as tall, or as
+    /// tall for a 4:2:2 picture), or a 4:4:4 picture's luma, Cb and Cr, each
+    /// as large ([`AnnexBPicture::chroma`]).
     pub fn planes(&self) -> Vec<ReadPlane<'_>> {
         (self.0.planes().into_iter())
             .map(|(bytes, bytes_per_row, rows)| ReadPlane {
@@ -447,8 +452,8 @@ pub struct AnnexBPicture {
 }
 
 impl AnnexBPicture {
-    /// Bytes a sample: 1 for NV12, 2 for P016 (10-bit samples in each
-    /// sample's high bits, as P010's).
+    /// Bytes a sample: 1 for NV12 and NV16, 2 for P016 and P216 (10-bit
+    /// samples in each sample's high bits, as P010's).
     pub fn bytes_per_sample(&self) -> usize {
         self.picture.bytes_per_sample()
     }
@@ -459,6 +464,17 @@ impl AnnexBPicture {
     /// [`Self::write_4_4_4_into_device`] takes the three.
     pub fn four_four_four(&self) -> bool {
         self.picture.plane_count() == 3
+    }
+
+    /// Its chroma format: 4:2:0 (NV12 and P016), 4:2:2 (NV16 and P216, two
+    /// planes laid out as 4:2:0's, the chroma as tall as the luma) or 4:4:4
+    /// ([`Self::four_four_four`]).
+    pub fn chroma(&self) -> Chroma {
+        match self.picture.chroma() {
+            ChromaFormat::Yuv422 => Chroma::Yuv422,
+            ChromaFormat::Yuv444 => Chroma::Yuv444,
+            ChromaFormat::Yuv420 | ChromaFormat::Monochrome => Chroma::Yuv420,
+        }
     }
 
     /// The refusal of a write of two planes, where it is 4:4:4.
@@ -641,7 +657,8 @@ impl AnnexBPicture {
         hold: Box<dyn Any + Send>,
     ) -> Result<Result<(), String>, Error> {
         if !self.four_four_four() {
-            return Ok(Err("a 4:2:0 picture's two planes into three".to_owned()));
+            let chroma = self.chroma().name();
+            return Ok(Err(format!("a {chroma} picture's two planes into three")));
         }
         // SAFETY: the caller's planes and hold, as this function's contract says.
         unsafe { self.write_planes_into_device(size, planes.into(), hold) }
