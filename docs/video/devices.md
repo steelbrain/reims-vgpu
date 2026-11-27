@@ -38,14 +38,26 @@ codec: the kext names AppleGVA no video driver (`publishVideoCodecs`,
 hardware (`kVTCouldNotFindVideoDecoderErr`, `kVTCouldNotFindVideoEncoderErr`), and decodes and
 encodes every other session in software, as on a Mac without hardware video.
 
-An arm64 guest is offered no codec on any host: the arm64e kext names AppleGVA no video driver
-and publishes no HEVC decode or H.264 encode, whatever the caps list, and VideoToolbox answers
-as above for decoders. Its encoders are the OS's own: arm64 macOS 27.0.1 lists no hardware
-encoder and refuses a session that requires one (−12908), while arm64 macOS 26 lists Apple's
-AVE encoders (`com.apple.videotoolbox.videoencoder.ave.avc` and `.ave.hevc`) as hardware, which
-have no encoder behind them in a VM, and fails such a session −12903, with the kexts' video keys
-or without them (measured under TCG on a 780M host, 2026-11-16). The route our video driver
-serves, AppleGVA's vendor driver, is x86-64's: with the keys an arm64 macOS 14.6.1 guest on a
+An arm64 guest's hardware video takes another route: VideoToolbox's paravirtual path, over the
+arm64e kext ([design.md](../graphics-kext/design.md), "Decided", 17). The arm64e kext names
+AppleGVA no video driver; where the guest took `RGFX_FEATURE_VT_MESSAGES` and the caps list a
+decoder, it publishes VideoToolbox's paravirtualization service, and the guest's VideoToolbox
+registers each decoder and encoder the host lists, running each session as `VT_MESSAGE`s on
+ring 0. The host lists a decoder for each H.264 or HEVC decode entry of the caps (`vt_features`
+and the decoder list beside it in `graphics.rs`), and an encoder for each codec its arm encodes a
+profile of (`guest_encoders` in `graphics/vaapi.rs` and `graphics/nvidia.rs`). So on a Linux host
+an arm64 guest decodes H.264 and HEVC and encodes H.264 and HEVC Main and Main 10 in hardware; on
+a Windows host it decodes alone, as the Windows arm answers no encoder. Its decoders land 4:2:0
+pictures, and HEVC's 4:4:4 where the arm's decoder decodes it (`guest_declines`): NVDEC's, and
+VA-API's Main 4:4:4 at 8 bits where the driver has one.
+
+Where the host lists no decoder, the kext publishes no service, and the guest's VideoToolbox
+answers as above for decoders. Its encoders are then the OS's own: arm64 macOS 27.0.1 lists no
+hardware encoder and refuses a session that requires one (−12908), while arm64 macOS 26 lists
+Apple's AVE encoders (`com.apple.videotoolbox.videoencoder.ave.avc` and `.ave.hevc`) as
+hardware, which have no encoder behind them in a VM, and fails such a session −12903, with the
+kexts' video keys or without them (measured under TCG on a 780M host, 2026-11-16). The route
+AppleGVA's vendor driver serves is x86-64's: with its keys an arm64 macOS 14.6.1 guest on a
 VA-API host answered `VTIsHardwareDecodeSupported` true for HEVC, while a session requiring a
 hardware HEVC decoder failed −17692, one requiring H.264 −12906, and no session reached the
 host (measured 2026-11-16).

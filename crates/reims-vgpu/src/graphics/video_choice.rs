@@ -7,11 +7,12 @@
 //!    Windows on its DXGI adapter, over Mesa's VA-on-D3D12 driver (`super::vaapi::open_on_rt`),
 //!    by the LUID Vulkan answers for the device, where each picture lands by the CPU's copy.
 //!
-//! VA-API decodes alone: its encoders read a surface the GPU copied a frame
-//! into, which rt's platform does not release to the driver (`super::vaapi::PlatformRules`), and
-//! it decodes a reference picture into a surface of its own, not into its output's cache
-//! (`super::vaapi::CachedReferences`). NVENC's input is released to CUDA after each frame's copy
-//! (`super::nvidia::encode::fill`).
+//! On Linux, VA-API decodes and encodes: its encoders' inputs are written by the GPU, else
+//! uploaded by the CPU (`super::vaapi::open_on_rt`, `PlatformRules::encodes`). On Windows it
+//! decodes alone: rt imports no shared Direct3D 12 texture, which an encoder's input would be
+//! written through. On both it decodes a reference picture into a surface of its own, not into
+//! its output's cache (`super::vaapi::CachedReferences`). NVENC's input is released to CUDA after
+//! each frame's copy (`super::nvidia::encode::fill`).
 
 use std::sync::Arc;
 
