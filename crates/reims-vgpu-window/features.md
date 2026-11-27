@@ -565,6 +565,7 @@ runtime's own device. The switches above apply, and `resolution=` too.
   2560 × 1600 screen's borderless window at 1280 × 800 points). A change of
   the screen's scale, or a move to a screen of another, tells the guest the
   new one.
+  `test: native::sdl_thread::render::the_guest_is_told_its_screen_s_scale`,
   `test: sdl::units::a_window_s_scale_is_its_density_where_sizes_are_points_else_its_screen_s`,
   `test: geometry::the_layout_carries_the_screen_s_scale`, `manual` (a
   Windows host at 150%, X11 at a content scale above 1)
