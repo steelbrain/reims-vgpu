@@ -19,12 +19,27 @@
 //!
 //! A picture's targets are made without the [`PlaneDraw`]'s lock, as both devices' methods are
 //! free-threaded (neither is made single-threaded); the draws' device opens each by its NT handle
-//! (`OpenSharedResource1`) at its make. A draw records its writes and submits them with the
-//! queue's fence signalled after them, under the lock; it then waits on its caller's thread for
-//! the fence without the lock, so that another picture's draw is recorded while the GPU
-//! writes. Once the wait returns the importer may read the targets: the caller says so to it
-//! (`external_writes_done`). Nothing else orders the writes before the reads: the flush, the
-//! fence's wait and then the importer's acquire do, and no device takes a keyed mutex.
+//! (`OpenSharedResource1`) at its make. A draw records its writes, then the immediate context's
+//! signal of a fence after them, and submits both (`Flush`), under the lock; it then waits on
+//! its caller's thread for the fence without the lock, so that another picture's draw is
+//! recorded while the GPU writes. Once the wait returns the importer may read the targets: the
+//! caller says so to it (`external_writes_done`). Nothing else orders the writes before the
+//! reads: the context's signal, the fence's wait and then the importer's acquire do, and no
+//! device takes a keyed mutex. Every submission of the draws' device is ordered so, a target's
+//! clear to zeros alone too ([`PlaneDraw::zero_owed`]).
+//!
+//! The fence is the Direct3D 12 device's, made shared, which the Direct3D 11 device opens from
+//! an NT handle of it (`ID3D12Device::CreateSharedHandle`, then `ID3D11Device5::OpenSharedFence`)
+//! for the context to signal (`ID3D11DeviceContext4::Signal`). That method's page says it
+//! "Updates a fence to a specified value after all previous work has completed": the context's
+//! work recorded before it, the draws. `ID3D12CommandQueue::Signal`'s page says only that it
+//! "Updates a fence to a specified value", "from the GPU side", and nothing of what a D3D11On12
+//! context's flush has yet to submit to the queue. **Measured** (2026-11-26, Intel UHD 630, a
+//! macOS guest's adaptive stream played 16 times): a signal on the queue the device records
+//! onto, after the context's flush, passed while the context's own signal after the same draws
+//! had not at 2676 of 17663 drawn pictures (12.0 to 19.7% a pass), and the guest's GPU read of a
+//! picture then came back, at times, as the surface's earlier picture while its CPU read was
+//! right.
 //!
 //! A driver may refuse the draws' device's open of a target shared so. [`PlaneDraw::targets`]
 //! then answers the call that refused and its HRESULT (`OpenSharedResource1 failed:
@@ -66,8 +81,11 @@
 //! bits.
 //!
 //! The form is made only where both Direct3D 11 devices answer `ExtendedResourceSharing`
-//! (`D3D11_FEATURE_D3D11_OPTIONS`), which sharing the targets' formats needs; elsewhere
-//! [`PlaneDraw::new`] says why not, and the caller copies by the CPU.
+//! (`D3D11_FEATURE_D3D11_OPTIONS`), which sharing the targets' formats needs, and where the
+//! draws' device opens the shared fence and its context signals it (`ID3D11Device5`,
+//! `ID3D11DeviceContext4`); elsewhere [`PlaneDraw::new`] says why not, and the caller copies by
+//! the CPU. A signal refused at a draw fails the draw, whose picture the caller copies by the
+//! CPU too.
 //!
 //! **Measured** (2026-11-19, Intel UHD 630, Mesa 26.2.7's `vaon12`): drawn so and read back by
 //! Vulkan, 600 pictures of 1080p and 4K NV12 and 4K P010 matched `vaGetImage`'s exactly; a draw,
@@ -90,13 +108,11 @@ use std::sync::{Arc, Weak};
 
 use crate::core::sync::{Condvar, Mutex};
 
-#[cfg(test)]
-use super::d3d12::DEVICE_CREATE_SHARED_HANDLE;
 use super::d3d12::{
-    Com, CommandQueueDesc, CreateEventW, DEVICE_CREATE_COMMAND_QUEUE, DEVICE_CREATE_FENCE, Device,
-    FENCE_GET_COMPLETED_VALUE, FENCE_SET_EVENT_ON_COMPLETION, Guid, Handle, Hresult,
-    IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, LetGo, QUEUE_SIGNAL, SharedTexture, WAIT_OBJECT_0,
-    WaitForSingleObject, adapter_of, check, guid, system_function,
+    Com, CommandQueueDesc, CreateEventW, DEVICE_CREATE_COMMAND_QUEUE, DEVICE_CREATE_FENCE,
+    DEVICE_CREATE_SHARED_HANDLE, Device, FENCE_GET_COMPLETED_VALUE, FENCE_SET_EVENT_ON_COMPLETION,
+    Guid, Handle, Hresult, IID_ID3D12_COMMAND_QUEUE, IID_ID3D12_FENCE, LetGo, QUEUE_SIGNAL,
+    SharedTexture, WAIT_OBJECT_0, WaitForSingleObject, adapter_of, check, guid, system_function,
 };
 
 const IID_ID3D11_ON12_DEVICE: Guid = guid(
@@ -123,21 +139,18 @@ const IID_IDXGI_RESOURCE1: Guid = guid(
     0x4a41,
     [0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1],
 );
-#[cfg(test)]
 const IID_ID3D11_DEVICE5: Guid = guid(
     0x8ffd_e202,
     0xa0e7,
     0x45df,
     [0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0],
 );
-#[cfg(test)]
 const IID_ID3D11_DEVICE_CONTEXT4: Guid = guid(
     0x9176_00da,
     0xf58c,
     0x4c33,
     [0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24],
 );
-#[cfg(test)]
 const IID_ID3D11_FENCE: Guid = guid(
     0xaffd_e9d1,
     0x1df7,
@@ -154,7 +167,6 @@ const DEVICE_CREATE_VERTEX_SHADER: usize = 12;
 const DEVICE_CREATE_PIXEL_SHADER: usize = 15;
 const DEVICE_CHECK_FEATURE_SUPPORT: usize = 33;
 const DEVICE1_OPEN_SHARED_RESOURCE_1: usize = 48;
-#[cfg(test)]
 const DEVICE5_OPEN_SHARED_FENCE: usize = 67;
 const CONTEXT_PS_SET_SHADER_RESOURCES: usize = 8;
 const CONTEXT_PS_SET_SHADER: usize = 9;
@@ -171,7 +183,6 @@ const CONTEXT_COPY_RESOURCE: usize = 47;
 const CONTEXT_UPDATE_SUBRESOURCE: usize = 48;
 const CONTEXT_CLEAR_RENDER_TARGET_VIEW: usize = 50;
 const CONTEXT_FLUSH: usize = 111;
-#[cfg(test)]
 const CONTEXT4_SIGNAL: usize = 147;
 const ON12_CREATE_WRAPPED_RESOURCE: usize = 3;
 const ON12_RELEASE_WRAPPED_RESOURCES: usize = 4;
@@ -203,9 +214,7 @@ const D3D11_SRV_DIMENSION_TEXTURE2D: u32 = 4;
 const D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST: u32 = 4;
 const D3D12_RESOURCE_STATE_COMMON: u32 = 0;
 const D3D12_COMMAND_LIST_TYPE_DIRECT: u32 = 0;
-#[cfg(test)]
 const D3D12_FENCE_FLAG_SHARED: u32 = 0x1;
-#[cfg(test)]
 const GENERIC_ALL: u32 = 0x1000_0000;
 const INFINITE: u32 = u32::MAX;
 
@@ -370,12 +379,18 @@ pub struct PlaneDraw {
 struct State {
     /// The Direct3D 12 device the draws run on, which opens the pool textures.
     d3d12: Device,
-    /// Its direct queue, which the Direct3D 11 device records onto.
+    /// Its direct queue, which the Direct3D 11 device records onto, and which signals nothing
+    /// but a test's control's fence ([`Self::flush_and_signal`]).
     queue: Com,
     /// The Direct3D 11 device over it, its immediate context, and its `ID3D11On12Device`.
     device: Com,
     context: Com,
     on12: Com,
+    /// The immediate context as `ID3D11DeviceContext4`, which signals the fence in the context's
+    /// own stream, and the fence as the Direct3D 11 device opened it
+    /// (`ID3D11Device5::OpenSharedFence`), which it signals ([`Self::flush_and_signal`]).
+    signals: Com,
+    signalled: Com,
     /// The native Direct3D 11 device on the adapter, which makes the targets, and its context.
     native: Com,
     native_context: Com,
@@ -384,13 +399,15 @@ struct State {
     pixel: [[Com; 2]; 2],
     /// The constant buffer of the crop's origin: its column and row, and half of each.
     origin: Com,
+    /// The fence, as the Direct3D 12 device made it, shared, which a draw waits for.
     fence: Com,
     /// The fence's last value signalled.
     value: u64,
     /// The pool textures opened, each kept while it lives, and let go as it goes (module doc).
     opened: Vec<Opened>,
-    /// A test's control: the fence signalled on the queue ahead of the context's flush, so that
-    /// it may pass before the GPU runs what the flush submits ([`Self::flush_and_signal`]).
+    /// A test's control: the fence signalled on the Direct3D 12 queue ahead of the context's
+    /// flush, in place of the context's own signal, so that it may pass before the GPU runs what
+    /// the flush submits ([`Self::flush_and_signal`]).
     #[cfg(test)]
     signal_ahead: bool,
     /// A test's probe of the context's stream ([`Probe`]), once [`PlaneDraw::probe_the_stream`]
@@ -401,14 +418,12 @@ struct State {
 
 /// A test's probe of the draws' device's stream: a fence of the Direct3D 12 device's, shared,
 /// which the immediate context signals after what it recorded (`ID3D11DeviceContext4::Signal`,
-/// on the fence as the Direct3D 11 device opened it), ahead of the flush and of the draws' own
-/// fence ([`State::flush_and_signal`]). Direct3D 11 orders a context's signal after the work
-/// recorded before it, so the probe has not passed where the GPU has not yet run that work: a
-/// draws' fence that passed while the probe had not passed ahead of the draws.
+/// on the fence as the Direct3D 11 device opened it), ahead of the draws' own fence's signal
+/// ([`State::flush_and_signal`]). Direct3D 11 orders a context's signal after the work recorded
+/// before it, so the probe has not passed where the GPU has not yet run that work: a draws'
+/// fence that passed while the probe had not passed ahead of the draws.
 #[cfg(test)]
 struct Probe {
-    /// The immediate context as `ID3D11DeviceContext4`.
-    signals: Com,
     /// The fence as Direct3D 12 made it, which the test reads, and as the Direct3D 11 device
     /// opened it, which the context signals.
     fence: Com,
@@ -648,8 +663,10 @@ impl PlaneDraw {
         };
         let pixel = [pair("255.0", "8")?, pair("65535.0", "16")?];
         let origin = constant_buffer(&device)?;
-        let fence = new_fence(&d3d12.device, 0)?;
+        let fence = new_fence(&d3d12.device, D3D12_FENCE_FLAG_SHARED)?;
         let waits = fence.query(&IID_ID3D12_FENCE, "ID3D12Fence")?;
+        let signals = context.query(&IID_ID3D11_DEVICE_CONTEXT4, "ID3D11DeviceContext4")?;
+        let signalled = open_fence(&d3d12.device, &fence, &device)?;
         let makers = Makers {
             native: native.query(&IID_ID3D11_DEVICE1, "ID3D11Device1")?,
             device: device.query(&IID_ID3D11_DEVICE1, "ID3D11Device1")?,
@@ -660,6 +677,8 @@ impl PlaneDraw {
             device,
             context,
             on12,
+            signals,
+            signalled,
             native,
             native_context,
             vertex,
@@ -760,7 +779,7 @@ impl PlaneDraw {
             (chroma_target, &opened.views[1], &shaders[1], chroma),
         ];
         state.encode(&opened.wrapped, &draws);
-        // The flush submits the draws, and the queue signals the fence after them.
+        // The context signals the fence after the draws, and the flush submits both.
         let signalled = state.flush_and_signal();
         drop(state);
         // The wait for the GPU's writes holds no lock (module doc).
@@ -803,11 +822,9 @@ impl PlaneDraw {
     #[cfg(test)]
     fn probe_the_stream(&self) -> Result<(), String> {
         let mut state = self.state.lock();
-        let signals = (state.context).query(&IID_ID3D11_DEVICE_CONTEXT4, "ID3D11DeviceContext4")?;
         let fence = new_fence(&state.d3d12.device, D3D12_FENCE_FLAG_SHARED)?;
         let opened = open_fence(&state.d3d12.device, &fence, &state.device)?;
         state.probe = Some(Probe {
-            signals,
             fence,
             opened,
             value: 0,
@@ -1143,8 +1160,14 @@ impl State {
         wait_for(&self.fence, value)
     }
 
-    /// Flushes what the context recorded, and signals the fence after it on the queue: the
-    /// value it reaches once the GPU did it. `Err` where a call failed.
+    /// Signals the fence after what the context recorded, in the context's own stream
+    /// (`ID3D11DeviceContext4::Signal`, of the fence as its device opened it), and flushes the
+    /// context, which submits both: the value the fence reaches once the GPU did what was
+    /// recorded. `Err` where a call failed.
+    ///
+    /// The context's signal is the one that orders the fence after the context's work
+    /// (module doc). A signal on the Direct3D 12 queue after the flush does not: on the UHD 630
+    /// it passed, at times, before the GPU ran what the flush submitted.
     fn flush_and_signal(&mut self) -> Result<u64, String> {
         self.value += 1;
         #[cfg(test)]
@@ -1153,22 +1176,26 @@ impl State {
         let ahead = false;
         #[cfg(test)]
         self.signal_probe()?;
-        // SAFETY: each method is the named one of its object's interface: the context's flush
-        // under the state's lock, and the queue's signal of the state's fence.
+        type Signal = unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> Hresult;
+        // SAFETY: each method is the named one of its object's interface, under the state's
+        // lock: the immediate context's signal of the fence its device opened, or, as a test's
+        // control, the queue's signal of the state's fence; then the context's flush.
         unsafe {
-            let flush: unsafe extern "system" fn(*mut c_void) = self.context.method(CONTEXT_FLUSH);
-            let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> Hresult =
-                self.queue.method(QUEUE_SIGNAL);
-            if !ahead {
-                flush(self.context.raw());
-            }
-            check(
-                "ID3D12CommandQueue::Signal",
-                signal(self.queue.raw(), self.fence.raw(), self.value),
-            )?;
             if ahead {
-                flush(self.context.raw());
+                let signal: Signal = self.queue.method(QUEUE_SIGNAL);
+                check(
+                    "ID3D12CommandQueue::Signal",
+                    signal(self.queue.raw(), self.fence.raw(), self.value),
+                )?;
+            } else {
+                let signal: Signal = self.signals.method(CONTEXT4_SIGNAL);
+                check(
+                    "ID3D11DeviceContext4::Signal",
+                    signal(self.signals.raw(), self.signalled.raw(), self.value),
+                )?;
             }
+            let flush: unsafe extern "system" fn(*mut c_void) = self.context.method(CONTEXT_FLUSH);
+            flush(self.context.raw());
         }
         Ok(self.value)
     }
@@ -1185,10 +1212,10 @@ impl State {
         // the state's lock, of the fence its device opened.
         unsafe {
             let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> Hresult =
-                probe.signals.method(CONTEXT4_SIGNAL);
+                self.signals.method(CONTEXT4_SIGNAL);
             check(
                 "ID3D11DeviceContext4::Signal",
-                signal(probe.signals.raw(), probe.opened.raw(), probe.value),
+                signal(self.signals.raw(), probe.opened.raw(), probe.value),
             )
         }
     }
@@ -1361,7 +1388,6 @@ fn new_fence(device: &Com, flags: u32) -> Result<Com, String> {
 /// Direct3D 11 device over it, opens it (`ID3D11Device5::OpenSharedFence`) from an NT handle of
 /// it (`ID3D12Device::CreateSharedHandle`), which is closed once it is open: an `ID3D11Fence`
 /// for the device's context to signal.
-#[cfg(test)]
 fn open_fence(d3d12: &Com, fence: &Com, device: &Com) -> Result<Com, String> {
     let mut handle = null_mut();
     // SAFETY: the method is ID3D12Device's `CreateSharedHandle`, of a fence of the device's made

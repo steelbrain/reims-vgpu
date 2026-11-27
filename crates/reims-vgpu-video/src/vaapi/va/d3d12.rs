@@ -120,7 +120,6 @@ pub(super) const DEVICE_CREATE_COMMAND_QUEUE: usize = 8;
 const DEVICE_CREATE_COMMAND_ALLOCATOR: usize = 9;
 const DEVICE_CREATE_COMMAND_LIST: usize = 12;
 const DEVICE_CREATE_COMMITTED_RESOURCE: usize = 27;
-#[cfg(test)]
 pub(super) const DEVICE_CREATE_SHARED_HANDLE: usize = 31;
 pub(super) const DEVICE_CREATE_FENCE: usize = 36;
 const QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
