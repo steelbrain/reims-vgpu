@@ -271,10 +271,13 @@
 //! one, acquires those planes from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own
 //! ahead of everything, after a global barrier from and to every stage, and releases them to that
 //! family in another after everything, so Direct3D 11 owns the planes' memory between rt's
-//! submissions. rt counts those submissions, a group that goes member by member once
-//! (`Metrics::d3d11_plane_submissions`), and the counts line carries them as an amount,
-//! [`D3D11_PLANE_SUBMISSIONS_CODE`], so a boot's line says how many of its submissions handed
-//! planes over. Off Windows no Direct3D 11 surface is made, and the amount stays 0.
+//! submissions. rt counts those `vkQueueSubmit2` calls (`Metrics::d3d11_plane_submissions`): a
+//! group sent as one submission once, and a group that goes member by member once for each of its
+//! calls that uses a plane, each handing over its own planes, which rt also counts apart
+//! (`Metrics::d3d11_plane_parts`). The counts line carries both as amounts,
+//! [`D3D11_PLANE_SUBMISSIONS_CODE`] and [`D3D11_PLANE_PARTS_CODE`], so a boot's line says how many
+//! of its submissions handed planes over, and how many of them were parts of a group sent member
+//! by member. Off Windows no Direct3D 11 surface is made, and both amounts stay 0.
 //!
 //! **Its compute dispatches.** rt counts no dispatch, so the rt platform's compute encoders count
 //! those they encode, by form, one relaxed add each (`super::compute`): the direct ones
@@ -576,6 +579,12 @@ pub const EXTENDED_VIEW_DISPATCHES_CODE: &str = "rt-extended-view-dispatches";
 /// (`Metrics::d3d11_plane_submissions`), an amount on the counts line ([`fold_metrics`]).
 pub const D3D11_PLANE_SUBMISSIONS_CODE: &str = "rt-d3d11-plane-submissions";
 
+/// The code of those of [`D3D11_PLANE_SUBMISSIONS_CODE`]'s calls that were a part of a group rt
+/// sent member by member, each acquiring and releasing that part's Direct3D 11 planes itself
+/// (`Metrics::d3d11_plane_parts`), an amount on the counts line ([`fold_metrics`]): 0 where no
+/// group that used a plane went member by member.
+pub const D3D11_PLANE_PARTS_CODE: &str = "rt-d3d11-plane-parts";
+
 /// The code of the dispatches and draws whose push carried a storage texture's level count or the
 /// first of its level elements (`Metrics::level_field_commands`), an amount on the counts line
 /// ([`fold_metrics`]).
@@ -688,7 +697,7 @@ pub(super) const OVER_COPY_METRICS: usize = 4 + 2 * 12;
 /// first-use waits for an unfinished main pipeline and their nanoseconds, the over-copies of a
 /// kind rt kept none of, and the flushes and invalidates of Shared memory, their bytes and the
 /// calls that failed.
-const FOLDED_METRICS: usize = OVER_COPY_METRICS + 43;
+const FOLDED_METRICS: usize = OVER_COPY_METRICS + 44;
 
 /// The metrics the counts line carries at their highest ([`highest_metrics`]): rt's maxima since
 /// a device was made.
@@ -917,7 +926,8 @@ fn over_copy_kind_line(
 /// ragged grids ([`PARTIAL_VARIANT_RAGGED_GRIDS_CODE`]) that ran a partial-threadgroups variant,
 /// the dispatches that wrote a view through its image's extended storage usage
 /// ([`EXTENDED_VIEW_DISPATCHES_CODE`]), the submissions that handed Direct3D 11 planes over
-/// ([`D3D11_PLANE_SUBMISSIONS_CODE`]), the dispatches and draws that pushed a storage texture's
+/// ([`D3D11_PLANE_SUBMISSIONS_CODE`]) and those of them that were parts of a group sent member by
+/// member ([`D3D11_PLANE_PARTS_CODE`]), the dispatches and draws that pushed a storage texture's
 /// level fields ([`LEVEL_FIELD_COMMANDS_CODE`]), the heap textures moved out of the undefined
 /// layout ([`HEAP_MOVES_CODE`]), the draws that read an attachment of their own pass through the
 /// feedback loop ([`ATTACHMENT_LOOP_READS_CODE`]), the copies into attachments' shadows on a
@@ -979,6 +989,7 @@ fn folded_counts(m: &rt::Metrics) -> [(&'static str, u64); FOLDED_METRICS] {
         ),
         (EXTENDED_VIEW_DISPATCHES_CODE, m.extended_view_dispatches),
         (D3D11_PLANE_SUBMISSIONS_CODE, m.d3d11_plane_submissions),
+        (D3D11_PLANE_PARTS_CODE, m.d3d11_plane_parts),
         (LEVEL_FIELD_COMMANDS_CODE, m.level_field_commands),
         (HEAP_MOVES_CODE, m.heap_moves),
         (ATTACHMENT_LOOP_READS_CODE, m.attachment_loop_reads),
@@ -2809,6 +2820,7 @@ mod tests {
             PARTIAL_VARIANT_RAGGED_GRIDS_CODE,
             EXTENDED_VIEW_DISPATCHES_CODE,
             D3D11_PLANE_SUBMISSIONS_CODE,
+            D3D11_PLANE_PARTS_CODE,
             LEVEL_FIELD_COMMANDS_CODE,
             HEAP_MOVES_CODE,
             ATTACHMENT_LOOP_READS_CODE,
@@ -2863,6 +2875,7 @@ mod tests {
         m.partial_variant_ragged_grids = 2;
         m.extended_view_dispatches = 1;
         m.d3d11_plane_submissions = 3;
+        m.d3d11_plane_parts = 1;
         m.level_field_commands = 5;
         m.heap_moves = 2;
         m.attachment_loop_reads = 7;
@@ -2911,6 +2924,7 @@ mod tests {
         m.partial_variant_ragged_grids = 9;
         m.extended_view_dispatches = 4;
         m.d3d11_plane_submissions = 12;
+        m.d3d11_plane_parts = 5;
         m.level_field_commands = 8;
         m.heap_moves = 6;
         m.attachment_loop_reads = 7 + 12;
@@ -2936,7 +2950,7 @@ mod tests {
             [
                 3, 12288, 1, 4096, 1, 4096, 1, 4096, 1, 4096, 5, 3, 98_304, 9, 4, 4_250_000, 6,
                 28_500_000, 3, 1, 2, 3, 9_000, 2, 3, 1, 7, 5, 11, 2, 10, 4, 14_745_600, 13, 9, 4,
-                12, 8, 6, 19, 3, 3_145_728, 24, 5, 18_750_000, 3, 1_300_000, 4, 25, 102_400, 10,
+                12, 5, 8, 6, 19, 3, 3_145_728, 24, 5, 18_750_000, 3, 1_300_000, 4, 25, 102_400, 10,
                 20_480, 1
             ]
         );
