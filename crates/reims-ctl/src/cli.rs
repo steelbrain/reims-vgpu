@@ -1773,12 +1773,22 @@ fn usb_line(
 }
 
 fn doctor(host: Host) -> Result<i32> {
+    doctor_on(host, &runtime::host_kernel, &mut |l| println!("{l}"))
+}
+
+/// [`doctor`], with the running kernel's version read by `kernel` and each line given to `out`.
+fn doctor_on(
+    host: Host,
+    kernel: &dyn Fn() -> Option<(u32, u32)>,
+    out: &mut dyn FnMut(String),
+) -> Result<i32> {
     let mut bad = 0;
     let mut line = |ok: bool, what: &str, detail: String| {
         if !ok {
             bad += 1;
         }
-        println!("{} {what}: {detail}", if ok { "ok  " } else { "FAIL" });
+        let mark = if ok { "ok  " } else { "FAIL" };
+        out(format!("{mark} {what}: {detail}"));
     };
     let profile = host.default_profile();
     line(
@@ -1895,7 +1905,7 @@ fn doctor(host: Host) -> Result<i32> {
     // runs.
     let vms = registered_vms();
     if host.os == crate::host::Os::Linux
-        && let Some(v) = runtime::host_kernel()
+        && let Some(v) = kernel()
     {
         let problem = runtime::kernel_problem(v);
         line(

@@ -71,6 +71,11 @@ pub fn running(vm: &Vm) -> bool {
 
 /// What is wrong with the host or the VM's files for a start, if anything.
 pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
+    preflight_on(vm, host, &host_kernel)
+}
+
+/// [`preflight`], with the running kernel's version read by `kernel`.
+fn preflight_on(vm: &Vm, host: Host, kernel: &dyn Fn() -> Option<(u32, u32)>) -> Result<()> {
     let c = &vm.config;
     c.check()?;
     if !crate::host::Profile::supported_on(host).contains(&c.profile) {
@@ -135,7 +140,7 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
     }
     if host.os == Os::Linux
         && c.graphics() == Graphics::ReimsVgpu
-        && let Some(problem) = host_kernel().and_then(kernel_problem)
+        && let Some(problem) = kernel().and_then(kernel_problem)
     {
         bail!("{problem}");
     }
