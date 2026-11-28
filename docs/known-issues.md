@@ -127,10 +127,27 @@ exceptions:
   same way on a real Intel Mac, which came out at 5.7 times the bitrate asked in the same test.
   The video still plays back correctly.
 
-An app can also set a hard limit on the bytes in any one second. In our tests at 1080p with
-such a limit, the busiest second came out 1.7% to 3.0% over it, and every frame still played
-back. A real Intel Mac stayed under the same limit, but we ran it with a keyframe every 30
-frames and ours with macOS's default spacing, so the two runs don't compare directly.
+An app can also set a hard limit on the bytes in any one second. In our tests at 1080p, with
+8 Mbit/s asked and a limit of 1,000,000 bytes a second, the busiest second came out 1.7% to 3.0%
+over it, and every frame still played back. For HEVC, your GPU is driven by the same path of
+macOS's encoder as a real Intel Mac's GPU, which codes a frame over again when it breaks the
+limit. A real Intel Mac in the same test stayed under the limit in every second.
+
+## H.264 from Intel Mac guests doesn't hold a hard data-rate limit
+
+An app that encodes H.264 can set a hard limit on the bytes in any one second. When an app in an
+Intel Mac guest encodes H.264 on your GPU, the limit is not acted on: on our AMD test GPU, the
+video came out exactly the same with the limit as without it. In our tests at 1080p, with
+8 Mbit/s asked and a limit of 1,000,000 bytes a second (the same as the bitrate asked), the
+busiest second came out 18.3% to 19.4% over the limit on the AMD, NVIDIA and Intel GPUs we
+tested, and more than half of the one-second windows were over. The video as a whole stays
+within about 2% of the bitrate asked, and plays back correctly.
+
+macOS's encoder takes one path for a Mac's Intel GPU and another for an AMD GPU, and for H.264
+your GPU is driven by the AMD path. The Intel path codes a frame over again when it breaks the
+limit. The AMD path plans each frame against the limit and doesn't code frames over. A real Mac
+on the Intel path went 2.3% over the limit in its busiest second in the same test. We haven't
+measured a real Mac with only an AMD GPU, so we don't know yet whether one holds the limit.
 
 ## Sound comes after video on Windows
 
