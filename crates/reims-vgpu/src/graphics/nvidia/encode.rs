@@ -283,6 +283,28 @@ fn frame_rate_of(settings: &RgfxVideoEncodeSettings) -> (u32, u32) {
 /// takes it. NVENC's own single-frame time at P1 for 4K is about 15 ms, above the Mac's whole
 /// chain of about 13 ms a frame, so the 3090 does not reach the Mac's 4K rate one frame at a
 /// time. A guest that asks for more quality than the middle gets the slower presets.
+///
+/// No slower preset earns its time at the settings AppleGVA's plug-in forces on an x86 guest's
+/// encodes: constant QP, an IDR every 60 frames, no B-frames. **Measured** on the same 3090 and
+/// driver (2026-11-27, m3-max-77665, read in m3-max-77677): NVENC alone, one frame in flight,
+/// tuning hq, QP 22 to 34, P1 to P7. The bar was a preset that gains 0.5 dB of luma over P1 at
+/// equal bits (BD-PSNR Y) while the encoder stays faster than the guest round trip above (45 to
+/// 47 fps at 3840x2160, 155 to 175 at 1920x1080) at both sizes. The best rows:
+///
+/// | codec, preset | gain at 1080p / 2160p | encoder at 1080p / 2160p | misses |
+/// |---|---|---|---|
+/// | HEVC Main, P5 | +0.57 / +0.49 dB | 169-183 / 42.6-47.2 fps | the gain and the rate at 2160p |
+/// | HEVC Main 10, P5 | +0.64 / +0.60 dB | 118-132 / 29.5-35.1 fps | the rate |
+/// | every codec, P6 and P7 | +0.19 to +1.02 / +0.77 to +0.99 dB | 82-155 / 21.8-40.1 fps | the rate |
+/// | H.264 High, P2 and P3 | +0.10, +0.22 / +0.78, +0.92 dB | 224-250 / 62.2-65.7 fps | the gain at 1080p |
+///
+/// P1 runs at 165-267 and 42.6-76.5 fps. The gains are a clean source's, a moving test pattern;
+/// the same pattern under temporal noise gains 0.15 dB or less at every preset, since its noise
+/// is not coded at these QPs. HEVC's P4 gains +0.23 to +0.34 dB over P1 on the clean source:
+/// about a third or less of the 0.95 dB (Main) and 1.54 dB (Main 10) by which a guest's HEVC on
+/// this 3090 trails the host's own P4 encodes in docs/graphics-kext/design.md (m3-max-77477).
+/// The rest of that gap is unread; **inferred**: the host's own runs differ from the plug-in's in
+/// rate control and GOP as well as preset.
 fn preset_of(quality: u32) -> u8 {
     let above_middle = quality.min(100).saturating_sub(50);
     u8::try_from(1 + (above_middle * 6 + 25) / 50).unwrap_or(7)
