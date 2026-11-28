@@ -5,10 +5,11 @@
 
 use std::sync::Arc;
 
-use super::header::{self, FrameHeader, State};
+use super::header::{self, CS_RGB, ColorConfig, FrameHeader, State};
 use super::quant::{self, SegmentParams};
 use super::superframe;
 use super::{Error, config::VpCodecConfiguration};
+use crate::core::backend::Chroma;
 
 /// The largest side this decoder takes, past what any lab driver decodes
 /// (8192 on the AMD cards and the 3090, 16384 on the Iris Xe) and far
@@ -22,10 +23,12 @@ pub const MAX_SIDE: u32 = 16384;
 /// [`Accelerator::configure`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Format {
-    /// `Profile`: 0 or 2 here ([`check_supported`]).
+    /// `Profile`.
     pub profile: u8,
-    /// `BitDepth`: 8 or 10 here.
+    /// `BitDepth`: 8, 10 or 12.
     pub bit_depth: u8,
+    /// The chroma subsampling: 4:2:0 in profiles 0 and 2, 4:2:2 or 4:4:4 in 1 and 3.
+    pub chroma: Chroma,
     /// `FrameWidth`.
     pub width: u32,
     /// `FrameHeight`.
@@ -268,39 +271,79 @@ impl<A: Accelerator> Decoder<A> {
     }
 }
 
-/// A frame's format, where this decoder takes it: profile 0 or 2, 4:2:0 at
-/// 8 or 10 bits, no side past [`MAX_SIDE`].
+/// A frame's format, where this decoder takes it ([`chroma_of`]), no side
+/// past [`MAX_SIDE`].
 fn check_frame(header: &FrameHeader) -> Result<Format, Error> {
     let color = &header.color;
-    if !(color.subsampling_x && color.subsampling_y) {
-        return Err(Error::Unsupported("VP9 other than 4:2:0"));
-    }
-    match (header.profile, color.bit_depth) {
-        (0, 8) | (2, 10) => {}
-        (2, _) => return Err(Error::Unsupported("VP9 at 12 bits")),
-        _ => return Err(Error::Unsupported("VP9 profiles 1 and 3")),
-    }
+    let chroma = chroma_of(header.profile, color)?;
     if header.width > MAX_SIDE || header.height > MAX_SIDE {
         return Err(Error::TooLarge);
     }
     Ok(Format {
         profile: header.profile,
         bit_depth: color.bit_depth,
+        chroma,
         width: header.width,
         height: header.height,
     })
 }
 
-/// Whether this decoder takes a stream of `config`'s record: profile 0 at
-/// 8 bits or profile 2 at 10, 4:2:0. What a frame's own header says is
+/// The chroma format of a frame of `profile` in `color`, where this decoder takes it: 4:2:0 in
+/// profiles 0 and 2, 4:2:2 and 4:4:4 in profiles 1 and 3, at the profile's depths (7.2.2: 8 bits
+/// in 0 and 1, 10 or 12 in 2 and 3). 4:4:0 and the RGB colour space are refused, as no format
+/// the guest takes holds them; so is 4:2:0 in profile 1 or 3, which libvpx refuses too.
+fn chroma_of(profile: u8, color: &ColorConfig) -> Result<Chroma, Error> {
+    if color.color_space == CS_RGB {
+        return Err(Error::Unsupported("VP9 in the RGB colour space"));
+    }
+    let chroma = match (color.subsampling_x, color.subsampling_y) {
+        (true, true) => Chroma::Yuv420,
+        (true, false) => Chroma::Yuv422,
+        (false, false) => Chroma::Yuv444,
+        (false, true) => return Err(Error::Unsupported("VP9 at 4:4:0")),
+    };
+    let odd = profile & 1 == 1;
+    if odd == (chroma == Chroma::Yuv420) {
+        return Err(Error::Unsupported(
+            "VP9 of a chroma format its profile does not code",
+        ));
+    }
+    Ok(chroma)
+}
+
+/// Whether this decoder takes a stream of `config`'s record: profile 0 at 8
+/// bits and profile 2 at 10 or 12, 4:2:0; profile 1 at 8 bits and profile 3 at
+/// 10 or 12, 4:2:2 or 4:4:4, and not in the RGB colour space, which a record
+/// names with `matrixCoefficients` 0 (Identity). A record cannot name 4:4:0,
+/// which the stream's first frame shows. What a frame's own header says is
 /// checked again at each frame.
 pub fn check_supported(config: &VpCodecConfiguration) -> Result<(), Error> {
-    if !config.is_4_2_0() {
-        return Err(Error::Unsupported("VP9 other than 4:2:0"));
+    let odd = config.profile & 1 == 1;
+    if odd && config.matrix_coefficients == MC_IDENTITY {
+        return Err(Error::Unsupported("VP9 in the RGB colour space"));
     }
-    match (config.profile, config.bit_depth) {
-        (0, 8) | (2, 10) => Ok(()),
-        (2, _) => Err(Error::Unsupported("VP9 at 12 bits")),
-        _ => Err(Error::Unsupported("VP9 profiles 1 and 3")),
+    if config.chroma_subsampling > 3 {
+        return Err(Error::Unsupported(
+            "VP9 of a chroma subsampling vpcC does not name",
+        ));
     }
+    let depths_ok = match config.profile {
+        0 | 1 => config.bit_depth == 8,
+        2 | 3 => matches!(config.bit_depth, 10 | 12),
+        _ => false,
+    };
+    if !depths_ok {
+        return Err(Error::Unsupported(
+            "VP9 of a profile or depth VP9 does not code",
+        ));
+    }
+    if odd == config.is_4_2_0() {
+        return Err(Error::Unsupported(
+            "VP9 of a chroma format its profile does not code",
+        ));
+    }
+    Ok(())
 }
+
+/// `matrixCoefficients` 0, Identity (ISO/IEC 23091-2): a record's RGB.
+const MC_IDENTITY: u8 = 0;

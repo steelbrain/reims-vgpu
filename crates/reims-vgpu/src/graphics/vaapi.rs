@@ -96,9 +96,12 @@
 //!   GPU where the import check passed XYUV (`xyuv`). The rest are read back and split by the
 //!   CPU, each picture counted (`video-pictures-cpu-converted`). Every other stream that is not
 //!   4:2:0 Main or Main 10 is refused at its session's start, naming why.
-//!   VP9 decodes there alone, profile 0 and profile 2 at 10 bits where the driver lists them
-//!   (`Vp9Decoder`, each sample a frame or a superframe whole), and lands as H.264's and HEVC's
-//!   4:2:0 pictures do.
+//!   VP9 decodes there alone (`Vp9Decoder`, each sample a frame or a superframe whole): profile 0
+//!   and profile 2 at 10 bits where the driver lists them, landing as H.264's and HEVC's 4:2:0
+//!   pictures do; and profile 2 at 12 bits and profiles 1 and 3, 4:2:2 and 4:4:4 at their depths,
+//!   where the driver's decoder of the profile makes the stream's surfaces (`declines_vp9`, the VA
+//!   crate's `vp9_decoder`), landing as the range extensions' pictures of the same chroma format
+//!   and depth do.
 //! - **VideoToolbox's paravirtual encoders** (`encode::VaGuestEncoder`, `super::vt`): an arm64
 //!   guest's encoder reads each source frame from the IOSurface its kext lent: written by the
 //!   runtime device's GPU from a buffer over its pages into an input of the encoder's, as an x86
@@ -124,7 +127,9 @@ use reims_vgpu_graphics::wire::{
 #[cfg(unix)]
 use reims_vgpu_video::codec::PictureRole;
 use reims_vgpu_video::codec::{PictureStart, vp9};
-use reims_vgpu_video::core::backend::{BackendError as VideoError, DeviceWrite, PixelFormat};
+use reims_vgpu_video::core::backend::{
+    BackendError as VideoError, Chroma, DeviceWrite, PixelFormat,
+};
 #[cfg(unix)]
 use reims_vgpu_video::core::device_memory::{
     DeviceImports, DmaBufError, MemoryIdentity, SurfaceDmaBuf,
@@ -141,7 +146,9 @@ use reims_vgpu_video::vaapi::{
     H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, Target,
     TargetCodec, TargetFor, VideoEncoder, Vp9Decoder, encoder_support,
 };
-use reims_vgpu_video::vaapi::{SurfaceCapabilities, range_extensions_decoder, rt_format_names};
+use reims_vgpu_video::vaapi::{
+    Fourcc, SurfaceCapabilities, range_extensions_decoder, rt_format_names, vp9_decoder,
+};
 #[cfg(unix)]
 use reims_vgpu_video::vaapi::{TARGET_ALIGNMENT, TargetChecks, TargetPlane, TargetShape};
 use reims_vgpu_video::vaapi::{h264_decoder_profiles, hevc_main_decoder};
@@ -438,6 +445,9 @@ impl<P: Platform> VaapiVideo<P> {
             Profile::HEVC_MAIN444,
             Profile::HEVC_MAIN444_10,
             Profile::HEVC_MAIN444_12,
+            Profile::VP9_PROFILE1,
+            Profile::VP9_PROFILE2,
+            Profile::VP9_PROFILE3,
         ]
         .into_iter()
         .filter_map(|profile| capabilities.find(profile, Entrypoint::VLD).cloned())
@@ -595,20 +605,14 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
     /// 4:2:0 streams of Main and Main 10, and HEVC's range extensions where the driver's
     /// decoder of their chroma format and depth decodes them, by the driver's own answers
     /// ([`declines`]); AV1's at the depths and sizes the driver lists (`super::av1::declines`);
-    /// and VP9's where the driver's config of the stream's profile takes its depth and size.
+    /// and VP9's where the driver decodes the stream's profile, chroma format, depth and size
+    /// ([`declines_vp9`]).
     fn guest_declines(&self, codec: u32, stream: &Stream) -> Option<String> {
         if codec == HOST_VIDEO_CODEC_AV1 {
             return super::av1::declines(NAME, self.av1, stream);
         }
-        if codec == RGFX_VIDEO_CODEC_VP9 && stream.chroma_format_idc == 1 {
-            return Vp9Decoder::supports(
-                &self.display,
-                stream.profile,
-                stream.luma_bits,
-                (stream.width, stream.height),
-            )
-            .err()
-            .map(|error| format!("{NAME}: {error}"));
+        if codec == RGFX_VIDEO_CODEC_VP9 {
+            return declines_vp9(&self.display, &self.decoders, stream);
         }
         declines(&self.decoders, codec, stream)
     }
@@ -778,7 +782,60 @@ fn declines_range_extensions(configs: &[ConfigCapabilities], stream: &Stream) ->
              bits, not chroma_format_idc {chroma} at {bits}"
         ));
     };
-    let name = profile.name().unwrap_or("HEVC");
+    declines_on(configs, (profile, rt_format, fourcc), "HEVC", stream)
+}
+
+/// Why VA-API's decoders take none of a VP9 `stream`'s pictures, `None` where they take them.
+/// Profile 0 at 8 bits and profile 2 at 10, 4:2:0, decode where the driver's VLD config of the
+/// profile takes their render targets, surfaces and size (`Vp9Decoder::supports`). The rest of VP9's
+/// formats, profile 2 at 12 bits and profiles 1 and 3 at 4:2:2 and 4:4:4, decode where the
+/// driver's decoder among `configs` of the stream's profile makes the render targets and the
+/// surfaces of its chroma format and depth (`vp9_decoder`), within its sizes, as HEVC's range
+/// extensions do ([`declines_on`]), and land as theirs.
+fn declines_vp9(
+    display: &Display,
+    configs: &[ConfigCapabilities],
+    stream: &Stream,
+) -> Option<String> {
+    let (profile, bits) = (stream.profile, stream.luma_bits);
+    if stream.chroma_format_idc == 1 && matches!((profile, bits), (0, 8) | (2, 10)) {
+        let size = (stream.width, stream.height);
+        return Vp9Decoder::supports(display, profile, bits, Chroma::Yuv420, size)
+            .err()
+            .map(|error| format!("{NAME}: {error}"));
+    }
+    declines_vp9_formats(configs, stream)
+}
+
+/// [`declines_vp9`] of a stream of the formats past profile 0 and profile 2 at 10 bits, by the
+/// driver's answers in `configs` alone.
+fn declines_vp9_formats(configs: &[ConfigCapabilities], stream: &Stream) -> Option<String> {
+    let (profile, bits) = (stream.profile, stream.luma_bits);
+    let Some(chroma) = Chroma::of_idc(stream.chroma_format_idc) else {
+        return Some(format!(
+            "{NAME} decodes VP9 at 4:2:0, 4:2:2 and 4:4:4, not chroma_format_idc {}",
+            stream.chroma_format_idc
+        ));
+    };
+    let Some(decoder) = vp9_decoder(profile, chroma, bits) else {
+        return Some(format!(
+            "{NAME} decodes no VP9 profile {profile} in {chroma:?} at {bits} bits"
+        ));
+    };
+    declines_on(configs, decoder, "VP9", stream)
+}
+
+/// Why the driver decodes none of `stream`'s pictures on its decoder among `configs` of
+/// `profile`, `None` where it does: the decoder makes `rt_format` render targets and surfaces of
+/// `fourcc`, the ones the VA crate's decoder lands the stream's pictures from, within its sizes.
+/// `codec` names the codec where va.h names no profile.
+fn declines_on(
+    configs: &[ConfigCapabilities],
+    (profile, rt_format, fourcc): (Profile, u32, Fourcc),
+    codec: &str,
+    stream: &Stream,
+) -> Option<String> {
+    let name = profile.name().unwrap_or(codec);
     let Some(config) = configs.iter().find(|config| config.profile == profile) else {
         return Some(format!("{NAME}: the driver has no {name} decoder"));
     };

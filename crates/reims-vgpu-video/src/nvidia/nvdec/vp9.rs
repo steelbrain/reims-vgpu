@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::codec::vp9::header::FrameHeader;
 use crate::codec::vp9::{Accelerator, Format, FrameParams};
+use crate::core::backend::Chroma;
 
 use super::decoder::{
     Decoder, DecoderSpec, InPlace, Picture, SPARE_SURFACES, Slices, active, surface_count,
@@ -73,8 +74,19 @@ impl Accelerator for NvdecVp9 {
     type Picture = Picture;
     type Error = Error;
 
+    /// Profile 0 and profile 2 at 10 bits, 4:2:0, which the codec module
+    /// lets through beside VP9's other formats: this decoder lands no other,
+    /// and the device's caps list no other of NVDEC's.
     fn configure(&mut self, format: &Format) -> Result<(), Error> {
         self.decoder = None;
+        if format.chroma != Chroma::Yuv420
+            || !matches!((format.profile, format.bit_depth), (0, 8) | (2, 10))
+        {
+            return Err(Error::Unsupported(format!(
+                "VP9 profile {} in {:?} at {} bits: NVDEC decodes profile 0, and 2 at 10 bits, here",
+                format.profile, format.chroma, format.bit_depth
+            )));
+        }
         self.decoder = Some(Decoder::new(Arc::clone(&self.gpu), &spec(format))?);
         Ok(())
     }

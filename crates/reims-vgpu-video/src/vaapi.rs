@@ -32,7 +32,7 @@ pub use va::SharedTexture;
 #[cfg(windows)]
 pub use va::{PlaneDraw, PlaneTargets};
 
-pub use va::Vp9Decoder;
+pub use va::{Vp9Decoder, vp9_decoder};
 
 pub use va::{
     TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,

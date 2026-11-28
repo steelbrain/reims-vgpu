@@ -1296,21 +1296,32 @@ fn vpcc(profile: u8, bit_depth: u8, chroma: u8, full_range: bool) -> Vec<u8> {
 
 #[test]
 fn each_vp9_stream_lands_in_its_format_or_is_refused_at_its_start() {
-    // profile, bit depth, chroma subsampling, range, and the format its frames land in.
+    // profile, bit depth, chroma subsampling, range, and the format its frames land in, on an arm
+    // that lands 4:2:2 and 4:4:4 pictures too.
     for (profile, depth, chroma, full_range, format) in [
         (0, 8, 1, false, Some(b"420v")),
         (0, 8, 0, true, Some(b"420f")),
         (2, 10, 1, false, Some(b"x420")),
         (2, 10, 1, true, Some(b"xf20")),
-        (2, 12, 1, false, None),
-        (1, 8, 3, false, None),
-        (1, 8, 2, false, None),
-        (3, 10, 3, false, None),
+        (2, 12, 1, false, Some(b"tv20")),
+        (1, 8, 2, false, Some(b"422v")),
+        (1, 8, 3, true, Some(b"444f")),
+        (3, 10, 2, false, Some(b"x422")),
+        (3, 10, 3, false, Some(b"x444")),
+        (3, 12, 2, true, Some(b"tf22")),
+        (3, 12, 3, false, Some(b"tv44")),
+        // A profile of another chroma format or depth than it codes.
+        (1, 8, 1, false, None),
+        (3, 8, 3, false, None),
+        (2, 10, 3, false, None),
     ] {
         let what = format!("profile {profile}, {depth} bits, chroma {chroma}, {full_range}");
         let record = vpcc(profile, depth, chroma, full_range);
-        starts_in(Codec::Vp9, &record, false, format, &what);
+        starts_in(Codec::Vp9, &record, true, format, &what);
     }
+    // An arm that lands 4:2:0 pictures alone refuses the rest at their start.
+    let p1 = vpcc(1, 8, 3, false);
+    starts_in(Codec::Vp9, &p1, false, None, "profile 1 on a 4:2:0 arm");
     // A record that does not read, or is not there, or is of version 0, refuses the session.
     let mut version_0 = vpcc(0, 8, 1, false);
     version_0[0] = 0;
@@ -1358,19 +1369,30 @@ fn a_vp9_sample_goes_to_the_backend_whole_with_no_parameter_sets() {
 #[test]
 fn a_refused_vp9_stream_is_named_by_its_profile_chroma_depths_and_size() {
     let arm = FakeBackend::landing();
-    let refused = undecoded_on(&arm, Codec::Vp9, vpcc(1, 8, 3, false)).expect("refused");
+    let refused = undecoded_on(&arm, Codec::Vp9, vpcc(1, 8, 1, false)).expect("refused");
     assert_eq!(
         refused.to_string(),
-        "unsupported: VP9 other than 4:2:0 (VP9 profile 1, chroma_format_idc 3, luma 8 bits, \
-         chroma 8 bits, 64x48)"
+        "unsupported: VP9 of a chroma format its profile does not code (VP9 profile 1, \
+         chroma_format_idc 1, luma 8 bits, chroma 8 bits, 64x48)"
     );
     assert_eq!(
         refused.kind(),
-        "VP9 profile one chroma format three, luma eight bits, chroma eight bits"
+        "VP9 profile one chroma format one, luma eight bits, chroma eight bits"
     );
-    let twelve = undecoded_on(&arm, Codec::Vp9, vpcc(2, 12, 1, false)).expect("refused");
-    assert_eq!(twelve.why, "unsupported: VP9 at 12 bits");
-    assert_eq!(undecoded_on(&arm, Codec::Vp9, vpcc(2, 10, 0, false)), None);
+    // RGB, which a record names with matrixCoefficients 0.
+    let mut rgb = vpcc(1, 8, 3, true);
+    rgb[9] = 0;
+    let rgb = undecoded_on(&arm, Codec::Vp9, rgb).expect("refused");
+    assert_eq!(rgb.why, "unsupported: VP9 in the RGB colour space");
+    // Decoded on an arm that lands 4:2:2 and 4:4:4 pictures too.
+    let range_extensions = RangeExtensions(FakeBackend::landing());
+    for decoded in [
+        vpcc(2, 10, 0, false),
+        vpcc(2, 12, 1, false),
+        vpcc(1, 8, 3, false),
+    ] {
+        assert_eq!(undecoded_on(&range_extensions, Codec::Vp9, decoded), None);
+    }
 }
 
 mod av1;

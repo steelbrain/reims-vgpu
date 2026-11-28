@@ -1176,6 +1176,24 @@ fn vp9_s_caps_are_nvdec_s_answers_and_decline_what_they_lack() {
     assert!(declines_vp9(Some(&both), &stream(0, 8, 64, 64)).is_some());
     assert!(declines_vp9(Some(&both), &stream(0, 8, 8192, 8192)).is_some());
     assert!(declines_vp9(None, &stream(0, 8, 640, 360)).is_some());
+    // Profiles 1 and 3, which NVDEC's caps here never list (the RTX 3090 answers profile 0 and
+    // profile 2 at 10 bits), are refused by those answers at every size and depth.
+    for (profile, chroma, bits) in [(1, 3, 8), (1, 2, 8), (3, 3, 10), (3, 2, 12)] {
+        let odd = Stream {
+            chroma_format_idc: chroma,
+            ..stream(profile, bits, 640, 360)
+        };
+        assert_eq!(
+            declines_vp9(Some(&both), &odd).as_deref(),
+            Some(
+                format!(
+                    "NVDEC does not decode VP9 profile {profile} at {bits} bits, \
+                     chroma_format_idc {chroma}"
+                )
+                .as_str()
+            )
+        );
+    }
 }
 
 /// A VideoToolbox decoder sees a stream that does not decode, or a picture NVDEC failed, as bad

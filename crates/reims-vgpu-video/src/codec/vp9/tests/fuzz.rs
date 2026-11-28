@@ -71,10 +71,17 @@ impl Accelerator for Checking {
     type Error = Error;
 
     fn configure(&mut self, format: &Format) -> Result<(), Error> {
-        assert!(matches!(
-            (format.profile, format.bit_depth),
-            (0, 8) | (2, 10)
-        ));
+        use crate::core::backend::Chroma::{Yuv420, Yuv422, Yuv444};
+        assert!(
+            matches!(
+                (format.profile, format.chroma, format.bit_depth),
+                (0, Yuv420, 8)
+                    | (1, Yuv422 | Yuv444, 8)
+                    | (2, Yuv420, 10 | 12)
+                    | (3, Yuv422 | Yuv444, 10 | 12)
+            ),
+            "a configuration of {format:?}"
+        );
         assert!((1..=MAX_SIDE).contains(&format.width));
         assert!((1..=MAX_SIDE).contains(&format.height));
         self.configured = None;
@@ -129,6 +136,7 @@ impl Accelerator for Checking {
                     .as_ref()
                     .expect("an inter frame's reference is in its slot");
                 assert_eq!(reference.picture.1.bit_depth, format.bit_depth);
+                assert_eq!(reference.picture.1.chroma, format.chroma);
                 for (frame, of) in [
                     (format.width, reference.width),
                     (format.height, reference.height),
@@ -163,18 +171,47 @@ fn some_delta(rng: &mut Rng, magnitude: u32) -> Option<i32> {
         .then(|| rng.range(0, u64::from(2 * magnitude + 1)) as i32 - magnitude as i32)
 }
 
+/// A stream's profile, and the subsampling and depth its frames code where
+/// they code one: 4:2:0 in profiles 0 and 2, 4:2:2 or 4:4:4 in 1 and 3.
+#[derive(Clone, Copy)]
+struct StreamFormat {
+    profile: u32,
+    subsampling: (bool, bool),
+    twelve_bit: bool,
+}
+
+impl StreamFormat {
+    fn draw(rng: &mut Rng) -> Self {
+        let profile = *rng.pick(&[0, 0, 1, 2, 3]);
+        let subsampling = if profile & 1 == 1 {
+            (rng.bool(), false)
+        } else {
+            (true, true)
+        };
+        Self {
+            profile,
+            subsampling,
+            twelve_bit: profile >= 2 && rng.bool(),
+        }
+    }
+}
+
 /// A frame's header with every field drawn: most often an inter frame of
 /// the stream's size, now and then a key frame, an intra-only frame or a
 /// frame that shows a slot, and in `stray` frames fields past their
-/// ranges.
-fn frame_spec(rng: &mut Rng, profile: u32, size: (u32, u32), show: bool) -> FrameSpec {
+/// ranges, among them another profile, depth, subsampling or colour space.
+fn frame_spec(rng: &mut Rng, format: StreamFormat, size: (u32, u32), show: bool) -> FrameSpec {
     let stray = rng.one_in(8);
     let mut spec = if rng.one_in(6) {
         FrameSpec::key(size.0, size.1)
     } else {
         FrameSpec::inter(size.0, size.1)
     };
-    spec.profile = if stray { rng.below(4) as u32 } else { profile };
+    spec.profile = if stray {
+        rng.below(4) as u32
+    } else {
+        format.profile
+    };
     spec.show = show;
     if rng.one_in(12) {
         spec.show_existing = Some(rng.below(8) as u32);
@@ -183,10 +220,14 @@ fn frame_spec(rng: &mut Rng, profile: u32, size: (u32, u32), show: bool) -> Fram
     spec.error_resilient = rng.one_in(8);
     spec.intra_only = !spec.key && !show && rng.one_in(3);
     spec.reset_frame_context = rng.below(4) as u32;
-    spec.twelve_bit = stray && rng.bool();
+    spec.twelve_bit = if stray { rng.bool() } else { format.twelve_bit };
     spec.color_space = if stray { rng.below(8) as u32 } else { 2 };
     spec.full_range = rng.bool();
-    spec.subsampling = (!stray || rng.bool(), !stray || rng.bool());
+    spec.subsampling = if stray {
+        (rng.bool(), rng.bool())
+    } else {
+        format.subsampling
+    };
     if !spec.key {
         spec.refresh = rng.below(256) as u32;
         spec.refs = [0, 1, 2].map(|_| rng.below(8) as u32);
@@ -250,7 +291,7 @@ fn frame_spec(rng: &mut Rng, profile: u32, size: (u32, u32), show: bool) -> Fram
 /// samples of one frame, or of hidden frames and a shown one in a
 /// superframe, each mutated now and then.
 fn stream_case(rng: &mut Rng) {
-    let profile = *rng.pick(&[0, 0, 2]);
+    let format = StreamFormat::draw(rng);
     let size = (side(rng, 64), side(rng, 48));
     let size = (size.0.min(4096), size.1.min(4096));
     let mut decoder = Decoder::new(Checking::default());
@@ -259,9 +300,9 @@ fn stream_case(rng: &mut Rng) {
     for id in 0..samples as u64 {
         let hidden = if rng.one_in(4) { 1 + rng.below(3) } else { 0 };
         let mut frames: Vec<Vec<u8>> = (0..hidden)
-            .map(|_| frame_spec(rng, profile, size, false).write())
+            .map(|_| frame_spec(rng, format, size, false).write())
             .collect();
-        let mut last = frame_spec(rng, profile, size, true);
+        let mut last = frame_spec(rng, format, size, true);
         if id == 0 && !rng.one_in(8) {
             last = FrameSpec {
                 key: true,
@@ -290,13 +331,12 @@ fn stream_case(rng: &mut Rng) {
     }
 }
 
-/// libvpx's streams, a few samples mutated, dropped or repeated.
+/// libvpx's streams of every format, a few samples mutated, dropped or
+/// repeated.
 fn sample_case(rng: &mut Rng) {
-    let file = if rng.bool() {
-        PROFILE_0_IVF
-    } else {
-        PROFILE_2_IVF
-    };
+    let mut files = vec![PROFILE_0_IVF, PROFILE_2_IVF];
+    files.extend(FORMAT_STREAMS.iter().map(|stream| stream.ivf));
+    let file = *rng.pick(&files);
     let samples = ivf_frames(file);
     let mut decoder = Decoder::new(Checking::default());
     for (id, whole) in (0u64..).zip(&samples) {

@@ -15,7 +15,9 @@ use super::{BitField, VA_PADDING_LOW, VA_PADDING_MEDIUM, VAProfile, VASurfaceID}
 
 // VAProfile.
 pub(crate) const VAProfileVP9Profile0: VAProfile = 19;
+pub(crate) const VAProfileVP9Profile1: VAProfile = 20;
 pub(crate) const VAProfileVP9Profile2: VAProfile = 21;
+pub(crate) const VAProfileVP9Profile3: VAProfile = 22;
 
 /// `VADecPictureParameterBufferVP9`: a frame's uncompressed header, as
 /// the driver takes it.
@@ -200,7 +202,9 @@ mod tests {
             ],
         );
         out.push(format!("VAProfileVP9Profile0 {VAProfileVP9Profile0}"));
+        out.push(format!("VAProfileVP9Profile1 {VAProfileVP9Profile1}"));
         out.push(format!("VAProfileVP9Profile2 {VAProfileVP9Profile2}"));
+        out.push(format!("VAProfileVP9Profile3 {VAProfileVP9Profile3}"));
         out
     }
 

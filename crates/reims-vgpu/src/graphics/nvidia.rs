@@ -620,16 +620,17 @@ fn vp9_caps(
     Some(entry)
 }
 
-/// Why NVDEC's decoders take none of `stream`'s pictures, a VP9 stream at 4:2:0, by VP9's `caps`
-/// ([`vp9_caps`]): a profile and depth they lack, or a size outside theirs; `None` where they
-/// take it.
+/// Why NVDEC's decoders take none of `stream`'s pictures, a VP9 stream, by VP9's `caps`
+/// ([`vp9_caps`]), which list profile 0 and profile 2 at 10 bits, 4:2:0, alone: a profile, depth or
+/// chroma format they lack, as profiles 1 and 3 and 12 bits are, or a size outside theirs; `None`
+/// where they take it.
 fn declines_vp9(caps: Option<&RgfxVideoCodecCaps>, stream: &Stream) -> Option<String> {
     let Some(caps) = caps else {
         return Some(format!("{NAME} does not decode VP9"));
     };
-    let profile = match (stream.profile, stream.luma_bits) {
-        (0, 8) => RGFX_VIDEO_VP9_PROFILE_0,
-        (2, 10) => RGFX_VIDEO_VP9_PROFILE_2,
+    let profile = match (stream.profile, stream.luma_bits, stream.chroma_format_idc) {
+        (0, 8, 1) => RGFX_VIDEO_VP9_PROFILE_0,
+        (2, 10, 1) => RGFX_VIDEO_VP9_PROFILE_2,
         _ => 0,
     };
     let (width, height) = (stream.width, stream.height);
@@ -637,8 +638,8 @@ fn declines_vp9(caps: Option<&RgfxVideoCodecCaps>, stream: &Stream) -> Option<St
     let [max_width, max_height] = caps.max_size;
     if caps.profiles & profile == 0 {
         Some(format!(
-            "{NAME} does not decode VP9 profile {} at {} bits",
-            stream.profile, stream.luma_bits
+            "{NAME} does not decode VP9 profile {} at {} bits, chroma_format_idc {}",
+            stream.profile, stream.luma_bits, stream.chroma_format_idc
         ))
     } else if width < min_width || height < min_height || width > max_width || height > max_height {
         Some(format!(
@@ -786,7 +787,7 @@ impl<P: Platform> GraphicsVideo<P> for Shared<P> {
         if codec == HOST_VIDEO_CODEC_AV1 {
             return super::av1::declines(NAME, self.0.av1, stream);
         }
-        if codec == RGFX_VIDEO_CODEC_VP9 && stream.chroma_format_idc == 1 {
+        if codec == RGFX_VIDEO_CODEC_VP9 {
             return declines_vp9(self.0.vp9.as_ref(), stream);
         }
         let gpu = &self.0.gpu;

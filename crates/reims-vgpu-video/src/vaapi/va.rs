@@ -83,5 +83,5 @@ pub use libva::LoadError;
 pub use readback::{ReadbackTimes, ReadbackWay, read_back_by};
 pub use target::{Target, TargetFor, TargetFormat, TargetPlane, TargetShape, TargetTiling};
 pub use target_check::{ALIGNMENT as TARGET_ALIGNMENT, TargetChecks, TargetCodec};
-pub use vp9::Vp9Decoder;
+pub use vp9::{Vp9Decoder, vp9_decoder};
 pub use zero_copy::PackedTarget;

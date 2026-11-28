@@ -52,8 +52,12 @@ impl Profile {
     pub const HEVC_MAIN444_12: Self = Self(ffi::VAProfileHEVCMain444_12);
     /// `VAProfileVP9Profile0`: 4:2:0 at 8 bits.
     pub const VP9_PROFILE0: Self = Self(ffi::vp9::VAProfileVP9Profile0);
+    /// `VAProfileVP9Profile1`: 4:2:2, 4:4:0 and 4:4:4 at 8 bits.
+    pub const VP9_PROFILE1: Self = Self(ffi::vp9::VAProfileVP9Profile1);
     /// `VAProfileVP9Profile2`: 4:2:0 at 10 or 12 bits.
     pub const VP9_PROFILE2: Self = Self(ffi::vp9::VAProfileVP9Profile2);
+    /// `VAProfileVP9Profile3`: 4:2:2, 4:4:0 and 4:4:4 at 10 or 12 bits.
+    pub const VP9_PROFILE3: Self = Self(ffi::vp9::VAProfileVP9Profile3);
 
     /// va.h's name for the profile, without its `VAProfile` prefix.
     pub fn name(self) -> Option<&'static str> {

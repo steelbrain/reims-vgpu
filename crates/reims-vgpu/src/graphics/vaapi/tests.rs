@@ -287,6 +287,111 @@ fn an_hevc_range_extensions_stream_decodes_on_its_profiles_decoder_of_its_surfac
     );
 }
 
+/// A VP9 stream past profile 0 and profile 2 at 10 bits decodes where the driver's decoder of its
+/// profile makes the render targets and surfaces of its chroma format and depth, as the Iris Xe's
+/// iHD lists them for 4:4:4 and 12-bit 4:2:0 (potluck jobs m3-max-77550 and m3-max-77586); a
+/// 4:2:2 one, whose surfaces iHD does not list, and the rest on a driver that lists profiles 0 and
+/// 2 at 10 bits alone, as radeonsi does, are declined by the driver's own answers, naming why.
+#[test]
+fn a_vp9_stream_of_profiles_1_and_3_decodes_where_the_driver_lists_its_decoder() {
+    use reims_vgpu_video::paravirt::Codec as StreamCodec;
+    let stream = |profile: u8, chroma_format_idc: u8, luma_bits: u8| Stream {
+        codec: StreamCodec::Vp9,
+        profile,
+        chroma_format_idc,
+        luma_bits,
+        chroma_bits: luma_bits,
+        width: 1920,
+        height: 1080,
+        range_extensions: false,
+    };
+    let with = |profile, pixel_formats: Vec<Fourcc>, rt_formats: u32| {
+        let mut config = config(profile, rt_formats, (16384, 16384), Some((16, 16)));
+        if let Ok(surfaces) = config.surfaces.as_mut() {
+            surfaces.pixel_formats = pixel_formats;
+        }
+        config
+    };
+    let fourcc = |name: &[u8; 4]| Fourcc(u32::from_le_bytes(*name));
+    let iris = [
+        with(
+            Profile::VP9_PROFILE1,
+            vec![fourcc(b"AYUV"), Fourcc::XYUV],
+            0x0000_0006,
+        ),
+        with(
+            Profile::VP9_PROFILE2,
+            vec![fourcc(b"P010"), Fourcc::P012, fourcc(b"P016")],
+            0x0000_1100,
+        ),
+        with(
+            Profile::VP9_PROFILE3,
+            vec![Fourcc::Y410, Fourcc::Y412, fourcc(b"Y416")],
+            0x0000_6600,
+        ),
+    ];
+    for (profile, chroma, bits) in [(1, 3, 8), (2, 1, 12), (3, 3, 10), (3, 3, 12)] {
+        let taken = stream(profile, chroma, bits);
+        assert_eq!(declines_vp9_formats(&iris, &taken), None, "{taken:?}");
+    }
+    for (taken, why) in [
+        (
+            stream(1, 2, 8),
+            "VA-API's VP9Profile1 decoder writes [AYUV, XYUV], not YUY2",
+        ),
+        (
+            stream(3, 2, 10),
+            "VA-API's VP9Profile3 decoder writes [Y410, Y412, Y416], not Y210",
+        ),
+        (
+            stream(3, 2, 12),
+            "VA-API's VP9Profile3 decoder writes [Y410, Y412, Y416], not Y212",
+        ),
+    ] {
+        assert_eq!(
+            declines_vp9_formats(&iris, &taken).as_deref(),
+            Some(why),
+            "{taken:?}"
+        );
+    }
+    let radeonsi = [
+        with(Profile::VP9_PROFILE0, vec![Fourcc::NV12], RT_YUV420),
+        with(Profile::VP9_PROFILE2, vec![], RT_YUV420_10),
+    ];
+    for (taken, why) in [
+        (
+            stream(1, 3, 8),
+            "VA-API: the driver has no VP9Profile1 decoder",
+        ),
+        (
+            stream(3, 2, 10),
+            "VA-API: the driver has no VP9Profile3 decoder",
+        ),
+        (
+            stream(2, 1, 12),
+            "VA-API: the driver's VP9Profile2 decoder has no YUV420_12 render targets",
+        ),
+        (
+            stream(1, 0, 8),
+            "VA-API decodes VP9 at 4:2:0, 4:2:2 and 4:4:4, not chroma_format_idc 0",
+        ),
+    ] {
+        assert_eq!(
+            declines_vp9_formats(&radeonsi, &taken).as_deref(),
+            Some(why),
+            "{taken:?}"
+        );
+    }
+    // A decoder that lists 4:2:2's surfaces takes a 4:2:2 stream, and one that lists the render
+    // targets but not the surfaces a stream lands from declines it.
+    let yuy2_alone = [with(Profile::VP9_PROFILE1, vec![Fourcc::YUY2], 0x0000_0006)];
+    assert_eq!(declines_vp9_formats(&yuy2_alone, &stream(1, 2, 8)), None);
+    assert_eq!(
+        declines_vp9_formats(&yuy2_alone, &stream(1, 3, 8)).as_deref(),
+        Some("VA-API's VP9Profile1 decoder writes [YUY2], not XYUV")
+    );
+}
+
 /// A 4:2:0 stream of H.264, or of HEVC's Main or Main 10, is declined at its session's start
 /// where the driver's decoder of it, the first of its profiles the driver lists with its render
 /// targets, leaves its size out (from the least its surfaces list, none where they list none, up

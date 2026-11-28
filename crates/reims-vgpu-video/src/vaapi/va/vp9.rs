@@ -1,6 +1,6 @@
 //! VP9 decoding on VA-API: [`crate::codec::vp9::Decoder`] over an accelerator
 //! that fills libva's VP9 buffers (va_dec_vp9.h) and decodes each frame into
-//! a pool of NV12 surfaces for profile 0, P010 ones for profile 2 at 10 bits.
+//! a pool of surfaces of its chroma format and depth ([`vp9_decoder`]).
 //!
 //! A frame goes to the driver whole, its uncompressed header first, as one
 //! slice (`VA_SLICE_DATA_FLAG_ALL`), with the header's fields in the picture
@@ -10,9 +10,35 @@
 //! another size or format than the last makes a new context and pool; the
 //! slots keep the surfaces of the frames before it, which the driver scales
 //! from as references.
+//!
+//! A stream's surfaces must be among those the driver lists for its profile's
+//! decoder (`vaQuerySurfaceAttributes`), or the decoder refuses it. What iHD
+//! 26.3.5 on the Iris Xe of an i9-13900H lists and decodes (**measured**,
+//! potluck job m3-max-77586, 2026-11-27: `vaapi-probe`, and libvpx's streams
+//! of each format decoded into each surface of its chroma format, each frame
+//! against vpxdec's; profiles 0 and 2 at 10 bits, m3-max-77387):
+//!
+//! | profile, chroma, bits | listed surfaces | equal to vpxdec | the driver fails |
+//! |---|---|---|---|
+//! | 0, 4:2:0, 8 | NV12 | NV12 | |
+//! | 1, 4:4:4, 8 | AYUV, XYUV | XYUV, AYUV | |
+//! | 1, 4:2:2, 8 | AYUV, XYUV | none | YUY2 (invalid parameter), XYUV and AYUV (decoding error) |
+//! | 2, 4:2:0, 10 | P010, P012, P016 | P010 | |
+//! | 2, 4:2:0, 12 | P010, P012, P016 | P012, P016 | |
+//! | 3, 4:4:4, 10 | Y410, Y412, Y416 | Y410 | |
+//! | 3, 4:4:4, 12 | Y410, Y412, Y416 | Y412, Y416 | |
+//! | 3, 4:2:2, 10 | Y410, Y412, Y416 | none | Y210 (decoding error), Y410 (invalid parameter) |
+//! | 3, 4:2:2, 12 | Y410, Y412, Y416 | none | Y212, Y216, Y412, Y416 (invalid parameter) |
+//!
+//! So 12-bit 4:2:0 decodes into P012 as HEVC Main 12's does, with no need of
+//! P016, and iHD decodes no 4:2:2 VP9 though its profile 1 and 3 decoders
+//! make 4:2:2 render targets: a 4:2:2 stream's YUY2, Y210 or Y212 surfaces are
+//! not listed, and it is refused. radeonsi (Mesa 26.2.6) on the RX 7900 XTX
+//! lists NV12 and P010 surfaces for profiles 0 and 2, YUV420 and YUV420_10
+//! render targets, and no profile 1 or 3 decoder (potluck job m3-max-77604).
 
 use super::buffer::{Buffer, render_decode};
-use super::caps::{Context, Entrypoint, Profile};
+use super::caps::{Context, Entrypoint, Fourcc, Profile};
 use super::display::{Display, Error};
 use super::ffi;
 use super::ffi::vp9::{
@@ -25,6 +51,7 @@ use super::wait::{self, Deadline};
 use crate::codec::vp9::header::{FrameHeader, MAX_SEGMENTS};
 use crate::codec::vp9::quant::SegmentParams;
 use crate::codec::vp9::{Accelerator, Decoder, Format, FrameParams, Output};
+use crate::core::backend::Chroma;
 
 /// The segment feature that names a reference frame (`SEG_LVL_REF_FRAME`).
 const SEG_LVL_REF_FRAME: usize = 2;
@@ -59,17 +86,19 @@ impl Vp9Decoder {
     }
 
     /// Why the driver decodes none of a stream of VP9 `profile` at
-    /// `bit_depth` and `width` by `height`, or `Ok` where its VLD config of
-    /// the profile takes it.
+    /// `bit_depth` in `chroma` and `width` by `height`, or `Ok` where its VLD
+    /// config of the profile takes it and lists its surfaces.
     pub fn supports(
         display: &Display,
         profile: u8,
         bit_depth: u8,
+        chroma: Chroma,
         (width, height): (u32, u32),
     ) -> Result<(), Error> {
         let format = Format {
             profile,
             bit_depth,
+            chroma,
             width,
             height,
         };
@@ -162,18 +191,51 @@ impl VaVp9 {
     }
 }
 
-/// The VA profile and surface format of `format`'s frames: profile 0 in
-/// NV12, profile 2 at 10 bits in P010. The codec's decoder has refused the
-/// rest.
+/// The VA profile and surface format of `format`'s frames ([`surfaces_of`]).
+/// The codec's decoder has refused the rest.
 fn profile_for(format: &Format) -> Result<(Profile, SurfaceFormat), Error> {
-    match (format.profile, format.bit_depth) {
-        (0, 8) => Ok((Profile::VP9_PROFILE0, SurfaceFormat::Nv12)),
-        (2, 10) => Ok((Profile::VP9_PROFILE2, SurfaceFormat::P010)),
-        (profile, depth) => Err(Error::Unsupported(format!(
-            "VP9 profile {profile} at {depth} bits: VA-API decodes profile 0, and 2 at 10 bits, \
-             here"
-        ))),
-    }
+    surfaces_of(format.profile, format.chroma, format.bit_depth).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "VP9 profile {} in {:?} at {} bits",
+            format.profile, format.chroma, format.bit_depth
+        ))
+    })
+}
+
+/// The VA profile of VP9's `profile`, and the surfaces a stream of `chroma` at
+/// `bits` decodes into: 4:2:0 into NV12, P010 and P012 at 8, 10 and 12 bits;
+/// 4:2:2 into YUY2, Y210 and Y212; 4:4:4 into XYUV, Y410 and Y412 (as HEVC's
+/// range extensions decode into them, `super::hevc`).
+fn surfaces_of(profile: u8, chroma: Chroma, bits: u8) -> Option<(Profile, SurfaceFormat)> {
+    let va = match profile {
+        0 => Profile::VP9_PROFILE0,
+        1 => Profile::VP9_PROFILE1,
+        2 => Profile::VP9_PROFILE2,
+        3 => Profile::VP9_PROFILE3,
+        _ => return None,
+    };
+    let surfaces = match (chroma, bits) {
+        (Chroma::Yuv420, 8) => SurfaceFormat::Nv12,
+        (Chroma::Yuv420, 10) => SurfaceFormat::P010,
+        (Chroma::Yuv420, 12) => SurfaceFormat::P012,
+        (Chroma::Yuv422, 8) => SurfaceFormat::Yuy2,
+        (Chroma::Yuv422, 10) => SurfaceFormat::Y210,
+        (Chroma::Yuv422, 12) => SurfaceFormat::Y212,
+        (Chroma::Yuv444, 8) => SurfaceFormat::Xyuv,
+        (Chroma::Yuv444, 10) => SurfaceFormat::Y410,
+        (Chroma::Yuv444, 12) => SurfaceFormat::Y412,
+        _ => return None,
+    };
+    Some((va, surfaces))
+}
+
+/// What a VP9 stream of `profile` in `chroma` at `bits` decodes on, for a
+/// caller that checks the driver's answers for it: the VA profile, the
+/// render-target format (a `VA_RT_FORMAT_*` bit) its config is made with, and
+/// the surfaces' FOURCC; `None` for a format the decoder takes none of.
+pub fn vp9_decoder(profile: u8, chroma: Chroma, bits: u8) -> Option<(Profile, u32, Fourcc)> {
+    let (va, surfaces) = surfaces_of(profile, chroma, bits)?;
+    Some((va, surfaces.rt_format(), Fourcc(surfaces.fourcc())))
 }
 
 /// The VA profile, where the driver decodes `format`'s frames at their size.
@@ -197,6 +259,15 @@ fn select_profile(display: &Display, format: &Format) -> Result<Profile, Error> 
     if limits[0].is_some_and(|f| f & surfaces.rt_format() == 0) {
         return Err(Error::Unsupported(format!(
             "{name}: no {} render targets",
+            surfaces.name()
+        )));
+    }
+    // iHD's profile 1 and 3 decoders make 4:2:2 render targets, but list no 4:2:2 surfaces,
+    // and fail a 4:2:2 frame's decode into any surface (module doc).
+    let listed = display.surface_capabilities(profile, Entrypoint::VLD)?;
+    if !listed.pixel_formats.contains(&Fourcc(surfaces.fourcc())) {
+        return Err(Error::Unsupported(format!(
+            "{name}: the driver's decoder writes no {} surfaces",
             surfaces.name()
         )));
     }

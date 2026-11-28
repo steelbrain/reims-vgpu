@@ -87,6 +87,8 @@ int main(void)
     SEG(segment_reference_skipped);
 
     C(VAProfileVP9Profile0);
+    C(VAProfileVP9Profile1);
     C(VAProfileVP9Profile2);
+    C(VAProfileVP9Profile3);
     return 0;
 }

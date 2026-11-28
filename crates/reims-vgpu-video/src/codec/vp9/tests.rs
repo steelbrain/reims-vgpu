@@ -30,6 +30,49 @@ pub(crate) const PROFILE_0_MD5: &str = include_str!("tests/vp9p0.md5");
 /// high bits of a 16-bit little-endian word.
 pub(crate) const PROFILE_2_MD5: &str = include_str!("tests/vp9p2.md5");
 
+/// A libvpx stream of one of VP9's formats past profile 0 and profile 2 at 10
+/// bits: 352x288, 20 frames of ffmpeg's `testsrc2` coded by libvpx-vp9 (two
+/// passes, altref frames on, so hidden frames in superframes), in IVF, with
+/// each frame's MD5 as `vpxdec` decodes it over the guest's two planes of its
+/// format: luma, then Cb and Cr interleaved at the chroma's resolution, a
+/// sample past 8 bits a little-endian 16-bit word with its bits at the top
+/// (ffmpeg's `p012`, `nv16`, `p210`, `p212`, `nv24`, `p410` and `p412`, whose
+/// framemd5 of ffmpeg's own VP9 decoder gives the same).
+pub(crate) struct FormatStream {
+    pub(crate) name: &'static str,
+    pub(crate) profile: u8,
+    pub(crate) chroma: crate::core::backend::Chroma,
+    pub(crate) depth: u8,
+    pub(crate) ivf: &'static [u8],
+    pub(crate) md5: &'static str,
+}
+
+/// The streams of profile 2 at 12 bits and of profiles 1 and 3.
+pub(crate) const FORMAT_STREAMS: [FormatStream; 7] = {
+    use crate::core::backend::Chroma::{Yuv420, Yuv422, Yuv444};
+    macro_rules! stream {
+        ($name:literal, $profile:literal, $chroma:expr, $depth:literal) => {
+            FormatStream {
+                name: $name,
+                profile: $profile,
+                chroma: $chroma,
+                depth: $depth,
+                ivf: include_bytes!(concat!("tests/", $name, ".ivf")),
+                md5: include_str!(concat!("tests/", $name, ".md5")),
+            }
+        };
+    }
+    [
+        stream!("vp9p2-12", 2, Yuv420, 12),
+        stream!("vp9p1-422", 1, Yuv422, 8),
+        stream!("vp9p1-444", 1, Yuv444, 8),
+        stream!("vp9p3-422-10", 3, Yuv422, 10),
+        stream!("vp9p3-422-12", 3, Yuv422, 12),
+        stream!("vp9p3-444-10", 3, Yuv444, 10),
+        stream!("vp9p3-444-12", 3, Yuv444, 12),
+    ]
+};
+
 /// An IVF file's frames: each frame record's bytes after its 12-byte
 /// header.
 pub(crate) fn ivf_frames(file: &[u8]) -> Vec<&[u8]> {
@@ -805,7 +848,46 @@ fn a_vpcc_record_reads_and_its_streams_are_checked() {
     assert_eq!(check_supported(&p2), Ok(()));
     let p1 = VpCodecConfiguration::parse(&[1, 0, 0, 0, 1, 0, 0x86, 1, 1, 1, 0, 0]).unwrap();
     assert_eq!(p1.chroma_subsampling, 3);
-    assert!(matches!(check_supported(&p1), Err(Error::Unsupported(_))));
+    assert_eq!(check_supported(&p1), Ok(()));
+    // Each profile at its depths and chroma formats, and the records VP9 does not code.
+    let record = |profile, depth: u8, chroma: u8, matrix| VpCodecConfiguration {
+        profile,
+        level: 0,
+        bit_depth: depth,
+        chroma_subsampling: chroma,
+        full_range: false,
+        colour_primaries: 1,
+        transfer_characteristics: 1,
+        matrix_coefficients: matrix,
+    };
+    for (profile, depth, chroma) in [(1, 8, 2), (2, 12, 1), (3, 10, 2), (3, 12, 3)] {
+        assert_eq!(check_supported(&record(profile, depth, chroma, 1)), Ok(()));
+    }
+    for (profile, depth, chroma, matrix) in [
+        // 4:2:0 in profile 1 or 3, 4:2:2 or 4:4:4 in 0 or 2.
+        (1, 8, 1, 1),
+        (3, 10, 0, 1),
+        (0, 8, 3, 1),
+        (2, 10, 2, 1),
+        // A depth the profile does not code.
+        (0, 10, 1, 1),
+        (1, 12, 3, 1),
+        (3, 8, 3, 1),
+        (4, 8, 1, 1),
+        // RGB (Identity) in profile 1, and a reserved chroma subsampling.
+        (1, 8, 3, 0),
+        (3, 10, 4, 1),
+    ] {
+        assert!(
+            matches!(
+                check_supported(&record(profile, depth, chroma, matrix)),
+                Err(Error::Unsupported(_))
+            ),
+            "profile {profile}, {depth} bits, chroma {chroma}, matrix {matrix}"
+        );
+    }
+    // Profile 0's Identity matrix is not RGB, which profile 0 cannot code.
+    assert_eq!(check_supported(&record(0, 8, 1, 0)), Ok(()));
     for short in 0..12 {
         assert_eq!(
             VpCodecConfiguration::parse(&[1; 12][..short]),
@@ -917,28 +999,98 @@ fn references_out_of_scale_or_format_are_refused() {
     ));
 }
 
+/// A key frame of `profile` at 64x64: `subsampling` in profiles 1 and 3,
+/// 12 bits where `twelve_bit` in 2 and 3.
+fn key_of(profile: u32, subsampling: (bool, bool), twelve_bit: bool) -> FrameSpec {
+    let mut key = FrameSpec::key(64, 64);
+    key.profile = profile;
+    key.subsampling = subsampling;
+    key.twelve_bit = twelve_bit;
+    key
+}
+
 #[test]
-fn unsupported_profiles_and_sizes_are_refused_before_the_accelerator() {
+fn unsupported_formats_and_sizes_are_refused_before_the_accelerator() {
     let mut decoder = Decoder::new(Recording::default());
-    let mut p1 = FrameSpec::key(64, 64);
-    p1.profile = 1;
-    p1.subsampling = (false, false);
+    let four_four_zero = key_of(1, (false, true), false);
+    assert_eq!(
+        decoder.decode(&four_four_zero.write(), 0).err(),
+        Some(Error::Unsupported("VP9 at 4:4:0"))
+    );
+    let mut rgb = key_of(3, (false, false), false);
+    rgb.color_space = header::CS_RGB.into();
+    assert_eq!(
+        decoder.decode(&rgb.write(), 1).err(),
+        Some(Error::Unsupported("VP9 in the RGB colour space"))
+    );
+    // libvpx refuses 4:2:0 in profiles 1 and 3.
+    assert_eq!(
+        decoder
+            .decode(&key_of(1, (true, true), false).write(), 2)
+            .err(),
+        Some(Error::Unsupported(
+            "VP9 of a chroma format its profile does not code"
+        ))
+    );
     assert!(matches!(
-        decoder.decode(&p1.write(), 0),
-        Err(Error::Unsupported(_))
-    ));
-    let mut twelve = FrameSpec::key(64, 64);
-    twelve.profile = 2;
-    twelve.twelve_bit = true;
-    assert!(matches!(
-        decoder.decode(&twelve.write(), 1),
-        Err(Error::Unsupported(_))
-    ));
-    assert!(matches!(
-        decoder.decode(&FrameSpec::key(MAX_SIDE + 1, 64).write(), 2),
+        decoder.decode(&FrameSpec::key(MAX_SIDE + 1, 64).write(), 3),
         Err(Error::TooLarge)
     ));
     assert!(decoder.accelerator().configured.is_empty());
+}
+
+#[test]
+fn each_profile_configures_its_chroma_format_and_depth() {
+    use crate::core::backend::Chroma::{Yuv420, Yuv422, Yuv444};
+    for (spec, chroma, depth) in [
+        (key_of(0, (true, true), false), Yuv420, 8),
+        (key_of(1, (true, false), false), Yuv422, 8),
+        (key_of(1, (false, false), false), Yuv444, 8),
+        (key_of(2, (true, true), false), Yuv420, 10),
+        (key_of(2, (true, true), true), Yuv420, 12),
+        (key_of(3, (true, false), false), Yuv422, 10),
+        (key_of(3, (true, false), true), Yuv422, 12),
+        (key_of(3, (false, false), false), Yuv444, 10),
+        (key_of(3, (false, false), true), Yuv444, 12),
+    ] {
+        let mut decoder = Decoder::new(Recording::default());
+        let out = decoder.decode(&spec.write(), 0).unwrap();
+        assert_eq!(out[0].bit_depth, depth);
+        let configured = decoder.accelerator().configured[0];
+        assert_eq!(
+            (configured.profile, configured.chroma, configured.bit_depth),
+            (u8::try_from(spec.profile).unwrap(), chroma, depth)
+        );
+    }
+}
+
+#[test]
+fn an_inter_frame_whose_reference_has_another_chroma_format_is_refused() {
+    let mut decoder = Decoder::new(Recording::default());
+    // A 4:4:4 key frame fills every slot; an intra-only 4:2:2 frame of the
+    // same profile then refills slot 0 alone, and puts 4:2:2 in force.
+    let mut key = key_of(1, (false, false), false);
+    key.size = (64, 64);
+    decoder.decode(&key.write(), 0).unwrap();
+    let mut intra = key_of(1, (true, false), false);
+    intra.key = false;
+    intra.show = false;
+    intra.intra_only = true;
+    intra.refresh = 1;
+    decoder.decode(&intra.write(), 1).unwrap();
+    // A 4:2:2 inter frame from slot 0 decodes; one naming slot 1 (4:4:4) is
+    // refused, and the accelerator decodes nothing of it.
+    let mut inter = FrameSpec::inter(64, 64);
+    inter.profile = 1;
+    inter.refs = [0, 0, 0];
+    assert_eq!(decoder.decode(&inter.write(), 2).unwrap().len(), 1);
+    inter.refs = [0, 1, 0];
+    let decoded = decoder.accelerator().frames.len();
+    assert_eq!(
+        decoder.decode(&inter.write(), 3).err(),
+        Some(Error::BadReference)
+    );
+    assert_eq!(decoder.accelerator().frames.len(), decoded);
 }
 
 #[test]
@@ -988,6 +1140,37 @@ fn libvpx_streams_decode_every_frame_in_order() {
             PROFILE_2_MD5
         };
         assert_eq!(md5.lines().count(), 30, "a reference MD5 a frame");
+    }
+}
+
+#[test]
+fn libvpx_streams_of_every_format_decode_every_frame_in_order() {
+    for stream in &FORMAT_STREAMS {
+        let name = stream.name;
+        let mut decoder = Decoder::new(Recording::default());
+        let (mut shown, mut frames) = (0, 0);
+        for (id, sample) in (0u64..).zip(ivf_frames(stream.ivf)) {
+            frames += superframe::frames(sample).unwrap().len();
+            let out = decoder.decode(sample, id).unwrap();
+            assert_eq!(out.len(), 1, "{name}: sample {id} shows one frame");
+            assert_eq!((out[0].size, out[0].bit_depth), ((352, 288), stream.depth));
+            shown += 1;
+        }
+        assert_eq!(shown, 20, "{name}");
+        assert!(frames > shown, "{name}: hidden frames in superframes");
+        let configured = &decoder.accelerator().configured;
+        assert_eq!(configured.len(), 1, "{name}");
+        let format = configured[0];
+        assert_eq!(
+            (format.profile, format.chroma, format.bit_depth),
+            (stream.profile, stream.chroma, stream.depth),
+            "{name}"
+        );
+        assert_eq!(
+            stream.md5.lines().count(),
+            20,
+            "{name}: a reference MD5 a frame"
+        );
     }
 }
 

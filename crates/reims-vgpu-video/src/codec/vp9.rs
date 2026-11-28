@@ -12,9 +12,11 @@
 //!
 //! A sample is a frame or a superframe (Annex B), as a container's sample
 //! and VideoToolbox's sample buffer hold it: the host splits a superframe
-//! itself, from bytes the guest wrote ([`superframe`]). Profiles 0 and 2,
-//! 4:2:0 at 8 and 10 bits, are decoded; profiles 1 and 3, 12-bit samples
-//! and RGB are refused with [`Error::Unsupported`] ([`check_supported`]).
+//! itself, from bytes the guest wrote ([`superframe`]). Every profile is
+//! decoded at its depths: 4:2:0 in profiles 0 and 2, 4:2:2 and 4:4:4 in
+//! profiles 1 and 3; 4:4:0 and the RGB colour space are refused with
+//! [`Error::Unsupported`] ([`check_supported`]), as no format the guest takes
+//! holds them.
 
 mod bits;
 pub mod config;
