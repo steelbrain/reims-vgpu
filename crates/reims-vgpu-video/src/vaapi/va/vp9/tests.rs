@@ -154,15 +154,15 @@ fn libvpx_streams_decode_to_libvpx_frames() {
 
 /// The streams of profile 2 at 12 bits and of profiles 1 and 3, each where the
 /// driver's decoder of its profile makes its render targets and lists its
-/// surfaces (`Vp9Decoder::supports`), each stream's outcome printed: on the
-/// Iris Xe's iHD the 12-bit 4:2:0 and every 4:4:4 one (4:2:2's surfaces are
-/// not listed, `super` module doc); on radeonsi none, which lists profiles 0
-/// and 2 at 10 bits alone.
+/// surfaces (`Vp9Decoder::supports`), each stream's name printed before it
+/// decodes, so a failure names its stream: on the Iris Xe's iHD the 12-bit
+/// 4:2:0 and every 4:4:4 one (4:2:2's surfaces are not listed, `super` module
+/// doc); on radeonsi none, which lists profiles 0 and 2 at 10 bits alone.
 #[test]
 #[ignore = "needs a VA-API driver: run on a VA-API host"]
 fn libvpx_streams_of_every_format_the_driver_lists_decode_to_libvpx_frames() {
     let display = display();
-    let (mut decoded, mut failed) = (Vec::new(), Vec::new());
+    let mut decoded = Vec::new();
     for stream in &FORMAT_STREAMS {
         let size = (352, 288);
         if let Err(why) =
@@ -171,19 +171,11 @@ fn libvpx_streams_of_every_format_the_driver_lists_decode_to_libvpx_frames() {
             eprintln!("{}: not listed here: {why}", stream.name);
             continue;
         }
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert_frames(&display, stream.name, stream.ivf, stream.md5);
-        }));
-        match outcome {
-            Ok(()) => decoded.push(stream.name),
-            Err(_) => failed.push(stream.name),
-        }
+        eprintln!("{}: decoding", stream.name);
+        assert_frames(&display, stream.name, stream.ivf, stream.md5);
+        decoded.push(stream.name);
     }
     eprintln!("decoded to libvpx's frames: {decoded:?}");
-    assert!(
-        failed.is_empty(),
-        "not decoded to libvpx's frames: {failed:?}"
-    );
 }
 
 #[test]
