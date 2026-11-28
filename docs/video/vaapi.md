@@ -1308,14 +1308,26 @@ them. The map's prediction probabilities go as 255 where its update is not tempo
 
 ### Surfaces and what it refuses
 
-- Profile 0 decodes into NV12 (`VAProfileVP9Profile0`), profile 2 at 10 bits into P010
-  (`VAProfileVP9Profile2`, `VA_RT_FORMAT_YUV420_10`), where the driver's VLD config lists the
-  format and the frame's size (`Vp9Decoder::supports`, which answers the guest's stream at its
-  session's start).
+- A frame decodes on the VA profile of its VP9 profile (`VAProfileVP9Profile0` to `3`) into
+  surfaces of its chroma format and depth, the ones HEVC's range extensions decode into
+  ("Surfaces, formats and readback"): 4:2:0 into NV12, P010 and P012 at 8, 10 and 12 bits,
+  4:2:2 into YUY2, Y210 and Y212, and 4:4:4 into XYUV, Y410 and Y412 (`vp9_decoder`). It does so
+  where the driver's VLD config of the profile makes their render targets, lists the surfaces
+  (`vaQuerySurfaceAttributes`) and takes the frame's size (`Vp9Decoder::supports`, which answers
+  the guest's stream at its session's start).
+- iHD 26.3.5 on the Iris Xe lists AYUV and XYUV surfaces for profile 1, P010, P012 and P016 for
+  profile 2, and Y410, Y412 and Y416 for profile 3, though its profile 1 and 3 decoders make
+  4:2:2 render targets. It decodes no 4:2:2 VP9: forced into YUY2, Y210, Y212, Y216, XYUV, AYUV,
+  Y410, Y412 or Y416 surfaces, a 4:2:2 frame's `vaEndPicture` fails. It decodes 12-bit 4:2:0
+  into P012 and P016 alike, and 4:4:4 at 12 bits into Y412 and Y416 alike (**measured**, potluck
+  job m3-max-77586, 2026-11-27; the table is `src/vaapi/va/vp9.rs`'s module doc).
 - A context is made for each run of frames of one format and size; a frame's references stay
   the surfaces of the frames its slots hold, of whichever context.
 - Refused with `Error::Vp9Bitstream(vp9::Error::Unsupported(..))`, before anything reaches the
-  driver: profiles 1 and 3 (4:4:4, 4:2:2 and 4:4:0) and 12 bits. A frame that predicts from an
+  driver: 4:4:0, VP9's RGB colour space (a frame's `color_space` 7, or `vpcC`'s matrix
+  coefficients 0 in profile 1 or 3), a chroma format the profile does not code (4:2:0 in
+  profile 1 or 3, any other in profile 0 or 2), and a depth it does not (profiles 0 and 1 code
+  8 bits, profiles 2 and 3 code 10 and 12). A frame that predicts from an
   empty slot, as a stream started after its key frame does, is a picture's error, until a key
   frame fills the slots.
 - Malformed superframe indexes and headers are refused as bad data, with nothing taken from a
@@ -1325,7 +1337,11 @@ them. The map's prediction probabilities go as 255 where its update is not tempo
 The tree's two libvpx streams (`src/codec/vp9/tests`: 640x360, profile 0 and profile 2, three
 superframes each with a hidden altref frame) decode frame by frame equal to vpxdec's MD5s
 (the ignored `vaapi::va::vp9` tests): on the RX 7900 XTX's radeonsi (potluck job m3-max-77352)
-and the Iris Xe's iHD (potluck job m3-max-77387), 2026-11-27.
+and the Iris Xe's iHD (potluck job m3-max-77387), 2026-11-27. Its seven streams of the other
+formats (352x288, 20 frames, two superframes each: profile 2 at 12 bits, profile 1 at 4:2:2 and
+4:4:4, profile 3 at 4:2:2 and 4:4:4 at 10 and 12 bits) decode the same way where the driver
+lists their decoder and surfaces: on the Iris Xe the 12-bit 4:2:0 one and the three 4:4:4 ones,
+and on the RX 7900 XTX none (potluck jobs m3-max-77605 and m3-max-77604, 2026-11-27).
 
 ## The encoders
 

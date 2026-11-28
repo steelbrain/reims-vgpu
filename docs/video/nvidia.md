@@ -337,8 +337,11 @@ DPB names it follows NVIDIA's parser, measured on 2026-10-24:
   and NVDEC names references by their surfaces, so a frame of another
   size than the frames it predicts from (a resize between key frames,
   which VP9 allows) does not decode, nor do the frames after it until an
-  intra frame fills the slots ([bugs.md](bugs.md), B96). VP9's profiles 1
-  and 3 and 12 bits, as unsupported, before NVDEC sees a frame.
+  intra frame fills the slots ([bugs.md](bugs.md), B96). VP9 past profile 0
+  and profile 2 at 10 bits, 4:2:0 (profiles 1 and 3, and 12 bits), as
+  unsupported, at the decoder's configure, before NVDEC sees a frame; the
+  arm's `dsta` refuses such a stream at its start
+  ([devices.md](devices.md), "VP9's profiles 1 and 3 on arm64 guests").
 - An HEVC picture with more than 8 pictures in one of its current
   reference sets, as unsupported: `CUVIDHEVCPICPARAMS` holds 8 a set
   (`current_set`, `src/nvidia/nvdec/hevc.rs`, "NVDEC takes 8"). The caps answer 8 current references

@@ -1970,13 +1970,16 @@ Stages:
       each superframe by its index and decodes every frame, after checking
       each size against the bytes it holds (`reims_vgpu_video::codec::vp9`).
       `dsta` refuses with `kVTVideoDecoderUnsupportedDataFormatErr` a
-      stream of profile 1 or 3, of 12 bits, or one the arm declines (a
-      profile or size its driver lacks), and arm64 macOS then has no VP9
-      decoder for it (devices.md, "Which hardware"). The guest's
-      VideoToolbox, on macOS 14.6.1 as on 26.6.2, lists the decoder once a
-      process registers VP9, and hands it every VP9 stream, a Profile 1
-      stream too, which the host then refuses at `dsta` (measured under
-      TCG, 2026-11-27, potluck jobs m3-max-77373 and m3-max-77382).
+      stream the arm declines (a profile, chroma format, depth or size its
+      driver lacks) and one of 4:4:0 or VP9's RGB colour space, and arm64
+      macOS then has no VP9 decoder for it (devices.md, "Which hardware").
+      The guest's VideoToolbox, on macOS 14.6.1 as on 26.6.2, lists the
+      decoder once a process registers VP9, and hands it every VP9 stream,
+      though `dcap` names profiles 0 and 2 alone (measured under TCG,
+      2026-11-27, potluck jobs m3-max-77373 and m3-max-77382). So a host
+      whose driver decodes profiles 1 and 3, or 12 bits, takes them with
+      no change to the wire (devices.md, "VP9's profiles 1 and 3 on arm64
+      guests").
     - **The host offers `VT_MESSAGES` where its arm lands decodes in the
       guest's surfaces**: on VA-API and on NVDEC, each where it decodes
       H.264 or HEVC. The arm64e kext publishes the service on macOS 14

@@ -65,13 +65,15 @@ none reaches the host; after it a session decodes on the host. arm64 macOS 26.6.
 decoder of its own, and the M3's macOS 27.0.1 none in software: a session that allows no hardware
 fails −12906 before and after (**measured** under TCG on an RX 7900 XTX host, and on the M3,
 2026-11-27, potluck jobs m3-max-77263 and m3-max-77262). So a VP9 stream the host does not decode,
-a Profile 1 or 3 stream or one at 12 bits, or any VP9 on a host whose driver lists none, is not
-decoded in the guest at all. The guest's VideoToolbox does hand such a stream to the host's
-decoder, though its profiles name 0 and 2 alone: an 8-bit 4:4:4 Profile 1 stream's session reached
-the host, whose `dsta` refused it (−12910, `kVTVideoDecoderUnsupportedDataFormatErr`, whether the
-session required hardware or allowed it), and a session that allowed no hardware failed −12906
-(**measured** on the Iris Xe host, whose driver lists profiles 1 and 3, 2026-11-27, potluck job
-m3-max-77382). Each sample, a frame or a superframe whole, is split into its frames on the host,
+or any VP9 on a host whose driver lists none, is not decoded in the guest at all. The guest's
+VideoToolbox hands a stream of every profile to the host's decoder, though the caps' profiles
+name 0 and 2 alone: before the host took profiles 1 and 3, an 8-bit 4:4:4 Profile 1 stream's
+session reached the host, whose `dsta` refused it (−12910,
+`kVTVideoDecoderUnsupportedDataFormatErr`, whether the session required hardware or allowed it),
+and a session that allowed no hardware failed −12906 (**measured** on the Iris Xe host, 2026-11-27,
+potluck job m3-max-77382). The host takes profiles 1 and 3, and profile 2 at 12 bits, where its
+driver decodes them, and refuses the rest at `dsta` so ("VP9's profiles 1 and 3 on arm64 guests",
+below). Each sample, a frame or a superframe whole, is split into its frames on the host,
 which decodes them all and lands the one it shows. The guest's pictures of our two libvpx streams
 equal vpxdec's, frame by frame, by the IVF route (the probe's own `vpcC`) and the MP4 route
 (AVFoundation's), in sessions that require hardware: on an RX 7900 XTX (radeonsi), an Iris Xe
@@ -576,3 +578,41 @@ medians of the three, in seconds for the 30 pictures:
 Every hardware run was faster than every software run of its stream (hardware 0.361 to 0.660 s,
 software 1.883 to 5.315 s), and the run counted 450 pictures converted by the CPU, the five CPU
 rows' 90 each.
+
+## VP9's profiles 1 and 3 on arm64 guests
+
+VP9's profile 1 (4:2:2 and 4:4:4 at 8 bits), profile 3 (the same at 10 and 12 bits) and profile 2
+at 12 bits reach the host by the paravirtual route as profiles 0 and 2 do. The caps entry still
+lists profiles 0 and 2 alone, and the device's wire is unchanged: the host's `dsta` decides from
+the arm's own answers (`declines_vp9` in `graphics/vaapi.rs` and `graphics/nvidia.rs`), naming
+the stream and the reason in its warning where it refuses. VA-API takes a stream where the
+driver's decoder of its profile (`VAProfileVP9Profile1` to `3`) makes the render targets and
+lists the surfaces of its chroma format and depth, the ones HEVC's range extensions decode into:
+P012 for 4:2:0 at 12 bits, YUY2, Y210 and Y212 for 4:2:2, XYUV, Y410 and Y412 for 4:4:4
+([vaapi.md](vaapi.md), "The VP9 decoder"). Its pictures land as the range extensions' pictures
+of the same chroma format and depth do (the table in "HEVC's range extensions on arm64 guests",
+above): `tv20`, `422v`, `x422`, `tv22`, `444v`, `x444` and `tv44`. NVDEC takes profile 0 and
+profile 2 at 10 bits alone ([nvidia.md](nvidia.md)). 4:4:0 and VP9's RGB colour space are the
+codec's own refusals on every host.
+
+| host | taken | refused |
+|---|---|---|
+| Iris Xe, iHD 26.3.5 | profile 1 at 4:4:4; profile 2 at 12 bits; profile 3 at 4:4:4, 10 and 12 bits | 4:2:2 at every depth: the decoders of profiles 1 and 3 make 4:2:2 render targets but list no 4:2:2 surfaces, as `VA-API's VP9Profile1 decoder writes [AYUV, XYUV], not YUY2`, and fail a 4:2:2 frame's decode into any surface (vaapi.md) |
+| RX 7900 XTX and Radeon 780M, radeonsi | none | profiles 1 and 3: `VA-API: the driver has no VP9Profile1 decoder`; profile 2 at 12 bits: no YUV420_12 render targets |
+| RTX 3090, NVDEC | none | `NVDEC does not decode VP9 profile 1 at 8 bits, chroma_format_idc 3`, and so on |
+
+The guest's pictures of our libvpx streams of the formats past profile 0 and profile 2 at 10 bits
+(`src/codec/vp9/tests` of the video crate: 352x288, 20 frames, two superframes each) equal
+vpxdec's frame by frame, by the IVF route and the MP4 route, in sessions that require hardware, on
+the Iris Xe under arm64 macOS 26.6.2 and 14.6.1 under TCG: profile 1 at 4:4:4 into `444v`,
+profile 2 at 12 bits into `tv20`, and profile 3 at 4:4:4 into `x444` and `tv44`. The session of
+each 4:2:2 stream failed −12910 at its create, and the profile 0 and 2 streams decoded as before
+(**measured** 2026-11-27, potluck jobs m3-max-77567 and m3-max-77606). A profile 1 4:4:4 stream at
+1920x1080 (60 frames, profile 0's stream's frames) decodes at 85% and 87% of profile 0's rate on
+the same card, its pictures split by the GPU from XYUV into `444v`'s two planes (3.4 ms a picture
+on average, from the driver's write to the pass's end). Measured with the guest's CPU emulated
+(TCG, 4 CPUs), in sessions that require hardware taking turns with profile 0's, in frames a
+second: under macOS 26.6.2 (m3-max-77567), 77.9 and 82.1 against profile 0's 99.5, 82.0 and
+94.6, and HEVC's 92.1; under 14.6.1 (m3-max-77606), 81.2 and 77.9 against 91.0, 93.5 and 88.8,
+and HEVC's 84.9. The percentages are the means of profile 1's runs against the medians of
+profile 0's.

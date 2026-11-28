@@ -107,8 +107,10 @@ ignored hardware tests ([nvidia.md](nvidia.md)).
 
 x264, x265, kvazaar and ffmpeg are test oracles alone: they write the test streams and the
 reference MD5s under `build/`, and nothing they write is committed. VP9 has no such suite: the
-codec module's VP9 tests carry two streams of their own, committed (`src/codec/vp9/tests`:
-ffmpeg's `testsrc2` encoded by libvpx at 640x360, profile 0 and profile 2, 60 and 56 KB), with
+codec module's VP9 tests carry streams of their own, committed (`src/codec/vp9/tests`:
+ffmpeg's `testsrc2` encoded by libvpx at 640x360, profile 0 and profile 2, 60 and 56 KB; and at
+352x288, 20 frames in two passes, each with two superframes, profile 2 at 12 bits, profile 1 at
+4:2:2 and 4:4:4, and profile 3 at 4:2:2 and 4:4:4 at 10 and 12 bits, 385 KB in all), with
 vpxdec's MD5 of each frame, which ffmpeg's own VP9 decoder matched frame for frame; each arm's
 ignored VP9 tests decode them against those MD5s ([vaapi.md](vaapi.md), "The VP9 decoder";
 [nvidia.md](nvidia.md), "Tests"). Each script runs in a potluck

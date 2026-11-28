@@ -86,10 +86,12 @@ or has no player for them at all:
   hardware by name before they hand a photo or a Motion JPEG video to a GPU. Our virtual
   machines have neither, so they decode JPEG in software. Our virtual GPU decodes JPEG when
   asked directly, but no app's route asks it.
-- **VP9 at 4:2:2 or 4:4:4, or at 12 bits, on arm64 guests.** On a Linux host whose GPU decodes
-  VP9, arm64 guests decode it there at 4:2:0 in 8 and 10 bits. macOS hands the other VP9 formats
-  to our virtual GPU too, but our virtual GPU doesn't take them yet, and arm64 macOS has no VP9
-  decoding of its own, so the guest has no player for them.
+- **Some VP9 formats on arm64 guests.** arm64 guests decode VP9 on the host's GPU in the formats
+  its driver decodes. On an Intel Iris Xe that's 4:2:0 at 8, 10 and 12 bits and 4:4:4 at 8, 10
+  and 12 bits, but no 4:2:2. On the AMD and NVIDIA GPUs we tested it's 4:2:0 at 8 and 10 bits.
+  arm64 macOS has no VP9 decoding of its own, so a stream in a format the host's GPU doesn't
+  decode has no player in the guest. Our virtual GPU doesn't take two formats on any host: 4:4:0,
+  and VP9's RGB colour space.
 - **MPEG-1, MPEG-2, MPEG-4 Part 2, VC-1 and VP8 decoding, and VP9 and AV1 encoding.** We found no
   way in macOS for a GPU to take these.
 
