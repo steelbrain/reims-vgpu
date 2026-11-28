@@ -512,7 +512,8 @@ runtime's own device. The switches above apply, and `resolution=` too.
   as 2.1, about one size in 16 comes to a multiple of 16 pixels); on X11
   the pixels themselves. SDL takes no resize increments, so a window the
   person resizes, or the compositor sizes otherwise, shows the guest's mode
-  beside up to 15 columns and a row of black.
+  beside up to 15 columns and a row of black (on a Windows host only a
+  maximized, full-screen or borderless one: "A resize's end", below).
   `test: sdl::units::a_window_opens_a_multiple_of_16_pixels_wide_at_fractional_scales`,
   `test: handle::a_window_s_title_is_reims_vgpu_and_its_port`,
   `test: geometry::a_new_window_shows_a_guest_point_per_host_point`,
@@ -577,6 +578,18 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `manual`
 - A window that keeps its size (the reims-graphics display's) never follows
   the guest's mode, as on macOS. `manual`
+- A resize's end, on a Windows host: once the person lets go of the edge,
+  the window takes the next smaller size that is a multiple of 16 pixels
+  wide and even high, the size whose pixels the guest is offered whole, so
+  the image fills it with no black beside it, as a window on macOS resizes
+  by those steps. The person's drag runs in a loop of Windows' own, and its
+  size events reach the UI thread when it is over, so the size is set once,
+  after the drag. A maximized, full-screen or borderless window keeps the
+  size Windows gave it. On Wayland and X11 the window keeps the person's
+  size.
+  `test: sdl::units::a_person_s_size_is_made_the_next_the_guest_is_offered_whole`,
+  `manual` (drag an edge on a Windows host: the window's client area and the
+  guest's mode are the same pixels afterwards)
 - With several reims-graphics displays, each window is its own display's,
   offered its own mode, rate and scale and capped by its share of the
   scanout, and a window whose display the guest does not drive shows black,

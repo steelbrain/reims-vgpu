@@ -147,9 +147,40 @@ pub(crate) fn windowed_size(
     )
 }
 
+/// `size`, a content size in `units` the person gave a window, made the largest up to it whose
+/// pixels are a multiple of [`geometry::MODE_WIDTH_STEP`] wide and of
+/// [`geometry::MODE_HEIGHT_STEP`] high, and at least [`MIN_CONTENT`] points: the size whose
+/// pixels the guest is offered whole ([`geometry::offered_mode`]), so the image fills the window
+/// with no black beside it.
+#[cfg_attr(
+    not(any(windows, test)),
+    expect(dead_code, reason = "Windows alone sets a size after the person's")
+)]
+pub(crate) fn offered_size(size: (i32, i32), units: Units) -> (i32, i32) {
+    let min = units.min_content();
+    (
+        units.aligned(size.0, min.0, geometry::MODE_WIDTH_STEP),
+        units.aligned(size.1, min.1, geometry::MODE_HEIGHT_STEP),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A size the person gave is made the next smaller the guest is offered whole
+    #[test]
+    fn a_person_s_size_is_made_the_next_the_guest_is_offered_whole() {
+        let pixels = Units::new(1.0, 1.0);
+        assert_eq!(offered_size((1645, 1090), pixels), (1632, 1090));
+        assert_eq!(offered_size((2000, 1143), pixels), (2000, 1142));
+        assert_eq!(offered_size((1920, 1080), pixels), (1920, 1080));
+        // SDL's sizes are pixels at a content scale too (Windows, X11).
+        assert_eq!(
+            offered_size((2575, 1401), Units::new(1.0, 1.5)),
+            (2560, 1400)
+        );
+    }
 
     /// A screen's scale is its mode's density above 1, else its content scale
     #[test]
